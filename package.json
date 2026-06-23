@@ -1,0 +1,27 @@
+{
+	"name": "@isopodlabs/tison",
+	"version": "0.0.0",
+	"description": "Typescript bison.",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/adrianstephens/ts-bison.git"
+	},
+	"main": "dist/tison.js",
+	"files": [
+		"dist/**/*.{js,d.ts}",
+		"README.md"
+	],
+	"scripts": {
+		"build": "tsc",
+		"watch": "tsc -watch -p ./",
+		"lint": "eslint \"src/**/*.ts\""
+	},
+	"keywords": [
+		"typescript",
+		"string",
+		"iterator",
+		"algorithm"
+	],
+	"author": "Adrian Stephens",
+	"license": "MIT"
+}
