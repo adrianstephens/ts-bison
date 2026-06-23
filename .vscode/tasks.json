@@ -1,0 +1,54 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "npm",
+			"script": "build",
+			"group": "build",
+			"problemMatcher": "$tsc",
+			"label": "npm: build",
+			"detail": "tsc"
+		},
+		{
+			"type": "npm",
+			"script": "watch",
+			"group": "build",
+			"problemMatcher": "$tsc-watch",
+			"label": "npm: watch",
+			"isBackground": true
+		},
+		{
+			"type": "shell",
+			"label": "prepublish",
+			"command": "git add .; npm version ${input:version} --force",
+			"windows": {
+				"command": "git add . & npm version ${input:version} --force",
+			},
+			"problemMatcher": [],
+			"dependsOn": "npm: build"
+		},
+		{
+			"type": "shell",
+			"label": "PUBLISH",
+			"command": "npm publish --access public",
+			"problemMatcher": [],
+			"dependsOn": "prepublish"
+		},
+		{
+			"type": "shell",
+			"label": "PACKAGE",
+			"command": "npm pack",
+			"problemMatcher": [],
+			"dependsOn": "npm: build"
+		},
+	],
+	"inputs": [
+		{
+			"id": "version",
+			"description": "Version bump:",
+			"type": "pickString",
+			"options": ["patch", "minor", "major"],
+			"default": "none"
+		},
+	]
+}
