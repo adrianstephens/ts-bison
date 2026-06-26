@@ -18,6 +18,17 @@ tison is a TypeScript-native parser generator -- analogous to GNU Bison, but ins
 
 Grammars build SLR(1) tables, with an automatic, low-overhead fallback for the rare construct that's genuinely ambiguous -- see [Handling ambiguity](#handling-ambiguity-glr-on-demand) below.
 
+### Why tison, and not...
+
+There's no shortage of JS/TS parser generators -- tison's particular combination of choices just isn't quite any of theirs:
+- **[Jison](https://github.com/zaach/jison)** is the closest precedent (LALR(1), Bison-style precedence, integrated lexer) but is largely unmaintained, and its lexer has nothing like tison's `Terminal.lex`/state-restricted-lexing hooks for context-sensitive tokens.
+- **[Chevrotain](https://chevrotain.io/)** is the closest peer for "define the grammar as TS code, no build step" -- but it's a hand-rolled LL(k)/CST-builder under the hood, not LR tables, and ambiguity is handled via explicit backtracking/gates rather than GLR forking.
+- **[nearley](https://nearley.js.org/)** also embraces ambiguity (it returns every parse) via Earley parsing, but grammars are `.ne` files compiled to JS, not a TS value you construct and call directly.
+- **[Peggy](https://peggyjs.org/)** (the maintained PEG.js fork) is by far the most widely used JS parser generator, but PEG's ordered-choice semantics are a different tool for a different problem shape -- no real notion of ambiguity to resolve.
+- **[lezer](https://lezer.codemirror.net/)** is GSS-based like tison's GLR fallback, but built for incremental/editor reparsing (it's CodeMirror 6's parser), and its grammars are still a separate `.grammar` file run through a generator.
+
+tison's niche: SLR(1) tables with GLR forking used only on the specific `(state, token)` pairs that are genuinely ambiguous, a grammar that's a plain TS value rather than a generated file, and a lexer wired directly into the parser's own state (the `allowed`-row trick) instead of a separate phase.
+
 ## Usage
 
 ```ts

@@ -50,17 +50,34 @@
 // utility
 //
 // A literal that ends in a word character (e.g. 'var', 'in') is given an implicit trailing word-boundary, so it can never match as a strict prefix of a longer word
-function literalPattern(s: string) {
+export function literalPattern(s: string) {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + (/\w/.test(s[s.length - 1]) ? '(?!\\w)' : '');
 }
 
-// One regex matching any of `names` -- each alternative gets the same
-// implicit word-boundary treatment as individual literal sugar (see
-// `literalPattern`), so e.g. 'in' and 'instanceof' in the same list don't
-// need to be ordered carefully relative to each other.
-export function reOneOf(names: readonly string[]) {
-	return new RegExp(names.map(literalPattern).join('|'));
+export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: string) {
+	return Rules<T[]>(self => [
+		Rule([single] as const,	$ => [$[0]]),
+		sep
+			? Rule([self, sep, single] as const,	$ => [...($[0] as T[]), $[2]])
+			: Rule([self, single] as const,			$ => [...($[0] as T[]), $[1]])
+	]);
 }
+
+interface Ref<T> { ref: string; }
+export function Ref<T>(s: string): Ref<T> {
+	return {ref: s};
+}
+
+export function Forward<T>(f: () => any) {
+	return f as (() => Rules<T>);
+}
+export interface TextPos {
+	offset: number; line: number; col: number;
+}
+export interface LexState extends TextPos {
+	prev?:	Terminal;	// the most recently returned non-ignored terminal -- feeds LexContext.prev
+}
+
 
 // Context given to a terminal's `lex` callback once its pattern has matched at the current position.
 // The callback decides what (if anything) this match actually is:
@@ -68,15 +85,16 @@ export function reOneOf(names: readonly string[]) {
 //   - return the terminal itself to accept it normally
 //   - return a different terminal to reclassify the match as that instead
 // `peekNext` looks past this match non-destructively, for terminals (like whitespace) that need to know what's coming to decide how to classify themselves
-export interface LexContext {
+export interface LexContext extends LexState {
 	text:		string;
-	prev:		Terminal | undefined;
+	ctx?:		any;
 	peekNext:	() => Token | null;
+	peekText:	() => string;
 }
 
-export type LexCallback = (ctx: LexContext) => Terminal | string | RegExp | undefined
+export type LexCallback = (ctx: LexContext) => Terminal | string | RegExp | undefined;
 
-export class Terminal {
+export class Terminal<T = string> {
 	ignore = false;
 	pattern?: RegExp;
 	constructor(public name: string, pattern?: RegExp, public lex?: LexCallback) {
@@ -85,30 +103,50 @@ export class Terminal {
 	}
 }
 
-export function terminal(pattern: RegExp, lex?: LexCallback) {
-	return new Terminal(pattern.source, pattern, lex);
-}
-export function virtualTerminal(name: string) {
-	return new Terminal(name);
+export function termOneOf<T extends string>(names: readonly T[]) {
+	return new Terminal<T>(names.join('|'), RegExp(names.map(literalPattern).join('|')));
 }
 
-type Sym = string | RegExp | Terminal | Alt<any, any>[];
+export function terminal(name: string, pattern?: RegExp, lex?: LexCallback) {
+	return new Terminal(name, pattern, lex);
+}
 
-type ElemValue<S> = S extends Alt<infer U, any>[] ? U : S extends RegExp | Terminal ? string : unknown;
+export type Rules<T> = Rule<T, any>[]
+type Action<T, A = unknown[]> = (values: A, ctx?: any) => T
+type Sym = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any>;
+
+type ElemValue<S> = S extends Rule<infer U, any>[] ? U
+	: S extends RegExp ? string
+	: S extends Terminal<infer U> ? U
+	: S extends (()=>infer U) ? ElemValue<U>
+	: S extends Ref<infer U> ? U
+	: S extends string ? S
+	: S extends Action<any, infer U> ? U
+	: unknown;
+
 type ValuesOf<T extends readonly Sym[]> = {[K in keyof T]: ElemValue<T[K]>}
 
-export interface Alt<T, R extends readonly Sym[]> {
+export interface Rule<T, R extends readonly Sym[]> {
 	rhs:		R;
-	action?:	(values: ValuesOf<R>) => T;
+	action?:	(values: ValuesOf<R>, ctx?: any) => T;
 	prec?:		string;
 }
-export type ValueOf<R> = R extends Alt<infer T, any>[] ? T : never;
+export type ValueOf<R> = R extends Rule<infer T, any>[] ? T : never;
 
-export function Rule<T, R extends readonly Sym[]>(rhs: R, action?: (values: ValuesOf<R>) => T, prec?: string): Alt<T, R> {
+export function Rule<T, R extends readonly Sym[]>(rhs: R, action?: Action<T, ValuesOf<R>>, prec?: string): Rule<T, R> {
 	return { rhs, action, prec };
 }
-export function Rules<T>(...alts: Alt<T, any>[]) {
-	return alts;
+
+// A self-recursive rule set (e.g. `Rule(['delete', X], ...)` where X means "another one of these") needs *some* reference to itself while it's still being built.
+// The builder-callback overload hands that back for free as `self`, typed correctly with no circular-inference workaround needed at the call site
+export function Rules<T>(builder: (self: () => Rules<T>) => Rules<T>): Rules<T>;
+export function Rules<T>(...alts: Rules<T>): Rules<T>;
+export function Rules<T>(...args: [(self: () => Rules<T>) => Rules<T>] | Rules<T>): Rules<T> {
+	if (args.length === 1 && typeof args[0] === 'function') {
+		const rules = args[0](() => rules);
+		return rules;
+	}
+	return args as Rules<T>;
 }
 
 type Assoc = 'left' | 'right' | 'nonassoc';
@@ -120,13 +158,13 @@ export interface Precedence {
 export interface GrammarSpec {
 	skip?:			(RegExp | Terminal)[];
 	precedence?:	Record<string, Assoc>;
-	start?:			string;		// defaults to the first key of `rules`
-	rules:			Record<string, Alt<any, any>[]>;
+	start?:			Rules<any>;		// defaults to the first value of `rules`
+	rules?:			Record<string, Rules<any>>;
 	recover?: (row: Map<Terminal, ActionEntry>, token: Token, prevToken: Token | undefined) => Token | undefined;
 }
 
 export interface Parser {
-	parse(input: string): unknown;
+	parse(input: string, ctx?: any): unknown;
 	tables: ParseTables;
 }
 
@@ -140,7 +178,7 @@ export class NonTerminal {
 
 export type InternalSym = Terminal | NonTerminal;
 
-export const EOF		= new Terminal('$end');
+export const EOF	= new Terminal('$end');
 export const ACCEPT	= new NonTerminal('$accept');
 
 interface PrecEntry {
@@ -152,7 +190,7 @@ export interface InternalRule {
 	id:			number;
 	lhs:		NonTerminal;
 	rhs:		InternalSym[];
-	action: 	(values: readonly unknown[]) => unknown;
+	action: 	(values: readonly unknown[], ctx?: any) => unknown;
 	prec?:		PrecEntry;
 }
 
@@ -171,7 +209,8 @@ export interface ConflictReport {
 export interface ParseTables {
 	action: 	Map<Terminal, ActionEntry>[];		// indexed by state
 	goto:		Map<NonTerminal, number>[];			// indexed by state
-	rules:		{ lhs: NonTerminal; rhsLen: number }[];
+//	rules:		{ lhs: NonTerminal; rhsLen: number }[];
+	rules:		InternalRule[];
 	conflicts:	ConflictReport[];
 }
 
@@ -179,39 +218,63 @@ export interface ParseTables {
 //  Grammar builder
 // ===================================================================
 
+function has0args<T>(fn: (arg: any) => T): fn is ()=>T {
+	return fn.length === 0;
+}
+
 export class GrammarBuilder {
 	rules:		InternalRule[] = [];
-	lexEntries:	Terminal[] = [];
 	terminalsByName	= new Map<string, Terminal>();
 
 	private first	= new Map<InternalSym, { terms: Set<Terminal>; nullable: boolean }>();
 	private startSymbol: NonTerminal;
 
 	constructor(spec: GrammarSpec) {
-		const lhsNames = Object.keys(spec.rules);
-		if (lhsNames.length === 0)
-			throw new Error('tison: no rules supplied');
+		const rules = [
+			...(spec.start ? [spec.start] : []),
+			...(spec.rules ? Object.values(spec.rules): [])
+		];
+		if (!rules.length)
+			throw new Error('No rules defined in grammar spec');
 
+		const nonTerminalsByName	= new Map(Object.keys(spec.rules ?? {}).map(name => [name, new NonTerminal(name)]));
+		const nonTerminalsByRules	= new Map(Object.entries(spec.rules ?? {}).map(([name, nt]) => [nt, nonTerminalsByName.get(name)!]));
 
-		const nonTerminalsByName	= new Map<string, NonTerminal>();
-		const internNonTerminal		= (name: string): NonTerminal => {
-			let nt = nonTerminalsByName.get(name);
+		if (spec.start && !nonTerminalsByRules.get(spec.start))
+			nonTerminalsByRules.set(spec.start, new NonTerminal('start'));
+
+		const internByRules	= (r: Rules<any>) => {
+			let nt = nonTerminalsByRules.get(r);
 			if (!nt) {
-				nt = new NonTerminal(name);
-				nonTerminalsByName.set(name, nt);
+				nt = new NonTerminal('unknown name');
+				nonTerminalsByRules.set(r, nt);
+				rules.push(r);
 			}
 			return nt;
 		};
 
-		const lexerTerminals	= new Set<Terminal>();
-		const internTerminal	= (re: RegExp): Terminal => {
-			let term = this.terminalsByName.get(re.source);
-			if (!term) {
-				term = new Terminal(re.source, re);
-				this.terminalsByName.set(re.source, term);
-				lexerTerminals.add(term);
-			}
+		const internTerminal	= (name: string, re: RegExp): Terminal =>
+			this.terminalsByName.get(name) ?? addTerminal(new Terminal(name, re));
+
+		const addTerminal 		= (term: Terminal): Terminal => {
+			if (nonTerminalsByName.has(term.name))
+				throw `${term.name} used as terminal and nonterminal`;
+			this.terminalsByName.set(term.name, term);
 			return term;
+		};
+
+		const anon = (action: Action<any, any>) => {
+			const id	= this.rules.length;
+			const lhs	= new NonTerminal(`anon ${id}`);
+
+			this.first.set(lhs, { terms: new Set(), nullable: false });
+			this.rules.push({
+				id,
+				lhs,
+				rhs:	[],
+				action
+			});
+			return lhs;
 		};
 
 		// -- Precedence -----------------------------------------------
@@ -224,40 +287,12 @@ export class GrammarBuilder {
 			});
 		}
 
-		// -- Discover non-terminals -----------------------------------
-		const byRules = new Map(lhsNames.map(lhs => [spec.rules[lhs], internNonTerminal(lhs)] as const));
-
-		const resolveExternalTerminal = (term: Terminal): Terminal => {
-			lexerTerminals.add(term);
-			return term;
-		};
-
-		const internLiteral = (s: string): Terminal =>
-			internTerminal(new RegExp(literalPattern(s)));
-
-		const resolveSym = (sym: Sym) =>
-			typeof sym === 'string'		? nonTerminalsByName.get(sym) ?? internLiteral(sym)
-			: sym instanceof RegExp		? internTerminal(sym)
-			: sym instanceof Terminal	? resolveExternalTerminal(sym)
-			: byRules.get(sym)!;
-
-
-		const resolved = lhsNames.flatMap(lhs => spec.rules[lhs].map(alt => ({
-			lhs: internNonTerminal(lhs),
-			rhs: alt.rhs.map(resolveSym),
-			action: alt.action ?? (() => undefined) as any,
-			prec: alt.prec !== undefined ? prec.get(alt.prec) : undefined,
-		})));
-
 		// -- Skip (whitespace/comments) ------------------------------------
 		for (const s of spec.skip ?? [])
-			(s instanceof Terminal ? resolveExternalTerminal(s) : internTerminal(s)).ignore = true;
-
-		// -- Token registration -----------------------------------------
-		this.lexEntries = Array.from(lexerTerminals).filter(t => t.pattern);
+			(s instanceof RegExp ? internTerminal(s.source, s) : addTerminal(s)).ignore = true;
 
 		// -- Augmented start rule -------------------------------------
-		this.startSymbol = internNonTerminal(spec.start ?? lhsNames[0]);
+		this.startSymbol = internByRules(rules[0])!;
 
 		this.rules.push({
 			id:		0,
@@ -266,29 +301,49 @@ export class GrammarBuilder {
 			action: v => v[0],
 		});
 
-		// -- User rules -----------------------------------------------
-		for (const r of resolved)
-			this.rules.push({id: this.rules.length, ...r});
+		// -- Discover non-terminals -----------------------------------
+
+		const resolveSym = (sym: Sym) =>
+			typeof sym === 'string'		? nonTerminalsByName.get(sym) ?? internTerminal(sym, new RegExp(literalPattern(sym)))
+			: typeof sym === 'function'	? (has0args(sym) ? internByRules(sym()) : anon(sym))
+			: sym instanceof RegExp		? internTerminal(sym.source, sym)
+			: sym instanceof Terminal	? this.terminalsByName.get(sym.name) ?? addTerminal(sym)
+			: 'ref' in sym				? nonTerminalsByName.get(sym.ref)
+			: internByRules(sym)!;
+
+		for (const r of rules) {
+			const lhs = nonTerminalsByRules.get(r)!;
+			for (const alt of r) {
+				const rhs = alt.rhs.map(resolveSym);
+				this.rules.push({
+					id:		this.rules.length,
+					lhs,
+					rhs,
+					action:	alt.action ?? ((() => undefined) as any),
+					prec:	alt.prec !== undefined ? prec.get(alt.prec) : undefined,
+				});
+			}
+		}
 
 		// -- FIRST sets ---------------------------------------------------
 
-		for (const t of lexerTerminals)
+		for (const t of this.terminalsByName.values())
 			this.first.set(t, { terms: new Set([t]), nullable: false });
 		this.first.set(EOF, { terms: new Set([EOF]), nullable: false });
-		for (const nt of nonTerminalsByName.values())
+		for (const nt of nonTerminalsByRules.values())
 			this.first.set(nt, { terms: new Set(), nullable: false });
 		this.first.set(ACCEPT, { terms: new Set(), nullable: false });
 
 		for (let changed = true; changed;) {
 			changed = false;
 			for (const rule of this.rules) {
-				const lhsFirst = this.first.get(rule.lhs)!;
+				const first = this.first.get(rule.lhs)!;
 				let allDeriveEps = true;
 				for (const sym of rule.rhs) {
 					const symFirst = this.first.get(sym)!;
 					for (const f of symFirst.terms) {
-						if (!lhsFirst.terms.has(f)) {
-							lhsFirst.terms.add(f);
+						if (!first.terms.has(f)) {
+							first.terms.add(f);
 							changed = true;
 						}
 					}
@@ -297,8 +352,8 @@ export class GrammarBuilder {
 						break;
 					}
 				}
-				if (allDeriveEps && !lhsFirst.nullable) {
-					lhsFirst.nullable = true;
+				if (allDeriveEps && !first.nullable) {
+					first.nullable = true;
 					changed = true;
 				}
 			}
@@ -388,8 +443,7 @@ export class GrammarBuilder {
 		for (const nt of new Set(this.rules.map(r => r.lhs)))
 			follow.set(nt, new Set());
 
-		let changed = true;
-		while (changed) {
+		for (let changed = true; changed; ) {
 			changed = false;
 			for (const rule of this.rules) {
 				for (let i = 0; i < rule.rhs.length; i++) {
@@ -424,11 +478,7 @@ export class GrammarBuilder {
 			}
 		}
 
-		// Per state+terminal, the rule whose item is about to shift that terminal --
-		// precedence belongs to rules, so this is what a shift is compared against.
-		const shiftRule = Array.from({ length: numStates }, () => new Map<Terminal, number>());
-
-		// Build ACTION / GOTO tables
+		const shiftRule = Array.from({ length: numStates }, () => new Map<Terminal, InternalRule>());
 		const action	= Array.from({ length: numStates }, () => new Map<Terminal, ActionEntry>());
 		const goto		= Array.from({ length: numStates }, () => new Map<NonTerminal, number>());
 		const conflicts: ConflictReport[]	= [];
@@ -439,28 +489,27 @@ export class GrammarBuilder {
 				if (item.dot < r.rhs.length) {
 					const sym = r.rhs[item.dot];
 					if (sym instanceof Terminal && !shiftRule[s].has(sym))
-						shiftRule[s].set(sym, item.rule);
+						shiftRule[s].set(sym, r);
 				}
 			}
 			for (const [sym, target] of lr0Trans[s]) {
 				if (sym instanceof Terminal)
-					this.setAction(action[s], sym, sym === EOF ? { kind: 'accept' } : { kind: 'shift', state: target }, s, shiftRule[s].get(sym), conflicts);
+					this.setAction(action[s], sym, sym === EOF ? { kind: 'accept' } : { kind: 'shift', state: target }, s, shiftRule[s].get(sym)?.prec, conflicts);
 				else
 					goto[s].set(sym, target);
 			}
 			for (const item of lr0States[s]) {
 				const r = this.rules[item.rule];
-				if (item.dot < r.rhs.length || r.lhs === ACCEPT)
-					continue;
-				for (const la of follow.get(r.lhs)!)
-					this.setAction(action[s], la, { kind: 'reduce', rule: item.rule }, s, shiftRule[s].get(la), conflicts);
+				if (item.dot >= r.rhs.length && r.lhs !== ACCEPT)
+					for (const la of follow.get(r.lhs)!)
+						this.setAction(action[s], la, { kind: 'reduce', rule: item.rule }, s, shiftRule[s].get(la)?.prec, conflicts);
 			}
 		}
 
 		return {
 			action,
 			goto,
-			rules:		this.rules.map(r => ({ lhs: r.lhs, rhsLen: r.rhs.length })),
+			rules:		this.rules,//.map(r => ({ lhs: r.lhs, rhsLen: r.rhs.length })),
 			conflicts,
 		};
 	}
@@ -472,7 +521,8 @@ export class GrammarBuilder {
 		term:		Terminal,
 		incoming:	ActionEntry,
 		state:		number,
-		shiftRuleId: number | undefined,
+		//shiftRuleId: number | undefined,
+		shiftPrec:	PrecEntry | undefined,
 		conflicts:	ConflictReport[]
 	) {
 		if (!row.has(term)) {
@@ -480,7 +530,6 @@ export class GrammarBuilder {
 			return;
 		}
 		const existing = row.get(term)!;
-
 		if (
 			(existing.kind === 'shift' && incoming.kind === 'reduce') ||
 			(existing.kind === 'reduce' && incoming.kind === 'shift')
@@ -489,7 +538,7 @@ export class GrammarBuilder {
 			const reduceEntry	= (existing.kind === 'reduce'	? existing : incoming) as { kind: 'reduce';	rule:	number };
 			// Precedence belongs to rules: compare the reducing rule's level against
 			// the level of whichever rule is about to shift this lookahead token.
-			const shiftPrec		= shiftRuleId !== undefined ? this.rules[shiftRuleId].prec : undefined;
+			//const shiftPrec		= shiftRuleId !== undefined ? this.rules[shiftRuleId].prec : undefined;
 			const reducePrec	= this.rules[reduceEntry.rule].prec;
 
 			if (shiftPrec !== undefined && reducePrec !== undefined) {
@@ -532,17 +581,37 @@ export class GrammarBuilder {
 export interface Token {
 	type:	Terminal;
 	value:	string;	// semantic value; available as $[i] in actions
-	pos?:	{ offset: number; line: number; col: number };
+	pos?:	TextPos;
 }
 
-export interface LexState {
-	offset:			number;
-	line:			number;
-	col:			number;
-	lastTerminal?:	Terminal;	// the most recently returned non-ignored terminal -- feeds LexContext.prev
+
+function advancePos(state: TextPos, text: string) {
+	for (const ch of text) {
+		if (ch === '\n') {
+			state.line++;
+			state.col = 1;
+			console.log(state.line);
+		} else {
+			state.col++;
+		}
+	}
+	state.offset += text.length;
+	return state;
 }
 
-export function nextToken(entries: Terminal[], input: string, state: LexState, resolveSym: (sym: string|RegExp|Terminal|undefined) => Terminal|undefined, allowed?: Map<Terminal, ActionEntry>): Token {
+export interface TokenStream {
+	// `allowed`, if given, is consulted only while computing a fresh token (i.e. the first peek() since the last consume())
+	peek(allowed?: Map<Terminal, ActionEntry>): Token;
+	peekText(): string;
+	consume(): void;
+}
+
+type TryRecover = (row: Map<Terminal, ActionEntry>, tok: Token, prevToken: Token | undefined) => { entry: ActionEntry; tok: Token; } | undefined
+
+export type MergeFn = (left: unknown, right: unknown) => unknown;
+const defaultMerge: MergeFn = (left, right) => Array.isArray(left) ? [...left, right] : [left, right];
+
+export function nextToken(entries: Terminal[], input: string, state: LexState, ctx: any, resolveSym: (sym: string|RegExp|Terminal|undefined) => Terminal|undefined, allowed?: Map<Terminal, ActionEntry>): Token {
 
 	while (state.offset < input.length) {
 		const candidates: { term: Terminal; len: number }[] = [];
@@ -556,8 +625,8 @@ export function nextToken(entries: Terminal[], input: string, state: LexState, r
 		candidates.sort((a, b) => b.len - a.len
 			|| (a.term.pattern!.source < b.term.pattern!.source ? 1 : a.term.pattern!.source > b.term.pattern!.source ? -1 : 0));
 
-		let chosen: { finalTerm: Terminal; len: number } | undefined;
-		let firstViable: { finalTerm: Terminal; len: number } | undefined;
+		let chosen:			{ finalTerm: Terminal; len: number } | undefined;
+		let firstViable:	{ finalTerm: Terminal; len: number } | undefined;
 		for (const { term, len } of candidates) {
 			let result: Terminal | undefined;
 			if (!term.lex) {
@@ -565,28 +634,19 @@ export function nextToken(entries: Terminal[], input: string, state: LexState, r
 			} else {
 				const text = input.slice(state.offset, state.offset + len);
 				result = resolveSym(term.lex({
-					text, prev: state.lastTerminal,
-					peekNext: (): Token | null => {
-						const clone: LexState = { offset: state.offset, line: state.line, col: state.col, lastTerminal: state.lastTerminal };
-						for (const ch of text) {
-							if (ch === '\n') {
-								clone.line++;
-								clone.col = 1;
-							} else {
-								clone.col++;
-							}
-						}
-						clone.offset += len;
-						return nextToken(entries, input, clone, resolveSym);
-					},
+					...state,
+					text,
+					ctx,
+					peekNext: () => nextToken(entries, input, advancePos({...state}, text), ctx, resolveSym, allowed),
+					peekText: () => input.substring(state.offset)
 				}));
 			}
-			if (!result)
-				continue;
-			firstViable ??= { finalTerm: result, len };
-			if (!allowed || result.ignore || allowed.has(result)) {
-				chosen = { finalTerm: result, len };
-				break;
+			if (result) {
+				firstViable ??= { finalTerm: result, len };
+				if (!allowed || result.ignore || allowed.has(result)) {
+					chosen = { finalTerm: result, len };
+					break;
+				}
 			}
 		}
 		chosen ??= firstViable;
@@ -600,36 +660,23 @@ export function nextToken(entries: Terminal[], input: string, state: LexState, r
 			? { type: finalTerm, value: matched, pos: { offset: state.offset, line: state.line, col: state.col } }
 			: null;
 
-		for (const ch of matched) {
-			if (ch === '\n') {
-				state.line++;
-				state.col = 1;
-			} else {
-				state.col++;
-			}
-		}
-		state.offset += len;
+		advancePos(state, matched);
 
 		if (token) {
-			state.lastTerminal = finalTerm;
+			state.prev = finalTerm;
 			return token;
 		}
 	}
 	return { type: EOF, value: '', pos: { offset: state.offset, line: state.line, col: state.col }};
 }
 
-export interface TokenStream {
-	// `allowed`, if given, is consulted only while computing a fresh token (i.e. the first peek() since the last consume())
-	peek(allowed?: Map<Terminal, ActionEntry>): Token;
-	consume(): void;
+function dumpStack(valueStack: readonly unknown[]) {
+	console.error('Stack dump:');
+	for (let i = 0; i < valueStack.length; i++)
+		console.error(`${'  '.repeat(i)}value: ${JSON.stringify(valueStack[i])}`);
 }
 
-type TryRecover = (row: Map<Terminal, ActionEntry>, tok: Token, prevToken: Token | undefined) => { entry: ActionEntry; tok: Token; } | undefined
-
-export type MergeFn = (left: unknown, right: unknown) => unknown;
-const defaultMerge: MergeFn = (left, right) => Array.isArray(left) ? [...left, right] : [left, right];
-
-export function runParser(tables: ParseTables, stream: TokenStream, rules: InternalRule[], tryRecover: TryRecover, mergeFns: Record<number, MergeFn> = {}) {
+export function runParser(tables: ParseTables, stream: TokenStream, ctx: any, tryRecover: TryRecover, mergeFns: Record<number, MergeFn> = {}) {
 	let stateStack: number[]	= [0];
 	let valueStack: unknown[]	= [];
 	let lastShifted: Token | undefined;
@@ -642,15 +689,16 @@ export function runParser(tables: ParseTables, stream: TokenStream, rules: Inter
 		const tok			= fromRecovery?.tok ?? realTok;
 
 		if (!entry) {
+			dumpStack(valueStack);
 			const expected = [...row.keys()].filter(k => k !== EOF).map(k => k.name);
 			throw new SyntaxError(
-				`Unexpected token '${realTok.type.name}'${realTok.pos ? ` at line ${realTok.pos.line}, col ${realTok.pos.col}` : ' at end of input'}. ` +
-				`Expected: ${expected.length ? expected.join(', ') : '(nothing)'}`
+				`Unexpected token '${realTok.type.name}'${realTok.pos ? ` at line ${realTok.pos.line}, col ${realTok.pos.col}` : ' at end of input'}. `
+				+ `Expected: ${expected.length ? expected.join(', ') : '(nothing)'}`
 			);
 		}
 
 		if (entry.kind === 'conflict') {
-			const result = runGlrFork(tables, stream, rules, mergeFns, tryRecover, stateStack, valueStack, lastShifted);
+			const result = runGlrFork(tables, stream, ctx, mergeFns, tryRecover, stateStack, valueStack, lastShifted);
 			if (result.accepted)
 				return result.value;
 			({stateStack, valueStack, lastShifted } = result);
@@ -663,7 +711,7 @@ export function runParser(tables: ParseTables, stream: TokenStream, rules: Inter
 				lastShifted = realTok;
 			}
 		} else if (entry.kind === 'reduce') {
-			const rule		= rules[entry.rule];
+			const rule		= tables.rules[entry.rule];
 			const rhsLen	= rule.rhs.length;
 			const vals		= valueStack.splice(valueStack.length - rhsLen, rhsLen);
 			stateStack.splice(stateStack.length - rhsLen, rhsLen);
@@ -674,7 +722,9 @@ export function runParser(tables: ParseTables, stream: TokenStream, rules: Inter
 				throw new Error(`No GOTO entry for state ${topState}, non-terminal '${rule.lhs.name}'`);
 
 			stateStack.push(nextState);
-			valueStack.push(rule.action(vals));
+			const value = rule.action(vals, ctx);
+			//console.log(`${'  '.repeat(stateStack.length)}${rule.lhs.name} -> ${rule.rhs.map(r => r.name).join(' ')}, made: ${JSON.stringify(value)}`);
+			valueStack.push(value);//rule.action(vals, ctx));
 		} else {
 			// accept
 			return valueStack[valueStack.length - 1];
@@ -693,7 +743,7 @@ type GlrForkResult =
 
 
 function runGlrFork(
-	tables: ParseTables, stream: TokenStream, rules: InternalRule[], mergeFns: Record<number, MergeFn>, tryRecover: TryRecover,
+	tables: ParseTables, stream: TokenStream, ctx: any, mergeFns: Record<number, MergeFn>, tryRecover: TryRecover,
 	stateStack: readonly number[], valueStack: readonly unknown[], lastShifted: Token | undefined,
 ): GlrForkResult {
 
@@ -763,7 +813,7 @@ function runGlrFork(
 				}
 
 			} else if (entry.kind === 'reduce') {
-				const	rule	= rules[entry.rule];
+				const	rule	= tables.rules[entry.rule];
 				let		top		= path.top;
 				let		n		= rule.rhs.length;
 				const vals: unknown[] = new Array(n);
@@ -771,7 +821,7 @@ function runGlrFork(
 					vals[n]	= top.value;
 					top		= top.parent!;
 				}
-				const reducedValue	= rule.action(vals);
+				const reducedValue	= rule.action(vals, ctx);
 				const nextState		= tables.goto[top.state]?.get(rule.lhs);
 				if (nextState !== undefined)
 					registerAtPosition(makeFrame(top, nextState, reducedValue));
@@ -847,10 +897,9 @@ export function tison(spec: GrammarSpec,
 	merge?:		Record<number, MergeFn>, 	// Merge functions for ambiguous convergence points. Key = LALR state id (see tables.action.length).
 ): Parser {
 	const g = new GrammarBuilder(spec);
-	if (g.lexEntries.length === 0)
-		throw new Error('tison: every terminal must declare a pattern');
 
 	const tables	= g.buildTables();
+	const lexEntries = Array.from(g.terminalsByName.values()).filter(t => t.pattern);
 
 	const recover	= (row: Map<Terminal, ActionEntry>, tok: Token, prevToken: Token | undefined) => {
 		const substitute = spec.recover?.(row, tok, prevToken);
@@ -861,22 +910,23 @@ export function tison(spec: GrammarSpec,
 	};
 
 	const resolveSym = (sym: string|RegExp|Terminal|undefined): Terminal|undefined =>
-		typeof sym === 'string'		? g.terminalsByName.get(literalPattern(sym))
+		typeof sym === 'string'		? g.terminalsByName.get(sym)
 		: sym instanceof RegExp		? g.terminalsByName.get(sym.source)
 		: sym;
 
 
-	const createTokenStream = (lexEntries: Terminal[], input: string) => {
+	const createTokenStream = (lexEntries: Terminal[], input: string, ctx: any) => {
 		const lexState: LexState = { offset: 0, line: 1, col: 1 };
 		let lookahead: Token | undefined;
 		return {
-			peek: (allowed?: Map<Terminal, ActionEntry>): Token => lookahead ??= nextToken(lexEntries, input, lexState, resolveSym, allowed),
-			consume: () => { lookahead = undefined; }
+			peek: (allowed?: Map<Terminal, ActionEntry>): Token => lookahead ??= nextToken(lexEntries, input, lexState, ctx, resolveSym, allowed),
+			peekText:	() => { return input.substring(lexState.offset); },
+			consume:	() => { lookahead = undefined; }
 		};
 	};
 
 	return {
 		tables,
-		parse: input => runParser(tables, createTokenStream(g.lexEntries, input), g.rules, recover, merge ?? {})
+		parse: (input, ctx) => runParser(tables, createTokenStream(lexEntries, input, ctx), ctx, recover, merge ?? {})
 	};
 }
