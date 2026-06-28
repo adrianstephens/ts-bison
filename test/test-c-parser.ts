@@ -1,4 +1,4 @@
-import {cParser} from '../src/examples/c-parser';
+import {cParser} from '../examples/c-parser';
 
 function test(name: string, code: string) {
 	try {

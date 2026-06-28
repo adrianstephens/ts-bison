@@ -1,4 +1,4 @@
-import { tison, Rule, Rules, terminal, termOneOf, List, Forward } from '../tison';
+import { makeParser, Rule, Rules, terminal, termOneOf, List, Forward } from '../src/tison';
 
 // ===================================================================
 //  C Parser Grammar using tison
@@ -19,7 +19,7 @@ export interface Ctx {
 
 
 export const TYPE_NAME		= terminal('TYPE_NAME');
-export const IDENT 			= terminal('identifier', /[a-zA-Z_][a-zA-Z0-9_]*/, ({ text, ctx }) => ctx.typedefNames.has(text) ? TYPE_NAME : IDENT);
+export const IDENT			= terminal('identifier', /[a-zA-Z_][a-zA-Z0-9_]*/, ({text}, ctx: Ctx ) => ctx.typedefNames.has(text) ? TYPE_NAME : IDENT);
 
 export const INT_LITERAL 	= /[0-9]+(?:[uU]|[lL]|[uU][lL]|[lL][uU])?/;
 export const FLOAT_LITERAL 	= /[0-9]+\.[0-9]*(?:[eE][-+]?[0-9]+)?[fFlL]?/;
@@ -455,10 +455,9 @@ statement = Rules(self => [
 	Rule([IDENT, ':', self] as const, 										$ => ({ type: 'labeled', label: $[0], body: $[2] })),
 	Rule([expression_statement] as const, 									$ => $[0]),
 ]),
-statement_list = List(statement),
 
 compound_statement = Rules(
-	Rule(['{', statement_list, '}'] as const, 								$ => ({ type: 'block', statements: $[1] })),
+	Rule(['{', List(statement), '}'] as const, 								$ => ({ type: 'block', statements: $[1] })),
 	{ rhs: ['{', '}'], 														action: () => ({ type: 'block', statements: [] }) },
 ),
 
@@ -477,7 +476,7 @@ translation_unit = Rules<TranslationUnit>(self => [
 	Rule([self, external_definition] as const, 								$ => ({ ...$[0], definitions: [...$[0].definitions, $[1]] })),
 ]);
 
-const parser = tison({
+const parser = makeParser({
 	skip: [/\s+/, /#[^\n]*/, /\/\/[^\n]*/, /\/\*[^]*?\*\//],
 	precedence: PREC_LEVELS,
 	start: translation_unit,

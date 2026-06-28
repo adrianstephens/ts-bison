@@ -1,4 +1,4 @@
-import { tison, Rule, Rules, terminal, EOF, termOneOf, Forward, List, type GrammarSpec } from '../tison';
+import { makeParser, Rule, Rules, terminal, EOF, termOneOf, Forward, List, type GrammarSpec } from '../src/tison';
 
 // ===================================================================
 //  JavaScript Parser using tison
@@ -54,16 +54,16 @@ const RESTRICTED_BEFORE = new Set(['++', '--']);
 const WS = terminal('ws',
 	/\s+/,
 	lex => {
-		if (!lex.text.includes('\n'))
-			return WS;
-		if (lex.prev && RESTRICTED_AFTER.has(lex.prev.name))
-			return ';';
-		const next = lex.peekNext();
-		if (next && RESTRICTED_BEFORE.has(next.type.name))
-			return ';';
-		//const next = /\s*.*/.exec(peekText());
-		//if (next && RESTRICTED_BEFORE.has(next[1]))
-		//	return ';';
+		if (lex.text.includes('\n')) {
+			if (lex.prev && RESTRICTED_AFTER.has(lex.prev.name))
+				return ';';
+			const next = lex.peekNext();
+			if (next && RESTRICTED_BEFORE.has(next.type.name))
+				return ';';
+			//const next = /\s*.*/.exec(peekText());
+			//if (next && RESTRICTED_BEFORE.has(next[1]))
+			//	return ';';
+		}
 		return WS;
 	}
 );
@@ -76,7 +76,7 @@ const regexDisallowedAfter = new Set([
 
 const REGEX_LITERAL = terminal('regex',
 	/\/(?:[^/\\\n[]|\\.|\[(?:[^\]\\\n]|\\.)*\])+\/[a-zA-Z]*/,
-	({ prev }) => (!prev || !regexDisallowedAfter.has(prev.name)) ? REGEX_LITERAL : undefined
+	lex => (!lex.prev || !regexDisallowedAfter.has(lex.prev.name)) ? REGEX_LITERAL : undefined
 );
 
 
@@ -982,7 +982,7 @@ named_exports,
 module_item_list,
 };
 
-export const jsParser = tison({
+export const jsParser = makeParser({
 	skip: jsSkip,
 	recover: jsRecover,
 	start: program,

@@ -1,4 +1,4 @@
-import {jsParser} from '../src/examples/js-parser';
+import {jsParser} from '../examples/js-parser';
 
 function test(name: string, code: string) {
 	try {

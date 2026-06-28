@@ -1,4 +1,4 @@
-import {parseTS} from '../src/examples/ts-parser';
+import {parseTS} from '../examples/ts-parser';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 

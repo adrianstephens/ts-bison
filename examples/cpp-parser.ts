@@ -2,7 +2,7 @@ import {
 	Rule, Rules, List, termOneOf, GrammarBuilder,
 	runParser, nextToken,
 	type GrammarSpec, type Parser, type LexState, type ActionEntry, type Token, type Terminal, type LexContext,
-} from '../tison';
+} from '../src/tison';
 import {
 	IDENT, TYPE_NAME,
 	PREC_LEVELS,
@@ -538,7 +538,7 @@ function buildCppParser(spec: GrammarSpec): Parser {
 	for (const name of ['>>', '>>='] as const) {
 		const term = g.terminalsByName.get(name);
 		if (term)
-			term.lex = ({ ctx }: LexContext) => ((ctx as CppCtx).templateDepth > 0 ? undefined : term);
+			term.callback = (_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : term;
 	}
 
 	const tables = g.buildTables();
