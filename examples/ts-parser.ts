@@ -1,4 +1,4 @@
-import { tison, Rule, Rules, Forward, List, termOneOf, terminal } from '../tison';
+import { makeParser, Rule, Rules, Forward, List, termOneOf, terminal } from '../src/tison';
 import {
 	IDENT, NUMBER, STRING, unquoteString,
 	jsRules, jsSkip, jsRecover, varKeywords,
@@ -590,7 +590,7 @@ arrow_function.push(
 //  Wire it up
 // ===================================================================
 
-export const tsParser = tison({
+export const tsParser = makeParser({
 	skip: jsSkip,
 	recover: jsRecover,
 	start: program,

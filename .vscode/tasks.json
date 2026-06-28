@@ -7,7 +7,6 @@
 			"group": "build",
 			"problemMatcher": "$tsc",
 			"label": "npm: build",
-			"detail": "tsc"
 		},
 		{
 			"type": "npm",
@@ -16,6 +15,13 @@
 			"problemMatcher": "$tsc-watch",
 			"label": "npm: watch",
 			"isBackground": true
+		},
+		{
+			"type": "npm",
+			"script": "examples",
+			"group": "build",
+			"problemMatcher": "$tsc",
+			"label": "build examples",
 		},
 		{
 			"type": "shell",

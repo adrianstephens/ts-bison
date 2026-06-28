@@ -50,7 +50,7 @@
 // utility
 //
 // A literal that ends in a word character (e.g. 'var', 'in') is given an implicit trailing word-boundary, so it can never match as a strict prefix of a longer word
-export function literalPattern(s: string) {
+function literalPattern(s: string) {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + (/\w/.test(s[s.length - 1]) ? '(?!\\w)' : '');
 }
 
@@ -87,17 +87,16 @@ export interface LexState extends TextPos {
 // `peekNext` looks past this match non-destructively, for terminals (like whitespace) that need to know what's coming to decide how to classify themselves
 export interface LexContext extends LexState {
 	text:		string;
-	ctx?:		any;
 	peekNext:	() => Token | null;
 	peekText:	() => string;
 }
 
-export type LexCallback = (ctx: LexContext) => Terminal | string | RegExp | undefined;
+export type TerminalCallback<C = any> = (lexctx: LexContext, ctx: C) => Terminal | string | RegExp | undefined;
 
-export class Terminal<T = string> {
+export class Terminal<T = any> {
 	ignore = false;
 	pattern?: RegExp;
-	constructor(public name: string, pattern?: RegExp, public lex?: LexCallback) {
+	constructor(public name: string, pattern?: RegExp, public callback?: TerminalCallback) {
 		if (pattern)
 			this.pattern = new RegExp(pattern.source, 'y' + pattern.flags.replace(/[gyd]/g, ''));
 	}
@@ -107,13 +106,13 @@ export function termOneOf<T extends string>(names: readonly T[]) {
 	return new Terminal<T>(names.join('|'), RegExp(names.map(literalPattern).join('|')));
 }
 
-export function terminal(name: string, pattern?: RegExp, lex?: LexCallback) {
-	return new Terminal(name, pattern, lex);
+export function terminal(name: string, pattern?: RegExp, lex?: TerminalCallback) {
+	return new Terminal<string>(name, pattern, lex);
 }
 
 export type Rules<T> = Rule<T, any>[]
-type Action<T, A = unknown[]> = (values: A, ctx?: any) => T
-type Sym = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any>;
+type Action<T, C = any, A = any[]> = (values: A, ctx: C) => T
+type Sym<C = any> = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any, C>;
 
 type ElemValue<S> = S extends Rule<infer U, any>[] ? U
 	: S extends RegExp ? string
@@ -121,24 +120,35 @@ type ElemValue<S> = S extends Rule<infer U, any>[] ? U
 	: S extends (()=>infer U) ? ElemValue<U>
 	: S extends Ref<infer U> ? U
 	: S extends string ? S
-	: S extends Action<any, infer U> ? U
+	: S extends Action<infer U> ? U
 	: unknown;
 
 type ValuesOf<T extends readonly Sym[]> = {[K in keyof T]: ElemValue<T[K]>}
 
 export interface Rule<T, R extends readonly Sym[]> {
 	rhs:		R;
-	action?:	(values: ValuesOf<R>, ctx?: any) => T;
+	action?:	(values: ValuesOf<R>, ctx: any) => T;
 	prec?:		string;
 }
 export type ValueOf<R> = R extends Rule<infer T, any>[] ? T : never;
 
-export function Rule<T, R extends readonly Sym[]>(rhs: R, action?: Action<T, ValuesOf<R>>, prec?: string): Rule<T, R> {
+export function Rule<R extends readonly Sym[]>(rhs: R): Rule<ValuesOf<R>[0], R>;
+export function Rule<T, R extends readonly Sym[], C = any>(rhs: R, action?: Action<T, C, ValuesOf<R>>, prec?: string): Rule<T, R>;
+export function Rule(rhs: Sym[], action?: Action<any, any>, prec?: string) {
 	return { rhs, action, prec };
 }
 
-// A self-recursive rule set (e.g. `Rule(['delete', X], ...)` where X means "another one of these") needs *some* reference to itself while it's still being built.
-// The builder-callback overload hands that back for free as `self`, typed correctly with no circular-inference workaround needed at the call site
+// Pins `ctx`'s type to `C` for every rule built with the returned function
+export function makeRule<C>() {
+	function boundRule<R extends readonly Sym<C>[]>(rhs: R): Rule<ValuesOf<R>[0], R>;
+	function boundRule<T, R extends readonly Sym<C>[]>(rhs: R, action?: Action<T, C, ValuesOf<R>>, prec?: string): Rule<T, R>;
+	function boundRule(rhs: Sym[], action?: Action<any, any>, prec?: string) {
+		return { rhs, action, prec };
+	}
+	return boundRule;
+}
+
+// A self-recursive rule set that allows the current rules to be referenced as `self`
 export function Rules<T>(builder: (self: () => Rules<T>) => Rules<T>): Rules<T>;
 export function Rules<T>(...alts: Rules<T>): Rules<T>;
 export function Rules<T>(...args: [(self: () => Rules<T>) => Rules<T>] | Rules<T>): Rules<T> {
@@ -190,7 +200,7 @@ export interface InternalRule {
 	id:			number;
 	lhs:		NonTerminal;
 	rhs:		InternalSym[];
-	action: 	(values: readonly unknown[], ctx?: any) => unknown;
+	action: 	Action<unknown>;
 	prec?:		PrecEntry;
 }
 
@@ -209,7 +219,6 @@ export interface ConflictReport {
 export interface ParseTables {
 	action: 	Map<Terminal, ActionEntry>[];		// indexed by state
 	goto:		Map<NonTerminal, number>[];			// indexed by state
-//	rules:		{ lhs: NonTerminal; rhsLen: number }[];
 	rules:		InternalRule[];
 	conflicts:	ConflictReport[];
 }
@@ -218,7 +227,7 @@ export interface ParseTables {
 //  Grammar builder
 // ===================================================================
 
-function has0args<T>(fn: (arg: any) => T): fn is ()=>T {
+function has0args<T>(fn: (() => T) | Action<T>): fn is ()=>T {
 	return fn.length === 0;
 }
 
@@ -263,7 +272,7 @@ export class GrammarBuilder {
 			return term;
 		};
 
-		const anon = (action: Action<any, any>) => {
+		const anon = (action: Action<any>) => {
 			const id	= this.rules.length;
 			const lhs	= new NonTerminal(`anon ${id}`);
 
@@ -319,7 +328,7 @@ export class GrammarBuilder {
 					id:		this.rules.length,
 					lhs,
 					rhs,
-					action:	alt.action ?? ((() => undefined) as any),
+					action:	alt.action ?? ((values: any[]) => values[0]) as any,
 					prec:	alt.prec !== undefined ? prec.get(alt.prec) : undefined,
 				});
 			}
@@ -629,17 +638,16 @@ export function nextToken(entries: Terminal[], input: string, state: LexState, c
 		let firstViable:	{ finalTerm: Terminal; len: number } | undefined;
 		for (const { term, len } of candidates) {
 			let result: Terminal | undefined;
-			if (!term.lex) {
+			if (!term.callback) {
 				result = term;
 			} else {
 				const text = input.slice(state.offset, state.offset + len);
-				result = resolveSym(term.lex({
+				result = resolveSym(term.callback({
 					...state,
 					text,
-					ctx,
 					peekNext: () => nextToken(entries, input, advancePos({...state}, text), ctx, resolveSym, allowed),
 					peekText: () => input.substring(state.offset)
-				}));
+				}, ctx));
 			}
 			if (result) {
 				firstViable ??= { finalTerm: result, len };
@@ -893,7 +901,7 @@ function runGlrFork(
 //  Main entry point
 // ===================================================================
 
-export function tison(spec: GrammarSpec,
+export function makeParser(spec: GrammarSpec,
 	merge?:		Record<number, MergeFn>, 	// Merge functions for ambiguous convergence points. Key = LALR state id (see tables.action.length).
 ): Parser {
 	const g = new GrammarBuilder(spec);

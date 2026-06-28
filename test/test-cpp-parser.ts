@@ -1,4 +1,4 @@
-import {cppParser} from '../src/examples/cpp-parser';
+import {cppParser} from '../examples/cpp-parser';
 
 function test(name: string, code: string) {
 	try {
