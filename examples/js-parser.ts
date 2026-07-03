@@ -1,68 +1,82 @@
-import { makeParser, Rule, Rules, terminal, EOF, termOneOf, Forward, List, type GrammarSpec } from '../src/tison';
+import { makeParser, Rule, Rules, RRules, terminal, Forward, List, OneOf, forceFork, type GrammarSpec, type Token, termOneOf } from '../src/tison';
 
 // ===================================================================
 //  JavaScript Parser using tison
 // ===================================================================
 //
-// Scope: full statement set, full expression precedence chain, function
-// declarations/expressions/arrow functions, generators (function*/yield),
-// async/await, classes (incl. extends, static/async/generator/computed
-// members, fields, get/set -- not static blocks or private #names),
-// var/let/const, destructuring (declarations, for-loops, parameters, with
-// defaults/rest/nesting), object/array literals (incl. ES5 getter/setter,
-// shorthand properties/methods, computed keys, holes), regex and template
-// literals (incl. tagged templates), spread/rest, optional chaining,
-// exponentiation, nullish coalescing, modules (import/export), with,
-// debugger, labeled statements. get/set are only recognized as such inside
-// object-literal property assignments -- elsewhere they're not treated as
-// identifiers (a known simplification). 'async'/'await'/'yield'/'static'/
-// 'get'/'set'/etc. are all treated as fully reserved words rather than the
-// real spec's contextual keywords (another deliberate simplification).
-//
-// This grammar is the proving ground for tison's general-purpose lexer
-// extension points (see src/tison.ts -- none of them know anything about
-// JavaScript, ASI, or semicolons; the policy below is entirely local to
-// this file):
-//   - Terminal.lex: a single callback, invoked once a terminal's
-//     pattern has matched, that can accept the match, reject it (so a
-//     shorter match from a different terminal wins instead), or
-//     reclassify it as a different terminal. REGEX_LITERAL uses this to
-//     reject itself when the previous token shows a '/' here must be
-//     division, not the start of a regex. A whitespace/newline skip
-//     terminal uses the same hook (with `peekNext` to look past itself)
-//     to reclassify a run of whitespace into a semicolon -- this is how
-//     ECMAScript's "restricted productions" are implemented below, with
-//     zero ASI-specific concepts in tison itself.
-//   - GrammarSpec.recover: a single error-recovery callback -- if the
-//     real lookahead has no action, it's given the state's valid actions
-//     and the offending token, and can substitute a different token to
-//     retry with. This covers ASI's other half: inserting `;` only when
-//     the real token would otherwise fail to parse.
+// Known simplifications/omissions:
+//   - Class static initialization blocks (`static { ... }`) and private `#name` members.
+//   - `&&=`/`||=`/`??=` (logical assignment operators).
+//   - Dynamic `import()` and `import.meta`.
+//   - 'async'/'await'/'yield'/'static'/'get'/'set'/etc. are not fully contextual only
+//   - Rest in any destructuring pattern (function params, array, object) is always a bare
+//     identifier, never a nested pattern (e.g. `function f(...[a, b]) {}` doesn't parse here).
 
 // --- Terminals ---
 
-export const IDENT		= terminal('identifier', /[a-zA-Z_$][a-zA-Z0-9_$]*/);
+// `\p{ID_Start}`/`\p{ID_Continue}` are the exact Unicode properties the ECMAScript spec itself defines
+// IdentifierStart/IdentifierPart in terms of (UAX #31) -- `$`/`_` aren't covered by those properties on
+// their own so they're added explicitly, same as real engines do. ZWNJ/ZWJ (u200C/u200D) are also spec-
+// legal identifier *parts* (not starts). Not supported: the `\uXXXX`-escape spelling of identifier
+// characters (e.g. `Apple`) -- a rarely-used legacy form, consistent with this file's other
+// known simplifications.
+export const IDENT		= terminal('identifier', /[$_\p{ID_Start}][$\u200C\u200D\p{ID_Continue}]*/u);
 export const NUMBER		= terminal('number', /0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*n?|0[oO][0-7](?:_?[0-7])*n?|0[bB][01](?:_?[01])*n?|[0-9](?:_?[0-9])*n|(?:[0-9](?:_?[0-9])*\.(?:[0-9](?:_?[0-9])*)?|\.[0-9](?:_?[0-9])*|[0-9](?:_?[0-9])*)(?:[eE][-+]?[0-9]+)?/);
 export const STRING		= terminal('string', /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/);
-const ASSIGN_OP		= /(?:>>>|<<|>>|[+\-*/%&^|])?=/;
+//const ASSIGN_OP		= /(?:>>>|<<|>>|[+\-*/%&^|])?=/;
+const ASSIGN_OP		= /(?:>>>|<<|>>|\?\?|&&|\|\||[+\-*/%&^|])?=/;
+//const ASSIGN_OP		= termOneOf(['=', '+=', '-=', '*=', '/=', '%=', '**=', '&=', '|=', '^=', '>>=', '<<=', '>>>=', '||=', '&&=', '??=']);
+
+// `get`/`set`/`async` are contextual keywords: they're only keywords when what immediately follows
+// still looks like the rest of that construct, otherwise they're ordinary identifiers --
+// `{ get: 5 }`, `let x = async;`, `get();` all need this to parse. `async` followed directly by `(`
+// is left alone (stays the keyword): that specific case is genuinely ambiguous between a call
+// (`async(x)`) and the start of an async arrow's parameter list (`async (x) => ...`), which can't be
+// resolved with this kind of bounded lookahead -- `async()` and `class C { async() {} }` are still
+// unsupported (see the file-level "known simplifications" comment).
+function startsPropertyName(next: Token | undefined) {
+	return !!next && (next.type === IDENT || next.type === STRING || next.type === NUMBER || next.type.name === '[');
+}
+export const GET	= terminal('get',	/get(?!\w)/,	lex => startsPropertyName(lex.next()) ? GET : IDENT);
+export const SET	= terminal('set',	/set(?!\w)/,	lex => startsPropertyName(lex.next()) ? SET : IDENT);
+export const ASYNC	= terminal('async',	/async(?!\w)/,	lex => {
+	const next = lex.next();
+	return (next && (next.type.name === 'function' || next.type.name === '*' || next.type.name === '(')) || startsPropertyName(next) ? ASYNC : IDENT;
+});
 
 // Automatic Semicolon Insertion
 const RESTRICTED_AFTER	= new Set(['return', 'throw', 'break', 'continue', 'yield']);
 const RESTRICTED_BEFORE = new Set(['++', '--']);
+// A postfix `++`/`--` can only continue a LeftHandSideExpression that just ended -- an identifier or a
+// `]`/`)` from indexing/a call. Deliberately excludes `)` closing a control-flow condition (`if`/`while`/
+// `for`/`switch`), which looks identical to a call's `)` at the lexer level but is never followed by a
+// genuine postfix target; `)` is left out of this set entirely (real-world `if (x)\n\t++y;`-style unbraced
+// bodies vastly outnumber the vanishingly rare, and arguably pointless, `(expr)++`).
+const RESTRICTED_BEFORE_PREV = new Set([IDENT.name, ']']);
 
 // Restricted productions: reclassify a run of whitespace into a semicolon (unconditionally -- even though the real token would otherwise have parsed fine) when it contains a line terminator right after return/throw/break/continue, or right before postfix ++/--.
 const WS = terminal('ws',
 	/\s+/,
 	lex => {
-		if (lex.text.includes('\n')) {
-			if (lex.prev && RESTRICTED_AFTER.has(lex.prev.name))
+		if (lex.match.includes('\n')) {
+			if (lex.prev && RESTRICTED_AFTER.has(lex.prev.type.name))
 				return ';';
-			const next = lex.peekNext();
-			if (next && RESTRICTED_BEFORE.has(next.type.name))
-				return ';';
-			//const next = /\s*.*/.exec(peekText());
-			//if (next && RESTRICTED_BEFORE.has(next[1]))
-			//	return ';';
+			if (lex.prev && RESTRICTED_BEFORE_PREV.has(lex.prev.type.name)) {
+				// `remaining` starts right after this whitespace run, so unless a comment intervenes the next
+				// token's text is sitting right at its start -- and the only tokens being looked for are `++`/`--`
+				// (no other terminal both starts with those characters and could out-compete them on length), so a
+				// prefix check answers the question without the tokenizing peek `lex.next()` does. That matters
+				// because this branch runs for nearly every line ending in an identifier or `]`; only a comment can
+				// hide the next real token from the prefix check, so the expensive peek is kept just for that case.
+				const r = lex.remaining;
+				if (r.startsWith('++') || r.startsWith('--'))
+					return ';';
+				if (r[0] === '/' && (r[1] === '/' || r[1] === '*')) {
+					const next = lex.next();
+					if (next && RESTRICTED_BEFORE.has(next.type.name))
+						return ';';
+				}
+			}
 		}
 		return WS;
 	}
@@ -76,7 +90,7 @@ const regexDisallowedAfter = new Set([
 
 const REGEX_LITERAL = terminal('regex',
 	/\/(?:[^/\\\n[]|\\.|\[(?:[^\]\\\n]|\\.)*\])+\/[a-zA-Z]*/,
-	lex => (!lex.prev || !regexDisallowedAfter.has(lex.prev.name)) ? REGEX_LITERAL : undefined
+	lex => (!lex.prev || !regexDisallowedAfter.has(lex.prev.type.name)) ? REGEX_LITERAL : undefined
 );
 
 
@@ -91,7 +105,9 @@ export type Literal =
 	| { type: 'bigint'; value: string };	// because bigint can't round-trip through JSON.stringify
 
 export interface TemplatePart { str: string; exp?: Expr; }
-export interface ObjectProperty { key: string | { computed: Expr }; value: Expr; kind: 'init' | 'get' | 'set'; }
+export type ObjectProperty =
+	| { key: string | { computed: Expr }; value: Expr; kind: 'init' | 'get' | 'set' }
+	| { kind: 'spread'; argument: Expr };	// `{...obj}` -- object spread (ES2018).
 
 // Destructuring binding targets, shared by variable declarations, for-loop left-hand sides, and function parameters.
 // A plain identifier is just a string (matching this file's existing convention of not wrapping simple names in their own node) -- only object/array patterns get a `type` tag.
@@ -108,7 +124,7 @@ export interface ArrayPattern { type: 'array_pattern'; elements: (ArrayPatternEl
 // its own richer type there via rule actions pushed onto the exported
 // `parameter` array, without this file needing to know anything about types.
 export type Param = string | { target: BindingTarget; default?: Expr; typeAnnotation?: unknown; optional?: boolean; modifiers?: string[] };
-export interface ParamList { params: Param[]; rest?: string; }
+export interface ParamList { params: Param[]; rest?: string; restType?: unknown; }
 
 // `returnType`/`typeParams` (on 'function'/'arrow') and the 'as_expression'/'non_null' variants are the same kind of untyped extension point as
 // Param's, above -- only a grammar extension that adds its own type-expression rules ever populates/produces them; the base JS grammar below never does.
@@ -119,11 +135,11 @@ export type Expr =
 	| { type: 'array'; elements: readonly (Expr | undefined)[] }	// `undefined` entries are holes (elisions), e.g. the gaps in `[1, , 3]`.
 	| { type: 'object'; properties: readonly ObjectProperty[] }
 	// `rest` is the trailing `...name` parameter, if any (always last, though this syntax-only grammar doesn't enforce that it can't appear earlier).
-	| { type: 'function'; name?: string; params: Param[]; rest?: string; body: Statement[]; generator?: boolean; async?: boolean; returnType?: unknown; typeParams?: unknown[] }
+	| { type: 'function'; name?: string; params: Param[]; rest?: string; restType?: unknown; body: Statement[]; generator?: boolean; async?: boolean; returnType?: unknown; typeParams?: unknown[] }
 	| { type: 'member'; object: Expr; property: string; optional?: boolean }
 	| { type: 'index'; object: Expr; property: Expr; optional?: boolean }
 	| { type: 'call'; callee: Expr; arguments: Expr[]; optional?: boolean; typeArgs?: unknown[] }
-	| { type: 'new'; callee: Expr; arguments: Expr[] }
+	| { type: 'new'; callee: Expr; arguments: Expr[]; typeArgs?: unknown[] }
 	| { type: 'unary'; operator: string; argument: Expr; prefix: boolean }
 	| { type: 'update'; operator: string; argument: Expr; prefix: boolean }
 	| { type: 'binary'; operator: string; left: Expr; right: Expr }
@@ -133,7 +149,7 @@ export type Expr =
 	| { type: 'sequence'; expressions: Expr[] }
 	| { type: 'spread'; argument: Expr }	// `...x` inside an array literal or a call's argument list.
 	| { type: 'tagged_template'; tag: Expr; quasi: TemplatePart[] }
-	| { type: 'arrow'; params: Param[]; rest?: string; body: Expr | Statement[]; async?: boolean; returnType?: unknown; typeParams?: unknown[] }
+	| { type: 'arrow'; params: Param[]; rest?: string; restType?: unknown; body: Expr | Statement[]; async?: boolean; returnType?: unknown; typeParams?: unknown[] }
 	| { type: 'yield'; argument?: Expr; delegate?: boolean }	// `delegate` is `yield*`; this grammar doesn't enforce that `yield` only appears inside a generator body
 	| { type: 'class'; name?: string; superClass?: Expr; body: ClassMember[]; typeParams?: unknown[]; implementsClause?: unknown[]; abstract?: boolean }
 	| { type: 'await'; argument: Expr }
@@ -156,7 +172,10 @@ export interface ExportSpecifier { local: string; exported: string; }
 export type ClassMember =
 	| { type: 'method'; static?: boolean; kind: 'method' | 'get' | 'set'; key: string | { computed: Expr }; value: Expr; modifiers?: string[]; optional?: boolean }
 	| { type: 'field'; static?: boolean; key: string | { computed: Expr }; value?: Expr; modifiers?: string[]; optional?: boolean; typeAnnotation?: unknown; definite?: boolean }
-	| { type: 'static_block'; body: Statement[] };
+	| { type: 'static_block'; body: Statement[] }
+	// Method overload signature (`read<T>(x: T): T;`, no body) -- TS-only, so `params`/`typeParams`/`returnType`
+	// stay `unknown` here the same way `function_decl`'s do; ts-parser.ts's own rules populate them for real.
+	| { type: 'method_signature'; static?: boolean; key: string | { computed: Expr }; params: Param[]; rest?: string; restType?: unknown; modifiers?: string[]; optional?: boolean; typeParams?: unknown[]; returnType?: unknown };
 
 export type Statement =
 	| { type: 'block'; body: Statement[] }
@@ -177,7 +196,9 @@ export type Statement =
 	| { type: 'throw'; argument: Expr }
 	| { type: 'try'; block: Statement[]; handlerParam?: string; handlerBody?: Statement[]; finalizer?: Statement[] }
 	| { type: 'debugger' }
-	| { type: 'function_decl'; name: string; params: Param[]; rest?: string; body: Statement[]; generator?: boolean; async?: boolean; returnType?: unknown; typeParams?: unknown[] }
+	// `body` is `undefined` only for a bodyless overload/ambient signature (`function f(): void;`) -- a real
+	// implementation's body is always an array, even when empty (`function f() {}` has `body: []`).
+	| { type: 'function_decl'; name: string; params: Param[]; rest?: string; restType?: unknown; body?: Statement[]; generator?: boolean; async?: boolean; returnType?: unknown; typeParams?: unknown[] }
 	| { type: 'import'; default?: string; namespace?: string; specifiers?: ImportSpecifier[]; source: string }
 	| { type: 'export_named'; specifiers: ExportSpecifier[]; source?: string }
 	| { type: 'export_all'; source: string; exported?: string }
@@ -191,23 +212,47 @@ export interface Program { type: 'program'; body: Statement[]; }
 //  Grammar
 // ===================================================================
 
-export const varKeywords = termOneOf(VAR_KEYWORDS);
+const varKeywords = OneOf(VAR_KEYWORDS);
 
 // Two parallel chains exist above shift_expression: the normal one (allows 'in' as a relational operator) and a "NoIn" one (excludes it), mirroring ECMA-262's own duplication
 // It's needed because `for (x in y)` and `for (x; ...)` would otherwise be ambiguous as to whether 'in' continues a RelationalExpression or marks the for-in separator.
 // NoIn variants are used only inside for-loop headers.
 function binaryChain(lower: Rules<Expr>, ops: string[], prec: string, kind: 'binary' | 'logical' = 'binary') {
-	return Rules<Expr>(self => [
-		Rule([lower] as const, $ => $[0]),
-		Rule([self, termOneOf(ops), lower] as const, $ =>	({ type: kind, operator: $[1], left: $[0], right: $[2] } as const), prec)
+	return RRules<Expr>(self => [
+		Rule([lower] as const),
+		Rule([self, OneOf(ops), lower] as const, $ =>	({ type: kind, operator: $[1], left: $[0], right: $[2] } as const), prec)
 	]);
 }
 
-// Single-quoted strings are re-quoted to double quotes so JSON.parse can unescape them the same way as already-double-quoted ones -- STRING's own pattern accepts either.
-export const unquoteString = (s: string) => JSON.parse(s.replace(/^'|'$/g, '"')) as string;
+// Same shape as `binaryChain`, but for a "Left"-restricted chain (see `_nobrace` below): only the
+// leftmost operand -- the chain's own self-recursion -- needs to stay restricted, since the
+// restriction is purely about the very first token of the whole expression. The right operand of
+// the operator is never leftmost, so it can (and should) be the ordinary, unrestricted nonterminal.
+function binaryChainLeft(lowerLeft: Rules<Expr>, lowerRight: Rules<Expr>, ops: string[], prec: string, kind: 'binary' | 'logical' = 'binary') {
+	return RRules<Expr>(self => [
+		Rule([lowerLeft] as const),
+		Rule([self, OneOf(ops), lowerRight] as const, $ => ({ type: kind, operator: $[1], left: $[0], right: $[2] } as const), prec)
+	]);
+}
+
+// Strips the surrounding quote (either kind -- STRING's own pattern accepts both) and decodes JS escape
+// sequences by hand, rather than round-tripping through `JSON.parse` -- JSON's escape set is a *subset* of
+// JS's (no `\0`, `\xHH`, `\uHHHH`/`\u{H+}` differ slightly, and JSON rejects an escaped quote of the *other*
+// kind, e.g. `\'` inside a double-quoted string), so real-world strings using any of those (e.g. `'\0'` for
+// a NUL terminator) threw "Bad escaped character in JSON" even though they're perfectly valid JS.
+export const unquoteString = (s: string) => s.slice(1, -1).replace(
+	/\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|\r\n|\n|(.))/g,
+	(_, hex, ubrace, u4, ch) =>
+		hex !== undefined ? String.fromCharCode(parseInt(hex, 16))
+		: ubrace !== undefined || u4 !== undefined ? String.fromCodePoint(parseInt(ubrace ?? u4, 16))
+		: ch === undefined ? ''	// line continuation: backslash followed by a (CR)LF contributes nothing
+		: ch === 'n' ? '\n' : ch === 't' ? '\t' : ch === 'r' ? '\r' : ch === 'b' ? '\b' : ch === 'f' ? '\f' : ch === 'v' ? '\v' : ch === '0' ? '\0'
+		: ch	// \', \", \\, and anything else JS treats as just that literal character
+);
 
 const fwd_parameter_clause		= () => parameter_clause;
 const fwd_assignment_expression	= Forward<Expr>(() => assignment_expression);
+const fwd_assignment_expression_nobrace = Forward<Expr>(() => assignment_expression_nobrace);
 const fwd_function_body 		= Forward<Statement[]>(() => function_body);
 const fwd_statement				= Forward<Statement>(() => statement);
 const fwd_expression			= Forward<Expr>(() => expression);
@@ -217,13 +262,13 @@ const fwd_expression			= Forward<Expr>(() => expression);
 // `elision`: a run of N commas with nothing between them, i.e. N holes -- shared by array literals and array patterns.
 // A *single* trailing comma after a real element (the existing `'[', element_list, ',', ']'` shape below) is just a separator and creates no hole, matching real JS;
 // an elision only starts counting from the *next* comma onward.
-const elision = Rules<number>(self => [
+const elision = RRules<number>(self => [
 	Rule([','] as const, 		() => 1),
 	Rule([self, ','] as const,	$ => ($[0] as number) + 1),
 ]);
 const holes = (n: number) => Array<undefined>(n).fill(undefined);
 
-const element_list = Rules<(Expr | undefined)[]>(self => [
+const element_list = RRules<(Expr | undefined)[]>(self => [
 	Rule([fwd_assignment_expression] as const, 								$ => [$[0]]),
 	Rule([elision, fwd_assignment_expression] as const, 					$ => [...holes($[0] as number), $[1]]),
 	Rule([self, ',', fwd_assignment_expression] as const, 					$ => [...$[0], $[2]]),
@@ -241,29 +286,41 @@ const array_literal = Rules(
 	Rule(['[', element_list, ',', elision, ']'] as const, 					$ => ({ type: 'array', elements: [...$[1], ...holes($[3] as number)] } as const)),
 );
 
-const property_name = Rules(
-	Rule([IDENT] as const, $ => $[0]),
+export const property_name = Rules(
+	Rule([IDENT] as const),
 	Rule([STRING] as const, $ => unquoteString($[0])),
-	Rule([NUMBER] as const, $ => $[0]),
+	Rule([NUMBER] as const),
 );
-const property_assignment = Rules<ObjectProperty>(
-	Rule([property_name, ':', fwd_assignment_expression] as const, 									$ => ({ key: $[0], value: $[2], kind: 'init' } as const)),
-	Rule(['get', property_name, '(', ')', '{', fwd_function_body, '}'] as const, 					$ => ({ key: $[1], value: { type: 'function', params: [], body: $[5] }, kind: 'get' } as const)),
-	Rule(['set', property_name, '(', IDENT, ')', '{', fwd_function_body, '}'] as const, 			$ => ({ key: $[1], value: { type: 'function', params: [$[3]], body: $[6] }, kind: 'set' } as const)),
+export const property_assignment = Rules<ObjectProperty>(
+	// `IDENT ':' value` goes directly (not through `property_name`) specifically for this rule:
+	// `property_name`'s `IDENT` alternative is a *separate* reduction that would otherwise compete
+	// with `object_pattern_property`'s own `IDENT ':' binding_target` shift for the same raw IDENT
+	// -- an unresolved shift/reduce conflict (object_pattern_property only matters where this exact
+	// `{...}` is reached through a path that's also reinterpretable as a destructured parameter
+	// elsewhere in the grammar) that the table's default-to-shift resolution would otherwise settle
+	// by treating the value as a binding pattern, breaking ordinary values like `{key: a.b}`.
+	Rule([IDENT, ':', fwd_assignment_expression] as const, 											$ => ({ key: $[0], value: $[2], kind: 'init' } as const)),
+	Rule([STRING, ':', fwd_assignment_expression] as const, 											$ => ({ key: unquoteString($[0]), value: $[2], kind: 'init' } as const)),
+	Rule([NUMBER, ':', fwd_assignment_expression] as const, 											$ => ({ key: $[0], value: $[2], kind: 'init' } as const)),
+	Rule([GET, property_name, '(', ')', '{', fwd_function_body, '}'] as const, 					$ => ({ key: $[1], value: { type: 'function', params: [], body: $[5] }, kind: 'get' } as const)),
+	Rule([SET, property_name, '(', IDENT, ')', '{', fwd_function_body, '}'] as const, 			$ => ({ key: $[1], value: { type: 'function', params: [$[3]], body: $[6] }, kind: 'set' } as const)),
 	// Shorthand property: `{x}` is `{x: x}`.
 	Rule([IDENT] as const, 																			$ => ({ key: $[0], value: { type: 'identifier', name: $[0] }, kind: 'init' } as const)),
 	// `{x = 1}` is never valid as a *real* object literal (only inside a destructuring target) -- accepted here anyway, permissively, purely so arrow-function parameters can be parsed as a plain object literal and reinterpreted as a pattern afterward (see `exprToBindingTarget` below).
 	// A real object literal with this shape only arises if that reinterpretation is never attempted, which this grammar doesn't catch.
 	Rule([IDENT, '=', fwd_assignment_expression] as const, 											$ => ({ key: $[0], value: { type: 'assign', operator: '=', left: { type: 'identifier', name: $[0] }, right: $[2] }, kind: 'init' } as const)),
 	// Shorthand method: `{foo() {...}}` is `{foo: function() {...}}`.
-	Rule([property_name, fwd_parameter_clause, '{', fwd_function_body, '}'] as const, 				$ => ({ key: $[0], value: { type: 'function', params: $[1].params, rest: $[1].rest, body: $[3] }, kind: 'init' } as const)),
+	Rule([property_name, fwd_parameter_clause, '{', fwd_function_body, '}'] as const, 				$ => ({ key: $[0], value: { type: 'function', ...$[1], body: $[3] }, kind: 'init' } as const)),
 	// Generator method: `{*foo() {...}}` is `{foo: function*() {...}}`.
-	Rule(['*', property_name, fwd_parameter_clause, '{', fwd_function_body, '}'] as const, 			$ => ({ key: $[1], value: { type: 'function', params: $[2].params, rest: $[2].rest, body: $[4], generator: true }, kind: 'init' } as const)),
+	Rule(['*', property_name, fwd_parameter_clause, '{', fwd_function_body, '}'] as const, 			$ => ({ key: $[1], value: { type: 'function', ...$[2], body: $[4], generator: true }, kind: 'init' } as const)),
 	// Async method: `{async foo() {...}}` is `{foo: async function() {...}}`.
-	Rule(['async', property_name, fwd_parameter_clause, '{', fwd_function_body, '}'] as const, 		$ => ({ key: $[1], value: { type: 'function', params: $[2].params, rest: $[2].rest, body: $[4], async: true }, kind: 'init' } as const)),
-	Rule(['async', '*', property_name, fwd_parameter_clause, '{', fwd_function_body, '}'] as const, $ => ({ key: $[2], value: { type: 'function', params: $[3].params, rest: $[3].rest, body: $[5], generator: true, async: true }, kind: 'init' } as const)),
+	Rule([ASYNC, property_name, fwd_parameter_clause, '{', fwd_function_body, '}'] as const, 		$ => ({ key: $[1], value: { type: 'function', ...$[2], body: $[4], async: true }, kind: 'init' } as const)),
+	Rule([ASYNC, '*', property_name, fwd_parameter_clause, '{', fwd_function_body, '}'] as const, $ => ({ key: $[2], value: { type: 'function', ...$[3], body: $[5], generator: true, async: true }, kind: 'init' } as const)),
 	// Computed key: `{[expr]: value}` -- only supported for the plain key:value form, not get/set/shorthand-method.
 	Rule(['[', fwd_assignment_expression, ']', ':', fwd_assignment_expression] as const, 			$ => ({ key: { computed: $[1] }, value: $[4], kind: 'init' } as const)),
+	// Object spread (ES2018): `{...obj}`. `exprToBindingTarget` below turns a *trailing* one back
+	// into `ObjectPattern.rest` when this same `{...}` gets reinterpreted as an arrow parameter.
+	Rule(['...', fwd_assignment_expression] as const, 													$ => ({ kind: 'spread', argument: $[1] } as const)),
 );
 const property_list = List(property_assignment, ',');
 
@@ -275,14 +332,20 @@ const object_literal = Rules(
 
 // --- Destructuring binding patterns ---
 // Only reachable from contexts that are unambiguously a binding position (right after 'var'/'let'/'const', or inside a parameter list) -- never
-// from general expression position, so there's no grammar conflict with object_literal/array_literal despite the shared '{'/'[' tokens.
-
+// from general expression position, so there's no grammar conflict with object_literal/array_literal despite the shared '{'/'[' tokens, in this
+// file's own grammar. ts-parser.ts's typed-arrow extension (`parameter_clause '=>' arrow_body`) breaks that isolation: since its `parameter_clause`
+// pulls in real `binding_target`/`object_pattern` grammar (not js-parser.ts's own untyped-arrow AST-reinterpretation trick), a bare `identifier` right
+// after `(` inside `(expr) => ...`-shaped input becomes genuinely ambiguous between this rule and `primary_expression`'s own plain `identifier`
+// alternative -- an SLR(1) reduce-reduce conflict the table silently settled by "earlier rule wins" (this rule, since it's defined first), wrongly
+// forcing every property-list value that's a bare identifier to parse as a pattern. Found via a real `binary/src/index.ts` failure: `x => ({ x: x,
+// valueOf: () => x / scale })` -- the SECOND property's value (not itself pattern-shaped) had nowhere left to go. `forceFork` makes this reduce-reduce
+// conflict resolve via GLR instead (engine support for fork on reduce-reduce, not just shift-reduce, added in `src/tison.ts`'s `setAction` for this).
 export const binding_pattern = Rules<ObjectPattern | ArrayPattern>(
-	Rule([Forward<ObjectPattern>(()=>object_pattern)] as const,	$ => $[0]),
-	Rule([Forward<ArrayPattern>(()=>array_pattern)] as const,	$ => $[0]),
+	Rule([Forward<ObjectPattern>(()=>object_pattern)] as const),
+	Rule([Forward<ArrayPattern>(()=>array_pattern)] as const),
 );
 export const binding_target = Rules<BindingTarget>(
-	Rule([IDENT] as const,				$ => $[0]),
+	Rule([IDENT] as const, $ => $[0], forceFork),
 	...binding_pattern,
 );
 
@@ -307,7 +370,7 @@ const array_pattern_element = Rules(
 	Rule([binding_target] as const, 												$ => ({ target: $[0] } as const)),
 	Rule([binding_target, '=', fwd_assignment_expression] as const,					$ => ({ target: $[0], default: $[2] } as const)),
 );
-const array_pattern_element_list = Rules<(ArrayPatternElement | undefined)[]>(self => [
+const array_pattern_element_list = RRules<(ArrayPatternElement | undefined)[]>(self => [
 	Rule([array_pattern_element] as const,											$ => [$[0]]),
 	Rule([elision, array_pattern_element] as const,									$ => [...holes($[0]), $[1]]),
 	Rule([self, ',', array_pattern_element] as const,								$ => [...$[0], $[2]]),
@@ -337,16 +400,27 @@ const array_pattern = Rules<ArrayPattern>(
 function exprToBindingTarget(e: Expr): BindingTarget {
 	switch (e.type) {
 		case 'identifier':	return e.name;
-		case 'object':		return {
-			type: 'object_pattern',
-			properties: e.properties.map(p => {
-				if (typeof p.key !== 'string')
-					throw new SyntaxError('Invalid destructuring target: computed key');
-				return p.value.type === 'assign'
-					? { key: p.key, value: exprToBindingTarget(p.value.left), default: p.value.right }
-					: { key: p.key, value: exprToBindingTarget(p.value) };
-			}),
-		};
+		case 'object': {
+			// A trailing spread becomes `rest` (must be a plain identifier, same restriction as array's);
+			// a spread anywhere else, or `key`/`value` on a spread entry, is never a valid pattern.
+			const last = e.properties[e.properties.length - 1];
+			const rest = last?.kind === 'spread' ? last.argument : undefined;
+			if (rest && rest.type !== 'identifier')
+				throw new SyntaxError('Invalid destructuring rest target');
+			return {
+				type: 'object_pattern',
+				properties: (rest ? e.properties.slice(0, -1) : e.properties).map(p => {
+					if (p.kind === 'spread')
+						throw new SyntaxError('Invalid destructuring target: spread must be last');
+					if (typeof p.key !== 'string')
+						throw new SyntaxError('Invalid destructuring target: computed key');
+					return p.value.type === 'assign'
+						? { key: p.key, value: exprToBindingTarget(p.value.left), default: p.value.right }
+						: { key: p.key, value: exprToBindingTarget(p.value) };
+				}),
+				...(rest ? { rest: rest.name } : {}),
+			};
+		}
 		case 'array': {
 			const last = e.elements[e.elements.length - 1];
 			const rest = last?.type === 'spread' ? last.argument : undefined;
@@ -375,9 +449,13 @@ function exprToParams(e: Expr): Param[] {
 	return e.type === 'sequence' ? e.expressions.map(exprToParam) : [exprToParam(e)];
 }
 
+// `[^`$]` covers everything except a literal `$`, which only needs to stop the match when it's the start
+// of an interpolation (`${`) -- a bare `$` anywhere else (e.g. `` `Error expanding $(${body})` ``, a real
+// case that broke this) is ordinary text, same as real JS/TS. Previously required `\$` (backslash-escaped)
+// for a literal dollar, which is stricter than real template-literal syntax actually demands.
 const template_literal_part = Rules<TemplatePart>(
-	Rule([/(?:[^`$]|\\\$(?!\{))*(?=\$\{)/, '${', fwd_expression, '}'] as const,	$ => ({ str: $[0], exp: $[2] })),
-	Rule([/(?:[^`$]|\\\$(?!\{))*(?=`)/] as const, 									$ => ({ str: $[0] })),
+	Rule([/(?:[^`$]|\$(?!\{))*(?=\$\{)/, '${', fwd_expression, '}'] as const,	$ => ({ str: $[0], exp: $[2] })),
+	Rule([/(?:[^`$]|\$(?!\{))*(?=`)/] as const, 								$ => ({ str: $[0] })),
 );
 const template_literal_parts = List(template_literal_part);
 
@@ -404,20 +482,42 @@ export const primary_expression = Rules(
 	Rule(['true'] as const, 					() => ({ type: 'literal', value: true } as const)),
 	Rule(['false'] as const,					() => ({ type: 'literal', value: false } as const)),
 	Rule(['null'] as const,						() => ({ type: 'literal', value: null } as const)),
-	Rule([array_literal] as const,				$ => $[0]),
-	Rule([object_literal] as const,				$ => $[0]),
+	Rule([array_literal] as const),
+	Rule([object_literal] as const),
 	Rule(['(', fwd_expression, ')'] as const, 	$ => $[1]),
 	Rule(['`', template_literal_parts, '`'],	$ => ({ type: 'literal', value: $[1] } as Expr))
 );
 
 // A single parameter: a bare name, a name with a default, or a destructured (optionally defaulted) target. Plain identifiers stay bare strings, same convention as elsewhere in this file -- only the richer forms wrap.
+// The default-value forms use `ASSIGN_OP` (not a bare `'='` token) purely to dodge a lexer-level ambiguity, not
+// for any semantic reason -- ts-parser.ts's typed-arrow `parameter_clause '=>' arrow_body` rule makes this same
+// `(` reachable from plain expression position (e.g. `(b = buffer[i]) & 0x80`, a grouped assignment, nothing to
+// do with arrow parameters), and a bare `'='` auto-terminal and `ASSIGN_OP`'s regex both match plain "=" with
+// equal length there -- the lexer's longest-match tie-break then deterministically prefers whichever terminal's
+// pattern source sorts later, which happens to be the bare `'='`, silently forcing every `(x = y)` down this
+// rule's path even when it's just a parenthesized assignment expression. `ASSIGN_OP` also matches `+=` etc.,
+// which isn't really valid here (this rule discards the operator, same shape as elsewhere in this file's
+// syntax-only simplifications), but using the *same* terminal object as `assignment_expression`'s own rule
+// removes the duplicate-terminal lexer race, turning it into an ordinary shift-reduce conflict at the parser
+// level instead (`parameter`'s shift vs. `primary_expression`'s reduce) -- same genuine one-token-of-lookahead
+// ambiguity as this file's other `forceFork` uses (see `parameter`'s bare `IDENT '?'` rule in ts-parser.ts),
+// so it needs the same treatment rather than accepting the silent default-shift.
+// The bare `Rule([IDENT])` alternative also needs `forceFork`, for a related but distinct reason: it's a
+// reduce-reduce conflict (not shift-reduce) against `primary_expression -> identifier`, and reduce-reduce
+// conflicts default to "earlier-defined rule wins" -- `primary_expression` is defined far earlier in this
+// file, so it always won, silently forcing e.g. a second+ untyped arrow parameter (`(s, v?: number) => ...`,
+// found in real code) down the plain-expression path instead, breaking once `v?:` needed the parameter
+// reading. Only the *second-and-later* `formal_parameter_list` position actually hits this in practice --
+// the first position happens to additionally collide with (and get rescued by) the `IDENT '?'`/`ASSIGN_OP`
+// conflicts above, which are already `fork`-tagged -- but tagging this rule directly is the real fix, not
+// reliant on that coincidence.
 export const parameter = Rules<Param>(
-	Rule([IDENT] as const,											$ => $[0]),
-	Rule([IDENT, '=', fwd_assignment_expression] as const,			$ => ({ target: $[0], default: $[2] })),
-	Rule([object_pattern] as const,									$ => ({ target: $[0] } as const)),
-	Rule([object_pattern, '=', fwd_assignment_expression] as const,	$ => ({ target: $[0], default: $[2] })),
-	Rule([array_pattern] as const,									$ => ({ target: $[0] } as const)),
-	Rule([array_pattern, '=', fwd_assignment_expression] as const,	$ => ({ target: $[0], default: $[2] })),
+	Rule([IDENT] as const, $ => $[0], forceFork),
+	Rule([IDENT, ASSIGN_OP, fwd_assignment_expression] as const,			$ => ({ target: $[0], default: $[2] }), forceFork),
+	Rule([object_pattern] as const,										$ => ({ target: $[0] } as const)),
+	Rule([object_pattern, ASSIGN_OP, fwd_assignment_expression] as const,	$ => ({ target: $[0], default: $[2] })),
+	Rule([array_pattern] as const,											$ => ({ target: $[0] } as const)),
+	Rule([array_pattern, ASSIGN_OP, fwd_assignment_expression] as const,	$ => ({ target: $[0], default: $[2] })),
 );
 export const formal_parameter_list = List(parameter, ',');
 
@@ -427,33 +527,36 @@ export const formal_parameter_list = List(parameter, ',');
 export const parameter_clause = Rules<ParamList>(
 	Rule(['(', ')'] as const, 											() => ({ params: [] } as const)),
 	Rule(['(', formal_parameter_list, ')'] as const, 					$ => ({ params: $[1] } as const)),
+	// Trailing comma after the last (non-rest) parameter -- real JS/TS allows it; a rest parameter
+	// can't take one (`(...x,)` isn't valid there either), so this is only the non-rest forms.
+	Rule(['(', formal_parameter_list, ',', ')'] as const, 				$ => ({ params: $[1] } as const)),
 	Rule(['(', '...', IDENT, ')'] as const, 							$ => ({ params: [], rest: $[2] } as const)),
 	Rule(['(', formal_parameter_list, ',', '...', IDENT, ')'] as const, $ => ({ params: $[1], rest: $[4] } as const)),
 );
 export const function_expression = Rules(
-	Rule(['function', parameter_clause, '{', fwd_function_body, '}'] as const, 						$ => ({ type: 'function', params: $[1].params, rest: $[1].rest, body: $[3] } as const)),
-	Rule(['function', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 				$ => ({ type: 'function', name: $[1], params: $[2].params, rest: $[2].rest, body: $[4] } as const)),
-	Rule(['function', '*', parameter_clause, '{', fwd_function_body, '}'] as const, 				$ => ({ type: 'function', params: $[2].params, rest: $[2].rest, body: $[4], generator: true } as const)),
-	Rule(['function', '*', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 			$ => ({ type: 'function', name: $[2], params: $[3].params, rest: $[3].rest, body: $[5], generator: true } as const)),
-	Rule(['async', 'function', parameter_clause, '{', fwd_function_body, '}'] as const, 			$ => ({ type: 'function', params: $[2].params, rest: $[2].rest, body: $[4], async: true } as const)),
-	Rule(['async', 'function', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 		$ => ({ type: 'function', name: $[2], params: $[3].params, rest: $[3].rest, body: $[5], async: true } as const)),
-	Rule(['async', 'function', '*', parameter_clause, '{', fwd_function_body, '}'] as const, 		$ => ({ type: 'function', params: $[3].params, rest: $[3].rest, body: $[5], generator: true, async: true } as const)),
-	Rule(['async', 'function', '*', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, $ => ({ type: 'function', name: $[3], params: $[4].params, rest: $[4].rest, body: $[6], generator: true, async: true } as const))
+	Rule(['function', parameter_clause, '{', fwd_function_body, '}'] as const, 						$ => ({ type: 'function', ...$[1], body: $[3] } as const)),
+	Rule(['function', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 				$ => ({ type: 'function', name: $[1], ...$[2], body: $[4] } as const)),
+	Rule(['function', '*', parameter_clause, '{', fwd_function_body, '}'] as const, 				$ => ({ type: 'function', ...$[2], body: $[4], generator: true } as const)),
+	Rule(['function', '*', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 			$ => ({ type: 'function', name: $[2], ...$[3], body: $[5], generator: true } as const)),
+	Rule([ASYNC, 'function', parameter_clause, '{', fwd_function_body, '}'] as const, 			$ => ({ type: 'function', ...$[2], body: $[4], async: true } as const)),
+	Rule([ASYNC, 'function', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 		$ => ({ type: 'function', name: $[2], ...$[3], body: $[5], async: true } as const)),
+	Rule([ASYNC, 'function', '*', parameter_clause, '{', fwd_function_body, '}'] as const, 		$ => ({ type: 'function', ...$[3], body: $[5], generator: true, async: true } as const)),
+	Rule([ASYNC, 'function', '*', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, $ => ({ type: 'function', name: $[3], ...$[4], body: $[6], generator: true, async: true } as const))
 );
 
-export const member_expression = Rules<Expr>(self => [
-	Rule([primary_expression] as const, 									$ => $[0]),
-	Rule([function_expression] as const, 									$ => $[0]),
-	Rule([Forward(()=>class_expression)] as const,							$ => $[0] as Expr),
+export const member_expression = RRules<Expr>(self => [
+	Rule([primary_expression] as const),
+	Rule([function_expression] as const),
+	Rule([Forward<Expr>(()=>class_expression)] as const),
 	Rule([self, '.', IDENT] as const, 										$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
 	Rule([self, '[', fwd_expression, ']'] as const, 						$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
 	Rule(['new', self, ()=>arguments_] as const, 							$ => ({ type: 'new', callee: $[1], arguments: $[2] as Expr[] } as const)),
 ]);
-const new_expression = Rules<Expr>(self => [
-	Rule([member_expression] as const, 										$ => $[0]),
+const new_expression = RRules<Expr>(self => [
+	Rule([member_expression] as const),
 	Rule(['new', self] as const, 											$ => ({ type: 'new', callee: $[1], arguments: [] } as const)),
 ]);
-const argument_list = Rules<Expr[]>(self => [
+const argument_list = RRules<Expr[]>(self => [
 	Rule([fwd_assignment_expression] as const, 								$ => [$[0]]),
 	Rule([self, ',', fwd_assignment_expression] as const, 					$ => [...($[0]), $[2]]),
 	Rule(['...', fwd_assignment_expression] as const, 						$ => [{ type: 'spread', argument: $[1] } as const]),
@@ -462,8 +565,10 @@ const argument_list = Rules<Expr[]>(self => [
 export const arguments_ = Rules(
 	Rule(['(', ')'] as const, 												() => []),
 	Rule(['(', argument_list, ')'] as const, 								$ => $[1] as Expr[]),
+	// Trailing comma after the last argument -- real JS allows it (a spread argument can take one too).
+	Rule(['(', argument_list, ',', ')'] as const, 							$ => $[1] as Expr[]),
 );
-export const call_expression = Rules<Expr>(self => [
+export const call_expression = RRules<Expr>(self => [
 	Rule([member_expression, arguments_] as const, 							$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
 	Rule([self, arguments_] as const, 										$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
 	Rule([self, '.', IDENT] as const, 										$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
@@ -482,8 +587,8 @@ export const call_expression = Rules<Expr>(self => [
 	Rule([self, '?.', arguments_] as const, 								$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
 ]);
 export const left_hand_side_expression = Rules(
-	Rule([new_expression] as const, $ => $[0]),
-	Rule([call_expression] as const, $ => $[0]),
+	Rule([new_expression] as const),
+	Rule([call_expression] as const),
 );
 
 // --- Unary / update / binary precedence chain ---
@@ -493,12 +598,12 @@ export const left_hand_side_expression = Rules(
 // lexer level before either token ever reaches the parser.
 
 const postfix_expression = Rules(
-	Rule([left_hand_side_expression] as const, 			$ => $[0]),
+	Rule([left_hand_side_expression] as const),
 	Rule([left_hand_side_expression, '++'] as const,	$ => ({ type: 'update', operator: '++', argument: $[0], prefix: false } as const)),
 	Rule([left_hand_side_expression, '--'] as const,	$ => ({ type: 'update', operator: '--', argument: $[0], prefix: false } as const)),
 );
-const unary_expression = Rules<Expr>(self => [
-	Rule([postfix_expression] as const, $ => $[0]),
+const unary_expression = RRules<Expr>(self => [
+	Rule([postfix_expression] as const),
 	Rule(['delete', self] as const, 	$ => ({ type: 'unary', operator: 'delete', argument: $[1], prefix: true } as const)),
 	Rule(['void', self] as const, 		$ => ({ type: 'unary', operator: 'void', argument: $[1], prefix: true } as const)),
 	Rule(['typeof', self] as const, 	$ => ({ type: 'unary', operator: 'typeof', argument: $[1], prefix: true } as const)),
@@ -516,8 +621,8 @@ const unary_expression = Rules<Expr>(self => [
 // Right-associative: 2 ** 3 ** 2 === 2 ** (3 ** 2). Spelled as a dedicated
 // self-recursion on the right (rather than binaryChain's left-recursion)
 // since right-associativity needs the recursive reference on the other side.
-const exponentiation_expression = Rules<Expr>(self => [
-	Rule([unary_expression] as const, $ => $[0]),
+const exponentiation_expression = RRules<Expr>(self => [
+	Rule([unary_expression] as const),
 	Rule([unary_expression, '**', self] as const, $ => ({ type: 'binary', operator: '**', left: $[0], right: $[2] } as const), 'exponentiation'),
 ]);
 
@@ -525,7 +630,7 @@ const multiplicative_expression		= binaryChain(exponentiation_expression,	['*', 
 const additive_expression			= binaryChain(multiplicative_expression,	['+', '-'], 								'additive');
 const shift_expression				= binaryChain(additive_expression,			['<<', '>>', '>>>'], 						'shift');
 
-export const relational_expression			= binaryChain(shift_expression,				['<', '>', '<=', '>=', 'instanceof', 'in'], 'relational');
+export const relational_expression	= binaryChain(shift_expression,				['<', '>', '<=', '>=', 'instanceof', 'in'], 'relational');
 const equality_expression			= binaryChain(relational_expression,		['==', '!=', '===', '!=='], 				'equality');
 const bitwise_and_expression		= binaryChain(equality_expression,			['&'], 										'bitwiseAnd');
 const bitwise_xor_expression		= binaryChain(bitwise_and_expression,		['^'], 										'bitwiseXor');
@@ -546,11 +651,11 @@ const nullish_expression			= binaryChain(logical_or_expression,		['??'], 							
 const nullish_expression_noin		= binaryChain(logical_or_expression_noin,	['??'], 									'nullish',		'logical');
 
 const conditional_expression = Rules(
-	Rule([nullish_expression] as const, $ => $[0]),
+	Rule([nullish_expression] as const),
 	Rule([nullish_expression, '?', fwd_assignment_expression, ':', fwd_assignment_expression] as const, $ => ({ type: 'conditional', test: $[0], consequent: $[2], alternate: $[4] } as const)),
 );
 const conditional_expression_noin = Rules(
-	Rule([nullish_expression_noin] as const, $ => $[0]),
+	Rule([nullish_expression_noin] as const),
 	Rule([nullish_expression_noin, '?', fwd_assignment_expression, ':', Forward<Expr>(()=>assignment_expression_noin)] as const, $ => ({ type: 'conditional', test: $[0], consequent: $[2], alternate: $[4] } as const)),
 );
 
@@ -559,10 +664,18 @@ const conditional_expression_noin = Rules(
 // it only diverges from a plain parenthesized expression on the `=>` lookahead that follows the closing `)`, which is an ordinary, conflict-free one-token decision for an LR parser.
 //
 // Arrow functions aren't offered from assignment_expression_noin: they'd only matter inside a for-loop header's init/test/update clauses, where nobody realistically writes one, so that duplication isn't worth it here.
+// The concise (non-block) form must not be able to start with `{`: real JS always treats `x => { ... }`
+// as a block, never as an implicit object-literal return (you have to parenthesize -- `x => ({...})` --
+// to return one). `fwd_assignment_expression` can independently derive an object literal, which starts
+// with the same `{` as this rule's own block alternatives above -- without this `_nobrace` restriction,
+// that overlap is a genuine ambiguity an SLR(1) table can't resolve by lookahead alone (confirmed: even a
+// bare `x => { release = resolve; }`, no object literal in sight, was failing because the parser had
+// already committed to the object-literal path by the time `;` ruled it out). Same technique
+// `expression_statement` already uses for the same reason, just applied to arrow bodies instead of statements.
 export const arrow_body = Rules<Expr | Statement[]>(
 	Rule(['{', '}'] as const, 										() => [] as Statement[]),
 	Rule(['{', Forward(()=>statement_list), '}'] as const, 			$ => $[1] as Statement[]),
-	Rule([fwd_assignment_expression] as const, 						$ => $[0]),
+	Rule([fwd_assignment_expression_nobrace] as const),
 );
 export const arrow_function = Rules<Expr>(
 	Rule([IDENT, '=>', arrow_body] as const, 												$ => ({ type: 'arrow', params: [$[0]], body: $[2] } as const)),
@@ -570,11 +683,11 @@ export const arrow_function = Rules<Expr>(
 	Rule(['(', '...', IDENT, ')', '=>', arrow_body] as const, 								$ => ({ type: 'arrow', params: [], rest: $[2], body: $[5] } as const)),
 	Rule(['(', fwd_expression, ')', '=>', arrow_body] as const, 							$ => ({ type: 'arrow', params: exprToParams($[1]), body: $[4] } as const)),
 	Rule(['(', fwd_expression, ',', '...', IDENT, ')', '=>', arrow_body] as const, 			$ => ({ type: 'arrow', params: exprToParams($[1]), rest: $[4], body: $[7] } as const)),
-	Rule(['async', IDENT, '=>', arrow_body] as const, 										$ => ({ type: 'arrow', params: [$[1]], body: $[3], async: true } as const)),
-	Rule(['async', '(', ')', '=>', arrow_body] as const, 									$ => ({ type: 'arrow', params: [], body: $[4], async: true } as const)),
-	Rule(['async', '(', '...', IDENT, ')', '=>', arrow_body] as const, 						$ => ({ type: 'arrow', params: [], rest: $[3], body: $[6], async: true } as const)),
-	Rule(['async', '(', fwd_expression, ')', '=>', arrow_body] as const, 					$ => ({ type: 'arrow', params: exprToParams($[2]), body: $[5], async: true } as const)),
-	Rule(['async', '(', fwd_expression, ',', '...', IDENT, ')', '=>', arrow_body] as const,	$ => ({ type: 'arrow', params: exprToParams($[2]), rest: $[5], body: $[8], async: true } as const)),
+	Rule([ASYNC, IDENT, '=>', arrow_body] as const, 										$ => ({ type: 'arrow', params: [$[1]], body: $[3], async: true } as const)),
+	Rule([ASYNC, '(', ')', '=>', arrow_body] as const, 									$ => ({ type: 'arrow', params: [], body: $[4], async: true } as const)),
+	Rule([ASYNC, '(', '...', IDENT, ')', '=>', arrow_body] as const, 						$ => ({ type: 'arrow', params: [], rest: $[3], body: $[6], async: true } as const)),
+	Rule([ASYNC, '(', fwd_expression, ')', '=>', arrow_body] as const, 					$ => ({ type: 'arrow', params: exprToParams($[2]), body: $[5], async: true } as const)),
+	Rule([ASYNC, '(', fwd_expression, ',', '...', IDENT, ')', '=>', arrow_body] as const,	$ => ({ type: 'arrow', params: exprToParams($[2]), rest: $[5], body: $[8], async: true } as const)),
 );
 
 // `yield` with no argument relies on the same restricted-production/ASI
@@ -586,24 +699,135 @@ const yield_expression = Rules(
 	Rule(['yield', '*', fwd_assignment_expression] as const, 		$ => ({ type: 'yield', argument: $[2], delegate: true } as const)),
 );
 
-export const assignment_expression = Rules<Expr>(self => [
+export const assignment_expression = RRules<Expr>(self => [
 	Rule([left_hand_side_expression, ASSIGN_OP, self] as const, 	$ => ({ type: 'assign', operator: $[1], left: $[0], right: $[2] } as const)),
-	Rule([conditional_expression] as const, 						$ => $[0]),
-	Rule([arrow_function] as const, 								$ => $[0]),
-	Rule([yield_expression] as const, 								$ => $[0]),
+	Rule([conditional_expression] as const),
+	Rule([arrow_function] as const),
+	Rule([yield_expression] as const),
 ]);
-export const assignment_expression_noin = Rules<Expr>(self => [
+export const assignment_expression_noin = RRules<Expr>(self => [
 	Rule([left_hand_side_expression, ASSIGN_OP, self] as const, 	$ => ({ type: 'assign', operator: $[1], left: $[0], right: $[2] } as const)),
-	Rule([conditional_expression_noin] as const,					$ => $[0]),
+	Rule([conditional_expression_noin] as const),
 ]);
 
-const expression = Rules<Expr>(self => [
-	Rule([assignment_expression] as const,							$ => $[0]),
+const expression = RRules<Expr>(self => [
+	Rule([assignment_expression] as const),
 	Rule([self, ',', assignment_expression] as const,				$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] } as const))
 ]);
-const expression_noin = Rules<Expr>(self => [
-	Rule([assignment_expression_noin] as const,						$ => $[0]),
+const expression_noin = RRules<Expr>(self => [
+	Rule([assignment_expression_noin] as const),
 	Rule([self, ',', assignment_expression_noin] as const,			$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] }))
+]);
+
+// A second parallel chain, "NoBrace", mirroring the NoIn one above but for a different ambiguity:
+// real ECMAScript forbids `ExpressionStatement` from starting with `{`/`function`/`class` (that's
+// *why* `({a: 1})` needs its parens) precisely because `{` is also `block`'s opening token, and
+// `function`/`class` are also `function_declaration`'s/`class_declaration`'s. Without this
+// restriction, `{ x = 1; }` is genuinely ambiguous between a block containing an assignment and an
+// object literal using shorthand-with-default syntax -- and since both readings stay valid for a
+// while (`identifier '=' assignment_expression` parses either way), the table commits to one
+// without ever flagging a conflict, only failing several tokens later when they diverge.
+//
+// Unlike NoIn (where the excluded token can appear anywhere inside a for-loop header), this
+// restriction only ever concerns the *leftmost* token of the whole statement -- `a + {}` is fine,
+// only `{` *starting* the statement is the problem. So only the chain's own left-recursive
+// self-reference needs to route through the NoBrace nonterminal at each level; every right operand
+// (after an operator, inside parens/brackets, etc.) is no longer leftmost and stays on the
+// ordinary, unrestricted chain. `arrow_function`/`yield_expression` need no NoBrace counterpart at
+// all -- neither can ever start with `{`/`function`/`class` in the first place.
+const primary_expression_nobrace = Rules(
+	Rule(['this'] as const, 					() => ({ type: 'this' } as const)),
+	Rule([IDENT] as const,						$ => ({ type: 'identifier', name: $[0] } as const)),
+	Rule([NUMBER] as const, 					$ => parseNumber($[0])),
+	Rule([STRING] as const, 					$ => ({ type: 'literal', value: unquoteString($[0]) } as const)),
+	Rule([REGEX_LITERAL] as const,				$ => { const m = /^\/(.*)\/([a-zA-Z]*)$/.exec($[0])!; return { type: 'regex', pattern: m[1], flags: m[2] } as const; }),
+	Rule(['true'] as const, 					() => ({ type: 'literal', value: true } as const)),
+	Rule(['false'] as const,					() => ({ type: 'literal', value: false } as const)),
+	Rule(['null'] as const,						() => ({ type: 'literal', value: null } as const)),
+	Rule([array_literal] as const),
+	// `object_literal` dropped: `{` starting a statement always means a block.
+	Rule(['(', fwd_expression, ')'] as const, 	$ => $[1]),
+	Rule(['`', template_literal_parts, '`'],	$ => ({ type: 'literal', value: $[1] } as Expr))
+);
+export const member_expression_nobrace = RRules<Expr>(self => [
+	Rule([primary_expression_nobrace] as const),
+	// `function_expression`/`class_expression` alternatives dropped, same reason as `object_literal` above.
+	Rule([self, '.', IDENT] as const, 										$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
+	Rule([self, '[', fwd_expression, ']'] as const, 						$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
+	// `new` itself is never ambiguous with `block`/declarations, so everything from here on (including the callee) is the ordinary, unrestricted chain.
+	Rule(['new', member_expression, ()=>arguments_] as const, 				$ => ({ type: 'new', callee: $[1], arguments: $[2] as Expr[] } as const)),
+]);
+const new_expression_nobrace = Rules<Expr>(
+	Rule([member_expression_nobrace] as const),
+	Rule(['new', new_expression] as const, 								$ => ({ type: 'new', callee: $[1], arguments: [] } as const)),
+);
+export const call_expression_nobrace = RRules<Expr>(self => [
+	Rule([member_expression_nobrace, arguments_] as const, 				$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
+	Rule([self, arguments_] as const, 										$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
+	Rule([self, '.', IDENT] as const, 										$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
+	Rule([self, '[', fwd_expression, ']'] as const, 						$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
+	Rule([member_expression_nobrace, '`', template_literal_parts, '`'] as const, 	$ => ({ type: 'tagged_template', tag: $[0], quasi: $[2] } as const)),
+	Rule([self, '`', template_literal_parts, '`'] as const,					$ => ({ type: 'tagged_template', tag: $[0], quasi: $[2] } as const)),
+	Rule([member_expression_nobrace, '?.', IDENT] as const, 				$ => ({ type: 'member', object: $[0], property: $[2], optional: true } as const)),
+	Rule([self, '?.', IDENT] as const, 										$ => ({ type: 'member', object: $[0], property: $[2], optional: true } as const)),
+	Rule([member_expression_nobrace, '?.', '[', fwd_expression, ']'] as const, 	$ => ({ type: 'index', object: $[0], property: $[3], optional: true } as const)),
+	Rule([self, '?.', '[', fwd_expression, ']'] as const, 					$ => ({ type: 'index', object: $[0], property: $[3], optional: true } as const)),
+	Rule([member_expression_nobrace, '?.', arguments_] as const, 			$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
+	Rule([self, '?.', arguments_] as const, 								$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
+]);
+const left_hand_side_expression_nobrace = Rules(
+	Rule([new_expression_nobrace] as const),
+	Rule([call_expression_nobrace] as const),
+);
+const postfix_expression_nobrace = Rules(
+	Rule([left_hand_side_expression_nobrace] as const),
+	Rule([left_hand_side_expression_nobrace, '++'] as const,	$ => ({ type: 'update', operator: '++', argument: $[0], prefix: false } as const)),
+	Rule([left_hand_side_expression_nobrace, '--'] as const,	$ => ({ type: 'update', operator: '--', argument: $[0], prefix: false } as const)),
+);
+const unary_expression_nobrace = Rules<Expr>(
+	// Every prefix alternative starts with a keyword/operator, never `{`/`function`/`class` -- only
+	// the bare pass-through (no prefix at all) needs to stay on the NoBrace chain; the operand after
+	// any of these prefixes is no longer leftmost, so it's the ordinary `unary_expression`.
+	Rule([postfix_expression_nobrace] as const),
+	Rule(['delete', unary_expression] as const, 	$ => ({ type: 'unary', operator: 'delete', argument: $[1], prefix: true } as const)),
+	Rule(['void', unary_expression] as const, 		$ => ({ type: 'unary', operator: 'void', argument: $[1], prefix: true } as const)),
+	Rule(['typeof', unary_expression] as const, 	$ => ({ type: 'unary', operator: 'typeof', argument: $[1], prefix: true } as const)),
+	Rule(['await', unary_expression] as const, 		$ => ({ type: 'await', argument: $[1] } as const)),
+	Rule(['++', unary_expression] as const, 		$ => ({ type: 'update', operator: '++', argument: $[1], prefix: true } as const)),
+	Rule(['--', unary_expression] as const, 		$ => ({ type: 'update', operator: '--', argument: $[1], prefix: true } as const)),
+	Rule(['+', unary_expression] as const, 			$ => ({ type: 'unary', operator: '+', argument: $[1], prefix: true } as const)),
+	Rule(['-', unary_expression] as const, 			$ => ({ type: 'unary', operator: '-', argument: $[1], prefix: true } as const)),
+	Rule(['~', unary_expression] as const, 			$ => ({ type: 'unary', operator: '~', argument: $[1], prefix: true } as const)),
+	Rule(['!', unary_expression] as const, 			$ => ({ type: 'unary', operator: '!', argument: $[1], prefix: true } as const)),
+);
+const exponentiation_expression_nobrace = Rules<Expr>(
+	Rule([unary_expression_nobrace] as const),
+	Rule([unary_expression_nobrace, '**', exponentiation_expression] as const, $ => ({ type: 'binary', operator: '**', left: $[0], right: $[2] } as const), 'exponentiation'),
+);
+const multiplicative_expression_nobrace	= binaryChainLeft(exponentiation_expression_nobrace,	exponentiation_expression,	['*', '/', '%'], 							'multiplicative');
+const additive_expression_nobrace			= binaryChainLeft(multiplicative_expression_nobrace,	multiplicative_expression,	['+', '-'], 								'additive');
+const shift_expression_nobrace				= binaryChainLeft(additive_expression_nobrace,			additive_expression,		['<<', '>>', '>>>'], 						'shift');
+export const relational_expression_nobrace		= binaryChainLeft(shift_expression_nobrace,			shift_expression,			['<', '>', '<=', '>=', 'instanceof', 'in'], 'relational');
+const equality_expression_nobrace			= binaryChainLeft(relational_expression_nobrace,		relational_expression,		['==', '!=', '===', '!=='], 				'equality');
+const bitwise_and_expression_nobrace		= binaryChainLeft(equality_expression_nobrace,			equality_expression,		['&'], 										'bitwiseAnd');
+const bitwise_xor_expression_nobrace		= binaryChainLeft(bitwise_and_expression_nobrace,		bitwise_and_expression,		['^'], 										'bitwiseXor');
+const bitwise_or_expression_nobrace			= binaryChainLeft(bitwise_xor_expression_nobrace,		bitwise_xor_expression,		['|'], 										'bitwiseOr');
+const logical_and_expression_nobrace		= binaryChainLeft(bitwise_or_expression_nobrace,		bitwise_or_expression,		['&&'], 									'logicalAnd',	'logical');
+const logical_or_expression_nobrace		= binaryChainLeft(logical_and_expression_nobrace,		logical_and_expression,		['||'], 									'logicalOr',	'logical');
+const nullish_expression_nobrace			= binaryChainLeft(logical_or_expression_nobrace,		logical_or_expression,		['??'], 									'nullish',		'logical');
+const conditional_expression_nobrace = Rules(
+	Rule([nullish_expression_nobrace] as const),
+	Rule([nullish_expression_nobrace, '?', fwd_assignment_expression, ':', fwd_assignment_expression] as const, $ => ({ type: 'conditional', test: $[0], consequent: $[2], alternate: $[4] } as const)),
+);
+const assignment_expression_nobrace = Rules<Expr>(
+	Rule([left_hand_side_expression_nobrace, ASSIGN_OP, fwd_assignment_expression] as const, $ => ({ type: 'assign', operator: $[1], left: $[0], right: $[2] } as const)),
+	Rule([conditional_expression_nobrace] as const),
+	Rule([arrow_function] as const),
+	Rule([yield_expression] as const),
+);
+const expression_nobrace = RRules<Expr>(self => [
+	Rule([assignment_expression_nobrace] as const),
+	Rule([self, ',', assignment_expression] as const,				$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] } as const))
 ]);
 
 // --- Statements ---
@@ -626,7 +850,7 @@ export const variable_statement = Rules<Statement>(
 	Rule([varKeywords, variable_declaration_list, ';'] as const, $ => ({ type: 'var', kind: $[0], declarations: $[1] } as const))
 );
 
-const statement_list = Rules<Statement[]>(self => [
+export const statement_list = RRules<Statement[]>(self => [
 	Rule([fwd_statement] as const,						$ => [$[0]]),
 	Rule([self, fwd_statement] as const,				$ => [...$[0], $[1]]),
 ]);
@@ -636,7 +860,7 @@ const block = Rules<Statement>(
 );
 
 const expression_statement = Rules(
-	Rule([expression, ';'] as const,					$ => ({ type: 'expression', expression: $[0] } as const)),
+	Rule([expression_nobrace, ';'] as const,			$ => ({ type: 'expression', expression: $[0] } as const)),
 );
 
 const if_statement = Rules(
@@ -646,18 +870,18 @@ const if_statement = Rules(
 
 const for_init = Rules<ForInit>(
 	Rule([varKeywords, variable_declaration_list_noin] as const,			$ => ({ type: 'var', kind: $[0], declarations: $[1]} as const)),
-	Rule([expression_noin] as const,										$ => $[0]),
+	Rule([expression_noin] as const),
 );
 const for_lhs = Rules<ForInit>(
 	Rule([varKeywords, variable_declaration_noin] as const,					$ => ({ type: 'var', kind: $[0], declarations: [$[1]] } as const)),
 	// `for (const {a} of arr)` -- a for-in/of binding has no initializer, so (unlike variable_declaration_noin) the pattern stands alone here.
 	Rule([varKeywords, binding_pattern] as const,							$ => ({ type: 'var', kind: $[0], declarations: [{ name: $[1] }] } as const)),
-	Rule([left_hand_side_expression] as const,								$ => $[0]),
+	Rule([left_hand_side_expression] as const),
 );
 
 const expression_opt = Rules(
 	Rule([] as const,			() => undefined),
-	Rule([expression] as const, $ => $[0]),
+	Rule([expression] as const),
 );
 
 const iteration_statement = Rules<Statement>(
@@ -704,7 +928,7 @@ const switch_statement = Rules<Statement>(
 const throw_statement = Rules(
 	Rule(['throw', expression, ';'] as const,				$ => ({ type: 'throw', argument: $[1] } as const)),
 );
-const catch_ = Rules(
+export const catch_ = Rules(
 	Rule(['catch', '(', IDENT, ')', '{', '}'] as const, 				$ => ({ param: $[2], body: [] as Statement[]} as const)),
 	Rule(['catch', '(', IDENT, ')', '{', statement_list, '}'] as const, $ => ({ param: $[2], body: $[5] } as const)),
 );
@@ -723,42 +947,46 @@ const try_statement = Rules<Statement>(
 );
 
 export const function_declaration = Rules(
-	Rule(['function', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 				$ => ({ type: 'function_decl', name: $[1], params: $[2].params, rest: $[2].rest, body: $[4] } as const)),
-	Rule(['function', '*', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 			$ => ({ type: 'function_decl', name: $[2], params: $[3].params, rest: $[3].rest, body: $[5], generator: true } as const)),
-	Rule(['async', 'function', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 		$ => ({ type: 'function_decl', name: $[2], params: $[3].params, rest: $[3].rest, body: $[5], async: true } as const)),
-	Rule(['async', 'function', '*', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, $ => ({ type: 'function_decl', name: $[3], params: $[4].params, rest: $[4].rest, body: $[6], generator: true, async: true } as const))
+	Rule(['function', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 				$ => ({ type: 'function_decl', name: $[1], ...$[2], body: $[4] } as const)),
+	Rule(['function', '*', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 			$ => ({ type: 'function_decl', name: $[2], ...$[3], body: $[5], generator: true } as const)),
+	Rule([ASYNC, 'function', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, 		$ => ({ type: 'function_decl', name: $[2], ...$[3], body: $[5], async: true } as const)),
+	Rule([ASYNC, 'function', '*', IDENT, parameter_clause, '{', fwd_function_body, '}'] as const, $ => ({ type: 'function_decl', name: $[3], ...$[4], body: $[6], generator: true, async: true } as const))
 );
 export const function_body = Rules(
 	Rule([] as const, 				() => []),
-	Rule([statement_list] as const,	$ => $[0]),
+	Rule([statement_list] as const),
 );
 
 // --- Classes ---
 // Static initialization blocks and private (`#name`) members aren't supported -- a known simplification.
 
 export const class_member_name = Rules<string | { computed: Expr }>(
-	Rule([property_name] as const,						$ => $[0]),
+	Rule([property_name] as const),
 	Rule(['[', assignment_expression, ']'] as const,	$ => ({ computed: $[1] } as const)),
 );
 // Static-ness is split out from the member shape itself (rather than duplicating every method/field alternative once with 'static' and once without), so the combinatorics stay linear instead of doubling.
 export const class_member_body = Rules<ClassMember>(
-	Rule([class_member_name, parameter_clause, '{', function_body, '}'] as const, 				$ => ({ type: 'method', kind: 'method', key: $[0] as string | { computed: Expr }, value: { type: 'function', params: $[1].params, rest: $[1].rest, body: $[3] } } as const)),
-	Rule(['*', class_member_name, parameter_clause, '{', function_body, '}'] as const, 			$ => ({ type: 'method', kind: 'method', key: $[1] as string | { computed: Expr }, value: { type: 'function', params: $[2].params, rest: $[2].rest, body: $[4], generator: true } } as const)),
-	Rule(['get', class_member_name, '(', ')', '{', function_body, '}'] as const, 				$ => ({ type: 'method', kind: 'get', key: $[1] as string | { computed: Expr }, value: { type: 'function', params: [], body: $[5] } } as const)),
-	Rule(['set', class_member_name, '(', IDENT, ')', '{', function_body, '}'] as const, 		$ => ({ type: 'method', kind: 'set', key: $[1] as string | { computed: Expr }, value: { type: 'function', params: [$[3] as string], body: $[6] } } as const)),
-	Rule(['async', class_member_name, parameter_clause, '{', function_body, '}'] as const, 		$ => ({ type: 'method', kind: 'method', key: $[1] as string | { computed: Expr }, value: { type: 'function', params: $[2].params, rest: $[2].rest, body: $[4], async: true } } as const)),
-	Rule(['async', '*', class_member_name, parameter_clause, '{', function_body, '}'] as const, $ => ({ type: 'method', kind: 'method', key: $[2] as string | { computed: Expr }, value: { type: 'function', params: $[3].params, rest: $[3].rest, body: $[5], generator: true, async: true } } as const)),
+	Rule([class_member_name, parameter_clause, '{', function_body, '}'] as const, 				$ => ({ type: 'method', kind: 'method', key: $[0] as string | { computed: Expr }, value: { type: 'function', ...$[1], body: $[3] } } as const)),
+	Rule(['*', class_member_name, parameter_clause, '{', function_body, '}'] as const, 			$ => ({ type: 'method', kind: 'method', key: $[1] as string | { computed: Expr }, value: { type: 'function', ...$[2], body: $[4], generator: true } } as const)),
+	Rule([GET, class_member_name, '(', ')', '{', function_body, '}'] as const, 				$ => ({ type: 'method', kind: 'get', key: $[1] as string | { computed: Expr }, value: { type: 'function', params: [], body: $[5] } } as const)),
+	Rule([SET, class_member_name, '(', IDENT, ')', '{', function_body, '}'] as const, 		$ => ({ type: 'method', kind: 'set', key: $[1] as string | { computed: Expr }, value: { type: 'function', params: [$[3] as string], body: $[6] } } as const)),
+	Rule([ASYNC, class_member_name, parameter_clause, '{', function_body, '}'] as const, 		$ => ({ type: 'method', kind: 'method', key: $[1] as string | { computed: Expr }, value: { type: 'function', ...$[2], body: $[4], async: true } } as const)),
+	Rule([ASYNC, '*', class_member_name, parameter_clause, '{', function_body, '}'] as const, $ => ({ type: 'method', kind: 'method', key: $[2] as string | { computed: Expr }, value: { type: 'function', ...$[3], body: $[5], generator: true, async: true } } as const)),
 	Rule([class_member_name, ';'] as const, 													$ => ({ type: 'field', key: $[0] as string | { computed: Expr } } as const)),
 	Rule([class_member_name, '=', assignment_expression, ';'] as const, 						$ => ({ type: 'field', key: $[0] as string | { computed: Expr }, value: $[2] } as const)),
 );
 export const class_member = Rules(
-	Rule([class_member_body] as const,					$ => $[0]),
+	Rule([class_member_body] as const),
 	Rule(['static', class_member_body] as const,		$ => ({ ...$[1], static: true } as const)),
+	// A bare `;` is its own (do-nothing) class element in real JS/TS -- explicitly legal, not just
+	// tolerated, so a stray semicolon after a method's closing `}` (easy to leave behind when editing)
+	// doesn't fail to parse. Filtered back out in `class_body` below.
+	Rule([';'] as const,								() => undefined),
 );
 const class_member_list = List(class_member);
 export const class_body = Rules(
 	Rule(['{', '}'] as const, 							() => []),
-	Rule(['{', class_member_list, '}'] as const, 		$ => $[1]),
+	Rule(['{', class_member_list, '}'] as const, 		$ => $[1].filter(m => m !== undefined)),
 );
 export const class_expression = Rules(
 	Rule(['class', class_body] as const, 													$ => ({ type: 'class', body: $[1] } as const)),
@@ -772,23 +1000,23 @@ export const class_declaration = Rules(
 );
 
 export const statement = Rules(
-	Rule([block] as const, 					$ => $[0]),
-	Rule([variable_statement] as const, 	$ => $[0]),
+	Rule([block] as const),
+	Rule([variable_statement] as const),
 	Rule([';'] as const, 					() => ({ type: 'empty' } as const)),
-	Rule([expression_statement] as const, 	$ => $[0]),
-	Rule([if_statement] as const, 			$ => $[0]),
-	Rule([iteration_statement] as const, 	$ => $[0]),
-	Rule([continue_statement] as const, 	$ => $[0]),
-	Rule([break_statement] as const, 		$ => $[0]),
-	Rule([return_statement] as const, 		$ => $[0]),
-	Rule([with_statement] as const, 		$ => $[0]),
-	Rule([labelled_statement] as const, 	$ => $[0]),
-	Rule([switch_statement] as const, 		$ => $[0]),
-	Rule([throw_statement] as const, 		$ => $[0]),
-	Rule([try_statement] as const, 			$ => $[0]),
+	Rule([expression_statement] as const),
+	Rule([if_statement] as const),
+	Rule([iteration_statement] as const),
+	Rule([continue_statement] as const),
+	Rule([break_statement] as const),
+	Rule([return_statement] as const),
+	Rule([with_statement] as const),
+	Rule([labelled_statement] as const),
+	Rule([switch_statement] as const),
+	Rule([throw_statement] as const),
+	Rule([try_statement] as const),
 	Rule(['debugger', ';'] as const, 		() => ({ type: 'debugger' } as const)),
-	Rule([function_declaration] as const, 	$ => $[0]),
-	Rule([class_declaration] as const, 		$ => $[0]),
+	Rule([function_declaration] as const),
+	Rule([class_declaration] as const),
 );
 
 // --- Modules ---
@@ -836,9 +1064,9 @@ export const export_declaration = Rules<Statement>(
 );
 
 export const module_item = Rules(
-	Rule([import_declaration] as const, 				$ => $[0]),
-	Rule([export_declaration] as const, 				$ => $[0]),
-	Rule([statement] as const, 							$ => $[0]),
+	Rule([import_declaration] as const),
+	Rule([export_declaration] as const),
+	Rule([statement] as const),
 );
 const module_item_list = List(module_item);
 
@@ -857,15 +1085,29 @@ export const program = Rules<Program>(
 // list and ASI `recover` policy unchanged, while also adding new top-level
 // entries and/or mutating (pushing alternatives onto) any of these same
 // exported arrays before that call happens.
-export const jsSkip = [WS, /\/\/[^\n]*\n/, /\/\*[^]*?\*\//];
+// The line comment's `\n` terminator is optional (`\n?`, still consumed when present -- NOT a `(?=\n|$)`
+// lookahead, tried and reverted, see below) so it also matches a `//comment` that's the very last thing in
+// the file with no trailing newline -- real JS/TS comments legitimately terminate at EOF too. Without this,
+// an unmatchable trailing comment produces an ERROR token *without advancing the lexer position* (see
+// `nextToken` in src/tison.ts), and since a newline usually precedes such a comment, `jsRecover`'s ASI
+// heuristic below fires and synthesizes a phantom `;` at that same frozen position forever -- an infinite
+// loop, found via a real file (`binary-archives/test/test_tar.ts`) ending in an unterminated comment.
+// A lookahead version of this fix (matching the newline without consuming it, leaving it for `WS`) caused a
+// *combinatorial* blowup instead: `WS`'s own callback does an expensive `lex.next()` peek whenever its match
+// includes a newline (for ASI's restricted-production check), and normally a `//comment\n` never triggers it
+// because the comment consumes its own trailing newline, leaving no bare newline for `WS` to see. With the
+// lookahead version, every comment line left its `\n` as a separate `WS` match, and each one recursively
+// peeked past the *rest* of the file, so N consecutive comment lines took exponential time -- found via a
+// real file (`binary-libs/src/cvinfo.ts`) with ~30 consecutive commented-out lines hanging for minutes.
+export const jsSkip = [WS, /\/\/[^\n]*\n?/, /\/\*[^]*?\*\//];
 
 // Error-driven insertion: only when the real token would otherwise fail to parse, and is preceded by a line terminator, or is `}`, or EOF --
 // found by name among this state's own valid actions, so tison resolves nothing on our behalf. "Preceded by a line terminator" isn't a
 // special fact tison hands us -- it's just comparing this token's line against the previously-shifted one, the same line numbers every
 // token already carries for error messages.
-export const jsRecover: GrammarSpec['recover'] = (row, tok, prevToken) => {
-	const newlineBefore = prevToken && tok.pos && prevToken.pos && tok.pos.line > prevToken.pos.line;
-	if (!(newlineBefore || tok.value === '}' || tok.type === EOF))
+export const jsRecover: GrammarSpec['recover'] = (lex, row) => {
+	const newlineBefore = lex.prev && lex.prev.pos && lex.line > lex.prev.pos.line;
+	if (!(newlineBefore || lex.remaining.startsWith('}') || !lex.remaining))
 		return undefined;
 	const semi = [...row.keys()].find(t => t.name === ';');
 	return semi && { type: semi, value: '' };

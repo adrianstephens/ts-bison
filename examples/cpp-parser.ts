@@ -1,11 +1,9 @@
 import {
-	Rule, Rules, List, termOneOf, GrammarBuilder,
-	runParser, nextToken,
-	type GrammarSpec, type Parser, type LexState, type ActionEntry, type Token, type Terminal, type LexContext,
+	Rule, Rules, List, termOneOf, makeParser, terminal,
 } from '../src/tison';
 import {
 	IDENT, TYPE_NAME,
-	PREC_LEVELS,
+	PREC,
 	type Ctx,
 	type Expr, type Statement, type Declarator, type DeclarationSpecifiers, type Declaration,
 	type TypeSpecifier, type TypeName, type StructMember, type StructSpecifier, type ParamOrVariadic,
@@ -516,66 +514,28 @@ statementCast.push(
 //  Wire it up
 // ===================================================================
 //
-// Not `tison()` directly: the right-shift operator `>>` (and `>>=`) needs a *context-sensitive* lexer
-// hook -- when `ctx.templateDepth > 0`, reject the 2-/3-char match so the lexer falls back to a plain
+// The right-shift operator `>>` (and `>>=`) needs a *context-sensitive* lexer hook -- when
+// `ctx.templateDepth > 0`, reject the 2-/3-char match so the lexer falls back to a plain
 // single-char `>` instead, closing one generic-type-argument level at a time. That's exactly what lets
 // `vector<vector<int>>` lex its trailing `>>` as two `>` tokens (closing the inner level, then the outer
 // one) instead of one right-shift token -- the same problem real C++ had until C++11 standardized this
 // splitting behavior.
 //
-// The hook has to be attached to whichever single `Terminal` object ends up registered under the name
-// `>>` (interning is by name, and c-parser.ts's own right-shift rule -- `Rule([self, '>>', self], ...)`
-// in assignment_expression -- already creates one from a bare string literal). `tison()` builds and
-// discards its `GrammarBuilder` internally with no way to reach that terminal afterwards, so this
-// reimplements `tison()`'s own few lines of plumbing, inserting one extra step in between
-// `new GrammarBuilder(spec)` (which is also the point at which every terminal -- including '>>' and
-// '>>=', wherever in the grammar they were first referenced -- already exists in `g.terminalsByName`)
-// and `g.buildTables()`.
+// These have to be named exactly `>>`/`>>=`: c-parser.ts's own right-shift/compound-assignment rules
+// reference them as bare string literals (`Rule([self, '>>', self], ...)` in assignment_expression, and
+// similarly for '>>='), and terminal interning is by name -- passing these through `terminals` below
+// registers them *before* rule traversal reaches those bare strings, so the bare-string references
+// resolve to these same callback-bearing objects instead of creating fresh, hook-less ones.
+const RIGHT_SHIFT			= terminal('>>',  />>/,	(_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : RIGHT_SHIFT);
+const RIGHT_SHIFT_ASSIGN	= terminal('>>=', />>=/,	(_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : RIGHT_SHIFT_ASSIGN);
 
-function buildCppParser(spec: GrammarSpec): Parser {
-	const g = new GrammarBuilder(spec);
-
-	for (const name of ['>>', '>>='] as const) {
-		const term = g.terminalsByName.get(name);
-		if (term)
-			term.callback = (_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : term;
-	}
-
-	const tables = g.buildTables();
-	const lexEntries = Array.from(g.terminalsByName.values()).filter(t => t.pattern);
-
-	const recover = (row: Map<Terminal, ActionEntry>, tok: Token, prevToken: Token | undefined) => {
-		const substitute = spec.recover?.(row, tok, prevToken);
-		if (!substitute)
-			return undefined;
-		const entry = row.get(substitute.type);
-		return entry && { entry, tok: substitute };
-	};
-
-	const resolveSym = (sym: string | RegExp | Terminal | undefined): Terminal | undefined =>
-		typeof sym === 'string'	? g.terminalsByName.get(sym)
-		: sym instanceof RegExp	? g.terminalsByName.get(sym.source)
-		: sym;
-
-	const createTokenStream = (input: string, ctx: any) => {
-		const lexState: LexState = { offset: 0, line: 1, col: 1 };
-		let lookahead: Token | undefined;
-		return {
-			peek: (allowed?: Map<Terminal, ActionEntry>): Token => lookahead ??= nextToken(lexEntries, input, lexState, ctx, resolveSym, allowed),
-			peekText: () => input.substring(lexState.offset),
-			consume: () => { lookahead = undefined; },
-		};
-	};
-
-	return {
-		tables,
-		parse: (input, ctx) => runParser(tables, createTokenStream(input, ctx), ctx, recover, {}),
-	};
-}
-
-const cppParserSpec = buildCppParser({
+const cppParserSpec = makeParser({
 	skip: [/\s+/, /#[^\n]*/, /\/\/[^\n]*/, /\/\*[^]*?\*\//],
-	precedence: PREC_LEVELS,
+	// IDENT has to be lexed even where only TYPE_NAME is grammatically valid (see c-parser.ts's own
+	// `terminals: [IDENT]`) -- it's the only terminal whose pattern matches the text, and its callback
+	// is what reclassifies a registered template parameter name into TYPE_NAME.
+	terminals: [IDENT, RIGHT_SHIFT, RIGHT_SHIFT_ASSIGN],
+	precedence: PREC,
 	start: translation_unit,
 	rules: { translation_unit },
 });

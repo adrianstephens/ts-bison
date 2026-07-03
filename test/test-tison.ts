@@ -1,4 +1,4 @@
-import {tison, Ref, Rules} from '../src/tison';
+import {makeParser, Ref, Rules, RRules, Rule, RuleR, WithPrec} from '../src/tison';
 
 // ===================================================================
 //  Self-test
@@ -6,14 +6,14 @@ import {tison, Ref, Rules} from '../src/tison';
 
 const NUMBER = /[0-9]+(?:\.[0-9]+)?/;
 
-const lexParser = tison({
+const lexParser = makeParser({
     skip: [/\s+/],
     precedence: {
         additive:		'left',
         multiplicative:	'left',
         unary:			'right',
     },
-    start: Rules(self => [
+    start: RRules(self => [
         { rhs: [self, '+', (x: any) => {console.log('hello', x); return 42;}, self], action: $ => ($[0] as number) + ($[2] as number), prec: 'additive' },
         { rhs: [self, '-', self], action: $ => ($[0] as number) - ($[2] as number), prec: 'additive' },
         { rhs: [self, '*', self], action: $ => ($[0] as number) * ($[2] as number), prec: 'multiplicative' },
@@ -32,7 +32,7 @@ console.log('2.5 * 4 =', lexParser.parse('2.5 * 4'));      // 10
 
 const ref = Ref('expression');
 
-const lexParser2 = tison({
+const lexParser2 = makeParser({
     skip: [/\s+/],
     precedence: {
         additive:		'left',
@@ -57,3 +57,29 @@ console.log('(3 + 4) * 5 =', lexParser2.parse('(3 + 4) * 5'));  // 35
 console.log('-3 * 2 =', lexParser2.parse('-3 * 2'));       // -6
 console.log('10 / 2 + 1 =', lexParser2.parse('10 / 2 + 1'));   // 6
 console.log('2.5 * 4 =', lexParser2.parse('2.5 * 4'));      // 10
+
+const lexParser3 = makeParser({
+    skip: [/\s+/],
+    precedence: {
+        additive:		'left',
+        multiplicative:	'left',
+        unary:			'right',
+    },
+    rules: {
+        expression: RRules<number>(self => [
+            WithPrec(RuleR(self, '+', self, $ => $[0] + $[2]), 'additive'),
+            WithPrec(RuleR(self, '-', self, $ => $[0] - $[2]), 'additive'),
+            WithPrec(RuleR(self, '*', self, $ => $[0] * $[2]), 'multiplicative'),
+            WithPrec(RuleR(self, '/', self, $ => $[0] / $[2]), 'multiplicative'),
+            WithPrec(RuleR('-', self, 		$ => -$[1]), 'unary'),
+            RuleR('(', self, ')', 			$ => $[1]),
+            RuleR(NUMBER, 					$ => parseFloat($[0])),
+        ])
+    },
+});
+
+console.log('3 + 4 * 5 =', lexParser3.parse('3 + 4 * 5'));    // 23
+console.log('(3 + 4) * 5 =', lexParser3.parse('(3 + 4) * 5'));  // 35
+console.log('-3 * 2 =', lexParser3.parse('-3 * 2'));       // -6
+console.log('10 / 2 + 1 =', lexParser3.parse('10 / 2 + 1'));   // 6
+console.log('2.5 * 4 =', lexParser3.parse('2.5 * 4'));      // 10

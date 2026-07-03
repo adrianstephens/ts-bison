@@ -4,3 +4,4 @@ assistant
 dist
 *.tgz
 *.tsbuildinfo
+PROGRESS.md

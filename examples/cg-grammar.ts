@@ -1,12 +1,15 @@
 /* eslint-disable @typescript-eslint/no-this-alias */
-import { makeParser, makeRule, Rules, List, terminal, Forward, TextPos } from '../src/tison';
+import { makeParser, makeRule, makeRuleR, Rules, RRules, List, terminal, Forward, TextPos } from '../src/tison';
+
+function claim(condition: any): asserts condition {}
 
 const Rule		= makeRule<CG>();
+const RuleR		= makeRuleR<CG>();
 type ident		= number;
 
 type NumericStatics<T> = { [K in keyof T]: T[K] extends number ? T[K] : never }[keyof T];
 
-function duplicate(a: object) {
+function duplicate<T extends object>(a: T): T {
 	return Object.assign(Object.create(Object.getPrototypeOf(a)), a);
 }
 
@@ -474,9 +477,63 @@ class Type {
 	IsUnsizedArray()				{ return this.IsArray() && this.arr!.numels == 0; }
 
 	AddStructBase(type: Type) 		{ return this; }
-	InstantiateTemplate(types: Type[])	{ return this; }
 
+	Instantiate(types: Type[]) {
+		switch (this.GetCategory()) {
+			case Type.CATEGORY_NONE:
+			case Type.CATEGORY_SCALAR:
+				if (this.GetBase() == Type.BASE_UNDEFINED_TYPE) {
+					let out = types[this.typname!.index];
+					if (~out.properties & this.properties & Type.QUALIFIER_MASK) {
+						out = duplicate(out);
+						out.properties |= this.properties & Type.QUALIFIER_MASK;
+					}
+					return out;
+				}
+				break;
+
+			case Type.CATEGORY_ARRAY: {
+				claim(this.arr);
+				const	eltype = this.subtype?.Instantiate(types);
+				if (eltype != this.subtype || this.arr.numels < 0) {
+					const	out = duplicate(this);
+					out.subtype	= eltype;
+					if (this.arr.numels < 0)
+						out.arr!.numels = types[-this.arr.numels].typname!.index;
+					//out.size	= cg.hal.GetSizeof(out);
+					return out;
+				}
+				break;
+			}
+
+			case Type.CATEGORY_FUNCTION: {
+				claim(this.fun);
+				let out = this;
+				if (this.subtype) {
+					const	rettype = this.subtype.Instantiate(types);
+					if (rettype != this.subtype) {
+						out = duplicate(this);
+						out.subtype = rettype;
+					}
+				}
+
+				const paramtypes = this.fun.paramtypes.map(p => p.Instantiate(types));
+				if (paramtypes.some((p, i) => p != this.fun!.paramtypes[i])) {
+					if (out === this)
+						out = duplicate(this);
+					out.fun!.paramtypes = paramtypes;
+				}
+				return out;
+			}
+			case Type.CATEGORY_STRUCT:
+				break;
+		}
+
+		return this;
+	}
 };
+
+
 
 class Attr {
 	name:	ident;
@@ -894,7 +951,7 @@ class CG {
 			}
 			return sym.type;
 		} else {
-			this.InternalError('ERROR_S_TYPE_NAME_NOT_FOUND', name);
+			this.InternalError('ERROR_S_Type.NAME_NOT_FOUND', name);
 			return UndefinedType;
 		}
 	}
@@ -1042,6 +1099,24 @@ class CG {
 	Function_Definition_Header(decl: Decl) { return {} as Decl; }
 
 	SetConstantBuffer(sym: Sym, members: Scope) { return {} as Expr; }
+
+	InstantiateTemplate(tmplt: Type, types: Type[]) {
+		if (!tmplt.IsStruct())
+			return tmplt.Instantiate(types);
+		
+		const	inst	= duplicate(tmplt);
+		claim(inst.str);
+		inst.str.members	= new Scope;
+	
+		inst.str.tag = this.Atom(`${this.GetAtomString(tmplt.str!.tag)}<${types.map(t => t.toString()).join(', ')}>`);
+
+		inst.str.members.symbols.map(s => {
+			const si 	= duplicate(s);
+			si.type		= s.type.Instantiate(types);
+		});
+
+		return inst;
+	}
 };
 
 
@@ -1073,9 +1148,9 @@ const UINTCONST_SY	= Rules(
 	Rule([/\d+/], $ => parseInt($[0]))
 );
 
-const INTCONST_SY	= Rules(
-	Rule([UINTCONST_SY]),
-	Rule(['-', UINTCONST_SY], $ => -$[1])
+const INTCONST_SY	= Rules<number>(
+	RuleR(UINTCONST_SY),
+	RuleR('-', UINTCONST_SY, $ => -$[1])
 );
 
 const CFLOATCONST_SY = Rules(
@@ -1092,7 +1167,7 @@ const struct_identifier = Rules<ident>(
 );
 
 const enum_header = Rules(
-	Rule([ENUM_SY, struct_identifier] as const, ($, cg) => cg.EnumHeader($[1])),
+	RuleR(ENUM_SY, struct_identifier, ($, cg) => cg.EnumHeader($[1])),
 );
 
 const enum_declaration = Rules(
@@ -1100,7 +1175,7 @@ const enum_declaration = Rules(
 	Rule([identifier, '=', INTCONST_SY] as const, ($, cg) => { cg.EnumAdd($[0], $[2]); }),
 );
 
-const enum_declaration_list = Rules(self => [
+const enum_declaration_list = RRules<void>(self => [
 	Rule([enum_declaration]),
 	Rule([self, ',', enum_declaration] as const),
 ]);
@@ -1177,7 +1252,7 @@ const constant = Rules(
 	Rule([STRCONST_SY, /*, Temporary!, */] as const,	($, cg) => cg.NewConstNode('ICONST', $[0], Type.BASE_STRING)),
 );
 
-const expression_list = Rules<Expr>(self => [
+const expression_list = RRules<Expr>(self => [
 	Rule([expression] as const, $ => $[0]),
 	Rule([self, ',', expression] as const, $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[2])),
 ]);
@@ -1210,7 +1285,7 @@ const actual_argument_list = Rules(
 /* Postfix Operators */
 /*********************/
 
-const postfix_expression = Rules<Expr>(self => [
+const postfix_expression = RRules<Expr>(self => [
 	Rule([primary_expression]),
 	Rule([self, PLUSPLUS_SY] as const, 						$ => Expr.NewUnopNode('POSTINC', $[0])),
 	Rule([self, MINUSMINUS_SY] as const, 					$ => Expr.NewUnopNode('POSTDEC', $[0])),
@@ -1223,7 +1298,7 @@ const postfix_expression = Rules<Expr>(self => [
 /* Unary Operators */
 /*******************/
 
-const unary_expression = Rules<Expr>(self => [
+const unary_expression = RRules<Expr>(self => [
 	Rule([postfix_expression]),
 	Rule([PLUSPLUS_SY, self] as const,		$ => Expr.NewUnopNode('PREINC', $[1])),
 	Rule([MINUSMINUS_SY, self] as const,	$ => Expr.NewUnopNode('PREDEC', $[1])),
@@ -1233,7 +1308,7 @@ const unary_expression = Rules<Expr>(self => [
 	Rule(['~', self] as const, 				($, cg) => cg.NewUnaryOperator('NOT', $[1], true)),
 ]);				
 
-const non_empty_abstract_parameter_list = Rules<Decl[]>(self => [
+const non_empty_abstract_parameter_list = RRules<Decl[]>(self => [
 	Rule([abstract_declaration] as const, ($, cg) => {
 		if ($[0].type!.type.IsVoid())
 			cg.current_scope!.flags |= Scope.has_void_param;
@@ -1251,7 +1326,7 @@ const abstract_parameter_list = Rules<Decl[]>(
 	Rule([non_empty_abstract_parameter_list]),
 );
 
-const abstract_declarator = Rules<Decl>(self => [
+const abstract_declarator = RRules<Decl>(self => [
 	Rule([/*, empty, */] as const, ($, cg) => cg.NewDeclNode(0, cg.type_specs)),
 	Rule([self, '[', constant_expression, ']'] as const, ($, cg) => cg.Array_Declarator($[0], $[2], 0)),
 	Rule([self, '[', ']'] as const, ($, cg) => cg.Array_Declarator($[0], 0 , 1)),
@@ -1278,7 +1353,7 @@ const _abstract_declaration = Rules(
 /* Expression */
 /*****************/
 
-const cast_expression = Rules<Expr>(self => [
+const cast_expression = RRules<Expr>(self => [
 	Rule([unary_expression]),
 /* *** reduce/reduce conflict: (var-ident) (type-ident) ***
 	Rule(['(', type_name, ')', cast_expression] as const),
@@ -1286,26 +1361,26 @@ const cast_expression = Rules<Expr>(self => [
 	Rule(['(', abstract_declaration, ')', self] as const, ($, cg) => cg.NewCastOperator($[3], cg.GetTypePointer($[1].loc!, $[1].type!))),
 ]);
 
-const multiplicative_expression = Rules<Expr>(self => [
+const multiplicative_expression = RRules<Expr>(self => [
 	Rule([cast_expression]),
 	Rule([self, '*', cast_expression] as const, ($, cg) => cg.NewBinaryOperator('MUL', $[0], $[2], false)),
 	Rule([self, '/', cast_expression] as const, ($, cg) => cg.NewBinaryOperator('DIV', $[0], $[2], false)),
 	Rule([self, '%', cast_expression] as const, ($, cg) => cg.NewBinaryOperator('MOD', $[0], $[2], true)),
 ]);
 
-const additive_expression = Rules<Expr>(self => [
+const additive_expression = RRules<Expr>(self => [
 	Rule([multiplicative_expression]),
 	Rule([self, '+', multiplicative_expression] as const, ($, cg) => cg.NewBinaryOperator('ADD', $[0], $[2], false)),
 	Rule([self, '-', multiplicative_expression] as const, ($, cg) => cg.NewBinaryOperator('SUB', $[0], $[2], false)),
 ]);
 
-const shift_expression = Rules<Expr>(self => [
+const shift_expression = RRules<Expr>(self => [
 	Rule([additive_expression]),
 	Rule([self, LL_SY, additive_expression] as const, ($, cg) => cg.NewBinaryOperator('SHL', $[0], $[2], true)),
 	Rule([self, GG_SY, additive_expression] as const, ($, cg) => cg.NewBinaryOperator('SHR', $[0], $[2], true)),
 ]);
 
-const relational_expression = Rules<Expr>(self => [
+const relational_expression = RRules<Expr>(self => [
 	Rule([shift_expression]),
 	Rule([self, '<', shift_expression] as const, 	($, cg) => cg.NewBinaryOperator('LT', $[0], $[2], false)),
 	Rule([self, '>', shift_expression] as const, 	($, cg) => cg.NewBinaryOperator('GT', $[0], $[2], false)),
@@ -1313,33 +1388,33 @@ const relational_expression = Rules<Expr>(self => [
 	Rule([self, GE_SY, shift_expression] as const,	($, cg) => cg.NewBinaryOperator('GE', $[0], $[2], false)),
 ]);
 
-const equality_expression = Rules<Expr>(self => [
+const equality_expression = RRules<Expr>(self => [
 	Rule([relational_expression]),
 	Rule([self, EQ_SY, relational_expression] as const, ($, cg) => cg.NewBinaryOperator('EQ', $[0], $[2], false)),
 	Rule([self, NE_SY, relational_expression] as const, ($, cg) => cg.NewBinaryOperator('NE', $[0], $[2], false)),
 ]);
 
-const AND_expression = Rules<Expr>(self => [
+const AND_expression = RRules<Expr>(self => [
 	Rule([equality_expression]),
 	Rule([self, '&', equality_expression] as const, ($, cg) => cg.NewBinaryOperator('AND', $[0], $[2], true)),
 ]);
 
-const exclusive_OR_expression = Rules<Expr>(self => [
+const exclusive_OR_expression = RRules<Expr>(self => [
 	Rule([AND_expression]),
 	Rule([self, '^', AND_expression] as const, ($, cg) => cg.NewBinaryOperator('XOR', $[0], $[2], true)),
 ]);
 
-const inclusive_OR_expression = Rules<Expr>(self => [
+const inclusive_OR_expression = RRules<Expr>(self => [
 	Rule([exclusive_OR_expression]),
 	Rule([self, '|', exclusive_OR_expression] as const, ($, cg) => cg.NewBinaryOperator('OR', $[0], $[2], true)),
 ]);
 
-const logical_AND_expression = Rules<Expr>(self => [
+const logical_AND_expression = RRules<Expr>(self => [
 	Rule([inclusive_OR_expression]),
 	Rule([self, AND_SY, inclusive_OR_expression] as const, ($, cg) => cg.NewBinaryOperator('BAND', $[0], $[2], true)),
 ]);
 
-const logical_OR_expression = Rules<Expr>(self => [
+const logical_OR_expression = RRules<Expr>(self => [
 	Rule([logical_AND_expression]),
 	Rule([self, OR_SY, logical_AND_expression] as const, ($, cg) => cg.NewBinaryOperator('BOR', $[0], $[2], true)),
 ]);
@@ -1348,7 +1423,7 @@ const conditional_test = Rules<any>(
 	Rule([logical_OR_expression] as const, ($, cg) => cg.CheckBooleanExpr($[0]).result),
 );
 
-const conditional_expression = Rules<Expr>(self => [
+const conditional_expression = RRules<Expr>(self => [
 	Rule([logical_OR_expression]),
 	Rule([conditional_test, '?', expression, ':', self] as const, ($, cg) => cg.NewConditionalOperator($[0], $[2], $[4])),
 ]);
@@ -1401,7 +1476,7 @@ const state = Rules(
 	Rule([TYPEIDENT_SY, '=', state_value] as const, ($, cg) => cg.StateInitializer($[0], $[2])),
 );
 
-const state_list = Rules<Expr>(self => [
+const state_list = RRules<Expr>(self => [
 	Rule([state, ';'] as const),
 	Rule([self, state, ';'] as const, $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[1]))
 ]);
@@ -1417,7 +1492,7 @@ const _initializer = Rules<any>(
 	Rule([SAMPLERSTATE_SY, '{', state_list, '}'] as const,	$ => $[2]),
 );
 
-const parameter_declaration = Rules<Decl>(self => [
+const parameter_declaration = RRules<Decl>(self => [
 	Rule([attribute, self] as const, $ => $[1].AddAttribute($[0])),
 	Rule([declaration_specifiers, declarator] as const, ($, cg) => cg.Param_Init_Declarator($[1])),
 	Rule([declaration_specifiers, declarator, '=', initializer] as const, ($, cg) => cg.Param_Init_Declarator($[1], $[3])),
@@ -1482,7 +1557,7 @@ const assembly = Rules(
 	Rule([], ($, cg) => cg.ParseAsm())
 );
 
-const balanced_statement = Rules<Stmt>(self => [
+const balanced_statement = RRules<Stmt>(self => [
 	Rule([compound_header, block_item_list, compound_tail] as const, ($, cg) => cg.NewBlockStmt($[1], cg.popped_scope)),
 	Rule([compound_header, compound_tail] as const, () => ({} as Stmt)),
 
@@ -1509,7 +1584,7 @@ const balanced_statement = Rules<Stmt>(self => [
 	Rule([ASM_SY, '{', assembly, '}'] as const, $ => $[2]),
 ]);
 
-const dangling_statement = Rules<Stmt>(self => [
+const dangling_statement = RRules<Stmt>(self => [
 //	dangling_if
 	Rule([if_header, statement] as const, $ => $[0].SetThenElseStmts($[1])),
 	Rule([if_header, balanced_statement, ELSE_SY, self] as const, $ => $[0].SetThenElseStmts($[1], $[3])),
@@ -1518,7 +1593,7 @@ const dangling_statement = Rules<Stmt>(self => [
 	Rule([FOR_SY, '(', for_expression_init, ';', boolean_expression_opt, ';', for_expression_opt, ')', self] as const, ($, cg) => cg.NewForStmt($[2], $[4], $[6], $[8])),
 ]);
 
-const _statement = Rules<Stmt>(self => [
+const _statement = RRules<Stmt>(self => [
 	Rule([attribute, self] as const, $ => $[1].AddAttribute($[0])),
 	Rule([balanced_statement]),
 	Rule([dangling_statement]),
@@ -1536,7 +1611,7 @@ const function_decl_header = Rules<Decl>(
 	Rule([OPERATOR_SY, operator, '('] as const, ($, cg) => cg.FunctionDeclHeader(cg.NewDeclNode(cg.Atom($[1]), cg.type_specs))),
 );
 
-const _basic_declarator = Rules<Decl>(self => [
+const _basic_declarator = RRules<Decl>(self => [
 	Rule([identifier] as const, ($, cg) => cg.NewDeclNode($[0], cg.type_specs)),
 	Rule([self, '[', constant_expression, ']'] as const, ($, cg) => cg.Array_Declarator($[0], $[2], 0)),
 	Rule([self, '[', ']'] as const, ($, cg) => cg.Array_Declarator($[0], 0, 1)),
@@ -1560,7 +1635,7 @@ const semantic_declarator = Rules<Decl>(
 /* Annotations */
 /***************/
 
-const annotation_decl_list = Rules<Stmt>(self => [
+const annotation_decl_list = RRules<Stmt>(self => [
 	Rule([/*, empty, */] as const, () => ({} as Stmt)),
 	Rule([self, declaration] as const),
 ]);
@@ -1578,7 +1653,7 @@ const _declarator = Rules<Decl>(
 	Rule([semantic_declarator, annotation] as const),
 );
 
-const function_definition_header = Rules<Decl>(self => [
+const function_definition_header = RRules<Decl>(self => [
 	Rule([attribute, self] as const, $ => $[1].AddAttribute($[0])),
 	Rule([declaration_specifiers, declarator, '{'] as const, ($, cg) => cg.Function_Definition_Header($[1])),
 ]);
@@ -1601,7 +1676,7 @@ const struct_declaration = Rules<any>(
 	Rule([function_definition]),
 );
 
-const struct_declaration_list = Rules(self => [
+const struct_declaration_list = RRules(self => [
 	Rule([struct_declaration]),
 	Rule([self, struct_declaration]),
 ]);
@@ -1622,7 +1697,7 @@ const template_arg = Rules(
 	Rule([additive_expression] as const, ($, cg) => cg.IntToType(cg.GetConstant($[0], 0))),
 );
 
-const non_empty_template_arg_list = Rules<Type[]>(self => [
+const non_empty_template_arg_list = RRules<Type[]>(self => [
 	Rule([template_arg] as const, ($, cg) => cg.AddtoTypeList([], $[0])),
 	Rule([self, ',', template_arg] as const, ($, cg) => cg.AddtoTypeList($[0], $[2])),
 ]);
@@ -1632,8 +1707,8 @@ const template_arg_list = Rules<Type[]>(
 );
 
 const templated_type = Rules(
-	Rule([TEMPLATEIDENT_SY] as const, ($, cg) => cg.LookUpTypeSymbol($[0]).InstantiateTemplate([])),
-	Rule([TEMPLATEIDENT_SY, '<', template_arg_list, '>'] as const, ($, cg) => cg.LookUpTypeSymbol($[0]).InstantiateTemplate($[2])),
+	Rule([TEMPLATEIDENT_SY] as const, ($, cg) => cg.InstantiateTemplate(cg.LookUpTypeSymbol($[0]), [])),
+	Rule([TEMPLATEIDENT_SY, '<', template_arg_list, '>'] as const, ($, cg) => cg.InstantiateTemplate(cg.LookUpTypeSymbol($[0]),$[2])),
 );
 
 
@@ -1704,7 +1779,7 @@ const function_specifier = Rules<number>(
 	Rule([INTERNAL_SY] as const, () => Type.MISC_INTERNAL),
 );
 
-const abstract_declaration_specifiers2 = Rules<Derived>(self => [
+const abstract_declaration_specifiers2 = RRules(self => [
 	Rule([type_specifier] as const, 			($, cg) => cg.type_specs.SetDType($[0])),
 	Rule([self, type_qualifier] as const, 		($, cg) => { cg.SetTypeQualifiers($[1]); return cg.type_specs; }),
 	Rule([self, storage_class] as const, 		($, cg) => { cg.SetStorageClass($[1]); return cg.type_specs; }),
@@ -1714,7 +1789,7 @@ const abstract_declaration_specifiers2 = Rules<Derived>(self => [
 	Rule([self, PACKED_SY] as const, 			($, cg) => { cg.SetTypeMisc(Type.MISC_PACKED | Type.MISC_PACKED_KW); return cg.type_specs; }),
 ]);
 
-const _abstract_declaration_specifiers = Rules<Derived>(self => [
+const _abstract_declaration_specifiers = RRules(self => [
 	Rule([abstract_declaration_specifiers2]),
 	Rule([type_qualifier, self] as const, 		($, cg) => { cg.SetTypeQualifiers($[0]); return cg.type_specs; }),
 	Rule([storage_class, self] as const, 		($, cg) => { cg.SetStorageClass($[0]); return cg.type_specs; }),
@@ -1789,7 +1864,7 @@ const pass_item = Rules(
 	Rule([identifier, '=', pass_state_value] as const, ($, cg) => cg.StateInitializer($[0], $[2])),
 );
 
-const pass_item_list = Rules<Expr>(self => [
+const pass_item_list = RRules<Expr>(self => [
 	Rule([pass_item]),
 	Rule([self, ';', pass_item] as const, $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[2])),
 	Rule([self, ';', ] as const),
@@ -1817,7 +1892,7 @@ const external_declaration = Rules<any>(
 	Rule([function_definition]),
 );
 
-const compilation_unit = Rules(self => [
+const compilation_unit = RRules(self => [
 	Rule([external_declaration]),
 	Rule([self, external_declaration]),
 ]);
