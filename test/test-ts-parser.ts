@@ -1,11 +1,16 @@
 import {parseTS} from '../examples/ts-parser';
+import {tsToCode} from '../examples/ts-codegen';
+
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-function test(name: string, code: string) {
+function test(name: string, code: string, outputCode = true) {
 	try {
 		console.log(name);
-		console.log(JSON.stringify(parseTS(code), null, 2));
+		const ast = parseTS(code);
+		if (outputCode)
+			console.log(tsToCode(ast));
+		//console.log(JSON.stringify(ast, null, 2));
 	} catch (e) {
 		console.error(`${name} failed:`, e);
 	}
@@ -26,6 +31,12 @@ export class Terminal<T = string> {
 }
 `);
 
+test('enum', `
+enum Color { Red, Green, Blue }
+const enum Direction { Up = 1, Down, Left, Right }
+`);
+
+
 test('type array', `
 export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: string) {
 	return Rules<T[]>(self => [
@@ -39,6 +50,18 @@ export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: string) {
 
 
 test('source', await fs.readFile(path.join(__dirname, '../src/tison.ts'), 'utf8'));
+
+async function testDir(dir: string) {
+	for (const entry of await fs.readdir(dir, {withFileTypes: true})) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory())
+			await testDir(full);
+		else if (full.endsWith('.ts') && !full.endsWith('.d.ts'))
+			test(full, await fs.readFile(full, 'utf8'), false);
+	}
+}
+
+await testDir(path.join(__dirname, '../..'));
 
 test('typed variables', `
 let a: number = 1;
@@ -75,11 +98,6 @@ interface Point {
 interface Named extends Point {
 	name: string;
 }
-`);
-
-test('enum', `
-enum Color { Red, Green, Blue }
-const enum Direction { Up = 1, Down, Left, Right }
 `);
 
 test('class with generics, implements, typed members', `

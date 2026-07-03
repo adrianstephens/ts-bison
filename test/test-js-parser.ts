@@ -3,13 +3,27 @@ import {jsParser} from '../examples/js-parser';
 function test(name: string, code: string) {
 	try {
 		console.log(name);
-		console.log(JSON.stringify(jsParser.parse(code), null, 2));
+        const ast = jsParser.parse(code);
+		console.log(JSON.stringify(ast, null, 2));
 	} catch (e) {
 		console.error(`${name} failed:`, e);
 	}
 }
 
 console.log('Testing JS Parser...\n');
+
+test('ASI: restricted production (return)', `
+function f() {
+    return
+    1
+}
+`);
+
+test('ASI: omitted semicolons', `
+var a = 1
+var b = 2
+a + b
+`);
 
 test('template literals', `
 var a = \`hello \${1+2} goodbye\`;
@@ -23,18 +37,6 @@ test('template literals: nested braces', `
 var a = \`x = \${ {a: 1}.a } end\`;
 `);
 
-test('ASI: omitted semicolons', `
-var a = 1
-var b = 2
-a + b
-`);
-
-test('ASI: restricted production (return)', `
-function f() {
-    return
-    1
-}
-`);
 
 test('ASI: restricted production (postfix ++)', `
 var a = 1
