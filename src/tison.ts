@@ -1,100 +1,66 @@
 // tison.ts -- A TypeScript-object-based SLR(1)/GLR parser generator.
 //
-// Analogous to GNU Bison, but instead of parsing a .y file you pass a
-// plain TypeScript object that describes your grammar. Terminals carry
-// regex patterns, so tison is the lexer too -- you just feed it a string.
-//
-// Usage:
-//
-//   const NUMBER = /[0-9]+(?:[.][0-9]+)?/;
-//   const PLUS   = /[+]/;
-//   const MINUS  = /[-]/;
-//   const STAR   = /[*]/;
-//   const SLASH  = /[/]/;
-//   const LPAREN = /[(]/;
-//   const RPAREN = /[)]/;
-//
-//   const parser = tison({
-//     skip: [/\s+/],
-//     precedence: [
-//       { assoc: 'left',  name: 'additive' },
-//       { assoc: 'left',  name: 'multiplicative' },
-//       { assoc: 'right', name: 'unary' },
-//     ],
-//     start: 'expr',
-//     rules: {
-//       expr: [
-//         { rhs: ['expr', PLUS,  'expr'], action: ($) => $[0] + $[2], prec: 'additive' },
-//         { rhs: ['expr', MINUS, 'expr'], action: ($) => $[0] - $[2], prec: 'additive' },
-//         { rhs: ['expr', STAR,  'expr'], action: ($) => $[0] * $[2], prec: 'multiplicative' },
-//         { rhs: ['expr', SLASH, 'expr'], action: ($) => $[0] / $[2], prec: 'multiplicative' },
-//         { rhs: [MINUS, 'expr'],         action: ($) => -$[1], prec: 'unary' },
-//         { rhs: [LPAREN, 'expr', RPAREN], action: ($) => $[1] },
-//         { rhs: [NUMBER], action: ($) => parseFloat($[0] as string) },
-//       ],
-//     },
-//   });
-//
-//   console.log(parser.parse('3 + 4 * 5'));   // 23
-//
-// A token is just a RegExp -- reuse the same pattern (by source text) everywhere it's referenced and tison treats it as one terminal, auto-naming it internally.
-// A plain string in `rhs` is a non-terminal if some rule's `lhs` uses that name, otherwise it's sugar for a terminal matching that literal text (e.g. '+' instead of /[+]/).
-//
-// Precedence belongs to rules, not tokens:
-// `precedence` declares named levels (lowest to highest); rules opt in via `prec`, and a shift/reduce conflict is resolved by comparing the reducing rule's level against the level of whichever rule wants to shift instead.
+// Analogous to GNU Bison, but instead of parsing a .y file you pass a plain TypeScript object that describes your grammar.
+// Terminals carry regex patterns, so tison is the lexer too -- you just feed it a string.
 
 // ===================================================================
 //  Public API types
 // ===================================================================
 
-// utility
-//
+export type Assoc = 'left' | 'right' | 'nonassoc' | 'fork';
+export interface PrecEntry {
+	assoc:		Assoc;
+	level?:		number;
+}
+export type Precedence = string | PrecEntry;
+export const forceFork: PrecEntry = {assoc:'fork', level: 0};
+
+function has0args<T>(fn: (() => T) | Action<T>): fn is ()=>T {
+	return fn.length === 0;
+}
+
 // A literal that ends in a word character (e.g. 'var', 'in') is given an implicit trailing word-boundary, so it can never match as a strict prefix of a longer word
 function literalPattern(s: string) {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + (/\w/.test(s[s.length - 1]) ? '(?!\\w)' : '');
 }
 
-export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: string) {
-	return Rules<T[]>(self => [
-		Rule([single] as const,	$ => [$[0]]),
-		sep
-			? Rule([self, sep, single] as const,	$ => [...($[0] as T[]), $[2]])
-			: Rule([self, single] as const,			$ => [...($[0] as T[]), $[1]])
-	]);
-}
-
 interface Ref<T> { ref: string; }
-export function Ref<T>(s: string): Ref<T> {
-	return {ref: s};
+export function Ref<T>(ref: string): Ref<T> {
+	return {ref};
 }
-
-export function Forward<T>(f: () => any) {
-	return f as (() => Rules<T>);
+export function Forward<T>(ref: () => any) {
+	return ref as (() => Rules<T>);
 }
 export interface TextPos {
 	offset: number; line: number; col: number;
 }
-export interface LexState extends TextPos {
-	prev?:	Terminal;	// the most recently returned non-ignored terminal -- feeds LexContext.prev
+
+export interface Token {
+	type:	Terminal;
+	value:	string;	// semantic value; available as $[i] in actions
+	pos?:	TextPos;
 }
 
+export interface LexPosition extends TextPos {
+	prev?:		Token;	// the most recently shifted token
+	remaining:	string;	// raw remaining input from this position onward
+}
 
 // Context given to a terminal's `lex` callback once its pattern has matched at the current position.
-// The callback decides what (if anything) this match actually is:
 //   - return undefined to reject the match (it won't compete this round, so a shorter match from a different terminal can win instead)
 //   - return the terminal itself to accept it normally
 //   - return a different terminal to reclassify the match as that instead
-// `peekNext` looks past this match non-destructively, for terminals (like whitespace) that need to know what's coming to decide how to classify themselves
-export interface LexContext extends LexState {
-	text:		string;
-	peekNext:	() => Token | null;
-	peekText:	() => string;
+// `next` looks past this match non-destructively, for terminals (like whitespace) that need to know what's coming to decide how to classify themselves
+export interface LexContext extends LexPosition {
+	match:		string;	// the text this terminal just matched
+	next(): 	Token | undefined;
 }
 
 export type TerminalCallback<C = any> = (lexctx: LexContext, ctx: C) => Terminal | string | RegExp | undefined;
+export type RecoveryCallback = (lex: LexPosition, row: Map<Terminal, ActionEntry>) => Token | undefined;
 
 export class Terminal<T = any> {
-	ignore = false;
+	_ignore = false;
 	pattern?: RegExp;
 	constructor(public name: string, pattern?: RegExp, public callback?: TerminalCallback) {
 		if (pattern)
@@ -103,18 +69,18 @@ export class Terminal<T = any> {
 }
 
 export function termOneOf<T extends string>(names: readonly T[]) {
-	return new Terminal<T>(names.join('|'), RegExp(names.map(literalPattern).join('|')));
+	const sorted = [...names].sort((a, b) => b.length - a.length);
+	return new Terminal<T>(names.join('|'), RegExp(sorted.map(literalPattern).join('|')));
 }
 
 export function terminal(name: string, pattern?: RegExp, lex?: TerminalCallback) {
 	return new Terminal<string>(name, pattern, lex);
 }
 
-export type Rules<T> = Rule<T, any>[]
 type Action<T, C = any, A = any[]> = (values: A, ctx: C) => T
 type Sym<C = any> = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any, C>;
 
-type ElemValue<S> = S extends Rule<infer U, any>[] ? U
+type ElemValue<S> = S extends Rule<infer U>[] ? U
 	: S extends RegExp ? string
 	: S extends Terminal<infer U> ? U
 	: S extends (()=>infer U) ? ElemValue<U>
@@ -125,33 +91,103 @@ type ElemValue<S> = S extends Rule<infer U, any>[] ? U
 
 type ValuesOf<T extends readonly Sym[]> = {[K in keyof T]: ElemValue<T[K]>}
 
-export interface Rule<T, R extends readonly Sym[]> {
-	rhs:		R;
-	action?:	(values: ValuesOf<R>, ctx: any) => T;
-	prec?:		string;
+/*
+export interface Rule<T> {
+	rhs:		Sym[];
+	action?:	(values: any[], ctx: any) => T;
+	prec?:		Precedence;
 }
-export type ValueOf<R> = R extends Rule<infer T, any>[] ? T : never;
+*/
+export type Rule<T> = Rules<T> | {
+	rhs:		Sym[];
+	action?:	(values: any[], ctx: any) => T;
+	prec?:		Precedence;
+}
 
-export function Rule<R extends readonly Sym[]>(rhs: R): Rule<ValuesOf<R>[0], R>;
-export function Rule<T, R extends readonly Sym[], C = any>(rhs: R, action?: Action<T, C, ValuesOf<R>>, prec?: string): Rule<T, R>;
-export function Rule(rhs: Sym[], action?: Action<any, any>, prec?: string) {
+export function Rule<R extends readonly Sym[]>(rhs: R): Rule<ElemValue<R[0]>>;
+export function Rule<T, R extends readonly Sym[], C = any>(rhs: R, action: Action<T, C, ValuesOf<R>>, prec?: Precedence): Rule<T>;
+export function Rule(rhs: Sym[], action?: Action<any, any>, prec?: Precedence) {
 	return { rhs, action, prec };
 }
 
 // Pins `ctx`'s type to `C` for every rule built with the returned function
 export function makeRule<C>() {
-	function boundRule<R extends readonly Sym<C>[]>(rhs: R): Rule<ValuesOf<R>[0], R>;
-	function boundRule<T, R extends readonly Sym<C>[]>(rhs: R, action?: Action<T, C, ValuesOf<R>>, prec?: string): Rule<T, R>;
-	function boundRule(rhs: Sym[], action?: Action<any, any>, prec?: string) {
+	function boundRule<R extends readonly Sym<C>[]>(rhs: R): Rule<ElemValue<R[0]>>;
+	function boundRule<T, R extends readonly Sym<C>[]>(rhs: R, action: Action<T, C, ValuesOf<R>>, prec?: Precedence): Rule<T>;
+	function boundRule(rhs: Sym[], action?: Action<any, any>, prec?: Precedence) {
 		return { rhs, action, prec };
 	}
 	return boundRule;
 }
+//export const Rule = makeRule<any>;
+
+
+// Rest-parameter alternative to Rule(): pass rhs symbols directly instead of wrapping them in an array literal with `as const`.
+// Any parameter may be an inline action -- it's typed against exactly the parameters that precede it.
+// The rule's own result defaults to whatever the *last* argument evaluates to
+
+type SymR<A extends readonly unknown[], C = any> = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any, C, ValuesOfR<A>>;
+type RSymR<T, A extends readonly unknown[], C = any> = Terminal<T> | Rules<T> | (()=>Rules<T>) | Ref<T> | Action<T, C, ValuesOfR<A>>;
+type ValuesOfR<T extends readonly unknown[]> = { [K in keyof T]: ElemValue<T[K]> };
+/*
+export function RuleR<T, C, S1 extends RSymR<T, [], C>>(s1: S1): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends RSymR<T, [S1], C>>(s1: S1, s2: S2): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends RSymR<T, [S1, S2], C>>(s1: S1, s2: S2, s3: S3): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends RSymR<T, [S1, S2, S3], C>>(s1: S1, s2: S2, s3: S3, s4: S4): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends RSymR<T, [S1, S2, S3, S4], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends RSymR<T, [S1, S2, S3, S4, S5], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends RSymR<T, [S1, S2, S3, S4, S5, S6], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9], C>, S11 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10, s11: S11): Rule<T>;
+export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9], C>, S11 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9, S10], C>, S12 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10, s11: S11, s12: S12): Rule<T>;
+
+export function RuleR(...syms: any[]): any {
+	const last = syms.at(-1);
+	if (typeof last === 'function' && last.length > 0)
+		return Rule(syms.slice(0, -1), last);
+	return Rule(syms, (values: any[]) => values[values.length - 1]);
+}
+*/
+export function WithPrec<T>(rule: Rule<T>, prec: Precedence): Rule<T> {
+	return {...rule, prec};
+}
+
+// Pins `ctx`'s type to `C` for every rule built with the returned function
+export function makeRuleR<C>() {
+	function boundRule<T, S1 extends RSymR<T, [], C>>(s1: S1): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends RSymR<T, [S1], C>>(s1: S1, s2: S2): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends RSymR<T, [S1, S2], C>>(s1: S1, s2: S2, s3: S3): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends RSymR<T, [S1, S2, S3], C>>(s1: S1, s2: S2, s3: S3, s4: S4): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends RSymR<T, [S1, S2, S3, S4], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends RSymR<T, [S1, S2, S3, S4, S5], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends RSymR<T, [S1, S2, S3, S4, S5, S6], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9], C>, S11 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10, s11: S11): Rule<T>;
+	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9], C>, S11 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9, S10], C>, S12 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10, s11: S11, s12: S12): Rule<T>;
+	function boundRule(...syms: any) { return RuleR(syms); }
+	return boundRule;
+}
+export const RuleR = makeRuleR<any>();
+
+
+export type Rules<T> = Rule<T>[]
+
+export function Rules<T>(...alts: Rules<T>): Rules<T> {
+	return alts;
+}
+export function RRules<T>(builder: (self: () => Rules<T>) => Rules<T>): Rules<T> {
+	const rules: Rules<T> = builder(() => rules);
+	return rules;
+}
 
 // A self-recursive rule set that allows the current rules to be referenced as `self`
-export function Rules<T>(builder: (self: () => Rules<T>) => Rules<T>): Rules<T>;
-export function Rules<T>(...alts: Rules<T>): Rules<T>;
-export function Rules<T>(...args: [(self: () => Rules<T>) => Rules<T>] | Rules<T>): Rules<T> {
+export function CRules<T>(builder: (self: () => Rules<T>) => Rules<T>): Rules<T>;
+export function CRules<T>(...alts: Rules<T>): Rules<T>;
+export function CRules<T>(...args: [(self: () => Rules<T>) => Rules<T>] | Rules<T>): Rules<T> {
 	if (args.length === 1 && typeof args[0] === 'function') {
 		const rules = args[0](() => rules);
 		return rules;
@@ -159,18 +195,28 @@ export function Rules<T>(...args: [(self: () => Rules<T>) => Rules<T>] | Rules<T
 	return args as Rules<T>;
 }
 
-type Assoc = 'left' | 'right' | 'nonassoc';
-export interface Precedence {
-	name:		string;
-	assoc:		Assoc;
+export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: Sym) {
+	return RRules<T[]>(self => [
+		Rule([single] as const,	$ => [$[0]]),
+		sep
+			? Rule([self, sep, single] as const,	$ => [...($[0] as T[]), $[2]])
+			: Rule([self, single] as const,			$ => [...($[0] as T[]), $[1]])
+	]);
+}
+export function OneOf<T extends string>(names: readonly T[]) {
+	return Rules(...names.map(name => Rule([name])));
 }
 
+export type TermLike = RegExp | string | Terminal;
+export type MergeFn = (left: unknown, right: unknown) => unknown;
+
 export interface GrammarSpec {
-	skip?:			(RegExp | Terminal)[];
-	precedence?:	Record<string, Assoc>;
+	precedence?:	Record<string, Assoc | PrecEntry>;
 	start?:			Rules<any>;		// defaults to the first value of `rules`
 	rules?:			Record<string, Rules<any>>;
-	recover?: (row: Map<Terminal, ActionEntry>, token: Token, prevToken: Token | undefined) => Token | undefined;
+	skip?:			TermLike[];
+	terminals?:		TermLike[];
+	recover?:		RecoveryCallback;
 }
 
 export interface Parser {
@@ -182,19 +228,15 @@ export interface Parser {
 //  Internal representation
 // ===================================================================
 
-export class NonTerminal {
+class NonTerminal {
 	constructor(public name: string) {}
 }
 
-export type InternalSym = Terminal | NonTerminal;
+type InternalSym = Terminal | NonTerminal;
 
-export const EOF	= new Terminal('$end');
-export const ACCEPT	= new NonTerminal('$accept');
-
-interface PrecEntry {
-	level:		number;
-	assoc:		Assoc;
-}
+const EOF		= new Terminal('$end');
+const ERROR		= new Terminal('$error');
+const ACCEPT	= new NonTerminal('$accept');
 
 export interface InternalRule {
 	id:			number;
@@ -202,18 +244,21 @@ export interface InternalRule {
 	rhs:		InternalSym[];
 	action: 	Action<unknown>;
 	prec?:		PrecEntry;
+	peek?:		number;		// extra preceding stack values to pass to `action` without popping them (mid-rhs actions: values of the symbols before them in the containing rule)
 }
 
 export type ActionEntry =
 	| { kind: 'shift';	state:	number }
 	| { kind: 'reduce'; rule:	number }
 	| { kind: 'accept' }
+	| { kind: 'ignore' }
+	| { kind: 'error' }
 	| { kind: 'conflict'; entries: ActionEntry[] }
 
 export interface ConflictReport {
 	state:		number;
 	term:		Terminal;
-	kind:		'shift-reduce' | 'reduce-reduce' | 'conflict';
+	kind:		'auto' | 'shift-reduce' | 'reduce-reduce' | 'conflict';
 	resolution: string;
 }
 export interface ParseTables {
@@ -227,12 +272,10 @@ export interface ParseTables {
 //  Grammar builder
 // ===================================================================
 
-function has0args<T>(fn: (() => T) | Action<T>): fn is ()=>T {
-	return fn.length === 0;
-}
-
 export class GrammarBuilder {
-	rules:		InternalRule[] = [];
+	rules:				InternalRule[] = [];
+	alwaysTerminals:	Terminal[] = [];
+	alwaysSkip:			Terminal[] = [];
 	terminalsByName	= new Map<string, Terminal>();
 
 	private first	= new Map<InternalSym, { terms: Set<Terminal>; nullable: boolean }>();
@@ -272,7 +315,10 @@ export class GrammarBuilder {
 			return term;
 		};
 
-		const anon = (action: Action<any>) => {
+		const internTermLike = (s: TermLike) =>
+			typeof(s) === 'string' ? internTerminal(s, new RegExp(literalPattern(s))) : s instanceof RegExp ? internTerminal(s.source, s) : addTerminal(s);
+
+		const anon = (action: Action<any>, peek: number) => {
 			const id	= this.rules.length;
 			const lhs	= new NonTerminal(`anon ${id}`);
 
@@ -281,24 +327,31 @@ export class GrammarBuilder {
 				id,
 				lhs,
 				rhs:	[],
-				action
+				action,
+				peek,
 			});
 			return lhs;
 		};
 
 		// -- Precedence -----------------------------------------------
-		// Levels are pure named abstractions -- rules opt into one via `prec`.
 
 		const prec	= new Map<string, PrecEntry>();
 		if (spec.precedence) {
-			Object.entries(spec.precedence).forEach(([name, assoc], i) => {
-				prec.set(name, { level: i, assoc: assoc });
-			});
+			let i = 0;
+			for (const [name, val] of Object.entries(spec.precedence)) {
+				if (typeof val !== 'string' && val.level)
+					i = val.level;
+				prec.set(name, { level: i++, assoc: typeof val === 'string' ? val : val.assoc });
+			}
 		}
+
+		// -- provided terminals ------------------------------------
+		for (const s of spec.terminals ?? [])
+			this.alwaysTerminals.push(internTermLike(s));
 
 		// -- Skip (whitespace/comments) ------------------------------------
 		for (const s of spec.skip ?? [])
-			(s instanceof RegExp ? internTerminal(s.source, s) : addTerminal(s)).ignore = true;
+			this.alwaysSkip.push(internTermLike(s));
 
 		// -- Augmented start rule -------------------------------------
 		this.startSymbol = internByRules(rules[0])!;
@@ -312,25 +365,36 @@ export class GrammarBuilder {
 
 		// -- Discover non-terminals -----------------------------------
 
-		const resolveSym = (sym: Sym) =>
+		const resolveSym = (sym: Sym, i: number) =>
 			typeof sym === 'string'		? nonTerminalsByName.get(sym) ?? internTerminal(sym, new RegExp(literalPattern(sym)))
-			: typeof sym === 'function'	? (has0args(sym) ? internByRules(sym()) : anon(sym))
+			: typeof sym === 'function'	? (has0args(sym) ? internByRules(sym()) : anon(sym, i))
 			: sym instanceof RegExp		? internTerminal(sym.source, sym)
 			: sym instanceof Terminal	? this.terminalsByName.get(sym.name) ?? addTerminal(sym)
-			: 'ref' in sym				? nonTerminalsByName.get(sym.ref)
+//			: 'ref' in sym				? (typeof sym.ref === 'string' ? nonTerminalsByName.get(sym.ref) : internByRules(sym.ref()))
+			: 'ref' in sym				? nonTerminalsByName.get(sym.ref)!
 			: internByRules(sym)!;
 
 		for (const r of rules) {
 			const lhs = nonTerminalsByRules.get(r)!;
 			for (const alt of r) {
-				const rhs = alt.rhs.map(resolveSym);
-				this.rules.push({
-					id:		this.rules.length,
-					lhs,
-					rhs,
-					action:	alt.action ?? ((values: any[]) => values[0]) as any,
-					prec:	alt.prec !== undefined ? prec.get(alt.prec) : undefined,
-				});
+				if (Array.isArray(alt)) {
+					const nt = internByRules(alt);
+					this.rules.push({
+						id:		this.rules.length,
+						lhs,
+						rhs:	[nt],
+						action:	(values: any[]) => values[0],
+					});
+				} else {
+					const rhs = alt.rhs.map(resolveSym);
+					this.rules.push({
+						id:		this.rules.length,
+						lhs,
+						rhs,
+						action:	alt.action ?? ((values: any[]) => values[0]),
+						prec:	alt.prec === undefined ? undefined : typeof alt.prec === 'string' ? prec.get(alt.prec) : alt.prec,
+					});
+				}
 			}
 		}
 
@@ -384,34 +448,28 @@ export class GrammarBuilder {
 			const inSet = new Set(items.map(lr0Key));
 			const queue = [...items];
 			for (const { rule, dot } of queue) {
-				const r = this.rules[rule];
-				if (dot >= r.rhs.length)
-					continue;
-				const B = r.rhs[dot];
-				if (!(B instanceof NonTerminal))
-					continue;
-				for (const prod of this.rules) {
-					if (prod.lhs !== B)
-						continue;
-					const ni: LR0Item = { rule: prod.id, dot: 0 };
-					const k = lr0Key(ni);
-					if (!inSet.has(k)) {
-						inSet.add(k);
-						queue.push(ni);
+				const B = this.rules[rule].rhs[dot];
+				if (B instanceof NonTerminal) {
+					for (const prod of this.rules) {
+						if (prod.lhs === B) {
+							const ni	= { rule: prod.id, dot: 0 };
+							const k		= lr0Key(ni);
+							if (!inSet.has(k)) {
+								inSet.add(k);
+								queue.push(ni);
+							}
+						}
 					}
 				}
 			}
 			return queue;
 		};
 
-		const lr0Goto = (items: LR0Item[], sym: InternalSym): LR0Item[] => {
+		const lr0Goto = (items: LR0Item[], sym: InternalSym) => {
 			const moved = items
-				.filter(i => {
-					const r = this.rules[i.rule];
-					return i.dot < r.rhs.length && r.rhs[i.dot] === sym;
-				})
+				.filter(i => this.rules[i.rule].rhs[i.dot] === sym)
 				.map(i => ({ rule: i.rule, dot: i.dot + 1 }));
-			return moved.length ? lr0Closure(moved) : [];
+			return lr0Closure(moved);
 		};
 
 		const lr0SetKey = (items: LR0Item[]) => [...items].map(lr0Key).sort().join('|');
@@ -457,7 +515,7 @@ export class GrammarBuilder {
 			for (const rule of this.rules) {
 				for (let i = 0; i < rule.rhs.length; i++) {
 					const sym = rule.rhs[i];
-					if (!(sym instanceof NonTerminal))
+					if (sym instanceof Terminal)
 						continue;
 					const followSym = follow.get(sym)!;
 
@@ -513,6 +571,14 @@ export class GrammarBuilder {
 					for (const la of follow.get(r.lhs)!)
 						this.setAction(action[s], la, { kind: 'reduce', rule: item.rule }, s, shiftRule[s].get(la)?.prec, conflicts);
 			}
+			for (const term of this.alwaysTerminals) {
+				if (!action[s].has(term))
+					action[s].set(term, {'kind': 'error'} );
+			}
+			for (const term of this.alwaysSkip) {
+				if (!action[s].has(term))
+					action[s].set(term, {'kind': 'ignore'} );
+			}
 		}
 
 		return {
@@ -550,11 +616,14 @@ export class GrammarBuilder {
 			//const shiftPrec		= shiftRuleId !== undefined ? this.rules[shiftRuleId].prec : undefined;
 			const reducePrec	= this.rules[reduceEntry.rule].prec;
 
-			if (shiftPrec !== undefined && reducePrec !== undefined) {
-				if (reducePrec.level > shiftPrec.level) {
+			if (reducePrec?.assoc === 'fork' || shiftPrec?.assoc === 'fork') {
+				row.set(term, {kind: 'conflict', entries: [shiftEntry, reduceEntry]});
+				conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR (fork)' });
+			} else if (shiftPrec !== undefined && reducePrec !== undefined) {
+				if (reducePrec.level! > shiftPrec.level!) {
 					row.set(term, reduceEntry);
 					conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'reduce (reduce-rule prec > shift-rule prec)' });
-				} else if (reducePrec.level < shiftPrec.level) {
+				} else if (reducePrec.level! < shiftPrec.level!) {
 					row.set(term, shiftEntry);
 					conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'shift (shift-rule prec > reduce-rule prec)' });
 				} else if (shiftPrec.assoc === 'left') {
@@ -565,19 +634,22 @@ export class GrammarBuilder {
 					conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'shift (right assoc)' });
 				} else {
 					row.set(term, {kind: 'conflict', entries: [shiftEntry, reduceEntry]});
-					conflicts.push({ state, term, kind: 'conflict', resolution: 'error (nonassoc)' });
+					conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR' });
 				}
 			} else {
 				row.set(term, shiftEntry);
-				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'shift (default, no prec info)' });
+				conflicts.push({ state, term, kind: 'auto', resolution: 'shift (default, no prec info)' });
 			}
-			return;
-		}
 
-		if (existing.kind === 'reduce' && incoming.kind === 'reduce') {
-			const winner = existing.rule < incoming.rule ? existing : incoming;
-			row.set(term, winner);
-			conflicts.push({ state, term, kind: 'reduce-reduce', resolution: `reduce by rule ${winner.rule} (earlier rule wins)` });
+		} else if (existing.kind === 'reduce' && incoming.kind === 'reduce') {
+			if (this.rules[existing.rule].prec?.assoc === 'fork' || this.rules[incoming.rule].prec?.assoc === 'fork') {
+				row.set(term, {kind: 'conflict', entries: [existing, incoming]});
+				conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR (fork)' });
+			} else {
+				const winner = existing.rule < incoming.rule ? existing : incoming;
+				row.set(term, winner);
+				conflicts.push({ state, term, kind: 'reduce-reduce', resolution: `reduce by rule ${winner.rule} (earlier rule wins)` });
+			}
 		}
 		// shift-shift / accept: keep existing (shouldn't occur in valid grammars)
 	}
@@ -587,19 +659,12 @@ export class GrammarBuilder {
 //  Parser runtime
 // ===================================================================
 
-export interface Token {
-	type:	Terminal;
-	value:	string;	// semantic value; available as $[i] in actions
-	pos?:	TextPos;
-}
-
-
 function advancePos(state: TextPos, text: string) {
 	for (const ch of text) {
 		if (ch === '\n') {
 			state.line++;
 			state.col = 1;
-			console.log(state.line);
+			//console.log(state.line);
 		} else {
 			state.col++;
 		}
@@ -608,134 +673,188 @@ function advancePos(state: TextPos, text: string) {
 	return state;
 }
 
-export interface TokenStream {
-	// `allowed`, if given, is consulted only while computing a fresh token (i.e. the first peek() since the last consume())
-	peek(allowed?: Map<Terminal, ActionEntry>): Token;
+interface Lexer extends TextPos {
+	prev?:		Token;
+	next(allowed: Map<Terminal, ActionEntry>): 	Token;
 	peekText(): string;
-	consume(): void;
 }
 
-type TryRecover = (row: Map<Terminal, ActionEntry>, tok: Token, prevToken: Token | undefined) => { entry: ActionEntry; tok: Token; } | undefined
+// Combines the values of two GLR derivation paths that have converged onto the same state+parent (see `runGlrFork`).
+// Only consulted for reduce-driven convergence, keyed by the reducing rule's id (its index in `tables.rules`) --
+// shift-driven convergence always uses `defaultMerge`, since both paths shifted the same literal token.
+// Two forked paths that both survive to the same convergence point with an identical value aren't a real
+// ambiguity to report -- they're the same parse reached two ways (e.g. a reduce-reduce `fork` between two
+// rules that happen to build the same AST shape for a given input). Collapse those instead of accumulating
+// an array, which downstream consumers would otherwise see instead of the plain value they expect.
+const sameValue = (a: unknown, b: unknown) => a === b || JSON.stringify(a) === JSON.stringify(b);
+const defaultMerge: MergeFn = (left, right) => {
+	if (Array.isArray(left))
+		return left.some(v => sameValue(v, right)) ? left : [...left, right];
+	return sameValue(left, right) ? left : [left, right];
+};
 
-export type MergeFn = (left: unknown, right: unknown) => unknown;
-const defaultMerge: MergeFn = (left, right) => Array.isArray(left) ? [...left, right] : [left, right];
-
-export function nextToken(entries: Terminal[], input: string, state: LexState, ctx: any, resolveSym: (sym: string|RegExp|Terminal|undefined) => Terminal|undefined, allowed?: Map<Terminal, ActionEntry>): Token {
+function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: TextPos & { lastShifted?: Token }, ctx: any, resolveSym: (sym: string|RegExp|Terminal|undefined) => Terminal|undefined): Token {
 
 	while (state.offset < input.length) {
 		const candidates: { term: Terminal; len: number }[] = [];
-		for (const term of entries) {
-			const re = term.pattern!;
-			re.lastIndex = state.offset;
-			const m = re.exec(input);
-			if (m && m[0].length > 0)
-				candidates.push({ term, len: m[0].length });
+		for (const term of allowed.keys()) {
+			const re = term.pattern;
+			if (re) {
+				re.lastIndex = state.offset;
+				const m = re.exec(input);
+				if (m && (m[0].length > 0 || allowed.get(term)?.kind !== 'ignore'))
+					candidates.push({ term, len: m[0].length });
+			}
 		}
 		candidates.sort((a, b) => b.len - a.len
 			|| (a.term.pattern!.source < b.term.pattern!.source ? 1 : a.term.pattern!.source > b.term.pattern!.source ? -1 : 0));
 
-		let chosen:			{ finalTerm: Terminal; len: number } | undefined;
-		let firstViable:	{ finalTerm: Terminal; len: number } | undefined;
+		let chosen:	{ term: Terminal; len: number } | undefined;
 		for (const { term, len } of candidates) {
 			let result: Terminal | undefined;
 			if (!term.callback) {
 				result = term;
 			} else {
 				const text = input.slice(state.offset, state.offset + len);
+				const after = advancePos({...state}, text);
 				result = resolveSym(term.callback({
 					...state,
-					text,
-					peekNext: () => nextToken(entries, input, advancePos({...state}, text), ctx, resolveSym, allowed),
-					peekText: () => input.substring(state.offset)
+					prev:		state.lastShifted,
+					match:		text,
+					remaining:	input.substring(after.offset),
+					next: 		() => nextToken(allowed, input, after, ctx, resolveSym),
 				}, ctx));
 			}
 			if (result) {
-				firstViable ??= { finalTerm: result, len };
-				if (!allowed || result.ignore || allowed.has(result)) {
-					chosen = { finalTerm: result, len };
-					break;
-				}
+				chosen = { term: result, len };
+				break;
 			}
 		}
-		chosen ??= firstViable;
 
 		if (!chosen)
-			throw new SyntaxError(`Unexpected character '${input[state.offset]}' at line ${state.line}, col ${state.col}`);
+			return { type: ERROR, value: input.substring(state.offset), pos: { offset: state.offset, line: state.line, col: state.col }};
 
-		const { finalTerm, len } = chosen;
-		const matched	= input.slice(state.offset, state.offset + len);
-		const token		= !finalTerm.ignore
-			? { type: finalTerm, value: matched, pos: { offset: state.offset, line: state.line, col: state.col } }
+		const matched	= input.slice(state.offset, state.offset + chosen.len);
+		const token		= allowed.get(chosen.term)?.kind !== 'ignore'
+			? { type: chosen.term, value: matched, pos: { offset: state.offset, line: state.line, col: state.col } }
 			: null;
 
 		advancePos(state, matched);
 
-		if (token) {
-			state.prev = finalTerm;
+		if (token)
 			return token;
-		}
 	}
 	return { type: EOF, value: '', pos: { offset: state.offset, line: state.line, col: state.col }};
 }
 
-function dumpStack(valueStack: readonly unknown[]) {
+interface StackEntry { state: number; value: unknown; }
+
+function dumpStack(stack: readonly StackEntry[]) {
 	console.error('Stack dump:');
-	for (let i = 0; i < valueStack.length; i++)
-		console.error(`${'  '.repeat(i)}value: ${JSON.stringify(valueStack[i])}`);
+	for (let i = 0; i < stack.length; i++)
+		console.error(`${'  '.repeat(i)}state: ${stack[i].state}, value: ${JSON.stringify(stack[i].value)}`);
 }
 
-export function runParser(tables: ParseTables, stream: TokenStream, ctx: any, tryRecover: TryRecover, mergeFns: Record<number, MergeFn> = {}) {
-	let stateStack: number[]	= [0];
-	let valueStack: unknown[]	= [];
-	let lastShifted: Token | undefined;
+function recoverCtx(stream: Lexer): LexPosition {
+	return { offset: stream.offset, line: stream.line, col: stream.col, remaining: stream.peekText(), prev: stream.prev };
+}
+
+function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: RecoveryCallback | undefined, mergeFns: Record<number, MergeFn> = {}) {
+	const stack: StackEntry[] = [{ state: 0, value: undefined }];
+
+	let realTok		= stream.next(tables.action[0]);
+
+	// A `recover`-synthesized token (e.g. ASI's phantom `;`) never consumes `realTok` itself -- only a
+	// genuine shift/reduce of `realTok` (or the lexer producing a fresh one) advances `stream.offset`.
+	// If recovery keeps firing at the *same* offset well beyond what any legitimate multi-step recovery
+	// cascade should need, it's re-synthesizing against the exact same real token that's still sitting
+	// there unconsumed: an infinite loop (recovery keeps "fixing" the parse by inserting more phantom
+	// tokens, but the actual unexpected input is never shifted or reported). The bound is generous (not
+	// 1) since a single stuck token can legitimately need a few recovery-driven reduces before it's
+	// finally shift-able, just never anywhere near this many. Found via real files ending in an unmatched
+	// `}` and via `binary-archives/test/test_tar.ts`'s unterminated trailing comment (a different trigger
+	// of the same underlying gap, before the lexer fix for that -- kept as a backstop here in case another
+	// trigger exists).
+	let recoveryStuckAt: number | undefined;
+	let recoveryStuckCount = 0;
+	const MAX_RECOVERY_AT_SAME_OFFSET = 50;
 
 	while (true) {
-		const row			= tables.action[stateStack[stateStack.length - 1]];
-		const realTok		= stream.peek(row);
-		const fromRecovery	= !row.has(realTok.type) ? tryRecover(row, realTok, lastShifted) : undefined;
-		const entry			= fromRecovery?.entry ?? row.get(realTok.type);
-		const tok			= fromRecovery?.tok ?? realTok;
+		const row			= tables.action[stack[stack.length - 1].state];
+		const direct		= row.get(realTok.type);
+		const usingRecovery	= !direct || direct.kind === 'error';
+		if (usingRecovery) {
+			// Deliberately NOT reset when `usingRecovery` is false: a stuck cycle typically alternates
+			// recovery steps with genuine direct shift/reduce steps *of the synthesized token itself*
+			// (e.g. shift the phantom `;`, reduce it into an empty statement, hit recovery again) --
+			// resetting on every non-recovery step means the counter never accumulates, since it's rare
+			// to see two recovery steps in a row even when truly stuck. `stream.offset` only advances
+			// when `realTok` itself is genuinely consumed, so comparing against it (not against "was the
+			// previous step recovery") is what actually detects "no real progress since recovery started".
+			recoveryStuckCount = recoveryStuckAt === stream.offset ? recoveryStuckCount + 1 : 1;
+			recoveryStuckAt = stream.offset;
+			if (recoveryStuckCount > MAX_RECOVERY_AT_SAME_OFFSET) {
+				dumpStack(stack);
+				const pos = recoverCtx(stream);
+				throw new SyntaxError(
+					`Parser stuck in error recovery at line ${pos.line}, col ${pos.col} `
+					+ `(recovery keeps re-inserting a token without consuming '${realTok.type.name}') -- this is a parser/grammar bug, not just invalid input.`
+				);
+			}
+		}
+		const tok			= usingRecovery ? recover?.(recoverCtx(stream), row) : realTok;
+		const entry			= tok && row.get(tok.type);
 
-		if (!entry) {
-			dumpStack(valueStack);
-			const expected = [...row.keys()].filter(k => k !== EOF).map(k => k.name);
+		if (!entry || entry.kind === 'error') {
+			dumpStack(stack);
+			const expected	= [...row].filter(([k, v]) => k !== EOF && v.kind !== 'error').map(([k]) => k.name);
+			const pos		= recoverCtx(stream);
 			throw new SyntaxError(
-				`Unexpected token '${realTok.type.name}'${realTok.pos ? ` at line ${realTok.pos.line}, col ${realTok.pos.col}` : ' at end of input'}. `
+				(realTok.type !== ERROR ? `Unexpected token '${realTok.type.name}'` : `Unexpected character '${pos.remaining[0] ?? ''}'`)
+				+ ` at line ${pos.line}, col ${pos.col}. `
 				+ `Expected: ${expected.length ? expected.join(', ') : '(nothing)'}`
 			);
 		}
 
 		if (entry.kind === 'conflict') {
-			const result = runGlrFork(tables, stream, ctx, mergeFns, tryRecover, stateStack, valueStack, lastShifted);
-			if (result.accepted)
+			const result = runGlrFork(tables, stream, tok, ctx, mergeFns, recover, stack);
+			if (result)
 				return result.value;
-			({stateStack, valueStack, lastShifted } = result);
+			realTok = stream.next(tables.action[stack[stack.length - 1].state]);
 
 		} else if (entry.kind === 'shift') {
-			stateStack.push(entry.state);
-			valueStack.push(tok.value);
-			if (!fromRecovery) {
-				stream.consume();
-				lastShifted = realTok;
+			stack.push({ state: entry.state, value: tok.value });
+			if (tok === realTok) {
+				stream.prev = realTok;
+				realTok = stream.next(tables.action[entry.state]);
+			} else if (realTok.type === ERROR) {
+				realTok = stream.next(tables.action[entry.state]);
 			}
+
 		} else if (entry.kind === 'reduce') {
 			const rule		= tables.rules[entry.rule];
 			const rhsLen	= rule.rhs.length;
-			const vals		= valueStack.splice(valueStack.length - rhsLen, rhsLen);
-			stateStack.splice(stateStack.length - rhsLen, rhsLen);
+			const peek		= rule.peek ?? 0;
+			const vals		= [
+				...(peek ? stack.slice(stack.length - rhsLen - peek, stack.length - rhsLen).map(e => e.value) : []),
+				...stack.splice(stack.length - rhsLen, rhsLen).map(e => e.value)
+			];
 
-			const topState	= stateStack[stateStack.length - 1];
-			const nextState = tables.goto[topState].get(rule.lhs);
-			if (nextState === undefined)
+			const topState	= stack[stack.length - 1].state;
+			const state = tables.goto[topState].get(rule.lhs);
+			if (state === undefined)
 				throw new Error(`No GOTO entry for state ${topState}, non-terminal '${rule.lhs.name}'`);
 
-			stateStack.push(nextState);
 			const value = rule.action(vals, ctx);
-			//console.log(`${'  '.repeat(stateStack.length)}${rule.lhs.name} -> ${rule.rhs.map(r => r.name).join(' ')}, made: ${JSON.stringify(value)}`);
-			valueStack.push(value);//rule.action(vals, ctx));
+			//console.log(`${'  '.repeat(stack.length)}${rule.lhs.name} -> ${rule.rhs.map(r => r.name).join(' ')}, made: ${JSON.stringify(value)}`);
+			stack.push({ state, value });
+
+		} else if (entry.kind === 'accept') {
+			return stack[stack.length - 1].value;
+
 		} else {
-			// accept
-			return valueStack[valueStack.length - 1];
+			// 'error' is filtered out above; 'ignore' tokens are never returned by the lexer.
+			throw new Error(`Internal error: unexpected action kind '${entry.kind}'`);
 		}
 	}
 }
@@ -745,14 +864,12 @@ export function runParser(tables: ParseTables, stream: TokenStream, ctx: any, tr
 //  GLR fork explorer
 // ===================================================================
 
-type GlrForkResult =
-	| { accepted: true; value: unknown }
-	| { accepted: false; stateStack: number[]; valueStack: unknown[]; lastShifted: Token | undefined };
+type GlrForkResult = { accepted: true; value: unknown } | undefined;
 
-
+// On a non-accepting return, `stack` has been overwritten in place with the settled single derivation.
 function runGlrFork(
-	tables: ParseTables, stream: TokenStream, ctx: any, mergeFns: Record<number, MergeFn>, tryRecover: TryRecover,
-	stateStack: readonly number[], valueStack: readonly unknown[], lastShifted: Token | undefined,
+	tables: ParseTables, stream: Lexer, tok: Token, ctx: any, mergeFns: Record<number, MergeFn>, recover: RecoveryCallback | undefined,
+	stack: StackEntry[],
 ): GlrForkResult {
 
 	interface StackFrame {
@@ -762,100 +879,118 @@ function runGlrFork(
 		value:	unknown;
 	}
 
-	interface Path {
-		id:		number;
-		top:	StackFrame;
-	}
-
 	let frameIdCounter	= 0;
-	let pathIdCounter	= 0;
 	let accepted		= false;
 	let acceptedValue: unknown;
 
 	const makeFrame		= (parent: StackFrame | null, state: number, value: unknown) => ({ id: frameIdCounter++, parent, state, value });
-	const makePath		= (top: StackFrame): Path => ({ id: pathIdCounter++, top });
 	const convergeKey	= (top: StackFrame) => `${top.state}:${top.parent ? top.parent.id : -1}`;
-	const mergeInto		= (into: StackFrame, incoming: StackFrame) => makeFrame(into.parent, into.state, (mergeFns[into.state] ?? defaultMerge)(into.value, incoming.value));
+	const mergeInto		= (into: StackFrame, incoming: StackFrame, ruleId?: number) =>
+		makeFrame(into.parent, into.state, ((ruleId !== undefined ? mergeFns[ruleId] : undefined) ?? defaultMerge)(into.value, incoming.value));
 
 	// Flat stack -> frame chain
-	let frame = makeFrame(null, stateStack[0], undefined);
-	for (let i = 1; i < stateStack.length; i++)
-		frame = makeFrame(frame, stateStack[i], valueStack[i - 1]);
+	let frame = makeFrame(null, stack[0].state, undefined);
+	for (let i = 1; i < stack.length; i++)
+		frame = makeFrame(frame, stack[i].state, stack[i].value);
 
-	const activeLists: Path[][] = [[makePath(frame)]];
+	let active = new Map([[convergeKey(frame), frame]]);
+
+	// General circuit breaker on top of the recovery-specific one further down: bounds *all* work done
+	// across this whole call (every dequeue from every position's worklist), not just recovery-driven
+	// re-registrations at a single position. Catches runaway path explosion from any cause -- genuine
+	// grammar ambiguity gone combinatorial, not just the "recovery never converges" pattern the more
+	// specific check below targets -- since a real GLR fork resolving a small, deliberate ambiguity
+	// (the handful of `forceFork`-tagged rules in this codebase) never needs anywhere near this many.
+	let totalWork = 0;
+	const MAX_TOTAL_WORK = 5_000;
 
 	for (let i = 0; ; i++) {
-		const active = activeLists[i];
-		if (!active || active.length === 0)
-			throw new SyntaxError(`No active parse paths at position ${i}`);
-
-		// Several paths can be active at once, each in its own state -- a token valid for *any* of them is fair game, so the lexer restriction is their rows' union, not any single one's.
-		const allowed = new Map<Terminal, ActionEntry>();
-		for (const path of active)
-			for (const [term, entry] of tables.action[path.top.state])
-				allowed.set(term, entry);
-
-		const tok		= stream.peek(allowed);
-		const byKey		= new Map<string, Path>(active.map(p => [convergeKey(p.top), p]));
-		const worklist	= [...active];
-		const shifted	= new Map<number, Path[]>();	// next position -> paths to merge there
+		const worklist	= [...active.values()];
+		const shifted: StackFrame[] = [];	// frames shifted to position i + 1, to be merged there
 
 		// Register a freshly-produced same-position frame merging with whatever's already live at that state+parent.
-		const registerAtPosition = (newTop: StackFrame) => {
+		const registerAtPosition = (newTop: StackFrame, ruleId?: number) => {
 			const key		= convergeKey(newTop);
-			const existing	= byKey.get(key);
-			const path		= makePath(existing ? mergeInto(existing.top, newTop) : newTop);
-			byKey.set(key, path);
-			worklist.push(path);
+			const existing	= active.get(key);
+			const top		= existing ? mergeInto(existing, newTop, ruleId) : newTop;
+			active.set(key, top);
+			worklist.push(top);
 		};
 
-		const applyAction = (path: Path, entry: ActionEntry, actionTok: Token, stayAtSamePosition: boolean) => {
+		const applyAction = (path: StackFrame, entry: ActionEntry, actionTok: Token, stayAtSamePosition: boolean) => {
 			if (entry.kind === 'shift') {
-				const top = makeFrame(path.top, entry.state, actionTok.value);
-				if (stayAtSamePosition) {
+				const top = makeFrame(path, entry.state, actionTok.value);
+				if (stayAtSamePosition)
 					registerAtPosition(top);
-				} else {
-					if (!shifted.has(i + 1))
-						shifted.set(i + 1, []);
-					shifted.get(i + 1)!.push(makePath(top));
-				}
+				else
+					shifted.push(top);
 
 			} else if (entry.kind === 'reduce') {
 				const	rule	= tables.rules[entry.rule];
-				let		top		= path.top;
+				const	peek	= rule.peek ?? 0;
+				let		top		= path;
 				let		n		= rule.rhs.length;
-				const vals: unknown[] = new Array(n);
+				const vals: unknown[] = new Array(n + peek);
 				while (n--) {
-					vals[n]	= top.value;
-					top		= top.parent!;
+					vals[peek + n]	= top.value;
+					top				= top.parent!;
+				}
+				let peekFrame = top;
+				for (let m = peek; m--; ) {
+					vals[m]		= peekFrame.value;
+					peekFrame	= peekFrame.parent!;
 				}
 				const reducedValue	= rule.action(vals, ctx);
 				const nextState		= tables.goto[top.state]?.get(rule.lhs);
 				if (nextState !== undefined)
-					registerAtPosition(makeFrame(top, nextState, reducedValue));
+					registerAtPosition(makeFrame(top, nextState, reducedValue), entry.rule);
 
-			} else { // accept
-				acceptedValue = path.top.value;
+			} else {//if (entry.kind === 'accept') {
+				acceptedValue = path.value;
 				accepted = true;
 			}
 		};
 
+		// Same infinite-loop hazard `runParser`'s own recovery-stuck check guards against (see there for the
+		// full explanation), just shaped differently here: a recovery-synthesized token can `registerAtPosition`
+		// (push back onto this *same* worklist) instead of advancing to `shifted`, so a recovery that never
+		// converges toward actually consuming `tok` can churn this loop forever without ever growing `i` or
+		// exhausting the worklist naturally. Bounded generously -- legitimate wide ambiguity can process many
+		// paths per position, but not via recovery specifically, repeatedly, at a single frozen `tok`.
+		let recoveryUsedCount = 0;
+		const MAX_RECOVERY_PER_POSITION = 200;
+
 		while (worklist.length > 0 && !accepted) {
+			if (++totalWork > MAX_TOTAL_WORK) {
+				const pos = recoverCtx(stream);
+				throw new SyntaxError(
+					`GLR fork exceeded ${MAX_TOTAL_WORK} total steps resolving ambiguity at line ${pos.line}, col ${pos.col} `
+					+ `-- likely runaway path explosion, not genuine ambiguity (this is a parser/grammar bug, not just invalid input).`
+				);
+			}
 			const path	= worklist.shift()!;
-			// A path superseded by a later merge at the same key is a dead end: skip it, since the merged successor (already on the worklist) carries the real value.
-			if (byKey.get(convergeKey(path.top)) !== path)
+			// A frame superseded by a later merge at the same key is a dead end: skip it, since the merged successor (already on the worklist) carries the real value.
+			if (active.get(convergeKey(path)) !== path)
 				continue;
 
-			const row			= tables.action[path.top.state];
-			const fromRecovery	= !row.has(tok.type) ? tryRecover(row, tok, lastShifted) : undefined;
-			const entry			= fromRecovery?.entry ?? row.get(tok.type);
-			if (entry) {
-				const actionTok = fromRecovery?.tok ?? tok;
+			const row			= tables.action[path.state];
+			const direct		= row.get(tok.type);
+			const usingRecovery	= !direct || direct.kind === 'error';
+			if (usingRecovery && ++recoveryUsedCount > MAX_RECOVERY_PER_POSITION) {
+				const pos = recoverCtx(stream);
+				throw new SyntaxError(
+					`GLR fork stuck in error recovery at line ${pos.line}, col ${pos.col} `
+					+ `(recovery keeps re-inserting a token without consuming '${tok.type.name}') -- this is a parser/grammar bug, not just invalid input.`
+				);
+			}
+			const actionTok		= usingRecovery ? recover?.(recoverCtx(stream), row) : tok;
+			const entry			= actionTok && row.get(actionTok.type);
+			if (entry && entry.kind !== 'error') {
 				if (entry.kind === 'conflict') {
 					for (const inner of entry.entries)
-						applyAction(path, inner, actionTok, !!fromRecovery);
+						applyAction(path, inner, actionTok, actionTok != tok);
 				} else {
-					applyAction(path, entry, actionTok, !!fromRecovery);
+					applyAction(path, entry, actionTok, actionTok != tok);
 				}
 			}
 		}
@@ -866,34 +1001,37 @@ function runGlrFork(
 		if (tok.type === EOF)
 			throw new SyntaxError('Parse completed without accept');
 
-		stream.consume();
-		lastShifted = tok;
+		if (tok.type !== ERROR)
+			stream.prev = tok;
 
 		// Merge converging paths landing on i + 1 (same derivation reached by separate shifts).
-		for (const [pos, paths] of shifted) {
-			const merged = new Map<string, Path>();
-			for (const path of paths) {
-				const key		= convergeKey(path.top);
-				const existing	= merged.get(key);
-				merged.set(key, existing ? makePath(mergeInto(existing.top, path.top)) : path);
-			}
-			activeLists[pos] = Array.from(merged.values());
+		if (!shifted.length)
+			throw new SyntaxError(`No active parse paths at position ${i + 1}`);
+
+		active = new Map<string, StackFrame>();
+		for (const path of shifted) {
+			const key		= convergeKey(path);
+			const existing	= active.get(key);
+			active.set(key, existing ? mergeInto(existing, path) : path);
 		}
 
 		// Settled back down to a single derivation -- hand it back to runParser's fast loop
-		if (activeLists[i + 1] && activeLists[i + 1].length === 1) {
-			// Frame chain -> flat stack
-			const stateStack: number[] = [];
-			const valueStack: unknown[] = [];
-			for (let frame: StackFrame | null = activeLists[i + 1][0].top; frame; frame = frame.parent) {
-				stateStack.push(frame.state);
-				if (frame.parent)
-					valueStack.push(frame.value);
-			}
-			stateStack.reverse();
-			valueStack.reverse();
-			return { accepted: false, stateStack, valueStack, lastShifted };
+		if (active.size === 1) {
+			const frames: StackEntry[] = [];
+			for (let frame: StackFrame | null = active.values().next().value!; frame; frame = frame.parent)
+				frames.push({ state: frame.state, value: frame.value });
+			stack.length = 0;
+			for (let i = frames.length - 1; i >= 0; i--)
+				stack.push(frames[i]);
+			return;
 		}
+
+		// Still multiple derivations active -- a token valid for *any* of them is fair game, so the lexer restriction is their rows' union, not any single one's.
+		const allowed = new Map<Terminal, ActionEntry>();
+		for (const path of active.values())
+			for (const [term, entry] of tables.action[path.state])
+				allowed.set(term, entry);
+		tok = stream.next(allowed);
 	}
 }
 
@@ -902,39 +1040,26 @@ function runGlrFork(
 // ===================================================================
 
 export function makeParser(spec: GrammarSpec,
-	merge?:		Record<number, MergeFn>, 	// Merge functions for ambiguous convergence points. Key = LALR state id (see tables.action.length).
+	merge?:		Record<number, MergeFn>, 	// Merge functions for ambiguous convergence points. Key = rule id of the reducing rule (its index in tables.rules).
 ): Parser {
-	const g = new GrammarBuilder(spec);
-
+	const g			= new GrammarBuilder(spec);
 	const tables	= g.buildTables();
-	const lexEntries = Array.from(g.terminalsByName.values()).filter(t => t.pattern);
-
-	const recover	= (row: Map<Terminal, ActionEntry>, tok: Token, prevToken: Token | undefined) => {
-		const substitute = spec.recover?.(row, tok, prevToken);
-		if (!substitute)
-			return undefined;
-		const entry = row.get(substitute.type);
-		return entry && { entry, tok: substitute };
-	};
 
 	const resolveSym = (sym: string|RegExp|Terminal|undefined): Terminal|undefined =>
 		typeof sym === 'string'		? g.terminalsByName.get(sym)
 		: sym instanceof RegExp		? g.terminalsByName.get(sym.source)
 		: sym;
 
-
-	const createTokenStream = (lexEntries: Terminal[], input: string, ctx: any) => {
-		const lexState: LexState = { offset: 0, line: 1, col: 1 };
-		let lookahead: Token | undefined;
-		return {
-			peek: (allowed?: Map<Terminal, ActionEntry>): Token => lookahead ??= nextToken(lexEntries, input, lexState, ctx, resolveSym, allowed),
-			peekText:	() => { return input.substring(lexState.offset); },
-			consume:	() => { lookahead = undefined; }
-		};
-	};
+	const makeLexer = (input: string, ctx: any) => ({
+		offset:	0,
+		line:	1,
+		col:	1,
+		next(allowed: Map<Terminal, ActionEntry>) { return nextToken(allowed, input, this, ctx, resolveSym); },
+		peekText() { return input.substring(this.offset); }
+	});
 
 	return {
 		tables,
-		parse: (input, ctx) => runParser(tables, createTokenStream(lexEntries, input, ctx), ctx, recover, merge ?? {})
+		parse: (input, ctx) => runParser(tables, makeLexer(input, ctx), ctx, spec.recover ?? (()=>undefined), merge ?? {})
 	};
 }
