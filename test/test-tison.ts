@@ -1,4 +1,5 @@
-import {makeParser, Ref, Rules, RRules, Rule, RuleR, WithPrec} from '../src/tison';
+import {makeParser, Ref, Rules, RRules, Rule, WithPrec} from '../src/tison';
+import { RuleR } from '../src/rrule';
 
 // ===================================================================
 //  Self-test
