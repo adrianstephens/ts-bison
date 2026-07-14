@@ -1,9 +1,9 @@
-import {jsParser} from '../examples/js-parser';
+import {parser} from '../examples/TS/js-parser';
 
 function test(name: string, code: string) {
 	try {
 		console.log(name);
-        const ast = jsParser.parse(code);
+        const ast = parser.parse(code);
 		console.log(JSON.stringify(ast, null, 2));
 	} catch (e) {
 		console.error(`${name} failed:`, e);

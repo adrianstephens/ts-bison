@@ -1,4 +1,4 @@
-import { makeParser, Rule, Rules, RRules, terminal, termOneOf, List, Forward } from '../src/tison';
+import { makeParser, Rule, Rules, RRules, terminal, termOneOf, List, Forward, WithPrec } from '../src/tison';
 
 // ===================================================================
 //  C Parser Grammar using tison
@@ -171,56 +171,56 @@ fwd_type_name = Forward<TypeName>(()=>type_name),
 // (function arguments, declarator lists, initializers, ...) and never accidentally absorbs into a comma-expression; only the dedicated parenthesized-expression and subscript positions reach for full `expression` instead
 assignment_expression = RRules<Expr>(self => [
 	Rule([Forward<Expr>(()=>postfix_expression)],		$ => $[0]),
-	Rule(['+', self] as const, 							$ => ({ type: 'unary_op',		operator: '+', operand: $[1] } as const), PREC.unary),
-	Rule(['-', self] as const, 							$ => ({ type: 'unary_op',		operator: '-', operand: $[1] } as const), PREC.unary),
-	Rule(['!', self] as const, 							$ => ({ type: 'unary_op',		operator: '!', operand: $[1] } as const), PREC.unary),
-	Rule(['~', self] as const, 							$ => ({ type: 'unary_op',		operator: '~', operand: $[1] } as const), PREC.unary),
-	Rule(['*', self] as const, 							$ => ({ type: 'dereference',	operand: $[1] } as const), PREC.unary),
-	Rule(['&', self] as const, 							$ => ({ type: 'address_of',		operand: $[1] } as const), PREC.unary),
-	Rule(['++', self] as const, 						$ => ({ type: 'pre_increment',	operand: $[1] } as const), PREC.unary),
-	Rule(['--', self] as const, 						$ => ({ type: 'pre_decrement',	operand: $[1] } as const), PREC.unary),
-	Rule(['sizeof', self] as const, 					$ => ({ type: 'sizeof', 		operand: $[1] } as const), PREC.unary),
+	WithPrec(Rule(['+', self] as const, 						$ => ({ type: 'unary_op',		operator: '+', operand: $[1] } as const)), PREC.unary),
+	WithPrec(Rule(['-', self] as const, 						$ => ({ type: 'unary_op',		operator: '-', operand: $[1] } as const)), PREC.unary),
+	WithPrec(Rule(['!', self] as const, 						$ => ({ type: 'unary_op',		operator: '!', operand: $[1] } as const)), PREC.unary),
+	WithPrec(Rule(['~', self] as const, 						$ => ({ type: 'unary_op',		operator: '~', operand: $[1] } as const)), PREC.unary),
+	WithPrec(Rule(['*', self] as const, 						$ => ({ type: 'dereference',	operand: $[1] } as const)), PREC.unary),
+	WithPrec(Rule(['&', self] as const, 						$ => ({ type: 'address_of',		operand: $[1] } as const)), PREC.unary),
+	WithPrec(Rule(['++', self] as const, 						$ => ({ type: 'pre_increment',	operand: $[1] } as const)), PREC.unary),
+	WithPrec(Rule(['--', self] as const, 						$ => ({ type: 'pre_decrement',	operand: $[1] } as const)), PREC.unary),
+	WithPrec(Rule(['sizeof', self] as const, 					$ => ({ type: 'sizeof', 		operand: $[1] } as const)), PREC.unary),
 	// 'type_name' stays a string: it's declared later (it needs specifier_qualifier_list, which itself needs constant_expression --
 	// part of this same expression chain), the same kind of cycle the original cast rule already cut this way with 'type_specifier'.
-	Rule(['sizeof', '(', fwd_type_name, ')'] as const,	$ => ({ type: 'sizeof_type',	operand: $[2] as TypeName } as const), PREC.unary),
-	Rule(['(', fwd_type_name, ')', self] as const, 		$ => ({ type: 'cast',			type1: $[1] as TypeName, expression: $[3] }), PREC.cast),
-	Rule([self, '*',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '*', left: $[0], right: $[2]}), PREC.multiplicative),
-	Rule([self, '/',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '/', left: $[0], right: $[2]}), PREC.multiplicative),
-	Rule([self, '%',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '%', left: $[0], right: $[2]}), PREC.multiplicative),
-	Rule([self, '+',  self] as const,					$ => ({ type: 'binary_op', 		operator: '+', left: $[0], right: $[2] }), PREC.additive),
-	Rule([self, '-',  self] as const,					$ => ({ type: 'binary_op', 		operator: '-', left: $[0], right: $[2] }), PREC.additive),
-	Rule([self, '<<', self] as const, 					$ => ({ type: 'binary_op', 		operator: '<<', left: $[0], right: $[2] }), PREC.shift),
-	Rule([self, '>>', self] as const, 					$ => ({ type: 'binary_op', 		operator: '>>', left: $[0], right: $[2] }), PREC.shift),
-	Rule([self, '<',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '<', left: $[0], right: $[2] }), PREC.relational),
-	Rule([self, '>',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '>', left: $[0], right: $[2] }), PREC.relational),
-	Rule([self, '<=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '<=', left: $[0], right: $[2] }), PREC.relational),
-	Rule([self, '>=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '>=', left: $[0], right: $[2] }), PREC.relational),
-	Rule([self, '==', self] as const, 					$ => ({ type: 'binary_op', 		operator: '==', left: $[0], right: $[2] }), PREC.equality),
-	Rule([self, '!=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '!=', left: $[0], right: $[2] }), PREC.equality),
-	Rule([self, '&',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '&', left: $[0], right: $[2] }), PREC.bitwiseAnd),
-	Rule([self, '^',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '^', left: $[0], right: $[2] }), PREC.bitwiseXor),
-	Rule([self, '|',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '|', left: $[0], right: $[2] }), PREC.bitwiseOr),
-	Rule([self, '&&', self] as const, 					$ => ({ type: 'binary_op', 		operator: '&&', left: $[0], right: $[2] }), PREC.logicalAnd),
-	Rule([self, '||', self] as const,					$ => ({ type: 'binary_op', 		operator: '||', left: $[0], right: $[2] }), PREC.logicalOr),
-	Rule([self, '?', self, ':', self] as const,			$ => ({ type: 'conditional',	test: $[0], consequent: $[2], alternate: $[4] }), PREC.conditional),
-	Rule([self, '=',  self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '=' }), PREC.assignment),
-	Rule([self, '+=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '+=' }), PREC.assignment),
-	Rule([self, '-=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '-=' }), PREC.assignment),
-	Rule([self, '*=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '*=' }), PREC.assignment),
-	Rule([self, '/=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '/=' }), PREC.assignment),
-	Rule([self, '%=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '%=' }), PREC.assignment),
-	Rule([self, '&=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '&=' }), PREC.assignment),
-	Rule([self, '|=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '|=' }), PREC.assignment),
-	Rule([self, '^=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '^=' }), PREC.assignment),
-	Rule([self, '<<=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '<<=' }), PREC.assignment),
-	Rule([self, '>>=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '>>=' }), PREC.assignment),
+	WithPrec(Rule(['sizeof', '(', fwd_type_name, ')'] as const,	$ => ({ type: 'sizeof_type',	operand: $[2] as TypeName } as const)), PREC.unary),
+	WithPrec(Rule(['(', fwd_type_name, ')', self] as const, 	$ => ({ type: 'cast',			type1: $[1] as TypeName, expression: $[3] })), PREC.cast),
+	WithPrec(Rule([self, '*',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '*', left: $[0], right: $[2]})), PREC.multiplicative),
+	WithPrec(Rule([self, '/',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '/', left: $[0], right: $[2]})), PREC.multiplicative),
+	WithPrec(Rule([self, '%',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '%', left: $[0], right: $[2]})), PREC.multiplicative),
+	WithPrec(Rule([self, '+',  self] as const,					$ => ({ type: 'binary_op', 		operator: '+', left: $[0], right: $[2] })), PREC.additive),
+	WithPrec(Rule([self, '-',  self] as const,					$ => ({ type: 'binary_op', 		operator: '-', left: $[0], right: $[2] })), PREC.additive),
+	WithPrec(Rule([self, '<<', self] as const, 					$ => ({ type: 'binary_op', 		operator: '<<', left: $[0], right: $[2] })), PREC.shift),
+	WithPrec(Rule([self, '>>', self] as const, 					$ => ({ type: 'binary_op', 		operator: '>>', left: $[0], right: $[2] })), PREC.shift),
+	WithPrec(Rule([self, '<',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '<', left: $[0], right: $[2] })), PREC.relational),
+	WithPrec(Rule([self, '>',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '>', left: $[0], right: $[2] })), PREC.relational),
+	WithPrec(Rule([self, '<=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '<=', left: $[0], right: $[2] })), PREC.relational),
+	WithPrec(Rule([self, '>=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '>=', left: $[0], right: $[2] })), PREC.relational),
+	WithPrec(Rule([self, '==', self] as const, 					$ => ({ type: 'binary_op', 		operator: '==', left: $[0], right: $[2] })), PREC.equality),
+	WithPrec(Rule([self, '!=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '!=', left: $[0], right: $[2] })), PREC.equality),
+	WithPrec(Rule([self, '&',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '&', left: $[0], right: $[2] })), PREC.bitwiseAnd),
+	WithPrec(Rule([self, '^',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '^', left: $[0], right: $[2] })), PREC.bitwiseXor),
+	WithPrec(Rule([self, '|',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '|', left: $[0], right: $[2] })), PREC.bitwiseOr),
+	WithPrec(Rule([self, '&&', self] as const, 					$ => ({ type: 'binary_op', 		operator: '&&', left: $[0], right: $[2] })), PREC.logicalAnd),
+	WithPrec(Rule([self, '||', self] as const,					$ => ({ type: 'binary_op', 		operator: '||', left: $[0], right: $[2] })), PREC.logicalOr),
+	WithPrec(Rule([self, '?', self, ':', self] as const,		$ => ({ type: 'conditional',	test: $[0], consequent: $[2], alternate: $[4] })), PREC.conditional),
+	WithPrec(Rule([self, '=',  self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '=' })), PREC.assignment),
+	WithPrec(Rule([self, '+=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '+=' })), PREC.assignment),
+	WithPrec(Rule([self, '-=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '-=' })), PREC.assignment),
+	WithPrec(Rule([self, '*=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '*=' })), PREC.assignment),
+	WithPrec(Rule([self, '/=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '/=' })), PREC.assignment),
+	WithPrec(Rule([self, '%=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '%=' })), PREC.assignment),
+	WithPrec(Rule([self, '&=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '&=' })), PREC.assignment),
+	WithPrec(Rule([self, '|=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '|=' })), PREC.assignment),
+	WithPrec(Rule([self, '^=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '^=' })), PREC.assignment),
+	WithPrec(Rule([self, '<<=', self] as const, 				$ => ({ type: 'assign', left: $[0], right: $[2], operator: '<<=' })), PREC.assignment),
+	WithPrec(Rule([self, '>>=', self] as const, 				$ => ({ type: 'assign', left: $[0], right: $[2], operator: '>>=' })), PREC.assignment),
 ]),
 
 // The comma operator's own level, kept out of assignment_expression -- this is what plain `expression` means in real C:
 // parenthesized sub-expressions and array subscripts allow a comma operator, but argument lists, initializers, and declarator lists must not.
 expression = RRules<Expr>(self => [
 	Rule([assignment_expression] as const, 				$ => $[0]),
-	Rule([self, ',', assignment_expression] as const, 	$ => ({ type: 'comma', left: $[0], right: $[2] } as const), PREC.comma),
+	WithPrec(Rule([self, ',', assignment_expression] as const, 	$ => ({ type: 'comma', left: $[0], right: $[2] } as const)), PREC.comma),
 ]),
 
 argument_expression_list = List(assignment_expression, ','),
@@ -242,8 +242,8 @@ primary_expression = Rules(
 
 postfix_expression = RRules<Expr>(self => [
 	Rule([primary_expression] as const, 									$ => $[0]),
-	Rule([self, '++'] as const,												$ => ({ type: 'post_increment', operand: $[0] } as const), PREC.unary),
-	Rule([self, '--'] as const,												$ => ({ type: 'post_decrement',	operand: $[0] } as const), PREC.unary),
+	WithPrec(Rule([self, '++'] as const,									$ => ({ type: 'post_increment', operand: $[0] } as const)), PREC.unary),
+	WithPrec(Rule([self, '--'] as const,									$ => ({ type: 'post_decrement',	operand: $[0] } as const)), PREC.unary),
 	Rule([self, '[', expression, ']'] as const, 							$ => ({ type: 'subscript',	array: $[0], index: $[2] } as const)),
 	Rule([self, '.', IDENT] as const,										$ => ({ type: 'member_access',	object: $[0], member: $[2] } as const)),
 	Rule([self, '->', IDENT] as const, 										$ => ({ type: 'pointer_member', object: $[0], member: $[2] } as const)),
@@ -313,7 +313,7 @@ specifier_qualifier_list = RRules<DeclSpecItem[]>(self => [
 ]),
 
 // --- Declarators / declarations ---
-storage_class_specifier = Rules(//<StorageClass>(
+storage_class_specifier = Rules(
 	{ rhs: ['typedef'], 													action: () => 'typedef' as const},
 	{ rhs: ['extern'], 														action: () => 'extern'  as const},
 	{ rhs: ['static'], 														action: () => 'static'  as const},
@@ -393,7 +393,7 @@ parameter_declaration = Rules(
 	Rule([declaration_specifiers] as const, 								$ => ({ type: 'parameter', specifiers: $[0] } as const)),
 ),
 parameter_list = List(parameter_declaration, ','),
-parameter_type_list = Rules(//<ParamOrVariadic[]>(
+parameter_type_list = Rules(
 	Rule([parameter_list] as const, 										$ => $[0]),
 	Rule([parameter_list, ',', '...'] as const, 							$ => [...($[0]), { type: 'variadic' } as const]),
 ),
@@ -485,7 +485,6 @@ const parser = makeParser({
 	terminals: [IDENT],
 	precedence: PREC,
 	start: translation_unit,
-	//rules
 	rules: {translation_unit}
 });
 

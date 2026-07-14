@@ -1,4 +1,4 @@
-// tison.ts -- A TypeScript-object-based SLR(1)/GLR parser generator.
+// tison.ts -- A TypeScript-object-based LALR(1)/SLR(1)/GLR parser generator.
 //
 // Analogous to GNU Bison, but instead of parsing a .y file you pass a plain TypeScript object that describes your grammar.
 // Terminals carry regex patterns, so tison is the lexer too -- you just feed it a string.
@@ -14,6 +14,7 @@ export interface PrecEntry {
 }
 export type Precedence = string | PrecEntry;
 export const forceFork: PrecEntry = {assoc:'fork', level: 0};
+export type MergeFn = (left: unknown, right: unknown) => unknown;
 
 function has0args<T>(fn: (() => T) | Action<T>): fn is ()=>T {
 	return fn.length === 0;
@@ -24,7 +25,7 @@ function literalPattern(s: string) {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + (/\w/.test(s[s.length - 1]) ? '(?!\\w)' : '');
 }
 
-interface Ref<T> { ref: string; }
+export interface Ref<T> { ref: string; }
 export function Ref<T>(ref: string): Ref<T> {
 	return {ref};
 }
@@ -34,11 +35,12 @@ export function Forward<T>(ref: () => any) {
 export interface TextPos {
 	offset: number; line: number; col: number;
 }
+export type WithTextPos<T> = T & {pos: TextPos};
 
 export interface Token {
 	type:	Terminal;
 	value:	string;	// semantic value; available as $[i] in actions
-	pos?:	TextPos;
+	pos:	TextPos;
 }
 
 export interface LexPosition extends TextPos {
@@ -56,8 +58,8 @@ export interface LexContext extends LexPosition {
 	next(): 	Token | undefined;
 }
 
-export type TerminalCallback<C = any> = (lexctx: LexContext, ctx: C) => Terminal | string | RegExp | undefined;
-export type RecoveryCallback = (lex: LexPosition, row: Map<Terminal, ActionEntry>) => Token | undefined;
+export type TerminalCallback<C = any> = (lexctx: LexContext, ctx: C) => Token | Terminal | string | RegExp | undefined;
+export type RecoveryCallback = (lex: LexPosition, row: Map<Terminal, ActionEntry>) => Token | Terminal | string | RegExp | undefined;
 
 export class Terminal<T = any> {
 	_ignore = false;
@@ -77,10 +79,10 @@ export function terminal(name: string, pattern?: RegExp, lex?: TerminalCallback)
 	return new Terminal<string>(name, pattern, lex);
 }
 
-type Action<T, C = any, A = any[]> = (values: A, ctx: C) => T
-type Sym<C = any> = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any, C>;
+export type Action<T, C = any, A = any[]> = (values: WithTextPos<A>, ctx: C) => T
+type GrammarSym<C = any> = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any, C>;
 
-type ElemValue<S> = S extends Rule<infer U>[] ? U
+export type ElemValue<S> = S extends Rule2<infer U>[] ? U
 	: S extends RegExp ? string
 	: S extends Terminal<infer U> ? U
 	: S extends (()=>infer U) ? ElemValue<U>
@@ -89,92 +91,41 @@ type ElemValue<S> = S extends Rule<infer U>[] ? U
 	: S extends Action<infer U> ? U
 	: unknown;
 
-type ValuesOf<T extends readonly Sym[]> = {[K in keyof T]: ElemValue<T[K]>}
+type ValuesOf<T extends readonly GrammarSym[]> = {[K in keyof T]: ElemValue<T[K]>}
 
-/*
+
 export interface Rule<T> {
-	rhs:		Sym[];
-	action?:	(values: any[], ctx: any) => T;
+	rhs:		GrammarSym[];
+	action?:	(values: WithTextPos<any[]>, ctx: any) => T;
 	prec?:		Precedence;
-}
-*/
-export type Rule<T> = Rules<T> | {
-	rhs:		Sym[];
-	action?:	(values: any[], ctx: any) => T;
-	prec?:		Precedence;
+	merge?:		MergeFn;
 }
 
-export function Rule<R extends readonly Sym[]>(rhs: R): Rule<ElemValue<R[0]>>;
-export function Rule<T, R extends readonly Sym[], C = any>(rhs: R, action: Action<T, C, ValuesOf<R>>, prec?: Precedence): Rule<T>;
-export function Rule(rhs: Sym[], action?: Action<any, any>, prec?: Precedence) {
-	return { rhs, action, prec };
-}
-
-// Pins `ctx`'s type to `C` for every rule built with the returned function
-export function makeRule<C>() {
-	function boundRule<R extends readonly Sym<C>[]>(rhs: R): Rule<ElemValue<R[0]>>;
-	function boundRule<T, R extends readonly Sym<C>[]>(rhs: R, action: Action<T, C, ValuesOf<R>>, prec?: Precedence): Rule<T>;
-	function boundRule(rhs: Sym[], action?: Action<any, any>, prec?: Precedence) {
-		return { rhs, action, prec };
-	}
-	return boundRule;
-}
-//export const Rule = makeRule<any>;
-
-
-// Rest-parameter alternative to Rule(): pass rhs symbols directly instead of wrapping them in an array literal with `as const`.
-// Any parameter may be an inline action -- it's typed against exactly the parameters that precede it.
-// The rule's own result defaults to whatever the *last* argument evaluates to
-
-type SymR<A extends readonly unknown[], C = any> = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any, C, ValuesOfR<A>>;
-type RSymR<T, A extends readonly unknown[], C = any> = Terminal<T> | Rules<T> | (()=>Rules<T>) | Ref<T> | Action<T, C, ValuesOfR<A>>;
-type ValuesOfR<T extends readonly unknown[]> = { [K in keyof T]: ElemValue<T[K]> };
-/*
-export function RuleR<T, C, S1 extends RSymR<T, [], C>>(s1: S1): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends RSymR<T, [S1], C>>(s1: S1, s2: S2): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends RSymR<T, [S1, S2], C>>(s1: S1, s2: S2, s3: S3): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends RSymR<T, [S1, S2, S3], C>>(s1: S1, s2: S2, s3: S3, s4: S4): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends RSymR<T, [S1, S2, S3, S4], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends RSymR<T, [S1, S2, S3, S4, S5], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends RSymR<T, [S1, S2, S3, S4, S5, S6], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9], C>, S11 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10, s11: S11): Rule<T>;
-export function RuleR<T, C, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9], C>, S11 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9, S10], C>, S12 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10, s11: S11, s12: S12): Rule<T>;
-
-export function RuleR(...syms: any[]): any {
-	const last = syms.at(-1);
-	if (typeof last === 'function' && last.length > 0)
-		return Rule(syms.slice(0, -1), last);
-	return Rule(syms, (values: any[]) => values[values.length - 1]);
-}
-*/
 export function WithPrec<T>(rule: Rule<T>, prec: Precedence): Rule<T> {
 	return {...rule, prec};
 }
+export function WithMerge<T>(rule: Rule<T>, merge: MergeFn): Rule<T> {
+	return {...rule, merge};
+}
+
+export function Rule<R extends readonly GrammarSym[]>(rhs: R): Rule<ElemValue<R[0]>>;
+export function Rule<T, R extends readonly GrammarSym[], C = any>(rhs: R, action: Action<T, C, ValuesOf<R>>): Rule<T>;
+export function Rule(rhs: GrammarSym[], action?: Action<any, any>) {
+	return { rhs, action };
+}
 
 // Pins `ctx`'s type to `C` for every rule built with the returned function
-export function makeRuleR<C>() {
-	function boundRule<T, S1 extends RSymR<T, [], C>>(s1: S1): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends RSymR<T, [S1], C>>(s1: S1, s2: S2): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends RSymR<T, [S1, S2], C>>(s1: S1, s2: S2, s3: S3): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends RSymR<T, [S1, S2, S3], C>>(s1: S1, s2: S2, s3: S3, s4: S4): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends RSymR<T, [S1, S2, S3, S4], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends RSymR<T, [S1, S2, S3, S4, S5], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends RSymR<T, [S1, S2, S3, S4, S5, S6], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9], C>, S11 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10, s11: S11): Rule<T>;
-	function boundRule<T, S1 extends SymR<[], C>, S2 extends SymR<[S1], C>, S3 extends SymR<[S1, S2], C>, S4 extends SymR<[S1, S2, S3], C>, S5 extends SymR<[S1, S2, S3, S4], C>, S6 extends SymR<[S1, S2, S3, S4, S5], C>, S7 extends SymR<[S1, S2, S3, S4, S5, S6], C>, S8 extends SymR<[S1, S2, S3, S4, S5, S6, S7], C>, S9 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8], C>, S10 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9], C>, S11 extends SymR<[S1, S2, S3, S4, S5, S6, S7, S8, S9, S10], C>, S12 extends RSymR<T, [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11], C>>(s1: S1, s2: S2, s3: S3, s4: S4, s5: S5, s6: S6, s7: S7, s8: S8, s9: S9, s10: S10, s11: S11, s12: S12): Rule<T>;
-	function boundRule(...syms: any) { return RuleR(syms); }
+export function makeRule<C>(commonAction?: <T>(value: T, values: WithTextPos<any[]>, ctx: C)=>any) {
+	function boundRule<R extends readonly GrammarSym<C>[]>(rhs: R): Rule<ElemValue<R[0]>>;
+	function boundRule<T, R extends readonly GrammarSym<C>[]>(rhs: R, action: Action<T, C, ValuesOf<R>>): Rule<T>;
+	function boundRule(rhs: GrammarSym[], action?: Action<any, any>) {
+		return { rhs, action: commonAction && action ? (values: WithTextPos<any[]>, ctx: C) => commonAction(action(values, ctx), values, ctx) : action };
+	}
 	return boundRule;
 }
-export const RuleR = makeRuleR<any>();
 
-
-export type Rules<T> = Rule<T>[]
+type Rule2<T> = Rule<T> | Rules<T> | (()=>Rules<T>)
+export type Rules<T> = Rule2<T>[]
 
 export function Rules<T>(...alts: Rules<T>): Rules<T> {
 	return alts;
@@ -184,31 +135,36 @@ export function RRules<T>(builder: (self: () => Rules<T>) => Rules<T>): Rules<T>
 	return rules;
 }
 
-// A self-recursive rule set that allows the current rules to be referenced as `self`
-export function CRules<T>(builder: (self: () => Rules<T>) => Rules<T>): Rules<T>;
-export function CRules<T>(...alts: Rules<T>): Rules<T>;
-export function CRules<T>(...args: [(self: () => Rules<T>) => Rules<T>] | Rules<T>): Rules<T> {
-	if (args.length === 1 && typeof args[0] === 'function') {
-		const rules = args[0](() => rules);
-		return rules;
-	}
-	return args as Rules<T>;
+export function Maybe<T>(rule: Rules<T>) {
+	return Rules(
+		Rule([], () => undefined),
+		rule,
+	);
 }
 
-export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: Sym) {
+export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: GrammarSym, trailing?: boolean) {
 	return RRules<T[]>(self => [
 		Rule([single] as const,	$ => [$[0]]),
 		sep
 			? Rule([self, sep, single] as const,	$ => [...($[0] as T[]), $[2]])
-			: Rule([self, single] as const,			$ => [...($[0] as T[]), $[1]])
+			: Rule([self, single] as const,			$ => [...($[0] as T[]), $[1]]),
+		...(sep && trailing ? [Rule([self, sep] as const, $ => $[0] as T[])] : []),
 	]);
 }
+
+export function MaybeList<T>(rule: Rules<T>, sep?: GrammarSym, trailing?: boolean) {
+	return Rules(
+		List(rule, sep, trailing),
+		Rule([], () => []),
+	);
+}
+
+
 export function OneOf<T extends string>(names: readonly T[]) {
 	return Rules(...names.map(name => Rule([name])));
 }
 
 export type TermLike = RegExp | string | Terminal;
-export type MergeFn = (left: unknown, right: unknown) => unknown;
 
 export interface GrammarSpec {
 	precedence?:	Record<string, Assoc | PrecEntry>;
@@ -217,6 +173,8 @@ export interface GrammarSpec {
 	skip?:			TermLike[];
 	terminals?:		TermLike[];
 	recover?:		RecoveryCallback;
+	optimize?:		boolean;		// default true: bypass pass-through unit-rule GOTO hops in the built tables (see eliminateUnitGotos); set false to parse with the raw tables when debugging a suspect parse
+	lalr?:			boolean;		// default true (real per-state LALR(1) reduce lookaheads); set false for the older, strictly weaker SLR(1) global-FOLLOW-set lookaheads instead -- see `buildTables`'s header comment
 }
 
 export interface Parser {
@@ -237,6 +195,7 @@ type InternalSym = Terminal | NonTerminal;
 const EOF		= new Terminal('$end');
 const ERROR		= new Terminal('$error');
 const ACCEPT	= new NonTerminal('$accept');
+const identityAction: Action<unknown> = values => values[0];
 
 export interface InternalRule {
 	id:			number;
@@ -245,6 +204,7 @@ export interface InternalRule {
 	action: 	Action<unknown>;
 	prec?:		PrecEntry;
 	peek?:		number;		// extra preceding stack values to pass to `action` without popping them (mid-rhs actions: values of the symbols before them in the containing rule)
+	merge?:		MergeFn;	// GLR convergence combiner for this rule's ambiguous reduce, carried over from the user Rule
 }
 
 export type ActionEntry =
@@ -319,17 +279,10 @@ export class GrammarBuilder {
 			typeof(s) === 'string' ? internTerminal(s, new RegExp(literalPattern(s))) : s instanceof RegExp ? internTerminal(s.source, s) : addTerminal(s);
 
 		const anon = (action: Action<any>, peek: number) => {
-			const id	= this.rules.length;
-			const lhs	= new NonTerminal(`anon ${id}`);
-
+			const lhs	= new NonTerminal(`anon ${this.rules.length}`);
 			this.first.set(lhs, { terms: new Set(), nullable: false });
-			this.rules.push({
-				id,
-				lhs,
-				rhs:	[],
-				action,
-				peek,
-			});
+			const r = this.addRule(lhs, [], action);
+			r.peek = peek;
 			return lhs;
 		};
 
@@ -356,44 +309,29 @@ export class GrammarBuilder {
 		// -- Augmented start rule -------------------------------------
 		this.startSymbol = internByRules(rules[0])!;
 
-		this.rules.push({
-			id:		0,
-			lhs:	ACCEPT,
-			rhs:	[this.startSymbol, EOF],
-			action: v => v[0],
-		});
+		this.addRule(ACCEPT, [this.startSymbol, EOF]);
 
 		// -- Discover non-terminals -----------------------------------
 
-		const resolveSym = (sym: Sym, i: number) =>
+		const resolveSym = (sym: GrammarSym, i: number) =>
 			typeof sym === 'string'		? nonTerminalsByName.get(sym) ?? internTerminal(sym, new RegExp(literalPattern(sym)))
 			: typeof sym === 'function'	? (has0args(sym) ? internByRules(sym()) : anon(sym, i))
 			: sym instanceof RegExp		? internTerminal(sym.source, sym)
 			: sym instanceof Terminal	? this.terminalsByName.get(sym.name) ?? addTerminal(sym)
-//			: 'ref' in sym				? (typeof sym.ref === 'string' ? nonTerminalsByName.get(sym.ref) : internByRules(sym.ref()))
 			: 'ref' in sym				? nonTerminalsByName.get(sym.ref)!
 			: internByRules(sym)!;
 
 		for (const r of rules) {
 			const lhs = nonTerminalsByRules.get(r)!;
 			for (const alt of r) {
-				if (Array.isArray(alt)) {
-					const nt = internByRules(alt);
-					this.rules.push({
-						id:		this.rules.length,
-						lhs,
-						rhs:	[nt],
-						action:	(values: any[]) => values[0],
-					});
+				if (typeof alt === 'function') {
+					this.addRule(lhs, [internByRules(alt())]);
+				} else if (Array.isArray(alt)) {
+					this.addRule(lhs, [internByRules(alt)]);
 				} else {
-					const rhs = alt.rhs.map(resolveSym);
-					this.rules.push({
-						id:		this.rules.length,
-						lhs,
-						rhs,
-						action:	alt.action ?? ((values: any[]) => values[0]),
-						prec:	alt.prec === undefined ? undefined : typeof alt.prec === 'string' ? prec.get(alt.prec) : alt.prec,
-					});
+					const r = this.addRule(lhs, alt.rhs.map(resolveSym), alt.action);
+					r.prec = alt.prec === undefined ? undefined : typeof alt.prec === 'string' ? prec.get(alt.prec) : alt.prec;
+					r.merge = alt.merge;
 				}
 			}
 		}
@@ -433,14 +371,26 @@ export class GrammarBuilder {
 		}
 	}
 
-	// -- SLR(1) table construction -------------------------------------
-	//
-	// Builds the compact LR(0) automaton (items carry no per-state lookahead, so there's no canonical-LR(1) state explosion
-	// Then assigns each reduce item's lookahead via the rule's plain FOLLOW(lhs) set rather than context-sensitive per-state lookaheads.
-	// This is SLR(1), strictly weaker than true LALR(1): it can flag a few conflicts a context-sensitive LALR(1) table would have resolved without one.
-	// Those still go through the same precedence/assoc resolution below, or the GLR fork/merge engine for genuine ambiguity -- so correctness isn't at risk, only how many conflicts get reported.
+	private addRule(lhs: NonTerminal, rhs: InternalSym[], action?: Action<unknown>): InternalRule {
+		const r: InternalRule = {
+			id:		this.rules.length,
+			lhs,
+			rhs,
+			action:	action ?? identityAction
+		};
+		this.rules.push(r);
+		return r;
+	}
 
-	buildTables(): ParseTables {
+	// -- SLR(1)/LALR(1) table construction -------------------------------------
+	//
+	// Builds the LR(0) automaton, then (when `lalr`) computes per-state LALR(1) reduce lookaheads via
+	// fixed-point propagation over it, rather than the canonical-LR(1)-then-merge approach (avoids that
+	// method's state explosion). The propagation is monotone over a finite domain so it always terminates;
+	// `LALR_MAX_PASSES` is just a tripwire against that invariant ever breaking.
+	// `lalr: false` falls back to plain FOLLOW(lhs)-based SLR(1) lookaheads (weaker: more spurious
+	// conflicts, but no correctness difference since conflicts still resolve via precedence/GLR either way).
+	buildTables(lalr = true): ParseTables {
 		interface LR0Item { rule: number; dot: number; }
 		const lr0Key = (i: LR0Item) => `${i.rule}:${i.dot}`;
 
@@ -545,6 +495,74 @@ export class GrammarBuilder {
 			}
 		}
 
+		// `lalrLA[state]` maps an LR(0) item (by `lr0Key`) to the terminals valid for reducing it in that state.
+		// Seeded from the accept item's `{EOF}` lookahead, then propagated to a fixed point:
+		//   - closure: item `A -> α.Bβ` with lookahead L gives every `B -> .γ` in the same state FIRST(β) (plus L if β is nullable).
+		//   - goto: an item's lookahead carries unchanged into the corresponding item after a shift/goto on its next symbol.
+		let lalrLA: Map<string, Set<Terminal>>[] | undefined;
+		if (lalr) {
+			lalrLA = lr0States.map(() => new Map<string, Set<Terminal>>());
+
+			const addLA = (state: number, item: LR0Item, terms: Iterable<Terminal>): boolean => {
+				const k = lr0Key(item);
+				let set = lalrLA![state].get(k);
+				if (!set)
+					lalrLA![state].set(k, set = new Set());
+				let added = false;
+				for (const t of terms) {
+					if (!set.has(t)) {
+						set.add(t);
+						added = true;
+					}
+				}
+				return added;
+			};
+
+			addLA(0, { rule: 0, dot: 0 }, [EOF]);
+
+			const LALR_MAX_PASSES = numStates * 8 + 1000;
+			let pass = 0;
+			for (let changed = true; changed; ) {
+				if (++pass > LALR_MAX_PASSES)
+					throw new Error(`LALR(1) lookahead propagation did not converge after ${LALR_MAX_PASSES} passes -- this is a table-construction bug, not a grammar problem`);
+				changed = false;
+				for (let s = 0; s < numStates; s++) {
+					for (const item of lr0States[s]) {
+						const itemLA = lalrLA[s].get(lr0Key(item));
+						if (!itemLA)
+							continue;
+						const rule = this.rules[item.rule];
+						const sym = rule.rhs[item.dot];
+						if (sym === undefined)
+							continue; // complete item -- nothing to propagate from here (handled as a reduce below)
+
+						if (sym instanceof NonTerminal) {
+							let restNullable = true;
+							const firstOfRest = new Set<Terminal>();
+							for (let j = item.dot + 1; j < rule.rhs.length; j++) {
+								const sf = this.first.get(rule.rhs[j])!;
+								for (const f of sf.terms)
+									firstOfRest.add(f);
+								if (!sf.nullable) {
+									restNullable = false;
+									break;
+								}
+							}
+							const laForClosure = restNullable ? new Set([...firstOfRest, ...itemLA]) : firstOfRest;
+							for (const prod of this.rules) {
+								if (prod.lhs === sym && addLA(s, { rule: prod.id, dot: 0 }, laForClosure))
+									changed = true;
+							}
+						}
+
+						const target = lr0Trans[s].get(sym);
+						if (target !== undefined && addLA(target, { rule: item.rule, dot: item.dot + 1 }, itemLA))
+							changed = true;
+					}
+				}
+			}
+		}
+
 		const shiftRule = Array.from({ length: numStates }, () => new Map<Terminal, InternalRule>());
 		const action	= Array.from({ length: numStates }, () => new Map<Terminal, ActionEntry>());
 		const goto		= Array.from({ length: numStates }, () => new Map<NonTerminal, number>());
@@ -567,9 +585,11 @@ export class GrammarBuilder {
 			}
 			for (const item of lr0States[s]) {
 				const r = this.rules[item.rule];
-				if (item.dot >= r.rhs.length && r.lhs !== ACCEPT)
-					for (const la of follow.get(r.lhs)!)
+				if (item.dot >= r.rhs.length && r.lhs !== ACCEPT) {
+					const lookaheads = lalr ? (lalrLA![s].get(lr0Key(item)) ?? new Set<Terminal>()) : follow.get(r.lhs)!;
+					for (const la of lookaheads)
 						this.setAction(action[s], la, { kind: 'reduce', rule: item.rule }, s, shiftRule[s].get(la)?.prec, conflicts);
+				}
 			}
 			for (const term of this.alwaysTerminals) {
 				if (!action[s].has(term))
@@ -584,7 +604,7 @@ export class GrammarBuilder {
 		return {
 			action,
 			goto,
-			rules:		this.rules,//.map(r => ({ lhs: r.lhs, rhsLen: r.rhs.length })),
+			rules:		this.rules,
 			conflicts,
 		};
 	}
@@ -596,7 +616,6 @@ export class GrammarBuilder {
 		term:		Terminal,
 		incoming:	ActionEntry,
 		state:		number,
-		//shiftRuleId: number | undefined,
 		shiftPrec:	PrecEntry | undefined,
 		conflicts:	ConflictReport[]
 	) {
@@ -611,9 +630,6 @@ export class GrammarBuilder {
 		) {
 			const shiftEntry	= (existing.kind === 'shift'	? existing : incoming) as { kind: 'shift';	state:	number };
 			const reduceEntry	= (existing.kind === 'reduce'	? existing : incoming) as { kind: 'reduce';	rule:	number };
-			// Precedence belongs to rules: compare the reducing rule's level against
-			// the level of whichever rule is about to shift this lookahead token.
-			//const shiftPrec		= shiftRuleId !== undefined ? this.rules[shiftRuleId].prec : undefined;
 			const reducePrec	= this.rules[reduceEntry.rule].prec;
 
 			if (reducePrec?.assoc === 'fork' || shiftPrec?.assoc === 'fork') {
@@ -638,7 +654,10 @@ export class GrammarBuilder {
 				}
 			} else {
 				row.set(term, shiftEntry);
-				conflicts.push({ state, term, kind: 'auto', resolution: 'shift (default, no prec info)' });
+				// Name the silently-losing reduce rule: unflagged default-shifts are the classic source of
+				// "wrong parse, no error" bugs here, and knowing which rule lost is the first debugging step.
+				const lost = this.rules[reduceEntry.rule];
+				conflicts.push({ state, term, kind: 'auto', resolution: `shift (default, no prec info; loses reduce of rule ${lost.id}: ${lost.lhs.name} -> ${lost.rhs.map(s => s.name).join(' ')})` });
 			}
 
 		} else if (existing.kind === 'reduce' && incoming.kind === 'reduce') {
@@ -659,14 +678,19 @@ export class GrammarBuilder {
 //  Parser runtime
 // ===================================================================
 
+function getTextPos(x: TextPos) {
+	return {offset: x.offset, line: x.line, col: x.col };
+}
+
 function advancePos(state: TextPos, text: string) {
 	for (const ch of text) {
 		if (ch === '\n') {
 			state.line++;
 			state.col = 1;
-			//console.log(state.line);
 		} else {
 			state.col++;
+			if (ch === '\t')
+				state.col = Math.floor((state.col + 3) / 4) * 4;
 		}
 	}
 	state.offset += text.length;
@@ -679,13 +703,9 @@ interface Lexer extends TextPos {
 	peekText(): string;
 }
 
-// Combines the values of two GLR derivation paths that have converged onto the same state+parent (see `runGlrFork`).
-// Only consulted for reduce-driven convergence, keyed by the reducing rule's id (its index in `tables.rules`) --
-// shift-driven convergence always uses `defaultMerge`, since both paths shifted the same literal token.
-// Two forked paths that both survive to the same convergence point with an identical value aren't a real
-// ambiguity to report -- they're the same parse reached two ways (e.g. a reduce-reduce `fork` between two
-// rules that happen to build the same AST shape for a given input). Collapse those instead of accumulating
-// an array, which downstream consumers would otherwise see instead of the plain value they expect.
+// Combines two GLR derivation paths that converged onto the same state+parent (see `runGlrFork`). Two paths
+// converging on an identical value aren't a real ambiguity (same parse reached two ways) so collapse rather
+// than accumulate an array.
 const sameValue = (a: unknown, b: unknown) => a === b || JSON.stringify(a) === JSON.stringify(b);
 const defaultMerge: MergeFn = (left, right) => {
 	if (Array.isArray(left))
@@ -693,9 +713,10 @@ const defaultMerge: MergeFn = (left, right) => {
 	return sameValue(left, right) ? left : [left, right];
 };
 
-function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: TextPos & { lastShifted?: Token }, ctx: any, resolveSym: (sym: string|RegExp|Terminal|undefined) => Terminal|undefined): Token {
+function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: TextPos & { prev?: Token }, ctx: any, resolveSym: (sym: Token|Terminal|string|RegExp|undefined) => Token|Terminal|undefined): Token {
 
 	while (state.offset < input.length) {
+		const pos = getTextPos(state);
 		const candidates: { term: Terminal; len: number }[] = [];
 		for (const term of allowed.keys()) {
 			const re = term.pattern;
@@ -709,72 +730,62 @@ function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: Te
 		candidates.sort((a, b) => b.len - a.len
 			|| (a.term.pattern!.source < b.term.pattern!.source ? 1 : a.term.pattern!.source > b.term.pattern!.source ? -1 : 0));
 
-		let chosen:	{ term: Terminal; len: number } | undefined;
+		let chosen = false;
 		for (const { term, len } of candidates) {
-			let result: Terminal | undefined;
+			const match = input.slice(state.offset, state.offset + len);
+
 			if (!term.callback) {
-				result = term;
+				advancePos(state, match);
+				if (allowed.get(term)?.kind !== 'ignore')
+					return { type: term, value: match, pos };
+				chosen = true;
+				break;
+
 			} else {
-				const text = input.slice(state.offset, state.offset + len);
-				const after = advancePos({...state}, text);
-				result = resolveSym(term.callback({
+				const after		= advancePos({...state}, match);
+				const result 	= resolveSym(term.callback({
 					...state,
-					prev:		state.lastShifted,
-					match:		text,
+					match,
 					remaining:	input.substring(after.offset),
 					next: 		() => nextToken(allowed, input, after, ctx, resolveSym),
 				}, ctx));
-			}
-			if (result) {
-				chosen = { term: result, len };
-				break;
+
+				if (result) {
+					advancePos(state, match);
+					// `result` is the callback's *returned* terminal (e.g. a contextual keyword like GET
+					// downgrading itself to IDENT) -- using `term` (the originally-matched terminal) here
+					// instead would silently discard that reclassification and always keep the keyword type.
+					const type = result instanceof Terminal ? result : result.type;
+					if (allowed.get(type)?.kind !== 'ignore')
+						return { type, value: result instanceof Terminal ? match : result.value, pos };
+					chosen = true;
+					break;
+				}
 			}
 		}
 
 		if (!chosen)
-			return { type: ERROR, value: input.substring(state.offset), pos: { offset: state.offset, line: state.line, col: state.col }};
-
-		const matched	= input.slice(state.offset, state.offset + chosen.len);
-		const token		= allowed.get(chosen.term)?.kind !== 'ignore'
-			? { type: chosen.term, value: matched, pos: { offset: state.offset, line: state.line, col: state.col } }
-			: null;
-
-		advancePos(state, matched);
-
-		if (token)
-			return token;
+			return { type: ERROR, value: input.substring(state.offset), pos};
 	}
-	return { type: EOF, value: '', pos: { offset: state.offset, line: state.line, col: state.col }};
+	return { type: EOF, value: '', pos: getTextPos(state)};
 }
 
 interface StackEntry { state: number; value: unknown; }
-
-function dumpStack(stack: readonly StackEntry[]) {
-	console.error('Stack dump:');
-	for (let i = 0; i < stack.length; i++)
-		console.error(`${'  '.repeat(i)}state: ${stack[i].state}, value: ${JSON.stringify(stack[i].value)}`);
-}
 
 function recoverCtx(stream: Lexer): LexPosition {
 	return { offset: stream.offset, line: stream.line, col: stream.col, remaining: stream.peekText(), prev: stream.prev };
 }
 
-function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: RecoveryCallback | undefined, mergeFns: Record<number, MergeFn> = {}) {
+type RecoveryCallback2 = (stream: Lexer, row: Map<Terminal, ActionEntry>) => Token | undefined;
+
+function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: RecoveryCallback2) {
 	const stack: StackEntry[] = [{ state: 0, value: undefined }];
 
 	let realTok		= stream.next(tables.action[0]);
 
-	// A `recover`-synthesized token (e.g. ASI's phantom `;`) never consumes `realTok` itself -- only a
-	// genuine shift/reduce of `realTok` (or the lexer producing a fresh one) advances `stream.offset`.
-	// If recovery keeps firing at the *same* offset well beyond what any legitimate multi-step recovery
-	// cascade should need, it's re-synthesizing against the exact same real token that's still sitting
-	// there unconsumed: an infinite loop (recovery keeps "fixing" the parse by inserting more phantom
-	// tokens, but the actual unexpected input is never shifted or reported). The bound is generous (not
-	// 1) since a single stuck token can legitimately need a few recovery-driven reduces before it's
-	// finally shift-able, just never anywhere near this many. Found via real files ending in an unmatched
-	// `}` and via `binary-archives/test/test_tar.ts`'s unterminated trailing comment (a different trigger
-	// of the same underlying gap, before the lexer fix for that -- kept as a backstop here in case another
-	// trigger exists).
+	// A `recover`-synthesized token never consumes `realTok` -- only a genuine shift/reduce advances
+	// `stream.offset`. Recovery firing forever at the same offset means it's stuck re-synthesizing against
+	// the same unconsumed token; the bound is generous since a few recovery-driven reduces can legitimately precede a real shift.
 	let recoveryStuckAt: number | undefined;
 	let recoveryStuckCount = 0;
 	const MAX_RECOVERY_AT_SAME_OFFSET = 50;
@@ -784,17 +795,12 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 		const direct		= row.get(realTok.type);
 		const usingRecovery	= !direct || direct.kind === 'error';
 		if (usingRecovery) {
-			// Deliberately NOT reset when `usingRecovery` is false: a stuck cycle typically alternates
-			// recovery steps with genuine direct shift/reduce steps *of the synthesized token itself*
-			// (e.g. shift the phantom `;`, reduce it into an empty statement, hit recovery again) --
-			// resetting on every non-recovery step means the counter never accumulates, since it's rare
-			// to see two recovery steps in a row even when truly stuck. `stream.offset` only advances
-			// when `realTok` itself is genuinely consumed, so comparing against it (not against "was the
-			// previous step recovery") is what actually detects "no real progress since recovery started".
+			// Not reset on non-recovery steps: a stuck cycle alternates recovery with shift/reduce of the
+			// synthesized token itself, so consecutive recovery steps are rare even when truly stuck --
+			// compare against `stream.offset` (real progress) instead.
 			recoveryStuckCount = recoveryStuckAt === stream.offset ? recoveryStuckCount + 1 : 1;
 			recoveryStuckAt = stream.offset;
 			if (recoveryStuckCount > MAX_RECOVERY_AT_SAME_OFFSET) {
-				dumpStack(stack);
 				const pos = recoverCtx(stream);
 				throw new SyntaxError(
 					`Parser stuck in error recovery at line ${pos.line}, col ${pos.col} `
@@ -802,12 +808,11 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 				);
 			}
 		}
-		const tok			= usingRecovery ? recover?.(recoverCtx(stream), row) : realTok;
+		const tok			= usingRecovery ? recover(stream, row) : realTok;
 		const entry			= tok && row.get(tok.type);
 
 		if (!entry || entry.kind === 'error') {
-			dumpStack(stack);
-			const expected	= [...row].filter(([k, v]) => k !== EOF && v.kind !== 'error').map(([k]) => k.name);
+			const expected	= [...row].filter(([k, v]) => k !== EOF && v.kind !== 'error' && v.kind !== 'ignore').map(([k]) => k.name);
 			const pos		= recoverCtx(stream);
 			throw new SyntaxError(
 				(realTok.type !== ERROR ? `Unexpected token '${realTok.type.name}'` : `Unexpected character '${pos.remaining[0] ?? ''}'`)
@@ -817,7 +822,7 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 		}
 
 		if (entry.kind === 'conflict') {
-			const result = runGlrFork(tables, stream, tok, ctx, mergeFns, recover, stack);
+			const result = runGlrFork(tables, stream, tok, ctx, recover, stack);
 			if (result)
 				return result.value;
 			realTok = stream.next(tables.action[stack[stack.length - 1].state]);
@@ -835,10 +840,10 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 			const rule		= tables.rules[entry.rule];
 			const rhsLen	= rule.rhs.length;
 			const peek		= rule.peek ?? 0;
-			const vals		= [
+			const vals		= Object.assign([
 				...(peek ? stack.slice(stack.length - rhsLen - peek, stack.length - rhsLen).map(e => e.value) : []),
 				...stack.splice(stack.length - rhsLen, rhsLen).map(e => e.value)
-			];
+			], {pos: tok.pos});
 
 			const topState	= stack[stack.length - 1].state;
 			const state = tables.goto[topState].get(rule.lhs);
@@ -846,7 +851,6 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 				throw new Error(`No GOTO entry for state ${topState}, non-terminal '${rule.lhs.name}'`);
 
 			const value = rule.action(vals, ctx);
-			//console.log(`${'  '.repeat(stack.length)}${rule.lhs.name} -> ${rule.rhs.map(r => r.name).join(' ')}, made: ${JSON.stringify(value)}`);
 			stack.push({ state, value });
 
 		} else if (entry.kind === 'accept') {
@@ -867,16 +871,11 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 type GlrForkResult = { accepted: true; value: unknown } | undefined;
 
 // On a non-accepting return, `stack` has been overwritten in place with the settled single derivation.
-function runGlrFork(
-	tables: ParseTables, stream: Lexer, tok: Token, ctx: any, mergeFns: Record<number, MergeFn>, recover: RecoveryCallback | undefined,
-	stack: StackEntry[],
-): GlrForkResult {
+function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, recover: RecoveryCallback2, stack: StackEntry[]): GlrForkResult {
 
-	interface StackFrame {
+	interface StackFrame extends StackEntry {
 		id:		number;			// identifies this exact frame, for convergence keys below
 		parent: StackFrame | null;
-		state:	number;
-		value:	unknown;
 	}
 
 	let frameIdCounter	= 0;
@@ -886,7 +885,7 @@ function runGlrFork(
 	const makeFrame		= (parent: StackFrame | null, state: number, value: unknown) => ({ id: frameIdCounter++, parent, state, value });
 	const convergeKey	= (top: StackFrame) => `${top.state}:${top.parent ? top.parent.id : -1}`;
 	const mergeInto		= (into: StackFrame, incoming: StackFrame, ruleId?: number) =>
-		makeFrame(into.parent, into.state, ((ruleId !== undefined ? mergeFns[ruleId] : undefined) ?? defaultMerge)(into.value, incoming.value));
+		makeFrame(into.parent, into.state, ((ruleId !== undefined ? tables.rules[ruleId].merge : undefined) ?? defaultMerge)(into.value, incoming.value));
 
 	// Flat stack -> frame chain
 	let frame = makeFrame(null, stack[0].state, undefined);
@@ -895,12 +894,8 @@ function runGlrFork(
 
 	let active = new Map([[convergeKey(frame), frame]]);
 
-	// General circuit breaker on top of the recovery-specific one further down: bounds *all* work done
-	// across this whole call (every dequeue from every position's worklist), not just recovery-driven
-	// re-registrations at a single position. Catches runaway path explosion from any cause -- genuine
-	// grammar ambiguity gone combinatorial, not just the "recovery never converges" pattern the more
-	// specific check below targets -- since a real GLR fork resolving a small, deliberate ambiguity
-	// (the handful of `forceFork`-tagged rules in this codebase) never needs anywhere near this many.
+	// Bounds all work across this call (any cause of runaway path explosion), on top of the more specific
+	// recovery-stuck check below.
 	let totalWork = 0;
 	const MAX_TOTAL_WORK = 5_000;
 
@@ -930,7 +925,7 @@ function runGlrFork(
 				const	peek	= rule.peek ?? 0;
 				let		top		= path;
 				let		n		= rule.rhs.length;
-				const vals: unknown[] = new Array(n + peek);
+				const	vals	= Object.assign(new Array<unknown>(n + peek), {pos: actionTok.pos});
 				while (n--) {
 					vals[peek + n]	= top.value;
 					top				= top.parent!;
@@ -951,12 +946,9 @@ function runGlrFork(
 			}
 		};
 
-		// Same infinite-loop hazard `runParser`'s own recovery-stuck check guards against (see there for the
-		// full explanation), just shaped differently here: a recovery-synthesized token can `registerAtPosition`
-		// (push back onto this *same* worklist) instead of advancing to `shifted`, so a recovery that never
-		// converges toward actually consuming `tok` can churn this loop forever without ever growing `i` or
-		// exhausting the worklist naturally. Bounded generously -- legitimate wide ambiguity can process many
-		// paths per position, but not via recovery specifically, repeatedly, at a single frozen `tok`.
+		// Same recovery-stuck hazard as `runParser` (see there), shaped differently: a recovery-synthesized
+		// token can re-register onto this same worklist instead of advancing, churning forever without `tok`
+		// ever being consumed.
 		let recoveryUsedCount = 0;
 		const MAX_RECOVERY_PER_POSITION = 200;
 
@@ -983,7 +975,7 @@ function runGlrFork(
 					+ `(recovery keeps re-inserting a token without consuming '${tok.type.name}') -- this is a parser/grammar bug, not just invalid input.`
 				);
 			}
-			const actionTok		= usingRecovery ? recover?.(recoverCtx(stream), row) : tok;
+			const actionTok		= usingRecovery ? recover(stream, row) : tok;
 			const entry			= actionTok && row.get(actionTok.type);
 			if (entry && entry.kind !== 'error') {
 				if (entry.kind === 'conflict') {
@@ -1005,8 +997,10 @@ function runGlrFork(
 			stream.prev = tok;
 
 		// Merge converging paths landing on i + 1 (same derivation reached by separate shifts).
-		if (!shifted.length)
-			throw new SyntaxError(`No active parse paths at position ${i + 1}`);
+		if (!shifted.length) {
+			const pos = recoverCtx(stream);
+			throw new SyntaxError(`No active GLR fork paths survived to token ${i + 1} (at line ${pos.line}, col ${pos.col}, near '${tok.type.name}') -- every forked derivation died out; this is a parser/grammar bug, not just invalid input.`);
+		}
 
 		active = new Map<string, StackFrame>();
 		for (const path of shifted) {
@@ -1036,16 +1030,76 @@ function runGlrFork(
 }
 
 // ===================================================================
+//  Unit-rule GOTO bypass
+// ===================================================================
+// When a reduce lands on a state whose only possible move is reducing a pass-through unit rule (`A -> B`,
+// identity action), that hop is a no-op: redirecting goto(s, B) straight to goto(s, A) at table-build time
+// skips it.
+//
+// IMPORTANT: only GOTO entries are rewritten, never shift targets -- action rows double as the lexer's
+// allowed-terminal sets, which must stay byte-identical for candidate-restricted terminal callbacks
+// (regex-vs-divide, ASI, contextual keywords) to keep making the same choices. Don't extend this to shifts.
+//
+// A state qualifies only if every action is the SAME identity-unit reduce and it has no gotos of its own.
+function eliminateUnitGotos(tables: ParseTables): number {
+	// Reduce-only states and the nonterminal their unit rule forwards to.
+	const bypass = new Map<number, NonTerminal>();
+	for (let s = 0; s < tables.action.length; s++) {
+		if (tables.goto[s].size)
+			continue;
+		let ruleId = -1;
+		for (const entry of tables.action[s].values()) {
+			if (entry.kind === 'ignore' || entry.kind === 'error')
+				continue;
+			if (entry.kind !== 'reduce' || (ruleId >= 0 && ruleId !== entry.rule)) {
+				ruleId = -2;
+				break;
+			}
+			ruleId = entry.rule;
+		}
+		if (ruleId < 0)
+			continue;
+		const rule = tables.rules[ruleId];
+		// `!rule.merge`: a rule with a GLR convergence combiner must keep its reduce, since bypassing it
+		// would also skip the merge hook that fires when two fork paths converge on that reduce.
+		if (rule.action === identityAction && !rule.merge && !rule.peek && rule.rhs.length === 1 && rule.rhs[0] instanceof NonTerminal)
+			bypass.set(s, rule.lhs);
+	}
+
+	// Redirect until stable: a redirect target can itself be a bypassable state (chained unit rules).
+	// The iteration cap guards against pathological unit *cycles* (`A -> B`, `B -> A`); real chains are no deeper than the grammar's unit nesting.
+	let redirected = 0;
+	for (let changed = true, guard = 100; changed && guard--; ) {
+		changed = false;
+		for (const gotoRow of tables.goto) {
+			for (const [nt, target] of gotoRow) {
+				const lhs = bypass.get(target);
+				if (lhs && lhs !== nt) {
+					const fwd = gotoRow.get(lhs);
+					if (fwd !== undefined && fwd !== target) {
+						gotoRow.set(nt, fwd);
+						redirected++;
+						changed = true;
+					}
+				}
+			}
+		}
+	}
+	return redirected;
+}
+
+// ===================================================================
 //  Main entry point
 // ===================================================================
 
-export function makeParser(spec: GrammarSpec,
-	merge?:		Record<number, MergeFn>, 	// Merge functions for ambiguous convergence points. Key = rule id of the reducing rule (its index in tables.rules).
-): Parser {
+export function makeParser(spec: GrammarSpec): Parser {
 	const g			= new GrammarBuilder(spec);
-	const tables	= g.buildTables();
+	const tables	= g.buildTables(spec.lalr ?? true);
 
-	const resolveSym = (sym: string|RegExp|Terminal|undefined): Terminal|undefined =>
+	if (spec.optimize !== false)
+		eliminateUnitGotos(tables);
+
+	const resolveSym = (sym: Token|Terminal|string|RegExp|undefined): Token|Terminal|undefined =>
 		typeof sym === 'string'		? g.terminalsByName.get(sym)
 		: sym instanceof RegExp		? g.terminalsByName.get(sym.source)
 		: sym;
@@ -1058,8 +1112,19 @@ export function makeParser(spec: GrammarSpec,
 		peekText() { return input.substring(this.offset); }
 	});
 
+	const makeRecover = (recover?: RecoveryCallback): RecoveryCallback2 => {
+		return recover
+			? (stream, row) => {
+				const result = resolveSym(recover(recoverCtx(stream), row));
+				if (result)
+					return result instanceof Terminal ? {type: result, value: '', pos: getTextPos(stream)} : result;
+				return undefined;
+			}
+			: (_stream, _row) => undefined;
+	};
+
 	return {
 		tables,
-		parse: (input, ctx) => runParser(tables, makeLexer(input, ctx), ctx, spec.recover ?? (()=>undefined), merge ?? {})
+		parse: (input, ctx) => runParser(tables, makeLexer(input, ctx), ctx, makeRecover(spec.recover))
 	};
 }
