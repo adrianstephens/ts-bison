@@ -9,6 +9,6 @@
 	"include": [
 		"*.ts",
 		"../src/**/*.ts",
-		"../examples/**/*.ts",
+		"../examples/**/*.ts", "../examples/TSR/js-parserR.ts", "../examples/TSR/ts-parserR.ts",
 	]
 }

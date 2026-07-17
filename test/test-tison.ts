@@ -1,4 +1,4 @@
-import {makeParser, Ref, Rules, RRules, Rule, WithPrec} from '../src/tison';
+import {makeParser, Ref, Rules, Rule, WithPrec} from '../src/tison';
 import { RuleR } from '../src/rrule';
 
 // ===================================================================
@@ -14,7 +14,7 @@ const lexParser = makeParser({
         multiplicative:	'left',
         unary:			'right',
     },
-    start: RRules(self => [
+    start: Rules(self => [
         { rhs: [self, '+', (x: any) => {console.log('hello', x); return 42;}, self], action: $ => ($[0] as number) + ($[2] as number), prec: 'additive' },
         { rhs: [self, '-', self], action: $ => ($[0] as number) - ($[2] as number), prec: 'additive' },
         { rhs: [self, '*', self], action: $ => ($[0] as number) * ($[2] as number), prec: 'multiplicative' },
@@ -67,7 +67,7 @@ const lexParser3 = makeParser({
         unary:			'right',
     },
     rules: {
-        expression: RRules<number>(self => [
+        expression: Rules<number>(self => [
             WithPrec(RuleR(self, '+', self, $ => $[0] + $[2]), 'additive'),
             WithPrec(RuleR(self, '-', self, $ => $[0] - $[2]), 'additive'),
             WithPrec(RuleR(self, '*', self, $ => $[0] * $[2]), 'multiplicative'),

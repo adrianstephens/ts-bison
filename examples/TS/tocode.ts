@@ -1,8 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unused-expressions */
-/* eslint-disable @typescript-eslint/no-this-alias */
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
-import { Expr, BindingTarget, Key, NameAndType } from './js-parser';
+import { Expr, BindingTarget, Key, Rest } from './js-parser';
 import { Type } from './ts-parser';
 import { isProgram, isType, isTsStatement, guard, hasMod } from './walker';
 import { VOID } from './type-utils';
@@ -40,22 +38,18 @@ const BINARY_PREC: Record<string, number> = {
 	'||': 5,
 	'??': 4,
 };
-const WORD_UNARY_OPS = new Set(['typeof', 'void', 'delete']);
 
 function exprPrecedence(expr: Expr): number {
 	switch (expr.type) {
 		case 'sequence':			return 1;
-		case 'assign':
 		case 'yield':
 		case 'arrow':				return 2;
 		case 'conditional':			return 3;
-		case 'binary':
-		case 'logical':				return BINARY_PREC[expr.operator] ?? 0;
+		case 'binary':				return BINARY_PREC[expr.operator] ?? expr.operator.endsWith('=') ? 2 : 0;
 		case 'as_expression':
 		case 'satisfies_expression':return 11;
-		case 'await':
 		case 'unary':				return 16;
-		case 'update':				return expr.prefix ? 16 : 17;
+		case 'unary_post':			return 17;
 		default:					return 18;
 	}
 }
@@ -67,6 +61,28 @@ function indentCode(lines: string[], indent: string): string {
 function withParens(x: string, parens = true)	{
 	return parens ? '(' + x + ')' : x;
 }
+function arrowParens(body: string) {
+	return withParens(body, body.startsWith('{'));
+}
+function optional(enable: any) {
+	return enable ? '?' : '';
+}
+
+// Parsing merges `{foo: 1}` and `{'foo': 1}` into the same plain-string `key`, so regenerating always-bare
+// breaks any key that isn't a valid identifier on its own (e.g. `'filter-out': ...`).
+function isValidIdentifier(s: string) { return /^[$_\p{ID_Start}][$\p{ID_Continue}]*$/u.test(s); }
+function isLogicalOp(op: string) { return op === '&&' || op === '||' || op === '??'; } 
+function isAssignOp(op: string) { return !(op in BINARY_PREC) && op.endsWith('='); }
+
+function needsNullishParens(parentOp: string, child: Expr): boolean {
+	const childOp = child.type === 'binary' && isLogicalOp(child.operator) ? child.operator : undefined;
+	return (parentOp === '??' && (childOp === '&&' || childOp === '||'))
+		|| ((parentOp === '&&' || parentOp === '||') && childOp === '??');
+}
+
+function needsAsIntersectionParens(parentOp: string, child: Expr): boolean {
+	return parentOp === '&' && (child?.type === 'as_expression' || child?.type === 'satisfies_expression');
+}
 
 // A compound element type needs parens as an array element, or it re-parses with the wrong
 // precedence -- `(A | B)[]` printed without them becomes `A | B[]` (only `B` is the element).
@@ -76,19 +92,6 @@ export class TSoutput {
 	opts: CodegenOptions = {
 		indent: '  '
 	};
-	// Parsing merges `{foo: 1}` and `{'foo': 1}` into the same plain-string `key`, so regenerating always-bare
-	// breaks any key that isn't a valid identifier on its own (e.g. `'filter-out': ...`).
-	static isValidIdentifier(s: string) { return /^[$_\p{ID_Start}][$\p{ID_Continue}]*$/u.test(s); }
-
-	static needsNullishParens(parentOp: string, child: any): boolean {
-		const childOp = child?.type === 'logical' ? child.operator : undefined;
-		return (parentOp === '??' && (childOp === '&&' || childOp === '||'))
-			|| ((parentOp === '&&' || parentOp === '||') && childOp === '??');
-	}
-
-	static needsAsIntersectionParens(parentOp: string, child: any): boolean {
-		return parentOp === '&' && (child?.type === 'as_expression' || child?.type === 'satisfies_expression');
-	}
 
 	constructor(opts: Partial<CodegenOptions> = {}) {
 		this.opts = {...this.opts, ...opts};
@@ -116,11 +119,9 @@ export class TSoutput {
 				return  type.name + this.typeArgsToCode(type.typeArgs);
 
 			case 'literal':
-				if (type.value === null)
-					return 'null';
-				if (typeof type.value === 'string')
-					return JSON.stringify(type.value);
-				return String(type.value);
+				return type.value === null ? 'null'
+					:	typeof type.value === 'string' ? JSON.stringify(type.value)
+					:	String(type.value);
 
 			case 'template_literal':
 				return '`' + type.parts.map(p => p.str + (p.exp ? '${' + this.typeToCode(p.exp) + '}' : '')).join('') + '`';
@@ -134,7 +135,7 @@ export class TSoutput {
 			case 'tuple':
 				return '[' + type.elements.map(t => t.type === 'spread' ? '...' + (t.label ? t.label + ': ' : '') + this.typeToCode(t.argument)
 					: t.type === 'optional' ? this.typeToCode(t.element) + '?'
-					: t.type === 'labeled' ? t.label + (t.optional ? '?' : '') + ': ' + this.typeToCode(t.element)
+					: t.type === 'labeled' ? t.label + optional(t.optional) + ': ' + this.typeToCode(t.element)
 					: this.typeToCode(t)).join(', ') + ']';
 
 			case 'union':
@@ -144,12 +145,12 @@ export class TSoutput {
 				return type.types.map(t => this.typeToCode(t)).join(' & ');
 
 			case 'function':
-				return this.typeParamsToCode(type.typeParams) + this.paramsToCode(type) + ' => ' + this.typeToCode(type.returnType!);
+				return this.typeParamsToCode(type.typeParams) + this.paramsToCode(type) + ' => ' + this.typeToCode(type.returnType ?? VOID);
 
 			case 'constructor':
 				return (type.abstract ? 'abstract ' : '') + 'new '
 					+ this.typeParamsToCode(type.typeParams)
-					+ this.paramsToCode(type) + ' => ' + this.typeToCode(type.returnType!);
+					+ this.paramsToCode(type) + ' => ' + this.typeToCode(type.returnType ?? VOID);
 
 			case 'object':
 				return this.typeMemberBodyToCode(type.members);
@@ -170,9 +171,9 @@ export class TSoutput {
 				return this.typeToCode(type.object) + '[' + this.typeToCode(type.index) + ']';
 
 			case 'conditional':
-				return this.typeToCode(type.checkType) + ' extends ' + this.typeToCode(type.extendsType) +
-					' ? ' + this.typeToCode(type.trueType) +
-					' : ' + this.typeToCode(type.falseType);
+				return this.typeToCode(type.checkType) + ' extends ' + this.typeToCode(type.extendsType)
+					+ ' ? ' + this.typeToCode(type.trueType)
+					+ ' : ' + this.typeToCode(type.falseType);
 
 			case 'infer':
 				return 'infer ' + type.name + (type.constraint ? ' extends ' + this.typeToCode(type.constraint) : '');
@@ -196,17 +197,13 @@ export class TSoutput {
 	}
 
 	mappedTypeToCode(mt: TS.MappedType): string {
-		let result = '{ ';
-		if (mt.readonly)
-			result += 'readonly ';
-		result += '[' + mt.keyName + ' in ' + this.typeToCode(mt.constraint);
-		if (mt.nameType)
-			result += ' as ' + this.typeToCode(mt.nameType);
-		result += ']';
-		if (mt.optional)
-			result += '?';
-		result += ': ' + this.typeToCode(mt.valueType) + ' }';
-		return result;
+		return '{ '
+			+  (mt.readonly ? 'readonly ' : '')
+			+ '[' + mt.keyName + ' in ' + this.typeToCode(mt.constraint)
+			+ (mt.nameType ? ' as ' + this.typeToCode(mt.nameType) : '')
+			+ ']'
+			+ optional(mt.optional)
+			+ ': ' + this.typeToCode(mt.valueType) + ' }';
 	}
 
 	typeMemberBodyToCode(members: TS.TypeMember[]): string {
@@ -222,31 +219,23 @@ export class TSoutput {
 	}
 
 	static typeMemberNameToCode(key: Key): string {
-		return typeof key === 'string' ? (this.isValidIdentifier(key) ? key : JSON.stringify(key)) : '[' + this.computedTypeMemberKeyToCode(key.computed) + ']';
+		return typeof key === 'string' ? (isValidIdentifier(key) ? key : JSON.stringify(key)) : '[' + this.computedTypeMemberKeyToCode(key.computed) + ']';
 	}
 
 	typeMemberToCode(member: TS.TypeMember): string {
 		switch (member.kind) {
-			case 'property': {
-				let result = '';
-				if (member.readonly)
-					result += 'readonly ';
-				result += TSoutput.typeMemberNameToCode(member.name);
-				if (member.optional)
-					result += '?';
-				result += ': ' + this.typeToCode(member.typeAnnotation);
-				return result;
-			}
+			case 'property':
+				return (member.readonly ? 'readonly ' : '')
+					+	TSoutput.typeMemberNameToCode(member.name)
+					+	optional(member.optional)
+					+	': ' + this.typeToCode(member.typeAnnotation);
 
-			case 'method': {
-				let result = TSoutput.typeMemberNameToCode(member.name);
-				if (member.optional)
-					result += '?';
-				result += this.typeParamsToCode(member.typeParams);
-				result += this.paramsToCode(member);
-				result += this.typeAnnotationToCode(member.returnType);
-				return result;
-			}
+			case 'method':
+				return TSoutput.typeMemberNameToCode(member.name)
+					+ optional(member.optional)
+					+ this.typeParamsToCode(member.typeParams)
+					+ this.paramsToCode(member)
+					+ this.typeAnnotationToCode(member.returnType);
 
 			case 'index':
 				return '[' + member.paramName + ': ' + this.typeToCode(member.paramType) + ']: ' + this.typeToCode(member.typeAnnotation);
@@ -275,20 +264,17 @@ export class TSoutput {
 	}
 
 	typeParamsToCode(typeParams?: TS.TypeParam[]) {
-		return typeParams ? ('<' + typeParams.map(param => {
-			let result = (param.const ? 'const ' : '') + param.name;
-			if (param.constraint)
-				result += ' extends ' + this.typeToCode(param.constraint);
-			if (param.default)
-				result += ' = ' + this.typeToCode(param.default);
-			return result;
-		}).join(', ') + '>') : '';
+		return typeParams ? ('<' + typeParams.map(param =>
+			(param.const ? 'const ' : '') + param.name
+		+	(param.constraint ? ' extends ' + this.typeToCode(param.constraint) : '')
+		+	(param.default ? ' = ' + this.typeToCode(param.default) : '')
+		).join(', ') + '>') : '';
 	}
 
-	paramsToCode(params: TS.ParamList): string {
-		const a = params.params.map(p => p.key + (hasMod(p, 'optional') ? '?' : '') + this.typeAnnotationToCode(p.typeAnnotation));
+	paramsToCode(params: TS.Params): string {
+		const a = params.params.map(p => p.key + optional(hasMod(p, 'optional')) + this.typeAnnotationToCode(p.typeAnnotation));
 		if (params.rest)
-			a.push('...' + params.rest?.key + this.typeAnnotationToCode(params.rest?.typeAnnotation));
+			a.push('...' + this.bindingTargetToCode(params.rest.key) + this.typeAnnotationToCode(params.rest?.typeAnnotation));
 		return withParens(a.join(', '));
 	}
 
@@ -314,24 +300,18 @@ export class TSoutput {
 		return String(target);
 	}
 	// `params.join(', ') + (rest ? ', ...' + rest : '')` looks right but leaves a stray leading comma for a rest-only list (e.g. `(...alts)`).
-	paramListToCode(params: JS.Param[], rest?: NameAndType): string {
+	paramListToCode(params: JS.Param[], rest?: Rest): string {
 		const parts = params.map(param => {
-			let result = '';
 			// `'optional'` renders as a trailing `?`, not a prefix keyword like the rest (`public`/`readonly`/...).
 			const prefix = param.modifiers?.filter(m => m !== 'optional');
-			if (prefix?.length)
-				result += prefix.join(' ') + ' ';
-			result += this.bindingTargetToCode(param.key);
-			if (hasMod(param, 'optional'))
-				result += '?';
-			if (param.typeAnnotation)
-				result += ': ' + this.typeToCode(param.typeAnnotation as Type);
-			if (param.default)
-				result += ' = ' + this.exprToCode(param.default, 2);
-			return result;
+			return (prefix?.length ? prefix.join(' ') + ' ' : '')
+				+	this.bindingTargetToCode(param.key)
+				+	optional(hasMod(param, 'optional'))
+				+	(param.typeAnnotation ? ': ' + this.typeToCode(param.typeAnnotation as Type) : '')
+				+	(param.default ? ' = ' + this.exprToCode(param.default, 2) : '');
 		});
 		if (rest)
-			parts.push('...' + rest.key + (rest.typeAnnotation ? ': ' + this.typeToCode(rest.typeAnnotation as Type) : ''));
+			parts.push('...' + this.bindingTargetToCode(rest.key) + (rest.typeAnnotation ? ': ' + this.typeToCode(rest.typeAnnotation as Type) : ''));
 		return withParens(parts.join(', ') );
 	}
 
@@ -356,14 +336,11 @@ export class TSoutput {
 					+ this.typeParamsToCode(stmt.typeParams)
 					+ ' = ' + this.typeToCode(stmt.value) + ';';
 
-			case 'interface_decl': {
-				let result = 'interface ' + stmt.name;
-				result += this.typeParamsToCode(stmt.typeParams);
-				if (stmt.extendsClause)
-					result += ' extends ' + stmt.extendsClause.map(t => this.typeToCode(t)).join(', ');
-				result += ' ' + this.typeMemberBodyToCode(stmt.body);
-				return result;
-			}
+			case 'interface_decl':
+				return 'interface ' + stmt.name
+					+ this.typeParamsToCode(stmt.typeParams)
+					+ (stmt.extendsClause ? ' extends ' + stmt.extendsClause.map(t => this.typeToCode(t)).join(', ') : '')
+					+ ' ' + this.typeMemberBodyToCode(stmt.body);
 
 			case 'enum_decl':
 				return stmt.const ? 'const ' : '' + 'enum ' + stmt.name + ' {\n' + indentCode(stmt.members.map(m =>
@@ -379,7 +356,7 @@ export class TSoutput {
 			case 'block':
 				return '{\n' + this.indentBlock(stmt.body) + '\n}';
 
-			case 'var':
+			case 'var_decl':
 				return this.varDeclsToCode(stmt) + ';';
 
 			case 'expression': {
@@ -404,7 +381,7 @@ export class TSoutput {
 
 			case 'for':
 				return 'for (' + (stmt.init
-					? (stmt.init.type === 'var'
+					? (stmt.init.type === 'var_decl'
 						? this.varDeclsToCode(stmt.init)
 						: this.exprToCode(stmt.init)
 					) : ''
@@ -412,11 +389,13 @@ export class TSoutput {
 				 + this.dependentCode(stmt.body);
 
 			case 'for_in':
-				return 'for ' + (stmt.await ? 'await ' : '') + withParens(
-					(stmt.left && stmt.left.type === 'var'
-						? this.varDeclsToCode(stmt.left)
-						: this.exprToCode(stmt.left)) +
-					' ' + stmt.kind + ' ' + this.exprToCode(stmt.right)
+				return 'for ' + (stmt.kind === 'of await' ? 'await ' : '') + withParens(
+					(stmt.init && stmt.init.type === 'var_decl'
+						? this.varDeclsToCode(stmt.init)
+						: this.exprToCode(stmt.init)
+					)
+					+ ' ' + (stmt.kind === 'of await' ? 'of' : stmt.kind)
+					+ ' ' + this.exprToCode(stmt.right)
 				) + ' ' + this.dependentCode(stmt.body);
 
 			case 'continue':
@@ -444,14 +423,10 @@ export class TSoutput {
 			case 'throw':
 				return 'throw ' + this.exprToCode(stmt.argument) + ';';
 
-			case 'try': {
-				let result = 'try {\n' + this.indentBlock(stmt.block) + '\n}';
-				if (stmt.handlerBody)
-					result += ' catch' + (stmt.handlerParam ? ' (' + stmt.handlerParam + ')' : '') + ' {\n' + this.indentBlock(stmt.handlerBody) + '\n}';
-				if (stmt.finalizer)
-					result += ' finally {\n' + this.indentBlock(stmt.finalizer) + '\n}';
-				return result;
-			}
+			case 'try':
+				return 'try {\n' + this.indentBlock(stmt.block) + '\n}'
+					+ (stmt.handlerBody ? ' catch' + (stmt.handlerParam ? ' (' + stmt.handlerParam + ')' : '') + ' {\n' + this.indentBlock(stmt.handlerBody) + '\n}' : '')
+					+ (stmt.finalizer ? ' finally {\n' + this.indentBlock(stmt.finalizer) + '\n}' : '');
 
 			case 'debugger':
 				return 'debugger;';
@@ -463,25 +438,17 @@ export class TSoutput {
 					+ this.typeAnnotationToCode(stmt.returnType as Type)
 					+ (stmt.body ? ' {\n' + this.indentBlock(stmt.body) + '\n}' : ';');
 
-			case 'import': {
-				// Bare side-effect import (`import 'x';`) has no binding at all -- no `from` clause either,
-				// unlike every other shape below (which all bind at least one name to the module).
+			case 'import':
 				if (!stmt.default && !stmt.namespace && !stmt.specifiers?.length)
 					return 'import ' + JSON.stringify(stmt.source) + ';';
-				let result = 'import ' + (stmt.typeOnly ? 'type ' : '');
-				if (stmt.default) {
-					result += stmt.default;
-					if (stmt.namespace || stmt.specifiers?.length)
-						result += ', ';
-				}
-				// `namespace`/`specifiers` are mutually exclusive in real JS -- `else if`, not two independent `if`s, avoids a stray extra comma.
-				if (stmt.namespace)
-					result += '* as ' + stmt.namespace;
-				else if (stmt.specifiers?.length)
-					result += '{ ' + stmt.specifiers.map(s => (s.typeOnly ? 'type ' : '') + s.imported + (s.local !== s.imported ? ' as ' + s.local : '')).join(', ') + ' }';
-				result += ' from ' + JSON.stringify(stmt.source) + ';';
-				return result;
-			}
+
+				return 'import ' + (stmt.typeOnly ? 'type ' : '')
+					+	(stmt.default ? stmt.default + ((stmt.namespace || stmt.specifiers?.length) ? ', ' : '') : '')
+					+ 	(stmt.namespace
+							? '* as ' + stmt.namespace
+							: stmt.specifiers?.length ? '{ ' + stmt.specifiers.map(s => (s.typeOnly ? 'type ' : '') + s.imported + (s.local !== s.imported ? ' as ' + s.local : '')).join(', ') + ' }' : ''
+						)
+					+	' from ' + JSON.stringify(stmt.source) + ';';
 
 			case 'export':
 				if (stmt.default)
@@ -496,17 +463,13 @@ export class TSoutput {
 			case 'export_decl':
 				return 'export ' + this.statementToCode(stmt.declaration);
 
-			case 'class_decl': {
-				let result = stmt.abstract ? 'abstract ' : '';
-				result += 'class ' + stmt.name;
-				result += this.typeParamsToCode(stmt.typeParams as TS.TypeParam[]);
-				if (stmt.superClass)
-					result += ' extends ' + this.exprToCode(stmt.superClass, 18);
-				if (stmt.implementsClause)
-					result += ' implements ' + (stmt.implementsClause as Type[]).map(t => this.typeToCode(t)).join(', ');
-				result += ' {\n' + indentCode(stmt.body.map(m => this.classMemberToCode(m)), this.opts.indent) + '\n}';
-				return result;
-			}
+			case 'class_decl':
+				return stmt.abstract ? 'abstract ' : ''
+					+ 'class ' + stmt.name
+					+ this.typeParamsToCode(stmt.typeParams as TS.TypeParam[])
+					+ (stmt.superClass ? ' extends ' + this.exprToCode(stmt.superClass, 18) : '')
+					+ (stmt.implementsClause ? ' implements ' + (stmt.implementsClause as Type[]).map(t => this.typeToCode(t)).join(', ') : '')
+					+ ' {\n' + indentCode(stmt.body.map(m => this.classMemberToCode(m)), this.opts.indent) + '\n}';
 
 			default:
 				throw new Error(`Unknown statement: ${(stmt as any).type}`);
@@ -514,16 +477,12 @@ export class TSoutput {
 	}
 
 	varDeclsToCode(x: {kind: JS.DeclarationKind, declarations: JS.VarDeclarator[]}) {
-		return x.kind + ' ' + x.declarations.map(decl => {
-			let result =this.bindingTargetToCode(decl.name);
-			if (decl.typeAnnotation)
-				result += ': ' + this.typeToCode(decl.typeAnnotation as Type);
-			if (decl.definite)
-				result = result.replace(/:/, '!:');
-			if (decl.init)
-				result += ' = ' + this.exprToCode(decl.init, 2);
-			return result;
-		}).join(', ');
+		return x.kind + ' ' + x.declarations.map(decl =>
+			this.bindingTargetToCode(decl.name)
+			+ (decl.definite ? '!' : '')
+			+ (decl.typeAnnotation ? ': ' + this.typeToCode(decl.typeAnnotation as Type) : '')
+			+ (decl.init ? ' = ' + this.exprToCode(decl.init, 2) : '')
+		).join(', ');
 	}
 
 	classMemberToCode(member: TS.ClassMember): string {
@@ -547,7 +506,7 @@ export class TSoutput {
 					+ (hasMod(fn, 'async') ? 'async ' : '')
 					+ (hasMod(fn, 'generator') ? '*' : '')
 					+ this.memberKeyToCode(member.key)
-					+ (hasMod(member, 'optional') ? '?' : '')
+					+ optional(hasMod(member, 'optional'))
 					+ this.typeParamsToCode(fn.typeParams as TS.TypeParam[])
 					+ this.paramListToCode(fn.params, fn.rest)
 					+ this.typeAnnotationToCode(fn.returnType as Type)
@@ -556,7 +515,7 @@ export class TSoutput {
 		} else if (member.type === 'method_signature') {
 			result	+= (member.kind ? member.kind + ' ' : '')
 					+ this.memberKeyToCode(member.key)
-					+ (hasMod(member, 'optional') ? '?' : '')
+					+ optional(hasMod(member, 'optional'))
 					+ this.typeParamsToCode(member.typeParams as TS.TypeParam[])
 					+ this.paramListToCode(member.params, member.rest)
 					+ this.typeAnnotationToCode(member.returnType as Type)
@@ -571,9 +530,9 @@ export class TSoutput {
 	}
 
 	memberKeyToCode(key: Key): string {
-		if (typeof key === 'string')
-			return TSoutput.isValidIdentifier(key) ? key : JSON.stringify(key);
-		return '[' + this.exprToCode(key.computed, 2) + ']';
+		return typeof key === 'string'
+			? isValidIdentifier(key) ? key : JSON.stringify(key)
+			: '[' + this.exprToCode(key.computed, 2) + ']';
 	}
 
 	templatePartsToCode(parts: JS.TemplatePart[]): string {
@@ -644,7 +603,8 @@ export class TSoutput {
 			case 'call':
 				return this.exprToCode(expr.callee, 18)
 					+ this.typeArgsToCode(expr.typeArgs as Type[])
-					+ (expr.optional ? '?.' : '') + withParens(expr.arguments.map((a: Expr) => this.exprToCode(a, 2)).join(', '));
+					+ (expr.optional ? '?.' : '')
+					+ withParens(expr.arguments.map((a: Expr) => this.exprToCode(a, 2)).join(', '));
 
 			case 'new':
 				return 'new ' + this.exprToCode(expr.callee, 18)
@@ -654,26 +614,18 @@ export class TSoutput {
 			case 'unary':
 				// Operand is `unary_expression` (self) in the grammar -- same tier, so chained unaries
 				// (`!!x`, `typeof typeof x`) don't need parens, but anything looser (e.g. `-(a + b)`) does.
-				return expr.operator + (WORD_UNARY_OPS.has(expr.operator) ? ' ' : '') + this.exprToCode(expr.argument, 16);
+				return expr.operator + (expr.operator.match(/\w+/) ? ' ' : '') + this.exprToCode(expr.argument, 16);
 
-			case 'update':
-				// Prefix `++`/`--`'s operand is `unary_expression` (tier 16); postfix's is restricted to
-				// `left_hand_side_expression` (tier 18) -- see postfix_expression/unary_expression in js-parser.ts.
-				return expr.prefix
-					? expr.operator + this.exprToCode(expr.argument, 16)
-					: this.exprToCode(expr.argument, 18) + expr.operator;
+			case 'unary_post':
+				return this.exprToCode(expr.argument, 18) + expr.operator;
 
-			case 'binary':
-			case 'logical': {
+			case 'binary': {
 				const op	= expr.operator;
 				const prec	= BINARY_PREC[op] ?? 0;
-				return withParens(this.exprToCode(expr.left, op === '**' ? 16 : prec), TSoutput.needsNullishParens(op, expr.left) || TSoutput.needsAsIntersectionParens(op, expr.left))
+				return withParens(this.exprToCode(expr.left, op === '**' ? 16 : isAssignOp(op) ? 18 : prec), needsNullishParens(op, expr.left) || needsAsIntersectionParens(op, expr.left))
 					+ ' ' + op + ' '
-					+ withParens(this.exprToCode(expr.right, op === '**' ? 15 : prec + 1), TSoutput.needsNullishParens(op, expr.right));
+					+ withParens(this.exprToCode(expr.right, op === '**' ? 15 : isAssignOp(op) ? 2 : prec + 1), needsNullishParens(op, expr.right));
 			}
-
-			case 'assign':
-				return this.exprToCode(expr.left, 18) + ' ' + expr.operator + ' ' + this.exprToCode(expr.right, 2);
 
 			case 'conditional':
 				// `test` is parsed as `nullish_expression` (tier 4); `consequent`/`alternate` are full
@@ -690,40 +642,28 @@ export class TSoutput {
 				return this.exprToCode(expr.tag, 18) + this.templatePartsToCode(expr.quasi);
 
 			case 'arrow': {
-				let result = (hasMod(expr, 'async') ? 'async ' : '') + this.typeParamsToCode(expr.typeParams as TS.TypeParam[])
+				return (hasMod(expr, 'async') ? 'async ' : '') + this.typeParamsToCode(expr.typeParams as TS.TypeParam[])
 					+ (!expr.typeParams && !expr.returnType && expr.params.length === 1 && !expr.rest && typeof expr.params[0].key === 'string'
 						? expr.params[0].key
 						: this.paramListToCode(expr.params, expr.rest)
 					)
 					+ this.typeAnnotationToCode(expr.returnType as Type)
-					+ ' => ';
-					
-				if (Array.isArray(expr.body)) {
-					result += '{\n' + this.indentBlock(expr.body) + '\n}';
-				} else {
-					// Body is `assignment_expression` (tier 2) -- but an object literal body additionally needs parens regardless of precedence, or `{` would be read as the arrow's block body instead (the same ambiguity real TS. requires `() => ({})` for).
-					const body = this.exprToCode(expr.body, 2);
-					result += withParens(body, body.startsWith('{'));
-				}
-				return result;
+					+ ' => '
+					+ (Array.isArray(expr.body)
+						? '{\n' + this.indentBlock(expr.body) + '\n}'
+						: arrowParens(this.exprToCode(expr.body, 2))	// Body is `assignment_expression` (tier 2) -- but an object literal body additionally needs parens regardless of precedence, or `{` would be read as the arrow's block body instead (the same ambiguity real TS. requires `() => ({})` for).
+					);
 			}
 
 			case 'yield':
 				return 'yield' + (expr.delegate ? '*' : '') + (expr.argument ? ' ' + this.exprToCode(expr.argument, 2) : '');
 
-			case 'await':
-				return 'await ' + this.exprToCode(expr.argument, 16);
-
-			case 'class': {
-				let result = 'class' + (expr.name ? ' ' + expr.name : '')
-					+ this.typeParamsToCode(expr.typeParams as TS.TypeParam[]);
-				if (expr.superClass)
-					result += ' extends ' + this.exprToCode(expr.superClass, 18);
-				if (expr.implementsClause)
-					result += ' implements ' + (expr.implementsClause as Type[]).map(t => this.typeToCode(t)).join(', ');
-				result += ' {\n' + (expr.body as TS.ClassMember[]).map(m => this.classMemberToCode(m)).join('\n') + '\n}';
-				return result;
-			}
+			case 'class':
+				return 'class' + (expr.name ? ' ' + expr.name : '')
+					+ this.typeParamsToCode(expr.typeParams as TS.TypeParam[])
+					+ (expr.superClass ? ' extends ' + this.exprToCode(expr.superClass, 18) : '')
+					+ (expr.implementsClause ? ' implements ' + (expr.implementsClause as Type[]).map(t => this.typeToCode(t)).join(', ') : '')
+					+ ' {\n' + (expr.body as TS.ClassMember[]).map(m => this.classMemberToCode(m)).join('\n') + '\n}';
 
 			case 'as_expression':
 				return this.exprToCode(expr.expression, 11) + ' as ' + this.typeToCode(expr.typeAnnotation as Type);
@@ -731,8 +671,8 @@ export class TSoutput {
 			case 'satisfies_expression':
 				return this.exprToCode(expr.expression, 11) + ' satisfies ' + this.typeToCode(expr.typeAnnotation as Type);
 
-			case 'non_null':
-				return this.exprToCode(expr.expression, 18) + '!';
+			case 'instantiation':
+				return this.exprToCode(expr.expression, 18) + this.typeArgsToCode(expr.typeArgs as Type[]);
 
 			default:
 				return String(expr);

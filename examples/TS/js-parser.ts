@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/consistent-type-definitions */
-import { makeParser, makeRule, Rules, RRules, terminal, Forward, List, MaybeList, OneOf, forceFork, type GrammarSpec, type Token, WithPrec, WithTextPos } from '../../src/tison';
+import { makeParser, makeRule, Rules, terminal, Forward, List, OneOf, ForceFork, type GrammarSpec, type Token, WithPrec } from '../../src/tison';
 
 // ===================================================================
 //  JavaScript Parser using tison
@@ -15,15 +15,20 @@ import { makeParser, makeRule, Rules, RRules, terminal, Forward, List, MaybeList
 //  AST
 // ===================================================================
 
+export type unaryOps	= '++'|'--'|'delete'|'void'|'typeof'|'+'|'-'|'~'|'!'|'await';
+export type binaryOps	= '+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'|'>>>'
+						| '&&'|'||'|'??'
+						|'<'|'>'|'<='|'>='|'instanceof'|'in'|'=='|'!='|'==='|'!=='
+						|'='|'+='|'-='|'*='|'/='|'%='|'&='|'|='|'^='|'<<='|'>>='|'>>>='
+						|'&&='|'||='|'??='
+
 export interface TemplatePart { str: string; exp?: Expr; }
 
 export type Literal =
 	| { type: 'literal'; value: number | string | boolean | null | TemplatePart[] }
 	| { type: 'regex'; pattern: string; flags: string }
 	| { type: 'bigint'; value: string };	// because bigint can't round-trip through JSON.stringify
-export function Literal(value: number | string | boolean | null | TemplatePart[] ): Literal {
-	return { type: 'literal', value } as const;
-}
+export function Literal(value: number | string | boolean | null | TemplatePart[] ): Literal { return { type: 'literal', value } as const; }
 
 export type Key = string | { computed: Expr };
 
@@ -36,32 +41,57 @@ export function ObjectProperty(key: Key, value: FunctionExpr, kind: 'get' | 'set
 export function ObjectProperty(key: Key, value: Expr, kind?: any): ObjectProperty { return { key, value, kind: kind ?? 'init' }; }
 
 export type BindingTarget = string | ObjectPattern | ArrayPattern;
-export interface ObjectPatternProperty	{ key: string; value: BindingTarget; default?: Expr; }
-export interface ObjectPattern			{ type: 'object_pattern'; properties: ObjectPatternProperty[]; rest?: string; }
-function ObjectPattern(properties: ObjectPatternProperty[], rest?: string): ObjectPattern { return { type: 'object_pattern', properties, rest }; }
 
-export interface ArrayPatternElement	{ target: BindingTarget; default?: Expr; }
-export interface ArrayPattern 			{ type: 'array_pattern'; elements: (ArrayPatternElement | undefined)[]; rest?: string; }
-function ArrayPattern(elements: (ArrayPatternElement | undefined)[], rest?: string): ArrayPattern { return { type: 'array_pattern', elements, rest }; }
+export interface ObjectPatternProperty		{ key: string; value: BindingTarget; default?: Expr; }
+export interface ObjectPattern				{ type: 'object_pattern'; properties: ObjectPatternProperty[]; rest?: string; }
+export function  ObjectPattern(properties: ObjectPatternProperty[], rest?: string): ObjectPattern { return { type: 'object_pattern', properties, rest }; }
 
-export interface NameAndType<T = unknown>	{ key: string; typeAnnotation?: T; }
+export interface ArrayPatternElement		{ target: BindingTarget; default?: Expr; }
+export interface ArrayPattern 				{ type: 'array_pattern'; elements: (ArrayPatternElement | undefined)[]; rest?: string; }
+export function  ArrayPattern(elements: (ArrayPatternElement | undefined)[], rest?: string): ArrayPattern { return { type: 'array_pattern', elements, rest }; }
+
+export interface Rest<T = unknown>			{ key: BindingTarget; typeAnnotation?: T; }
+export function  Rest<T>(key: BindingTarget, typeAnnotation?: T): Rest<T> { return {key, typeAnnotation}; }
 export interface Param<T = unknown>			{ key: BindingTarget; default?: Expr; typeAnnotation?: T; modifiers?: string[] }
-export interface ParamList<T = unknown>		{ params: Param<T>[]; rest?: NameAndType<T>; }
-export interface ParamListGeneric<T = unknown, U = unknown>		extends ParamList<T> { typeParams?: U[]; }
-export interface CallSig<T = unknown, U = unknown>		extends ParamListGeneric<T, U> { returnType?: T; }
+export function  Param<T>(key: BindingTarget, typeAnnotation?: T, modifiers?: string[]): Param<T> { return { key, typeAnnotation, modifiers }; }
+export interface Params<T = unknown>		{ params: Param<T>[]; rest?: Rest<T>; }
+export interface CallSig<T = unknown, U = unknown>	extends Params<T> { typeParams?: U[]; returnType?: T; }
 
-type ArrayLit = { type: 'array'; elements: readonly (Expr | undefined)[] }
-function ArrayLit(elements: readonly (Expr | undefined)[]): ArrayLit	{ return { type: 'array', elements}; }
+// `rest` deliberately never appears as a bare positional argument here (only nested inside a `Params`/`CallSig` object) -- a
+// prior version accepted `(params, rest, returnType, typeParams)` too, disambiguated by sniffing whether the 2nd argument had
+// a `.key` property at runtime. That's fragile for any *forwarding* call (spreading an existing signature's own `.rest`, which
+// is legitimately `undefined` most of the time) -- `undefined` in that slot is indistinguishable from "this call omitted rest
+// entirely", so it could silently shift `returnType`/`typeParams` by one position. Dispatch now depends only on
+// `Array.isArray(args[0])` and `args.length`, never on the shape of a later argument -- to specify `rest`, construct a `Params`
+// object (`{params, rest}`) as the first argument instead of passing a bare array.
+export type CallSigParams<T, U> =
+	|	[CallSig<T, U>]
+	|	[Params<T>]
+	|	[Params<T>, T|undefined]
+	|	[Params<T>, T|undefined, U[]|undefined]
+	|	[Param<T>[]]
+	|	[Param<T>[], T|undefined]
+	|	[Param<T>[], T|undefined, U[]|undefined]
+export function CallSig<T, U>(...args: CallSigParams<T, U>) : CallSig<T, U> {
+	if (Array.isArray(args[0]))
+		return { params: args[0], returnType: args[1] as T, typeParams: args[2] as U[] };
+	return args.length > 1
+		? { ...args[0], returnType: args[1] as T, typeParams: args[2] as U[] }
+		: args[0];
+}
 
-export interface Function<T = unknown, U = unknown> extends CallSig<T, U> { body?: Statement[]; }
-export interface FunctionExpr<T = unknown, U = unknown> extends Function<T, U> { type: 'function'; name?: string; modifiers?: string[] }
-export function FunctionExpr<T>(params: CallSig<T>, body: Statement[], more?: Partial<FunctionExpr>): FunctionExpr { return { type: 'function', body, ...params, ...more}; }
+
+export interface ArrayLit					{ type: 'array'; elements: readonly (Expr | undefined)[] }
+export function ArrayLit(elements: readonly (Expr | undefined)[]): ArrayLit	{ return { type: 'array', elements}; }
+
+export interface FunctionExpr<T = unknown, U = unknown> extends CallSig<T, U> { type: 'function'; name?: string; body?: Statement[]; modifiers?: string[] }
+export function FunctionExpr<T, U>(sig: CallSig<T, U>, body: Statement[], more?: Partial<FunctionExpr<T>>): FunctionExpr<T> { return { type: 'function', body, ...sig, ...more}; }
 
 export interface Arrow<T = unknown> extends CallSig<T> { type: 'arrow'; body: Expr | Statement[]; modifiers?: string[] }
-export function Arrow<T>(params: CallSig<T>, body: Expr | Statement[], more?: Partial<Arrow>): Arrow { return { body, ...params, ...more, type: 'arrow'}; }
+export function Arrow<T>(sig: CallSig<T>, body: Expr | Statement[], more?: Partial<Arrow<T>>): Arrow<T> { return { body, ...sig, ...more, type: 'arrow'}; }
 
-type Unary = { type: 'unary'; operator: string; argument: Expr; prefix: boolean }
-function Unary(operator: string, argument: Expr, prefix: boolean): Unary { return { type: 'unary', operator, argument, prefix }; }
+export interface ObjectExpr	{ type: 'object'; properties: readonly ObjectProperty[] }
+export function ObjectExpr(properties: readonly ObjectProperty[]): ObjectExpr { return {type: 'object', properties }; }
 
 export interface Class<T = unknown, U = unknown> { name?: string; superClass?: Expr; body: ClassMember<T, U>[]; typeParams?: U[]; implementsClause?: T[]; abstract?: boolean };
 
@@ -70,29 +100,25 @@ export type Expr =
 	| ArrayLit
 	| FunctionExpr
 	| Arrow
-	| Unary
 	| { type: 'identifier'; name: string; }
+	| { type: 'unary'; operator: unaryOps; argument: Expr }
+	| { type: 'unary_post'; operator: unaryOps; argument: Expr }
+	| { type: 'binary'; operator: binaryOps; left: Expr; right: Expr }
+	| { type: 'conditional'; test: Expr; consequent: Expr; alternate: Expr }
 	| { type: 'this' }
-	| { type: 'object'; properties: readonly ObjectProperty[] }
+	| ObjectExpr
 	| { type: 'member'; object: Expr; property: string; optional?: boolean }
 	| { type: 'index'; object: Expr; property: Expr; optional?: boolean }
 	| { type: 'call'; callee: Expr; arguments: Expr[]; optional?: boolean; typeArgs?: unknown[] }
 	| { type: 'new'; callee: Expr; arguments: Expr[]; typeArgs?: unknown[] }
-	| { type: 'update'; operator: string; argument: Expr; prefix: boolean }
-	| { type: 'binary'; operator: string; left: Expr; right: Expr }
-	| { type: 'logical'; operator: string; left: Expr; right: Expr }
-	| { type: 'assign'; operator: string; left: Expr; right: Expr }
-	| { type: 'conditional'; test: Expr; consequent: Expr; alternate: Expr }
 	| { type: 'sequence'; expressions: Expr[] }
 	| { type: 'spread'; argument: Expr }
 	| { type: 'tagged_template'; tag: Expr; quasi: TemplatePart[] }
 	| { type: 'yield'; argument?: Expr; delegate?: boolean }
 	| { type: 'class'; } & Class
-	| { type: 'await'; argument: Expr }
 	| { type: 'as_expression'; expression: Expr; typeAnnotation: unknown }
 	| { type: 'satisfies_expression'; expression: Expr; typeAnnotation: unknown }
-	| { type: 'non_null'; expression: Expr }
-
+	| { type: 'instantiation'; expression: Expr; typeArgs: unknown[] }
 
 
 export type ClassMember0<T = unknown, U = unknown> =
@@ -100,17 +126,20 @@ export type ClassMember0<T = unknown, U = unknown> =
 	| { type: 'field'; key: Key; value?: Expr; modifiers?: string[]; typeAnnotation?: T; }
 export type ClassMember<T = unknown, U = unknown> = ClassMember0<T, U> | { type: 'static_block'; body: Statement[] }
 
-export interface FunctionDecl<T = unknown, U = unknown>	extends Function<T, U> { type: 'function_decl'; name: string; modifiers?: string[] };
-export function FunctionDecl<T>(name: string, params: CallSig, body?: Statement[], more?: Partial<FunctionDecl<T>>): FunctionDecl { return { type: 'function_decl', name, body, ...params, ...more}; }
-export interface ClassDecl<T = unknown, U = unknown> extends Class<T, U> { type: 'class_decl'; name: string };
+export interface FunctionDecl<T = unknown, U = unknown>	extends CallSig<T, U> { type: 'function_decl'; name: string; body?: Statement[]; modifiers?: string[] };
+export function  FunctionDecl<T, U>(name: string, sig: CallSig<T, U>, body?: Statement[], more?: Partial<FunctionDecl<T>>): FunctionDecl { return { type: 'function_decl', name, body, ...sig, ...more}; }
+
+export interface ClassDecl<T = unknown, U = unknown> extends Class<T, U> { type: 'class_decl'; name: string }
+
 export interface VarDeclarator<T = unknown> { name: BindingTarget; init?: Expr; typeAnnotation?: T; definite?: boolean; }
-export type DeclarationKind			= typeof VAR_KEYWORDS[number] | 'using' | 'await using';
-export type VarDecl<T = unknown>	= { type: 'var'; kind: DeclarationKind; declarations: VarDeclarator<T>[] };
+export type DeclarationKind			= 'var' | 'let' | 'const' | 'using' | 'await using';
+export interface VarDecl<T = unknown>	{ type: 'var_decl'; kind: DeclarationKind; declarations: VarDeclarator<T>[] }
+export function  VarDecl<T>(kind: DeclarationKind, ...declarations: VarDeclarator<T>[]): VarDecl<T> { return { type: 'var_decl', kind, declarations }; }
 
 export type Declaration = VarDecl | FunctionDecl | ClassDecl;
 
-export type ExportDecl = { type: 'export_decl'; declaration: Declaration};
-export function ExportDecl(d: Declaration ): ExportDecl { return { type: 'export_decl', declaration: d }; }
+export interface ExportDecl { type: 'export_decl'; declaration: Declaration};
+export function  ExportDecl(d: Declaration ): ExportDecl { return { type: 'export_decl', declaration: d }; }
 
 export interface ImportSpecifier { imported: string; local: string; typeOnly?: boolean; }
 export interface ExportSpecifier { local: string; exported: string; typeOnly?: boolean; }
@@ -129,7 +158,7 @@ export type Statement = Declaration
 	| { type: 'do_while'; body: Statement; test: Expr }
 	| { type: 'while'; test: Expr; body: Statement }
 	| { type: 'for'; init?: ForInit; test?: Expr; update?: Expr; body: Statement }
-	| { type: 'for_in'; kind: 'in' | 'of'; left: ForInit; right: Expr; body: Statement; await?: boolean }
+	| { type: 'for_in'; kind: 'normal' | 'in' | 'of' | 'of await'; init: ForInit; right: Expr; body: Statement }
 	| { type: 'continue'; label?: string }
 	| { type: 'break'; label?: string }
 	| { type: 'return'; argument?: Expr }
@@ -154,16 +183,15 @@ export const reIDENT	= /[$_\p{ID_Start}][$\u200C\u200D\p{ID_Continue}]*/u;
 export const IDENT		= terminal('identifier', reIDENT);
 export const NUM		= terminal('number', /0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*n?|0[oO][0-7](?:_?[0-7])*n?|0[bB][01](?:_?[01])*n?|[0-9](?:_?[0-9])*n|(?:[0-9](?:_?[0-9])*\.(?:[0-9](?:_?[0-9])*)?|\.[0-9](?:_?[0-9])*|[0-9](?:_?[0-9])*)(?:[eE][-+]?[0-9]+)?/);
 export const STR		= terminal('string', /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/);
-export const ASSIGN_OP	= /(?:>>>|<<|>>|\?\?|&&|\|\||[+\-*/%&^|])?=/;
 
 // `get`/`set`/`async` are contextual keywords, only keywords when what follows still looks like the construct.
 function startsPropertyName(next: Token | undefined) {
-	return !!next && (next.type === IDENT || next.type === STR || next.type === NUM || next.type.name === '[');
+	return next && (next.type === IDENT || next.type === STR || next.type === NUM || next.type.name === '[');
 }
-export const GET	= terminal('get',	/get(?!\w)/,	lex => startsPropertyName(lex.next()) ? GET : IDENT);
-export const SET	= terminal('set',	/set(?!\w)/,	lex => startsPropertyName(lex.next()) ? SET : IDENT);
-export const USING	= terminal('using', /using(?!\w)/,	lex => lex.next()?.type === IDENT ? USING : IDENT);
-export const ASYNC	= terminal('async',	/async(?!\w)/,	lex => {
+export const GET		= terminal('get',	/get(?!\w)/,	lex => startsPropertyName(lex.next()) ? GET : IDENT);
+export const SET		= terminal('set',	/set(?!\w)/,	lex => startsPropertyName(lex.next()) ? SET : IDENT);
+export const USING		= terminal('using', /using(?!\w)/,	lex => lex.next()?.type === IDENT ? USING : IDENT);
+export const ASYNC		= terminal('async',	/async(?!\w)/,	lex => {
 	const next = lex.next();
 	return (next && (next.type.name === 'function' || next.type.name === '*' || next.type.name === '(' || next.type.name === '<')) || startsPropertyName(next) ? ASYNC : IDENT;
 });
@@ -207,8 +235,6 @@ const REGEX_LITERAL = terminal('regex',
 );
 
 
-export const VAR_KEYWORDS = ['var', 'let', 'const'] as const;
-
 // ===================================================================
 //  Grammar
 // ===================================================================
@@ -219,22 +245,24 @@ export const Rule = makeRule<any>(<T>(t: T, $: any) =>
 	typeof t === 'object' ? Object.assign(t as object, {pos: {line: $.pos.line, col: $.pos.col }}) : t
 );
 
-const varKeywords = OneOf(VAR_KEYWORDS);
+const ASSIGN_OP = OneOf(['+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=', '&&=', '||=', '=']);
+const UNARY_OP	= OneOf(['await', '++', '--', 'delete', 'void', 'typeof', '+', '-', '~', '!']);
+
 
 // Mirrors ECMA-262's own In/NoIn duplication above shift_expression: `for (x in y)` vs `for (x; ...)`
 // would otherwise be ambiguous over whether 'in' continues a RelationalExpression or marks the for-in separator.
-function binaryChain(lower: Rules<Expr>, ops: string[], prec: string, kind: 'binary' | 'logical' = 'binary') {
-	return RRules<Expr>(self => [
+function binaryChain(lower: Rules<Expr>, ops: binaryOps[], prec: string) {
+	return Rules<Expr>(self => [
 		lower,
-		WithPrec(Rule([self, OneOf(ops), lower] as const, $ =>	({ type: kind, operator: $[1], left: $[0], right: $[2] } as const)), prec)
+		WithPrec(Rule([self, OneOf(ops), lower] as const, $ =>	({ type: 'binary', operator: $[1], left: $[0], right: $[2] } as const)), prec)
 	]);
 }
 
 // Same as `binaryChain`, but only the chain's own left-recursion needs to stay NoBrace-restricted.
-function binaryChainLeft(lowerLeft: Rules<Expr>, lowerRight: Rules<Expr>, ops: string[], prec: string, kind: 'binary' | 'logical' = 'binary') {
-	return RRules<Expr>(self => [
+function binaryChainLeft(lowerLeft: Rules<Expr>, lowerRight: Rules<Expr>, ops: binaryOps[], prec: string) {
+	return Rules<Expr>(self => [
 		lowerLeft,
-		WithPrec(Rule([self, OneOf(ops), lowerRight] as const, $ => ({ type: kind, operator: $[1], left: $[0], right: $[2] } as const)), prec)
+		WithPrec(Rule([self, OneOf(ops), lowerRight] as const, $ => ({ type: 'binary', operator: $[1], left: $[0], right: $[2] }) as const), prec)
 	]);
 }
 
@@ -250,11 +278,14 @@ export const unquoteString = (s: string) => s.slice(1, -1).replace(
 );
 
 const fwd_assignment_expression	= Forward<Expr>(() => assignment_expression);
-const fwd_assignment_expression_nobrace = Forward<Expr>(() => assignment_expression_nobrace);
-const fwd_statement				= Forward<Statement>(() => statement);
-const fwd_expression			= Forward<Expr>(() => expression);
 
-export const statement_list = List(fwd_statement);
+const expression = Rules<Expr>(self => [
+	fwd_assignment_expression,
+	Rule([self, ',', fwd_assignment_expression] as const,				$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] } as const))
+]);
+
+
+export const statement_list = List(Forward<Statement>(() => statement));
 export const function_body = Rules(
 	Rule([], 			() => []),
 	statement_list
@@ -262,7 +293,7 @@ export const function_body = Rules(
 
 // `elision`: a run of N commas with nothing between them, i.e. N holes. A single trailing comma after a
 // real element is just a separator, not a hole -- counting only starts from the *next* comma onward.
-const elision = RRules<number>(self => [
+const elision = Rules<number>(self => [
 	Rule([','] as const, 		() => 1),
 	Rule([self, ','] as const,	$ => $[0] + 1),
 ]);
@@ -276,7 +307,7 @@ export const binding_pattern = Rules<ObjectPattern | ArrayPattern>(
 	Rule([Forward<ArrayPattern>(()=>array_pattern)] as const),
 );
 export const binding_target = Rules<BindingTarget>(
-	WithPrec(Rule([IDENT] as const, $ => $[0]), forceFork),
+	ForceFork(Rule([IDENT] as const, $ => $[0])),
 	...binding_pattern,
 );
 
@@ -287,7 +318,7 @@ const object_pattern_property = Rules(
 	Rule([IDENT, ':', binding_target, '=', fwd_assignment_expression] as const, 	$ => ({ key: $[0], value: $[2], default: $[4] } as const)),
 );
 const object_pattern_property_list = List(object_pattern_property, ',', true);
-export const object_pattern = Rules<ObjectPattern>(
+export const object_pattern = Rules(
 	Rule(['{', '}'] as const, 														_ => ObjectPattern([])),
 	Rule(['{', object_pattern_property_list, '}'] as const, 						$ => ObjectPattern($[1])),
 	Rule(['{', '...', IDENT, '}'] as const, 										$ => ObjectPattern([], $[2])),
@@ -298,13 +329,13 @@ const array_pattern_element = Rules(
 	Rule([binding_target] as const, 												$ => ({ target: $[0] } as const)),
 	Rule([binding_target, '=', fwd_assignment_expression] as const,					$ => ({ target: $[0], default: $[2] } as const)),
 );
-const array_pattern_element_list = RRules<(ArrayPatternElement | undefined)[]>(self => [
+const array_pattern_element_list = Rules<(ArrayPatternElement | undefined)[]>(self => [
 	Rule([array_pattern_element] as const,											$ => [$[0]]),
 	Rule([elision, array_pattern_element] as const,									$ => [...holes($[0]), $[1]]),
 	Rule([self, ',', array_pattern_element] as const,								$ => [...$[0], $[2]]),
 	Rule([self, ',', elision, array_pattern_element] as const, 						$ => [...$[0], ...holes($[2]), $[3]]),
 ]);
-export const array_pattern = Rules<ArrayPattern>(
+export const array_pattern = Rules(
 	Rule(['[', ']'] as const, 														_ => ArrayPattern([])),
 	Rule(['[', elision, ']'] as const, 												$ => ArrayPattern(holes($[1]))),
 	Rule(['[', array_pattern_element_list, ']'] as const, 							$ => ArrayPattern($[1])),
@@ -314,42 +345,39 @@ export const array_pattern = Rules<ArrayPattern>(
 	Rule(['[', array_pattern_element_list, ',', '...', IDENT, ']'] as const, 		$ => ArrayPattern($[1], $[4])),
 );
 
-// A name in a binding position; extension point ts-parser.ts populates.
-export const binding_name = Rules(
+// A name in a binding position; extension point ts-parser.ts populates. A rest binding can itself be destructured
+// (`function f(...[a, b]) {}` is legal JS), so `key` covers the same `BindingTarget` union as any other binding target.
+export const binding_name = Rules<{ key: BindingTarget }>(
 	Rule([IDENT] as const,						$ => ({ key: $[0] } as const)),
+	Rule([array_pattern] as const,				$ => ({ key: $[0] } as const)),
+	Rule([object_pattern] as const,				$ => ({ key: $[0] } as const)),
 );
 
 // `forceFork` on both: right after a bare identifier in a position also reachable as a plain expression, reducing here vs. `primary_expression -> identifier` is a genuine one-token ambiguity needing GLR.
 export const optional_binding_name = Rules<{key: string, modifiers?: string[]}> (
-	WithPrec(Rule([IDENT] as const, 			$ => ({ key: $[0] } as const)), forceFork),
-	WithPrec(Rule([IDENT, '?'] as const, 		$ => ({ key: $[0], modifiers: ['optional'] } as const)), forceFork),
+	ForceFork(Rule([IDENT] as const, 			$ => ({ key: $[0] } as const))),
+	ForceFork(Rule([IDENT, '?'] as const, 		$ => ({ key: $[0], modifiers: ['optional'] } as const))),
 );
-
-export function toParam(b: {key: string; optional?: true; typeAnnotation?: unknown}, modifiers?: string[]): Param {
-	const { optional, ...rest } = b;
-	const all = optional ? [...(modifiers ?? []), 'optional'] : modifiers;
-	return all?.length ? { ...rest, modifiers: all } : rest;
-}
 
 // Default values use `ASSIGN_OP`, not bare `'='` -- ts-parser.ts's typed-arrow rule makes this `(` reachable from plain expression position too, so a
 // separate `'='` terminal would win the lexer tie-break and silently break every `(x = y)`, instead of staying a resolvable shift-reduce conflict.
 export const parameter = Rules<Param>(
 	optional_binding_name,
-	WithPrec(Rule([optional_binding_name, ASSIGN_OP, fwd_assignment_expression] as const,	$ => ({ ...$[0], default: $[2] } as const)), forceFork),
+	ForceFork(Rule([optional_binding_name, '=', fwd_assignment_expression] as const,	$ => ({ ...$[0], default: $[2] } as const))),
 	Rule([object_pattern] as const,											$ => ({ key: $[0] } as const)),
-	Rule([object_pattern, ASSIGN_OP, fwd_assignment_expression] as const,	$ => ({ key: $[0], default: $[2] })),
+	Rule([object_pattern, '=', fwd_assignment_expression] as const,	$ => ({ key: $[0], default: $[2] })),
 	Rule([array_pattern] as const,											$ => ({ key: $[0] } as const)),
-	Rule([array_pattern, ASSIGN_OP, fwd_assignment_expression] as const,	$ => ({ key: $[0], default: $[2] })),
+	Rule([array_pattern, '=', fwd_assignment_expression] as const,	$ => ({ key: $[0], default: $[2] })),
 );
 
 // Hand-written, not `List`/`MaybeList` -- that combinator left the state after "formal_parameter_list ','" missing the '...'/')' continuations
 // (LALR "missing transition" from state merging; see tison_debugging_technique memory). Self-contained recursion avoids the collision.
-const formal_parameter_list = RRules<Param[]>(self => [
+const formal_parameter_list = Rules<Param[]>(self => [
 	Rule([parameter] as const,				$ => [$[0]]),
 	Rule([self, ',', parameter] as const,	$ => [...$[0], $[2]]),
 ]);
 
-export const parameter_clause0 = Rules<ParamList>(
+export const parameter_clause0 = Rules<Params>(
 	Rule(['(', ')'] as const, 													() => ({ params: [] } as const)),
 	Rule(['(', formal_parameter_list, ')'] as const, 							$ => ({ params: $[1] } as const)),
 	Rule(['(', formal_parameter_list, ',', ')'] as const, 						$ => ({ params: $[1] } as const)),
@@ -364,7 +392,7 @@ export const parameter_clause = Rules<CallSig>(
 
 // --- Primary / member / call / new chain ---
 
-const element_list = RRules<(Expr | undefined)[]>(self => [
+const element_list = Rules<(Expr | undefined)[]>(self => [
 	Rule([fwd_assignment_expression] as const, 								$ => [$[0]]),
 	Rule([elision, fwd_assignment_expression] as const, 					$ => [...holes($[0]), $[1]]),
 	Rule([self, ',', fwd_assignment_expression] as const, 					$ => [...$[0], $[2]]),
@@ -411,7 +439,7 @@ export const property_assignment = Rules(
 	Rule([IDENT] as const, 																			$ => ObjectProperty($[0], { type: 'identifier', name: $[0] })),
 	// `{x = 1}` is never valid as a *real* object literal -- accepted anyway, permissively, purely so arrow
 	// parameters can be parsed as a plain object literal and reinterpreted as a pattern (`exprToBindingTarget` below).
-	Rule([IDENT, '=', fwd_assignment_expression] as const, 											$ => ObjectProperty($[0], { type: 'assign', operator: '=', left: { type: 'identifier', name: $[0] }, right: $[2] })),
+	Rule([IDENT, '=', fwd_assignment_expression] as const, 											$ => ObjectProperty($[0], { type: 'binary', operator: '=', left: { type: 'identifier', name: $[0] }, right: $[2] })),
 	Rule([property_name_computed, parameter_clause, '{', function_body, '}'] as const, 				$ => ObjectProperty($[0], FunctionExpr($[1], $[3]))),
 	Rule(['*', property_name_computed, parameter_clause, '{', function_body, '}'] as const, 		$ => ObjectProperty($[1], FunctionExpr($[2], $[4], { modifiers: ['generator'] }))),
 	Rule([ASYNC, property_name_computed, parameter_clause, '{', function_body, '}'] as const, 		$ => ObjectProperty($[1], FunctionExpr($[2], $[4], { modifiers: ['async'] }))),
@@ -421,10 +449,10 @@ export const property_assignment = Rules(
 );
 
 const object_literal = Rules(
-	Rule(['{', MaybeList(property_assignment, ',', true), '}'] as const, 				$ => ({ type: 'object', properties: $[1] } as const)),
+	Rule(['{', List(property_assignment, ',', true), '}'] as const, 								$ => ObjectExpr($[1])),
 	// Empty `{}` as its own direct alternative: ts-parser.ts's typed-arrow rule makes `{}` also reachable as `object_pattern`'s own `'{' '}'` in the same
 	// merged state (LALR "missing transition"; see tison_debugging_technique memory). `forceFork` makes it a resolvable reduce-reduce conflict (`() => ({})`).
-	WithPrec(Rule(['{', '}'] as const, () => ({ type: 'object' as const, properties: [] as ObjectProperty[] })), forceFork),
+	ForceFork(Rule(['{', '}'] as const, 															_ => ObjectExpr([]))),
 );
 
 // --- Arrow function parameter reinterpretation ---
@@ -448,7 +476,7 @@ function exprToBindingTarget(e: Expr): BindingTarget {
 						throw new SyntaxError('Invalid destructuring target: spread must be last');
 					if (typeof p.key !== 'string')
 						throw new SyntaxError('Invalid destructuring target: computed key');
-					return p.value.type === 'assign'
+					return p.value.type === 'binary'
 						? { key: p.key, value: exprToBindingTarget(p.value.left), default: p.value.right }
 						: { key: p.key, value: exprToBindingTarget(p.value) };
 				}),
@@ -464,7 +492,7 @@ function exprToBindingTarget(e: Expr): BindingTarget {
 				type: 'array_pattern',
 				elements: (rest ? e.elements.slice(0, -1) : e.elements).map(el =>
 					  el === undefined ? undefined
-					: el.type === 'assign' ? { target: exprToBindingTarget(el.left), default: el.right }
+					: el.type === 'binary' ? { target: exprToBindingTarget(el.left), default: el.right }
 					: { target: exprToBindingTarget(el) }
 				),
 				rest: rest?.name,
@@ -476,7 +504,7 @@ function exprToBindingTarget(e: Expr): BindingTarget {
 }
 function exprToParam(e: Expr): Param {
 	return	e.type === 'identifier'						? { key: e.name }
-		:	e.type === 'assign' && e.operator === '='	? { key: exprToBindingTarget(e.left), default: e.right }
+		:	e.type === 'binary' && e.operator === '='	? { key: exprToBindingTarget(e.left), default: e.right }
 		:	{ key: exprToBindingTarget(e) };
 }
 function exprToParams(e: Expr): Param[] {
@@ -486,7 +514,7 @@ function exprToParams(e: Expr): Param[] {
 // A bare `$` only stops the match when starting `${` -- anywhere else (a real case that broke this once)
 // it's ordinary text, same as real JS/TS.
 const template_literal_part = Rules<TemplatePart>(
-	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=\$\{)/, '${', fwd_expression, '}'] as const,	$ => ({ str: $[0], exp: $[2] })),
+	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=\$\{)/, '${', expression, '}'] as const,	$ => ({ str: $[0], exp: $[2] })),
 	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=`)/] as const, 								$ => ({ str: $[0] })),
 );
 const template_literal_parts = List(template_literal_part);
@@ -506,17 +534,17 @@ function parseNumber(text: string): Literal {
 // Shared by `primary_expression` and its NoBrace mirror below; only the `{`-led object-literal alternative
 // differs, spliced in at its original position (not appended) so relative reduce-reduce rule order is preserved.
 const primaryRules = (objectLiteral?: Rules<Expr>): Rules<Expr> => [
-	Rule(['this'] as const, 					() => ({ type: 'this' } as const)),
+	Rule(['this'] as const, 					_ => ({ type: 'this' } as const)),
 	Rule([IDENT] as const,						$ => ({ type: 'identifier', name: $[0] } as const)),
-	Rule([NUM] as const, 					$ => parseNumber($[0])),
-	Rule([STR] as const, 					$ => Literal(unquoteString($[0]))),
+	Rule([NUM] as const, 						$ => parseNumber($[0])),
+	Rule([STR] as const, 						$ => Literal(unquoteString($[0]))),
 	Rule([REGEX_LITERAL] as const,				$ => { const m = /^\/(.*)\/([a-zA-Z]*)$/.exec($[0])!; return { type: 'regex', pattern: m[1], flags: m[2] } as const; }),
-	Rule(['true'] as const, 					() => Literal(true)),
-	Rule(['false'] as const,					() => Literal(false)),
-	Rule(['null'] as const,						() => Literal(null)),
+	Rule(['true'] as const, 					_ => Literal(true)),
+	Rule(['false'] as const,					_ => Literal(false)),
+	Rule(['null'] as const,						_ => Literal(null)),
 	array_literal,
 	...(objectLiteral ? [objectLiteral] : []),
-	Rule(['(', fwd_expression, ')'] as const, 	$ => $[1]),
+	Rule(['(', expression, ')'] as const, 	$ => $[1]),
 	Rule(['`', template_literal_parts, '`'],	$ => Literal($[1])),
 ];
 export const primary_expression = primaryRules(object_literal);
@@ -532,19 +560,19 @@ export const function_expression = Rules(
 	Rule([ASYNC, 'function', '*', IDENT, parameter_clause, '{', function_body, '}'] as const,	$ => FunctionExpr($[4], $[6], {name: $[3], modifiers: ['async', 'generator'] }))
 );
 
-export const member_expression = RRules<Expr>(self => [
+export const member_expression = Rules<Expr>(self => [
 	primary_expression,
 	function_expression,
 	Rule([Forward<Expr>(()=>class_expression)] as const),
 	Rule([self, '.', IDENT] as const, 										$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
-	Rule([self, '[', fwd_expression, ']'] as const, 						$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
+	Rule([self, '[', expression, ']'] as const, 							$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
 	Rule(['new', self, ()=>arguments_] as const, 							$ => ({ type: 'new', callee: $[1], arguments: $[2] } as const)),
 ]);
-const new_expression = RRules<Expr>(self => [
+const new_expression = Rules<Expr>(self => [
 	member_expression,
 	Rule(['new', self] as const, 											$ => ({ type: 'new', callee: $[1], arguments: [] } as const)),
 ]);
-const argument_list = RRules<Expr[]>(self => [
+const argument_list = Rules<Expr[]>(self => [
 	Rule([fwd_assignment_expression] as const, 								$ => [$[0]]),
 	Rule([self, ',', fwd_assignment_expression] as const, 					$ => [...($[0]), $[2]]),
 	Rule(['...', fwd_assignment_expression] as const, 						$ => [{ type: 'spread', argument: $[1] } as const]),
@@ -558,20 +586,20 @@ export const arguments_ = Rules(
 // The full postfix-continuation set, parameterized over the member-expression chain that seeds it -- built once for the ordinary chain and once for the
 // NoBrace mirror below, so they can't drift apart. Optional chaining only marks each `?.` step, doesn't enforce real short-circuiting semantics.
 const callChainRules = (member: Rules<Expr>, self: () => Rules<Expr>): Rules<Expr> => [
-	Rule([member, arguments_] as const, 							$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
-	Rule([self, arguments_] as const, 								$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
-	Rule([self, '.', IDENT] as const, 								$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
-	Rule([self, '[', fwd_expression, ']'] as const, 				$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
-	Rule([member, '`', template_literal_parts, '`'] as const, 		$ => ({ type: 'tagged_template', tag: $[0], quasi: $[2] } as const)),
-	Rule([self, '`', template_literal_parts, '`'] as const,			$ => ({ type: 'tagged_template', tag: $[0], quasi: $[2] } as const)),
-	Rule([member, '?.', IDENT] as const, 							$ => ({ type: 'member', object: $[0], property: $[2], optional: true } as const)),
-	Rule([self, '?.', IDENT] as const, 								$ => ({ type: 'member', object: $[0], property: $[2], optional: true } as const)),
-	Rule([member, '?.', '[', fwd_expression, ']'] as const, 		$ => ({ type: 'index', object: $[0], property: $[3], optional: true } as const)),
-	Rule([self, '?.', '[', fwd_expression, ']'] as const, 			$ => ({ type: 'index', object: $[0], property: $[3], optional: true } as const)),
-	Rule([member, '?.', arguments_] as const, 						$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
-	Rule([self, '?.', arguments_] as const, 						$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
+	Rule([member, arguments_] as const, 									$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
+	Rule([self, arguments_] as const, 										$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
+	Rule([self, '.', IDENT] as const, 										$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
+	Rule([self, '[', expression, ']'] as const, 							$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
+	Rule([member, '`', template_literal_parts, '`'] as const, 				$ => ({ type: 'tagged_template', tag: $[0], quasi: $[2] } as const)),
+	Rule([self, '`', template_literal_parts, '`'] as const,					$ => ({ type: 'tagged_template', tag: $[0], quasi: $[2] } as const)),
+	Rule([member, '?.', IDENT] as const, 									$ => ({ type: 'member', object: $[0], property: $[2], optional: true } as const)),
+	Rule([self, '?.', IDENT] as const, 										$ => ({ type: 'member', object: $[0], property: $[2], optional: true } as const)),
+	Rule([member, '?.', '[', expression, ']'] as const, 					$ => ({ type: 'index', object: $[0], property: $[3], optional: true } as const)),
+	Rule([self, '?.', '[', expression, ']'] as const, 						$ => ({ type: 'index', object: $[0], property: $[3], optional: true } as const)),
+	Rule([member, '?.', arguments_] as const, 								$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
+	Rule([self, '?.', arguments_] as const, 								$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
 ];
-export const call_expression = RRules<Expr>(self => callChainRules(member_expression, self));
+export const call_expression = Rules<Expr>(self => callChainRules(member_expression, self));
 export const left_hand_side_expression = Rules(
 	new_expression,
 	call_expression,
@@ -581,26 +609,17 @@ export const left_hand_side_expression = Rules(
 // Postfix ++/-- doesn't need its own "no line terminator before ++/--" check: WS's `lex` callback above already reclassifies that whitespace into a `;`.
 const postfix_expression = Rules(
 	left_hand_side_expression,
-	Rule([left_hand_side_expression, '++'] as const,	$ => ({ type: 'update', operator: '++', argument: $[0], prefix: false } as const)),
-	Rule([left_hand_side_expression, '--'] as const,	$ => ({ type: 'update', operator: '--', argument: $[0], prefix: false } as const)),
+	Rule([left_hand_side_expression, '++'] as const,	$ => ({type: 'unary_post', operator: '++', argument: $[0]} as const)),
+	Rule([left_hand_side_expression, '--'] as const,	$ => ({type: 'unary_post', operator: '--', argument: $[0]} as const)),
 );
-const unary_expression = RRules<Expr>(self => [
+const unary_expression = Rules<Expr>(self => [
 	postfix_expression,
-	Rule(['await', self] as const, 		$ => ({ type: 'await', 					argument: $[1] } as const)),
-	Rule(['++', self] as const, 		$ => ({ type: 'update', operator: '++', argument: $[1], prefix: true } as const)),
-	Rule(['--', self] as const, 		$ => ({ type: 'update', operator: '--', argument: $[1], prefix: true } as const)),
-	Rule(['delete', self] as const, 	$ => Unary('delete',	$[1], true)),
-	Rule(['void', self] as const, 		$ => Unary('void', 		$[1], true)),
-	Rule(['typeof', self] as const, 	$ => Unary('typeof',	$[1], true)),
-	Rule(['+', self] as const, 			$ => Unary('+', 		$[1], true)),
-	Rule(['-', self] as const, 			$ => Unary('-', 		$[1], true)),
-	Rule(['~', self] as const, 			$ => Unary('~', 		$[1], true)),
-	Rule(['!', self] as const, 			$ => Unary('!', 		$[1], true)),
+	Rule([UNARY_OP, self] as const, 	$ => ({type: 'unary', operator: $[0], argument: $[1]} as const)),
 ]);
 
 // Right-associative: 2 ** 3 ** 2 === 2 ** (3 ** 2). Spelled as a dedicated self-recursion on the right (rather than binaryChain's left-recursion)
 // since right-associativity needs the recursive reference on the other side.
-const exponentiation_expression		= RRules<Expr>(self => [
+const exponentiation_expression		= Rules<Expr>(self => [
 	unary_expression,
 	WithPrec(Rule([unary_expression, '**', self] as const, $ => ({ type: 'binary', operator: '**', left: $[0], right: $[2] } as const)), 'exponentiation'),
 ]);
@@ -614,19 +633,19 @@ const equality_expression			= binaryChain(relational_expression,		['==', '!=', '
 const bitwise_and_expression		= binaryChain(equality_expression,			['&'], 										'bitwiseAnd');
 const bitwise_xor_expression		= binaryChain(bitwise_and_expression,		['^'], 										'bitwiseXor');
 const bitwise_or_expression			= binaryChain(bitwise_xor_expression,		['|'], 										'bitwiseOr');
-const logical_and_expression		= binaryChain(bitwise_or_expression,		['&&'], 									'logicalAnd',	'logical');
-const logical_or_expression			= binaryChain(logical_and_expression,		['||'], 									'logicalOr',	'logical');
+const logical_and_expression		= binaryChain(bitwise_or_expression,		['&&'], 									'logicalAnd');
+const logical_or_expression			= binaryChain(logical_and_expression,		['||'], 									'logicalOr');
 
 const relational_expression_noin	= binaryChain(shift_expression,				['<', '>', '<=', '>=', 'instanceof'], 		'relational');
 const equality_expression_noin		= binaryChain(relational_expression_noin,	['==', '!=', '===', '!=='], 				'equality');
 const bitwise_and_expression_noin	= binaryChain(equality_expression_noin,		['&'], 										'bitwiseAnd');
 const bitwise_xor_expression_noin	= binaryChain(bitwise_and_expression_noin,	['^'], 										'bitwiseXor');
 const bitwise_or_expression_noin	= binaryChain(bitwise_xor_expression_noin,	['|'], 										'bitwiseOr');
-const logical_and_expression_noin	= binaryChain(bitwise_or_expression_noin,	['&&'], 									'logicalAnd',	'logical');
-const logical_or_expression_noin	= binaryChain(logical_and_expression_noin,	['||'], 									'logicalOr',	'logical');
+const logical_and_expression_noin	= binaryChain(bitwise_or_expression_noin,	['&&'], 									'logicalAnd');
+const logical_or_expression_noin	= binaryChain(logical_and_expression_noin,	['||'], 									'logicalOr');
 
-const nullish_expression			= binaryChain(logical_or_expression,		['??'], 									'nullish',		'logical');
-const nullish_expression_noin		= binaryChain(logical_or_expression_noin,	['??'], 									'nullish',		'logical');
+const nullish_expression			= binaryChain(logical_or_expression,		['??'], 									'nullish');
+const nullish_expression_noin		= binaryChain(logical_or_expression_noin,	['??'], 									'nullish');
 
 const conditional_expression = Rules(
 	nullish_expression,
@@ -641,16 +660,16 @@ const conditional_expression_noin = Rules(
 // `_nobrace` avoids the resulting ambiguity with a bare object-literal expression body, same technique `expression_statement` uses.
 export const arrow_body = Rules<Expr | Statement[]>(
 	Rule(['{', function_body, '}'] as const, 					$ => $[1]),
-	fwd_assignment_expression_nobrace,
+	Forward<Expr>(() => assignment_expression_nobrace),
 );
-export const sync_arrow_function = Rules<Expr>(
+export const sync_arrow_function = Rules(
 	Rule([IDENT, '=>', arrow_body] as const, 												$ => Arrow({params: [{key: $[0]}]}, $[2])),
-	Rule(['(', fwd_expression, ')', '=>', arrow_body] as const, 							$ => Arrow({params: exprToParams($[1])}, $[4])),
-	Rule(['(', fwd_expression, ',', '...', binding_name, ')', '=>', arrow_body] as const, 	$ => Arrow({params: exprToParams($[1]), rest: $[4]}, $[7])),
+	Rule(['(', expression, ')', '=>', arrow_body] as const, 							$ => Arrow({params: exprToParams($[1])}, $[4])),
+	Rule(['(', expression, ',', '...', binding_name, ')', '=>', arrow_body] as const, 	$ => Arrow({params: exprToParams($[1]), rest: $[4]}, $[7])),
 	Rule([parameter_clause, '=>', arrow_body] as const, 									$ => Arrow($[0], $[2])),
 );
 
-export const arrow_function = Rules<Expr>(
+export const arrow_function = Rules(
 	sync_arrow_function,
 	Rule([ASYNC, sync_arrow_function] as const, 					$ => { const a = $[1] as Arrow; return {...a, modifiers: [...(a.modifiers ?? []), 'async'] }; }),
 );
@@ -661,22 +680,22 @@ const yield_expression = Rules(
 	Rule(['yield', '*', fwd_assignment_expression] as const, 		$ => ({ type: 'yield', argument: $[2], delegate: true } as const)),
 );
 
-export const assignment_expression = RRules<Expr>(self => [
-	Rule([left_hand_side_expression, ASSIGN_OP, self] as const, 	$ => ({ type: 'assign', operator: $[1], left: $[0], right: $[2] } as const)),
+export const assignment_expression = Rules<Expr>(self => [
+	Rule([left_hand_side_expression, ASSIGN_OP, self] as const, 	$ => ({ type: 'binary', operator: $[1], left: $[0], right: $[2] } as const)),
 	conditional_expression,
 	arrow_function,
 	yield_expression,
 ]);
-export const assignment_expression_noin = RRules<Expr>(self => [
-	Rule([left_hand_side_expression, ASSIGN_OP, self] as const, 	$ => ({ type: 'assign', operator: $[1], left: $[0], right: $[2] } as const)),
+export const assignment_expression_noin = Rules<Expr>(self => [
+	Rule([left_hand_side_expression, ASSIGN_OP, self] as const, 	$ => ({ type: 'binary', operator: $[1], left: $[0], right: $[2] } as const)),
 	conditional_expression_noin,
 ]);
 
-const expression = RRules<Expr>(self => [
-	assignment_expression,
-	Rule([self, ',', assignment_expression] as const,				$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] } as const))
-]);
-const expression_noin = RRules<Expr>(self => [
+//const expression = RRules<Expr>(self => [
+//	assignment_expression,
+//	Rule([self, ',', assignment_expression] as const,				$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] } as const))
+//]);
+const expression_noin = Rules<Expr>(self => [
 	assignment_expression_noin,
 	Rule([self, ',', assignment_expression_noin] as const,			$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] }))
 ]);
@@ -684,40 +703,31 @@ const expression_noin = RRules<Expr>(self => [
 // A second parallel chain, "NoBrace": real ECMAScript forbids `ExpressionStatement` from starting with `{`/`function`/`class` (why `({a: 1})` needs parens).
 // Only the leftmost token is restricted (`a + {}` is fine), so only each chain level's left-recursive self-reference routes through NoBrace.
 const primary_expression_nobrace = primaryRules();
-export const member_expression_nobrace = RRules<Expr>(self => [
+export const member_expression_nobrace = Rules<Expr>(self => [
 	primary_expression_nobrace,
 	Rule([self, '.', IDENT] as const, 								$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
-	Rule([self, '[', fwd_expression, ']'] as const, 				$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
+	Rule([self, '[', expression, ']'] as const, 				$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
 	Rule(['new', member_expression, ()=>arguments_] as const, 		$ => ({ type: 'new', callee: $[1], arguments: $[2] } as const)),
 ]);
 const new_expression_nobrace = Rules<Expr>(
 	member_expression_nobrace,
 	Rule(['new', new_expression] as const, 							$ => ({ type: 'new', callee: $[1], arguments: [] } as const)),
 );
-export const call_expression_nobrace = RRules<Expr>(self => callChainRules(member_expression_nobrace, self));
+export const call_expression_nobrace = Rules<Expr>(self => callChainRules(member_expression_nobrace, self));
 const left_hand_side_expression_nobrace = Rules(
 	new_expression_nobrace,
 	call_expression_nobrace,
 );
 const postfix_expression_nobrace = Rules(
 	left_hand_side_expression_nobrace,
-	Rule([left_hand_side_expression_nobrace, '++'] as const,	$ => ({ type: 'update', operator: '++', argument: $[0], prefix: false } as const)),
-	Rule([left_hand_side_expression_nobrace, '--'] as const,	$ => ({ type: 'update', operator: '--', argument: $[0], prefix: false } as const)),
+	Rule([left_hand_side_expression_nobrace, '++'] as const,	$ => ({type: 'unary_post', operator: '++', argument: $[0]} as const)),
+	Rule([left_hand_side_expression_nobrace, '--'] as const,	$ => ({type: 'unary_post', operator: '--', argument: $[0]} as const)),
 );
-const unary_expression_nobrace = Rules<Expr>(
+const unary_expression_nobrace = Rules(
 	postfix_expression_nobrace,
-	Rule(['await', unary_expression] as const, 		$ => ({ type: 'await', argument: $[1] } as const)),
-	Rule(['++', unary_expression] as const, 		$ => ({ type: 'update', operator: '++', argument: $[1], prefix: true } as const)),
-	Rule(['--', unary_expression] as const, 		$ => ({ type: 'update', operator: '--', argument: $[1], prefix: true } as const)),
-	Rule(['delete', unary_expression] as const, 	$ => Unary('delete', 	$[1], true)),
-	Rule(['void', unary_expression] as const, 		$ => Unary('void', 		$[1], true)),
-	Rule(['typeof', unary_expression] as const, 	$ => Unary('typeof', 	$[1], true)),
-	Rule(['+', unary_expression] as const, 			$ => Unary('+', 		$[1], true)),
-	Rule(['-', unary_expression] as const, 			$ => Unary('-', 		$[1], true)),
-	Rule(['~', unary_expression] as const, 			$ => Unary('~', 		$[1], true)),
-	Rule(['!', unary_expression] as const, 			$ => Unary('!', 		$[1], true)),
+	Rule([UNARY_OP, unary_expression] as const, 	$ => ({type: 'unary', operator: $[0], argument: $[1]} as const)),
 );
-const exponentiation_expression_nobrace = Rules<Expr>(
+const exponentiation_expression_nobrace = Rules(
 	unary_expression_nobrace,
 	WithPrec(Rule([unary_expression_nobrace, '**', exponentiation_expression] as const, $ => ({ type: 'binary', operator: '**', left: $[0], right: $[2] } as const)), 'exponentiation'),
 );
@@ -729,20 +739,20 @@ const equality_expression_nobrace			= binaryChainLeft(relational_expression_nobr
 const bitwise_and_expression_nobrace		= binaryChainLeft(equality_expression_nobrace,			equality_expression,		['&'], 										'bitwiseAnd');
 const bitwise_xor_expression_nobrace		= binaryChainLeft(bitwise_and_expression_nobrace,		bitwise_and_expression,		['^'], 										'bitwiseXor');
 const bitwise_or_expression_nobrace			= binaryChainLeft(bitwise_xor_expression_nobrace,		bitwise_xor_expression,		['|'], 										'bitwiseOr');
-const logical_and_expression_nobrace		= binaryChainLeft(bitwise_or_expression_nobrace,		bitwise_or_expression,		['&&'], 									'logicalAnd',	'logical');
-const logical_or_expression_nobrace			= binaryChainLeft(logical_and_expression_nobrace,		logical_and_expression,		['||'], 									'logicalOr',	'logical');
-const nullish_expression_nobrace			= binaryChainLeft(logical_or_expression_nobrace,		logical_or_expression,		['??'], 									'nullish',		'logical');
+const logical_and_expression_nobrace		= binaryChainLeft(bitwise_or_expression_nobrace,		bitwise_or_expression,		['&&'], 									'logicalAnd');
+const logical_or_expression_nobrace			= binaryChainLeft(logical_and_expression_nobrace,		logical_and_expression,		['||'], 									'logicalOr');
+const nullish_expression_nobrace			= binaryChainLeft(logical_or_expression_nobrace,		logical_or_expression,		['??'], 									'nullish');
 const conditional_expression_nobrace = Rules(
 	nullish_expression_nobrace,
 	Rule([nullish_expression_nobrace, '?', fwd_assignment_expression, ':', fwd_assignment_expression] as const, $ => ({ type: 'conditional', test: $[0], consequent: $[2], alternate: $[4] } as const)),
 );
 const assignment_expression_nobrace = Rules(
-	Rule([left_hand_side_expression_nobrace, ASSIGN_OP, fwd_assignment_expression] as const, $ => ({ type: 'assign', operator: $[1], left: $[0], right: $[2] } as const)),
+	Rule([left_hand_side_expression_nobrace, ASSIGN_OP, fwd_assignment_expression] as const, $ => ({ type: 'binary', operator: $[1], left: $[0], right: $[2] } as const)),
 	conditional_expression_nobrace,
 	arrow_function,
 	yield_expression,
 );
-const expression_nobrace = RRules<Expr>(self => [
+const expression_nobrace = Rules<Expr>(self => [
 	assignment_expression_nobrace,
 	Rule([self, ',', assignment_expression] as const,					$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] } as const))
 ]);
@@ -779,7 +789,7 @@ export const class_body = Rules(
 
 // The nullable alternative is safe because every class rule routes through this: nothing else can shift `{` in the `class [IDENT] ...` state, so the
 // ε-reduce is the state's only action, leaving the silent-default-shift trap no conflict to resolve. `typeParams`/`implementsClause`: ts-parser.ts pushes `<T>`/`implements`.
-export const class_heritage = Rules<{ superClass?: Expr; typeParams?: unknown[]; implementsClause?: unknown[] }>(
+export const class_heritage = Rules<Partial<ClassDecl>>(
 	Rule([] as const,										() => ({})),
 	Rule(['extends', left_hand_side_expression] as const,	$ => ({ superClass: $[1] } as const)),
 );
@@ -804,25 +814,27 @@ export const function_declaration = Rules(
 // bare `'='` here and `parameter`'s own `ASSIGN_OP` compete in the same merged state (and `'='` always wins the lexer tie-break, silently breaking typed defaults).
 export const variable_declaration = Rules<VarDeclarator>(
 	Rule([optional_binding_name] as const, 											$ => ({ name: $[0].key, ...$[0] } as const)),
-	Rule([optional_binding_name, ASSIGN_OP, assignment_expression] as const, 		$ => ({ name: $[0].key, ...$[0], init: $[2] } as const)),
+	Rule([optional_binding_name, '=', assignment_expression] as const, 		$ => ({ name: $[0].key, ...$[0], init: $[2] } as const)),
 	Rule([binding_pattern, '=', assignment_expression] as const, 					$ => ({ name: $[0], init: $[2] } as const)),
 );
 const variable_declaration_list = List(variable_declaration, ',');
 export const variable_declaration_noin = Rules<VarDeclarator>(
 	Rule([optional_binding_name] as const, 											$ => ({ name: $[0].key, ...$[0] } as const)),
-	Rule([optional_binding_name, ASSIGN_OP, assignment_expression_noin] as const,	$ => ({ name: $[0].key, ...$[0], init: $[2] } as const)),
+	Rule([optional_binding_name, '=', assignment_expression_noin] as const,	$ => ({ name: $[0].key, ...$[0], init: $[2] } as const)),
 	Rule([binding_pattern, '=', assignment_expression_noin] as const, 				$ => ({ name: $[0], init: $[2] } as const)),
 );
 const variable_declaration_list_noin = List(variable_declaration_noin, ',');
 
-export const variable_decl_statement = Rules<Declaration>(
-	Rule([varKeywords, variable_declaration_list, ';'] as const, 		$ => ({ type: 'var', kind: $[0], declarations: $[1] } as const)),
+const varKeywords = OneOf(['var', 'let', 'const']);
+
+export const variable_decl_statement = Rules(
+	Rule([varKeywords, variable_declaration_list, ';'] as const, 		$ => VarDecl($[0], ...$[1])),
 );
 
-const variable_statement = Rules<Statement>(
+const variable_statement = Rules(
 	variable_decl_statement,
-	Rule([USING, variable_declaration_list, ';'] as const, 				$ => ({ type: 'var', kind: 'using', declarations: $[1] } as const)),
-	Rule(['await', USING, variable_declaration_list, ';'] as const, 	$ => ({ type: 'var', kind: 'await using', declarations: $[2] } as const)),
+	Rule([USING, variable_declaration_list, ';'] as const, 				$ => VarDecl('using', ...$[1])),
+	Rule(['await', USING, variable_declaration_list, ';'] as const, 	$ => VarDecl('await using', ...$[2])),
 );
 
 // Deliberately not collapsed to `'{' function_body '}'` like arrow/try/catch/finally: a statement block's `{` is reachable right after `IDENT ':'`, where a TS
@@ -833,12 +845,12 @@ const block = Rules<Statement>(
 );
 
 const for_init = Rules<ForInit>(
-	Rule([varKeywords, variable_declaration_list_noin] as const,		$ => ({ type: 'var', kind: $[0], declarations: $[1]} as const)),
+	Rule([varKeywords, variable_declaration_list_noin] as const,		$ => VarDecl($[0], ...$[1])),
 	expression_noin,
 );
 const for_lhs = Rules<ForInit>(
-	Rule([varKeywords, variable_declaration_noin] as const,				$ => ({ type: 'var', kind: $[0], declarations: [$[1]] } as const)),
-	Rule([varKeywords, binding_pattern] as const,						$ => ({ type: 'var', kind: $[0], declarations: [{ name: $[1] }] } as const)),
+	Rule([varKeywords, variable_declaration_noin] as const,				$ => VarDecl($[0], $[1])),
+	Rule([varKeywords, binding_pattern] as const,						$ => VarDecl($[0], { name: $[1] })),
 	left_hand_side_expression,
 );
 
@@ -865,43 +877,42 @@ const try_block = Rules(
 	Rule(['try', '{', function_body, '}'] as const,		$ => $[2]),
 );
 
-export const statement = Rules(
+export const statement = Rules<Statement>(self => [
 	block,
 	variable_statement,
-	Rule([';'] as const, 						_ => ({ type: 'empty' } as const)),
-	Rule([expression_nobrace, ';'] as const,	$ => ({ type: 'expression', expression: $[0] } as const)),
+	Rule([';'] as const, 								_ => ({ type: 'empty' } as const)),
+	Rule([expression_nobrace, ';'] as const,			$ => ({ type: 'expression', expression: $[0] } as const)),
+	Rule([IDENT, ':', self] as const,					$ => ({ type: 'labeled', label: $[0], body: $[2] } as const)),
 
-	Rule(['if', '(', expression, ')', fwd_statement] as const,											$ => ({ type: 'if', test: $[2], consequent: $[4] } as const)),
-	Rule(['if', '(', expression, ')', fwd_statement, 'else', fwd_statement] as const,					$ => ({ type: 'if', test: $[2], consequent: $[4], alternate: $[6] } as const)),
-	Rule(['do', fwd_statement, 'while', '(', expression, ')', ';'] as const, 							$ => ({ type: 'do_while', body: $[1], test: $[4] } as const)),
-	Rule(['while', '(', expression, ')', fwd_statement] as const, 										$ => ({ type: 'while', test: $[2], body: $[4] } as const)),
-	Rule(['for', '(', ';', expression_opt, ';', expression_opt, ')', fwd_statement] as const, 			$ => ({ type: 'for', test: $[3], update: $[5], body: $[7] } as const)),
-	Rule(['for', '(', for_init, ';', expression_opt, ';', expression_opt, ')', fwd_statement] as const, $ => ({ type: 'for', init: $[2], test: $[4], update: $[6], body: $[8] } as const)),
-	Rule(['for', '(', for_lhs, 'in', expression, ')', fwd_statement] as const, 							$ => ({ type: 'for_in', kind: 'in', left: $[2], right: $[4], body: $[6] } as const)),
-	Rule(['for', '(', for_lhs, 'of', assignment_expression, ')', fwd_statement] as const, 				$ => ({ type: 'for_in', kind: 'of', left: $[2], right: $[4], body: $[6] } as const)),
-	Rule(['for', 'await', '(', for_lhs, 'of', assignment_expression, ')', fwd_statement] as const, 		$ => ({ type: 'for_in', kind: 'of', left: $[3], right: $[5], body: $[7], await: true } as const)),
+	Rule(['continue', ';'] as const,					_ => ({ type: 'continue' } as const)),
+	Rule(['continue', IDENT, ';'] as const,				$ => ({ type: 'continue', label: $[1] } as const)),
+	Rule(['break', ';'] as const,						_ => ({ type: 'break' } as const)),
+	Rule(['break', IDENT, ';'] as const,				$ => ({ type: 'break', label: $[1] } as const)),
+	Rule(['return', ';'] as const,						_ => ({ type: 'return' } as const)),
+	Rule(['return', expression, ';'] as const,			$ => ({ type: 'return', argument: $[1] } as const)),
+	Rule(['with', '(', expression, ')', self] as const,	$ => ({ type: 'with', argument: $[2], body: $[4] } as const)),
+	Rule(['debugger', ';'] as const, 					_ => ({ type: 'debugger' } as const)),
 
-	Rule(['continue', ';'] as const,													_ => ({ type: 'continue' } as const)),
-	Rule(['continue', IDENT, ';'] as const,												$ => ({ type: 'continue', label: $[1] } as const)),
-	Rule(['break', ';'] as const,														_ => ({ type: 'break' } as const)),
-	Rule(['break', IDENT, ';'] as const,												$ => ({ type: 'break', label: $[1] } as const)),
-	Rule(['return', ';'] as const,														_ => ({ type: 'return' } as const)),
-	Rule(['return', expression, ';'] as const,											$ => ({ type: 'return', argument: $[1] } as const)),
-	Rule(['with', '(', expression, ')', fwd_statement] as const,						$ => ({ type: 'with', argument: $[2], body: $[4] } as const)),
-
-	Rule([IDENT, ':', fwd_statement] as const,											$ => ({ type: 'labeled', label: $[0], body: $[2] } as const)),
-	Rule(['switch', '(', expression, ')', '{', '}'] as const,							$ => ({ type: 'switch', discriminant: $[2], cases: [] } as const)),
-	Rule(['switch', '(', expression, ')', '{', List(case_clause), '}'] as const,		$ => ({ type: 'switch', discriminant: $[2], cases: $[5] } as const)),
+	Rule(['if', '(', expression, ')', self] as const,											$ => ({ type: 'if', test: $[2], consequent: $[4] } as const)),
+	Rule(['if', '(', expression, ')', self, 'else', self] as const,								$ => ({ type: 'if', test: $[2], consequent: $[4], alternate: $[6] } as const)),
+	Rule(['do', self, 'while', '(', expression, ')', ';'] as const, 							$ => ({ type: 'do_while', body: $[1], test: $[4] } as const)),
+	Rule(['while', '(', expression, ')', self] as const, 										$ => ({ type: 'while', test: $[2], body: $[4] } as const)),
+	Rule(['for', '(', ';', expression_opt, ';', expression_opt, ')', self] as const, 			$ => ({ type: 'for', test: $[3], update: $[5], body: $[7] } as const)),
+	Rule(['for', '(', for_init, ';', expression_opt, ';', expression_opt, ')', self] as const,	$ => ({ type: 'for', init: $[2], test: $[4], update: $[6], body: $[8] } as const)),
+	Rule(['for', '(', for_lhs, 'in', expression, ')', self] as const, 							$ => ({ type: 'for_in', kind: 'in', init: $[2], right: $[4], body: $[6] } as const)),
+	Rule(['for', '(', for_lhs, 'of', assignment_expression, ')', self] as const, 				$ => ({ type: 'for_in', kind: 'of', init: $[2], right: $[4], body: $[6] } as const)),
+	Rule(['for', 'await', '(', for_lhs, 'of', assignment_expression, ')', self] as const, 		$ => ({ type: 'for_in', kind: 'of await', init: $[3], right: $[5], body: $[7] } as const)),
+	Rule(['switch', '(', expression, ')', '{', '}'] as const,									$ => ({ type: 'switch', discriminant: $[2], cases: [] } as const)),
+	Rule(['switch', '(', expression, ')', '{', List(case_clause), '}'] as const,				$ => ({ type: 'switch', discriminant: $[2], cases: $[5] } as const)),
 
 	Rule(['throw', expression, ';'] as const,		$ => ({ type: 'throw', argument: $[1] } as const)),
 	Rule([try_block, catch_] as const, 				$ => ({ type: 'try', block: $[0], handlerParam: $[1].param, handlerBody: $[1].body } as const)),
 	Rule([try_block, finally_] as const, 			$ => ({ type: 'try', block: $[0], finalizer: $[1] } as const)),
 	Rule([try_block, catch_, finally_] as const, 	$ => ({ type: 'try', block: $[0], handlerParam: $[1].param, handlerBody: $[1].body, finalizer: $[2] } as const)),
 
-	Rule(['debugger', ';'] as const, 				() => ({ type: 'debugger' } as const)),
 	function_declaration,
 	class_declaration,
-);
+]);
 
 // --- Modules ---
 // import/export are only reachable from `module_item`, not `statement` -- the real spec restricts them to a Program's top level.
@@ -914,12 +925,12 @@ export const named_imports = Rules(
 	Rule(['{', List(import_specifier, ',', true), '}'] as const, 		$ => $[1]),
 );
 export const import_declaration = Rules<Statement>(
-	Rule([STR, ';'] as const, 										$ => ({ type: 'import', source: unquoteString($[0]) } as const)),
-	Rule([IDENT, 'from', STR, ';'] as const, 						$ => ({ type: 'import', default: $[0], source: unquoteString($[2]) } as const)),
+	Rule([STR, ';'] as const, 											$ => ({ type: 'import', source: unquoteString($[0]) } as const)),
+	Rule([IDENT, 'from', STR, ';'] as const, 							$ => ({ type: 'import', default: $[0], source: unquoteString($[2]) } as const)),
 	Rule(['*', 'as', IDENT, 'from', STR, ';'] as const, 				$ => ({ type: 'import', namespace: $[2], source: unquoteString($[4]) } as const)),
-	Rule([named_imports, 'from', STR, ';'] as const, 				$ => ({ type: 'import', specifiers: $[0], source: unquoteString($[2]) } as const)),
-	Rule([IDENT, ',', named_imports, 'from', STR, ';'] as const, 	$ => ({ type: 'import', default: $[0], specifiers: $[2], source: unquoteString($[4]) } as const)),
-	Rule([IDENT, ',', '*', 'as', IDENT, 'from', STR, ';'] as const,	$ => ({ type: 'import', default: $[0], namespace: $[4], source: unquoteString($[6]) } as const)),
+	Rule([named_imports, 'from', STR, ';'] as const, 					$ => ({ type: 'import', specifiers: $[0], source: unquoteString($[2]) } as const)),
+	Rule([IDENT, ',', named_imports, 'from', STR, ';'] as const, 		$ => ({ type: 'import', default: $[0], specifiers: $[2], source: unquoteString($[4]) } as const)),
+	Rule([IDENT, ',', '*', 'as', IDENT, 'from', STR, ';'] as const,		$ => ({ type: 'import', default: $[0], namespace: $[4], source: unquoteString($[6]) } as const)),
 );
 
 export const export_specifier = Rules(
@@ -932,8 +943,8 @@ export const named_exports = Rules(
 );
 export const export_declaration = Rules<Statement>(
 	Rule([named_exports, ';'] as const, 					$ => ({ type: 'export', specifiers: $[0] })),
-	Rule([named_exports, 'from', STR, ';'] as const, 	$ => ({ type: 'export', specifiers: $[0], source: unquoteString($[2]) })),
-	Rule(['*', 'from', STR, ';'] as const, 				$ => ({ type: 'export', source: unquoteString($[2]) })),
+	Rule([named_exports, 'from', STR, ';'] as const, 		$ => ({ type: 'export', specifiers: $[0], source: unquoteString($[2]) })),
+	Rule(['*', 'from', STR, ';'] as const, 					$ => ({ type: 'export', source: unquoteString($[2]) })),
 	Rule(['*', 'as', IDENT, 'from', STR, ';'] as const, 	$ => ({ type: 'export', namespace: $[2], source: unquoteString($[4]) })),
 	Rule(['default', assignment_expression, ';'] as const, 	$ => ({ type: 'export', default: $[1] })),
 	Rule(['default', function_declaration] as const, 		$ => ({ type: 'export', default: $[1] })),
@@ -964,103 +975,38 @@ export const skip = [WS, /\/\/[^\n]*\n?/, /\/\*[^]*?\*\//, /^#![^\n]*\n?/];
 
 // Error-driven insertion: only when the real token would otherwise fail, and is preceded by a line terminator, or is `}`, or EOF.
 export const recover: GrammarSpec['recover'] = (lex, row) => {
-	const newlineBefore = lex.prev && lex.prev.pos && lex.line > lex.prev.pos.line;
-	if (!(newlineBefore || lex.remaining.startsWith('}') || !lex.remaining))
+	if (!((lex.prev && lex.prev.pos && lex.line > lex.prev.pos.line) || lex.remaining.startsWith('}') || !lex.remaining))
 		return undefined;
 	return [...row.keys()].find(t => t.name === ';');
 };
 
 export const rules = {
-	binding_pattern,
-	binding_target,
-	primary_expression,
-	parameter,
-	formal_parameter_list,
-	parameter_clause,
-	function_expression,
-	member_expression,
-	arguments_,
-	call_expression,
-	left_hand_side_expression,
-	relational_expression,
-	arrow_body,
-	arrow_function: sync_arrow_function,
-	assignment_expression,
-	assignment_expression_noin,
-	variable_declaration,
-	variable_declaration_noin,
-	variable_statement,
-	function_declaration,
+	binding_pattern, binding_target,
+	parameter, formal_parameter_list, parameter_clause, arguments_, argument_list,
+	variable_declaration, variable_declaration_noin,
+	variable_statement, function_declaration,
 	function_body,
-	class_member_name,
-	class_member_body,
-	class_member,
-	class_body,
-	class_heritage,
-	class_expression,
-	class_declaration,
+	class_member_name, class_member_body, class_member, class_body, class_heritage, class_expression, class_declaration,
 	statement,
-	export_declaration,
-	module_item,
-	program,
 	elision,
 	element_list,
 	array_literal,
 	property_name,
 	property_assignment,
-	object_literal,
-	object_pattern_property,
-	object_pattern_property_list,
-	object_pattern,
-	array_pattern_element,
-	array_pattern_element_list,
-	array_pattern,
-	template_literal_part,
-	template_literal_parts,
-	new_expression,
-	argument_list,
-	postfix_expression,
-	unary_expression,
-	exponentiation_expression,
-	multiplicative_expression,
-	additive_expression,
-	shift_expression,
-	equality_expression,
-	bitwise_and_expression,
-	bitwise_xor_expression,
-	bitwise_or_expression,
-	logical_and_expression,
-	logical_or_expression,
-	relational_expression_noin,
-	equality_expression_noin,
-	bitwise_and_expression_noin,
-	bitwise_xor_expression_noin,
-	bitwise_or_expression_noin,
-	logical_and_expression_noin,
-	logical_or_expression_noin,
-	nullish_expression,
-	nullish_expression_noin,
-	conditional_expression,
-	conditional_expression_noin,
-	yield_expression,
-	expression,
-	expression_noin,
-	variable_declaration_list,
-	variable_declaration_list_noin,
-	statement_list,
-	block,
-	for_init,
-	for_lhs,
-	expression_opt,
-	case_clause,
-	catch_,
-	finally_,
-	try_block,
-	import_specifier,
-	named_imports,
-	import_declaration,
-	export_specifier,
-	named_exports,
+	object_literal,	object_pattern_property, object_pattern_property_list, object_pattern,
+	array_pattern_element, array_pattern_element_list, array_pattern,
+	template_literal_part, template_literal_parts,
+	arrow_body, sync_arrow_function,
+	primary_expression, function_expression, member_expression, call_expression, left_hand_side_expression,
+	new_expression, postfix_expression, unary_expression, exponentiation_expression, multiplicative_expression, additive_expression, shift_expression, yield_expression,
+	assignment_expression, relational_expression, equality_expression, conditional_expression, expression,
+	bitwise_and_expression, bitwise_xor_expression, bitwise_or_expression, logical_and_expression, logical_or_expression, nullish_expression,
+	assignment_expression_noin, relational_expression_noin, equality_expression_noin, conditional_expression_noin, expression_noin,
+	bitwise_and_expression_noin, bitwise_xor_expression_noin, bitwise_or_expression_noin, logical_and_expression_noin, logical_or_expression_noin, nullish_expression_noin,
+	variable_declaration_list, variable_declaration_list_noin,
+	statement_list, block, for_init, for_lhs, expression_opt, case_clause, catch_, finally_, try_block,
+	import_specifier, named_imports, import_declaration, export_specifier, named_exports, export_declaration,
+	module_item, program,
 };
 
 export const parser = makeParser({
