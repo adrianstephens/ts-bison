@@ -2,7 +2,7 @@
 /* eslint-disable @typescript-eslint/no-this-alias */
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
-import { Expr, BindingTarget, Key, NameAndType } from './js-parser';
+import { Expr, BindingTarget, Key, Rest } from './js-parser';
 import { Type } from './ts-parser';
 
 // ===================================================================
@@ -14,7 +14,7 @@ export function guard<R>(types: string[]) {
 	return (node: any): node is R => node && typeof node === 'object' && 'type' in node && set.has(node.type);
 }
 
-const stmts = ['block', 'var', 'expression', 'empty', 'if', 'do_while', 'while', 'for', 'for_in', 'continue', 'break', 'return', 'with', 'labeled', 'switch', 'throw', 'try', 'debugger', 'function_decl', 'import', 'export', 'export_decl', 'class_decl'];
+const stmts = ['block', 'var_decl', 'expression', 'empty', 'if', 'do_while', 'while', 'for', 'for_in', 'continue', 'break', 'return', 'with', 'labeled', 'switch', 'throw', 'try', 'debugger', 'function_decl', 'import', 'export', 'export_decl', 'class_decl'];
 
 export const isProgram 		= guard<TS.Program>(['program']);
 export const isType 			= guard<Type>(['ref', 'literal', 'template_literal', 'this', 'array', 'tuple', 'union', 'intersection', 'function', 'constructor', 'object', 'parenthesized', 'keyof', 'readonly', 'typeof', 'indexed_access', 'conditional', 'infer', 'mapped', 'predicate']);
@@ -130,7 +130,7 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 	const processTypeU = (type: unknown): unknown|undefined =>
 		processType(type as Type);
 
-	const processRest = (rest: NameAndType<any>): NameAndType<any> =>
+	const processRest = (rest: Rest<any>): Rest<any> =>
 		({key: rest.key, typeAnnotation: processTypeU(rest.typeAnnotation)});
 
 	const processBlock = processArraysA(processStatementC);
@@ -279,15 +279,12 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 				arguments:	processArraysA(processExpressionA),
 				typeArgs:	processArrays(processTypeU)
 			});
-			case 'unary':
-			case 'update':
 			case 'spread':
-			case 'await':		return mapper(expr, {
+			case 'unary_post':
+			case 'unary':		return mapper(expr, {
 				argument: 	processExpressionA
 			});
-			case 'binary':
-			case 'logical':
-			case 'assign':		return mapper(expr, {
+			case 'binary':		return mapper(expr, {
 				left:		processExpressionA,
 				right:		processExpressionA
 			});
@@ -317,11 +314,16 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 				typeParams:	processArrays(processTypeU),
 				implementsClause: processArrays(processTypeU)
 			}) as Expr;
+			case 'instantiation':	return mapper(expr, {
+				expression: processExpressionA,
+				typeArgs:	processArrays(processTypeU)
+			});
 			case 'as_expression':
 			case 'satisfies_expression':
-			case 'non_null':	return mapper(expr, {
-				expression: processExpressionA
+				return mapper(expr, {
+				expression: 	processExpressionA
 			});
+
 			case 'regex':
 			case 'bigint':
 			case 'this':
@@ -330,7 +332,7 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 		}
 	};
 
-	const processForInit = (init: JS.ForInit): JS.ForInit => init.type === 'var'
+	const processForInit = (init: JS.ForInit): JS.ForInit => init.type === 'var_decl'
 		? mapper(init, {declarations: processArrays(processVarDeclarator)})
 		: processExpressionA(init);
 
@@ -339,7 +341,7 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 			case 'block':		return mapper(stmt, {
 				body:			processArraysA(processStatementC)
 			});
-			case 'var': 		return mapper(stmt, {
+			case 'var_decl': 		return mapper(stmt, {
 				declarations: 	processArrays(processVarDeclarator)
 			});
 			case 'expression': 	return mapper(stmt, {
@@ -362,7 +364,7 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 				body:			processStatementCA
 			});
 			case 'for_in':		return mapper(stmt, {
-				left:			processForInit,
+				init:			processForInit,
 				right:			processExpressionA,
 				body:			processStatementCA
 			});

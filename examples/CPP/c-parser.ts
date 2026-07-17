@@ -1,4 +1,5 @@
-import { makeParser, Rule, Rules, RRules, terminal, termOneOf, List, Forward, WithPrec } from '../src/tison';
+import { makeParser, Rule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../../src/tison';
+import { preprocess, PreprocessOptions } from './preprocessor';
 
 // ===================================================================
 //  C Parser Grammar using tison
@@ -50,6 +51,12 @@ export const PREC = {
 // ===================================================================
 //  AST Types -- one per non-terminal group (or shared where alts agree)
 // ===================================================================
+export type unaryOps	= '++'|'--'|'+'|'-'|'~'|'!'|'&'|'*'|'sizeof';
+export type binaryOps	= ','|'+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'|'>>'
+						| '&&'|'||'
+						|'<'|'>'|'<='|'>='|'=='|'!='
+						|'='|'+='|'-='|'*='|'/='|'%='|'&='|'|='|'^='|'<<='|'>>='
+						|'&&='|'||='
 
 export type TypeQualifier	= 'const' | 'volatile';
 export type StorageClass	= 'typedef' | 'extern' | 'static' | 'auto' | 'register';
@@ -104,16 +111,15 @@ export type Definition				= Declaration | FunctionDef;
 export interface TranslationUnit	{ type: 'translation_unit'; definitions: Definition[]; }
 
 export interface Block				{ type: 'block'; statements: Statement[]; }
-export interface ForClauses		{ init: Expr | Declaration; condition?: Expr; update?: Expr; }
+export interface ForClauses			{ init: Expr | Declaration | undefined; condition?: Expr; update?: Expr; }
 
 export type Statement =
 	| Block
 	| Declaration
-	| { type: 'if'; condition: Expr; then: Statement }
-	| { type: 'if_else'; condition: Expr; then: Statement; else: Statement }
+	| { type: 'if'; condition: Expr; then: Statement; else?: Statement }
 	| { type: 'while'; condition: Expr; body: Statement }
 	| { type: 'do_while'; body: Statement; condition: Expr }
-	| { type: 'for'; init: Expr | Declaration; condition?: Expr; update?: Expr; body: Statement }
+	| { type: 'for' } & ForClauses
 	| { type: 'switch'; condition: Expr; body: Statement }
 	| { type: 'case'; value: Expr; body: Statement }
 	| { type: 'default'; body: Statement }
@@ -122,31 +128,22 @@ export type Statement =
 	| { type: 'return'; expression?: Expr }
 	| { type: 'goto'; label: string }
 	| { type: 'labeled'; label: string; body: Statement }
-	| { type: 'empty_statement' }
+	| { type: 'empty' }
 	| Expr;
 
 export type Expr =
 	| { type: 'identifier'; name: string }
-	| { type: 'literal'; value: number }
-	| { type: 'string_literal'; value: string }
+	| { type: 'literal'; value: number|string }
 	| { type: 'char_literal'; value: string }
-	| { type: 'post_increment'; operand: Expr }
-	| { type: 'post_decrement'; operand: Expr }
+	| { type: 'unary'; operator: unaryOps; operand: Expr }
+	| { type: 'unary_post'; operator: unaryOps, operand: Expr }
+	| { type: 'binary'; operator: binaryOps; left: Expr; right: Expr }
+	| { type: 'conditional'; test: Expr; consequent: Expr; alternate: Expr }
 	| { type: 'subscript'; array: Expr; index: Expr }
 	| { type: 'member_access'; object: Expr; member: string }
 	| { type: 'pointer_member'; object: Expr; member: string }
 	| { type: 'function_call'; function: Expr; arguments: Expr[] }
-	| { type: 'unary_op'; operator: string; operand: Expr }
-	| { type: 'dereference'; operand: Expr }
-	| { type: 'address_of'; operand: Expr }
-	| { type: 'pre_increment'; operand: Expr }
-	| { type: 'pre_decrement'; operand: Expr }
 	| { type: 'cast'; type1: TypeName; expression: Expr }
-	| { type: 'binary_op'; operator: string; left: Expr; right: Expr }
-	| { type: 'assign'; left: Expr; right: Expr; operator: string }
-	| { type: 'conditional'; test: Expr; consequent: Expr; alternate: Expr }
-	| { type: 'comma'; left: Expr; right: Expr }
-	| { type: 'sizeof'; operand: Expr }
 	| { type: 'sizeof_type'; operand: TypeName };
 
 /** The base identifier a declarator ultimately names, digging through function/array/pointer wrappers. */
@@ -160,7 +157,10 @@ export function declaratorName(d: Declarator): string {
 }
 
 // --- Grammar Definition ---
-//
+
+
+const ASSIGN_OP = OneOf(['+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '&&=', '||=', '=']);
+
 // Declared bottom-up (leaf non-terminals first) so each rule can reference an already-declared group BY OBJECT (typed, no cast needed) instead of by name (untyped string, needs `as`).
 // Every self-recursive rule, and exactly one edge per genuine cycle (chosen as whichever single rule sacrifices the fewest alternatives), necessarily stays a string -- see the comments below.
 
@@ -169,58 +169,35 @@ fwd_type_name = Forward<TypeName>(()=>type_name),
 
 // assignment_expression covers every precedence level except the comma operator -- kept separate from `expression` specifically so a comma here always means "next list item"
 // (function arguments, declarator lists, initializers, ...) and never accidentally absorbs into a comma-expression; only the dedicated parenthesized-expression and subscript positions reach for full `expression` instead
-assignment_expression = RRules<Expr>(self => [
-	Rule([Forward<Expr>(()=>postfix_expression)],		$ => $[0]),
-	WithPrec(Rule(['+', self] as const, 						$ => ({ type: 'unary_op',		operator: '+', operand: $[1] } as const)), PREC.unary),
-	WithPrec(Rule(['-', self] as const, 						$ => ({ type: 'unary_op',		operator: '-', operand: $[1] } as const)), PREC.unary),
-	WithPrec(Rule(['!', self] as const, 						$ => ({ type: 'unary_op',		operator: '!', operand: $[1] } as const)), PREC.unary),
-	WithPrec(Rule(['~', self] as const, 						$ => ({ type: 'unary_op',		operator: '~', operand: $[1] } as const)), PREC.unary),
-	WithPrec(Rule(['*', self] as const, 						$ => ({ type: 'dereference',	operand: $[1] } as const)), PREC.unary),
-	WithPrec(Rule(['&', self] as const, 						$ => ({ type: 'address_of',		operand: $[1] } as const)), PREC.unary),
-	WithPrec(Rule(['++', self] as const, 						$ => ({ type: 'pre_increment',	operand: $[1] } as const)), PREC.unary),
-	WithPrec(Rule(['--', self] as const, 						$ => ({ type: 'pre_decrement',	operand: $[1] } as const)), PREC.unary),
-	WithPrec(Rule(['sizeof', self] as const, 					$ => ({ type: 'sizeof', 		operand: $[1] } as const)), PREC.unary),
+assignment_expression = Rules<Expr>(self => [
+	Forward<Expr>(()=>postfix_expression),
+	WithPrec(Rule([OneOf(['+', '-', '!', '~', '*', '&', '++', '--']), self] as const, 	$ => ({ type: 'unary',			operator: '+', operand: $[1] } as const)), PREC.unary),
+	// 'sizeof' spelled standalone, NOT inside the OneOf group: the sizeof_type rule below also spells it
+	// standalone, and a OneOf-vs-literal tie starves whichever loses (`sizeof(expr)` never parsed).
+	WithPrec(Rule(['sizeof', self] as const, 							$ => ({ type: 'unary',			operator: 'sizeof', operand: $[1] } as const)), PREC.unary),
 	// 'type_name' stays a string: it's declared later (it needs specifier_qualifier_list, which itself needs constant_expression --
 	// part of this same expression chain), the same kind of cycle the original cast rule already cut this way with 'type_specifier'.
-	WithPrec(Rule(['sizeof', '(', fwd_type_name, ')'] as const,	$ => ({ type: 'sizeof_type',	operand: $[2] as TypeName } as const)), PREC.unary),
-	WithPrec(Rule(['(', fwd_type_name, ')', self] as const, 	$ => ({ type: 'cast',			type1: $[1] as TypeName, expression: $[3] })), PREC.cast),
-	WithPrec(Rule([self, '*',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '*', left: $[0], right: $[2]})), PREC.multiplicative),
-	WithPrec(Rule([self, '/',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '/', left: $[0], right: $[2]})), PREC.multiplicative),
-	WithPrec(Rule([self, '%',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '%', left: $[0], right: $[2]})), PREC.multiplicative),
-	WithPrec(Rule([self, '+',  self] as const,					$ => ({ type: 'binary_op', 		operator: '+', left: $[0], right: $[2] })), PREC.additive),
-	WithPrec(Rule([self, '-',  self] as const,					$ => ({ type: 'binary_op', 		operator: '-', left: $[0], right: $[2] })), PREC.additive),
-	WithPrec(Rule([self, '<<', self] as const, 					$ => ({ type: 'binary_op', 		operator: '<<', left: $[0], right: $[2] })), PREC.shift),
-	WithPrec(Rule([self, '>>', self] as const, 					$ => ({ type: 'binary_op', 		operator: '>>', left: $[0], right: $[2] })), PREC.shift),
-	WithPrec(Rule([self, '<',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '<', left: $[0], right: $[2] })), PREC.relational),
-	WithPrec(Rule([self, '>',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '>', left: $[0], right: $[2] })), PREC.relational),
-	WithPrec(Rule([self, '<=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '<=', left: $[0], right: $[2] })), PREC.relational),
-	WithPrec(Rule([self, '>=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '>=', left: $[0], right: $[2] })), PREC.relational),
-	WithPrec(Rule([self, '==', self] as const, 					$ => ({ type: 'binary_op', 		operator: '==', left: $[0], right: $[2] })), PREC.equality),
-	WithPrec(Rule([self, '!=', self] as const, 					$ => ({ type: 'binary_op', 		operator: '!=', left: $[0], right: $[2] })), PREC.equality),
-	WithPrec(Rule([self, '&',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '&', left: $[0], right: $[2] })), PREC.bitwiseAnd),
-	WithPrec(Rule([self, '^',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '^', left: $[0], right: $[2] })), PREC.bitwiseXor),
-	WithPrec(Rule([self, '|',  self] as const, 					$ => ({ type: 'binary_op', 		operator: '|', left: $[0], right: $[2] })), PREC.bitwiseOr),
-	WithPrec(Rule([self, '&&', self] as const, 					$ => ({ type: 'binary_op', 		operator: '&&', left: $[0], right: $[2] })), PREC.logicalAnd),
-	WithPrec(Rule([self, '||', self] as const,					$ => ({ type: 'binary_op', 		operator: '||', left: $[0], right: $[2] })), PREC.logicalOr),
-	WithPrec(Rule([self, '?', self, ':', self] as const,		$ => ({ type: 'conditional',	test: $[0], consequent: $[2], alternate: $[4] })), PREC.conditional),
-	WithPrec(Rule([self, '=',  self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '=' })), PREC.assignment),
-	WithPrec(Rule([self, '+=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '+=' })), PREC.assignment),
-	WithPrec(Rule([self, '-=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '-=' })), PREC.assignment),
-	WithPrec(Rule([self, '*=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '*=' })), PREC.assignment),
-	WithPrec(Rule([self, '/=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '/=' })), PREC.assignment),
-	WithPrec(Rule([self, '%=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '%=' })), PREC.assignment),
-	WithPrec(Rule([self, '&=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '&=' })), PREC.assignment),
-	WithPrec(Rule([self, '|=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '|=' })), PREC.assignment),
-	WithPrec(Rule([self, '^=', self] as const, 					$ => ({ type: 'assign', left: $[0], right: $[2], operator: '^=' })), PREC.assignment),
-	WithPrec(Rule([self, '<<=', self] as const, 				$ => ({ type: 'assign', left: $[0], right: $[2], operator: '<<=' })), PREC.assignment),
-	WithPrec(Rule([self, '>>=', self] as const, 				$ => ({ type: 'assign', left: $[0], right: $[2], operator: '>>=' })), PREC.assignment),
+	WithPrec(Rule(['sizeof', '(', fwd_type_name, ')'] as const,			$ => ({ type: 'sizeof_type',	operand: $[2] as TypeName } as const)), PREC.unary),
+	WithPrec(Rule(['(', fwd_type_name, ')', self] as const, 			$ => ({ type: 'cast',			type1: $[1] as TypeName, expression: $[3] })), PREC.cast),
+	WithPrec(Rule([self, OneOf(['*','/','%']),  self] as const, 		$ => ({ type: 'binary', 		operator: $[1], left: $[0], right: $[2]})), PREC.multiplicative),
+	WithPrec(Rule([self, OneOf(['+', '-']),  self] as const,			$ => ({ type: 'binary', 		operator: $[1], left: $[0], right: $[2] })), PREC.additive),
+	WithPrec(Rule([self, OneOf(['<<', '>>']), self] as const, 			$ => ({ type: 'binary', 		operator: $[1], left: $[0], right: $[2] })), PREC.shift),
+	WithPrec(Rule([self, OneOf(['<','>','<=','>=']),  self] as const, 	$ => ({ type: 'binary', 		operator: $[1], left: $[0], right: $[2] })), PREC.relational),
+	WithPrec(Rule([self, OneOf(['==', '!=']), self] as const, 			$ => ({ type: 'binary', 		operator: $[1], left: $[0], right: $[2] })), PREC.equality),
+	WithPrec(Rule([self, '&',  self] as const, 							$ => ({ type: 'binary', 		operator: '&', left: $[0], right: $[2] })), PREC.bitwiseAnd),
+	WithPrec(Rule([self, '^',  self] as const, 							$ => ({ type: 'binary', 		operator: '^', left: $[0], right: $[2] })), PREC.bitwiseXor),
+	WithPrec(Rule([self, '|',  self] as const, 							$ => ({ type: 'binary', 		operator: '|', left: $[0], right: $[2] })), PREC.bitwiseOr),
+	WithPrec(Rule([self, '&&', self] as const, 							$ => ({ type: 'binary', 		operator: '&&', left: $[0], right: $[2] })), PREC.logicalAnd),
+	WithPrec(Rule([self, '||', self] as const,							$ => ({ type: 'binary', 		operator: '||', left: $[0], right: $[2] })), PREC.logicalOr),
+	WithPrec(Rule([self, '?', self, ':', self] as const,				$ => ({ type: 'conditional',	test: $[0], consequent: $[2], alternate: $[4] })), PREC.conditional),
+	WithPrec(Rule([self, ASSIGN_OP,  self] as const, 					$ => ({ type: 'binary',			operator: $[1], left: $[0], right: $[2] })), PREC.assignment),
 ]),
 
 // The comma operator's own level, kept out of assignment_expression -- this is what plain `expression` means in real C:
 // parenthesized sub-expressions and array subscripts allow a comma operator, but argument lists, initializers, and declarator lists must not.
-expression = RRules<Expr>(self => [
-	Rule([assignment_expression] as const, 				$ => $[0]),
-	WithPrec(Rule([self, ',', assignment_expression] as const, 	$ => ({ type: 'comma', left: $[0], right: $[2] } as const)), PREC.comma),
+expression = Rules<Expr>(self => [
+	assignment_expression,
+	WithPrec(Rule([self, ',', assignment_expression] as const, 	$ => ({ type: 'binary', operator: ',', left: $[0], right: $[2] } as const)), PREC.comma),
 ]),
 
 argument_expression_list = List(assignment_expression, ','),
@@ -228,31 +205,29 @@ argument_expression_list = List(assignment_expression, ','),
 // === Constant Expression (for switch cases, array/bitfield sizes) ===
 // Real C narrows this to conditional-expression (excludes both assignment and comma); using assignment_expression is a pragmatic middle ground
 constant_expression = Rules(
-	Rule([assignment_expression] as const, 									$ => $[0]),
+	assignment_expression,
 ),
 
 primary_expression = Rules(
 	Rule([IDENT] as const, 													$ => ({ type: 'identifier', name: $[0] } as const)),
 	Rule([INT_LITERAL] as const,											$ => ({ type: 'literal', value: parseInt($[0], 10) } as const)),
 	Rule([FLOAT_LITERAL] as const, 											$ => ({ type: 'literal', value: parseFloat($[0]) } as const)),
-	Rule([STRING_LITERAL] as const, 										$ => ({ type: 'string_literal', value: $[0] } as const)),
+	Rule([STRING_LITERAL] as const, 										$ => ({ type: 'literal', value: $[0] } as const)),
 	Rule([CHAR_LITERAL] as const, 											$ => ({ type: 'char_literal', value: $[0] } as const)),
 	Rule(['(', expression, ')'] as const, 									$ => $[1]),
 ),
 
-postfix_expression = RRules<Expr>(self => [
-	Rule([primary_expression] as const, 									$ => $[0]),
-	WithPrec(Rule([self, '++'] as const,									$ => ({ type: 'post_increment', operand: $[0] } as const)), PREC.unary),
-	WithPrec(Rule([self, '--'] as const,									$ => ({ type: 'post_decrement',	operand: $[0] } as const)), PREC.unary),
+postfix_expression = Rules<Expr>(self => [
+	primary_expression,
+	WithPrec(Rule([self, '++'] as const,									$ => ({ type: 'unary_post', operator: $[1], operand: $[0] } as const)), PREC.unary),
+	WithPrec(Rule([self, '--'] as const,									$ => ({ type: 'unary_post',	operator: $[1], operand: $[0] } as const)), PREC.unary),
 	Rule([self, '[', expression, ']'] as const, 							$ => ({ type: 'subscript',	array: $[0], index: $[2] } as const)),
 	Rule([self, '.', IDENT] as const,										$ => ({ type: 'member_access',	object: $[0], member: $[2] } as const)),
 	Rule([self, '->', IDENT] as const, 										$ => ({ type: 'pointer_member', object: $[0], member: $[2] } as const)),
 	Rule([self, '(', argument_expression_list, ')'] as const,				$ => ({ type: 'function_call', function: $[0], arguments: $[2] } as const)),
 ]),
 
-type_qualifier = Rules(
-	Rule([termOneOf(['const', 'volatile'] as const)],						$ => $[0]),
-),
+type_qualifier = OneOf(['const', 'volatile']),
 
 struct_declarator = Rules<StructDeclarator>(
 	Rule([IDENT], 															$ => ({ name: $[0] })),
@@ -270,7 +245,7 @@ struct_declaration = Rules(
 struct_declaration_list = List(struct_declaration),
 
 struct_body = Rules(
-	Rule([struct_declaration_list] as const, 								$ => $[0]),
+	struct_declaration_list,
 	Rule([';'] as const, 													() => []),
 	Rule([struct_declaration_list, ';'] as const,	 						$ => $[0]),
 ),
@@ -281,13 +256,17 @@ struct_or_union_specifier = Rules<StructSpecifier>(
 	Rule(['union', IDENT, '{', struct_body, '}'] as const, 					$ => ({ type: 'union', name: $[1], members: $[3] } as const)),
 	Rule(['union', '{', struct_body, '}'] as const, 						$ => ({ type: 'union', members: $[2] } as const)),
 	// Tag-only reference to a struct/union defined elsewhere -- distinguished from the definition forms above purely by whether '{' follows IDENT, an ordinary one-token-lookahead decision.
-	{ rhs: ['struct', IDENT], 												action: $ => ({ type: 'struct', name: $[1] as string } as const) },
-	{ rhs: ['union', IDENT], 												action: $ => ({ type: 'union', name: $[1] as string } as const) },
+	Rule(['struct', IDENT], 												$ => ({ type: 'struct', name: $[1] as string } as const)),
+	Rule(['union', IDENT], 													$ => ({ type: 'union', name: $[1] as string } as const)),
 ),
 
 enumerator = Rules(
 	Rule([IDENT, '=', constant_expression] as const, 						$ => ({ name: $[0], value: $[2] })),
 	Rule([IDENT], 															$ => ({ name: $[0] })),
+	// TYPE_NAME variants: enumerator names may collide with registered type names (`enum { BASE, RUN }`
+	// with a `BASE` class known from elsewhere).
+	Rule([TYPE_NAME, '=', constant_expression] as const, 					$ => ({ name: $[0], value: $[2] })),
+	Rule([TYPE_NAME], 														$ => ({ name: $[0] })),
 ),
 
 enumerator_list = List(enumerator, ','),
@@ -295,31 +274,28 @@ enumerator_list = List(enumerator, ','),
 enum_specifier = Rules<EnumSpecifier>(
 	Rule(['enum', IDENT, '{', enumerator_list, '}'] as const, 				$ => ({ type: 'enum', name: $[1], enumerators: $[3] } as const)),
 	Rule(['enum', '{', enumerator_list, '}'] as const, 						$ => ({ type: 'enum', enumerators: $[2] } as const)),
+	// C99 allows a trailing comma after the last enumerator.
+	Rule(['enum', IDENT, '{', enumerator_list, ',', '}'] as const, 			$ => ({ type: 'enum', name: $[1], enumerators: $[3] } as const)),
+	Rule(['enum', '{', enumerator_list, ',', '}'] as const, 				$ => ({ type: 'enum', enumerators: $[2] } as const)),
 	// Tag-only reference, same as struct/union above.
-	{ rhs: ['enum', IDENT], 												action: $ => ({ type: 'enum', name: $[1] as string } as const) },
+	Rule(['enum', IDENT], 													$ => ({ type: 'enum', name: $[1] as string } as const)),
 ),
 
 type_specifier = Rules<TypeSpecifier>(
-	Rule([termOneOf(BUILTIN_TYPE)],											$ => ({ type: 'type', name: $[0] })),
-	Rule([struct_or_union_specifier] as const, 								$ => $[0]),
-	Rule([enum_specifier] as const, 										$ => $[0]),
+	Rule([OneOf(BUILTIN_TYPE)],												$ => ({ type: 'type', name: $[0] })),
+	struct_or_union_specifier,
+	enum_specifier,
 	Rule([TYPE_NAME], 														$ => ({ type: 'type', name: $[0] })),
 ),
 
-specifier_qualifier_list = RRules<DeclSpecItem[]>(self => [
+specifier_qualifier_list = Rules<DeclSpecItem[]>(self => [
 	Rule([type_specifier] as const, 										$ => [$[0]]),
 	Rule([self, type_specifier] as const, 									$ => [...$[0], $[1]]),
 	Rule([self, type_qualifier] as const, 									$ => [...$[0], $[1]]),
 ]),
 
 // --- Declarators / declarations ---
-storage_class_specifier = Rules(
-	{ rhs: ['typedef'], 													action: () => 'typedef' as const},
-	{ rhs: ['extern'], 														action: () => 'extern'  as const},
-	{ rhs: ['static'], 														action: () => 'static'  as const},
-	{ rhs: ['auto'], 														action: () => 'auto'  as const},
-	{ rhs: ['register'], 													action: () => 'register'  as const},
-),
+storage_class_specifier = OneOf(['typedef', 'extern', 'static', 'auto', 'register']),
 
 declaration_specifiers = Rules(
 	Rule([specifier_qualifier_list] as const, 								($, ctx) => { ctx.pendingTypedef = false; return [...($[0])]; }),
@@ -327,7 +303,7 @@ declaration_specifiers = Rules(
 	Rule([storage_class_specifier, specifier_qualifier_list] as const, 		($, ctx) => { ctx.pendingTypedef = $[0] === 'typedef'; return [$[0], ...($[1])]; }),
 ),
 
-pointer = RRules<Pointer>(self => [
+pointer = Rules<Pointer>(self => [
 	Rule(['*'], 															() => [{ level: 1 }]),
 	Rule(['*', self] as const,												$ => [{ level: $[1].length + 1 }, ...$[1]]),
 ]),
@@ -338,7 +314,7 @@ fwd_parameter_type_list = Forward<ParamOrVariadic[]>(() => parameter_type_list),
 //
 // `'(' ')'` (function-with-no-params) can't be confused with the grouping rule `'(' abstract_declarator ')'`, since abstract_declarator can never
 // derive empty -- it always needs at least a pointer or a direct form, the same way real C's grammar avoids this exact ambiguity.
-direct_abstract_declarator = RRules<AbstractDeclarator>(self => [
+direct_abstract_declarator = Rules<AbstractDeclarator>(self => [
 	Rule(['(', Forward<AbstractDeclarator>(() => abstract_declarator), ')'] as const, $ => $[1]),
 	Rule(['(', ')'] as const, 												() => ({ type: 'function', parameters: [] } as const)),
 	Rule(['(', fwd_parameter_type_list, ')'] as const, 						$ => ({ type: 'function', parameters: $[1] } as const)),
@@ -353,7 +329,7 @@ direct_abstract_declarator = RRules<AbstractDeclarator>(self => [
 ]),
 abstract_declarator = Rules<AbstractDeclarator>(
 	Rule([pointer] as const, 												$ => ({ type: 'pointer', pointer: $[0] as Pointer } as const)),
-	Rule([direct_abstract_declarator] as const, 							$ => $[0]),
+	direct_abstract_declarator,
 	Rule([pointer, direct_abstract_declarator] as const, 					$ => ({ type: 'pointer', pointer: $[0] as Pointer, to: $[1] } as const)),
 ),
 
@@ -366,7 +342,7 @@ type_name = Rules<TypeName>(
 // direct_declarator -> parameter_type_list stays a string: cheapest cut in the
 // direct_declarator <-> parameter_declaration cycle (a function declarator's
 // own parameter list is the only edge crossing back into that cycle).
-direct_declarator = RRules<Declarator>(self => [
+direct_declarator = Rules<Declarator>(self => [
 	Rule([IDENT] as const,													$ => ({ type: 'identifier', name: $[0] } as const)),
 	// Grouping -- the only way to attach a pointer to a *name* rather than to the surrounding function/array type, which is what makes a function
 	// pointer (`int (*fp)(int)`) parse as "fp is a pointer to a function" instead of "fp is a function returning a pointer". 'declarator' stays
@@ -384,7 +360,7 @@ direct_declarator = RRules<Declarator>(self => [
 // for function pointers, and so parameter declarators (which go through 'declarator' directly, not through init_declarator) can have pointer
 // types too (`void f(int *x)` -- previously unsupported).
 declarator = Rules<Declarator>(
-	Rule([direct_declarator] as const, 										$ => $[0]),
+	direct_declarator,
 	Rule([pointer, direct_declarator] as const, 							$ => ({ type: 'pointer', pointer: $[0], to: $[1] } as const)),
 ),
 
@@ -394,14 +370,14 @@ parameter_declaration = Rules(
 ),
 parameter_list = List(parameter_declaration, ','),
 parameter_type_list = Rules(
-	Rule([parameter_list] as const, 										$ => $[0]),
+	parameter_list,
 	Rule([parameter_list, ',', '...'] as const, 							$ => [...($[0]), { type: 'variadic' } as const]),
 ),
 
 // initializer_list -> initializer stays a string: the cheapest cut in their mutual cycle (initializer's only consumer of initializer_list is its own brace-list case, vs. initializer_list needing initializer for every element)
 initializer_list = List(Forward<Initializer>(() => initializer), ','),
 initializer = Rules<Initializer>(
-	Rule([assignment_expression] as const, 									$ => $[0]),
+	assignment_expression,
 	Rule(['{', '}'] as const, 												() => ({ type: 'initializer_list', elements: [] } as const)),
 	Rule(['{', initializer_list, '}'] as const, 							$ => ({ type: 'initializer_list', elements: $[1] } as const)),
 	Rule(['{', initializer_list, ',', '}'] as const, 						$ => ({ type: 'initializer_list', elements: $[1] } as const)),
@@ -429,36 +405,32 @@ for_statement = Rules<ForClauses>(
 	Rule([declaration, expression, ';', expression] as const, 				$ => ({ init: $[0], condition: $[1], update: $[3] })),
 ),
 
-expression_statement = Rules(
-	{ rhs: [';'],														   	action: () => ({ type: 'empty_statement' }) },
-	Rule([expression, ';'] as const, 										$ => $[0]),
-),
-
 // statement -> compound_statement stays a string: cheapest cut in the statement <-> compound_statement <-> statement_list cycle
 // (it's 1 of statement's 13 alternatives, vs. 2 uses on statement_list's side).
-statement = RRules(self => [
-	Rule([Forward<Block>(()=>compound_statement)], 							$ => $[0]),
-	Rule([declaration] as const, 											$ => $[0]),
+statement = Rules<Statement>(self => [
+	Forward<Block>(()=>compound_statement),
+	declaration,
 	Rule(['if', '(', expression, ')', self] as const, 						$ => ({ type: 'if', condition: $[2], then: $[4] })),
-	Rule(['if', '(', expression, ')', self, 'else', self] as const, 		$ => ({ type: 'if_else', condition: $[2], then: $[4], else: $[6] })),
+	Rule(['if', '(', expression, ')', self, 'else', self] as const, 		$ => ({ type: 'if', condition: $[2], then: $[4], else: $[6] })),
 	Rule(['while', '(', expression, ')', self] as const, 					$ => ({ type: 'while', condition: $[2], body: $[4] })),
 	Rule(['do', self, 'while', '(', expression, ')', ';'] as const, 		$ => ({ type: 'do_while', body: $[1], condition: $[4] })),
-	Rule(['for', '(', for_statement, ')', self] as const, 					$ => ({ type: 'for', ...($[2]), body: $[4] })),
+	Rule(['for', '(', for_statement, ')', self] as const, 					$ => ({ type: 'for', ...$[2], body: $[4] })),
 	Rule(['switch', '(', expression, ')', self] as const, 					$ => ({ type: 'switch', condition: $[2], body: $[4] })),
 	Rule(['case', constant_expression, ':', self] as const, 				$ => ({ type: 'case', value: $[1], body: $[3] })),
-	{ rhs: ['default', ':', self], 											action: $ => ({ type: 'default', body: $[2] }) },
-	{ rhs: ['break', ';'], 													action: () => ({ type: 'break' }) },
-	{ rhs: ['continue', ';'], 												action: () => ({ type: 'continue' }) },
+	Rule(['default', ':', self] as const, 									$ => ({ type: 'default', body: $[2] })),
+	Rule(['break', ';'] as const, 											_ => ({ type: 'break' })),
+	Rule(['continue', ';'] as const, 										_ => ({ type: 'continue' })),
 	Rule(['return', expression, ';'] as const, 								$ => ({ type: 'return', expression: $[1] })),
-	{ rhs: ['return', ';'], 												action: () => ({ type: 'return' }) },
+	Rule(['return', ';'] as const, 											_ => ({ type: 'return' })),
 	Rule(['goto', IDENT, ';'] as const, 									$ => ({ type: 'goto', label: $[1] })),
 	Rule([IDENT, ':', self] as const, 										$ => ({ type: 'labeled', label: $[0], body: $[2] })),
-	Rule([expression_statement] as const, 									$ => $[0]),
+	Rule([';'],														   		_ => ({ type: 'empty' } as const)),
+	Rule([expression, ';'] as const, 										$ => $[0]),
 ]),
 
-compound_statement = Rules(
+compound_statement = Rules<Block>(
 	Rule(['{', List(statement), '}'] as const, 								$ => ({ type: 'block', statements: $[1] })),
-	{ rhs: ['{', '}'], 														action: () => ({ type: 'block', statements: [] }) },
+	Rule(['{', '}'], 														() => ({ type: 'block', statements: [] })),
 ),
 
 // --- Top level ---
@@ -467,17 +439,17 @@ function_definition = Rules(
 ),
 
 external_definition = Rules<Definition>(
-	Rule([declaration] as const, 											$ => $[0]),
+	declaration,
 	Rule([function_definition] as const, 									$ => $[0] as Definition),
 ),
 
-translation_unit = RRules<TranslationUnit>(self => [
+translation_unit = Rules<TranslationUnit>(self => [
 	Rule([external_definition] as const, 									$ => ({ type: 'translation_unit', definitions: [$[0]] })),
 	Rule([self, external_definition] as const, 								$ => ({ ...$[0], definitions: [...$[0].definitions, $[1]] })),
 ]);
 
 const parser = makeParser({
-	skip: [/\s+/, /#[^\n]*/, /\/\/[^\n]*/, /\/\*[^]*?\*\//],
+	skip: [/\s+/, /\/\/[^\n]*/, /\/\*[^]*?\*\//],
 	// IDENT has to be lexed even in states where only TYPE_NAME is grammatically valid (e.g. a
 	// parameter's type-specifier position) -- it's the only terminal whose pattern actually
 	// matches the text, and its callback is what reclassifies a known typedef name into the
@@ -490,8 +462,9 @@ const parser = makeParser({
 
 export const cParser = {
 	...parser,
-	parse: (code: string) => {
-		return parser.parse(code, {
+	// source runs through the preprocessor first; `options` supplies -D defines and an #include resolver
+	parse: (code: string, options?: PreprocessOptions) => {
+		return parser.parse(preprocess(code, options), {
 			pendingTypedef: false,
 			typedefNames: new Set<string>(),
 		});

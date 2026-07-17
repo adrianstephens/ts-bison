@@ -4,6 +4,7 @@ import {TStoDecl, TStypeCheck, TStypeCheckAsync } from '../examples/TS/ts-codege
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { SEVERITY } from '../examples/TS/checker';
 
 const output = new TSoutput();
 let total_diag = 0;
@@ -32,7 +33,7 @@ function test(name: string, code: string, outputCode = false) {
 async function testAsync(name: string, pathname: string, outputCode = false) {
 	try {
 		console.log('====' + name + '====');
-		const {program, diagnostics} = await TStypeCheckAsync(pathname);
+		const {program, diagnostics} = await TStypeCheckAsync(pathname, SEVERITY.GAP);
 		if (diagnostics.length) {
 			console.error(`Type errors in ${name}:`);
 			for (const d of diagnostics)
@@ -49,9 +50,21 @@ async function testAsync(name: string, pathname: string, outputCode = false) {
 	}
 }
 
+async function testDir(dir: string) {
+	for (const entry of await fs.readdir(dir, {withFileTypes: true})) {
+		if (entry.name === 'node_modules' || entry.name === 'hidden' || entry.name === 'assistant')
+			continue;
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory())
+			await testDir(full);
+		else if (full.endsWith('.ts') && !full.endsWith('.d.ts'))
+			await testAsync(full, full);
+	}
+}
+
 (async()=> {
 
-await testAsync('source', path.join('/Volumes/DevSSD/dev/packages/vscode-utils/src/fs.ts'));
+//await testAsync('source', '/Volumes/DevSSD/dev/packages/maths/src/geometry.ts');
 //await testAsync('source', path.join(__dirname, '../examples/TS/ts-codegen.ts'));
 
 test('1', `
@@ -154,18 +167,6 @@ const handler: Callback = (err, result) => {};
 //await testAsync('vector', '/Volumes/DevSSD/dev/packages/algebraic/src/index.ts', true);
 //await testAsync('source', path.join(__dirname, '../src/tison.ts'));
 //await testAsync('vector', '/Volumes/DevSSD/dev/packages/maths/src/vector.ts', true);
-
-async function testDir(dir: string) {
-	for (const entry of await fs.readdir(dir, {withFileTypes: true})) {
-		if (entry.name === 'node_modules' || entry.name === 'hidden' || entry.name === 'assistant')
-			continue;
-		const full = path.join(dir, entry.name);
-		if (entry.isDirectory())
-			await testDir(full);
-		else if (full.endsWith('.ts') && !full.endsWith('.d.ts'))
-			await testAsync(full, full);
-	}
-}
 
 await testDir(path.join(__dirname, '../..'));
 

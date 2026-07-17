@@ -7,7 +7,7 @@
 	},
 	"include": [
 		"**/*.ts"
-, "TS/ts-codegen.ts", "TS/ts-parser.ts", "TS/js-parser.ts"	],
+	],
 	"references": [
 		{"path": "../tsconfig.json"}
 	]

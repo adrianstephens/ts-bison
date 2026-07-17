@@ -1,17 +1,43 @@
-import {cppParser} from '../examples/cpp-parser';
+import * as CPP from '../examples/CPP/cpp-parser';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 
 function test(name: string, code: string) {
 	try {
-		console.log(name);
-		console.log(JSON.stringify(cppParser.parse(code), null, 2));
+		console.log('====' + name + '====');
+		const options: CPP.Options = {
+			knownTypes: ['std', 'string', 'vector', 'exception', 'map', 'set'],
+			include:	async (name: string, angled: boolean) => {
+				return await fs.readFile(name, 'utf8');
+			}
+		};
+		const ast = CPP.parse(code, options);
+		console.log(JSON.stringify(ast, null, 2));
 	} catch (e) {
 		console.error(`${name} failed:`, e);
 	}
 }
 
-console.log(`Grammar conflicts: ${cppParser.tables.conflicts.length}`);
-for (const c of cppParser.tables.conflicts.slice(0, 20))
+async function testDir(dir: string) {
+	for (const entry of await fs.readdir(dir, {withFileTypes: true})) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory())
+			await testDir(full);
+		else if (full.endsWith('.cpp'))
+			test(full, await fs.readFile(full, 'utf8'));
+	}
+}
+
+
+console.log(`Grammar conflicts: ${CPP.parser.tables.conflicts.length}`);
+for (const c of CPP.parser.tables.conflicts.slice(0, 20))
 	console.log(c);
+
+(async()=> {
+
+await testDir('/Volumes/DevSSD/dev/shared');
+
+})();
 
 test('Simple class', `
 class Point {
@@ -179,7 +205,7 @@ Tuple<Args...> pack;
 let pass = 0, fail = 0;
 function check(name: string, code: string, knownTypes?: string[]) {
 	try {
-		cppParser.parse(code, knownTypes);
+		CPP.parse(code, {knownTypes});
 		pass++;
 	} catch (e: any) {
 		fail++;

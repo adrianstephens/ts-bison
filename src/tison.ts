@@ -20,7 +20,7 @@ function has0args<T>(fn: (() => T) | Action<T>): fn is ()=>T {
 	return fn.length === 0;
 }
 
-// A literal that ends in a word character (e.g. 'var', 'in') is given an implicit trailing word-boundary, so it can never match as a strict prefix of a longer word
+// A literal that ends in a word character (e.g. 'var_decl', 'in') is given an implicit trailing word-boundary, so it can never match as a strict prefix of a longer word
 function literalPattern(s: string) {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + (/\w/.test(s[s.length - 1]) ? '(?!\\w)' : '');
 }
@@ -70,7 +70,7 @@ export class Terminal<T = any> {
 	}
 }
 
-export function termOneOf<T extends string>(names: readonly T[]) {
+export function termOneOf<const T extends string>(names: readonly T[]) {
 	const sorted = [...names].sort((a, b) => b.length - a.length);
 	return new Terminal<T>(names.join('|'), RegExp(sorted.map(literalPattern).join('|')));
 }
@@ -107,6 +107,19 @@ export function WithPrec<T>(rule: Rule<T>, prec: Precedence): Rule<T> {
 export function WithMerge<T>(rule: Rule<T>, merge: MergeFn): Rule<T> {
 	return {...rule, merge};
 }
+export function ForceFork<T>(rule: Rule<T>): Rule<T> {
+	return {...rule, prec: forceFork};
+}
+
+export type CommonAction<C> = <T>(value: T, values: WithTextPos<any[]>, ctx: C)=>any
+export function withCommonAction<C>(commonAction: CommonAction<C>, action: <T>(values: WithTextPos<any[]>, ctx: C) => T) {
+	return (values: WithTextPos<any[]>, ctx: C) => commonAction(action(values, ctx), values, ctx);
+}
+export function maybeCommonAction<C>(commonAction: CommonAction<C> | undefined) {
+	return commonAction
+		? (action: <T>(values: WithTextPos<any[]>, ctx: C) => T) => (values: WithTextPos<any[]>, ctx: C) => commonAction(action(values, ctx), values, ctx)
+		: (action: <T>(values: WithTextPos<any[]>, ctx: C) => T) => action;
+}
 
 export function Rule<R extends readonly GrammarSym[]>(rhs: R): Rule<ElemValue<R[0]>>;
 export function Rule<T, R extends readonly GrammarSym[], C = any>(rhs: R, action: Action<T, C, ValuesOf<R>>): Rule<T>;
@@ -115,11 +128,12 @@ export function Rule(rhs: GrammarSym[], action?: Action<any, any>) {
 }
 
 // Pins `ctx`'s type to `C` for every rule built with the returned function
-export function makeRule<C>(commonAction?: <T>(value: T, values: WithTextPos<any[]>, ctx: C)=>any) {
+export function makeRule<C>(commonAction?: CommonAction<C>) {
+	const common = maybeCommonAction(commonAction);
 	function boundRule<R extends readonly GrammarSym<C>[]>(rhs: R): Rule<ElemValue<R[0]>>;
 	function boundRule<T, R extends readonly GrammarSym<C>[]>(rhs: R, action: Action<T, C, ValuesOf<R>>): Rule<T>;
 	function boundRule(rhs: GrammarSym[], action?: Action<any, any>) {
-		return { rhs, action: commonAction && action ? (values: WithTextPos<any[]>, ctx: C) => commonAction(action(values, ctx), values, ctx) : action };
+		return { rhs, action: action ? common(action) : undefined };
 	}
 	return boundRule;
 }
@@ -127,12 +141,23 @@ export function makeRule<C>(commonAction?: <T>(value: T, values: WithTextPos<any
 type Rule2<T> = Rule<T> | Rules<T> | (()=>Rules<T>)
 export type Rules<T> = Rule2<T>[]
 
-export function Rules<T>(...alts: Rules<T>): Rules<T> {
-	return alts;
+export function Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>): Rules<T>;
+export function Rules(...params: any[]) {
+	if (params.length === 1 && typeof params[0] === 'function' && !has0args(params[0])) {
+		const rules: any = params[0](() => rules);
+		return rules;
+	}
+	return params;
 }
-export function RRules<T>(builder: (self: () => Rules<T>) => Rules<T>): Rules<T> {
-	const rules: Rules<T> = builder(() => rules);
-	return rules;
+
+export function removeRules(rules: Rules<any>, pred: (rhs: GrammarSym[]) => boolean) {
+	for (let i = rules.length - 1; i >= 0; i--) {
+		const rule = rules[i];
+		if (Array.isArray(rule) || typeof rule === 'function')
+			continue;
+		if (pred(rule.rhs))
+			rules.splice(i, 1);
+	}
 }
 
 export function Maybe<T>(rule: Rules<T>) {
@@ -143,7 +168,7 @@ export function Maybe<T>(rule: Rules<T>) {
 }
 
 export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: GrammarSym, trailing?: boolean) {
-	return RRules<T[]>(self => [
+	return Rules<T[]>(self => [
 		Rule([single] as const,	$ => [$[0]]),
 		sep
 			? Rule([self, sep, single] as const,	$ => [...($[0] as T[]), $[2]])
@@ -159,9 +184,8 @@ export function MaybeList<T>(rule: Rules<T>, sep?: GrammarSym, trailing?: boolea
 	);
 }
 
-
-export function OneOf<T extends string>(names: readonly T[]) {
-	return Rules(...names.map(name => Rule([name])));
+export function OneOf<const T extends string>(names: readonly T[]) {
+	return Rules(...names.map(name => Rule([name]))) as Rules<T>;
 }
 
 export type TermLike = RegExp | string | Terminal;

@@ -1,6 +1,7 @@
 import {
-	Rule, Rules, RRules, List, termOneOf, makeParser, terminal, WithPrec
-} from '../src/tison';
+	Rule, Rules, List, termOneOf, makeParser, terminal, WithPrec, removeRules, ForceFork
+} from '../../src/tison';
+import { preprocess, PreprocessOptions } from './preprocessor';
 import {
 	IDENT, TYPE_NAME, INT_LITERAL, STRING_LITERAL,
 	PREC,
@@ -173,7 +174,7 @@ export interface MemberTemplate		{ type: 'member_template'; params: TemplatePara
 export type ClassMember = CppStructMember | AccessLabel | ConstructorMember | DestructorMember | MethodMember | ConversionMember | UsingDeclMember | UsingAlias | MemberTemplate;
 
 export interface BaseSpecifier			{ access?: AccessSpecifier; virtual?: boolean; name: string; args?: TemplateArg[]; }
-export interface ClassSpecifier		{ type: 'class' | 'struct' | 'union'; name?: string; final?: boolean; bases?: BaseSpecifier[]; members?: ClassMember[]; }
+export interface ClassSpecifier			{ type: 'class' | 'struct' | 'union'; name?: string; final?: boolean; bases?: BaseSpecifier[]; members?: ClassMember[]; }
 export interface CppEnumSpecifier		{ type: 'enum'; name?: string; scoped?: boolean; base?: TypeSpecifier[]; enumerators?: { name: string; value?: Expr }[]; }
 
 // Reference declarators (`T&`, `T&&`) -- the only new shapes added to C's `Declarator` union.
@@ -190,7 +191,7 @@ export type CppExpr =
 	| { type: 'bool_literal'; value: boolean }
 	| { type: 'null_literal' }
 	| { type: 'qualified'; parts: string[] }
-	| { type: 'new'; typeName: TypeSpecifier; arguments?: Expr[]; size?: Expr; braced?: boolean }
+	| { type: 'new'; typeName: TypeSpecifier; arguments?: Expr[]; size?: Expr; braced?: boolean; placement?: Expr[] }
 	| { type: 'delete'; operand: Expr; array?: boolean }
 	| { type: 'pack_expansion'; operand: Expr }
 	| { type: 'sizeof_pack'; name: string }
@@ -206,8 +207,8 @@ export type CppExpr =
 export interface CppCtx extends Ctx { templateDepth: number; }
 
 export interface CatchClause			{ paramType?: TypeName; paramName?: string; byRef?: boolean; body: Block; }
-export interface UsingDirective		{ type: 'using_namespace'; name: string; }
-export interface UsingAlias			{ type: 'using_alias'; name: string; target: TypeName; }
+export interface UsingDirective			{ type: 'using_namespace'; name: string; }
+export interface UsingAlias				{ type: 'using_alias'; name: string; target: TypeName; }
 export interface NamespaceDecl			{ type: 'namespace'; name?: string; inline?: boolean; definitions: CppDefinition[]; }
 export interface LinkageSpec			{ type: 'linkage'; language: string; definitions: CppDefinition[]; }
 export interface StaticAssert			{ type: 'static_assert'; condition: Expr; message: string; }
@@ -221,11 +222,11 @@ export interface GenericType			{ type: 'generic'; name: string; args: TemplateAr
 export interface QualifiedType			{ type: 'qualified_type'; parts: string[]; dependent?: boolean; }
 export interface DecltypeSpecifier		{ type: 'decltype'; expression?: Expr; auto?: boolean; }
 
-export interface OutOfClassMethod		{ type: 'method_def'; specifiers?: DeclarationSpecifiers; scope: string[]; name: string; parameters: ParamOrVariadic[]; tail: MethodTail; }
-export interface OutOfClassCtor		{ type: 'constructor_def'; scope: string[]; name: string; parameters: ParamOrVariadic[]; tail: CtorTail; }
-export interface OutOfClassDtor		{ type: 'destructor_def'; scope: string[]; name: string; tail: MethodTail; }
+export interface OutOfClassMethod		{ type: 'method_def'; specifiers?: DeclarationSpecifiers; pointer?: Pointer; scope: string[]; name: string; parameters: ParamOrVariadic[]; tail: MethodTail; }
+export interface OutOfClassCtor			{ type: 'constructor_def'; scope: string[]; name: string; parameters: ParamOrVariadic[]; tail: CtorTail; }
+export interface OutOfClassDtor			{ type: 'destructor_def'; scope: string[]; name: string; tail: MethodTail; }
 export interface OperatorDef			{ type: 'operator_def'; specifiers: DeclarationSpecifiers; scope?: string[]; operator: string; parameters: ParamOrVariadic[]; tail: MethodTail; }
-export interface StaticMemberDef		{ type: 'static_member_def'; specifiers: DeclarationSpecifiers; scope: string[]; name: string; initializer?: Expr; }
+export interface StaticMemberDef		{ type: 'static_member_def'; specifiers: DeclarationSpecifiers; pointer?: Pointer; scope: string[]; name: string; initializer?: Expr; ctorArgs?: Expr[]; }
 
 export type CppStatement =
 	| { type: 'throw'; argument?: Expr }
@@ -238,7 +239,7 @@ export type CppStatement =
 
 export type CppDefinition = Definition | NamespaceDecl | LinkageSpec | UsingDirective | UsingDeclMember | UsingAlias | TemplateDecl | StaticAssert
 	| OutOfClassMethod | OutOfClassCtor | OutOfClassDtor | OperatorDef | StaticMemberDef;
-export interface CppProgram { type: 'translation_unit'; definitions: CppDefinition[]; }
+export interface Program { type: 'translation_unit'; definitions: CppDefinition[]; }
 
 // ===================================================================
 //  The TYPE_SCOPE lexer hack
@@ -254,6 +255,12 @@ export interface CppProgram { type: 'translation_unit'; definitions: CppDefiniti
 // here can't change plain cParser's behavior -- its parse contexts never carry that field.
 export const TYPE_SCOPE = terminal('TYPE_SCOPE');
 
+// An identifier that opens an explicit-template-argument call (`get_leb128<uint32>(file)`,
+// `file.get<uint32>()`). Decided lexically -- `<` after a callable name is otherwise a comparison, and
+// the engine's GLR forks share ctx, so a templateDepth-mutating fork can't arbitrate this one.
+export const TEMPLATE_FN = terminal('TEMPLATE_FN');
+const TEMPLATE_CALL_RE = /^\s*<[^;{}<>]*>\s*\(/;
+
 // Destructures `match`/`remaining` out of the lex-context param in the body rather than the parameter list
 // itself (`({ match, remaining }, ctx) => ...`) -- a destructured *first* arrow parameter followed by a typed
 // second one is a known tison grammar gap: `object_pattern`'s typed-parameter rule is unreachable from an
@@ -261,14 +268,38 @@ export const TYPE_SCOPE = terminal('TYPE_SCOPE');
 // transition" the table never records as a conflict, so it can't be fixed with a precedence/fork tag).
 IDENT.callback = (lex, ctx: Ctx & Partial<CppCtx>) => {
 	const { match, remaining } = lex;
-	return ctx.typedefNames.has(match)
-		? (ctx.templateDepth !== undefined && /^\s*::/.test(remaining) ? TYPE_SCOPE : TYPE_NAME)
-		: IDENT;
+	// `name::` is a scope whether or not `name` was registered -- in C++ nothing else can precede `::`,
+	// and real code qualifies with names declared only in (unresolved) headers all the time.
+	if (ctx.templateDepth !== undefined && /^\s*::(?!:)/.test(remaining))
+		return TYPE_SCOPE;
+	if (!ctx.typedefNames.has(match))
+		return ctx.templateDepth !== undefined && TEMPLATE_CALL_RE.test(remaining) ? TEMPLATE_FN : IDENT;
+	// A member name after `.`/`->` is never a type, whatever it collides with (`fSymb->type`), but it
+	// may still be an explicit-template-arg call (`file.get<uint32>()`) -- `<...>(`` decides.
+	if (ctx.templateDepth !== undefined && (lex.prev?.type.name === '.' || lex.prev?.type.name === '->'))
+		return TEMPLATE_CALL_RE.test(remaining) ? TEMPLATE_FN : IDENT;
+	// After a completed type or declarator lead-in (`* & && >`), a registered name followed by `, ; )` is
+	// a declarator name or plain variable either way -- never another specifier (`int token, x;`).
+	const prevName = lex.prev?.type.name;
+	if (ctx.templateDepth !== undefined
+			&& prevName !== undefined
+			&& (prevName === 'TYPE_NAME' || ['*', '&', '&&', '>'].includes(prevName) || (BUILTIN_TYPE as readonly string[]).includes(prevName))
+			&& /^\s*[,;)]/.test(remaining))
+		return IDENT;
+	// Shadowing demotion: C++ lets a variable share a class's name (`class file` + `char *file`), so a
+	// registered name followed by something no *type* can precede (member access, assignment, comparison,
+	// arithmetic, subscript outside `new T[n]`) is really a variable here. `< > >> * & ( ) , ;` all stay:
+	// they're template/pointer/ref/cast syntax after a genuine type.
+	if (ctx.templateDepth !== undefined && (
+			/^\s*(?:\.(?!\.)|->|\+\+|--|<<=?|>>=|!=|<=|>=|==|[-+*/%&|^]=|=(?!=)|[-+/%^?](?!=)|\|\|?(?!=)|:(?!:))/.test(remaining)
+			|| (/^\s*\[/.test(remaining) && lex.prev?.type.name !== 'new')))
+		return IDENT;
+	return TYPE_NAME;
 };
 
 // `A::B::` -- one or more TYPE_SCOPE'd names, each consuming its own `::`. The building block of every
 // qualified construct (types, expressions, out-of-class definitions, using-declarations).
-const scope_prefix = RRules<string[]>(self => [
+const scope_prefix = Rules<string[]>(self => [
 	Rule([TYPE_SCOPE, '::'] as const,			$ => [$[0]]),
 	Rule([self, TYPE_SCOPE, '::'] as const,	$ => [...$[0], $[1]]),
 ]);
@@ -290,16 +321,6 @@ const type_ident = Rules<string>(
 // compete with the (separately handled, see below) qualified-name expressions.
 const using_path = List(type_ident, '::');
 
-// Removes rules from a shared c-parser.ts Rules array. Safe because c-parser's own tables were already
-// built (eagerly, at its module top level) by the time this module runs -- mutation here only affects
-// the grammar this file builds.
-function removeRules(rules: unknown[], pred: (rhs: unknown[]) => boolean) {
-	for (let i = rules.length - 1; i >= 0; i--) {
-		const rhs = (rules[i] as { rhs?: unknown[] }).rhs;
-		if (rhs && pred(rhs))
-			rules.splice(i, 1);
-	}
-}
 
 // ===================================================================
 //  C++14 literals
@@ -329,39 +350,98 @@ const PREFIXED_CHAR		= /(?:u8|[uUL])'(?:[^'\\]|\\.)*'/;
 
 const primaryExpressionCast = primary_expression as unknown as Rules<Expr | CppExpr>;
 primaryExpressionCast.push(
-	Rule([HEX_LITERAL] as const,		$ => ({ type: 'literal', value: parseInt(stripSep($[0]).slice(2), 16) } as unknown as Expr)),
-	Rule([BIN_LITERAL] as const,		$ => ({ type: 'literal', value: parseInt(stripSep($[0]).slice(2), 2) } as unknown as Expr)),
-	Rule([SEP_INT_LITERAL] as const,	$ => ({ type: 'literal', value: parseInt(stripSep($[0]), 10) } as unknown as Expr)),
-	Rule([LL_INT_LITERAL] as const,		$ => ({ type: 'literal', value: parseInt(stripSep($[0]), 10) } as unknown as Expr)),
-	Rule([EXP_FLOAT_LITERAL] as const,	$ => ({ type: 'literal', value: parseFloat(stripSep($[0])) } as unknown as Expr)),
-	Rule([DOT_FLOAT_LITERAL] as const,	$ => ({ type: 'literal', value: parseFloat($[0]) } as unknown as Expr)),
-	Rule([PREFIXED_STRING] as const,	$ => ({ type: 'string_literal', value: $[0] } as unknown as Expr)),
-	Rule([RAW_STRING] as const,			$ => ({ type: 'string_literal', value: $[0] } as unknown as Expr)),
-	Rule([PREFIXED_CHAR] as const,		$ => ({ type: 'char_literal', value: $[0] } as unknown as Expr)),
+	Rule([HEX_LITERAL] as const,		$ => ({ type: 'literal', value: parseInt(stripSep($[0]).slice(2), 16) })),
+	Rule([BIN_LITERAL] as const,		$ => ({ type: 'literal', value: parseInt(stripSep($[0]).slice(2), 2) })),
+	Rule([SEP_INT_LITERAL] as const,	$ => ({ type: 'literal', value: parseInt(stripSep($[0]), 10) })),
+	Rule([LL_INT_LITERAL] as const,		$ => ({ type: 'literal', value: parseInt(stripSep($[0]), 10) })),
+	Rule([EXP_FLOAT_LITERAL] as const,	$ => ({ type: 'literal', value: parseFloat(stripSep($[0])) })),
+	Rule([DOT_FLOAT_LITERAL] as const,	$ => ({ type: 'literal', value: parseFloat($[0]) })),
+	Rule([PREFIXED_STRING] as const,	$ => ({ type: 'literal', value: $[0] })),
+	Rule([RAW_STRING] as const,			$ => ({ type: 'literal', value: $[0] })),
+	Rule([PREFIXED_CHAR] as const,		$ => ({ type: 'char_literal', value: $[0] })),
 );
 
 // ===================================================================
 //  Gaps in the C grammar that C++ code trips over constantly
 // ===================================================================
 
+// Shadowing tolerance, grammar side (see the lexer demotion above for the token side): where the next
+// token can't disambiguate (`f(a, size)`, `char *str;`), let a registered name still be an expression
+// operand or a declarator name. Declarations keep winning where both readings stay viable (rule order).
+primaryExpressionCast.push(
+	// ForceFork: in condition/argument positions a lone registered name is one-token-ambiguous with a
+	// declaration's specifier list (`if (errors)` vs `if (int x = ...`), same as js-parser's primary ident.
+	ForceFork(Rule([TYPE_NAME] as const,	$ => ({ type: 'identifier', name: $[0] } as const))),
+);
+(direct_declarator as unknown as Rules<Declarator>).push(
+	// ForceFork: in `int token, x;` (with `token` also registered) this reduce ties with
+	// `type_specifier -> TYPE_NAME` and earlier-rule-wins picks the specifier, dying at the ','.
+	ForceFork(Rule([TYPE_NAME] as const,	$ => ({ type: 'identifier', name: $[0] } as const))),
+);
+
 // C's specifier_qualifier_list can only *trail* with qualifiers (`int const`); C++ style leads with them
 // (`const char*`, `catch (const int& e)`, `const auto&`). A right-recursive leading alternative fixes
 // every one of those at once.
-(specifier_qualifier_list as unknown as Rules<unknown[]>).push(
+specifier_qualifier_list.push(
 	Rule([type_qualifier, specifier_qualifier_list] as const,	$ => [$[0], ...$[1]]),
 );
 
-// Zero-argument calls (`g()`) -- C's postfix_expression only had the argument_expression_list form, and
-// that list (like every List here) is non-empty.
-(postfix_expression as unknown as Rules<Expr | CppExpr>).push(
-	Rule([postfix_expression, '(', ')'] as const,	$ => ({ type: 'function_call', function: $[0] as Expr, arguments: [] } as const)),
+// Unknown-type parameters (`f(CgStruct *Cg)`) -- a parameter list holds only declarations, so
+// `IDENT * IDENT` / `IDENT & IDENT` / `IDENT IDENT` can't be expressions there. Bare `IDENT` alone
+// stays an expression (the `int x(a);` most-vexing-parse keeps its existing resolution).
+(parameter_declaration as unknown as Rules<ParamOrVariadic>).push(
+	Rule([IDENT, pointer, IDENT] as const,
+		$ => ({ type: 'parameter', specifiers: [{ type: 'type', name: $[0] }], declarator: { type: 'pointer', pointer: $[1], to: { type: 'identifier', name: $[2] } } } as const)),
+	Rule([IDENT, pointer] as const,
+		$ => ({ type: 'parameter', specifiers: [{ type: 'type', name: $[0] }], declarator: { type: 'pointer', pointer: $[1], to: { type: 'identifier', name: '' } } } as const)),
+	Rule([IDENT, '&', IDENT] as const,
+		$ => ({ type: 'parameter', specifiers: [{ type: 'type', name: $[0] }], declarator: { type: 'reference', to: { type: 'identifier', name: $[2] } } as unknown as Declarator } as const)),
+	Rule([IDENT, IDENT] as const,
+		$ => ({ type: 'parameter', specifiers: [{ type: 'type', name: $[0] }], declarator: { type: 'identifier', name: $[1] } } as const)),
 );
+
+// Unknown-type members and globals (`FILE *fd;` with FILE undeclared): at member/external scope
+// `IDENT * IDENT ;` can't be an expression, so a narrow shape is safe. Statement scope is deliberately
+// excluded -- there `A * b;` really is ambiguous with multiplication and needs the typedef table.
+const unknown_type_field = Rules<unknown>(
+	Rule([IDENT, pointer, IDENT, ';'] as const,
+		$ => ({ type: 'struct_member', typeSpecifiers: [{ type: 'type', name: $[0] }], declarators: [{ declarator: { type: 'pointer', pointer: $[1], to: { type: 'identifier', name: $[2] } } }] })),
+	Rule([IDENT, pointer, TYPE_NAME, ';'] as const,
+		$ => ({ type: 'struct_member', typeSpecifiers: [{ type: 'type', name: $[0] }], declarators: [{ declarator: { type: 'pointer', pointer: $[1], to: { type: 'identifier', name: $[2] } } }] })),
+);
+(struct_declaration as unknown as Rules<unknown>).push(
+	Rule([unknown_type_field] as const, $ => $[0]),
+);
+
+// Casts through unknown pointer types (`(MemoryPoolCleanup*)fn`, `(uint32le*)p`): `( IDENT * )` can't
+// be a grouped expression (the `*` would need a right operand before `)`), so the cast reading is safe.
+(assignment_expression as unknown as Rules<Expr | CppExpr>).push(
+	WithPrec(Rule(['(', IDENT, pointer, ')', assignment_expression] as const,
+		$ => ({ type: 'cast', type1: { specifiers: [{ type: 'type', name: $[1] }], declarator: { type: 'pointer', pointer: $[2] } } as unknown as TypeName, expression: $[4] } as const)), PREC.cast),
+);
+
+// Constructor-style local/global initialization (`int x(5);`, `C_type t(C_type::UNKNOWN);`). An
+// unregistered lone identifier inside the parens reads as an argument, not a parameter, so `int x(a);`
+// resolves as this rather than as a function declarator -- matching what such code nearly always means.
+// Spelled at direct_declarator level, NOT `[declarator, '(' ...]`: the latter needs a declarator reduce
+// that the function-declarator's own `(` shift silently beats; at this level both `(` items coexist and
+// the parens' *contents* (params vs args) pick the reading.
+(init_declarator as unknown as Rules<unknown>).push(
+	Rule([direct_declarator, '(', argument_expression_list, ')'] as const,			$ => ({ declarator: $[0], ctorArgs: $[2] })),
+	Rule([pointer, direct_declarator, '(', argument_expression_list, ')'] as const,	$ => ({ declarator: { type: 'pointer', pointer: $[0], to: $[1] }, ctorArgs: $[3] })),
+);
+
+// Zero-argument calls (`g()`) -- C's postfix_expression only had the argument_expression_list form, and that list (like every List here) is non-empty.
+(postfix_expression as unknown as Rules<Expr | CppExpr>).push(
+	Rule([postfix_expression, '(', ')'] as const,	$ => ({ type: 'function_call', function: $[0], arguments: [] } as const)),
+);
+
 
 // `for (;;)` and friends: C's for-clause rules all demand a leading expression or declaration, so every
 // empty-slot combination (`;;`, `;cond;`, `init;;step`, ...) needs its own shape. A `declaration` clause
 // consumes its own first `;`, hence the shorter decl-led shapes.
-(for_statement as unknown as Rules<unknown>).push(
-	Rule([';', ';'] as const,											() => ({ init: undefined })),
+for_statement.push(
+	Rule([';', ';'] as const,											_ => ({ init: undefined })),
 	Rule([';', ';', expression] as const,								$ => ({ init: undefined, update: $[2] })),
 	Rule([';', expression, ';'] as const,								$ => ({ init: undefined, condition: $[1] })),
 	Rule([';', expression, ';', expression] as const,					$ => ({ init: undefined, condition: $[1], update: $[3] })),
@@ -375,7 +455,7 @@ primaryExpressionCast.push(
 
 // cv-qualified pointer levels (`const char* const* p`). The qualifier is accepted and discarded --
 // C's Pointer AST shape has nowhere to hang it, and widening that is a c-parser.ts change.
-(pointer as unknown as Rules<Pointer>).push(
+pointer.push(
 	Rule(['*', type_qualifier] as const,			() => [{ level: 1 }]),
 	Rule(['*', type_qualifier, pointer] as const,	$ => [{ level: $[2].length + 1 }, ...$[2]]),
 );
@@ -383,8 +463,8 @@ primaryExpressionCast.push(
 // Functional casts (`T(3.14)`, `T()`) -- the ctor-call-shaped counterpart of C's `(T)x`. Only for
 // registered names: TYPE_NAME in expression position is otherwise inert, so this steals nothing.
 primaryExpressionCast.push(
-	Rule([TYPE_NAME, '(', argument_expression_list, ')'] as const,	$ => ({ type: 'functional_cast', target: $[0], arguments: $[2] } as unknown as CppExpr)),
-	Rule([TYPE_NAME, '(', ')'] as const,							$ => ({ type: 'functional_cast', target: $[0], arguments: [] } as unknown as CppExpr)),
+	Rule([TYPE_NAME, '(', argument_expression_list, ')'] as const,	$ => ({ type: 'functional_cast', target: $[0], arguments: $[2] })),
+	Rule([TYPE_NAME, '(', ')'] as const,							$ => ({ type: 'functional_cast', target: $[0], arguments: [] })),
 );
 
 // ===================================================================
@@ -397,7 +477,7 @@ primaryExpressionCast.push(
 // bolted-on `auto x = ...` rules existed to dodge). With `auto` an ordinary type_specifier, deduced
 // variables, `auto&`/`auto*` declarators, generic lambda parameters, and `auto f() {...}` return-type
 // deduction all fall out of the existing C declaration machinery for free.
-removeRules(storage_class_specifier as unknown[], rhs => rhs.length === 1 && rhs[0] === 'auto');
+removeRules(storage_class_specifier, rhs => rhs.length === 1 && rhs[0] === 'auto');
 
 const CPP_SIMPLE_TYPE = termOneOf(['auto', 'bool', 'wchar_t', 'char16_t', 'char32_t'] as const);
 
@@ -418,9 +498,9 @@ typeSpecifierCast.push(
 
 // C's declaration_specifiers allows at most one storage-class-like specifier; C++ regularly stacks two
 // (`static constexpr int x`). Two is enough in practice -- three-deep stacks are vanishingly rare.
-(declaration_specifiers as unknown as Rules<DeclarationSpecifiers>).push(
+declaration_specifiers.push(
 	Rule([storage_class_specifier, storage_class_specifier, specifier_qualifier_list] as const,
-		($, ctx: Ctx) => { ctx.pendingTypedef = $[0] === 'typedef' || $[1] === 'typedef'; return [$[0], $[1], ...$[2]] as DeclarationSpecifiers; }),
+		($, ctx: Ctx) => { ctx.pendingTypedef = $[0] === 'typedef' || $[1] === 'typedef'; return [$[0], $[1], ...$[2]]; }),
 );
 
 // ===================================================================
@@ -449,14 +529,14 @@ declaratorCast.push(
 //  Parameters: defaults, abstract (unnamed), variadic packs
 // ===================================================================
 
-const parameterDeclarationCast = parameter_declaration as unknown as Rules<ParamOrVariadic>;
+const parameterDeclarationCast = parameter_declaration;
 parameterDeclarationCast.push(
-	Rule([declaration_specifiers, declarator, '=', assignment_expression] as const,	$ => ({ type: 'parameter', specifiers: $[0], declarator: $[1] as Declarator, default: $[3] } as const)),
+	Rule([declaration_specifiers, declarator, '=', assignment_expression] as const,	$ => ({ type: 'parameter', specifiers: $[0], declarator: $[1], default: $[3] } as const)),
 	Rule([declaration_specifiers, '=', assignment_expression] as const,				$ => ({ type: 'parameter', specifiers: $[0], default: $[2] } as const)),
 
 	// Unnamed-but-shaped parameters (`void f(int*)`, `void f(const Foo&)`) -- missing even from the C
 	// grammar, which only had fully-named or bare-specifier parameters.
-	Rule([declaration_specifiers, abstract_declarator] as const,					$ => ({ type: 'parameter', specifiers: $[0], declarator: $[1] as unknown as Declarator } as const)),
+	Rule([declaration_specifiers, abstract_declarator] as const,					$ => ({ type: 'parameter', specifiers: $[0], declarator: $[1] } as const)),
 
 	// Variadic function parameter packs -- the declaration-side half of variadic templates, now including
 	// forwarding references (`Args&&... args`).
@@ -493,6 +573,9 @@ primaryExpressionCast.push(
 	// this from ever colliding with the qualified-*type* rules over the same tokens: the third token's
 	// own kind (IDENT here, TYPE_NAME there) is the whole decision.
 	Rule([scope_prefix, IDENT] as const,					$ => ({ type: 'qualified', parts: [...$[0], $[1]] } as const)),
+	// ...except when the member name itself shadows a registered type (`Scope::list` as an argument).
+	// That's a genuine reduce-reduce tie with the qualified-type rules, so let GLR try both.
+	ForceFork(Rule([scope_prefix, TYPE_NAME] as const,		$ => ({ type: 'qualified', parts: [...$[0], $[1]] } as const))),
 );
 
 // ===================================================================
@@ -515,7 +598,7 @@ const capture_list_opt = Rules<LambdaCapture[]>(
 );
 const lambda_params_opt = Rules<ParamOrVariadic[]>(
 	Rule([] as const,						() => []),
-	Rule([parameter_type_list] as const,	$ => $[0] as ParamOrVariadic[]),
+	Rule([parameter_type_list] as const,	$ => $[0]),
 );
 
 // Pushed onto primary_expression (not a dedicated nonterminal kept separate) -- '[' is otherwise never a
@@ -525,16 +608,11 @@ const lambda_params_opt = Rules<ParamOrVariadic[]>(
 // C++14 generic lambdas need no rules of their own: `auto` is now an ordinary type_specifier, so
 // `[](auto x) {...}` comes through parameter_type_list like any other parameter.
 primaryExpressionCast.push(
-	Rule(['[', capture_list_opt, ']', compound_statement] as const,
-		$ => ({ type: 'lambda', captures: $[1], params: [], body: $[3] as Block } as const)),
-	Rule(['[', capture_list_opt, ']', '(', lambda_params_opt, ')', compound_statement] as const,
-		$ => ({ type: 'lambda', captures: $[1], params: $[4], body: $[6] as Block } as const)),
-	Rule(['[', capture_list_opt, ']', '(', lambda_params_opt, ')', 'mutable', compound_statement] as const,
-		$ => ({ type: 'lambda', captures: $[1], params: $[4], mutable: true, body: $[7] as Block } as const)),
-	Rule(['[', capture_list_opt, ']', '(', lambda_params_opt, ')', '->', type_name, compound_statement] as const,
-		$ => ({ type: 'lambda', captures: $[1], params: $[4], returnType: $[7] as TypeName, body: $[8] as Block } as const)),
-	Rule(['[', capture_list_opt, ']', '(', lambda_params_opt, ')', 'mutable', '->', type_name, compound_statement] as const,
-		$ => ({ type: 'lambda', captures: $[1], params: $[4], mutable: true, returnType: $[8] as TypeName, body: $[9] as Block } as const)),
+	Rule(['[', capture_list_opt, ']', compound_statement] as const,																$ => ({ type: 'lambda', captures: $[1], params: [], body: $[3] } as const)),
+	Rule(['[', capture_list_opt, ']', '(', lambda_params_opt, ')', compound_statement] as const,								$ => ({ type: 'lambda', captures: $[1], params: $[4], body: $[6] } as const)),
+	Rule(['[', capture_list_opt, ']', '(', lambda_params_opt, ')', 'mutable', compound_statement] as const,						$ => ({ type: 'lambda', captures: $[1], params: $[4], mutable: true, body: $[7] } as const)),
+	Rule(['[', capture_list_opt, ']', '(', lambda_params_opt, ')', '->', type_name, compound_statement] as const,				$ => ({ type: 'lambda', captures: $[1], params: $[4], returnType: $[7], body: $[8] } as const)),
+	Rule(['[', capture_list_opt, ']', '(', lambda_params_opt, ')', 'mutable', '->', type_name, compound_statement] as const,	$ => ({ type: 'lambda', captures: $[1], params: $[4], mutable: true, returnType: $[8], body: $[9] } as const)),
 );
 
 // ===================================================================
@@ -548,6 +626,13 @@ assignmentExpressionCast.push(
 	WithPrec(Rule(['new', type_specifier, '(', argument_expression_list, ')'] as const,	$ => ({ type: 'new', typeName: $[1], arguments: $[3] } as const)), 'unary'),
 	WithPrec(Rule(['new', type_specifier, '{', argument_expression_list, '}'] as const,	$ => ({ type: 'new', typeName: $[1], arguments: $[3], braced: true } as const)), 'unary'),
 	WithPrec(Rule(['new', type_specifier, '[', expression, ']'] as const,				$ => ({ type: 'new', typeName: $[1], size: $[3] } as const)), 'unary'),
+	// Placement new (`new(pool) T(args)`) -- the `(` right after `new` can't start a type_specifier, so
+	// these never compete with the ordinary forms.
+	WithPrec(Rule(['new', '(', argument_expression_list, ')', type_specifier] as const,	$ => ({ type: 'new', placement: $[2], typeName: $[4] } as const)), 'unary'),
+	WithPrec(Rule(['new', '(', argument_expression_list, ')', type_specifier, '(', ')'] as const,
+		$ => ({ type: 'new', placement: $[2], typeName: $[4], arguments: [] } as const)), 'unary'),
+	WithPrec(Rule(['new', '(', argument_expression_list, ')', type_specifier, '(', argument_expression_list, ')'] as const,
+		$ => ({ type: 'new', placement: $[2], typeName: $[4], arguments: $[6] } as const)), 'unary'),
 	WithPrec(Rule(['delete', assignment_expression] as const,							$ => ({ type: 'delete', operand: $[1] } as const)), 'unary'),
 	WithPrec(Rule(['delete', '[', ']', assignment_expression] as const,					$ => ({ type: 'delete', operand: $[3], array: true } as const)), 'unary'),
 
@@ -574,7 +659,7 @@ const cast_open = Rules<string>(
 		($, ctx: CppCtx) => { ctx.templateDepth++; return $[0]; }),
 );
 const cast_close = Rules<{ kind: string; target: TypeName }>(
-	Rule([cast_open, type_name, '>'] as const,	($, ctx: CppCtx) => { ctx.templateDepth--; return { kind: $[0], target: $[1] as TypeName }; }),
+	Rule([cast_open, type_name, '>'] as const,	($, ctx: CppCtx) => { ctx.templateDepth--; return { kind: $[0], target: $[1] }; }),
 );
 
 primaryExpressionCast.push(
@@ -582,10 +667,10 @@ primaryExpressionCast.push(
 	// Same TYPE_NAME-vs-expression split sizeof already relies on: a bare registered type can only be the
 	// type_name alternative, anything expression-shaped only the expression one.
 	Rule(['typeid', '(', expression, ')'] as const,	$ => ({ type: 'typeid', expression: $[2] } as const)),
-	Rule(['typeid', '(', type_name, ')'] as const,	$ => ({ type: 'typeid', target: $[2] as TypeName } as const)),
+	Rule(['typeid', '(', type_name, ')'] as const,	$ => ({ type: 'typeid', target: $[2] } as const)),
 );
 assignmentExpressionCast.push(
-	WithPrec(Rule(['alignof', '(', type_name, ')'] as const,	$ => ({ type: 'alignof', target: $[2] as TypeName } as const)), 'unary'),
+	WithPrec(Rule(['alignof', '(', type_name, ')'] as const,	$ => ({ type: 'alignof', target: $[2] } as const)), 'unary'),
 );
 
 const static_assert_decl = Rules<StaticAssert>(
@@ -621,27 +706,56 @@ const scoped_generic_open = Rules<string>(
 	Rule([scope_prefix, TYPE_NAME, '<'] as const,			($, ctx: CppCtx) => { ctx.templateDepth++; return [...$[0], $[1]].join('::'); }),
 	Rule([scope_prefix, IDENT, '<'] as const,				($, ctx: CppCtx) => { ctx.templateDepth++; return [...$[0], $[1]].join('::'); }),
 );
+// IDENT-rooted variant for base clauses ONLY -- in expression-reachable positions `IDENT <` must stay a
+// comparison, so this must never be spliced anywhere general.
+const base_generic_open = Rules<string>(
+	Rule([IDENT, '<'] as const,								($, ctx: CppCtx) => { ctx.templateDepth++; return $[0]; }),
+);
+
+// Explicit-template-argument calls, free and member (`get_leb128<uint32>(file)`, `file.get<uint32>()`).
+// TEMPLATE_FN comes from the lexer (see above), so `a < b` comparisons never reach these rules; the
+// open-nonterminals bump templateDepth before the arguments are lexed, keeping `>>` splitting correct.
+const template_fn_open = Rules<string>(
+	Rule([TEMPLATE_FN, '<'] as const,			($, ctx: CppCtx) => { ctx.templateDepth++; return $[0]; }),
+);
+const member_template_fn_open = Rules<{ object: unknown; member: string; arrow?: boolean }>(
+	Rule([postfix_expression, '.', TEMPLATE_FN, '<'] as const,	($, ctx: CppCtx) => { ctx.templateDepth++; return { object: $[0], member: $[2] }; }),
+	Rule([postfix_expression, '->', TEMPLATE_FN, '<'] as const,	($, ctx: CppCtx) => { ctx.templateDepth++; return { object: $[0], member: $[2], arrow: true }; }),
+);
 
 // Non-type template arguments (`array<int, 5>`). Deliberately *not* full constant_expression: allowing
 // relationals here would put `>` shifts in competition with the argument-list-closing `>` reduce.
 // A literal/name/sizeof covers real usage, and the parenthesized escape hatch admits any expression --
 // the same trade the standard itself makes (unparenthesized `>` is ill-formed in a template argument).
 const const_arg = Rules<Expr>(
-	Rule([INT_LITERAL] as const,				$ => ({ type: 'literal', value: parseInt($[0], 10) } as unknown as Expr)),
+	Rule([INT_LITERAL] as const,				$ => ({ type: 'literal', value: parseInt($[0], 10) })),
 	Rule([IDENT] as const,						$ => ({ type: 'identifier', name: $[0] } as const)),
 	Rule(['true'] as const,						() => ({ type: 'bool_literal', value: true } as unknown as Expr)),
 	Rule(['false'] as const,					() => ({ type: 'bool_literal', value: false } as unknown as Expr)),
-	Rule(['-', INT_LITERAL] as const,			$ => ({ type: 'literal', value: -parseInt($[1], 10) } as unknown as Expr)),
-	Rule(['sizeof', '(', type_name, ')'] as const,	$ => ({ type: 'sizeof_type', operand: $[2] } as unknown as Expr)),
+	Rule(['-', INT_LITERAL] as const,			$ => ({ type: 'literal', value: -parseInt($[1], 10) })),
+	Rule(['sizeof', '(', type_name, ')'] as const,	$ => ({ type: 'sizeof_type', operand: $[2] })),
 	Rule(['(', expression, ')'] as const,		$ => $[1]),
+	// Qualified names with an unregistered tail (`SEI::buffering_period` as a template argument).
+	Rule([scope_prefix, IDENT] as const,		$ => ({ type: 'qualified', parts: [...$[0], $[1]] } as unknown as Expr)),
 );
 
 const template_argument = Rules<TemplateArg>(
-	Rule([type_name] as const,				$ => ({ value: $[0] as TypeName } as const)),
-	Rule([type_name, '...'] as const,		$ => ({ value: $[0] as TypeName, pack: true } as const)),
+	Rule([type_name] as const,				$ => ({ value: $[0] } as const)),
+	Rule([type_name, '...'] as const,		$ => ({ value: $[0], pack: true } as const)),
 	Rule([const_arg] as const,				$ => ({ value: $[0] } as const)),
 );
 const template_argument_list = List(template_argument, ',');
+
+(postfix_expression as unknown as Rules<Expr | CppExpr>).push(
+	Rule([template_fn_open, template_argument_list, '>', '(', ')'] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'template_ref', name: $[0], args: $[1] } as unknown as Expr, arguments: [] } as const; }),
+	Rule([template_fn_open, template_argument_list, '>', '(', argument_expression_list, ')'] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'template_ref', name: $[0], args: $[1] } as unknown as Expr, arguments: $[4] } as const; }),
+	Rule([member_template_fn_open, template_argument_list, '>', '(', ')'] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'member_template_ref', ...$[0], args: $[1] } as unknown as Expr, arguments: [] } as const; }),
+	Rule([member_template_fn_open, template_argument_list, '>', '(', argument_expression_list, ')'] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'member_template_ref', ...$[0], args: $[1] } as unknown as Expr, arguments: $[4] } as const; }),
+);
 
 // `TYPE_NAME '<'` (shift) vs the plain `[TYPE_NAME]` alt already on `type_specifier` (reduce) is an
 // ordinary shift/reduce choice on the very next token, resolved to shift -- the same safe shape used
@@ -658,9 +772,9 @@ typeSpecifierCast.push(
 // scoped generics (`std::vector<int>`), as specifier_qualifier_list *starters* -- see the
 // scoped_generic_open comment for why they must not be type_specifier alternatives.
 (specifier_qualifier_list as unknown as Rules<unknown[]>).push(
-	Rule([scope_prefix, TYPE_NAME] as const,	$ => [{ type: 'qualified_type', parts: [...$[0], $[1]] } as QualifiedType]),
+	Rule([scope_prefix, TYPE_NAME] as const,	$ => [{ type: 'qualified_type', parts: [...$[0], $[1]] }]),
 	Rule([scoped_generic_open, template_argument_list, '>'] as const,
-		($, ctx: CppCtx) => { ctx.templateDepth--; return [{ type: 'generic', name: $[0], args: $[1] } as GenericType]; }),
+		($, ctx: CppCtx) => { ctx.templateDepth--; return [{ type: 'generic', name: $[0], args: $[1] }]; }),
 );
 
 // ===================================================================
@@ -688,12 +802,21 @@ const struct_head = Rules<{ kind: 'struct' | 'union'; name: string }>(
 	Rule(['struct', TYPE_NAME] as const,	$ => ({ kind: 'struct', name: $[1] } as const)),
 	Rule(['union', IDENT] as const,			($, ctx: Ctx) => { ctx.typedefNames.add($[1]); return { kind: 'union', name: $[1] } as const; }),
 	Rule(['union', TYPE_NAME] as const,		$ => ({ kind: 'union', name: $[1] } as const)),
+	// Specialization heads (`template<> struct ISO_def<int> : ... {}`) -- mirrors class_head's variant,
+	// plus an IDENT-rooted form for primary templates known only from unresolved headers.
+	Rule(['struct', generic_type_open, template_argument_list, '>'] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { kind: 'struct', name: $[1] } as const; }),
+	Rule(['struct', base_generic_open, template_argument_list, '>'] as const,
+		($, ctx: CppCtx & Ctx) => { ctx.templateDepth--; ctx.typedefNames.add($[1]); return { kind: 'struct', name: $[1] } as const; }),
+	// Scoped specializations (`template<> struct SEI::T<SEI::buffering_period> {...}`).
+	Rule(['struct', scoped_generic_open, template_argument_list, '>'] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { kind: 'struct', name: $[1] } as const; }),
 );
 
 // C's own named struct/union rules (both the monolithic `'struct' IDENT '{' ... '}'` definitions and the
 // tag-only references) are *replaced* by head-based ones: the monolithic shape shifts '{' before any
 // reduction can run, which is exactly too late to register the name for uses inside the body.
-removeRules(struct_or_union_specifier as unknown[], rhs => (rhs[0] === 'struct' || rhs[0] === 'union') && rhs[1] === IDENT);
+removeRules(struct_or_union_specifier, rhs => (rhs[0] === 'struct' || rhs[0] === 'union') && rhs[1] === IDENT);
 
 const base_specifier = Rules<BaseSpecifier>(
 	Rule([type_ident] as const,															$ => ({ name: $[0] } as const)),
@@ -704,6 +827,17 @@ const base_specifier = Rules<BaseSpecifier>(
 	Rule([generic_type_open, template_argument_list, '>'] as const,						($, ctx: CppCtx) => { ctx.templateDepth--; return { name: $[0], args: $[1] } as const; }),
 	Rule([termOneOf(['public', 'private', 'protected'] as const), generic_type_open, template_argument_list, '>'] as const,
 		($, ctx: CppCtx) => { ctx.templateDepth--; return { access: $[0], name: $[1], args: $[2] } as const; }),
+	// Generic bases rooted at an *unregistered* name (`: buffered_accum<X, char, 512>`, declared only in
+	// an unresolved header). Safe: a base clause holds no expressions, so `IDENT <` can only open args.
+	Rule([base_generic_open, template_argument_list, '>'] as const,						($, ctx: CppCtx) => { ctx.templateDepth--; return { name: $[0], args: $[1] } as const; }),
+	Rule([termOneOf(['public', 'private', 'protected'] as const), base_generic_open, template_argument_list, '>'] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { access: $[0], name: $[1], args: $[2] } as const; }),
+	// Qualified bases (`: public Imf::IStream`).
+	Rule([scope_prefix, type_ident] as const,											$ => ({ name: [...$[0], $[1]].join('::') } as const)),
+	Rule([termOneOf(['public', 'private', 'protected'] as const), scope_prefix, type_ident] as const,
+		$ => ({ access: $[0], name: [...$[1], $[2]].join('::') } as const)),
+	Rule(['virtual', termOneOf(['public', 'private', 'protected'] as const), scope_prefix, type_ident] as const,
+		$ => ({ virtual: true, access: $[1], name: [...$[2], $[3]].join('::') } as const)),
 );
 const base_list = List(base_specifier, ',');
 const base_clause = Rules<BaseSpecifier[]>(
@@ -718,8 +852,8 @@ for (const fin of [false, true]) {
 	for (const based of [false, true]) {
 		const prefix = [...(fin ? ['final'] : []), ...(based ? [base_clause] : [])];
 		class_body_rules.push(
-			Rule([...prefix, '{', '}'] as any,				($: any[]) => ({ final: fin || undefined, bases: based ? $[fin ? 1 : 0] : undefined, members: [] } as ClassBody)),
-			Rule([...prefix, '{', struct_body, '}'] as any,	($: any[]) => ({ final: fin || undefined, bases: based ? $[fin ? 1 : 0] : undefined, members: $[prefix.length + 1] as ClassMember[] } as ClassBody)),
+			Rule([...prefix, '{', '}'] as any,				($: any[]) => ({ final: fin || undefined, bases: based ? $[fin ? 1 : 0] : undefined, members: [] })),
+			Rule([...prefix, '{', struct_body, '}'] as any,	($: any[]) => ({ final: fin || undefined, bases: based ? $[fin ? 1 : 0] : undefined, members: $[prefix.length + 1] })),
 		);
 	}
 }
@@ -731,7 +865,7 @@ structOrUnionSpecifierCast.push(
 	Rule([class_head] as const,					$ => ({ type: 'class', name: $[0] } as const)),
 	Rule([class_head, class_body] as const,		$ => ({ type: 'class', name: $[0], ...$[1] } as const)),
 	Rule(['class', '{', '}'] as const,			() => ({ type: 'class', members: [] } as const)),
-	Rule(['class', '{', struct_body, '}'] as const,	$ => ({ type: 'class', members: $[2] as ClassMember[] } as const)),
+	Rule(['class', '{', struct_body, '}'] as const,	$ => ({ type: 'class', members: $[2] } as const)),
 	// struct/union: same shapes, now with registration + C++ bodies (bases, members) via the shared tail.
 	Rule([struct_head] as const,				$ => ({ type: $[0].kind, name: $[0].name } as const)),
 	Rule([struct_head, class_body] as const,	$ => ({ type: $[0].kind, name: $[0].name, ...$[1] } as const)),
@@ -743,7 +877,7 @@ structOrUnionSpecifierCast.push(
 
 // Same replace-with-eager-head treatment as struct above -- `enum Color {RED}; Color c;` needs Color
 // registered before the token after `}` is lexed, which only head-time registration achieves.
-removeRules(enum_specifier as unknown[], rhs => rhs[0] === 'enum' && rhs[1] === IDENT);
+removeRules(enum_specifier, rhs => rhs[0] === 'enum' && rhs[1] === IDENT);
 
 const enum_head = Rules<{ name: string; scoped?: boolean }>(
 	Rule(['enum', IDENT] as const,			($, ctx: Ctx) => { ctx.typedefNames.add($[1]); return { name: $[1] } as const; }),
@@ -777,17 +911,17 @@ const enum_base = Rules<TypeSpecifier[]>(
 // than a genuine reduce-reduce tie between two completed one-token rules.
 const method_declarator = Rules<{ name: string; parameters: ParamOrVariadic[] }>(
 	Rule([IDENT, '(', ')'] as const,							$ => ({ name: $[0], parameters: [] } as const)),
-	Rule([IDENT, '(', parameter_type_list, ')'] as const,		$ => ({ name: $[0], parameters: $[2] as ParamOrVariadic[] } as const)),
+	Rule([IDENT, '(', parameter_type_list, ')'] as const,		$ => ({ name: $[0], parameters: $[2] } as const)),
+	// Shadowed method names (`size_t size() const`): after the specifiers a TYPE_NAME here can only be
+	// the method's name. Inline (not via a shared name nonterminal) -- see the type_ident lesson above.
+	Rule([TYPE_NAME, '(', ')'] as const,						$ => ({ name: $[0], parameters: [] } as const)),
+	Rule([TYPE_NAME, '(', parameter_type_list, ')'] as const,	$ => ({ name: $[0], parameters: $[2] } as const)),
 );
 const method_signature = Rules<CppDeclarator>(
-	Rule([method_declarator] as const,
-		$ => ({ type: 'function', name: { type: 'identifier', name: $[0].name }, parameters: $[0].parameters } as const)),
-	Rule([pointer, method_declarator] as const,
-		$ => ({ type: 'pointer', pointer: $[0], to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
-	Rule(['&', method_declarator] as const,
-		$ => ({ type: 'reference', to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
-	Rule(['&&', method_declarator] as const,
-		$ => ({ type: 'rvalue_reference', to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
+	Rule([method_declarator] as const,			$ => ({ type: 'function', name: { type: 'identifier', name: $[0].name }, parameters: $[0].parameters } as const)),
+	Rule([pointer, method_declarator] as const,	$ => ({ type: 'pointer', pointer: $[0], to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
+	Rule(['&', method_declarator] as const,		$ => ({ type: 'reference', to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
+	Rule(['&&', method_declarator] as const,	$ => ({ type: 'rvalue_reference', to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
 );
 
 // Everything that can legally follow a member function's `)`: cv/noexcept/virt-specifiers in standard
@@ -796,12 +930,12 @@ const method_signature = Rules<CppDeclarator>(
 // shift; the hazardous direction is competing *prefixes*), and 60 generated rules beat 60 hand-written ones.
 const method_tail_rules: Rules<MethodTail> = [];
 for (const isConst of [false, true]) {
-	for (const noex of [false, true]) {
+	for (const noex of [false, true, 'throw'] as const) {
 		for (const virt of [undefined, 'override', 'final'] as const) {
-			const prefix: unknown[] = [...(isConst ? ['const'] : []), ...(noex ? ['noexcept'] : []), ...(virt ? [virt] : [])];
-			const flags: MethodTail = { isConst: isConst || undefined, noexcept: noex || undefined, override: virt === 'override' || undefined, final: virt === 'final' || undefined };
+			const prefix: unknown[] = [...(isConst ? ['const'] : []), ...(noex === 'throw' ? ['throw', '(', ')'] : noex ? ['noexcept'] : []), ...(virt ? [virt] : [])];
+			const flags: MethodTail = { isConst: isConst || undefined, noexcept: !!noex || undefined, override: virt === 'override' || undefined, final: virt === 'final' || undefined };
 			method_tail_rules.push(
-				Rule([...prefix, compound_statement] as any,	($: any[]) => ({ ...flags, body: $[$.length - 1] as Block })),
+				Rule([...prefix, compound_statement] as any,	($: any[]) => ({ ...flags, body: $[$.length - 1] })),
 				Rule([...prefix, ';'] as any,					() => ({ ...flags, declarationOnly: true })),
 				Rule([...prefix, '=', INT_LITERAL, ';'] as any,	() => ({ ...flags, pure: true })),
 				Rule([...prefix, '=', 'default', ';'] as any,	() => ({ ...flags, defaulted: true })),
@@ -821,11 +955,15 @@ const member_initializer_list = List(member_initializer, ',');
 // How a constructor ends -- member-initializer list + body, plain body, or the `= default`/`= delete`/
 // declaration-only forms shared with methods.
 const ctor_tail = Rules<CtorTail>(
-	Rule([compound_statement] as const,									$ => ({ body: $[0] as Block } as const)),
-	Rule([':', member_initializer_list, compound_statement] as const,	$ => ({ initializerList: $[1], body: $[2] as Block } as const)),
+	Rule([compound_statement] as const,									$ => ({ body: $[0] } as const)),
+	Rule([':', member_initializer_list, compound_statement] as const,	$ => ({ initializerList: $[1], body: $[2] } as const)),
 	Rule([';'] as const,												() => ({ declarationOnly: true } as const)),
 	Rule(['=', 'default', ';'] as const,								() => ({ defaulted: true } as const)),
 	Rule(['=', 'delete', ';'] as const,									() => ({ deleted: true } as const)),
+	// Legacy dynamic-exception-spec (`X() throw() : a(0) {}`).
+	Rule(['throw', '(', ')', compound_statement] as const,				$ => ({ body: $[3] } as const)),
+	Rule(['throw', '(', ')', ':', member_initializer_list, compound_statement] as const, $ => ({ initializerList: $[4], body: $[5] } as const)),
+	Rule(['throw', '(', ')', ';'] as const,								() => ({ declarationOnly: true } as const)),
 );
 
 // Leading member modifiers (`static`, `virtual`, `explicit`, ... in any combination) as a real list --
@@ -844,7 +982,7 @@ const member_mod = Rules<MemberMod>(
 	Rule(['friend'] as const,		() => 'friend'),
 	Rule(['mutable'] as const,		() => 'mutable'),
 );
-const member_mods = List(member_mod) as unknown as Rules<MemberMod[]>;
+const member_mods = List(member_mod);
 
 // Operator overloading. The operator-symbol terminal only ever competes in the lexer *after* the
 // `operator` keyword (state-driven lexing), so it can't steal `+` etc. from expression states.
@@ -862,7 +1000,7 @@ const operator_id = Rules<string>(
 );
 const operator_declarator = Rules<{ name: string; parameters: ParamOrVariadic[] }>(
 	Rule([operator_id, '(', ')'] as const,							$ => ({ name: $[0], parameters: [] } as const)),
-	Rule([operator_id, '(', parameter_type_list, ')'] as const,		$ => ({ name: $[0], parameters: $[2] as ParamOrVariadic[] } as const)),
+	Rule([operator_id, '(', parameter_type_list, ')'] as const,		$ => ({ name: $[0], parameters: $[2] } as const)),
 );
 // Pointer/reference-returning operator functions (`V& operator+=(...)`) -- the same leading-decorator
 // shapes method_signature has.
@@ -881,7 +1019,7 @@ const using_alias_head = Rules<string>(
 	Rule(['using', TYPE_NAME, '='] as const,	$ => $[1]),
 );
 const using_alias = Rules<UsingAlias>(
-	Rule([using_alias_head, type_name, ';'] as const, $ => ({ type: 'using_alias', name: $[0], target: $[1] as TypeName } as const)),
+	Rule([using_alias_head, type_name, ';'] as const, $ => ({ type: 'using_alias', name: $[0], target: $[1] } as const)),
 );
 
 // Fields beyond C's bare-IDENT struct_declarator: pointers, references, arrays, and non-static data
@@ -896,20 +1034,34 @@ for (const lead of [[], [pointer], ['&']] as unknown[][]) {
 			if (arr)
 				d = { type: 'array', element: d, size: $[lead.length + 2] };
 			if (lead.length)
-				d = lead[0] === '&' ? { type: 'reference', to: d } : { type: 'pointer', pointer: $[0] as Pointer, to: d };
+				d = lead[0] === '&' ? { type: 'reference', to: d } : { type: 'pointer', pointer: $[0], to: d };
 			return d;
 		};
-		const shape: unknown[] = [...lead, IDENT, ...(arr ? ['[', constant_expression, ']'] : [])];
-		field_shapes.push(
-			Rule([...shape] as any,										($: any[]) => ({ declarator: decor($[lead.length], $) })),
-			Rule([...shape, '=', assignment_expression] as any,			($: any[]) => ({ declarator: decor($[lead.length], $), initializer: $[$.length - 1] })),
-		);
+		// TYPE_NAME as well as IDENT: field names legally shadow registered class names (`char *str;`).
+		for (const nameT of [IDENT, TYPE_NAME]) {
+			const shape: unknown[] = [...lead, nameT, ...(arr ? ['[', constant_expression, ']'] : [])];
+			field_shapes.push(
+				Rule([...shape] as any,									($: any[]) => ({ declarator: decor($[lead.length], $) })),
+				Rule([...shape, '=', assignment_expression] as any,		($: any[]) => ({ declarator: decor($[lead.length], $), initializer: $[$.length - 1] })),
+			);
+		}
 	}
 }
 // C's own `[IDENT]` alternative is subsumed by the plain shape above (which also carries the NSDMI
 // variant); the bitfield alternatives stay.
-removeRules(struct_declarator as unknown[], rhs => rhs.length === 1 && rhs[0] === IDENT);
+removeRules(struct_declarator, rhs => rhs.length === 1 && rhs[0] === IDENT);
 (struct_declarator as unknown as Rules<unknown>).push(...field_shapes);
+
+// Function-pointer members (`void (*fn)(void*);`). The leading `( *` can't start a method (methods
+// start with a name), so this never competes with method_declarator.
+for (const nameT of [IDENT, TYPE_NAME]) {
+	(struct_declarator as unknown as Rules<unknown>).push(
+		Rule(['(', '*', nameT, ')', '(', ')'] as any,
+			($: any[]) => ({ declarator: { type: 'function', name: { type: 'pointer', pointer: [{ level: 1 }], to: { type: 'identifier', name: $[2] } }, parameters: [] } })),
+		Rule(['(', '*', nameT, ')', '(', parameter_type_list, ')'] as any,
+			($: any[]) => ({ declarator: { type: 'function', name: { type: 'pointer', pointer: [{ level: 1 }], to: { type: 'identifier', name: $[2] } }, parameters: $[5] } })),
+	);
+}
 
 // `struct_declaration` is C's "one member declaration" production -- widening it here is what lets class
 // bodies mix plain fields (already handled by c-parser.ts's own rule) with everything else.
@@ -925,8 +1077,8 @@ structDeclarationCast.push(
 	// Operators and conversion operators.
 	Rule([specifier_qualifier_list, operator_signature, method_tail] as const,				$ => ({ type: 'method', specifiers: $[0], declarator: { type: 'function', name: { type: 'identifier', name: 'operator' + $[1].name }, parameters: $[1].parameters }, ...$[2] } as const)),
 	Rule([member_mods, specifier_qualifier_list, operator_signature, method_tail] as const,	$ => ({ type: 'method', specifiers: $[1], declarator: { type: 'function', name: { type: 'identifier', name: 'operator' + $[2].name }, parameters: $[2].parameters }, ...$[3], modifiers: $[0] } as const)),
-	Rule(['operator', specifier_qualifier_list, '(', ')', method_tail] as const,				$ => ({ type: 'conversion', target: { specifiers: $[1] } as TypeName, ...$[4] } as const)),
-	Rule(['operator', specifier_qualifier_list, pointer, '(', ')', method_tail] as const,	$ => ({ type: 'conversion', target: { specifiers: $[1], declarator: { type: 'pointer', pointer: $[2] } } as TypeName, ...$[5] } as const)),
+	Rule(['operator', specifier_qualifier_list, '(', ')', method_tail] as const,				$ => ({ type: 'conversion', target: { specifiers: $[1] }, ...$[4] } as const)),
+	Rule(['operator', specifier_qualifier_list, pointer, '(', ')', method_tail] as const,	$ => ({ type: 'conversion', target: { specifiers: $[1], declarator: { type: 'pointer', pointer: $[2] } }, ...$[5] } as const)),
 
 	// Constructors: plain and modifier-prefixed (`explicit`, `constexpr`, ...). The name is spelled as a
 	// raw TYPE_NAME (the class's own name is always registered by its head, so that's what the lexer
@@ -937,9 +1089,9 @@ structDeclarationCast.push(
 	// completed TYPE_NAME -- one whose earlier-rule-wins resolution silently flips with rule traversal
 	// order (it did: `Foo f;` members broke while the ctor kept working).
 	Rule([TYPE_NAME, '(', ')', ctor_tail] as const,												$ => ({ type: 'constructor', name: $[0], parameters: [], ...$[3] } as const)),
-	Rule([TYPE_NAME, '(', parameter_type_list, ')', ctor_tail] as const,						$ => ({ type: 'constructor', name: $[0], parameters: $[2] as ParamOrVariadic[], ...$[4] } as const)),
+	Rule([TYPE_NAME, '(', parameter_type_list, ')', ctor_tail] as const,						$ => ({ type: 'constructor', name: $[0], parameters: $[2], ...$[4] } as const)),
 	Rule([member_mods, TYPE_NAME, '(', ')', ctor_tail] as const,								$ => ({ type: 'constructor', name: $[1], parameters: [], ...$[4], modifiers: $[0] } as const)),
-	Rule([member_mods, TYPE_NAME, '(', parameter_type_list, ')', ctor_tail] as const,			$ => ({ type: 'constructor', name: $[1], parameters: $[3] as ParamOrVariadic[], ...$[5], modifiers: $[0] } as const)),
+	Rule([member_mods, TYPE_NAME, '(', parameter_type_list, ')', ctor_tail] as const,			$ => ({ type: 'constructor', name: $[1], parameters: $[3], ...$[5], modifiers: $[0] } as const)),
 
 	// Destructors (method_tail permissively allows a few things a destructor can't really have -- `const`
 	// -- which is fine for a parser that doesn't validate).
@@ -983,7 +1135,7 @@ const namespace_decl = Rules<NamespaceDecl>(
 );
 
 const using_directive = Rules<UsingDirective>(
-	Rule(['using', 'namespace', type_ident, ';'] as const, $ => ({ type: 'using_namespace', name: $[2] } as const)),
+	Rule(['using', 'namespace', using_path, ';'] as const, $ => ({ type: 'using_namespace', name: $[2].join('::') } as const)),
 );
 const using_decl_top = Rules<UsingDeclMember>(
 	Rule(['using', using_path, ';'] as const, $ => ({ type: 'using_decl', scope: $[1].slice(0, -1), name: $[1][$[1].length - 1] } as const)),
@@ -1017,34 +1169,52 @@ externalDefinitionCast.push(
 // lexically: `Foo::Foo(` has TYPE_NAME after the `::` (registered, not followed by `::`), while a method
 // name is a plain IDENT.
 
-externalDefinitionCast.push(
-	Rule([declaration_specifiers, scope_prefix, IDENT, '(', ')', method_tail] as const,
-		$ => ({ type: 'method_def', specifiers: $[0], scope: $[1], name: $[2], parameters: [], tail: $[5] } as const)),
-	Rule([declaration_specifiers, scope_prefix, IDENT, '(', parameter_type_list, ')', method_tail] as const,
-		$ => ({ type: 'method_def', specifiers: $[0], scope: $[1], name: $[2], parameters: $[4] as ParamOrVariadic[], tail: $[6] } as const)),
-	Rule([scope_prefix, TYPE_NAME, '(', ')', ctor_tail] as const,
-		$ => ({ type: 'constructor_def', scope: $[0], name: $[1], parameters: [], tail: $[4] } as const)),
-	Rule([scope_prefix, TYPE_NAME, '(', parameter_type_list, ')', ctor_tail] as const,
-		$ => ({ type: 'constructor_def', scope: $[0], name: $[1], parameters: $[3] as ParamOrVariadic[], tail: $[5] } as const)),
-	Rule([scope_prefix, '~', type_ident, '(', ')', method_tail] as const,
-		$ => ({ type: 'destructor_def', scope: $[0], name: $[2], tail: $[5] } as const)),
-	Rule([declaration_specifiers, scope_prefix, operator_signature, method_tail] as const,
-		$ => ({ type: 'operator_def', specifiers: $[0], scope: $[1], operator: $[2].name, parameters: $[2].parameters, tail: $[3] } as const)),
+// A shared nonterminal (rather than pushing each rule straight into external_definition) so templates
+// can prefix these too (`template<int A> void ChaCha20::round(...) {...}`).
+const out_of_class_def = Rules<CppDefinition>(
+	Rule([declaration_specifiers, scope_prefix, IDENT, '(', ')', method_tail] as const,							$ => ({ type: 'method_def', specifiers: $[0], scope: $[1], name: $[2], parameters: [], tail: $[5] } as const)),
+	Rule([declaration_specifiers, scope_prefix, IDENT, '(', parameter_type_list, ')', method_tail] as const,	$ => ({ type: 'method_def', specifiers: $[0], scope: $[1], name: $[2], parameters: $[4], tail: $[6] } as const)),
+	Rule([scope_prefix, TYPE_NAME, '(', ')', ctor_tail] as const,												$ => ({ type: 'constructor_def', scope: $[0], name: $[1], parameters: [], tail: $[4] } as const)),
+	Rule([scope_prefix, TYPE_NAME, '(', parameter_type_list, ')', ctor_tail] as const,							$ => ({ type: 'constructor_def', scope: $[0], name: $[1], parameters: $[3], tail: $[5] } as const)),
+	// IDENT variants: the class was never registered (declared only in an unresolved header), so the
+	// name after `::` can't lex as TYPE_NAME. `Foo::Foo(` is still unambiguously a ctor at this scope.
+	Rule([scope_prefix, IDENT, '(', ')', ctor_tail] as const,													$ => ({ type: 'constructor_def', scope: $[0], name: $[1], parameters: [], tail: $[4] } as const)),
+	Rule([scope_prefix, IDENT, '(', parameter_type_list, ')', ctor_tail] as const,								$ => ({ type: 'constructor_def', scope: $[0], name: $[1], parameters: $[3], tail: $[5] } as const)),
+	Rule([scope_prefix, '~', type_ident, '(', ')', method_tail] as const,										$ => ({ type: 'destructor_def', scope: $[0], name: $[2], tail: $[5] } as const)),
+	Rule([declaration_specifiers, scope_prefix, operator_signature, method_tail] as const,						$ => ({ type: 'operator_def', specifiers: $[0], scope: $[1], operator: $[2].name, parameters: $[2].parameters, tail: $[3] } as const)),
 	// Free (non-member) operator functions.
-	Rule([declaration_specifiers, operator_signature, method_tail] as const,
-		$ => ({ type: 'operator_def', specifiers: $[0], operator: $[1].name, parameters: $[1].parameters, tail: $[2] } as const)),
+	Rule([declaration_specifiers, operator_signature, method_tail] as const,									$ => ({ type: 'operator_def', specifiers: $[0], operator: $[1].name, parameters: $[1].parameters, tail: $[2] } as const)),
 	// Out-of-class static data member definitions (`int C::count = 0;`).
-	Rule([declaration_specifiers, scope_prefix, IDENT, '=', assignment_expression, ';'] as const,
-		$ => ({ type: 'static_member_def', specifiers: $[0], scope: $[1], name: $[2], initializer: $[4] } as const)),
-	Rule([declaration_specifiers, scope_prefix, IDENT, ';'] as const,
-		$ => ({ type: 'static_member_def', specifiers: $[0], scope: $[1], name: $[2] } as const)),
+	Rule([declaration_specifiers, scope_prefix, IDENT, '=', assignment_expression, ';'] as const,				$ => ({ type: 'static_member_def', specifiers: $[0], scope: $[1], name: $[2], initializer: $[4] } as const)),
+	Rule([declaration_specifiers, scope_prefix, IDENT, ';'] as const,											$ => ({ type: 'static_member_def', specifiers: $[0], scope: $[1], name: $[2] } as const)),
+	// Pointer return/member types (`void **C::f() {...}`, `Scope *Scope::list = 0;`) -- the pointer can't
+	// live in declaration_specifiers, so it needs its own slot before the qualifier.
+	Rule([declaration_specifiers, pointer, scope_prefix, IDENT, '(', ')', method_tail] as const,				$ => ({ type: 'method_def', specifiers: $[0], pointer: $[1], scope: $[2], name: $[3], parameters: [], tail: $[6] } as const)),
+	Rule([declaration_specifiers, pointer, scope_prefix, IDENT, '(', parameter_type_list, ')', method_tail] as const,	$ => ({ type: 'method_def', specifiers: $[0], pointer: $[1], scope: $[2], name: $[3], parameters: $[5], tail: $[7] } as const)),
+	Rule([declaration_specifiers, pointer, scope_prefix, IDENT, '=', assignment_expression, ';'] as const,		$ => ({ type: 'static_member_def', specifiers: $[0], pointer: $[1], scope: $[2], name: $[3], initializer: $[5] } as const)),
+	Rule([declaration_specifiers, pointer, scope_prefix, IDENT, ';'] as const,									$ => ({ type: 'static_member_def', specifiers: $[0], pointer: $[1], scope: $[2], name: $[3] } as const)),
+	Rule([declaration_specifiers, pointer, scope_prefix, operator_signature, method_tail] as const,				$ => ({ type: 'operator_def', specifiers: $[0], scope: $[2], operator: $[3].name, parameters: $[3].parameters, tail: $[4] } as const)),
+	// Ctor-style static member init (`const C_type C_types::dummy(C_type::UNKNOWN);`).
+	Rule([declaration_specifiers, scope_prefix, IDENT, '(', argument_expression_list, ')', ';'] as const,		$ => ({ type: 'static_member_def', specifiers: $[0], scope: $[1], name: $[2], ctorArgs: $[4] } as const)),
+	// Shadowed method names (`bool HashTable::Match(...)` with `Match` also registered as a type).
+	Rule([declaration_specifiers, scope_prefix, TYPE_NAME, '(', ')', method_tail] as const,						$ => ({ type: 'method_def', specifiers: $[0], scope: $[1], name: $[2], parameters: [], tail: $[5] } as const)),
+	Rule([declaration_specifiers, scope_prefix, TYPE_NAME, '(', parameter_type_list, ')', method_tail] as const, $ => ({ type: 'method_def', specifiers: $[0], scope: $[1], name: $[2], parameters: $[4], tail: $[6] } as const)),
+	Rule([declaration_specifiers, pointer, scope_prefix, TYPE_NAME, '(', ')', method_tail] as const,			$ => ({ type: 'method_def', specifiers: $[0], pointer: $[1], scope: $[2], name: $[3], parameters: [], tail: $[6] } as const)),
+	Rule([declaration_specifiers, pointer, scope_prefix, TYPE_NAME, '(', parameter_type_list, ')', method_tail] as const, $ => ({ type: 'method_def', specifiers: $[0], pointer: $[1], scope: $[2], name: $[3], parameters: $[5], tail: $[7] } as const)),
+);
+externalDefinitionCast.push(
+	Rule([out_of_class_def] as const, $ => $[0]),
+	// Unknown-type globals (`lheap *instance;`, `static thread_local lheap *instance;`). Storage
+	// classes spelled directly (not via declaration_specifiers): the general form never gets IDENT into
+	// the post-specifier state's lookahead (LALR merged-state gap), so the direct shapes do it instead.
+	Rule([unknown_type_field] as const, $ => $[0] as unknown as CppDefinition),
+	Rule([storage_class_specifier, unknown_type_field] as const, $ => ({ ...($[1] as object), specifiers: [$[0]] }) as unknown as CppDefinition),
+	Rule([storage_class_specifier, storage_class_specifier, unknown_type_field] as const, $ => ({ ...($[2] as object), specifiers: [$[0], $[1]] }) as unknown as CppDefinition),
 );
 
-// Trailing return types on ordinary functions (`auto f(int) -> int {...}`). The `->` can only be
-// this rule here: nothing else follows a completed declarator with `->`.
+// Trailing return types on ordinary functions (`auto f(int) -> int {...}`). The `->` can only be this rule here: nothing else follows a completed declarator with `->`.
 (function_definition as unknown as Rules<unknown>).push(
-	Rule([declaration_specifiers, declarator, '->', type_name, compound_statement] as const,
-		$ => ({ type: 'function_def', specifiers: $[0], declarator: $[1] as Declarator, returnType: $[3] as TypeName, body: $[4] as Block } as const)),
+	Rule([declaration_specifiers, declarator, '->', type_name, compound_statement] as const,		$ => ({ type: 'function_def', specifiers: $[0], declarator: $[1], returnType: $[3], body: $[4] } as const)),
 );
 
 // ===================================================================
@@ -1074,10 +1244,10 @@ const template_param = Rules<TemplateParam>(
 	Rule(['typename', '...', TYPE_NAME] as const,	$ => ({ name: $[2], pack: true } as const)),
 	Rule(['class', '...', TYPE_NAME] as const,	$ => ({ name: $[2], pack: true } as const)),
 	// Default type arguments (`template<class T = int>`).
-	Rule(['typename', IDENT, '=', type_name] as const,	($, ctx: Ctx) => { ctx.typedefNames.add($[1]); return { name: $[1], default: $[3] as TypeName }; }),
-	Rule(['class', IDENT, '=', type_name] as const,		($, ctx: Ctx) => { ctx.typedefNames.add($[1]); return { name: $[1], default: $[3] as TypeName }; }),
-	Rule(['typename', TYPE_NAME, '=', type_name] as const,	$ => ({ name: $[1], default: $[3] as TypeName } as const)),
-	Rule(['class', TYPE_NAME, '=', type_name] as const,	$ => ({ name: $[1], default: $[3] as TypeName } as const)),
+	Rule(['typename', IDENT, '=', type_name] as const,	($, ctx: Ctx) => { ctx.typedefNames.add($[1]); return { name: $[1], default: $[3] }; }),
+	Rule(['class', IDENT, '=', type_name] as const,		($, ctx: Ctx) => { ctx.typedefNames.add($[1]); return { name: $[1], default: $[3] }; }),
+	Rule(['typename', TYPE_NAME, '=', type_name] as const,	$ => ({ name: $[1], default: $[3] } as const)),
+	Rule(['class', TYPE_NAME, '=', type_name] as const,	$ => ({ name: $[1], default: $[3] } as const)),
 	// Non-type parameters (`template<int N>`, `template<int N = 4>`). The name is a *value*, not a type,
 	// so it deliberately isn't registered. The type is a restricted `nontype_param_type`, NOT the full
 	// specifier_qualifier_list: pulling spec_qual in here also pulls in struct_or_union_specifier, whose
@@ -1086,6 +1256,9 @@ const template_param = Rules<TemplateParam>(
 	// parameters are integral/enum-ish in real C++ anyway, so nothing of value is lost).
 	Rule([nontype_param_type, IDENT] as const,		$ => ({ name: $[1], nonType: $[0] } as const)),
 	Rule([nontype_param_type, IDENT, '=', assignment_expression] as const,	$ => ({ name: $[1], nonType: $[0], default: $[3] } as const)),
+	// TYPE_NAME variants: non-type parameter names can collide with registered names (`template<int B>`).
+	Rule([nontype_param_type, TYPE_NAME] as const,	$ => ({ name: $[1], nonType: $[0] } as const)),
+	Rule([nontype_param_type, TYPE_NAME, '=', assignment_expression] as const,	$ => ({ name: $[1], nonType: $[0], default: $[3] } as const)),
 );
 const template_param_list = List(template_param, ',');
 
@@ -1096,23 +1269,20 @@ const template_head = Rules<TemplateParam[]>(
 );
 
 externalDefinitionCast.push(
-	Rule([template_head, struct_or_union_specifier, ';'] as const,
-		$ => ({ type: 'template', params: $[0], declaration: $[1] as unknown as ClassSpecifier } as const)),
-	Rule([template_head, function_definition] as const,
-		$ => ({ type: 'template', params: $[0], declaration: $[1] as unknown as Definition } as const)),
+	Rule([template_head, struct_or_union_specifier, ';'] as const,		$ => ({ type: 'template', params: $[0], declaration: $[1] as unknown as ClassSpecifier } as const)),
+	Rule([template_head, function_definition] as const,					$ => ({ type: 'template', params: $[0], declaration: $[1] as unknown as Definition } as const)),
 	// C++14 variable templates (`template<class T> constexpr T pi = T(3.14159);`) -- and, since
 	// `declaration` is general, templated typedefs and function *declarations* too.
-	Rule([template_head, declaration] as const,
-		$ => ({ type: 'template', params: $[0], declaration: $[1] as Definition } as const)),
+	Rule([template_head, declaration] as const,							$ => ({ type: 'template', params: $[0], declaration: $[1] as Definition } as const)),
 	// Alias templates (`template<class T> using Vec = vector<T>;`).
-	Rule([template_head, using_alias] as const,
-		$ => ({ type: 'template', params: $[0], declaration: $[1] } as unknown as TemplateDecl)),
+	Rule([template_head, using_alias] as const,							$ => ({ type: 'template', params: $[0], declaration: $[1] } as unknown as TemplateDecl)),
+	// Templated out-of-class member definitions (`template<int A> void ChaCha20::round(...) {...}`).
+	Rule([template_head, out_of_class_def] as const,					$ => ({ type: 'template', params: $[0], declaration: $[1] as Definition } as const)),
 );
 
 // Member templates (`template<class U> void set(U x) {...}` inside a class body).
 structDeclarationCast.push(
-	Rule([template_head, specifier_qualifier_list, method_signature, method_tail] as const,
-		$ => ({ type: 'member_template', params: $[0], declaration: { type: 'method', specifiers: $[1], declarator: $[2] as Declarator, ...$[3] } } as const)),
+	Rule([template_head, specifier_qualifier_list, method_signature, method_tail] as const,		$ => ({ type: 'member_template', params: $[0], declaration: { type: 'method', specifiers: $[1], declarator: $[2] as Declarator, ...$[3] } } as const)),
 );
 
 // ===================================================================
@@ -1120,17 +1290,17 @@ structDeclarationCast.push(
 // ===================================================================
 
 const catch_clause = Rules<CatchClause>(
-	Rule(['catch', '(', specifier_qualifier_list, IDENT, ')', compound_statement] as const,			$ => ({ paramType: { specifiers: $[2] } as TypeName, paramName: $[3], body: $[5] as Block } as const)),
-	Rule(['catch', '(', specifier_qualifier_list, '&', IDENT, ')', compound_statement] as const,		$ => ({ paramType: { specifiers: $[2] } as TypeName, paramName: $[4], byRef: true, body: $[6] as Block } as const)),
-	Rule(['catch', '(', specifier_qualifier_list, '&&', IDENT, ')', compound_statement] as const,	$ => ({ paramType: { specifiers: $[2] } as TypeName, paramName: $[4], byRef: true, body: $[6] as Block } as const)),
-	Rule(['catch', '(', specifier_qualifier_list, ')', compound_statement] as const,					$ => ({ paramType: { specifiers: $[2] } as TypeName, body: $[4] as Block } as const)),
-	Rule(['catch', '(', specifier_qualifier_list, '&', ')', compound_statement] as const,			$ => ({ paramType: { specifiers: $[2] } as TypeName, byRef: true, body: $[5] as Block } as const)),
-	Rule(['catch', '(', '...', ')', compound_statement] as const,									$ => ({ body: $[4] as Block } as const)),
+	Rule(['catch', '(', specifier_qualifier_list, IDENT, ')', compound_statement] as const,			$ => ({ paramType: { specifiers: $[2] }, paramName: $[3], body: $[5] } as const)),
+	Rule(['catch', '(', specifier_qualifier_list, '&', IDENT, ')', compound_statement] as const,	$ => ({ paramType: { specifiers: $[2] }, paramName: $[4], byRef: true, body: $[6] } as const)),
+	Rule(['catch', '(', specifier_qualifier_list, '&&', IDENT, ')', compound_statement] as const,	$ => ({ paramType: { specifiers: $[2] }, paramName: $[4], byRef: true, body: $[6] } as const)),
+	Rule(['catch', '(', specifier_qualifier_list, ')', compound_statement] as const,				$ => ({ paramType: { specifiers: $[2] }, body: $[4] } as const)),
+	Rule(['catch', '(', specifier_qualifier_list, '&', ')', compound_statement] as const,			$ => ({ paramType: { specifiers: $[2] }, byRef: true, body: $[5] } as const)),
+	Rule(['catch', '(', '...', ')', compound_statement] as const,									$ => ({ body: $[4] } as const)),
 );
-const catch_clause_list = List(catch_clause) as unknown as Rules<CatchClause[]>;
+const catch_clause_list = List(catch_clause);
 
 const try_statement = Rules<CppStatement>(
-	Rule(['try', compound_statement, catch_clause_list] as const, $ => ({ type: 'try', body: $[1] as Block, handlers: $[2] } as const)),
+	Rule(['try', compound_statement, catch_clause_list] as const, $ => ({ type: 'try', body: $[1], handlers: $[2] } as const)),
 );
 const throw_statement = Rules<CppStatement>(
 	Rule(['throw', expression, ';'] as const,	$ => ({ type: 'throw', argument: $[1] } as const)),
@@ -1143,23 +1313,27 @@ statementCast.push(
 	Rule([throw_statement] as const,	$ => $[0]),
 	Rule([using_directive] as const,	$ => $[0]),
 	Rule([using_decl_top] as const,		$ => $[0]),
-	Rule([using_alias] as const,		$ => $[0] as CppStatement),
+	Rule([using_alias] as const,		$ => $[0]),
 	Rule([static_assert_decl] as const,	$ => $[0]),
 	// Range-based for. The `:` never competes with the classic for-clauses: after the declarator, a
 	// classic for's declaration is looking for `=`/`,`/`;`, none of which is `:`.
-	Rule(['for', '(', declaration_specifiers, declarator, ':', expression, ')', statement] as const,
-		$ => ({ type: 'range_for', specifiers: $[2], declarator: $[3] as Declarator, range: $[5], body: $[7] } as unknown as CppStatement)),
+	Rule(['for', '(', declaration_specifiers, declarator, ':', expression, ')', statement] as const,	$ => ({ type: 'range_for', specifiers: $[2], declarator: $[3], range: $[5], body: $[7] })),
 	// `return {...};` list-initialized returns.
-	Rule(['return', '{', initializer_list, '}', ';'] as const,
-		$ => ({ type: 'return', expression: { type: 'initializer_list', elements: $[2] } as unknown as Expr } as const)),
+	Rule(['return', '{', initializer_list, '}', ';'] as const,											$ => ({ type: 'return', expression: { type: 'initializer_list', elements: $[2] } as unknown as Expr } as const)),
+	// Condition declarations (`if (int exp = f())`, `while (int c = next())`).
+	Rule(['if', '(', declaration_specifiers, declarator, '=', assignment_expression, ')', statement] as const,
+		$ => ({ type: 'if', condition: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as Expr, then: $[7] } as const)),
+	Rule(['if', '(', declaration_specifiers, declarator, '=', assignment_expression, ')', statement, 'else', statement] as const,
+		$ => ({ type: 'if', condition: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as Expr, then: $[7], else: $[9] } as const)),
+	Rule(['while', '(', declaration_specifiers, declarator, '=', assignment_expression, ')', statement] as const,
+		$ => ({ type: 'while', condition: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as Expr, body: $[7] } as const)),
 );
 
 // Braced direct-init in declarations (`T x{1, 2};`, `vector<int> v{1, 2, 3};`). Non-empty lists only:
 // an empty `{}` would complete on exactly the same tokens as an empty function *body*, a reduce-reduce
 // tie against C's compound_statement (`int f() {}` must keep parsing as a function definition).
-(init_declarator as unknown as Rules<unknown>).push(
-	Rule([declarator, '{', initializer_list, '}'] as const,
-		$ => ({ declarator: $[0], initializer: { type: 'initializer_list', elements: $[2] } as Initializer })),
+init_declarator.push(
+	Rule([declarator, '{', initializer_list, '}'] as const,		$ => ({ declarator: $[0], initializer: { type: 'initializer_list', elements: $[2] } as const })),
 );
 
 // ===================================================================
@@ -1181,30 +1355,27 @@ statementCast.push(
 const RIGHT_SHIFT			= terminal('>>',  />>/,	(_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : RIGHT_SHIFT);
 const RIGHT_SHIFT_ASSIGN	= terminal('>>=', />>=/,	(_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : RIGHT_SHIFT_ASSIGN);
 
-const cppParserSpec = makeParser({
-	// On top of C's whitespace/preprocessor/comment skips: attributes (`[[nodiscard]]`) and
+export const parser = makeParser({
+	// On top of C's whitespace/comment skips: attributes (`[[nodiscard]]`) and
 	// `alignas(...)` are recognized and *discarded* at the lexer level -- valid C++14 input parses, but
-	// they leave no trace in the AST.
-	skip: [/\s+/, /#[^\n]*/, /\/\/[^\n]*/, /\/\*[^]*?\*\//, /\[\[[^]*?\]\]/, /alignas\s*\([^()]*\)/],
+	// they leave no trace in the AST. Preprocessor directives are handled by preprocess() before parsing.
+	// MS calling conventions/attributes are discarded like [[attributes]] -- they carry no AST meaning here.
+	skip: [/\s+/, /\/\/[^\n]*/, /\/\*[^]*?\*\//, /\[\[[^]*?\]\]/, /alignas\s*\([^()]*\)/, /__(?:stdcall|cdecl|fastcall|thiscall|forceinline)(?!\w)/, /__declspec\s*\([^()]*\)/],
 	// IDENT has to be lexed even where only TYPE_NAME/TYPE_SCOPE are grammatically valid (see
 	// c-parser.ts's own `terminals: [IDENT]`) -- it's the only terminal whose pattern matches the text,
 	// and its callback is what reclassifies registered names.
-	terminals: [IDENT, TYPE_SCOPE, RIGHT_SHIFT, RIGHT_SHIFT_ASSIGN],
+	terminals: [IDENT, TYPE_SCOPE, TEMPLATE_FN, RIGHT_SHIFT, RIGHT_SHIFT_ASSIGN],
 	precedence: PREC,
 	start: translation_unit,
 	rules: { translation_unit },
 });
 
-export const cppParser = {
-	...cppParserSpec,
-	// `knownTypes` seeds the registered-name table, standing in for everything #include would have
-	// declared -- e.g. ['std', 'string', 'exception'] makes `std::vector<int>`, `std::string s;` and
-	// `catch (const exception& e)` parse. Namespace prefixes only need the namespace itself seeded.
-	parse: (code: string, knownTypes?: Iterable<string>): CppProgram => {
-		return cppParserSpec.parse(code, {
-			pendingTypedef: false,
-			typedefNames: new Set<string>(knownTypes),
-			templateDepth: 0,
-		} as CppCtx) as CppProgram;
-	},
-};
+export interface Options extends PreprocessOptions {
+	knownTypes?: Iterable<string>;
+}
+
+export const parse = (code: string, options?: Options) => parser.parse(preprocess(code, options), {
+	pendingTypedef: false,
+	typedefNames: new Set<string>(options?.knownTypes),
+	templateDepth: 0,
+} as CppCtx) as Program;

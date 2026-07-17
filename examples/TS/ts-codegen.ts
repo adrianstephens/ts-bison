@@ -1,5 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unused-expressions */
-/* eslint-disable @typescript-eslint/no-this-alias */
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import { Location, Expr, BindingTarget } from './js-parser';
@@ -7,21 +5,178 @@ import { Type } from './ts-parser';
 import { TSwalk, Preserve, hasMod } from './walker';
 import * as T from './type-utils';
 import { Scope } from './type-utils';
-import { makeChecker } from './checker';
+import { makeChecker, SEVERITY } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
 import { TSoutput } from './tocode';
 
 import * as fs from 'fs';
 import * as path from 'path';
 
-function dropMod(e: {modifiers?: string[]}, m: string) {
-	if (e.modifiers?.includes(m))
-		e.modifiers = e.modifiers.filter(i => i != m);
+const CompilerOptionsDefault = {
+//Type Checking
+	allowUnreachableCode:					undefined,
+	allowUnusedLabels:						undefined,
+	alwaysStrict:							false,
+	exactOptionalPropertyTypes:				undefined,
+	noFallthroughCasesInSwitch:				undefined,
+	noImplicitAny:							false,
+	noImplicitOverride:						undefined,
+	noImplicitReturns:						undefined,
+	noImplicitThis:							false,
+	noPropertyAccessFromIndexSignature:		undefined,
+	noUncheckedIndexedAccess:				undefined,
+	noUnusedLocals:							undefined,
+	noUnusedParameters:						undefined,
+	strict:									false,
+	strictBindCallApply:					false,
+	strictBuiltinIteratorReturn:			false,
+	strictFunctionTypes:					false,
+	strictNullChecks:						false,
+	strictPropertyInitialization:			false,
+	useUnknownInCatchVariables:				false,
+//Modules
+	allowArbitraryExtensions:				undefined,
+	allowImportingTsExtensions:				undefined,
+	allowUmdGlobalAccess:					undefined,
+	baseUrl:								undefined,
+	customConditions:						undefined,
+	module:									undefined,
+	moduleResolution:						'node',
+	moduleSuffixes:							undefined,
+	noResolve:								undefined,
+	noUncheckedSideEffectImports:			undefined,
+	paths:									undefined,
+	resolveJsonModule:						undefined,
+	resolvePackageJsonExports:				false,
+	resolvePackageJsonImports:				false,
+	rewriteRelativeImportExtensions:		undefined,
+	rootDir:								undefined,
+	rootDirs:								undefined,
+	typeRoots:								undefined,
+	types:									undefined,
+//Emit
+	declaration:							false,
+	declarationDir:							undefined,
+	declarationMap:							undefined,
+	downlevelIteration:						undefined,
+	emitBOM:								undefined,
+	emitDeclarationOnly:					undefined,
+	importHelpers:							undefined,
+	inlineSourceMap:						undefined,
+	inlineSources:							undefined,
+	mapRoot:								undefined,
+	newLine:								'lf',
+	noEmit:									undefined,
+	noEmitHelpers:							undefined,
+	noEmitOnError:							undefined,
+	outDir:									undefined,
+	outFile:								undefined,
+	preserveConstEnums:						undefined,
+	removeComments:							undefined,
+	sourceMap:								undefined,
+	sourceRoot:								undefined,
+	stripInternal:							undefined,
+//JavaScript Support
+	allowJs:								undefined,
+	checkJs:								undefined,
+	maxNodeModuleJsDepth:					0,
+//Editor Support
+	disableSizeLimit:						undefined,
+	plugins:								undefined,
+//Interop Constraints
+	allowSyntheticDefaultImports:			undefined,
+	erasableSyntaxOnly:						undefined,
+	esModuleInterop:						undefined,
+	forceConsistentCasingInFileNames:		true,
+	isolatedDeclarations:					undefined,
+	isolatedModules:						undefined,
+	preserveSymlinks:						undefined,
+	verbatimModuleSyntax:					undefined,
+//Backwards Compatibility
+	charset:								'utf8',
+	importsNotUsedAsValues:					0,
+	keyofStringsOnly:						undefined,
+	noImplicitUseStrict:					undefined,
+	noStrictGenericChecks:					undefined,
+	out:									undefined,
+	preserveValueImports:					undefined,
+	suppressExcessPropertyErrors:			undefined,
+	suppressImplicitAnyIndexErrors:			undefined,
+//Language
+	Environment:							undefined,
+	emitDecoratorMetadata:					undefined,
+	experimentalDecorators:					undefined,
+	jsx:									'preserve',
+	jsxFactory:								'React.createElement',
+	jsxFragmentFactory:						'React.Fragment',
+	jsxImportSource:						'react',
+	lib:									undefined,
+	libReplacement:							true,
+	moduleDetection:						'auto',
+	noLib:									undefined,
+	reactNamespace:							'React',
+	target:									'es5',
+	useDefineForClassFields:				false,
+//Compiler Diagnostics
+	diagnostics:							undefined,
+	explainFiles:							undefined,
+	extendedDiagnostics:					undefined,
+	generateCpuProfile:						'profile.cpuprofile',
+	generateTrace:							undefined,
+	listEmittedFiles:						undefined,
+	listFiles:								undefined,
+	noCheck:								undefined,
+	traceResolution:						undefined,
+//Projects
+	composite:								undefined,
+	disableReferencedProjectLoad:			undefined,
+	disableSolutionSearching:				undefined,
+	disableSourceOfProjectReferenceRedirect:undefined,
+	incremental:							false,
+	tsBuildInfoFile:						'.tsbuildinfo',
+//Output Formatting
+	noErrorTruncation:						undefined,
+	preserveWatchOutput:					undefined,
+	pretty:									true,
+//Completeness
+	skipDefaultLibCheck:					undefined,
+	skipLibCheck:							undefined,
+};
+
+export type CompilerOptions1 = typeof CompilerOptionsDefault;
+export type CompilerOptions = Partial<CompilerOptions1>;
+
+const TARGET_DEFAULT_LIB: Record<string, string> = {
+	es3: 	'lib',
+	es5: 	'lib',
+	es6: 	'lib.es6',
+	es2015: 'lib.es6',
+	es2016: 'lib.es2016.full',
+	es2017: 'lib.es2017.full',
+	es2018: 'lib.es2018.full',
+	es2019: 'lib.es2019.full',
+	es2020: 'lib.es2020.full',
+	es2021: 'lib.es2021.full',
+	es2022: 'lib.es2022.full',
+	es2023: 'lib.es2023.full',
+	es2024: 'lib.es2024.full',
+	esnext: 'lib.esnext.full',
+};
+
+function libSpecs(options: CompilerOptions1): string[] {
+	return	options.noLib ? []
+		:	options.lib ? Array.isArray(options.lib) ? options.lib : [options.lib]
+		:	['typescript/lib/' + (TARGET_DEFAULT_LIB[options.target.toLowerCase()] ?? TARGET_DEFAULT_LIB.es5)];
 }
 
 //-----------------------------------------------------------------------------
 // TS to JS
 //-----------------------------------------------------------------------------
+
+function dropMod(e: {modifiers?: string[]}, m: string) {
+	if (e.modifiers?.includes(m))
+		e.modifiers = e.modifiers.filter(i => i != m);
+}
 
 // Plain JS has no `?` -- drops the `'optional'` tag from a `Param`'s modifiers while keeping any others (e.g.
 // a parameter property's `public`/`readonly`, cleared separately by whichever caller also strips `modifiers`).
@@ -46,8 +201,11 @@ export function TStoJS(ast: TS.Program) {
 
 			case 'as_expression':
 			case 'satisfies_expression':
-			case 'non_null':
+			case 'instantiation':
 				return onExpression(expr.expression, process);
+
+			case 'unary_post':
+				return expr.operator === '!' ? onExpression(expr.argument, process) : process(expr);
 
 			default:
 				return process(expr);
@@ -77,13 +235,9 @@ export function TStoJS(ast: TS.Program) {
 				case 'enum_decl': {
 					stmt = process(stmt);
 					let next = 0;
-					return {
-						type: 'var', kind: 'const',
-						declarations: [{
+					return JS.VarDecl('const', {
 							name: stmt.name,
-							init: {
-								type: 'object',
-								properties: stmt.members.map(m => {
+							init: JS.ObjectExpr(stmt.members.map(m => {
 									let value: Expr;
 									if (m.init) {
 										value = m.init;
@@ -93,9 +247,9 @@ export function TStoJS(ast: TS.Program) {
 									}
 									return { key: m.name, value, kind: 'init' as const };
 								}),
-							},
-						}],
-					};
+							),
+						},
+					);
 				}
 				
 				case 'class_decl': {
@@ -114,7 +268,7 @@ export function TStoJS(ast: TS.Program) {
 									.map(p => ({
 										type: 'expression',
 										expression: {
-											type: 'assign', operator: '=',
+											type: 'binary', operator: '=',
 											left: { type: 'member', object: { type: 'this' }, property: p.key as string },
 											right: { type: 'identifier', name: p.key as string },
 										},
@@ -151,8 +305,9 @@ export function TStoJS(ast: TS.Program) {
 // ===================================================================
 
 export interface Diagnostic {
-	message:	string;
+	severity:	SEVERITY;
 	pos:		Location;
+	message:	string;
 }
 
 function makeDiagnostic(func: (d: Diagnostic) => void) {
@@ -160,26 +315,39 @@ function makeDiagnostic(func: (d: Diagnostic) => void) {
 	const clip		= (s: string, max = 60)	=> s.length > max ? s.slice(0, max - 3) + '...' : s;
 	const toString	= (v: any) => v === undefined ? '' : typeof v === 'string' ? v : renderer.toCode(v);
 
-	return (strings: TemplateStringsArray, pos: Location, ...values: any[]) => func({
-		message: strings.map((s, i) => s + clip(toString(values[i - 1]))).join(''),
+	return (severity: SEVERITY, pos: JS.Location, strings: TemplateStringsArray, ...values: any[]) => func({
+		severity,
+		message: ['GAP', 'WRN', 'ERR'][severity] + ': ' + strings.map((s, i) => s + clip(toString(values[i]))).join(''),
 		pos
 	});
 }
 
-export function TStypeCheck(ast: TS.Program): Diagnostic[] {
+export function TStypeCheck(ast: TS.Program, minSeverity: SEVERITY = SEVERITY.GAP): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
-	const checker = makeChecker(makeDiagnostic(d => diagnostics.push(d)));
+	const checker = makeChecker(makeDiagnostic(d => { if (d.severity >= minSeverity) diagnostics.push(d); }));
 	checker.checkBlock(ast.body, checker.global, undefined);
 	return diagnostics;
 }
 
-export async function TStypeCheckAsync(filename: string): Promise<{program: TS.Program, diagnostics: Diagnostic[]}> {
+export async function TStypeCheckAsync(filename: string, minSeverity: SEVERITY = SEVERITY.GAP, compilerOptions: CompilerOptions = {}): Promise<{program: TS.Program, diagnostics: Diagnostic[]}> {
 	const diagnostics: Diagnostic[] = [];
-	const checker	= makeChecker(makeDiagnostic(d => diagnostics.push(d)));
+	const checker	= makeChecker(makeDiagnostic(d => { if (d.severity >= minSeverity) diagnostics.push(d); }));
 	const global	= checker.global;
+	const options	= { ...CompilerOptionsDefault, ...compilerOptions };
+
+	const loader	= new ModuleLoader(path.dirname(filename), ['node']);
+
+	// `skipLibCheck`/`skipDefaultLibCheck` (real tsc: don't report diagnostics *from inside* a `.d.ts` file, just use its
+	// declarations) -- imported `.d.ts`s (`makeScope` below) already never run through `checkBlock` at all, only the lighter
+	// `exportScope`, so this loop -- the sole path that ever calls `checkBlock` on a `.d.ts` -- is the only place either flag matters.
+	const skipLib = !!(options.skipLibCheck || options.skipDefaultLibCheck);
+	for (const spec of libSpecs(options)) {
+		const lib = await loader.get(spec, '.');
+		if (lib)
+			checker.checkBlock(lib.body, global, skipLib);
+	}
 
 	const program	= TS.parse(await fs.promises.readFile(filename, 'utf8'));
-	const loader	= new ModuleLoader(path.dirname(filename), ['node']);
 
 	interface ModuleShape { scope: Scope; value: Type }
 
@@ -198,16 +366,17 @@ export async function TStypeCheckAsync(filename: string): Promise<{program: TS.P
 	const waitingFor = new Map<LoadedModule, Set<LoadedModule>>();
 
 	function wouldDeadlock(waiter: LoadedModule, target: LoadedModule): boolean {
-		const seen = new Set<LoadedModule>();
+		const seen = new Set<LoadedModule>([target]);
 		const stack = [target];
 		while (stack.length) {
 			const cur = stack.pop()!;
 			if (cur === waiter)
 				return true;
-			if (!seen.has(cur)) {
-				seen.add(cur);
-				for (const next of waitingFor.get(cur) ?? [])
+			for (const next of waitingFor.get(cur) ?? []) {
+				if (!seen.has(next)) {
+					seen.add(next);
 					stack.push(next);
+				}
 			}
 		}
 		return false;
@@ -235,7 +404,7 @@ export async function TStypeCheckAsync(filename: string): Promise<{program: TS.P
 	const resolveImport = async (waiter: LoadedModule, importScope: Scope, imp: JS.Import, from: string): Promise<void> => {
 		const impSrc = await loader.get(imp.source, from);
 		if (!impSrc) {
-			diagnostics.push({ message: `Could not resolve import '${imp.source}'`, pos: (imp as any).pos });
+			diagnostics.push({ severity: 1, pos: (imp as any).pos, message: `Could not resolve import '${imp.source}'` });
 			return;
 		}
 		const resolved = await awaitScope(waiter, importScope, impSrc);
@@ -244,23 +413,37 @@ export async function TStypeCheckAsync(filename: string): Promise<{program: TS.P
 
 		const { scope: impScope, value } = resolved;
 
+		// `import X from 'mod'` (default import) -- independent of `namespace`/`specifiers` below (`import X, {y} from 'mod'` and
+		// `import X, * as NS from 'mod'` both combine a default with the other form in the same statement). `checker.exportScope`
+		// registers a module's default export under the literal key `'default'`; this is the only place that key is read back.
+		if (imp.default) {
+			const v = impScope.values.get('default');
+			if (v)
+				importScope.values.set(imp.default, v);
+			const ns = impScope.namespace('default');
+			if (ns)
+				importScope.addNamespace(imp.default, ns);
+		}
+
 		if (imp.namespace) {
 			importScope.values.set(imp.namespace, value);
 			importScope.addNamespace(imp.namespace, impScope);
-		}
-
-		for (const spec of imp.specifiers ?? []) {
-			const v = impScope.values.get(spec.imported);
-			if (v)
-				importScope.values.set(spec.local, v);
-			const typeEntry = impScope.types.get(spec.imported);
-			if (typeEntry) {
-				const prev = importScope.types.get(spec.local);
-				importScope.types.set(spec.local, prev ? { typeParams: prev.typeParams ?? typeEntry.typeParams, type: { type: 'intersection', types: [prev.type, typeEntry.type] } } : typeEntry);
+		} else {
+			for (const spec of imp.specifiers ?? []) {
+				if (!imp.type && !spec.typeOnly) {
+					const v = impScope.values.get(spec.imported);
+					if (v)
+						importScope.values.set(spec.local, v);
+					const ns = impScope.namespace(spec.imported);
+					if (ns)
+						importScope.addNamespace(spec.local, ns);
+				}
+				const typeEntry = impScope.types.get(spec.imported);
+				if (typeEntry) {
+					const prev = importScope.types.get(spec.local);
+					importScope.types.set(spec.local, prev ? { typeParams: prev.typeParams ?? typeEntry.typeParams, type: TS.IntersectionType([prev.type, typeEntry.type]) } : typeEntry);
+				}
 			}
-			const ns = impScope.namespace(spec.imported);
-			if (ns)
-				importScope.addNamespace(spec.local, ns);
 		}
 	};
 
@@ -287,6 +470,7 @@ export async function TStypeCheckAsync(filename: string): Promise<{program: TS.P
 				const targetShape = await awaitScope(src, global, target);
 				if (!targetShape)
 					continue;	// genuine circular re-export chain -- contribute nothing further rather than deadlock/recurse forever
+
 				if (stmt.namespace) {
 					// `export * as name from './x'`: one property holding the target's whole shape.
 					scope.values.set(stmt.namespace, targetShape.value);
@@ -340,12 +524,6 @@ export async function TStypeCheckAsync(filename: string): Promise<{program: TS.P
 // ===================================================================
 
 export function TStoDecl(ast: TS.Program): TS.Program {
-	// ---- Type/value reference collection (used to build the reachability graph below) -------------
-
-	// Dotted type names (`ns.Type`) only need their leftmost segment tracked -- that's the actual
-	// locally-bound identifier (an import, typically); the rest is just a member access on it.
-	const addRef = (name: string, refs: Set<string>) => refs.add(name.split('.')[0]);
-
 	// ---- Gathering every top-level declaration, and the explicitly-exported roots ------------------
 
 	type Owner = TS.Statement | JS.VarDeclarator;
@@ -353,24 +531,10 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		add(name: string, owner: Owner) {
 			this.set(name, [...(this.get(name) ?? []), owner]);
 		}
-		//get(name: string): Owner[] | undefined {
-		//	return super.get(name) ?? this.parent?.get(name);
-		//}
 	}
 
 	const owners = new Owners;
 	const roots = new Set<string>();
-
-	// Shared inference: the checker's scope/typeOf machinery, run silently over the whole program once so identifier lookups resolve during the rebuild below
-	const checker		= makeChecker(()=>{});
-	const global		= checker.global;
-	checker.checkBlock(ast.body, checker.global);
-
-	// `undefined` (rather than an explicit `: any` annotation) keeps unknowable types implicit, as before
-	const inferType		= (e: Expr, narrow: boolean): Type | undefined => {
-		const t = narrow ? checker.typeOf(e, global) : T.widenLiterals(checker.typeOf(e, global));
-		return t.type === 'ref' && t.name === 'any' ? undefined : t;
-	};
 
 	// Registers a statement's own name(s) into `owners`, and -- if `exported` -- into `roots` too.
 	const registerDecl = (stmt: TS.Statement, exported: boolean) => {
@@ -385,7 +549,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 				if (exported)
 					roots.add(stmt.name);
 				break;
-			case 'var':
+			case 'var_decl':
 				for (const d of stmt.declarations) {
 					for (const name of T.bindingNames(d.name)) {
 						owners.add(name, d);
@@ -416,6 +580,17 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 
 
 	// ---- Final rebuild: strip bodies/initializers, keep only what's reachable ----------------------
+
+	const checker		= makeChecker(()=>{});
+	const global		= checker.global;
+	checker.checkBlock(ast.body, checker.global);
+
+	// `undefined` (rather than an explicit `: any` annotation) keeps unknowable types implicit, as before
+	const inferType		= (e: Expr, narrow: boolean): Type | undefined => {
+		const t = narrow ? checker.typeOf(e, global) : T.widenLiterals(checker.typeOf(e, global));
+		return t.type === 'ref' && t.name === 'any' ? undefined : t;
+	};
+
 	const stripBindingDefaults = (t: BindingTarget): BindingTarget => {
 		if (typeof t === 'string')
 			return t;
@@ -430,21 +605,20 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		modifiers:		hasMod(p, 'optional') || !!p.default ? ['optional'] : []
 	});
 
-	const wrapType = (t: Type, names: Set<string>, name: string) => t.type === 'ref' && names.has(t.name) ? t : { type: 'ref', name, typeArgs: [t] };
 	const PROMISE_TYPES		= new Set(['Promise']);
 	const GENERATOR_TYPES	= new Set(['Generator', 'IterableIterator', 'Iterator', 'Iterable']);
 
 	const stripFunctionDecl = (stmt: JS.FunctionDecl): JS.Declaration => {
-		const returnType: Type = stmt.returnType ? stmt.returnType as Type : stmt.body ? checker.inferReturn(stmt, global) : T.ANY;
+		const returnType: Type = stmt.returnType ? stmt.returnType as Type : stmt.body ? checker.inferReturn(stmt, stmt.body, global) : T.ANY;
 		return JS.FunctionDecl(stmt.name, {
 			params:		stmt.params.map(stripParam),
 			typeParams:	stmt.typeParams,
-			returnType: hasMod(stmt, 'async') ? wrapType(returnType, PROMISE_TYPES, 'Promise') : hasMod(stmt, 'generator') ? wrapType(returnType, GENERATOR_TYPES, 'Generator') : returnType
+			returnType: hasMod(stmt, 'async')		? T.wrapType(returnType, PROMISE_TYPES, 'Promise')
+					:	hasMod(stmt, 'generator')	? T.wrapType(returnType, GENERATOR_TYPES, 'Generator')
+					:	returnType
 		});
 	};
 
-	// Same `ClassMember`/`TS.ClassMember` gap as `TStoJS`'s `processClassMember`: `stmt.body`'s declared element type is narrower than what a
-	// class body can actually hold once ts-parser.ts's grammar extensions (`static_block`/`method_signature`) are in play.
 	const stripClassDecl = (stmt: JS.ClassDecl): JS.Declaration => {
 		const setKeys	= new Set(stmt.body.filter((m): m is Extract<JS.ClassMember, { type: 'method' }> => m.type === 'method' && m.kind === 'set' && typeof m.key === 'string').map(m => m.key as string));
 		const seen		= new Set<string>();
@@ -458,7 +632,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 				};
 
 			if (m.type === 'method') {
-				const fn = m.value as JS.Function<Type>;
+				const fn = m.value as JS.FunctionExpr<Type>;
 				if (m.kind) {
 					if (typeof m.key === 'string') {
 						if (seen.has(m.key))
@@ -475,9 +649,21 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 						if (p.modifiers?.length)
 							extra.push({type: 'field', key: typeof p.key === 'string' ? p.key : '?', typeAnnotation: p.typeAnnotation, modifiers: p.modifiers});
 					}
-					return { type: 'method_signature', key: m.key, params: fn.params.map(stripParam) as JS.Param<Type>[], rest: fn.rest };
+					return {
+						type:	'method_signature',
+						key:	m.key,
+						params: fn.params.map(stripParam) as JS.Param<Type>[],
+						rest:	fn.rest
+					};
 				}
-				return { type: 'method_signature', key: m.key, params: fn.params.map(stripParam) as JS.Param<Type>[], rest: fn.rest, modifiers: m.modifiers, returnType: fn.returnType ?? checker.inferReturn(fn, global) };
+				return {
+					type:		'method_signature',
+					key:		m.key,
+					params:		fn.params.map(stripParam) as JS.Param<Type>[],
+					rest:		fn.rest,
+					modifiers:	m.modifiers,
+					returnType: fn.returnType ?? (fn.body ? checker.inferReturn(fn, fn.body, global) : undefined)
+				};
 			}
 			return undefined;
 		}).filter(m => m !== undefined).concat(...extra) as JS.ClassMember[];
@@ -507,19 +693,19 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 			},
 			(e, process) => {
 				if (e.type === 'identifier')
-					addRef(e.name, refs);
+					refs.add(e.name.split('.')[0]);
 				return process(e);
 			},
 			(t, process) =>{
 				if (t.type === 'ref')
-					addRef(t.name, refs);
+					refs.add(t.name.split('.')[0]);
 				return process(t);
 			}
 		);
 	};
 
 	const reachable = new Set<string>(roots);
-	const worklist = [...roots];
+	const worklist	= [...roots];
 	while (worklist.length) {
 		const refs = new Set<string>();
 		for (const owner of owners.get(worklist.pop()!) ?? []) {
@@ -549,7 +735,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 			case 'enum_decl':
 			case 'namespace_decl':
 				return reachable.has(stmt.name);
-			case 'var':
+			case 'var_decl':
 				return stmt.declarations.some(d => T.bindingNames(d.name).some(n => reachable.has(n)));
 			default:
 				return false;
@@ -567,7 +753,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 			case 'module_decl':
 			case 'export_assignment':
 				return stmt;
-			case 'var': {
+			case 'var_decl': {
 				return {type: 'declare', declaration: { ...stmt, 
 					declarations: stmt.declarations
 						.filter(d => T.bindingNames(d.name).some(n => reachable.has(n)))
@@ -577,71 +763,71 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		}
 	};
 
-	const filterDecls = (stmt: TS.Statement): TS.Statement|undefined => {
-		switch (stmt.type) {
-			case 'import':
-				if (stmt.specifiers) {
-					const spec = stmt.specifiers!.filter(s => reachable.has(s.local));
-					if (!spec.length)
-						return undefined;
-					return { ...stmt, specifiers: spec};
+	return {
+		type: 'program',
+		body: ast.body.map((stmt: TS.Statement): TS.Statement|undefined => {
+			switch (stmt.type) {
+				case 'import':
+					if (stmt.specifiers) {
+						const spec = stmt.specifiers!.filter(s => reachable.has(s.local));
+						if (!spec.length)
+							return undefined;
+						return { ...stmt, specifiers: spec};
 
-				} else if (stmt.namespace) {
-					if (!reachable.has(stmt.namespace))
-						return undefined;
-				}
-				return stmt;
-
-			case 'export_decl': {
-				const decl = stmt.declaration as JS.Declaration|TS.Declare;
-				if (decl.type === 'declare') {
-					if (isReachable(decl.declaration))
-						return stmt;
-				} else if (isReachable(decl)) {
-					return { type: 'export_decl', declaration: processNamedDecl(decl) as JS.Declaration };
-				}
-				return undefined;
-			}
-
-			case 'export':
-				if (stmt.default) {
-					switch (stmt.default.type) {
-						case 'identifier':
-							return stmt;
-						case 'function_decl':
-							return { ...stmt, default: stripFunctionDecl(stmt.default) };
-						case 'class_decl':
-							return { ...stmt, default: stripClassDecl(stmt.default) };
-						case 'function':
-							if (stmt.default.name) {
-								// `export default function foo() {}` parses as a *named function expression*, not a `function_decl` statement (`class`
-								// doesn't have this asymmetry). Converted to the idiomatic bodyless `export default function foo(): T;` .d.ts form.
-								return { ...stmt, default: stripFunctionDecl({
-									type: 'function_decl', name: stmt.default.name,
-									params: stmt.default.params, rest: stmt.default.rest,
-									returnType: stmt.default.returnType, typeParams: stmt.default.typeParams,
-								})};
-							}
-							//fallthrough
-						default:
-							// Anonymous default export -- ambient declarations can't have an inline value, so synthesize a name, the same trick `tsc` uses.
-							return { type: 'export', default: { type: 'identifier', name: '_default' } } as JS.Statement;
+					} else if (stmt.namespace) {
+						if (!reachable.has(stmt.namespace))
+							return undefined;
 					}
-				}
-				return stmt;
-
-			case 'declare':
-				if (isReachable(stmt.declaration))
 					return stmt;
-				return undefined;
-			
-			default:
-				if (isReachable(stmt as JS.Declaration))
-					return processNamedDecl(stmt as unknown as JS.Declaration);
-				return undefined;
-		}
-	};
 
-	const x = ast.body.map(filterDecls).filter(s => s !== undefined);
-	return {type: 'program', body: x };
+				case 'export_decl': {
+					const decl = stmt.declaration as JS.Declaration|TS.Declare;
+					if (decl.type === 'declare') {
+						if (isReachable(decl.declaration))
+							return stmt;
+					} else if (isReachable(decl)) {
+						return { type: 'export_decl', declaration: processNamedDecl(decl) as JS.Declaration };
+					}
+					return undefined;
+				}
+
+				case 'export':
+					if (stmt.default) {
+						switch (stmt.default.type) {
+							case 'identifier':
+								return stmt;
+							case 'function_decl':
+								return { ...stmt, default: stripFunctionDecl(stmt.default) };
+							case 'class_decl':
+								return { ...stmt, default: stripClassDecl(stmt.default) };
+							case 'function':
+								if (stmt.default.name) {
+									// `export default function foo() {}` parses as a *named function expression*, not a `function_decl` statement (`class`
+									// doesn't have this asymmetry). Converted to the idiomatic bodyless `export default function foo(): T;` .d.ts form.
+									return { ...stmt, default: stripFunctionDecl({
+										type: 'function_decl', name: stmt.default.name,
+										params: stmt.default.params, rest: stmt.default.rest,
+										returnType: stmt.default.returnType, typeParams: stmt.default.typeParams,
+									})};
+								}
+								//fallthrough
+							default:
+								// Anonymous default export -- ambient declarations can't have an inline value, so synthesize a name, the same trick `tsc` uses.
+								return { type: 'export', default: { type: 'identifier', name: '_default' } } as JS.Statement;
+						}
+					}
+					return stmt;
+
+				case 'declare':
+					if (isReachable(stmt.declaration))
+						return stmt;
+					return undefined;
+				
+				default:
+					if (isReachable(stmt as JS.Declaration))
+						return processNamedDecl(stmt as unknown as JS.Declaration);
+					return undefined;
+			}
+		}).filter(s => s !== undefined)
+	};
 }
