@@ -8,6 +8,7 @@ import { SEVERITY } from '../examples/TS/checker';
 
 const output = new TSoutput();
 let total_diag = 0;
+const total_sev = [] as number[];
 
 function test(name: string, code: string, outputCode = false) {
 	try {
@@ -33,11 +34,14 @@ function test(name: string, code: string, outputCode = false) {
 async function testAsync(name: string, pathname: string, outputCode = false) {
 	try {
 		console.log('====' + name + '====');
-		const {program, diagnostics} = await TStypeCheckAsync(pathname, SEVERITY.GAP);
+		const {program, diagnostics} = await TStypeCheckAsync(pathname, SEVERITY.ERROR, {target: 'es2022'});
 		if (diagnostics.length) {
 			console.error(`Type errors in ${name}:`);
-			for (const d of diagnostics)
+			for (const d of diagnostics) {
 				console.error(`  ${d.pos.line}:${d.pos.col} - ${d.message}`);
+				total_sev[d.severity] ??= 0;
+				++total_sev[d.severity];
+			}
 			total_diag += diagnostics.length;
 		}
 		if (outputCode) {
@@ -172,4 +176,5 @@ await testDir(path.join(__dirname, '../..'));
 
 console.log('\nAll tests completed!');
 console.log(`Total Diagnostics: ${total_diag}`);
+total_sev.forEach((n, i) => console.log(`${['GAP', 'WARNING', 'ERROR'][i]}: ${n}`));
 })();

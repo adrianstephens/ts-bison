@@ -23,12 +23,8 @@ export type binaryOps	= '+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'|'>>>'
 						|'&&='|'||='|'??='
 
 export interface TemplatePart { str: string; exp?: Expr; }
-
-export type Literal =
-	| { type: 'literal'; value: number | string | boolean | null | TemplatePart[] }
-	| { type: 'regex'; pattern: string; flags: string }
-	| { type: 'bigint'; value: string };	// because bigint can't round-trip through JSON.stringify
-export function Literal(value: number | string | boolean | null | TemplatePart[] ): Literal { return { type: 'literal', value } as const; }
+export type Literal = { type: 'literal'; value: number | bigint | string | boolean | null | RegExp | TemplatePart[] }
+export function Literal<T extends number | bigint | string | boolean | null | RegExp | TemplatePart[]>(value: T) { return { type: 'literal', value } as const; }
 
 export type Key = string | { computed: Expr };
 
@@ -81,17 +77,17 @@ export function CallSig<T, U>(...args: CallSigParams<T, U>) : CallSig<T, U> {
 }
 
 
-export interface ArrayLit					{ type: 'array'; elements: readonly (Expr | undefined)[] }
-export function ArrayLit(elements: readonly (Expr | undefined)[]): ArrayLit	{ return { type: 'array', elements}; }
+export interface ArrayLit { type: 'array'; elements: readonly (Expr | undefined)[] }
+export function  ArrayLit(elements: readonly (Expr | undefined)[]): ArrayLit	{ return { type: 'array', elements}; }
 
 export interface FunctionExpr<T = unknown, U = unknown> extends CallSig<T, U> { type: 'function'; name?: string; body?: Statement[]; modifiers?: string[] }
-export function FunctionExpr<T, U>(sig: CallSig<T, U>, body: Statement[], more?: Partial<FunctionExpr<T>>): FunctionExpr<T> { return { type: 'function', body, ...sig, ...more}; }
+export function  FunctionExpr<T, U>(sig: CallSig<T, U>, body: Statement[], more?: Partial<FunctionExpr<T>>): FunctionExpr<T> { return { type: 'function', body, ...sig, ...more}; }
 
 export interface Arrow<T = unknown> extends CallSig<T> { type: 'arrow'; body: Expr | Statement[]; modifiers?: string[] }
-export function Arrow<T>(sig: CallSig<T>, body: Expr | Statement[], more?: Partial<Arrow<T>>): Arrow<T> { return { body, ...sig, ...more, type: 'arrow'}; }
+export function  Arrow<T>(sig: CallSig<T>, body: Expr | Statement[], more?: Partial<Arrow<T>>): Arrow<T> { return { body, ...sig, ...more, type: 'arrow'}; }
 
 export interface ObjectExpr	{ type: 'object'; properties: readonly ObjectProperty[] }
-export function ObjectExpr(properties: readonly ObjectProperty[]): ObjectExpr { return {type: 'object', properties }; }
+export function  ObjectExpr(properties: readonly ObjectProperty[]): ObjectExpr { return {type: 'object', properties }; }
 
 export interface Class<T = unknown, U = unknown> { name?: string; superClass?: Expr; body: ClassMember<T, U>[]; typeParams?: U[]; implementsClause?: T[]; abstract?: boolean };
 
@@ -122,18 +118,18 @@ export type Expr =
 
 
 export type ClassMember0<T = unknown, U = unknown> =
-	| { type: 'method'; kind?: 'get' | 'set'; key: Key; value: FunctionExpr<T, U>; modifiers?: string[] }
+	| { type: 'method'; kind?: 'get' | 'set'; key: Key; body?: Statement[], modifiers?: string[] } & CallSig<T, U>
 	| { type: 'field'; key: Key; value?: Expr; modifiers?: string[]; typeAnnotation?: T; }
 export type ClassMember<T = unknown, U = unknown> = ClassMember0<T, U> | { type: 'static_block'; body: Statement[] }
 
-export interface FunctionDecl<T = unknown, U = unknown>	extends CallSig<T, U> { type: 'function_decl'; name: string; body?: Statement[]; modifiers?: string[] };
+export interface FunctionDecl<T = unknown, U = unknown>	extends CallSig<T, U> { type: 'function_decl'; name: string; body?: Statement[]; modifiers?: string[]; ambient?: boolean };
 export function  FunctionDecl<T, U>(name: string, sig: CallSig<T, U>, body?: Statement[], more?: Partial<FunctionDecl<T>>): FunctionDecl { return { type: 'function_decl', name, body, ...sig, ...more}; }
 
-export interface ClassDecl<T = unknown, U = unknown> extends Class<T, U> { type: 'class_decl'; name: string }
+export interface ClassDecl<T = unknown, U = unknown> extends Class<T, U> { type: 'class_decl'; name: string; ambient?: boolean; }
 
 export interface VarDeclarator<T = unknown> { name: BindingTarget; init?: Expr; typeAnnotation?: T; definite?: boolean; }
 export type DeclarationKind			= 'var' | 'let' | 'const' | 'using' | 'await using';
-export interface VarDecl<T = unknown>	{ type: 'var_decl'; kind: DeclarationKind; declarations: VarDeclarator<T>[] }
+export interface VarDecl<T = unknown>	{ type: 'var_decl'; kind: DeclarationKind; ambient?: boolean; declarations: VarDeclarator<T>[] }
 export function  VarDecl<T>(kind: DeclarationKind, ...declarations: VarDeclarator<T>[]): VarDecl<T> { return { type: 'var_decl', kind, declarations }; }
 
 export type Declaration = VarDecl | FunctionDecl | ClassDecl;
@@ -521,7 +517,7 @@ const template_literal_parts = List(template_literal_part);
 
 function parseNumber(text: string): Literal {
 	if (text.endsWith('n'))
-		return { type: 'bigint', value: text.slice(0, -1).replace(/_/g, '') };
+		return Literal(BigInt(text.slice(0, -1).replace(/_/g, '')));
 	const clean = text.replace(/_/g, '');
 	return Literal(
 			/^0[xX]/.test(clean) ? parseInt(clean, 16)
@@ -538,7 +534,7 @@ const primaryRules = (objectLiteral?: Rules<Expr>): Rules<Expr> => [
 	Rule([IDENT] as const,						$ => ({ type: 'identifier', name: $[0] } as const)),
 	Rule([NUM] as const, 						$ => parseNumber($[0])),
 	Rule([STR] as const, 						$ => Literal(unquoteString($[0]))),
-	Rule([REGEX_LITERAL] as const,				$ => { const m = /^\/(.*)\/([a-zA-Z]*)$/.exec($[0])!; return { type: 'regex', pattern: m[1], flags: m[2] } as const; }),
+	Rule([REGEX_LITERAL] as const,				$ => { const m = /^\/(.*)\/([a-zA-Z]*)$/.exec($[0])!; return Literal(new RegExp(m[1], m[2])); }),
 	Rule(['true'] as const, 					_ => Literal(true)),
 	Rule(['false'] as const,					_ => Literal(false)),
 	Rule(['null'] as const,						_ => Literal(null)),
@@ -767,12 +763,12 @@ export const class_member_name = Rules(
 );
 
 export const class_member_body = Rules<ClassMember0>(
-	Rule([class_member_name, parameter_clause, '{', function_body, '}'] as const, 				$ => ({ type: 'method', ...$[0], 	value: FunctionExpr($[1], $[3]) } as const)),
-	Rule(['*', class_member_name, parameter_clause, '{', function_body, '}'] as const, 			$ => ({ type: 'method', ...$[1], 	value: FunctionExpr($[2], $[4], { modifiers: ['generator'] }) } as const)),
-	Rule([GET, property_name_computed, '(', ')', '{', function_body, '}'] as const, 			$ => ({ type: 'method', kind: 'get', key: $[1], value: FunctionExpr({params: []}, $[5]) } as const)),
-	Rule([SET, property_name_computed, '(', IDENT, ')', '{', function_body, '}'] as const, 		$ => ({ type: 'method', kind: 'set', key: $[1], value: FunctionExpr({params: [{key: $[3]}]}, $[6]) } as const)),
-	Rule([ASYNC, class_member_name, parameter_clause, '{', function_body, '}'] as const, 		$ => ({ type: 'method', ...$[1], 	value: FunctionExpr($[2], $[4], { modifiers: ['async'] }) } as const)),
-	Rule([ASYNC, '*', class_member_name, parameter_clause, '{', function_body, '}'] as const,	$ => ({ type: 'method', ...$[2], 	value: FunctionExpr($[3], $[5], { modifiers: ['async', 'generator'] }) } as const)),
+	Rule([class_member_name, parameter_clause, '{', function_body, '}'] as const, 				$ => ({ type: 'method', ...$[0], ...$[1], body:	$[3] } as const)),
+	Rule(['*', class_member_name, parameter_clause, '{', function_body, '}'] as const, 			$ => ({ type: 'method', ...$[1], ...$[2], body: $[4], modifiers: ['generator']} as const)),
+	Rule([GET, property_name_computed, '(', ')', '{', function_body, '}'] as const, 			$ => ({ type: 'method', kind: 'get', key: $[1], params: [], body:$[5] } as const)),
+	Rule([SET, property_name_computed, '(', IDENT, ')', '{', function_body, '}'] as const, 		$ => ({ type: 'method', kind: 'set', key: $[1], params: [{key: $[3]}], body: $[6] } as const)),
+	Rule([ASYNC, class_member_name, parameter_clause, '{', function_body, '}'] as const, 		$ => ({ type: 'method', ...$[1], ...$[2], body: $[4], modifiers: ['async'] } as const)),
+	Rule([ASYNC, '*', class_member_name, parameter_clause, '{', function_body, '}'] as const,	$ => ({ type: 'method', ...$[2], ...$[3], body: $[5], modifiers: ['async', 'generator'] } as const)),
 	Rule([class_member_name, ';'] as const, 													$ => ({ type: 'field', ...$[0] } as const)),
 	Rule([class_member_name, '=', assignment_expression, ';'] as const, 						$ => ({ type: 'field', ...$[0], value: $[2] } as const)),
 );

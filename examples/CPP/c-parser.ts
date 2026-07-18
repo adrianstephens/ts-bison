@@ -463,8 +463,8 @@ const parser = makeParser({
 export const cParser = {
 	...parser,
 	// source runs through the preprocessor first; `options` supplies -D defines and an #include resolver
-	parse: (code: string, options?: PreprocessOptions) => {
-		return parser.parse(preprocess(code, options), {
+	parse: async (code: string, options?: PreprocessOptions) => {
+		return parser.parse(await preprocess(code, options), {
 			pendingTypedef: false,
 			typedefNames: new Set<string>(),
 		});

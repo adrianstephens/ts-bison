@@ -8,8 +8,10 @@
 export interface PreprocessOptions {
 	// -D equivalents; keys may be function-like ('MIN(a,b)'), values are replacement text
 	defines?:	Record<string, string>;
-	// return source text for an #include, or undefined to skip it silently (the default)
-	include?:	(name: string, angled: boolean) => Promise<string | undefined>;
+	// resolve an #include: `from` is the path of the including file (for relative lookup). Return the
+	// source, or {path, source} so nested relative includes/#pragma once/__FILE__ see the real path;
+	// undefined skips the include silently (the default).
+	include?:	(name: string, angled: boolean, from: string) => Promise<string | { path: string; source: string } | undefined>;
 	filename?:	string;
 }
 
@@ -190,6 +192,7 @@ export class Preprocessor {
 	private out:	string[] = [];
 	private file	= '';
 	private depth	= 0;
+	private once	= new Set<string>();	// files that declared #pragma once, keyed by their run() path
 
 	constructor(private options: PreprocessOptions = {}) {
 		for (const [k, v] of Object.entries(options.defines ?? {}))
@@ -388,11 +391,15 @@ export class Preprocessor {
 		if (!m)
 			this.error(line, 'bad #include');
 		const name = m[1] ?? m[2];
-		const src = await this.options.include?.(name, m[2] !== undefined);
-		if (src !== undefined) {
+		const res = await this.options.include?.(name, m[2] !== undefined, this.file);
+		if (res !== undefined) {
+			const path	= typeof res === 'string' ? name : res.path;
+			const src	= typeof res === 'string' ? res : res.source;
+			if (this.once.has(path))
+				return;
 			if (++this.depth > 50)
 				this.error(line, `include depth exceeded at '${name}'`);
-			this.run(src, name);
+			await this.run(src, path);
 			--this.depth;
 		}
 	}
@@ -401,7 +408,7 @@ export class Preprocessor {
 		this.active = this.cond.every(c => c.active);
 	}
 
-	private directive(name: string, rest: string, line: number) {
+	private async directive(name: string, rest: string, line: number) {
 		switch (name) {
 			case 'if':
 			case 'ifdef':
@@ -449,9 +456,13 @@ export class Preprocessor {
 							this.macros.delete(m[0]);
 						break;
 					}
-					case 'include':	this.include(rest, line); break;
+					case 'include':	await this.include(rest, line); break;
 					case 'error':	this.error(line, `#error ${rest.trim()}`); break;
-					default:		break;	// #pragma, #line, #warning, null and unknown directives are ignored
+					case 'pragma':
+						if (/^once\b/.test(rest.trim()))
+							this.once.add(this.file);
+						break;
+					default:		break;	// #line, #warning, null and unknown directives are ignored
 				}
 				return;
 		}
@@ -470,7 +481,7 @@ export class Preprocessor {
 			this.out.push(lines[i] ?? '');
 	}
 
-	run(src: string, file: string) {
+	async run(src: string, file: string) {
 		const saveFile	= this.file;
 		const saveCond	= this.cond.length;
 		this.file = file;
@@ -496,7 +507,7 @@ export class Preprocessor {
 			const d = /^[ \t]*#[ \t]*(\w*)[ \t]*([^]*)$/.exec(text);
 			if (d) {
 				flush();
-				this.directive(d[1], d[2], start);
+				await this.directive(d[1], d[2], start);
 				for (let k = 0; k < phys; ++k)
 					this.out.push('');
 			} else if (this.active) {
@@ -517,8 +528,8 @@ export class Preprocessor {
 	}
 }
 
-export function preprocess(source: string, options: PreprocessOptions = {}): string {
+export async function preprocess(source: string, options: PreprocessOptions = {}): Promise<string> {
 	const pp = new Preprocessor(options);
-	pp.run(source, options.filename ?? '<source>');
+	await pp.run(source, options.filename ?? '<source>');
 	return pp.result;
 }

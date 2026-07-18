@@ -259,7 +259,9 @@ export const TYPE_SCOPE = terminal('TYPE_SCOPE');
 // `file.get<uint32>()`). Decided lexically -- `<` after a callable name is otherwise a comparison, and
 // the engine's GLR forks share ctx, so a templateDepth-mutating fork can't arbitrate this one.
 export const TEMPLATE_FN = terminal('TEMPLATE_FN');
-const TEMPLATE_CALL_RE = /^\s*<[^;{}<>]*>\s*\(/;
+// `<args>(` is a call; `<args>` right before `)` `,` is a template-id used as a value (`vput(tput<T>)`)
+// -- as comparisons those would leave `>` with no right operand, so the template reading is safe.
+const TEMPLATE_CALL_RE = /^\s*<[^;{}<>]*>\s*[(),]/;
 
 // Destructures `match`/`remaining` out of the lex-context param in the body rather than the parameter list
 // itself (`({ match, remaining }, ctx) => ...`) -- a destructured *first* arrow parameter followed by a typed
@@ -286,6 +288,10 @@ IDENT.callback = (lex, ctx: Ctx & Partial<CppCtx>) => {
 			&& (prevName === 'TYPE_NAME' || ['*', '&', '&&', '>'].includes(prevName) || (BUILTIN_TYPE as readonly string[]).includes(prevName))
 			&& /^\s*[,;)]/.test(remaining))
 		return IDENT;
+	// A registered name can still head an explicit-template-arg call (`C::as<float>()` where `as` also
+	// names a type somewhere) -- `<...>(` never reads as comparison-then-parenthesis.
+	if (ctx.templateDepth !== undefined && TEMPLATE_CALL_RE.test(remaining))
+		return TEMPLATE_FN;
 	// Shadowing demotion: C++ lets a variable share a class's name (`class file` + `char *file`), so a
 	// registered name followed by something no *type* can precede (member access, assignment, comparison,
 	// arithmetic, subscript outside `new T[n]`) is really a variable here. `< > >> * & ( ) , ;` all stay:
@@ -373,6 +379,18 @@ primaryExpressionCast.push(
 	// declaration's specifier list (`if (errors)` vs `if (int x = ...`), same as js-parser's primary ident.
 	ForceFork(Rule([TYPE_NAME] as const,	$ => ({ type: 'identifier', name: $[0] } as const))),
 );
+
+// Adjacent string-literal concatenation (`printf(TAG ": failed\n")` after macro expansion). The
+// IDENT-led form tolerates macros whose definition lives in an unresolvable header -- an identifier
+// right before a string is never anything else.
+const string_concat = Rules<string>(self => [
+	Rule([STRING_LITERAL, STRING_LITERAL] as const,	$ => $[0].slice(0, -1) + $[1].slice(1)),
+	Rule([IDENT, STRING_LITERAL] as const,			$ => $[1]),
+	Rule([self, STRING_LITERAL] as const,			$ => $[0].slice(0, -1) + $[1].slice(1)),
+]);
+primaryExpressionCast.push(
+	Rule([string_concat] as const,	$ => ({ type: 'literal', value: $[0] } as const)),
+);
 (direct_declarator as unknown as Rules<Declarator>).push(
 	// ForceFork: in `int token, x;` (with `token` also registered) this reduce ties with
 	// `type_specifier -> TYPE_NAME` and earlier-rule-wins picks the specifier, dying at the ','.
@@ -413,11 +431,14 @@ const unknown_type_field = Rules<unknown>(
 	Rule([unknown_type_field] as const, $ => $[0]),
 );
 
-// Casts through unknown pointer types (`(MemoryPoolCleanup*)fn`, `(uint32le*)p`): `( IDENT * )` can't
-// be a grouped expression (the `*` would need a right operand before `)`), so the cast reading is safe.
+// Casts through unknown pointer types (`(MemoryPoolCleanup*)fn`, `(uint32le*)p`). ForceFork: after
+// `( IDENT` the `*` is one-token-ambiguous with multiplication (`(hval * 13)`). The `*`s are spelled
+// inline, NOT via `pointer` -- the fork tag only reaches a conflict whose shift item is on THIS rule.
 (assignment_expression as unknown as Rules<Expr | CppExpr>).push(
-	WithPrec(Rule(['(', IDENT, pointer, ')', assignment_expression] as const,
-		$ => ({ type: 'cast', type1: { specifiers: [{ type: 'type', name: $[1] }], declarator: { type: 'pointer', pointer: $[2] } } as unknown as TypeName, expression: $[4] } as const)), PREC.cast),
+	ForceFork(Rule(['(', IDENT, '*', ')', assignment_expression] as const,
+		$ => ({ type: 'cast', type1: { specifiers: [{ type: 'type', name: $[1] }], declarator: { type: 'pointer', pointer: [{ level: 1 }] } } as unknown as TypeName, expression: $[4] } as const))),
+	ForceFork(Rule(['(', IDENT, '*', '*', ')', assignment_expression] as const,
+		$ => ({ type: 'cast', type1: { specifiers: [{ type: 'type', name: $[1] }], declarator: { type: 'pointer', pointer: [{ level: 2 }] } } as unknown as TypeName, expression: $[5] } as const))),
 );
 
 // Constructor-style local/global initialization (`int x(5);`, `C_type t(C_type::UNKNOWN);`). An
@@ -633,6 +654,8 @@ assignmentExpressionCast.push(
 		$ => ({ type: 'new', placement: $[2], typeName: $[4], arguments: [] } as const)), 'unary'),
 	WithPrec(Rule(['new', '(', argument_expression_list, ')', type_specifier, '(', argument_expression_list, ')'] as const,
 		$ => ({ type: 'new', placement: $[2], typeName: $[4], arguments: $[6] } as const)), 'unary'),
+	WithPrec(Rule(['new', '(', argument_expression_list, ')', type_specifier, '[', expression, ']'] as const,
+		$ => ({ type: 'new', placement: $[2], typeName: $[4], size: $[6] } as const)), 'unary'),
 	WithPrec(Rule(['delete', assignment_expression] as const,							$ => ({ type: 'delete', operand: $[1] } as const)), 'unary'),
 	WithPrec(Rule(['delete', '[', ']', assignment_expression] as const,					$ => ({ type: 'delete', operand: $[3], array: true } as const)), 'unary'),
 
@@ -737,6 +760,9 @@ const const_arg = Rules<Expr>(
 	Rule(['(', expression, ')'] as const,		$ => $[1]),
 	// Qualified names with an unregistered tail (`SEI::buffering_period` as a template argument).
 	Rule([scope_prefix, IDENT] as const,		$ => ({ type: 'qualified', parts: [...$[0], $[1]] } as unknown as Expr)),
+	// Member-pointer constants (`T_checktype<S, &U::top_expr>` -- the SFINAE detection idiom).
+	Rule(['&', scope_prefix, IDENT] as const,	$ => ({ type: 'member_pointer_const', parts: [...$[1], $[2]] } as unknown as Expr)),
+	Rule(['&', scope_prefix, TYPE_NAME] as const, $ => ({ type: 'member_pointer_const', parts: [...$[1], $[2]] } as unknown as Expr)),
 );
 
 const template_argument = Rules<TemplateArg>(
@@ -755,6 +781,12 @@ const template_argument_list = List(template_argument, ',');
 		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'member_template_ref', ...$[0], args: $[1] } as unknown as Expr, arguments: [] } as const; }),
 	Rule([member_template_fn_open, template_argument_list, '>', '(', argument_expression_list, ')'] as const,
 		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'member_template_ref', ...$[0], args: $[1] } as unknown as Expr, arguments: $[4] } as const; }),
+	// Template-id as a plain value (`vput(tput<T>)` -- a pointer to a specialization, no call).
+	Rule([template_fn_open, template_argument_list, '>'] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'template_ref', name: $[0], args: $[1] } as unknown as Expr; }),
+	// Static member of a template-id in expression position (`T_same<A, B>::value`).
+	Rule([generic_type_open, template_argument_list, '>', '::', IDENT] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'qualified', parts: [`${$[0]}<>`, $[4]] } as unknown as Expr; }),
 );
 
 // `TYPE_NAME '<'` (shift) vs the plain `[TYPE_NAME]` alt already on `type_specifier` (reduce) is an
@@ -766,6 +798,9 @@ typeSpecifierCast.push(
 	// `typename T::type` -- the dependent-name escape hatch, safe on type_specifier since it leads with
 	// its own keyword.
 	Rule(['typename', scope_prefix, type_ident] as const,	$ => ({ type: 'qualified_type', parts: [...$[1], $[2]], dependent: true } as const)),
+	// `typename T_if<b, T, F>::type` -- the scope is itself a template-id, beyond scope_prefix's reach.
+	Rule(['typename', generic_type_open, template_argument_list, '>', '::', type_ident] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'qualified_type', parts: [`${$[1]}<>`, $[5]], dependent: true } as unknown as QualifiedType; }),
 );
 
 // Qualified types (`Foo::Inner x;` -- Inner itself registered, automatic for in-file nested types) and
@@ -920,6 +955,8 @@ const method_declarator = Rules<{ name: string; parameters: ParamOrVariadic[] }>
 const method_signature = Rules<CppDeclarator>(
 	Rule([method_declarator] as const,			$ => ({ type: 'function', name: { type: 'identifier', name: $[0].name }, parameters: $[0].parameters } as const)),
 	Rule([pointer, method_declarator] as const,	$ => ({ type: 'pointer', pointer: $[0], to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
+	// Reference-to-pointer returns (`static T * &head() {...}`).
+	Rule([pointer, '&', method_declarator] as const,	$ => ({ type: 'reference', to: { type: 'pointer', pointer: $[0], to: { type: 'function', name: { type: 'identifier', name: $[2].name }, parameters: $[2].parameters } } } as unknown as CppDeclarator)),
 	Rule(['&', method_declarator] as const,		$ => ({ type: 'reference', to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
 	Rule(['&&', method_declarator] as const,	$ => ({ type: 'rvalue_reference', to: { type: 'function', name: { type: 'identifier', name: $[1].name }, parameters: $[1].parameters } } as const)),
 );
@@ -997,6 +1034,8 @@ const operator_id = Rules<string>(
 	Rule(['operator', '[', ']'] as const,			() => '[]'),
 	Rule(['operator', 'new'] as const,				() => 'new'),
 	Rule(['operator', 'delete'] as const,			() => 'delete'),
+	Rule(['operator', 'new', '[', ']'] as const,	() => 'new[]'),
+	Rule(['operator', 'delete', '[', ']'] as const,	() => 'delete[]'),
 );
 const operator_declarator = Rules<{ name: string; parameters: ParamOrVariadic[] }>(
 	Rule([operator_id, '(', ')'] as const,							$ => ({ name: $[0], parameters: [] } as const)),
@@ -1052,20 +1091,53 @@ for (const lead of [[], [pointer], ['&']] as unknown[][]) {
 removeRules(struct_declarator, rhs => rhs.length === 1 && rhs[0] === IDENT);
 (struct_declarator as unknown as Rules<unknown>).push(...field_shapes);
 
-// Function-pointer members (`void (*fn)(void*);`). The leading `( *` can't start a method (methods
-// start with a name), so this never competes with method_declarator.
+// Function-pointer members (`void (*fn)(void*);`, `HAL* (*CreateHAL)(CG*);`). The `( *` can't start a
+// method (methods start with a name), so this never competes with method_declarator.
 for (const nameT of [IDENT, TYPE_NAME]) {
-	(struct_declarator as unknown as Rules<unknown>).push(
-		Rule(['(', '*', nameT, ')', '(', ')'] as any,
-			($: any[]) => ({ declarator: { type: 'function', name: { type: 'pointer', pointer: [{ level: 1 }], to: { type: 'identifier', name: $[2] } }, parameters: [] } })),
-		Rule(['(', '*', nameT, ')', '(', parameter_type_list, ')'] as any,
-			($: any[]) => ({ declarator: { type: 'function', name: { type: 'pointer', pointer: [{ level: 1 }], to: { type: 'identifier', name: $[2] } }, parameters: $[5] } })),
-	);
+	for (const lead of [[], [pointer]] as unknown[][]) {
+		const n = lead.length;
+		(struct_declarator as unknown as Rules<unknown>).push(
+			Rule([...lead, '(', '*', nameT, ')', '(', ')'] as any,
+				($: any[]) => ({ declarator: { type: 'function', name: { type: 'pointer', pointer: [{ level: 1 }], to: { type: 'identifier', name: $[n + 2] } }, parameters: [], returnPointer: n ? $[0] : undefined } })),
+			Rule([...lead, '(', '*', nameT, ')', '(', parameter_type_list, ')'] as any,
+				($: any[]) => ({ declarator: { type: 'function', name: { type: 'pointer', pointer: [{ level: 1 }], to: { type: 'identifier', name: $[n + 2] } }, parameters: $[n + 5], returnPointer: n ? $[0] : undefined } })),
+		);
+	}
 }
 
 // `struct_declaration` is C's "one member declaration" production -- widening it here is what lets class
 // bodies mix plain fields (already handled by c-parser.ts's own rule) with everything else.
 const structDeclarationCast = struct_declaration as unknown as Rules<StructMember | ClassMember>;
+
+// Member typedefs (`typedef T type;`, `typedef char yes[1], no[2];`) -- after the `typedef` keyword
+// there's no method ambiguity, so the general struct_declarator_list is safe here. Every declared name
+// registers as a type.
+const declNames = (d: unknown): string[] => {
+	if (typeof d !== 'object' || d === null)
+		return [];
+	const o = d as Record<string, unknown>;
+	return o.type === 'identifier' ? [o.name as string] : Object.values(o).flatMap(declNames);
+};
+structDeclarationCast.push(
+	Rule(['typedef', specifier_qualifier_list, struct_declarator_list, ';'] as const,
+		($, ctx: Ctx) => {
+			for (const name of declNames($[2]))
+				ctx.typedefNames.add(name);
+			return { type: 'member_typedef', specifiers: $[1], declarators: $[2] } as unknown as ClassMember;
+		}),
+);
+
+// Fn-ptr members with a single TYPE_NAME return (`Blob (*vopen)(Includer*, const char*);`): a whole-
+// member rule with the TYPE_NAME spelled inline, because the in-class ctor's own `TYPE_NAME (` shift
+// otherwise beats the spec_qual reduce that the struct_declarator shapes depend on.
+for (const nameT of [IDENT, TYPE_NAME]) {
+	structDeclarationCast.push(
+		Rule([TYPE_NAME, '(', '*', nameT, ')', '(', ')', ';'] as any,
+			($: any[]) => ({ type: 'struct_member', typeSpecifiers: [{ type: 'type', name: $[0] }], declarators: [{ declarator: { type: 'function', name: { type: 'pointer', pointer: [{ level: 1 }], to: { type: 'identifier', name: $[3] } }, parameters: [] } }] } as unknown as StructMember)),
+		Rule([TYPE_NAME, '(', '*', nameT, ')', '(', parameter_type_list, ')', ';'] as any,
+			($: any[]) => ({ type: 'struct_member', typeSpecifiers: [{ type: 'type', name: $[0] }], declarators: [{ declarator: { type: 'function', name: { type: 'pointer', pointer: [{ level: 1 }], to: { type: 'identifier', name: $[3] } }, parameters: $[6] } }] } as unknown as StructMember)),
+	);
+}
 structDeclarationCast.push(
 	Rule([termOneOf(['public', 'private', 'protected'] as const), ':'] as const,	$ => ({ type: 'access_label', access: $[0] } as const)),
 
@@ -1194,6 +1266,19 @@ const out_of_class_def = Rules<CppDefinition>(
 	Rule([declaration_specifiers, pointer, scope_prefix, IDENT, '=', assignment_expression, ';'] as const,		$ => ({ type: 'static_member_def', specifiers: $[0], pointer: $[1], scope: $[2], name: $[3], initializer: $[5] } as const)),
 	Rule([declaration_specifiers, pointer, scope_prefix, IDENT, ';'] as const,									$ => ({ type: 'static_member_def', specifiers: $[0], pointer: $[1], scope: $[2], name: $[3] } as const)),
 	Rule([declaration_specifiers, pointer, scope_prefix, operator_signature, method_tail] as const,				$ => ({ type: 'operator_def', specifiers: $[0], scope: $[2], operator: $[3].name, parameters: $[3].parameters, tail: $[4] } as const)),
+	// Reference returns (`float& C::f() {...}`) -- mirrors the pointer variants above.
+	Rule([declaration_specifiers, '&', scope_prefix, IDENT, '(', ')', method_tail] as const,					$ => ({ type: 'method_def', specifiers: $[0], reference: true, scope: $[2], name: $[3], parameters: [], tail: $[6] } as unknown as OutOfClassMethod)),
+	Rule([declaration_specifiers, '&', scope_prefix, IDENT, '(', parameter_type_list, ')', method_tail] as const, $ => ({ type: 'method_def', specifiers: $[0], reference: true, scope: $[2], name: $[3], parameters: $[5], tail: $[7] } as unknown as OutOfClassMethod)),
+	// Explicit specializations of member templates (`template<> inline float& C::as<float>() {...}`) --
+	// the name lexes as TEMPLATE_FN (followed by `<...>(`), so reuse template_fn_open's depth machinery.
+	Rule([declaration_specifiers, scope_prefix, template_fn_open, template_argument_list, '>', '(', ')', method_tail] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'method_def', specifiers: $[0], scope: $[1], name: $[2], nameArgs: $[3], parameters: [], tail: $[7] } as unknown as OutOfClassMethod; }),
+	Rule([declaration_specifiers, scope_prefix, template_fn_open, template_argument_list, '>', '(', parameter_type_list, ')', method_tail] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'method_def', specifiers: $[0], scope: $[1], name: $[2], nameArgs: $[3], parameters: $[6], tail: $[8] } as unknown as OutOfClassMethod; }),
+	Rule([declaration_specifiers, '&', scope_prefix, template_fn_open, template_argument_list, '>', '(', ')', method_tail] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'method_def', specifiers: $[0], reference: true, scope: $[2], name: $[3], nameArgs: $[4], parameters: [], tail: $[8] } as unknown as OutOfClassMethod; }),
+	Rule([declaration_specifiers, '&', scope_prefix, template_fn_open, template_argument_list, '>', '(', parameter_type_list, ')', method_tail] as const,
+		($, ctx: CppCtx) => { ctx.templateDepth--; return { type: 'method_def', specifiers: $[0], reference: true, scope: $[2], name: $[3], nameArgs: $[4], parameters: $[7], tail: $[9] } as unknown as OutOfClassMethod; }),
 	// Ctor-style static member init (`const C_type C_types::dummy(C_type::UNKNOWN);`).
 	Rule([declaration_specifiers, scope_prefix, IDENT, '(', argument_expression_list, ')', ';'] as const,		$ => ({ type: 'static_member_def', specifiers: $[0], scope: $[1], name: $[2], ctorArgs: $[4] } as const)),
 	// Shadowed method names (`bool HashTable::Match(...)` with `Match` also registered as a type).
@@ -1259,6 +1344,8 @@ const template_param = Rules<TemplateParam>(
 	// TYPE_NAME variants: non-type parameter names can collide with registered names (`template<int B>`).
 	Rule([nontype_param_type, TYPE_NAME] as const,	$ => ({ name: $[1], nonType: $[0] } as const)),
 	Rule([nontype_param_type, TYPE_NAME, '=', assignment_expression] as const,	$ => ({ name: $[1], nonType: $[0], default: $[3] } as const)),
+	// Unnamed non-type parameters (`template<typename T, T> struct T_checktype;`).
+	Rule([nontype_param_type] as const,				$ => ({ name: '', nonType: $[0] } as const)),
 );
 const template_param_list = List(template_param, ',');
 
@@ -1283,6 +1370,19 @@ externalDefinitionCast.push(
 // Member templates (`template<class U> void set(U x) {...}` inside a class body).
 structDeclarationCast.push(
 	Rule([template_head, specifier_qualifier_list, method_signature, method_tail] as const,		$ => ({ type: 'member_template', params: $[0], declaration: { type: 'method', specifiers: $[1], declarator: $[2] as Declarator, ...$[3] } } as const)),
+	// With leading modifiers (`template<typename T> static void tput(...) {...}`).
+	Rule([template_head, member_mods, specifier_qualifier_list, method_signature, method_tail] as const,
+		$ => ({ type: 'member_template', params: $[0], declaration: { type: 'method', specifiers: $[2], declarator: $[3] as Declarator, modifiers: $[1], ...$[4] } } as unknown as MemberTemplate)),
+	// Templated conversion operators (`template<typename T> operator T*() const {...}`).
+	Rule([template_head, 'operator', specifier_qualifier_list, '(', ')', method_tail] as const,
+		$ => ({ type: 'member_template', params: $[0], declaration: { type: 'conversion', target: { specifiers: $[2] }, ...$[5] } } as unknown as MemberTemplate)),
+	Rule([template_head, 'operator', specifier_qualifier_list, pointer, '(', ')', method_tail] as const,
+		$ => ({ type: 'member_template', params: $[0], declaration: { type: 'conversion', target: { specifiers: $[2], declarator: { type: 'pointer', pointer: $[3] } }, ...$[6] } } as unknown as MemberTemplate)),
+	// Templated in-class constructors (`template<typename T> Outputter(T *t) : vput(tput<T>) {}`).
+	Rule([template_head, TYPE_NAME, '(', ')', ctor_tail] as const,
+		$ => ({ type: 'member_template', params: $[0], declaration: { type: 'constructor', name: $[1], parameters: [], ...$[4] } } as unknown as MemberTemplate)),
+	Rule([template_head, TYPE_NAME, '(', parameter_type_list, ')', ctor_tail] as const,
+		$ => ({ type: 'member_template', params: $[0], declaration: { type: 'constructor', name: $[1], parameters: $[3], ...$[5] } } as unknown as MemberTemplate)),
 );
 
 // ===================================================================
@@ -1374,7 +1474,7 @@ export interface Options extends PreprocessOptions {
 	knownTypes?: Iterable<string>;
 }
 
-export const parse = (code: string, options?: Options) => parser.parse(preprocess(code, options), {
+export const parse = async (code: string, options?: Options) => parser.parse(await preprocess(code, options), {
 	pendingTypedef: false,
 	typedefNames: new Set<string>(options?.knownTypes),
 	templateDepth: 0,

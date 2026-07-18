@@ -136,8 +136,8 @@ class NodeModules {
 	// so there's nothing more meaningful than the module's own name to use as their canonical specifier.
 	protected registerDeclaredModules(body: TS.Statement[]) {
 		for (const s of body) {
-			if (s.type === 'declare' && s.declaration.type === 'module_decl')
-				this.imported.set(s.declaration.name, { body: s.declaration.body, canonical: s.declaration.name });
+			if (s.type === 'module_decl' && s.ambient)
+				this.imported.set(s.name, { body: s.body, canonical: s.name });
 		}
 	}
 
@@ -156,16 +156,21 @@ class NodeModules {
 	// cycles are vanishingly rare in practice, unlike real import cycles.
 	private async withReferences(code: string, canonical: string, seen: Set<string>): Promise<TS.Statement[]> {
 		seen.add(canonical);
-		const body = TS.parse(code).body;
-		for (const [, kind, ref] of code.matchAll(referenceRE)) {
-			const refMod = kind === 'types' ? ref : joinSpecifier(canonical, kind === 'lib' ? './lib.' + ref : ref);
-			if (!seen.has(refMod)) {
-				const res = await this.tryLocalCode(refMod);
-				if (res)
-					body.push(...await this.withReferences(res.code, res.canonical, seen));
+		try {
+			const body = TS.parse(code).body;
+			for (const [, kind, ref] of code.matchAll(referenceRE)) {
+				const refMod = kind === 'types' ? ref : joinSpecifier(canonical, kind === 'lib' ? './lib.' + ref : ref);
+				if (!seen.has(refMod)) {
+					const res = await this.tryLocalCode(refMod);
+					if (res)
+						body.push(...await this.withReferences(res.code, res.canonical, seen));
+				}
 			}
+			return body;
+		} catch(e) {
+			console.error(`Failed to parse ${canonical}: ${e}`);
+			return [];
 		}
-		return body;
 	}
 
 	async get(mod: string): Promise<LoadedModule | undefined> {
@@ -184,20 +189,16 @@ class NodeModules {
 				this.imported.set(mod, existing);
 				return existing;
 			}
-			try {
-				const body = await this.withReferences(res.code, res.canonical, new Set());
-				this.registerDeclaredModules(body);
-				const fileEntry = { body, canonical: res.canonical };
-				this.imported.set(res.canonical, fileEntry);
-				// `registerDeclaredModules` may have just registered an ambient `declare module '<mod>' { ... }` found *inside* this
-				// file under the exact key `mod` (e.g. `@types/vscode`'s `index.d.ts` is just `declare module 'vscode' { ... }`) --
-				// that unwrapped inner body is what `mod` itself should resolve to, not this file's own (still-wrapped) top level.
-				const entry = this.imported.get(mod) ?? fileEntry;
-				this.imported.set(mod, entry);
-				return entry;
-			} catch(e) {
-				console.error(`Failed to parse ${mod}: ${e}`);
-			}
+			const body = await this.withReferences(res.code, res.canonical, new Set());
+			this.registerDeclaredModules(body);
+			const fileEntry = { body, canonical: res.canonical };
+			this.imported.set(res.canonical, fileEntry);
+			// `registerDeclaredModules` may have just registered an ambient `declare module '<mod>' { ... }` found *inside* this
+			// file under the exact key `mod` (e.g. `@types/vscode`'s `index.d.ts` is just `declare module 'vscode' { ... }`) --
+			// that unwrapped inner body is what `mod` itself should resolve to, not this file's own (still-wrapped) top level.
+			const entry = this.imported.get(mod) ?? fileEntry;
+			this.imported.set(mod, entry);
+			return entry;
 		}
 
 		if (!this.parent)
