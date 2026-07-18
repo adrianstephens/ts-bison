@@ -1,12 +1,16 @@
 import {cParser} from '../examples/CPP/c-parser';
 
+// parse() is async now (see the preprocessor's include resolver); one chain keeps output ordered.
+let chain = Promise.resolve();
 function test(name: string, code: string) {
-	try {
-		console.log(name);
-		console.log(JSON.stringify(cParser.parse(code), null, 2));
-	} catch (e) {
-		console.error(`${name} failed:`, e);
-	}
+	chain = chain.then(async () => {
+		try {
+			console.log(name);
+			console.log(JSON.stringify(await cParser.parse(code), null, 2));
+		} catch (e) {
+			console.error(`${name} failed:`, e);
+		}
+	});
 }
 
 
@@ -193,4 +197,4 @@ int f() {
 }
 `);
 
-console.log('\nAll tests completed!');
+chain = chain.then(() => console.log('\nAll tests completed!'));

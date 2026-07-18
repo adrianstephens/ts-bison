@@ -1,21 +1,29 @@
 import * as CPP from '../examples/CPP/cpp-parser';
+import {fileResolver} from '../examples/CPP/include-resolver';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-function test(name: string, code: string) {
-	try {
-		console.log('====' + name + '====');
-		const options: CPP.Options = {
-			knownTypes: ['std', 'string', 'vector', 'exception', 'map', 'set'],
-			include:	async (name: string, angled: boolean) => {
-				return await fs.readFile(name, 'utf8');
-			}
-		};
-		const ast = CPP.parse(code, options);
-		console.log(JSON.stringify(ast, null, 2));
-	} catch (e) {
-		console.error(`${name} failed:`, e);
-	}
+// parse() is async now (the preprocessor's include resolver is), so every test queues onto one chain --
+// call sites stay plain statements and output order is preserved.
+let chain = Promise.resolve();
+
+const CORPUS = '/Volumes/DevSSD/dev/shared';
+const corpusInclude = fileResolver([path.join(CORPUS, 'common'), CORPUS]);
+
+function test(name: string, code: string, filename?: string) {
+	chain = chain.then(async () => {
+		try {
+			console.log('====' + name + '====');
+			const ast = await CPP.parse(code, {
+				knownTypes: ['std', 'string', 'vector', 'exception', 'map', 'set'],
+				include: corpusInclude,
+				filename,
+			});
+			console.log(JSON.stringify(ast, null, 2));
+		} catch (e) {
+			console.error(`${name} failed:`, e);
+		}
+	});
 }
 
 async function testDir(dir: string) {
@@ -24,7 +32,7 @@ async function testDir(dir: string) {
 		if (entry.isDirectory())
 			await testDir(full);
 		else if (full.endsWith('.cpp'))
-			test(full, await fs.readFile(full, 'utf8'));
+			test(full, await fs.readFile(full, 'utf8'), full);
 	}
 }
 
@@ -33,11 +41,7 @@ console.log(`Grammar conflicts: ${CPP.parser.tables.conflicts.length}`);
 for (const c of CPP.parser.tables.conflicts.slice(0, 20))
 	console.log(c);
 
-(async()=> {
-
-await testDir('/Volumes/DevSSD/dev/shared');
-
-})();
+chain = chain.then(() => testDir(CORPUS));
 
 test('Simple class', `
 class Point {
@@ -204,13 +208,15 @@ Tuple<Args...> pack;
 
 let pass = 0, fail = 0;
 function check(name: string, code: string, knownTypes?: string[]) {
-	try {
-		CPP.parse(code, {knownTypes});
-		pass++;
-	} catch (e: any) {
-		fail++;
-		console.error(`FAIL: ${name}: ${(e.message as string).split('. Expected')[0]}`);
-	}
+	chain = chain.then(async () => {
+		try {
+			await CPP.parse(code, {knownTypes});
+			pass++;
+		} catch (e: any) {
+			fail++;
+			console.error(`FAIL: ${name}: ${(e.message as string).split('. Expected')[0]}`);
+		}
+	});
 }
 
 // --- literals ---
@@ -483,5 +489,7 @@ int main(int argc, char* argv[]) {
 }
 `);
 
-console.log(`\nC++14 coverage: ${pass} passed, ${fail} failed`);
-console.log('\nAll tests completed!');
+chain = chain.then(() => {
+	console.log(`\nC++14 coverage: ${pass} passed, ${fail} failed`);
+	console.log('\nAll tests completed!');
+});

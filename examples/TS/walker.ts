@@ -23,7 +23,7 @@ export const isJsStatement 	= guard<JS.Statement>(stmts);
 export const isTsStatement 	= guard<TS.Statement>(['declare', ...stmts]);
 
 export function hasMod(e: {modifiers?: string[]}, m: string) {
-	return e.modifiers?.includes(m);
+	return e.modifiers?.includes(m) ?? false;
 }
 export function dropMod(e: {modifiers?: string[]}, m: string) {
 	if (e.modifiers?.includes(m))
@@ -79,7 +79,9 @@ function mapObject<N extends Record<string, any>>(node: N, fields: NodeMap<N>): 
 	return r;
 }
 
-function mapObjectVoid<N extends Record<string, any>>(node: N, fields: NodeMap<N>): N {
+// Visits every field's child for side effects only (ignores what each processor returns) instead of rebuilding `node` --
+// pass as `TSwalk`'s `mapper` when the processor mutates in place (e.g. `stampScope`) rather than transforms functionally.
+export function mapObjectVoid<N extends Record<string, any>>(node: N, fields: NodeMap<N>): N {
 	for (const f in fields) {
 		const k = f as keyof N;
 		if (node[k] !== undefined)
@@ -94,6 +96,7 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 	onStatement?:	OnAST<TS.Statement>,
 	onExpression?:	OnAST<Expr>,
 	onType?:		OnAST<Type>,
+	onTypeMember?:	OnAST<TS.TypeMember>,
 	mapper			= mapObject
 ): T | undefined {
 
@@ -102,6 +105,9 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 
 	const processExpression = <T extends Expr>(expr: T) =>
 		onExpression ? onExpression(expr, _Expression as Preserve<Expr>) as T : expr;//_Expression(expr);
+
+	const processTypeMember = (m: TS.TypeMember) =>
+		onTypeMember ? onTypeMember(m, _TypeMember as Preserve<TS.TypeMember>) as TS.TypeMember : _TypeMember(m);
 
 	const processType = (type: Type) =>
 		onType ? onType(type, _Type as Preserve<Type>) : type;//_Type(type);
@@ -172,15 +178,38 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 
 	const processClassMember = (m: TS.ClassMember): JS.ClassMember => {
 		switch (m.type) {
-			case 'field':	return mapper(m, {key: processKey, value: processExpression, typeAnnotation: processTypeU});
-			case 'method':	return mapper(m, {key: processKey, value: processExpressionA});
-			case 'static_block':	return mapper(m, {body: processArraysA(processStatementC)}) as any;
-			case 'method_signature':return mapper(m, {key: processKey, params: processArraysA(processParam), rest: processRest, returnType: processType, typeParams: processArraysA(processTSTypeParam)}) as any;
-			case 'index_signature':	return mapper(m, {paramType: processType, typeAnnotation: processType}) as any;
+			case 'field':	return mapper(m, {
+				key:		processKey,
+				value:		processExpression,
+				typeAnnotation: processTypeU
+			});
+			case 'method':	return mapper(m, {
+				key:		processKey, 
+				params:		processArraysA(processParam),
+				body:		processArraysA(processStatementC),
+				typeParams: processArrays(processTypeU),
+				returnType:	processTypeU,
+				rest:		processRest,
+			});
+			case 'static_block':	return mapper(m, {
+				body: processArraysA(processStatementC)
+			});
+			/*
+			case 'method_signature':return mapper(m, {
+				key:		processKey,
+				params:		processArraysA(processParam),
+				rest:		processRest,
+				returnType: processType,
+				typeParams: processArraysA(processTSTypeParam)
+			}) as any;*/
+			case 'index_signature':	return mapper(m, {
+				paramType:	processType,
+				typeAnnotation: processType
+			}) as any;
 		}
 	};
 
-	const processTSTypeMember = (m: TS.TypeMember): TS.TypeMember => {
+	const _TypeMember = (m: TS.TypeMember): TS.TypeMember => {
 		switch (m.kind) {
 			case 'property':
 				return mapper(m, {name: processKey, typeAnnotation: processTypeA});
@@ -188,6 +217,15 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 				return mapper(m, {
 					name: processKey,
 					params: processArraysA(processTSParam),
+					rest: processRest,
+					returnType: processType,
+					typeParams: processArraysA(processTSTypeParam)
+				});
+			case 'call':
+			case 'construct':
+				return mapper(m, {
+					params: processArraysA(processTSParam),
+					rest: processRest,
 					returnType: processType,
 					typeParams: processArraysA(processTSTypeParam)
 				});
@@ -215,10 +253,11 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 			case 'function':
 			case 'constructor':			return mapper(type, {
 					params:			processArraysA(processTSParam),
+					rest:			processRest,
 					returnType: 	processTypeA,
 					typeParams: 	processArraysA(processTSTypeParam)
 				});
-			case 'object':				return mapper(type, {members: processArraysA(processTSTypeMember)});
+			case 'object':				return mapper(type, {members: processArraysA(processTypeMember)});
 			case 'parenthesized':		return mapper(type, {inner: processTypeA});
 			case 'keyof':				return mapper(type, {argument: processTypeA});
 			case 'readonly':			return mapper(type, {argument: processTypeA});
@@ -324,8 +363,6 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 				expression: 	processExpressionA
 			});
 
-			case 'regex':
-			case 'bigint':
 			case 'this':
 			case 'identifier':
 				return expr;
@@ -412,16 +449,13 @@ export function TSwalk<T extends TS.Program | TS.Statement | Expr | Type | TS.St
 			case 'interface_decl':	return mapper(stmt,{
 				typeParams:		processArrays(processTSTypeParam),
 				extendsClause:	processArrays(processType),
-				body:			processArrays(processTSTypeMember)
+				body:			processArrays(processTypeMember)
 			});
 			case 'enum_decl':	return mapper(stmt, {
 				members:		processArraysA(m => mapper(m, {init: processExpressionQ}))
 			});
 			case 'namespace_decl':	return mapper(stmt, {
 				body:			processArraysA(processStatement)
-			});
-			case 'declare':		return mapper(stmt, {
-				declaration: 	decl => processStatement(decl) as JS.Declaration
 			});
 
 			default:	{ const x = stmt; return stmt; }

@@ -218,7 +218,7 @@ export function TStoJS(ast: TS.Program) {
 			switch (stmt.type) {
 				case 'type_alias_decl':
 				case 'interface_decl':
-				case 'declare':
+				case 'namespace_decl':
 					return undefined;
 
 				case 'export_decl':
@@ -252,18 +252,22 @@ export function TStoJS(ast: TS.Program) {
 					);
 				}
 				
-				case 'class_decl': {
+				case 'var_decl':
+					return stmt.ambient ? undefined : process(stmt);
+
+				case 'class_decl':
+					if (stmt.ambient)
+						return undefined;
 					stmt = process(stmt);
 					stmt.body.forEach(m => {
 						if (m.type === 'field') {
 							delete m.modifiers;
 
 						} else if (m.type === 'method') {
-							const fn = m.value;
 							if (m.key === 'constructor') {
 								// A parameter-property modifier is anything but the unrelated `'optional'` tag
 								// that can now also live in `modifiers` (see `Param`'s own comment).
-								const prelude: JS.Statement[] = fn.params
+								const prelude: JS.Statement[] = m.params
 									.filter((p) => p.modifiers?.some(x => x !== 'optional'))
 									.map(p => ({
 										type: 'expression',
@@ -275,10 +279,10 @@ export function TStoJS(ast: TS.Program) {
 									})
 								);
 								if (prelude.length)
-									fn.body = [...prelude, ...fn.body!];
+									m.body = [...prelude, ...m.body!];
 							}
 
-							for (const p of fn.params)
+							for (const p of m.params)
 								delete p.modifiers;
 							delete m.modifiers;
 						}
@@ -287,7 +291,6 @@ export function TStoJS(ast: TS.Program) {
 					delete stmt.implementsClause;
 					delete stmt.abstract;
 					return stmt;
-				}
 
 				default:
 					return process(stmt);
@@ -322,14 +325,33 @@ function makeDiagnostic(func: (d: Diagnostic) => void) {
 	});
 }
 
+// Folds whatever `type-utils.ts`'s structural recursions (`resolve`/`lookupMember`/`isAssignable`/...) hit their depth
+// budget on during this check into one summary GAP diagnostic -- see `T.takeDepthExhaustion`'s own comment for why not
+// one diagnostic per occurrence.
+function pushDepthExhaustionGap(diagnostics: Diagnostic[], minSeverity: SEVERITY) {
+	const depthHits = T.takeDepthExhaustion();
+	if (depthHits.size && SEVERITY.GAP >= minSeverity) {
+		diagnostics.push({
+			severity: SEVERITY.GAP,
+			pos: { line: 1, col: 1 },
+			message: 'GAP: recursion depth limit reached during structural type resolution ('
+				+ [...depthHits].map(([fn, n]) => `${fn}×${n}`).join(', ')
+				+ ') -- some assignability/member checks may be incomplete',
+		});
+	}
+}
+
 export function TStypeCheck(ast: TS.Program, minSeverity: SEVERITY = SEVERITY.GAP): Diagnostic[] {
+	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
 	const checker = makeChecker(makeDiagnostic(d => { if (d.severity >= minSeverity) diagnostics.push(d); }));
 	checker.checkBlock(ast.body, checker.global, undefined);
+	pushDepthExhaustionGap(diagnostics, minSeverity);
 	return diagnostics;
 }
 
 export async function TStypeCheckAsync(filename: string, minSeverity: SEVERITY = SEVERITY.GAP, compilerOptions: CompilerOptions = {}): Promise<{program: TS.Program, diagnostics: Diagnostic[]}> {
+	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
 	const checker	= makeChecker(makeDiagnostic(d => { if (d.severity >= minSeverity) diagnostics.push(d); }));
 	const global	= checker.global;
@@ -416,34 +438,15 @@ export async function TStypeCheckAsync(filename: string, minSeverity: SEVERITY =
 		// `import X from 'mod'` (default import) -- independent of `namespace`/`specifiers` below (`import X, {y} from 'mod'` and
 		// `import X, * as NS from 'mod'` both combine a default with the other form in the same statement). `checker.exportScope`
 		// registers a module's default export under the literal key `'default'`; this is the only place that key is read back.
-		if (imp.default) {
-			const v = impScope.values.get('default');
-			if (v)
-				importScope.values.set(imp.default, v);
-			const ns = impScope.namespace('default');
-			if (ns)
-				importScope.addNamespace(imp.default, ns);
-		}
+		if (imp.default)
+			importScope.copy(impScope, 'default', imp.default, imp.typeOnly);
 
 		if (imp.namespace) {
-			importScope.values.set(imp.namespace, value);
+			importScope.addValue(imp.namespace, value);
 			importScope.addNamespace(imp.namespace, impScope);
 		} else {
-			for (const spec of imp.specifiers ?? []) {
-				if (!imp.type && !spec.typeOnly) {
-					const v = impScope.values.get(spec.imported);
-					if (v)
-						importScope.values.set(spec.local, v);
-					const ns = impScope.namespace(spec.imported);
-					if (ns)
-						importScope.addNamespace(spec.local, ns);
-				}
-				const typeEntry = impScope.types.get(spec.imported);
-				if (typeEntry) {
-					const prev = importScope.types.get(spec.local);
-					importScope.types.set(spec.local, prev ? { typeParams: prev.typeParams ?? typeEntry.typeParams, type: TS.IntersectionType([prev.type, typeEntry.type]) } : typeEntry);
-				}
-			}
+			for (const spec of imp.specifiers ?? [])
+				importScope.copy(impScope, spec.imported, spec.local, spec.typeOnly || imp.typeOnly);
 		}
 	};
 
@@ -473,33 +476,15 @@ export async function TStypeCheckAsync(filename: string, minSeverity: SEVERITY =
 
 				if (stmt.namespace) {
 					// `export * as name from './x'`: one property holding the target's whole shape.
-					scope.values.set(stmt.namespace, targetShape.value);
+					scope.addValue(stmt.namespace, targetShape.value);
 					scope.addNamespace(stmt.namespace, targetShape.scope);
 					
 				} else if (stmt.specifiers) {
-					for (const spec of stmt.specifiers) {
-						if (!stmt.typeOnly && !spec.typeOnly) {
-							const v = targetShape.scope.values.get(spec.local);
-							if (v)
-								scope.values.set(spec.exported, v);
-							const ns = targetShape.scope.namespace(spec.local);
-							if (ns)
-								scope.addNamespace(spec.exported, ns);
-						}
-						const te = targetShape.scope.types.get(spec.local);
-						if (te)
-							scope.types.set(spec.exported, te);
-					}
+					for (const spec of stmt.specifiers)
+						scope.copy(targetShape.scope, spec.local, spec.exported, stmt.typeOnly || spec.typeOnly);
 				} else {
 					// bare `export * from './x'`: everything, as-is
-					if (!stmt.typeOnly) {
-						for (const [n, v] of targetShape.scope.values)
-							scope.values.set(n, v);
-						for (const [n, ns] of targetShape.scope.namespaces ?? [])
-							scope.addNamespace(n, ns);
-					}
-					for (const [n, te] of targetShape.scope.types)
-						scope.types.set(n, te);
+					scope.copyAll(targetShape.scope, stmt.typeOnly);
 				}
 			}
 			return { scope, value: isAlias ? value : scope.toObject() };
@@ -516,6 +501,7 @@ export async function TStypeCheckAsync(filename: string, minSeverity: SEVERITY =
 	await Promise.all(program.body.filter(s => s.type === 'import').map(s => resolveImport(entrySrc, entryScope, s, '.')));
 
 	checker.checkBlock(program.body, entryScope);
+	pushDepthExhaustionGap(diagnostics, minSeverity);
 	return {program, diagnostics };
 }
 
@@ -571,8 +557,6 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 				stmt.specifiers.forEach(s => roots.add(s.local));
 		} else if (stmt.type === 'export_decl') {
 			registerDecl(stmt.declaration, true);
-		} else if (stmt.type === 'declare') {
-			registerDecl(stmt.declaration, false);
 		} else {
 			registerDecl(stmt, false);
 		}
@@ -616,7 +600,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 			returnType: hasMod(stmt, 'async')		? T.wrapType(returnType, PROMISE_TYPES, 'Promise')
 					:	hasMod(stmt, 'generator')	? T.wrapType(returnType, GENERATOR_TYPES, 'Generator')
 					:	returnType
-		});
+		}, undefined, {ambient: true});
 	};
 
 	const stripClassDecl = (stmt: JS.ClassDecl): JS.Declaration => {
@@ -632,7 +616,6 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 				};
 
 			if (m.type === 'method') {
-				const fn = m.value as JS.FunctionExpr<Type>;
 				if (m.kind) {
 					if (typeof m.key === 'string') {
 						if (seen.has(m.key))
@@ -640,29 +623,29 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 						seen.add(m.key);
 					}
 					return { type: 'field', key: m.key,
-						typeAnnotation: (m.kind === 'get' ? fn.returnType : fn.params[0]?.typeAnnotation) ?? T.ANY,
+						typeAnnotation: (m.kind === 'get' ? m.returnType : m.params[0]?.typeAnnotation) ?? T.ANY,
 						modifiers:		m.kind === 'get' && typeof m.key === 'string' && !setKeys.has(m.key) ? ['readonly'] : undefined,
 					};
 				}
 				if (m.key === 'constructor') {
-					for (const p of fn.params) {
+					for (const p of m.params) {
 						if (p.modifiers?.length)
 							extra.push({type: 'field', key: typeof p.key === 'string' ? p.key : '?', typeAnnotation: p.typeAnnotation, modifiers: p.modifiers});
 					}
 					return {
-						type:	'method_signature',
+						type:	'method',
 						key:	m.key,
-						params: fn.params.map(stripParam) as JS.Param<Type>[],
-						rest:	fn.rest
+						params: m.params.map(stripParam) as JS.Param<Type>[],
+						rest:	m.rest as JS.Rest<Type>
 					};
 				}
 				return {
-					type:		'method_signature',
+					type:		'method',
 					key:		m.key,
-					params:		fn.params.map(stripParam) as JS.Param<Type>[],
-					rest:		fn.rest,
+					params:		m.params.map(stripParam) as JS.Param<Type>[],
+					rest:		m.rest as JS.Rest<Type>,
 					modifiers:	m.modifiers,
-					returnType: fn.returnType ?? (fn.body ? checker.inferReturn(fn, fn.body, global) : undefined)
+					returnType: m.returnType as Type ?? (m.body ? checker.inferReturn(m, m.body, global) : undefined)
 				};
 			}
 			return undefined;
@@ -742,10 +725,10 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		}
 	};
 
-	const processNamedDecl = (stmt: TS.Declaration): TS.Declaration|TS.Declare => {
+	const processNamedDecl = (stmt: TS.Declaration): TS.Declaration => {
 		switch (stmt.type) {
-			case 'function_decl':	return {type: 'declare', declaration: stripFunctionDecl(stmt)};
-			case 'class_decl':		return {type: 'declare', declaration: stripClassDecl(stmt)};
+			case 'function_decl':	return stripFunctionDecl(stmt);
+			case 'class_decl':		return stripClassDecl(stmt);
 			case 'interface_decl':
 			case 'type_alias_decl':
 			case 'enum_decl':
@@ -754,11 +737,12 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 			case 'export_assignment':
 				return stmt;
 			case 'var_decl': {
-				return {type: 'declare', declaration: { ...stmt, 
-					declarations: stmt.declarations
+				return { ...stmt,
+					ambient:		true,
+					declarations:	stmt.declarations
 						.filter(d => T.bindingNames(d.name).some(n => reachable.has(n)))
 						.flatMap(d => stripVarDeclarator(d, stmt.kind === 'const'))
-				 }};
+				 };
 			}
 		}
 	};
@@ -781,13 +765,9 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 					return stmt;
 
 				case 'export_decl': {
-					const decl = stmt.declaration as JS.Declaration|TS.Declare;
-					if (decl.type === 'declare') {
-						if (isReachable(decl.declaration))
-							return stmt;
-					} else if (isReachable(decl)) {
+					const decl = stmt.declaration as JS.Declaration;
+					if (isReachable(decl))
 						return { type: 'export_decl', declaration: processNamedDecl(decl) as JS.Declaration };
-					}
 					return undefined;
 				}
 
@@ -818,11 +798,6 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 					}
 					return stmt;
 
-				case 'declare':
-					if (isReachable(stmt.declaration))
-						return stmt;
-					return undefined;
-				
 				default:
 					if (isReachable(stmt as JS.Declaration))
 						return processNamedDecl(stmt as unknown as JS.Declaration);

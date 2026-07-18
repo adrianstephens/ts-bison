@@ -169,7 +169,7 @@ export function Maybe<T>(rule: Rules<T>) {
 
 export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: GrammarSym, trailing?: boolean) {
 	return Rules<T[]>(self => [
-		Rule([single] as const,	$ => [$[0]]),
+		Rule([single], $ => [$[0]]),
 		sep
 			? Rule([self, sep, single] as const,	$ => [...($[0] as T[]), $[2]])
 			: Rule([self, single] as const,			$ => [...($[0] as T[]), $[1]]),
@@ -177,7 +177,7 @@ export function List<T>(single: Rules<T> | (()=>Rules<T>), sep?: GrammarSym, tra
 	]);
 }
 
-export function MaybeList<T>(rule: Rules<T>, sep?: GrammarSym, trailing?: boolean) {
+export function MaybeList<T>(rule: Rules<T> | (()=>Rules<T>), sep?: GrammarSym, trailing?: boolean) {
 	return Rules(
 		List(rule, sep, trailing),
 		Rule([], () => []),
@@ -730,7 +730,18 @@ interface Lexer extends TextPos {
 // Combines two GLR derivation paths that converged onto the same state+parent (see `runGlrFork`). Two paths
 // converging on an identical value aren't a real ambiguity (same parse reached two ways) so collapse rather
 // than accumulate an array.
-const sameValue = (a: unknown, b: unknown) => a === b || JSON.stringify(a) === JSON.stringify(b);
+export function sameValue(a: unknown, b: unknown): boolean {
+	if (Object.is(a, b))
+		return true;
+	if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null)
+		return false;
+	if (a instanceof RegExp || b instanceof RegExp)
+		return a instanceof RegExp && b instanceof RegExp && a.source === b.source && a.flags === b.flags;
+	if (Array.isArray(a) || Array.isArray(b))
+		return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => sameValue(v, b[i]));
+	const keysA = Object.keys(a);
+	return keysA.length === Object.keys(b).length && keysA.every(k => sameValue((a as any)[k], (b as any)[k]));
+}
 const defaultMerge: MergeFn = (left, right) => {
 	if (Array.isArray(left))
 		return left.some(v => sameValue(v, right)) ? left : [...left, right];

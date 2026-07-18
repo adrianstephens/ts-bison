@@ -28,7 +28,11 @@ export const CallSig		= JS.CallSig<Type, TypeParam>;
 
 function TypeParam(name: string, constraint?: Type, def?: Type, cnst?: boolean): TypeParam { return { name, constraint, default: def, const: cnst }; }
 
-export interface RefType { type: 'ref'; name: string; typeArgs?: Type[] }
+// `declScope`: same reasoning as `CallSig`'s own field above -- a bare ref extracted from another module's signature (a method's
+// return type, a free function's inferred return) and handed back as a standalone value carries no scope of its own otherwise;
+// `stampScope` (type-utils.ts) tags every ref reachable from a cross-module member/signature with its declaring scope once,
+// at the point it's built, so `Scope.resolve()` can use it instead of whichever scope happens to be resolving the value later.
+export interface RefType { type: 'ref'; name: string; typeArgs?: Type[]; declScope?: unknown }
 export function  RefType(name: string, typeArgs?: Type[] ): RefType { return { type: 'ref', name, typeArgs }; }
 
 export interface UnionType { type: 'union'; types: Type[] }
@@ -38,9 +42,9 @@ export interface IntersectionType { type: 'intersection'; types: Type[] }
 export function  IntersectionType(types: Type[]): IntersectionType { return { type: 'intersection', types }; }
 
 export interface FunctionType extends CallSig { type: 'function'; }
-//export function FunctionType(sig: CallSig): FunctionType { return {type: 'function', ...sig }; }
-//export function FunctionType(...args: Parameters<typeof CallSig>): FunctionType { return {type: 'function', ...CallSig(...args) }; }
-export function FunctionType(...args: JS.CallSigParams<Type, TypeParam>): FunctionType { return {type: 'function', ...CallSig(...args) }; }
+export function  FunctionType(...args: JS.CallSigParams<Type, TypeParam>): FunctionType { return {type: 'function', ...CallSig(...args) }; }
+
+export interface ConstructorType extends CallSig { type: 'constructor'; abstract?: boolean }
 
 export type TypeMember =
 	| { kind: 'property'; name: JS.Key; optional?: boolean; readonly?: boolean; typeAnnotation: Type }
@@ -48,11 +52,12 @@ export type TypeMember =
 	| { kind: 'index'; paramName: string; paramType: Type; typeAnnotation: Type; readonly?: boolean }
 	| { kind: 'call' } & CallSig
 	| { kind: 'construct' } & CallSig
+export function TypeMember(kind: 'call'|'construct', sig: CallSig): TypeMember { return { kind, ...sig }; }
 export function TypeProperty(name: JS.Key, typeAnnotation: Type, optional?: boolean, readonly?: boolean): TypeMember { return { kind: 'property', name, typeAnnotation, optional, readonly}; }
 export function TypeMethod(name: JS.Key, sig: CallSig, optional?: boolean): TypeMember { return { kind: 'method', name, ...sig, optional }; }
 export function TypeIndex(paramName: string, paramType: Type, typeAnnotation: Type, readonly?: boolean): TypeMember { return { kind: 'index', paramName, paramType, typeAnnotation, readonly }; }
-export function TypeCall(sig: CallSig): TypeMember { return { kind: 'call', ...sig }; }
-export function TypeConstruct(sig: CallSig): TypeMember { return { kind: 'construct', ...sig }; }
+export function TypeCall(sig: CallSig)		{ return TypeMember('call', sig); }
+export function TypeConstruct(sig: CallSig)	{ return TypeMember('construct', sig); }
 
 export interface MappedType { keyName: string; constraint: Type; nameType?: Type; valueType: Type; readonly?: boolean; optional?: boolean; }
 
@@ -81,7 +86,7 @@ export type Type =
 	| UnionType
 	| IntersectionType
 	| FunctionType
-	| { type: 'constructor'; abstract?: boolean } & CallSig
+	| ConstructorType
 	| ObjectType
 	| { type: 'parenthesized'; inner: Type }
 	| { type: 'keyof'; argument: Type }
@@ -97,26 +102,32 @@ export type Type =
 
 export interface EnumMember { name: string; init?: JS.Expr; }
 
-export type Declaration = JS.Declaration
+interface ModuleDecl { type: 'module_decl'; name: string; body: Declaration[]; ambient?: boolean }
+function  ModuleDecl(name: string, body: Declaration[]): ModuleDecl { return { type: 'module_decl', name, body}; }
+interface NamespaceDecl { type: 'namespace_decl'; name: string; body: Statement[]; ambient?: boolean }
+function  NamespaceDecl(name: string, body: Statement[], ambient?: boolean): NamespaceDecl { return { type: 'namespace_decl', name, body, ambient }; }
+interface EnumDecl { type: 'enum_decl'; name: string; const?: boolean; members: EnumMember[]; ambient?: boolean }
+
+export type MaybeAmbient = JS.Declaration
+	| EnumDecl
+	| NamespaceDecl
+	| ModuleDecl
+
+export type Declaration = MaybeAmbient
 	| { type: 'interface_decl'; name: string; typeParams?: TypeParam[]; extendsClause?: Type[]; body: TypeMember[] }
 	| { type: 'type_alias_decl'; name: string; typeParams?: TypeParam[]; value: Type }
-	| { type: 'enum_decl'; name: string; const?: boolean; members: EnumMember[] }
-	| { type: 'namespace_decl'; name: string; body: Statement[] }
-	| { type: 'module_decl'; name: string; body: Declaration[] }
 	| { type: 'export_assignment'; expr: string }
 
-export interface Declare { type: 'declare'; declaration: Declaration; }
-function Declare(d: Declaration): JS.Declaration { return { type: 'declare', declaration: d } as unknown as JS.Declaration; }
+function Declare<T extends {ambient?: boolean}>(d: T) { d.ambient = true; return d as unknown as JS.Declaration;; }
 
-type ClassMethodSignature = { type: 'method_signature'; key: JS.Key; modifiers?: string[]; kind?: 'get' | 'set' } & CallSig;
+//type ClassMethodSignature = { type: 'method_signature'; key: JS.Key; modifiers?: string[]; kind?: 'get' | 'set' } & CallSig;
 
 export type ClassMember = JS.ClassMember
-	| ClassMethodSignature
+//	| ClassMethodSignature
 	| { type: 'index_signature'; paramName: string; paramType: Type; typeAnnotation: Type; modifiers?: string[] };
 
-export type Statement = JS.Statement | Declaration | Declare;
+export type Statement = JS.Statement | Declaration;
 export interface Program { type: 'program'; body: Statement[]; }
-
 
 // ===================================================================
 //  terminals
@@ -210,13 +221,13 @@ const type_template_literal_part = Rules(
 const type_parameter = Rules(
 	Rule([IDENT] as const,													$ => ({ name: $[0] } as const)),
 	Rule([IDENT, 'extends', type] as const,									$ => ({ name: $[0], constraint: $[2] } as const)),
-	Rule([IDENT, '=', type] as const,								$ => ({ name: $[0], default: $[2] } as const)),
-	Rule([IDENT, 'extends', type, '=', type] as const,				$ => ({ name: $[0], constraint: $[2], default: $[4] } as const)),
+	Rule([IDENT, '=', type] as const,										$ => ({ name: $[0], default: $[2] } as const)),
+	Rule([IDENT, 'extends', type, '=', type] as const,						$ => ({ name: $[0], constraint: $[2], default: $[4] } as const)),
 	// TS 5.0 `const` type parameter modifier -- infers the narrowest (literal) type for T instead of widening.
 	Rule(['const', IDENT] as const,											$ => ({ name: $[1], const: true } as const)),
 	Rule(['const', IDENT, 'extends', type] as const,						$ => ({ name: $[1], constraint: $[3], const: true } as const)),
-	Rule(['const', IDENT, '=', type] as const,						$ => ({ name: $[1], default: $[3], const: true } as const)),
-	Rule(['const', IDENT, 'extends', type, '=', type] as const,	$ => ({ name: $[1], constraint: $[3], default: $[5], const: true } as const)),
+	Rule(['const', IDENT, '=', type] as const,								$ => ({ name: $[1], default: $[3], const: true } as const)),
+	Rule(['const', IDENT, 'extends', type, '=', type] as const,				$ => ({ name: $[1], constraint: $[3], default: $[5], const: true } as const)),
 );
 const type_parameters = Rules(
 	Rule(['<', List(type_parameter, ',', true), '>'] as const,				$ => $[1]),
@@ -446,24 +457,56 @@ const enum_body = Rules<EnumMember[]>(
 	Rule(['{', '}'] as const,								_ => []),
 	Rule(['{', List(enum_member, ',', true), '}'] as const,	$ => $[1]),
 );
-const enum_declaration = Rules<Declaration>(
+const enum_declaration = Rules<EnumDecl>(
 	Rule(['enum', IDENT, enum_body] as const,			$ => ({ type: 'enum_decl', name: $[1], members: $[2] } as const)),
 	Rule(['const', 'enum', IDENT, enum_body] as const,	$ => ({ type: 'enum_decl', name: $[2], const: true, members: $[3] })),
 );
 
-const module_item  = JS.module_item as unknown as Rules<Declaration>;
-
-// A namespace body needs `JS.module_item` (import/export/statement), not plain `function_body`, since real TS also restricts both to a module's top level or a namespace body, never an ordinary block.
-const namespace_body = MaybeList(module_item);
-
-const namespace_declaration = Rules<Declaration>(
-	Rule(['namespace', IDENT, '{', namespace_body, '}'] as const,	$ => ({ type: 'namespace_decl', name: $[1], body: $[3] } as const)),
-	Rule(['module', IDENT, '{', namespace_body, '}'] as const,		$ => ({ type: 'namespace_decl', name: $[1], body: $[3] } as const)),
+const bodyless_function = Rules(
+	Rule(['function', IDENT, JS.parameter_clause, ';'] as const,			$ => JS.FunctionDecl($[1], $[2])),
+	Rule(['async', 'function', IDENT, JS.parameter_clause, ';'] as const,	$ => JS.FunctionDecl($[2], $[3], undefined, {modifiers: ['async'] })),
 );
 
-const bodyless_function = Rules<JS.Declaration>(
-	Rule(['function', IDENT, JS.parameter_clause, ';'] as const,			$ => ({ type: 'function_decl', name: $[1], ...$[2] } as const)),
-	Rule(['async', 'function', IDENT, JS.parameter_clause, ';'] as const,	$ => ({ type: 'function_decl', name: $[2], ...$[3], modifiers: ['async'] } as const)),
+const module_item  = JS.module_item as unknown as Rules<Declaration>;
+const namespace_body	= MaybeList(module_item);
+const declared_body		= MaybeList(Forward<Declaration>(()=>declared_body_item));
+
+// can have real declare keyword
+const maybe_ambient = Rules<MaybeAmbient>(
+	JS.variable_decl_statement,
+	JS.class_declaration,
+	enum_declaration,
+	bodyless_function,
+	Rule(['namespace', IDENT, '{', declared_body, '}'] as const,$ => NamespaceDecl($[1], $[3])),
+	Rule(['module', IDENT, '{', declared_body, '}'] as const,	$ => NamespaceDecl($[1], $[3])),
+	Rule(['module', STR, '{', declared_body, '}'] as const,		$ => ModuleDecl(unquoteString($[1]), $[3])),
+);
+
+// can have meaningless declare keyword
+const fake_ambient = Rules(
+	interface_declaration,
+	type_alias_declaration,
+);
+
+const declared_body_item = Rules<Declaration>(
+	maybe_ambient,
+	fake_ambient,
+	Rule(['import', JS.import_declaration] as const,			$ => $[1] as Declaration),
+	Rule(['export', 'import', JS.import_declaration] as const,	$ => $[2] as Declaration),
+	Rule(['export', '=', dotted_path, ';'] as const,			$ => ({ type: 'export_assignment', expr: $[2] } as const)),
+	Rule(['export', JS.export_declaration] as const,			$ => $[1] as Declaration),
+	Rule(['module', IDENT, '{', declared_body, '}'] as const,	$ => NamespaceDecl($[1], $[3])),
+	Rule(['module', STR, ';'] as const,							$ => ModuleDecl(unquoteString($[2]), [])),
+	Rule([GLOBAL, '{', declared_body, '}'] as const,			$ => ModuleDecl('global', $[2])),
+);
+
+module_item.push(
+	Rule(['namespace', IDENT, '{', namespace_body, '}'] as const,	$ => NamespaceDecl($[1], $[3])),
+	Rule(['module', IDENT, '{', namespace_body, '}'] as const,		$ => NamespaceDecl($[1], $[3])),
+	Rule(['declare', maybe_ambient] as const,					$ => Declare($[1])),
+	Rule(['declare', fake_ambient] as const,					$ => $[1]),
+	// `export = X;` at the top level of a whole file, not just nested in a `declare module`/`namespace` body (`declared_body_item` covers that).
+	Rule(['export', '=', dotted_path, ';'] as const,			$ => ({ type: 'export_assignment', expr: $[2] } as const)),
 );
 
 JS.binding_name.push(
@@ -500,52 +543,10 @@ JS.import_declaration.push(
 	Rule([TYPE, '*', 'from', STR, ';'] as const,				$ => ({ type: 'export', source: unquoteString($[3]), typeOnly: true } as const)),
 	Rule([TYPE, '*', 'as', IDENT, 'from', STR, ';'] as const,	$ => ({ type: 'export', namespace: $[3], source: unquoteString($[5]), typeOnly: true } as const)),
 
-	Rule([bodyless_function] as const,						$ => JS.ExportDecl($[0])),
-	Rule([namespace_declaration] as const,					$ => JS.ExportDecl($[0] as JS.Declaration)),
-	Rule(['declare', bodyless_function] as const,			$ => JS.ExportDecl(Declare($[1]))),
-	Rule(['declare', namespace_declaration] as const,		$ => JS.ExportDecl(Declare($[1]))),
-
-	Rule([interface_declaration] as const,					$ => JS.ExportDecl($[0] as JS.Declaration)),
-	Rule([type_alias_declaration] as const,					$ => JS.ExportDecl($[0] as JS.Declaration)),
-	Rule([enum_declaration] as const,						$ => JS.ExportDecl($[0] as JS.Declaration)),
-	Rule(['declare', interface_declaration] as const,		$ => JS.ExportDecl($[1] as JS.Declaration)),
-	Rule(['declare', type_alias_declaration] as const,		$ => JS.ExportDecl($[1] as JS.Declaration)),
-	Rule(['declare', enum_declaration] as const,			$ => JS.ExportDecl($[1] as JS.Declaration)),
-
-	Rule(['declare', JS.variable_decl_statement] as const,	$ => JS.ExportDecl(Declare($[1]))),
-	Rule(['declare', JS.class_declaration] as const,		$ => JS.ExportDecl(Declare($[1]))),
-);
-
-const declared_body_item = Rules<Declaration>(
-	Rule(['import', JS.import_declaration] as const,			$ => $[1] as Declaration),
-	Rule(['export', 'import', JS.import_declaration] as const,	$ => $[2] as Declaration),
-	// `export = X;` -- an ambient module's "export assignment" (CommonJS-style default export).
-	Rule(['export', '=', dotted_path, ';'] as const,			$ => ({ type: 'export_assignment', expr: $[2] } as const)),
-	Rule(['export', JS.export_declaration] as const,			$ => $[1] as Declaration),
-	Forward<Declaration>(()=>declare),
-);
-
-const declared_body = MaybeList(declared_body_item);
-
-const declare = Rules<Declaration>(
-	JS.variable_decl_statement,
-	JS.class_declaration,
-	interface_declaration,
-	type_alias_declaration,
-	enum_declaration,
-	bodyless_function,
-	Rule(['namespace', IDENT, '{', declared_body, '}'] as const,$ => ({ type: 'namespace_decl', name: $[1], body: $[3] } as const)),
-	Rule(['module', IDENT, '{', declared_body, '}'] as const,	$ => ({ type: 'namespace_decl', name: $[1], body: $[3] } as const)),
-	Rule(['module', STR, '{', declared_body, '}'] as const,		$ => ({ type: 'module_decl', name: unquoteString($[1]), body: $[3] } as const)),
-	Rule(['module', STR, ';'] as const,							$ => ({ type: 'module_decl', name: unquoteString($[2]), body: [] } as const)),
-	Rule([GLOBAL, '{', declared_body, '}'] as const,			$ => ({ type: 'module_decl', name: 'global', body: $[2] } as const)),
-);
-
-module_item.push(
-	namespace_declaration,
-	Rule(['declare', declare] as const,							$ => Declare($[1])),
-	// `export = X;` at the top level of a whole file, not just nested in a `declare module`/`namespace` body (`declared_body_item` covers that).
-	Rule(['export', '=', dotted_path, ';'] as const,			$ => ({ type: 'export_assignment', expr: $[2] } as const)),
+	Rule([maybe_ambient] as const,							$ => JS.ExportDecl($[0] as JS.Declaration)),
+	Rule(['declare', maybe_ambient] as const,				$ => JS.ExportDecl(Declare($[1]))),
+	Rule([fake_ambient] as const,							$ => JS.ExportDecl($[0] as JS.Declaration)),
+	Rule(['declare', fake_ambient] as const,				$ => JS.ExportDecl($[1] as JS.Declaration)),
 );
 
 (JS.statement as unknown as Rules<Statement>).push(
@@ -571,12 +572,12 @@ JS.optional_binding_name.push(
 );
 JS.parameter.push(
 	// Parameter properties (`constructor(public x: number)`) are accepted anywhere a parameter is, not just in a constructor -- a known simplification.
-	Rule([param_modifier_list, JS.optional_binding_name] as const,											$ => ({...$[1], modifiers: mergeMods($[0], $[1].modifiers)})),
+	Rule([param_modifier_list, JS.optional_binding_name] as const,									$ => ({...$[1], modifiers: mergeMods($[0], $[1].modifiers)})),
 	// Typed destructured parameters. `forceFork`: an arrow's `(` is also reachable as a plain expression, so `{a}` as `object_pattern` vs. a plain
 	// object literal only resolves once the following `:` is seen, one token past this table's default lookahead.
-	ForceFork(Rule([JS.object_pattern, ':', type] as const,													$ => ({ key: $[0], typeAnnotation: $[2] } as const))),
+	ForceFork(Rule([JS.object_pattern, ':', type] as const,											$ => ({ key: $[0], typeAnnotation: $[2] } as const))),
 	ForceFork(Rule([JS.object_pattern, ':', type, '=', JS.assignment_expression] as const,			$ => ({ key: $[0], typeAnnotation: $[2], default: $[4] } as const))),
-	ForceFork(Rule([JS.array_pattern, ':', type] as const,													$ => ({ key: $[0], typeAnnotation: $[2] } as const))),
+	ForceFork(Rule([JS.array_pattern, ':', type] as const,											$ => ({ key: $[0], typeAnnotation: $[2] } as const))),
 	ForceFork(Rule([JS.array_pattern, ':', type, '=', JS.assignment_expression] as const,			$ => ({ key: $[0], typeAnnotation: $[2], default: $[4] } as const))),
 	// Default-valued parameter property (`protected offset = 0`). Uses `ASSIGN_OP`, not `'='`, to avoid the lexer tie-break race `ASSIGN_OP` fixes.
 	Rule([param_modifier_list, JS.optional_binding_name, '=', JS.assignment_expression] as const,	$ => ({...$[1], modifiers: mergeMods($[0], $[1].modifiers), default: $[3] } as const)),
@@ -601,20 +602,20 @@ JS.class_member_name.push(
 
 JS.class_member_body.push(
 	// Return types on get/generator/async-generator methods (`set`'s is always `void`, so it's skipped, mirroring js-parser.ts's own get/set asymmetry).
-	Rule([JS.GET, JS.property_name_computed, '(', ')', ':', return_type, '{', JS.function_body, '}'] as const,	$ => ({ type: 'method', kind: 'get', key: $[1], value: { type: 'function', params: [], body: $[7], returnType: $[5] } } as const)),
+	Rule([JS.GET, JS.property_name_computed, '(', ')', ':', return_type, '{', JS.function_body, '}'] as const,	$ => ({ type: 'method', kind: 'get', key: $[1], params: [], body: $[7], returnType: $[5] } as const)),
 	// `set`'s *parameter* type: js-parser.ts's own `set` rule only accepts a bare untyped `IDENT` parameter.
-	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', '{', JS.function_body, '}'] as const,	$ => ({ type: 'method', kind: 'set', key: $[1], value: { type: 'function', params: [{ key: $[3], typeAnnotation: $[5] }], body: $[8] } } as const)),
+	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', '{', JS.function_body, '}'] as const,	$ => ({ type: 'method', kind: 'set', key: $[1], params: [{ key: $[3], typeAnnotation: $[5] }], body: $[8] } as const)),
 	Rule([JS.class_member_name, ':', type, ';'] as const,														$ => ({ type: 'field', ...$[0], typeAnnotation: $[2] } as const)),
-	Rule([JS.class_member_name, ':', type, '=', JS.assignment_expression, ';'] as const,				$ => ({ type: 'field', ...$[0], typeAnnotation: $[2], value: $[4] } as const)),
+	Rule([JS.class_member_name, ':', type, '=', JS.assignment_expression, ';'] as const,						$ => ({ type: 'field', ...$[0], typeAnnotation: $[2], value: $[4] } as const)),
 );
 
-const class_member_overloads = Rules<ClassMethodSignature>(
+const class_member_overloads = Rules<JS.ClassMember0<Type, TypeParam>>(
 	// Bodyless overload signatures -- this syntax-only grammar doesn't check the names/signatures actually line up with a later implementation.
-	Rule([JS.class_member_name, parameter_clause, ';'] as const,							$ => ({ type: 'method_signature', ...$[0], ...$[1] } as const)),
+	Rule([JS.class_member_name, parameter_clause, ';'] as const,							$ => ({ type: 'method', ...$[0], ...$[1] } as const)),
 	// Bodyless accessor signatures (`abstract get length(): number;`). `JS.GET`/`JS.SET`, not bare string literals, to keep their `startsPropertyName`
 	// disambiguation (see the bareword-keyword-vs-identifier pattern in tison_project memory).
-	Rule([JS.GET, JS.property_name_computed, '(', ')', ':', type, ';'] as const,			$ => ({ type: 'method_signature', key: $[1], kind: 'get', params: [], returnType: $[5] } as const)),
-	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', ';'] as const,		$ => ({ type: 'method_signature', key: $[1], kind: 'set', params: [{ key: $[3], typeAnnotation: $[5] }] } as const)),
+	Rule([JS.GET, JS.property_name_computed, '(', ')', ':', type, ';'] as const,			$ => ({ type: 'method', key: $[1], kind: 'get', params: [], returnType: $[5] } as const)),
+	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', ';'] as const,		$ => ({ type: 'method', key: $[1], kind: 'set', params: [{ key: $[3], typeAnnotation: $[5] }] } as const)),
 );
 
 // Any number of member modifiers in any order (`static readonly`, `public static`, etc), pushed onto `class_member` so every member shape gets it.
@@ -630,7 +631,7 @@ const class_member_modifier_list = List(OneOf(['public', 'private', 'protected',
 	// A sole `static` modifier has no LR(0) state retaining the `class_member_overloads` completion (a missing transition from state-merging, not
 	// a resolvable conflict -- `forceFork` can't fix this class of bug), so it needs its own direct rule.
 	Rule(['static', class_member_overloads] as const,						$ => ({...$[1], modifiers: [...($[1].modifiers ?? []), 'static']} as const)),
-	...class_member_overloads,
+	class_member_overloads,
 );
 
 // ===================================================================
@@ -690,8 +691,8 @@ for (const [relational, member, call] of [
 		Rule([member, call_type_arguments, JS.arguments_] as const,	$ => ({ type: 'call', callee: $[0], arguments: $[2], typeArgs: $[1] } as const)),
 		Rule([call, call_type_arguments, JS.arguments_] as const,	$ => ({ type: 'call', callee: $[0], arguments: $[2], typeArgs: $[1] } as const)),
 		// Bare instantiation expression (TS 4.7+): `expr<T,U>` pins a generic function's type params without calling it.
-		Rule([member, call_type_arguments] as const,					$ => ({ type: 'instantiation', expression: $[0], typeArgs: $[1] } as const)),
-		Rule([call, call_type_arguments] as const,						$ => ({ type: 'instantiation', expression: $[0], typeArgs: $[1] } as const)),
+		Rule([member, call_type_arguments] as const,				$ => ({ type: 'instantiation', expression: $[0], typeArgs: $[1] } as const)),
+		Rule([call, call_type_arguments] as const,					$ => ({ type: 'instantiation', expression: $[0], typeArgs: $[1] } as const)),
 	);
 	// `new`'s callee stays the unrestricted `member_expression` in both chains (once `new` is shifted, an object-literal-vs-block ambiguity can't arise).
 	member.push(

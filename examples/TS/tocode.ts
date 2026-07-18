@@ -119,9 +119,7 @@ export class TSoutput {
 				return  type.name + this.typeArgsToCode(type.typeArgs);
 
 			case 'literal':
-				return type.value === null ? 'null'
-					:	typeof type.value === 'string' ? JSON.stringify(type.value)
-					:	String(type.value);
+				return this.literalToCode(type);
 
 			case 'template_literal':
 				return '`' + type.parts.map(p => p.str + (p.exp ? '${' + this.typeToCode(p.exp) + '}' : '')).join('') + '`';
@@ -348,16 +346,15 @@ export class TSoutput {
 				), this.opts.indent) + '\n}';
 
 			case 'namespace_decl':
+				if (stmt.ambient)
+					return 'declare namespace ' + stmt.name + ';';
 				return 'namespace ' + stmt.name + ' {\n' + this.indentBlock(stmt.body) + '\n}';
-
-			case 'declare':
-				return 'declare ' + this.statementToCode(stmt.declaration as TS.Declaration);
 
 			case 'block':
 				return '{\n' + this.indentBlock(stmt.body) + '\n}';
 
 			case 'var_decl':
-				return this.varDeclsToCode(stmt) + ';';
+				return (stmt.ambient ? 'declare ' : '') + this.varDeclsToCode(stmt) + ';';
 
 			case 'expression': {
 				// Real JS forbids an ExpressionStatement from starting with `{` -- a destructuring reassignment (`{a, b} = f()`) is exactly this.
@@ -432,7 +429,8 @@ export class TSoutput {
 				return 'debugger;';
 
 			case 'function_decl':
-				return ((hasMod(stmt, 'async') ? 'async ' : '') + 'function ' + (hasMod(stmt, 'generator') ? '*' : '') + stmt.name)
+				return (stmt.ambient ? 'declare ' : '')
+					+ ((hasMod(stmt, 'async') ? 'async ' : '') + 'function ' + (hasMod(stmt, 'generator') ? '*' : '') + stmt.name)
 					+ this.typeParamsToCode(stmt.typeParams as TS.TypeParam[])
 					+ this.paramListToCode(stmt.params, stmt.rest)
 					+ this.typeAnnotationToCode(stmt.returnType as Type)
@@ -464,7 +462,8 @@ export class TSoutput {
 				return 'export ' + this.statementToCode(stmt.declaration);
 
 			case 'class_decl':
-				return stmt.abstract ? 'abstract ' : ''
+				return (stmt.ambient ? 'declare ' : '')
+					+ (stmt.abstract ? 'abstract ' : '')
 					+ 'class ' + stmt.name
 					+ this.typeParamsToCode(stmt.typeParams as TS.TypeParam[])
 					+ (stmt.superClass ? ' extends ' + this.exprToCode(stmt.superClass, 18) : '')
@@ -501,18 +500,17 @@ export class TSoutput {
 					+ ';';
 
 		} else if (member.type === 'method') {
-			const fn = member.value;
 			result	+= (member.kind === 'get' ? 'get ' : member.kind === 'set' ? 'set ' : '')
-					+ (hasMod(fn, 'async') ? 'async ' : '')
-					+ (hasMod(fn, 'generator') ? '*' : '')
+					+ (hasMod(member, 'async') ? 'async ' : '')
+					+ (hasMod(member, 'generator') ? '*' : '')
 					+ this.memberKeyToCode(member.key)
 					+ optional(hasMod(member, 'optional'))
-					+ this.typeParamsToCode(fn.typeParams as TS.TypeParam[])
-					+ this.paramListToCode(fn.params, fn.rest)
-					+ this.typeAnnotationToCode(fn.returnType as Type)
-					+ ' {\n' + this.indentBlock(fn.body!, this.opts.indent + this.opts.indent) + '\n  }';
+					+ this.typeParamsToCode(member.typeParams as TS.TypeParam[])
+					+ this.paramListToCode(member.params, member.rest)
+					+ this.typeAnnotationToCode(member.returnType as Type)
+					+ member.body ? ' {\n' + this.indentBlock(member.body!, this.opts.indent + this.opts.indent) + '\n  }' : ';';
 
-		} else if (member.type === 'method_signature') {
+/*		} else if (member.type === 'method_signature') {
 			result	+= (member.kind ? member.kind + ' ' : '')
 					+ this.memberKeyToCode(member.key)
 					+ optional(hasMod(member, 'optional'))
@@ -520,7 +518,7 @@ export class TSoutput {
 					+ this.paramListToCode(member.params, member.rest)
 					+ this.typeAnnotationToCode(member.returnType as Type)
 					+ ';';
-
+*/
 		} else if (member.type === 'index_signature') {
 			result	+= '[' + member.paramName + ': ' + this.typeToCode(member.paramType) + ']: '
 					+ this.typeToCode(member.typeAnnotation) + ';';
@@ -539,6 +537,24 @@ export class TSoutput {
 		return '`' + parts.map(p => p.str + (p.exp ? '${' + this.exprToCode(p.exp) + '}' : '')).join('') + '`';
 	}
 
+	literalToCode(expr: JS.Literal) {
+		switch (typeof expr.value) {
+			case 'string':
+				return JSON.stringify(expr.value);
+
+			case 'bigint':
+				return expr.value.toString() + 'n';
+
+			case 'object':
+				return  expr.value === null ? 'null'
+					: expr.value instanceof RegExp	? '/' + expr.value.source + '/' + (expr.value.flags || '')
+					: Array.isArray(expr.value)		?  this.templatePartsToCode(expr.value)
+					: '?';
+			default:
+				return String(expr.value);
+		}
+	}
+
 	// `minPrec`: the precedence tier required of `expr` here -- if lower, it gets parens. Defaults to 0 (never wraps), right for statement-level callers.
 	exprToCode(expr: Expr, minPrec = 0): string {
 		return withParens(this.exprToCodeBody(expr), exprPrecedence(expr) < minPrec);
@@ -550,20 +566,7 @@ export class TSoutput {
 				return expr.name;
 
 			case 'literal':
-				// An *untagged* template literal: js-parser.ts parses `` `...` `` as `{ type: 'literal', value: <TemplatePart[]> }`, no separate node type.
-				if (Array.isArray(expr.value))
-					return this.templatePartsToCode(expr.value);
-				if (expr.value === null)
-					return 'null';
-				if (typeof expr.value === 'string')
-					return JSON.stringify(expr.value);
-				return String(expr.value);
-
-			case 'regex':
-				return '/' + expr.pattern + '/' + (expr.flags || '');
-
-			case 'bigint':
-				return expr.value + 'n';
+				return this.literalToCode(expr);
 
 			case 'this':
 				return 'this';
