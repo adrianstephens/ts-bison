@@ -14,7 +14,7 @@ export interface PrecEntry {
 }
 export type Precedence = string | PrecEntry;
 export const forceFork: PrecEntry = {assoc:'fork', level: 0};
-export type MergeFn = (left: unknown, right: unknown) => unknown;
+export type MergeValues = (left: unknown, right: unknown) => unknown;
 
 function has0args<T>(fn: (() => T) | Action<T>): fn is ()=>T {
 	return fn.length === 0;
@@ -98,13 +98,13 @@ export interface Rule<T> {
 	rhs:		GrammarSym[];
 	action?:	(values: WithTextPos<any[]>, ctx: any) => T;
 	prec?:		Precedence;
-	merge?:		MergeFn;
+	merge?:		MergeValues;
 }
 
 export function WithPrec<T>(rule: Rule<T>, prec: Precedence): Rule<T> {
 	return {...rule, prec};
 }
-export function WithMerge<T>(rule: Rule<T>, merge: MergeFn): Rule<T> {
+export function WithMerge<T>(rule: Rule<T>, merge: MergeValues): Rule<T> {
 	return {...rule, merge};
 }
 export function ForceFork<T>(rule: Rule<T>): Rule<T> {
@@ -121,8 +121,8 @@ export function maybeCommonAction<C>(commonAction: CommonAction<C> | undefined) 
 		: (action: <T>(values: WithTextPos<any[]>, ctx: C) => T) => action;
 }
 
-export function Rule<R extends readonly GrammarSym[]>(rhs: R): Rule<ElemValue<R[0]>>;
-export function Rule<T, R extends readonly GrammarSym[], C = any>(rhs: R, action: Action<T, C, ValuesOf<R>>): Rule<T>;
+export function Rule<const R extends readonly GrammarSym[]>(rhs: R): Rule<ElemValue<R[0]>>;
+export function Rule<T, const R extends readonly GrammarSym[], C = any>(rhs: R, action: Action<T, C, ValuesOf<R>>): Rule<T>;
 export function Rule(rhs: GrammarSym[], action?: Action<any, any>) {
 	return { rhs, action };
 }
@@ -130,12 +130,12 @@ export function Rule(rhs: GrammarSym[], action?: Action<any, any>) {
 // Pins `ctx`'s type to `C` for every rule built with the returned function
 export function makeRule<C>(commonAction?: CommonAction<C>) {
 	const common = maybeCommonAction(commonAction);
-	function boundRule<R extends readonly GrammarSym<C>[]>(rhs: R): Rule<ElemValue<R[0]>>;
-	function boundRule<T, R extends readonly GrammarSym<C>[]>(rhs: R, action: Action<T, C, ValuesOf<R>>): Rule<T>;
-	function boundRule(rhs: GrammarSym[], action?: Action<any, any>) {
+	function rule<const R extends readonly GrammarSym<C>[]>(rhs: R): Rule<ElemValue<R[0]>>;
+	function rule<T, const R extends readonly GrammarSym<C>[]>(rhs: R, action: Action<T, C, ValuesOf<R>>): Rule<T>;
+	function rule(rhs: GrammarSym[], action?: Action<any, any>) {
 		return { rhs, action: action ? common(action) : undefined };
 	}
-	return boundRule;
+	return rule;
 }
 
 type Rule2<T> = Rule<T> | Rules<T> | (()=>Rules<T>)
@@ -190,19 +190,21 @@ export function OneOf<const T extends string>(names: readonly T[]) {
 
 export type TermLike = RegExp | string | Terminal;
 
-export interface GrammarSpec {
+export interface GrammarSpec<T = any> {
 	precedence?:	Record<string, Assoc | PrecEntry>;
-	start?:			Rules<any>;		// defaults to the first value of `rules`
+	start?:			Rules<T>;		// defaults to the first value of `rules`
 	rules?:			Record<string, Rules<any>>;
 	skip?:			TermLike[];
 	terminals?:		TermLike[];
 	recover?:		RecoveryCallback;
 	optimize?:		boolean;		// default true: bypass pass-through unit-rule GOTO hops in the built tables (see eliminateUnitGotos); set false to parse with the raw tables when debugging a suspect parse
 	lalr?:			boolean;		// default true (real per-state LALR(1) reduce lookaheads); set false for the older, strictly weaker SLR(1) global-FOLLOW-set lookaheads instead -- see `buildTables`'s header comment
+	merge?:			MergeValues;
+	forkCtx?:		(ctx: any) => any;	// clone ctx per GLR fork branch so dying branches' action mutations can't leak; the winner's clone is adopted when the fork settles. Lexing during a fork still sees the pre-fork ctx.
 }
 
-export interface Parser {
-	parse(input: string, ctx?: any): unknown;
+export interface Parser<T, C = any> {
+	parse(input: string, ctx?: C): T;
 	tables: ParseTables;
 }
 
@@ -228,7 +230,7 @@ export interface InternalRule {
 	action: 	Action<unknown>;
 	prec?:		PrecEntry;
 	peek?:		number;		// extra preceding stack values to pass to `action` without popping them (mid-rhs actions: values of the symbols before them in the containing rule)
-	merge?:		MergeFn;	// GLR convergence combiner for this rule's ambiguous reduce, carried over from the user Rule
+	merge?:		MergeValues;	// GLR convergence combiner for this rule's ambiguous reduce, carried over from the user Rule
 }
 
 export type ActionEntry =
@@ -265,7 +267,7 @@ export class GrammarBuilder {
 	private first	= new Map<InternalSym, { terms: Set<Terminal>; nullable: boolean }>();
 	private startSymbol: NonTerminal;
 
-	constructor(spec: GrammarSpec) {
+	constructor(spec: GrammarSpec<any>) {
 		const rules = [
 			...(spec.start ? [spec.start] : []),
 			...(spec.rules ? Object.values(spec.rules): [])
@@ -723,6 +725,7 @@ function advancePos(state: TextPos, text: string) {
 
 interface Lexer extends TextPos {
 	prev?:		Token;
+	ctx:		any;			// reassigned when a GLR fork settles on a branch's cloned ctx
 	next(allowed: Map<Terminal, ActionEntry>): 	Token;
 	peekText(): string;
 }
@@ -742,11 +745,6 @@ export function sameValue(a: unknown, b: unknown): boolean {
 	const keysA = Object.keys(a);
 	return keysA.length === Object.keys(b).length && keysA.every(k => sameValue((a as any)[k], (b as any)[k]));
 }
-const defaultMerge: MergeFn = (left, right) => {
-	if (Array.isArray(left))
-		return left.some(v => sameValue(v, right)) ? left : [...left, right];
-	return sameValue(left, right) ? left : [left, right];
-};
 
 function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: TextPos & { prev?: Token }, ctx: any, resolveSym: (sym: Token|Terminal|string|RegExp|undefined) => Token|Terminal|undefined): Token {
 
@@ -806,21 +804,12 @@ function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: Te
 }
 
 interface StackEntry { state: number; value: unknown; }
+type InternalRecoveryCallback = (stream: Lexer, row: Map<Terminal, ActionEntry>) => Token | undefined;
 
-function recoverCtx(stream: Lexer): LexPosition {
-	return { offset: stream.offset, line: stream.line, col: stream.col, remaining: stream.peekText(), prev: stream.prev };
-}
-
-type RecoveryCallback2 = (stream: Lexer, row: Map<Terminal, ActionEntry>) => Token | undefined;
-
-function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: RecoveryCallback2) {
+function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any) {
 	const stack: StackEntry[] = [{ state: 0, value: undefined }];
 
 	let realTok		= stream.next(tables.action[0]);
-
-	// A `recover`-synthesized token never consumes `realTok` -- only a genuine shift/reduce advances
-	// `stream.offset`. Recovery firing forever at the same offset means it's stuck re-synthesizing against
-	// the same unconsumed token; the bound is generous since a few recovery-driven reduces can legitimately precede a real shift.
 	let recoveryStuckAt: number | undefined;
 	let recoveryStuckCount = 0;
 	const MAX_RECOVERY_AT_SAME_OFFSET = 50;
@@ -836,7 +825,7 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 			recoveryStuckCount = recoveryStuckAt === stream.offset ? recoveryStuckCount + 1 : 1;
 			recoveryStuckAt = stream.offset;
 			if (recoveryStuckCount > MAX_RECOVERY_AT_SAME_OFFSET) {
-				const pos = recoverCtx(stream);
+				const pos = getTextPos(stream);
 				throw new SyntaxError(
 					`Parser stuck in error recovery at line ${pos.line}, col ${pos.col} `
 					+ `(recovery keeps re-inserting a token without consuming '${realTok.type.name}') -- this is a parser/grammar bug, not just invalid input.`
@@ -848,18 +837,18 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 
 		if (!entry || entry.kind === 'error') {
 			const expected	= [...row].filter(([k, v]) => k !== EOF && v.kind !== 'error' && v.kind !== 'ignore').map(([k]) => k.name);
-			const pos		= recoverCtx(stream);
 			throw new SyntaxError(
-				(realTok.type !== ERROR ? `Unexpected token '${realTok.type.name}'` : `Unexpected character '${pos.remaining[0] ?? ''}'`)
-				+ ` at line ${pos.line}, col ${pos.col}. `
+				(realTok.type !== ERROR ? `Unexpected token '${realTok.type.name}'` : `Unexpected character '${stream.peekText()[0] ?? ''}'`)
+				+ ` at line ${stream.line}, col ${stream.col}. `
 				+ `Expected: ${expected.length ? expected.join(', ') : '(nothing)'}`
 			);
 		}
 
 		if (entry.kind === 'conflict') {
-			const result = runGlrFork(tables, stream, tok, ctx, recover, stack);
-			if (result)
-				return result.value;
+			const result = runGlrFork(tables, stream, tok, ctx, recover, stack, merge, forkCtx);
+			if (result.accepted)
+				return result.value as any;
+			ctx = stream.ctx = result.ctx;
 			realTok = stream.next(tables.action[stack[stack.length - 1].state]);
 
 		} else if (entry.kind === 'shift') {
@@ -881,12 +870,11 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 			], {pos: tok.pos});
 
 			const topState	= stack[stack.length - 1].state;
-			const state = tables.goto[topState].get(rule.lhs);
+			const state		= tables.goto[topState].get(rule.lhs);
 			if (state === undefined)
 				throw new Error(`No GOTO entry for state ${topState}, non-terminal '${rule.lhs.name}'`);
 
-			const value = rule.action(vals, ctx);
-			stack.push({ state, value });
+			stack.push({ state, value: rule.action(vals, ctx) });
 
 		} else if (entry.kind === 'accept') {
 			return stack[stack.length - 1].value;
@@ -903,34 +891,36 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Recove
 //  GLR fork explorer
 // ===================================================================
 
-type GlrForkResult = { accepted: true; value: unknown } | undefined;
+type GlrForkResult = { accepted: true; value: unknown } | { accepted: false; ctx: any };
 
-// On a non-accepting return, `stack` has been overwritten in place with the settled single derivation.
-function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, recover: RecoveryCallback2, stack: StackEntry[]): GlrForkResult {
+// On a non-accepting return, `stack` has been overwritten in place with the settled single derivation,
+// and `ctx` is the winning branch's context (a `forkCtx` clone when that hook is set).
+function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, recover: InternalRecoveryCallback, stack: StackEntry[], merge: MergeValues, forkCtx: (ctx: any) => any): GlrForkResult {
 
 	interface StackFrame extends StackEntry {
 		id:		number;			// identifies this exact frame, for convergence keys below
 		parent: StackFrame | null;
+		ctx:	any;			// this derivation path's context; only the top frame's is live
 	}
 
 	let frameIdCounter	= 0;
 	let accepted		= false;
 	let acceptedValue: unknown;
 
-	const makeFrame		= (parent: StackFrame | null, state: number, value: unknown) => ({ id: frameIdCounter++, parent, state, value });
+	const makeFrame		= (parent: StackFrame | null, state: number, value: unknown, pathCtx: any) => ({ id: frameIdCounter++, parent, state, value, ctx: pathCtx });
 	const convergeKey	= (top: StackFrame) => `${top.state}:${top.parent ? top.parent.id : -1}`;
+	// Converging paths may carry different ctx clones; the already-registered path's ctx wins.
 	const mergeInto		= (into: StackFrame, incoming: StackFrame, ruleId?: number) =>
-		makeFrame(into.parent, into.state, ((ruleId !== undefined ? tables.rules[ruleId].merge : undefined) ?? defaultMerge)(into.value, incoming.value));
+		makeFrame(into.parent, into.state, ((ruleId !== undefined ? tables.rules[ruleId].merge : undefined) ?? merge)(into.value, incoming.value), into.ctx);
 
 	// Flat stack -> frame chain
-	let frame = makeFrame(null, stack[0].state, undefined);
+	let frame = makeFrame(null, stack[0].state, undefined, ctx);
 	for (let i = 1; i < stack.length; i++)
-		frame = makeFrame(frame, stack[i].state, stack[i].value);
+		frame = makeFrame(frame, stack[i].state, stack[i].value, ctx);
 
 	let active = new Map([[convergeKey(frame), frame]]);
 
-	// Bounds all work across this call (any cause of runaway path explosion), on top of the more specific
-	// recovery-stuck check below.
+	// Bounds all work across this call (any cause of runaway path explosion), on top of the more specific recovery-stuck check below.
 	let totalWork = 0;
 	const MAX_TOTAL_WORK = 5_000;
 
@@ -947,9 +937,9 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 			worklist.push(top);
 		};
 
-		const applyAction = (path: StackFrame, entry: ActionEntry, actionTok: Token, stayAtSamePosition: boolean) => {
+		const applyAction = (path: StackFrame, entry: ActionEntry, actionTok: Token, stayAtSamePosition: boolean, pathCtx: any) => {
 			if (entry.kind === 'shift') {
-				const top = makeFrame(path, entry.state, actionTok.value);
+				const top = makeFrame(path, entry.state, actionTok.value, pathCtx);
 				if (stayAtSamePosition)
 					registerAtPosition(top);
 				else
@@ -970,10 +960,10 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 					vals[m]		= peekFrame.value;
 					peekFrame	= peekFrame.parent!;
 				}
-				const reducedValue	= rule.action(vals, ctx);
+				const reducedValue	= rule.action(vals, pathCtx);
 				const nextState		= tables.goto[top.state]?.get(rule.lhs);
 				if (nextState !== undefined)
-					registerAtPosition(makeFrame(top, nextState, reducedValue), entry.rule);
+					registerAtPosition(makeFrame(top, nextState, reducedValue, pathCtx), entry.rule);
 
 			} else {//if (entry.kind === 'accept') {
 				acceptedValue = path.value;
@@ -989,9 +979,8 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 
 		while (worklist.length > 0 && !accepted) {
 			if (++totalWork > MAX_TOTAL_WORK) {
-				const pos = recoverCtx(stream);
 				throw new SyntaxError(
-					`GLR fork exceeded ${MAX_TOTAL_WORK} total steps resolving ambiguity at line ${pos.line}, col ${pos.col} `
+					`GLR fork exceeded ${MAX_TOTAL_WORK} total steps resolving ambiguity at line ${stream.line}, col ${stream.col} `
 					+ `-- likely runaway path explosion, not genuine ambiguity (this is a parser/grammar bug, not just invalid input).`
 				);
 			}
@@ -1004,9 +993,8 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 			const direct		= row.get(tok.type);
 			const usingRecovery	= !direct || direct.kind === 'error';
 			if (usingRecovery && ++recoveryUsedCount > MAX_RECOVERY_PER_POSITION) {
-				const pos = recoverCtx(stream);
 				throw new SyntaxError(
-					`GLR fork stuck in error recovery at line ${pos.line}, col ${pos.col} `
+					`GLR fork stuck in error recovery at line ${stream.line}, col ${stream.col} `
 					+ `(recovery keeps re-inserting a token without consuming '${tok.type.name}') -- this is a parser/grammar bug, not just invalid input.`
 				);
 			}
@@ -1014,10 +1002,12 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 			const entry			= actionTok && row.get(actionTok.type);
 			if (entry && entry.kind !== 'error') {
 				if (entry.kind === 'conflict') {
+					// Every branch gets its own clone, leaving `path.ctx` (the original on the first
+					// fan-out) unmutated -- the lexer keeps reading it until the fork settles.
 					for (const inner of entry.entries)
-						applyAction(path, inner, actionTok, actionTok != tok);
+						applyAction(path, inner, actionTok, actionTok != tok, forkCtx(path.ctx));
 				} else {
-					applyAction(path, entry, actionTok, actionTok != tok);
+					applyAction(path, entry, actionTok, actionTok != tok, path.ctx);
 				}
 			}
 		}
@@ -1032,10 +1022,8 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 			stream.prev = tok;
 
 		// Merge converging paths landing on i + 1 (same derivation reached by separate shifts).
-		if (!shifted.length) {
-			const pos = recoverCtx(stream);
-			throw new SyntaxError(`No active GLR fork paths survived to token ${i + 1} (at line ${pos.line}, col ${pos.col}, near '${tok.type.name}') -- every forked derivation died out; this is a parser/grammar bug, not just invalid input.`);
-		}
+		if (!shifted.length)
+			throw new SyntaxError(`No active GLR fork paths survived to token ${i + 1} (at line ${stream.line}, col ${stream.col}, near '${tok.type.name}') -- every forked derivation died out; this is a parser/grammar bug, not just invalid input.`);
 
 		active = new Map<string, StackFrame>();
 		for (const path of shifted) {
@@ -1046,13 +1034,14 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 
 		// Settled back down to a single derivation -- hand it back to runParser's fast loop
 		if (active.size === 1) {
+			const winner = active.values().next().value!;
 			const frames: StackEntry[] = [];
-			for (let frame: StackFrame | null = active.values().next().value!; frame; frame = frame.parent)
+			for (let frame: StackFrame | null = winner; frame; frame = frame.parent)
 				frames.push({ state: frame.state, value: frame.value });
 			stack.length = 0;
 			for (let i = frames.length - 1; i >= 0; i--)
 				stack.push(frames[i]);
-			return;
+			return { accepted: false, ctx: winner.ctx };
 		}
 
 		// Still multiple derivations active -- a token valid for *any* of them is fair game, so the lexer restriction is their rows' union, not any single one's.
@@ -1127,7 +1116,7 @@ function eliminateUnitGotos(tables: ParseTables): number {
 //  Main entry point
 // ===================================================================
 
-export function makeParser(spec: GrammarSpec): Parser {
+export function makeParser<T>(spec: GrammarSpec<T>): Parser<T> {
 	const g			= new GrammarBuilder(spec);
 	const tables	= g.buildTables(spec.lalr ?? true);
 
@@ -1143,23 +1132,30 @@ export function makeParser(spec: GrammarSpec): Parser {
 		offset:	0,
 		line:	1,
 		col:	1,
-		next(allowed: Map<Terminal, ActionEntry>) { return nextToken(allowed, input, this, ctx, resolveSym); },
+		ctx,
+		next(allowed: Map<Terminal, ActionEntry>) { return nextToken(allowed, input, this, this.ctx, resolveSym); },
 		peekText() { return input.substring(this.offset); }
 	});
 
-	const makeRecover = (recover?: RecoveryCallback): RecoveryCallback2 => {
-		return recover
-			? (stream, row) => {
-				const result = resolveSym(recover(recoverCtx(stream), row));
-				if (result)
-					return result instanceof Terminal ? {type: result, value: '', pos: getTextPos(stream)} : result;
-				return undefined;
-			}
-			: (_stream, _row) => undefined;
-	};
+	const recover: InternalRecoveryCallback = spec.recover
+		? (stream, row) => {
+			const result = resolveSym(spec.recover!({...getTextPos(stream), remaining: stream.peekText(), prev: stream.prev}, row));
+			if (result)
+				return result instanceof Terminal ? {type: result, value: '', pos: getTextPos(stream)} : result;
+			return undefined;
+		}
+		: (_stream, _row) => undefined;
+
+	const merge: MergeValues = spec.merge ?? ((left, right) => {
+		if (Array.isArray(left))
+			return left.some(v => sameValue(v, right)) ? left : [...left, right];
+		return sameValue(left, right) ? left : [left, right];
+	});
+
+	const forkCtx = spec.forkCtx ?? (ctx => ctx);
 
 	return {
 		tables,
-		parse: (input, ctx) => runParser(tables, makeLexer(input, ctx), ctx, makeRecover(spec.recover))
+		parse: (input, ctx) => runParser(tables, makeLexer(input, ctx), ctx, recover, merge, forkCtx)
 	};
 }

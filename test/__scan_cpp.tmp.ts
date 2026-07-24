@@ -68,6 +68,8 @@ async function scan(dir: string) {
 	console.log(`${knownTypes.size} harvested type names`);
 	await scan(ROOT);
 	console.log(`${pass}/${total} parsed (${ppErrs} preprocessor errors)`);
+	if (process.env.DUMP)
+		for (const f of fails) console.log('FAIL', f.file);
 	const groups = new Map<string, Fail[]>();
 	for (const f of fails) {
 		const key = /Unexpected token '([^']*)'/.exec(f.msg)?.[1] ?? f.msg.replace(/line \d+, col \d+/, '').slice(0, 60);

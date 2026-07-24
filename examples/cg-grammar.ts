@@ -1069,13 +1069,11 @@ class CG {
 
 	GetFloatSuffixBase(suffix: string) {
 		switch (suffix) {
-		case 'f':
-		case 'F':
-			return Type.BASE_FLOAT;
-		case 'l':
-		case 'L':
-		default:
-			return Type.BASE_FLOAT;
+			case 'f':
+			case 'F':		return Type.BASE_FLOAT;
+			case 'l':
+			case 'L':
+			default:		return Type.BASE_FLOAT;
 		}
 	}
 	CheckBooleanExpr(expr: Expr, len?: number) { return {result: {} as Expr, len: 0}; }
@@ -1159,12 +1157,12 @@ const CFLOATCONST_SY = Rules(
 );
 
 const identifier = Rules<ident>(
-	Rule([IDENT_SY] as const, () => 0),
+	Rule([IDENT_SY], _ => 0),
 );
 
 const struct_identifier = Rules<ident>(
-	Rule([identifier]),
-	Rule([TYPEIDENT_SY] as const, () => 0),
+	identifier,
+	Rule([TYPEIDENT_SY], _ => 0),
 );
 
 const enum_header = Rules(
@@ -1172,44 +1170,44 @@ const enum_header = Rules(
 );
 
 const enum_declaration = Rules(
-	Rule([identifier] as const, ($, cg) => { cg.EnumAdd($[0], 0); }),
-	Rule([identifier, '=', INTCONST_SY] as const, ($, cg) => { cg.EnumAdd($[0], $[2]); }),
+	Rule([identifier], ($, cg) => { cg.EnumAdd($[0], 0); }),
+	Rule([identifier, '=', INTCONST_SY], ($, cg) => { cg.EnumAdd($[0], $[2]); }),
 );
 
 const enum_declaration_list = Rules<void>(self => [
-	Rule([enum_declaration]),
-	Rule([self, ',', enum_declaration] as const),
+	enum_declaration,
+	Rule([self, ',', enum_declaration]),
 ]);
 
 const untagged_enum_header = Rules(
-	Rule([ENUM_SY] as const, ($, cg) => cg.EnumHeader(0)),
+	Rule([ENUM_SY], ($, cg) => cg.EnumHeader(0)),
 );
 /****************/
 /* Enum Types */
 /****************/
 
 const enum_specifier = Rules(
-	Rule([enum_header, '{', ($: any, cg: CG) => {cg.type_specs.SetDType($[0]);}, enum_declaration_list, '}'] as const),
-	Rule([untagged_enum_header, '{', ($: any, cg: CG) => {cg.type_specs.SetDType($[0]);}, enum_declaration_list, '}'] as const),
-	Rule([enum_header]),
+	Rule([enum_header, '{', 			($, cg) => {cg.type_specs.SetDType($[0]);}, enum_declaration_list, '}']),
+	Rule([untagged_enum_header, '{',	($, cg) => {cg.type_specs.SetDType($[0]);}, enum_declaration_list, '}']),
+	enum_header,
 );
 
 const semantics_identifier = Rules<ident>(
-	Rule([identifier]),
+	identifier,
 );
 
 const struct_or_connector_header = Rules(
-	Rule([STRUCT_SY, struct_identifier] as const, ($, cg) => cg.StructHeader(0, $[1])),
-	Rule([STRUCT_SY, struct_identifier, ':', semantics_identifier] as const, ($, cg) => cg.StructHeader($[3], $[1])),
-	Rule([STRUCT_SY, struct_identifier, ':', TYPEIDENT_SY] as const, ($, cg) => cg.StructHeader(0, $[1]).AddStructBase(cg.LookUpTypeSymbol($[3]))),
+	Rule([STRUCT_SY, struct_identifier],							($, cg) => cg.StructHeader(0, $[1])),
+	Rule([STRUCT_SY, struct_identifier, ':', semantics_identifier], ($, cg) => cg.StructHeader($[3], $[1])),
+	Rule([STRUCT_SY, struct_identifier, ':', TYPEIDENT_SY],			($, cg) => cg.StructHeader(0, $[1]).AddStructBase(cg.LookUpTypeSymbol($[3]))),
 );
 
 const compound_header = Rules(
-	Rule(['{'] as const, ($, cg) => { cg.PushScope(); cg.current_scope!.funindex = cg.func_index; }),
+	Rule(['{'], ($, cg) => { cg.PushScope(); cg.current_scope!.funindex = cg.func_index; }),
 );
 
 const struct_compound_header = Rules(
-	Rule([compound_header] as const, ($, cg) => { cg.current_scope!.flags |= Scope.is_struct; return $[0]; }),
+	Rule([compound_header], ($, cg) => { cg.current_scope!.flags |= Scope.is_struct; return $[0]; }),
 );
 
 /***************/
@@ -1217,45 +1215,46 @@ const struct_compound_header = Rules(
 /***************/
 
 const attribute = Rules(
-	Rule(['[', identifier, ']'] as const, 																$ => new Attr($[1])),
-	Rule(['[', identifier, '(', INTCONST_SY, ')', ']'] as const, 										$ => new Attr($[1], $[3])),
-	Rule(['[', identifier, '(', INTCONST_SY, ',', INTCONST_SY, ')', ']'] as const, 						$ => new Attr($[1], $[3], $[5])),
-	Rule(['[', identifier, '(', INTCONST_SY, ',', INTCONST_SY, ',', INTCONST_SY, ')', ']'] as const, 	$ => new Attr($[1], $[3], $[5], $[7])),
+	Rule(['[', identifier, ']'], 																$ => new Attr($[1])),
+	Rule(['[', identifier, '(', INTCONST_SY, ')', ']'], 										$ => new Attr($[1], $[3])),
+	Rule(['[', identifier, '(', INTCONST_SY, ',', INTCONST_SY, ')', ']'], 						$ => new Attr($[1], $[3], $[5])),
+	Rule(['[', identifier, '(', INTCONST_SY, ',', INTCONST_SY, ',', INTCONST_SY, ')', ']'], 	$ => new Attr($[1], $[3], $[5], $[7])),
 );
 
 const variable_identifier = Rules(
-	Rule([identifier]),
+	identifier,
 );
 
 const basic_variable = Rules(
-	Rule([variable_identifier] as const, ($, cg) => cg.BasicVariable($[0])),
+	Rule([variable_identifier],					($, cg) => cg.BasicVariable($[0])),
 );
 
 const scope_identifier = Rules(
-	Rule([identifier]),
+	identifier,
 );
+
 /************/
 /* Variable */
 /************/
 
 const variable = Rules(
-	Rule([basic_variable]),
-	Rule([scope_identifier, COLONCOLON_SY, basic_variable] as const, $ => $[2]),
+	basic_variable,
+	Rule([scope_identifier, COLONCOLON_SY, basic_variable], $ => $[2]),
 );
 
 const constant = Rules(
-	Rule([INTCONST_SY, /*, Temporary!, */] as const, 	($, cg) => cg.NewConstNode('ICONST', $[0], Type.BASE_CINT)),
-	Rule([UINTCONST_SY, /*, Temporary!, */] as const, 	($, cg) => cg.NewConstNode('ICONST', $[0], Type.BASE_CINT)),
-	Rule([CFLOATCONST_SY, /*, Temporary!, */] as const, ($, cg) => cg.NewConstNode('FCONST', $[0], cg.GetFloatSuffixBase(' '))),
-	Rule([CFLOATCONST_SY, /[fF]/] as const, 			($, cg) => cg.NewConstNode('FCONST', $[0], cg.GetFloatSuffixBase('f'))),
-	Rule([CFLOATCONST_SY, /[hH]/] as const,				($, cg) => cg.NewConstNode('FCONST', $[0], cg.GetFloatSuffixBase('h'))),
-	Rule([CFLOATCONST_SY, /[xX]/] as const,				($, cg) => cg.NewConstNode('FCONST', $[0], cg.GetFloatSuffixBase('x'))),
-	Rule([STRCONST_SY, /*, Temporary!, */] as const,	($, cg) => cg.NewConstNode('ICONST', $[0], Type.BASE_STRING)),
+	Rule([INTCONST_SY, /*, Temporary!, */], 	($, cg) => cg.NewConstNode('ICONST', $[0], Type.BASE_CINT)),
+	Rule([UINTCONST_SY, /*, Temporary!, */], 	($, cg) => cg.NewConstNode('ICONST', $[0], Type.BASE_CINT)),
+	Rule([CFLOATCONST_SY, /*, Temporary!, */],	($, cg) => cg.NewConstNode('FCONST', $[0], cg.GetFloatSuffixBase(' '))),
+	Rule([CFLOATCONST_SY, /[fF]/], 				($, cg) => cg.NewConstNode('FCONST', $[0], cg.GetFloatSuffixBase('f'))),
+	Rule([CFLOATCONST_SY, /[hH]/],				($, cg) => cg.NewConstNode('FCONST', $[0], cg.GetFloatSuffixBase('h'))),
+	Rule([CFLOATCONST_SY, /[xX]/],				($, cg) => cg.NewConstNode('FCONST', $[0], cg.GetFloatSuffixBase('x'))),
+	Rule([STRCONST_SY, /*, Temporary!, */],		($, cg) => cg.NewConstNode('ICONST', $[0], Type.BASE_STRING)),
 );
 
 const expression_list = Rules<Expr>(self => [
-	Rule([expression] as const, $ => $[0]),
-	Rule([self, ',', expression] as const, $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[2])),
+	expression,
+	Rule([self, ',', expression], $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[2])),
 ]);
 
 /**********************/
@@ -1263,10 +1262,10 @@ const expression_list = Rules<Expr>(self => [
 /**********************/
 
 const primary_expression = Rules(
-	Rule([variable]),
-	Rule([constant]),
-	Rule(['(', expression, ')'] as const, 						$ => $[1]),
-	Rule([type_specifier, '(', expression_list, ')'] as const,	($, cg) => cg.NewConstructor($[0], $[2])),
+	variable,
+	constant,
+	Rule(['(', expression, ')'], 						$ => $[1]),
+	Rule([type_specifier, '(', expression_list, ')'],	($, cg) => cg.NewConstructor($[0], $[2])),
 );
 
 /*********/
@@ -1274,12 +1273,12 @@ const primary_expression = Rules(
 /*********/
 
 const member_identifier = Rules(
-	Rule([identifier]),
+	identifier,
 );
 
 const actual_argument_list = Rules(
-	Rule([/*, empty, */], () => undefined),
-	Rule([expression_list]),
+	Rule([/*, empty, */], _ => undefined),
+	expression_list,
 );
 
 /*********************/
@@ -1287,12 +1286,12 @@ const actual_argument_list = Rules(
 /*********************/
 
 const postfix_expression = Rules<Expr>(self => [
-	Rule([primary_expression]),
-	Rule([self, PLUSPLUS_SY] as const, 						$ => Expr.NewUnopNode('POSTINC', $[0])),
-	Rule([self, MINUSMINUS_SY] as const, 					$ => Expr.NewUnopNode('POSTDEC', $[0])),
-	Rule([self, '.', member_identifier] as const, 			($, cg) => cg.NewMemberSelectorOrSwizzleOrWriteMaskOperator($[0], $[2])),
-	Rule([self, '[', expression, ']'] as const, 			($, cg) => cg.NewIndexOperator($[0], $[2])),
-	Rule([self, '(', actual_argument_list, ')'] as const, 	($, cg) => cg.NewFunctionCallOperator($[0], $[2])),
+	primary_expression,
+	Rule([self, PLUSPLUS_SY], 						$ => Expr.NewUnopNode('POSTINC', $[0])),
+	Rule([self, MINUSMINUS_SY], 					$ => Expr.NewUnopNode('POSTDEC', $[0])),
+	Rule([self, '.', member_identifier], 			($, cg) => cg.NewMemberSelectorOrSwizzleOrWriteMaskOperator($[0], $[2])),
+	Rule([self, '[', expression, ']'], 				($, cg) => cg.NewIndexOperator($[0], $[2])),
+	Rule([self, '(', actual_argument_list, ')'], 	($, cg) => cg.NewFunctionCallOperator($[0], $[2])),
 ]);
 
 /*******************/
@@ -1300,22 +1299,22 @@ const postfix_expression = Rules<Expr>(self => [
 /*******************/
 
 const unary_expression = Rules<Expr>(self => [
-	Rule([postfix_expression]),
-	Rule([PLUSPLUS_SY, self] as const,		$ => Expr.NewUnopNode('PREINC', $[1])),
-	Rule([MINUSMINUS_SY, self] as const,	$ => Expr.NewUnopNode('PREDEC', $[1])),
-	Rule(['+', self] as const, 				($, cg) => cg.NewUnaryOperator('POS', $[1], false)),
-	Rule(['-', self] as const, 				($, cg) => cg.NewUnaryOperator('NEG', $[1], false)),
-	Rule(['!', self] as const, 				($, cg) => cg.NewUnaryOperator('BNOT',$[1], false)),
-	Rule(['~', self] as const, 				($, cg) => cg.NewUnaryOperator('NOT', $[1], true)),
+	postfix_expression,
+	Rule([PLUSPLUS_SY, self],		$ => Expr.NewUnopNode('PREINC', $[1])),
+	Rule([MINUSMINUS_SY, self],		$ => Expr.NewUnopNode('PREDEC', $[1])),
+	Rule(['+', self], 				($, cg) => cg.NewUnaryOperator('POS', $[1], false)),
+	Rule(['-', self], 				($, cg) => cg.NewUnaryOperator('NEG', $[1], false)),
+	Rule(['!', self], 				($, cg) => cg.NewUnaryOperator('BNOT',$[1], false)),
+	Rule(['~', self], 				($, cg) => cg.NewUnaryOperator('NOT', $[1], true)),
 ]);				
 
 const non_empty_abstract_parameter_list = Rules<Decl[]>(self => [
-	Rule([abstract_declaration] as const, ($, cg) => {
+	Rule([abstract_declaration], ($, cg) => {
 		if ($[0].type!.type.IsVoid())
 			cg.current_scope!.flags |= Scope.has_void_param;
 		return [$[0]];
 	}),
-	Rule([self, ',', abstract_declaration] as const, ($, cg) => {
+	Rule([self, ',', abstract_declaration], ($, cg) => {
 		if ((cg.current_scope!.flags & Scope.has_void_param) || $[0][0].type!.type.IsVoid())
 			cg.SemanticError('ERROR___VOIDOT_ONLY_PARAM');
 		return [...$[0], $[2]];
@@ -1323,14 +1322,14 @@ const non_empty_abstract_parameter_list = Rules<Decl[]>(self => [
 ]);
 
 const abstract_parameter_list = Rules<Decl[]>(
-	Rule([/*, empty, */] as const, () => []),
-	Rule([non_empty_abstract_parameter_list]),
+	Rule([/*, empty, */], _ => []),
+	non_empty_abstract_parameter_list,
 );
 
 const abstract_declarator = Rules<Decl>(self => [
-	Rule([/*, empty, */] as const, ($, cg) => cg.NewDeclNode(0, cg.type_specs)),
-	Rule([self, '[', constant_expression, ']'] as const, ($, cg) => cg.Array_Declarator($[0], $[2], 0)),
-	Rule([self, '[', ']'] as const, ($, cg) => cg.Array_Declarator($[0], 0 , 1)),
+	Rule([/*, empty, */], ($, cg) => cg.NewDeclNode(0, cg.type_specs)),
+	Rule([self, '[', constant_expression, ']'], ($, cg) => cg.Array_Declarator($[0], $[2], 0)),
+	Rule([self, '[', ']'], ($, cg) => cg.Array_Declarator($[0], 0 , 1)),
 /***
  *** This rule causes a major shift reduce conflict with:
  ***
@@ -1342,12 +1341,12 @@ const abstract_declarator = Rules<Decl>(self => [
  *** Will disallow abstract literal function parameter declarations should we ever defide to
  ***	support function parameters in the future.
  ***
-	Rule([abstract_declarator, '(', abstract_parameter_list, ')'] as const),
+	Rule([abstract_declarator, '(', abstract_parameter_list, ')']),
 ***/
 ]);
 
 const _abstract_declaration = Rules(
-	Rule([abstract_declaration_specifiers, abstract_declarator] as const, $ => $[1]),
+	Rule([abstract_declaration_specifiers, abstract_declarator], $ => $[1]),
 );
 
 /*****************/
@@ -1355,131 +1354,131 @@ const _abstract_declaration = Rules(
 /*****************/
 
 const cast_expression = Rules<Expr>(self => [
-	Rule([unary_expression]),
+	unary_expression,
 /* *** reduce/reduce conflict: (var-ident) (type-ident) ***
-	Rule(['(', type_name, ')', cast_expression] as const),
+	Rule(['(', type_name, ')', cast_expression]),
 */
-	Rule(['(', abstract_declaration, ')', self] as const, ($, cg) => cg.NewCastOperator($[3], cg.GetTypePointer($[1].loc!, $[1].type!))),
+	Rule(['(', abstract_declaration, ')', self], ($, cg) => cg.NewCastOperator($[3], cg.GetTypePointer($[1].loc!, $[1].type!))),
 ]);
 
 const multiplicative_expression = Rules<Expr>(self => [
-	Rule([cast_expression]),
-	Rule([self, '*', cast_expression] as const, ($, cg) => cg.NewBinaryOperator('MUL', $[0], $[2], false)),
-	Rule([self, '/', cast_expression] as const, ($, cg) => cg.NewBinaryOperator('DIV', $[0], $[2], false)),
-	Rule([self, '%', cast_expression] as const, ($, cg) => cg.NewBinaryOperator('MOD', $[0], $[2], true)),
+	cast_expression,
+	Rule([self, '*', cast_expression], ($, cg) => cg.NewBinaryOperator('MUL', $[0], $[2], false)),
+	Rule([self, '/', cast_expression], ($, cg) => cg.NewBinaryOperator('DIV', $[0], $[2], false)),
+	Rule([self, '%', cast_expression], ($, cg) => cg.NewBinaryOperator('MOD', $[0], $[2], true)),
 ]);
 
 const additive_expression = Rules<Expr>(self => [
-	Rule([multiplicative_expression]),
-	Rule([self, '+', multiplicative_expression] as const, ($, cg) => cg.NewBinaryOperator('ADD', $[0], $[2], false)),
-	Rule([self, '-', multiplicative_expression] as const, ($, cg) => cg.NewBinaryOperator('SUB', $[0], $[2], false)),
+	multiplicative_expression,
+	Rule([self, '+', multiplicative_expression], ($, cg) => cg.NewBinaryOperator('ADD', $[0], $[2], false)),
+	Rule([self, '-', multiplicative_expression], ($, cg) => cg.NewBinaryOperator('SUB', $[0], $[2], false)),
 ]);
 
 const shift_expression = Rules<Expr>(self => [
-	Rule([additive_expression]),
-	Rule([self, LL_SY, additive_expression] as const, ($, cg) => cg.NewBinaryOperator('SHL', $[0], $[2], true)),
-	Rule([self, GG_SY, additive_expression] as const, ($, cg) => cg.NewBinaryOperator('SHR', $[0], $[2], true)),
+	additive_expression,
+	Rule([self, LL_SY, additive_expression], ($, cg) => cg.NewBinaryOperator('SHL', $[0], $[2], true)),
+	Rule([self, GG_SY, additive_expression], ($, cg) => cg.NewBinaryOperator('SHR', $[0], $[2], true)),
 ]);
 
 const relational_expression = Rules<Expr>(self => [
-	Rule([shift_expression]),
-	Rule([self, '<', shift_expression] as const, 	($, cg) => cg.NewBinaryOperator('LT', $[0], $[2], false)),
-	Rule([self, '>', shift_expression] as const, 	($, cg) => cg.NewBinaryOperator('GT', $[0], $[2], false)),
-	Rule([self, LE_SY, shift_expression] as const,	($, cg) => cg.NewBinaryOperator('LE', $[0], $[2], false)),
-	Rule([self, GE_SY, shift_expression] as const,	($, cg) => cg.NewBinaryOperator('GE', $[0], $[2], false)),
+	shift_expression,
+	Rule([self, '<', shift_expression], 	($, cg) => cg.NewBinaryOperator('LT', $[0], $[2], false)),
+	Rule([self, '>', shift_expression], 	($, cg) => cg.NewBinaryOperator('GT', $[0], $[2], false)),
+	Rule([self, LE_SY, shift_expression],	($, cg) => cg.NewBinaryOperator('LE', $[0], $[2], false)),
+	Rule([self, GE_SY, shift_expression],	($, cg) => cg.NewBinaryOperator('GE', $[0], $[2], false)),
 ]);
 
 const equality_expression = Rules<Expr>(self => [
-	Rule([relational_expression]),
-	Rule([self, EQ_SY, relational_expression] as const, ($, cg) => cg.NewBinaryOperator('EQ', $[0], $[2], false)),
-	Rule([self, NE_SY, relational_expression] as const, ($, cg) => cg.NewBinaryOperator('NE', $[0], $[2], false)),
+	relational_expression,
+	Rule([self, EQ_SY, relational_expression], ($, cg) => cg.NewBinaryOperator('EQ', $[0], $[2], false)),
+	Rule([self, NE_SY, relational_expression], ($, cg) => cg.NewBinaryOperator('NE', $[0], $[2], false)),
 ]);
 
 const AND_expression = Rules<Expr>(self => [
-	Rule([equality_expression]),
-	Rule([self, '&', equality_expression] as const, ($, cg) => cg.NewBinaryOperator('AND', $[0], $[2], true)),
+	equality_expression,
+	Rule([self, '&', equality_expression], ($, cg) => cg.NewBinaryOperator('AND', $[0], $[2], true)),
 ]);
 
 const exclusive_OR_expression = Rules<Expr>(self => [
-	Rule([AND_expression]),
-	Rule([self, '^', AND_expression] as const, ($, cg) => cg.NewBinaryOperator('XOR', $[0], $[2], true)),
+	AND_expression,
+	Rule([self, '^', AND_expression], ($, cg) => cg.NewBinaryOperator('XOR', $[0], $[2], true)),
 ]);
 
 const inclusive_OR_expression = Rules<Expr>(self => [
-	Rule([exclusive_OR_expression]),
-	Rule([self, '|', exclusive_OR_expression] as const, ($, cg) => cg.NewBinaryOperator('OR', $[0], $[2], true)),
+	exclusive_OR_expression,
+	Rule([self, '|', exclusive_OR_expression], ($, cg) => cg.NewBinaryOperator('OR', $[0], $[2], true)),
 ]);
 
 const logical_AND_expression = Rules<Expr>(self => [
-	Rule([inclusive_OR_expression]),
-	Rule([self, AND_SY, inclusive_OR_expression] as const, ($, cg) => cg.NewBinaryOperator('BAND', $[0], $[2], true)),
+	inclusive_OR_expression,
+	Rule([self, AND_SY, inclusive_OR_expression], ($, cg) => cg.NewBinaryOperator('BAND', $[0], $[2], true)),
 ]);
 
 const logical_OR_expression = Rules<Expr>(self => [
-	Rule([logical_AND_expression]),
-	Rule([self, OR_SY, logical_AND_expression] as const, ($, cg) => cg.NewBinaryOperator('BOR', $[0], $[2], true)),
+	logical_AND_expression,
+	Rule([self, OR_SY, logical_AND_expression], ($, cg) => cg.NewBinaryOperator('BOR', $[0], $[2], true)),
 ]);
 
 const conditional_test = Rules<any>(
-	Rule([logical_OR_expression] as const, ($, cg) => cg.CheckBooleanExpr($[0]).result),
+	Rule([logical_OR_expression], ($, cg) => cg.CheckBooleanExpr($[0]).result),
 );
 
 const conditional_expression = Rules<Expr>(self => [
-	Rule([logical_OR_expression]),
-	Rule([conditional_test, '?', expression, ':', self] as const, ($, cg) => cg.NewConditionalOperator($[0], $[2], $[4])),
+	logical_OR_expression,
+	Rule([conditional_test, '?', expression, ':', self], ($, cg) => cg.NewConditionalOperator($[0], $[2], $[4])),
 ]);
 
 const _expression = Rules(
-	Rule([conditional_expression]),
+	conditional_expression,
 /***
-	Rule([basic_variable, '=', expression] as const, ($, cg) => cg.NewBinopNode(OP.ASSIGN, $[0], $[2])),
+	Rule([basic_variable, '=', expression], ($, cg) => cg.NewBinopNode(OP.ASSIGN, $[0], $[2])),
 ***/
 );
 
 const _constant_expression = Rules(
-	Rule([expression] as const, ($, cg) => cg.GetConstant($[0], 0)),
+	Rule([expression], ($, cg) => cg.GetConstant($[0], 0)),
 );
 
 const operator = Rules(
-	Rule(['+'		] as const, () => 'POS'),
-	Rule(['-', 		] as const, () => 'NEG'),
-	Rule(['!', 		] as const, () => 'BNOT'),
-	Rule(['~', 		] as const, () => 'NOT'),
-	Rule(['*', 		] as const, () => 'MUL'),
-	Rule(['/', 		] as const, () => 'DIV'),
-	Rule(['%'		] as const, () => 'MOD'),
-	Rule([GG_SY, 	] as const, () => 'SHR'),
-	Rule(['<', 		] as const, () => 'LT'),
-	Rule(['>', 		] as const, () => 'GT'),
-	Rule([LE_SY, 	] as const, () => 'LE'),
-	Rule([GE_SY, 	] as const, () => 'GE'),
-	Rule([EQ_SY, 	] as const, () => 'EQ'),
-	Rule([NE_SY		] as const, () => 'NE'),
-	Rule(['&', 		] as const, () => 'AND'),
-	Rule(['^', 		] as const, () => 'XOR'),
-	Rule(['|', 		] as const, () => 'OR'),
-	Rule([AND_SY, 	] as const, () => 'BAND'),
-	Rule([OR_SY		] as const, () => 'BOR'),
-	Rule(['(', ')'	] as const, () => 'FUN_CALL'),
-	Rule(['[', ']'	] as const, () => 'ARRAY_INDEX'),
+	Rule(['+'		], _ => 'POS'),
+	Rule(['-', 		], _ => 'NEG'),
+	Rule(['!', 		], _ => 'BNOT'),
+	Rule(['~', 		], _ => 'NOT'),
+	Rule(['*', 		], _ => 'MUL'),
+	Rule(['/', 		], _ => 'DIV'),
+	Rule(['%'		], _ => 'MOD'),
+	Rule([GG_SY, 	], _ => 'SHR'),
+	Rule(['<', 		], _ => 'LT'),
+	Rule(['>', 		], _ => 'GT'),
+	Rule([LE_SY, 	], _ => 'LE'),
+	Rule([GE_SY, 	], _ => 'GE'),
+	Rule([EQ_SY, 	], _ => 'EQ'),
+	Rule([NE_SY		], _ => 'NE'),
+	Rule(['&', 		], _ => 'AND'),
+	Rule(['^', 		], _ => 'XOR'),
+	Rule(['|', 		], _ => 'OR'),
+	Rule([AND_SY, 	], _ => 'BAND'),
+	Rule([OR_SY		], _ => 'BOR'),
+	Rule(['(', ')'	], _ => 'FUN_CALL'),
+	Rule(['[', ']'	], _ => 'ARRAY_INDEX'),
 );
 
 const initializer_list = List(initializer, ',');
 
 const state_value = Rules(
-	Rule([identifier] as const, ($, cg) => cg.SymbolicConstant($[0], 0)),
-	Rule([constant]),
-	Rule(['<', additive_expression, '>'] as const, $ => $[1]),
+	Rule([identifier],						($, cg) => cg.SymbolicConstant($[0], 0)),
+	constant,
+	Rule(['<', additive_expression, '>'],	$ => $[1]),
 );
 
 const state = Rules(
-	Rule([identifier, '=', state_value] as const, 	($, cg) => cg.StateInitializer($[0], $[2])),
-	Rule([TYPEIDENT_SY, '=', state_value] as const, ($, cg) => cg.StateInitializer($[0], $[2])),
+	Rule([identifier, '=', state_value], 	($, cg) => cg.StateInitializer($[0], $[2])),
+	Rule([TYPEIDENT_SY, '=', state_value],	($, cg) => cg.StateInitializer($[0], $[2])),
 );
 
 const state_list = Rules<Expr>(self => [
-	Rule([state, ';'] as const),
-	Rule([self, state, ';'] as const, $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[1]))
+	Rule([state, ';']),
+	Rule([self, state, ';'], $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[1]))
 ]);
 
 /******************/
@@ -1487,71 +1486,71 @@ const state_list = Rules<Expr>(self => [
 /******************/
 
 const _initializer = Rules<any>(
-	Rule([expression] as const, 							($, cg) => cg.Initializer($[0])),
-	Rule(['{', initializer_list, '}'] as const,				($, cg) => cg.Initializer($[1])),
-	Rule(['{', initializer_list, ',', '}'] as const,		($, cg) => cg.Initializer($[1])),
-	Rule([SAMPLERSTATE_SY, '{', state_list, '}'] as const,	$ => $[2]),
+	Rule([expression], 								($, cg) => cg.Initializer($[0])),
+	Rule(['{', initializer_list, '}'],				($, cg) => cg.Initializer($[1])),
+	Rule(['{', initializer_list, ',', '}'],			($, cg) => cg.Initializer($[1])),
+	Rule([SAMPLERSTATE_SY, '{', state_list, '}'],	$ => $[2]),
 );
 
 const parameter_declaration = Rules<Decl>(self => [
-	Rule([attribute, self] as const, $ => $[1].AddAttribute($[0])),
-	Rule([declaration_specifiers, declarator] as const, ($, cg) => cg.Param_Init_Declarator($[1])),
-	Rule([declaration_specifiers, declarator, '=', initializer] as const, ($, cg) => cg.Param_Init_Declarator($[1], $[3])),
+	Rule([attribute, self], $ => $[1].AddAttribute($[0])),
+	Rule([declaration_specifiers, declarator], ($, cg) => cg.Param_Init_Declarator($[1])),
+	Rule([declaration_specifiers, declarator, '=', initializer], ($, cg) => cg.Param_Init_Declarator($[1], $[3])),
 ]);
 
 const compound_tail = Rules(
-	Rule(['}'] as const, ($, cg) => cg.PopScope())
+	Rule(['}'], ($, cg) => cg.PopScope())
 );
 /************************/
 /* Stetements */
 /************************/
 
 const expression_statement = Rules(
-	Rule([expression] as const,										($, cg) => cg.NewExprStmt($[0])),
-	Rule([postfix_expression, '=', expression] as const,			($, cg) => cg.NewSimpleAssignmentStmt($[0], $[2], 0)),
-	Rule([postfix_expression, ASSIGNMINUS_SY, expression] as const, ($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNMINUS, $[0], $[2])),
-	Rule([postfix_expression, ASSIGNMOD_SY, expression] as const, 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNMOD, $[0], $[2])),
-	Rule([postfix_expression, ASSIGNPLUS_SY, expression] as const, 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNPLUS, $[0], $[2])),
-	Rule([postfix_expression, ASSIGNSLASH_SY, expression] as const, ($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNSLASH, $[0], $[2])),
-	Rule([postfix_expression, ASSIGNSTAR_SY, expression] as const, 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNSTAR, $[0], $[2])),
-	Rule([postfix_expression, ASSIGNAND_SY, expression] as const, 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNAND, $[0], $[2])),
-	Rule([postfix_expression, ASSIGNOR_SY, expression] as const, 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNOR, $[0], $[2])),
-	Rule([postfix_expression, ASSIGNXOR_SY, expression] as const, 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNXOR, $[0], $[2])),
+	Rule([expression],										($, cg) => cg.NewExprStmt($[0])),
+	Rule([postfix_expression, '=', expression],				($, cg) => cg.NewSimpleAssignmentStmt($[0], $[2], 0)),
+	Rule([postfix_expression, ASSIGNMINUS_SY, expression],	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNMINUS, $[0], $[2])),
+	Rule([postfix_expression, ASSIGNMOD_SY, expression], 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNMOD, $[0], $[2])),
+	Rule([postfix_expression, ASSIGNPLUS_SY, expression], 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNPLUS, $[0], $[2])),
+	Rule([postfix_expression, ASSIGNSLASH_SY, expression],	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNSLASH, $[0], $[2])),
+	Rule([postfix_expression, ASSIGNSTAR_SY, expression], 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNSTAR, $[0], $[2])),
+	Rule([postfix_expression, ASSIGNAND_SY, expression], 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNAND, $[0], $[2])),
+	Rule([postfix_expression, ASSIGNOR_SY, expression], 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNOR, $[0], $[2])),
+	Rule([postfix_expression, ASSIGNXOR_SY, expression], 	($, cg) => cg.NewCompoundAssignmentStmt(OP.ASSIGNXOR, $[0], $[2])),
 );
 
 const boolean_scalar_expression = Rules(
-	Rule([expression] as const, ($, cg) => cg.CheckBooleanExpr($[0]).result)
+	Rule([expression], ($, cg) => cg.CheckBooleanExpr($[0]).result)
 );
 
 const init_declarator = Rules(
-	Rule([declarator] as const, ($, cg) => cg.Init_Declarator($[0])),
-	Rule([declarator, '=', initializer] as const, ($, cg) => cg.Init_Declarator($[0], $[2])),
+	Rule([declarator], 						($, cg) => cg.Init_Declarator($[0])),
+	Rule([declarator, '=', initializer],	($, cg) => cg.Init_Declarator($[0], $[2])),
 );
 
 const init_declarator_list = List(init_declarator, ',');
 
 const for_expression_opt = Rules<Stmt|undefined>(
 	Rule([List(expression_statement, ',')], ($, cg) => cg.NewBlockStmt($[0])),
-	Rule([/*, empty, */], () => undefined),
+	Rule([/*, empty, */],					_ => undefined),
 );
 
 const for_expression_init = Rules<Stmt|undefined>(
-	Rule([declaration_specifiers, init_declarator_list] as const, ($, cg) => cg.NewBlockStmt($[1])),
-	Rule([for_expression_opt]),
+	Rule([declaration_specifiers, init_declarator_list], ($, cg) => cg.NewBlockStmt($[1])),
+	for_expression_opt,
 );
 
 const boolean_expression_opt = Rules(
-	Rule([boolean_scalar_expression]),
-	Rule([/*, empty, */] as const, () => ({} as Expr)),
+	boolean_scalar_expression,
+	Rule([/*, empty, */],	_ => ({} as Expr)),
 );
 
 const if_header = Rules(
-	Rule([IF_SY, '(', boolean_scalar_expression, ')'] as const, ($, cg) => cg.NewIfStmt($[2]) ),
+	Rule([IF_SY, '(', boolean_scalar_expression, ')'], ($, cg) => cg.NewIfStmt($[2]) ),
 );
 
 const labeled_statement = Rules(
-	Rule([CASE_SY, constant_expression, ':', statement] as const, $ => $[3]),
-	Rule([DEFAULT_SY, ':', statement] as const, $ => $[2]),
+	Rule([CASE_SY, constant_expression, ':', statement],	$ => $[3]),
+	Rule([DEFAULT_SY, ':', statement],						$ => $[2]),
 );
 
 const assembly = Rules(
@@ -1559,77 +1558,77 @@ const assembly = Rules(
 );
 
 const balanced_statement = Rules<Stmt>(self => [
-	Rule([compound_header, block_item_list, compound_tail] as const, ($, cg) => cg.NewBlockStmt($[1], cg.popped_scope)),
-	Rule([compound_header, compound_tail] as const, () => ({} as Stmt)),
+	Rule([compound_header, block_item_list, compound_tail], ($, cg) => cg.NewBlockStmt($[1], cg.popped_scope)),
+	Rule([compound_header, compound_tail],					_ => ({} as Stmt)),
 
-	Rule([DISCARD_SY, ';'] as const, ($, cg) => cg.NewDiscardStmt(new Expr('KILL', Expr.UNARY))),
-	Rule([DISCARD_SY, expression, ';'] as const, ($, cg) => {
+	Rule([DISCARD_SY, ';'],				(_, cg) => cg.NewDiscardStmt(new Expr('KILL', Expr.UNARY))),
+	Rule([DISCARD_SY, expression, ';'], ($, cg) => {
 		const {result, len} = cg.CheckBooleanExpr($[1]);
 		return cg.NewDiscardStmt(Expr.NewUnopNode('KILL', result, undefined, SUBOP_V(len, Type.BASE_BOOLEAN)));
 	}),
 
-	Rule([expression_statement, ';'] as const),
-	Rule([';'] as const, () => ({} as Stmt)),
+	Rule([expression_statement, ';']),
+	Rule([';'], _ => ({} as Stmt)),
 
-	Rule([WHILE_SY, '(', boolean_scalar_expression, ')', self] as const, 						($, cg) => cg.NewWhileStmt(Stmt.WHILE, $[2], $[4])),
-	Rule([DO_SY, statement, WHILE_SY, '(', boolean_scalar_expression, ')', ';'] as const, 		($, cg) => cg.NewWhileStmt(Stmt.DO, $[4], $[1])),
-	Rule([FOR_SY, '(', for_expression_init, ';', boolean_expression_opt, ';', for_expression_opt, ')', self] as const, ($, cg) => cg.NewForStmt($[2], $[4], $[6], $[8])),
+	Rule([WHILE_SY, '(', boolean_scalar_expression, ')', self], 						($, cg) => cg.NewWhileStmt(Stmt.WHILE, $[2], $[4])),
+	Rule([DO_SY, statement, WHILE_SY, '(', boolean_scalar_expression, ')', ';'], 		($, cg) => cg.NewWhileStmt(Stmt.DO, $[4], $[1])),
+	Rule([FOR_SY, '(', for_expression_init, ';', boolean_expression_opt, ';', for_expression_opt, ')', self], ($, cg) => cg.NewForStmt($[2], $[4], $[6], $[8])),
 
-	Rule([if_header, self, ELSE_SY, self] as const, $ => $[0].SetThenElseStmts($[1], $[3])),
+	Rule([if_header, self, ELSE_SY, self], $ => $[0].SetThenElseStmts($[1], $[3])),
 
-	Rule([SWITCH_SY, '(', expression, ')', compound_header, List(labeled_statement), compound_tail] as const, ($, cg) => cg.NewSwitchStmt($[2], $[5], cg.popped_scope!)),
-	Rule([BREAK_SY, ';'] as const, ($, cg) => cg.NewBreakStmt()),
-	Rule([RETURN_SY, expression, ';'] as const, ($, cg) => cg.NewReturnStmt($[1])),
-	Rule([RETURN_SY, ';'] as const, ($, cg) => cg.NewReturnStmt()),
+	Rule([SWITCH_SY, '(', expression, ')', compound_header, List(labeled_statement), compound_tail], ($, cg) => cg.NewSwitchStmt($[2], $[5], cg.popped_scope!)),
+	Rule([BREAK_SY, ';'], ($, cg) => cg.NewBreakStmt()),
+	Rule([RETURN_SY, expression, ';'], ($, cg) => cg.NewReturnStmt($[1])),
+	Rule([RETURN_SY, ';'], ($, cg) => cg.NewReturnStmt()),
 
-	Rule([ASM_SY, '{', assembly, '}'] as const, $ => $[2]),
+	Rule([ASM_SY, '{', assembly, '}'], $ => $[2]),
 ]);
 
 const dangling_statement = Rules<Stmt>(self => [
 //	dangling_if
-	Rule([if_header, statement] as const, $ => $[0].SetThenElseStmts($[1])),
-	Rule([if_header, balanced_statement, ELSE_SY, self] as const, $ => $[0].SetThenElseStmts($[1], $[3])),
+	Rule([if_header, statement], $ => $[0].SetThenElseStmts($[1])),
+	Rule([if_header, balanced_statement, ELSE_SY, self], $ => $[0].SetThenElseStmts($[1], $[3])),
 //	dangling_iteration
-	Rule([WHILE_SY, '(', boolean_scalar_expression, ')', self] as const, ($, cg) => cg.NewWhileStmt(Stmt.WHILE, $[2], $[4])),
-	Rule([FOR_SY, '(', for_expression_init, ';', boolean_expression_opt, ';', for_expression_opt, ')', self] as const, ($, cg) => cg.NewForStmt($[2], $[4], $[6], $[8])),
+	Rule([WHILE_SY, '(', boolean_scalar_expression, ')', self], ($, cg) => cg.NewWhileStmt(Stmt.WHILE, $[2], $[4])),
+	Rule([FOR_SY, '(', for_expression_init, ';', boolean_expression_opt, ';', for_expression_opt, ')', self], ($, cg) => cg.NewForStmt($[2], $[4], $[6], $[8])),
 ]);
 
 const _statement = Rules<Stmt>(self => [
-	Rule([attribute, self] as const, $ => $[1].AddAttribute($[0])),
-	Rule([balanced_statement]),
-	Rule([dangling_statement]),
+	Rule([attribute, self], $ => $[1].AddAttribute($[0])),
+	balanced_statement,
+	dangling_statement,
 ]);
 
 const block_item = Rules(
-	Rule([declaration]),
-	Rule([statement] as const, $ => $[0].Check()),
+	declaration,
+	Rule([statement], $ => $[0].Check()),
 );
 
 const _block_item_list = List(block_item);
 
 const function_decl_header = Rules<Decl>(
-	Rule([basic_declarator, '('] as const, ($, cg) => cg.FunctionDeclHeader($[0].loc, $[0])),
-	Rule([OPERATOR_SY, operator, '('] as const, ($, cg) => cg.FunctionDeclHeader(cg.NewDeclNode(cg.Atom($[1]), cg.type_specs))),
+	Rule([basic_declarator, '('],		($, cg) => cg.FunctionDeclHeader($[0].loc, $[0])),
+	Rule([OPERATOR_SY, operator, '('],	($, cg) => cg.FunctionDeclHeader(cg.NewDeclNode(cg.Atom($[1]), cg.type_specs))),
 );
 
 const _basic_declarator = Rules<Decl>(self => [
-	Rule([identifier] as const, ($, cg) => cg.NewDeclNode($[0], cg.type_specs)),
-	Rule([self, '[', constant_expression, ']'] as const, ($, cg) => cg.Array_Declarator($[0], $[2], 0)),
-	Rule([self, '[', ']'] as const, ($, cg) => cg.Array_Declarator($[0], 0, 1)),
-	Rule([function_decl_header, List(parameter_declaration, ','), ')'] as const, ($, cg) => cg.SetFunTypeParams($[0], $[1], $[1])),
-	Rule([function_decl_header, abstract_parameter_list, ')'] as const, ($, cg) => cg.SetFunTypeParams($[0], $[1], [])),
+	Rule([identifier],													($, cg) => cg.NewDeclNode($[0], cg.type_specs)),
+	Rule([self, '[', constant_expression, ']'],							($, cg) => cg.Array_Declarator($[0], $[2], 0)),
+	Rule([self, '[', ']'],												($, cg) => cg.Array_Declarator($[0], 0, 1)),
+	Rule([function_decl_header, List(parameter_declaration, ','), ')'],	($, cg) => cg.SetFunTypeParams($[0], $[1], $[1])),
+	Rule([function_decl_header, abstract_parameter_list, ')'],			($, cg) => cg.SetFunTypeParams($[0], $[1], [])),
 ]);
 
 const register_spec = Rules<ident>(
-	Rule([REGISTER_SY, '(', identifier, ')'] as const, $ => $[2]),
-	Rule([REGISTER_SY, '(', identifier, ',', identifier, ')'] as const, $ => $[4]),
+	Rule([REGISTER_SY, '(', identifier, ')'],							$ => $[2]),
+	Rule([REGISTER_SY, '(', identifier, ',', identifier, ')'],			$ => $[4]),
 );
 
 const semantic_declarator = Rules<Decl>(
-	Rule([basic_declarator] as const, ($, cg) => cg.Declarator($[0], 0, 0)),
-	Rule([basic_declarator, ':', semantics_identifier] as const, ($, cg) => cg.Declarator($[0], $[2], 0)),
-	Rule([basic_declarator, ':', register_spec] as const, ($, cg) => cg.Declarator($[0], 0, $[2])),
-	Rule([basic_declarator, ':', semantics_identifier, ':', register_spec] as const, ($, cg) => cg.Declarator($[0], $[2], $[4])),
+	Rule([basic_declarator],												($, cg) => cg.Declarator($[0], 0, 0)),
+	Rule([basic_declarator, ':', semantics_identifier],						($, cg) => cg.Declarator($[0], $[2], 0)),
+	Rule([basic_declarator, ':', register_spec],							($, cg) => cg.Declarator($[0], 0, $[2])),
+	Rule([basic_declarator, ':', semantics_identifier, ':', register_spec], ($, cg) => cg.Declarator($[0], $[2], $[4])),
 );
 
 /***************/
@@ -1637,12 +1636,12 @@ const semantic_declarator = Rules<Decl>(
 /***************/
 
 const annotation_decl_list = Rules<Stmt>(self => [
-	Rule([/*, empty, */] as const, () => ({} as Stmt)),
-	Rule([self, declaration] as const),
+	Rule([/*, empty, */], _ => ({} as Stmt)),
+	Rule([self, declaration]),
 ]);
 
 const annotation = Rules(
-	Rule(['<', ($, cg) => { cg.PushScope(); }, annotation_decl_list, '>'] as const, ($, cg) => { cg.PopScope(); return $[2]; }),
+	Rule(['<', ($, cg) => { cg.PushScope(); }, annotation_decl_list, '>'], ($, cg) => { cg.PopScope(); return $[2]; }),
 );
 
 /***************/
@@ -1650,13 +1649,13 @@ const annotation = Rules(
 /***************/
 
 const _declarator = Rules<Decl>(
-	Rule([semantic_declarator]),
-	Rule([semantic_declarator, annotation] as const),
+	semantic_declarator,
+	Rule([semantic_declarator, annotation]),
 );
 
 const function_definition_header = Rules<Decl>(self => [
-	Rule([attribute, self] as const, $ => $[1].AddAttribute($[0])),
-	Rule([declaration_specifiers, declarator, '{'] as const, ($, cg) => cg.Function_Definition_Header($[1])),
+	Rule([attribute, self],								$ => $[1].AddAttribute($[0])),
+	Rule([declaration_specifiers, declarator, '{'],		($, cg) => cg.Function_Definition_Header($[1])),
 ]);
 
 /***********************/
@@ -1664,8 +1663,8 @@ const function_definition_header = Rules<Decl>(self => [
 /***********************/
 
 const function_definition = Rules(
-	Rule([function_definition_header, block_item_list, '}'] as const, ($, cg) => { cg.DefineFunction($[0], $[1]); cg.PopScope(); }),
-	Rule([function_definition_header, '}'] as const, ($, cg) => { cg.DefineFunction($[0]); cg.PopScope(); }),
+	Rule([function_definition_header, block_item_list, '}'],	($, cg) => { cg.DefineFunction($[0], $[1]); cg.PopScope(); }),
+	Rule([function_definition_header, '}'],						($, cg) => { cg.DefineFunction($[0]); cg.PopScope(); }),
 );
 
 /****************/
@@ -1673,20 +1672,20 @@ const function_definition = Rules(
 /****************/
 
 const struct_declaration = Rules<any>(
-	Rule([declaration]),
-	Rule([function_definition]),
+	declaration,
+	function_definition,
 );
 
 const struct_declaration_list = Rules(self => [
-	Rule([struct_declaration]),
+	struct_declaration,
 	Rule([self, struct_declaration]),
 ]);
 
 
 const struct_or_connector_specifier = Rules(
-	Rule([struct_or_connector_header, struct_compound_header, struct_declaration_list, '}'] as const, ($, cg) => cg.SetStructMembers($[0], cg.PopScope())),
-	Rule([STRUCT_SY, struct_compound_header, struct_declaration_list, '}'] as const, ($, cg) => cg.SetStructMembers(cg.StructHeader(0, 0), cg.PopScope())),
-	Rule([struct_or_connector_header]),
+	Rule([struct_or_connector_header, struct_compound_header, struct_declaration_list, '}'],	($, cg) => cg.SetStructMembers($[0], cg.PopScope())),
+	Rule([STRUCT_SY, struct_compound_header, struct_declaration_list, '}'],						(_, cg) => cg.SetStructMembers(cg.StructHeader(0, 0), cg.PopScope())),
+	struct_or_connector_header,
 );
 
 /****************/
@@ -1694,22 +1693,22 @@ const struct_or_connector_specifier = Rules(
 /****************/
 
 const template_arg = Rules(
-	Rule([type_specifier]),
-	Rule([additive_expression] as const, ($, cg) => cg.IntToType(cg.GetConstant($[0], 0))),
+	type_specifier,
+	Rule([additive_expression], ($, cg) => cg.IntToType(cg.GetConstant($[0], 0))),
 );
 
 const non_empty_template_arg_list = Rules<Type[]>(self => [
-	Rule([template_arg] as const, ($, cg) => cg.AddtoTypeList([], $[0])),
-	Rule([self, ',', template_arg] as const, ($, cg) => cg.AddtoTypeList($[0], $[2])),
+	Rule([template_arg],			($, cg) => cg.AddtoTypeList([], $[0])),
+	Rule([self, ',', template_arg], ($, cg) => cg.AddtoTypeList($[0], $[2])),
 ]);
 const template_arg_list = Rules<Type[]>(
-	Rule([/*, empty, */] as const, () => []),
-	Rule([non_empty_template_arg_list]),
+	Rule([/*, empty, */], _ => []),
+	non_empty_template_arg_list,
 );
 
 const templated_type = Rules(
-	Rule([TEMPLATEIDENT_SY] as const, ($, cg) => cg.InstantiateTemplate(cg.LookUpTypeSymbol($[0]), [])),
-	Rule([TEMPLATEIDENT_SY, '<', template_arg_list, '>'] as const, ($, cg) => cg.InstantiateTemplate(cg.LookUpTypeSymbol($[0]),$[2])),
+	Rule([TEMPLATEIDENT_SY],								($, cg) => cg.InstantiateTemplate(cg.LookUpTypeSymbol($[0]), [])),
+	Rule([TEMPLATEIDENT_SY, '<', template_arg_list, '>'],	($, cg) => cg.InstantiateTemplate(cg.LookUpTypeSymbol($[0]),$[2])),
 );
 
 
@@ -1718,17 +1717,17 @@ const templated_type = Rules(
 /*******************/
 
 const _type_specifier = Rules(
-	Rule([INT_SY] as const, 				($, cg) => cg.LookUpTypeSymbol(INT_SY)),
-	Rule([UNSIGNED_SY, INT_SY] as const, 	($, cg) => cg.LookUpTypeSymbol(INT_SY)),
-	Rule([FLOAT_SY] as const, 				($, cg) => cg.LookUpTypeSymbol(FLOAT_SY)),
-	Rule([VOID_SY] as const, 				($, cg) => cg.LookUpTypeSymbol(VOID_SY)),
-	Rule([BOOLEAN_SY] as const, 			($, cg) => cg.LookUpTypeSymbol(BOOLEAN_SY)),
-	Rule([TEXOBJ_SY] as const, 				($, cg) => cg.LookUpTypeSymbol(TEXOBJ_SY)),
-	Rule([enum_specifier]),
-	Rule([struct_or_connector_specifier]),
-	Rule([TYPEIDENT_SY] as const, 			($, cg) => cg.LookUpTypeSymbol($[0])),
-	Rule([templated_type]),
-	Rule([error] as const, 					($, cg) => {cg.SemanticParseError('ERROR_S_TYPE.NAME_EXPECTED'); return UndefinedType; })
+	Rule([INT_SY], 					($, cg) => cg.LookUpTypeSymbol(INT_SY)),
+	Rule([UNSIGNED_SY, INT_SY], 	($, cg) => cg.LookUpTypeSymbol(INT_SY)),
+	Rule([FLOAT_SY], 				($, cg) => cg.LookUpTypeSymbol(FLOAT_SY)),
+	Rule([VOID_SY], 				($, cg) => cg.LookUpTypeSymbol(VOID_SY)),
+	Rule([BOOLEAN_SY], 				($, cg) => cg.LookUpTypeSymbol(BOOLEAN_SY)),
+	Rule([TEXOBJ_SY], 				($, cg) => cg.LookUpTypeSymbol(TEXOBJ_SY)),
+	enum_specifier,
+	struct_or_connector_specifier,
+	Rule([TYPEIDENT_SY], 			($, cg) => cg.LookUpTypeSymbol($[0])),
+	templated_type,
+	Rule([error], 					($, cg) => {cg.SemanticParseError('ERROR_S_TYPE.NAME_EXPECTED'); return UndefinedType; })
 );
 
 /*******************/
@@ -1736,7 +1735,7 @@ const _type_specifier = Rules(
 /*******************/
 
 const type_qualifier = Rules<number>(
-	Rule([CONST_SY] as const, () => Type.QUALIFIER_CONST),
+	Rule([CONST_SY], _ => Type.QUALIFIER_CONST),
 );
 
 /*******************/
@@ -1744,13 +1743,13 @@ const type_qualifier = Rules<number>(
 /*******************/
 
 const storage_class = Rules<number>(
-	Rule([STATIC_SY] as const, () => SC.STATIC),
-	Rule([EXTERN_SY] as const, () => SC.EXTERN),
-	Rule([NOINTERP_SY] as const, () => SC.NOINTERP),
-	Rule([PRECISE_SY] as const, () => SC.PRECISE),
-	Rule([SHARED_SY] as const, () => SC.SHARED),
-	Rule([GROUPSHARED_SY] as const, () => SC.GROUPSHARED),
-	Rule([VOLATILE_SY] as const, () => SC.UNKNOWN),
+	Rule([STATIC_SY], 		_ => SC.STATIC),
+	Rule([EXTERN_SY], 		_ => SC.EXTERN),
+	Rule([NOINTERP_SY], 	_ => SC.NOINTERP),
+	Rule([PRECISE_SY],		_ => SC.PRECISE),
+	Rule([SHARED_SY],		_ => SC.SHARED),
+	Rule([GROUPSHARED_SY],	_ => SC.GROUPSHARED),
+	Rule([VOLATILE_SY],		_ => SC.UNKNOWN),
 );
 
 /****************/
@@ -1758,7 +1757,7 @@ const storage_class = Rules<number>(
 /****************/
 
 const type_domain = Rules<number>(
-	Rule([UNIFORM_SY] as const, () => Type.DOMAIN_UNIFORM),
+	Rule([UNIFORM_SY], _ => Type.DOMAIN_UNIFORM),
 );
 
 /**********/
@@ -1766,9 +1765,9 @@ const type_domain = Rules<number>(
 /**********/
 
 const in_out = Rules<number>(
-	Rule([IN_SY] as const, () => Type.QUALIFIER_IN),
-	Rule([OUT_SY] as const, () => Type.QUALIFIER_OUT),
-	Rule([INOUT_SY] as const, () => Type.QUALIFIER_INOUT),
+	Rule([IN_SY],		_ => Type.QUALIFIER_IN),
+	Rule([OUT_SY],		_ => Type.QUALIFIER_OUT),
+	Rule([INOUT_SY],	_ => Type.QUALIFIER_INOUT),
 );
 
 /**********************/
@@ -1776,103 +1775,103 @@ const in_out = Rules<number>(
 /**********************/
 
 const function_specifier = Rules<number>(
-	Rule([INLINE_SY] as const, () => Type.MISC_INLINE),
-	Rule([INTERNAL_SY] as const, () => Type.MISC_INTERNAL),
+	Rule([INLINE_SY],	_ => Type.MISC_INLINE),
+	Rule([INTERNAL_SY],	_ => Type.MISC_INTERNAL),
 );
 
 const abstract_declaration_specifiers2 = Rules(self => [
-	Rule([type_specifier] as const, 			($, cg) => cg.type_specs.SetDType($[0])),
-	Rule([self, type_qualifier] as const, 		($, cg) => { cg.SetTypeQualifiers($[1]); return cg.type_specs; }),
-	Rule([self, storage_class] as const, 		($, cg) => { cg.SetStorageClass($[1]); return cg.type_specs; }),
-	Rule([self, type_domain] as const, 			($, cg) => { cg.SetTypeDomain($[1]); return cg.type_specs; }),
-	Rule([self, in_out] as const, 				($, cg) => { cg.SetTypeQualifiers($[1]); return cg.type_specs; }),
-	Rule([self, function_specifier] as const, 	($, cg) => { cg.SetTypeMisc($[1]); return cg.type_specs; }),
-	Rule([self, PACKED_SY] as const, 			($, cg) => { cg.SetTypeMisc(Type.MISC_PACKED | Type.MISC_PACKED_KW); return cg.type_specs; }),
+	Rule([type_specifier], 				($, cg) => cg.type_specs.SetDType($[0])),
+	Rule([self, type_qualifier], 		($, cg) => { cg.SetTypeQualifiers($[1]); return cg.type_specs; }),
+	Rule([self, storage_class], 		($, cg) => { cg.SetStorageClass($[1]); return cg.type_specs; }),
+	Rule([self, type_domain], 			($, cg) => { cg.SetTypeDomain($[1]); return cg.type_specs; }),
+	Rule([self, in_out], 				($, cg) => { cg.SetTypeQualifiers($[1]); return cg.type_specs; }),
+	Rule([self, function_specifier], 	($, cg) => { cg.SetTypeMisc($[1]); return cg.type_specs; }),
+	Rule([self, PACKED_SY], 			($, cg) => { cg.SetTypeMisc(Type.MISC_PACKED | Type.MISC_PACKED_KW); return cg.type_specs; }),
 ]);
 
 const _abstract_declaration_specifiers = Rules(self => [
-	Rule([abstract_declaration_specifiers2]),
-	Rule([type_qualifier, self] as const, 		($, cg) => { cg.SetTypeQualifiers($[0]); return cg.type_specs; }),
-	Rule([storage_class, self] as const, 		($, cg) => { cg.SetStorageClass($[0]); return cg.type_specs; }),
-	Rule([type_domain, self] as const, 			($, cg) => { cg.SetTypeDomain($[0]); return cg.type_specs; }),
-	Rule([in_out, self] as const, 				($, cg) => { cg.SetTypeQualifiers($[0]); return cg.type_specs; }),
-	Rule([function_specifier, self] as const,	($, cg) => { cg.SetTypeMisc($[0]); return cg.type_specs; }),
-	Rule([PACKED_SY, self] as const, 			($, cg) => { cg.SetTypeMisc(Type.MISC_PACKED | Type.MISC_PACKED_KW); return cg.type_specs; }),
-	Rule([ROWMAJOR_SY, self] as const, 			($, cg) => { cg.SetTypeMisc(Type.MISC_ROWMAJOR); return cg.type_specs; }),
-	Rule([COLMAJOR_SY, self] as const, 			($, cg) => { cg.ClearTypeMisc(Type.MISC_ROWMAJOR); return cg.type_specs; }),
-	Rule([LOWP_SY, self] as const, 				($, cg) => { cg.SetTypeMisc(Type.MISC_PRECISION*1); return cg.type_specs; }),
-	Rule([MEDIUMP_SY, self] as const, 			($, cg) => { cg.SetTypeMisc(Type.MISC_PRECISION*2); return cg.type_specs; }),
-	Rule([HIGHP_SY, self] as const, 			($, cg) => { cg.SetTypeMisc(Type.MISC_PRECISION*3); return cg.type_specs; }),
+	abstract_declaration_specifiers2,
+	Rule([type_qualifier, self], 		($, cg) => { cg.SetTypeQualifiers($[0]); return cg.type_specs; }),
+	Rule([storage_class, self], 		($, cg) => { cg.SetStorageClass($[0]); return cg.type_specs; }),
+	Rule([type_domain, self], 			($, cg) => { cg.SetTypeDomain($[0]); return cg.type_specs; }),
+	Rule([in_out, self], 				($, cg) => { cg.SetTypeQualifiers($[0]); return cg.type_specs; }),
+	Rule([function_specifier, self],	($, cg) => { cg.SetTypeMisc($[0]); return cg.type_specs; }),
+	Rule([PACKED_SY, self], 			($, cg) => { cg.SetTypeMisc(Type.MISC_PACKED | Type.MISC_PACKED_KW); return cg.type_specs; }),
+	Rule([ROWMAJOR_SY, self], 			($, cg) => { cg.SetTypeMisc(Type.MISC_ROWMAJOR); return cg.type_specs; }),
+	Rule([COLMAJOR_SY, self], 			($, cg) => { cg.ClearTypeMisc(Type.MISC_ROWMAJOR); return cg.type_specs; }),
+	Rule([LOWP_SY, self], 				($, cg) => { cg.SetTypeMisc(Type.MISC_PRECISION*1); return cg.type_specs; }),
+	Rule([MEDIUMP_SY, self], 			($, cg) => { cg.SetTypeMisc(Type.MISC_PRECISION*2); return cg.type_specs; }),
+	Rule([HIGHP_SY, self], 				($, cg) => { cg.SetTypeMisc(Type.MISC_PRECISION*3); return cg.type_specs; }),
 ]);
 
 const template_param = Rules<Decl>(
-	Rule([TYPEDEF_SY, identifier] as const, ($, cg) => cg.NewDeclNode($[1])),
-	Rule([abstract_declaration]),
+	Rule([TYPEDEF_SY, identifier], 		($, cg) => cg.NewDeclNode($[1])),
+	abstract_declaration,
 );
 
 const template_params = Rules<Decl[]>(
-	Rule([TEMPLATE_SY, '<', ($, cg) => { cg.current_scope!.formal++; }, List(template_param, ','), '>'] as const, ($, cg) => { cg.current_scope!.formal--; return $[3]; }),
+	Rule([TEMPLATE_SY, '<',				($, cg) => { cg.current_scope!.formal++; }, List(template_param, ','), '>'], ($, cg) => { cg.current_scope!.formal--; return $[3]; }),
 );
 
 const template_decl_header = Rules(
-	Rule([template_params, STRUCT_SY, struct_identifier] as const, ($, cg) => cg.TemplateHeader($[2], $[0])),
-	Rule([template_params, STRUCT_SY, struct_identifier, ':', TYPEIDENT_SY] as const, ($, cg) => cg.TemplateHeader($[2], $[0]).AddStructBase(cg.LookUpTypeSymbol($[4]))),
+	Rule([template_params, STRUCT_SY, struct_identifier],						($, cg) => cg.TemplateHeader($[2], $[0])),
+	Rule([template_params, STRUCT_SY, struct_identifier, ':', TYPEIDENT_SY],	($, cg) => cg.TemplateHeader($[2], $[0]).AddStructBase(cg.LookUpTypeSymbol($[4]))),
 );
 
 /****************/
 /* Template	*/
 /****************/
 const template_decl = Rules(
-	Rule([template_decl_header, '{', ($: any, cg: CG) => { cg.PushScope($[0].str.members); cg.current_scope!.flags |= Scope.is_struct; }, struct_declaration_list, '}'] as const, ($, cg) => { cg.PopScope(); return $[0]; }),
-	Rule([template_decl_header]),
+	Rule([template_decl_header, '{', ($: any, cg: CG) => { cg.PushScope($[0].str.members); cg.current_scope!.flags |= Scope.is_struct; }, struct_declaration_list, '}'], ($, cg) => { cg.PopScope(); return $[0]; }),
+	template_decl_header,
 );
 
 const _declaration_specifiers = Rules<Derived>(
-	Rule([abstract_declaration_specifiers]),
-	Rule([template_decl] as const, $ => $[0] as unknown as Derived),
-	Rule([TYPEDEF_SY, abstract_declaration_specifiers] as const, ($, cg) => { cg.SetTypeMisc(Type.MISC_TYPEDEF); return cg.type_specs; }),
+	abstract_declaration_specifiers,
+	Rule([template_decl],										$ => $[0] as unknown as Derived),
+	Rule([TYPEDEF_SY, abstract_declaration_specifiers],			($, cg) => { cg.SetTypeMisc(Type.MISC_TYPEDEF); return cg.type_specs; }),
 );
 
 const _declaration = Rules<Stmt[]>(
-	Rule([declaration_specifiers, ';'] as const, () => []),
-	Rule([declaration_specifiers, init_declarator_list, ';'] as const, $ => $[1]),
-	Rule([ERROR_SY, ';'] as const, ($, cg) => { cg.RecordErrorPos(); return []; }),
+	Rule([declaration_specifiers, ';'], _ => []),
+	Rule([declaration_specifiers, init_declarator_list, ';'],	$ => $[1]),
+	Rule([ERROR_SY, ';'],										($, cg) => { cg.RecordErrorPos(); return []; }),
 );
 
 const cbuffer_header = Rules<Sym>(
-	Rule([CBUFFER_SY, struct_identifier] as const, ($, cg) => cg.ConstantBuffer($[1], 0)),
-	Rule([CBUFFER_SY, struct_identifier, ':', register_spec] as const, ($, cg) => cg.ConstantBuffer($[1], $[3])),
+	Rule([CBUFFER_SY, struct_identifier],						($, cg) => cg.ConstantBuffer($[1], 0)),
+	Rule([CBUFFER_SY, struct_identifier, ':', register_spec],	($, cg) => cg.ConstantBuffer($[1], $[3])),
 
 );
 const cbuffer_compound_header = Rules(
-	Rule([compound_header] as const, ($, cg) => { cg.current_scope.flags |= Scope.is_struct | Scope.is_cbuffer; return $[0]; }),
+	Rule([compound_header], 									($, cg) => { cg.current_scope.flags |= Scope.is_struct | Scope.is_cbuffer; return $[0]; }),
 );
 
 /****************/
 /* Cbuffer	*/
 /****************/
 const cbuffer_decl = Rules(
-	Rule([cbuffer_header, cbuffer_compound_header, struct_declaration_list, '}'] as const, ($, cg) => cg.SetConstantBuffer($[0], cg.PopScope()!)),
+	Rule([cbuffer_header, cbuffer_compound_header, struct_declaration_list, '}'], ($, cg) => cg.SetConstantBuffer($[0], cg.PopScope()!)),
 );
 
 const pass_state_value = Rules(
-	Rule([state_value]),
-	Rule([COMPILE_SY, identifier, identifier, '(', ')'] as const, ($, cg) => cg.SymbolicConstant($[2], $[1])),
-	Rule([ASM_SY, '{', assembly, '}'] as const, ($, cg) => cg.SymbolicConstant(0, 0)),
+	state_value,
+	Rule([COMPILE_SY, identifier, identifier, '(', ')'],	($, cg) => cg.SymbolicConstant($[2], $[1])),
+	Rule([ASM_SY, '{', assembly, '}'], 						(_, cg) => cg.SymbolicConstant(0, 0)),
 );
 
 const pass_item = Rules(
-	Rule([identifier, '=', pass_state_value] as const, ($, cg) => cg.StateInitializer($[0], $[2])),
+	Rule([identifier, '=', pass_state_value], 				($, cg) => cg.StateInitializer($[0], $[2])),
 );
 
 const pass_item_list = Rules<Expr>(self => [
-	Rule([pass_item]),
-	Rule([self, ';', pass_item] as const, $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[2])),
-	Rule([self, ';', ] as const),
+	pass_item,
+	Rule([self, ';', pass_item], $ => Expr.NewBinopNode('EXPR_LIST', $[0], $[2])),
+	Rule([self, ';', ]),
 ]);
 
 const pass = Rules(
-	Rule([PASS_SY, identifier, '{', pass_item_list, '}'] as const, ($, cg) => cg.StateInitializer($[1], $[3])),
+	Rule([PASS_SY, identifier, '{', pass_item_list, '}'], 	($, cg) => cg.StateInitializer($[1], $[3])),
 );
 
 /*******************/
@@ -1886,15 +1885,15 @@ const pass_list = List(pass);
 /****************/
 
 const external_declaration = Rules<any>(
-	Rule([declaration],															($, cg) => cg.GlobalInitStatements($[0])),
-	Rule([cbuffer_decl, ';'],													() => undefined),
-	Rule([TECHNIQUE_SY, identifier, '{', pass_list, '}'] as const,				($, cg) => { cg.DefineTechnique($[1], $[3]); }),
-	Rule([TECHNIQUE_SY, identifier, annotation, '{', pass_list, '}'] as const,	($, cg) => { cg.DefineTechnique($[1], $[4], $[2]); }),
-	Rule([function_definition]),
+	Rule([declaration],													($, cg) => cg.GlobalInitStatements($[0])),
+	Rule([cbuffer_decl, ';'],											_ => undefined),
+	Rule([TECHNIQUE_SY, identifier, '{', pass_list, '}'],				($, cg) => { cg.DefineTechnique($[1], $[3]); }),
+	Rule([TECHNIQUE_SY, identifier, annotation, '{', pass_list, '}'],	($, cg) => { cg.DefineTechnique($[1], $[4], $[2]); }),
+	function_definition,
 );
 
 const compilation_unit = Rules(self => [
-	Rule([external_declaration]),
+	external_declaration,
 	Rule([self, external_declaration]),
 ]);
 

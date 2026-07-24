@@ -1,9 +1,31 @@
 import * as TS from './ts-parser';
-
-import * as fs from 'fs';
+import * as fs from 'fs/promises';
 import * as path from 'path';
 
-const reExt = /\.[^/]+$/;
+export const ModuleOptionsDefault = {
+	allowArbitraryExtensions:				false,
+	allowImportingTsExtensions:				false,
+	allowUmdGlobalAccess:					false,
+	baseUrl:								undefined as string | undefined,
+	customConditions:						undefined as string[] | undefined,
+	module:									undefined as string | undefined,
+	moduleResolution:						'node',
+	moduleSuffixes:							undefined as string[] | undefined,
+	noResolve:								false,
+	noUncheckedSideEffectImports:			false,
+	paths:									undefined as Record<string, string[]> | undefined,
+	resolveJsonModule:						false,
+	resolvePackageJsonExports:				false,
+	resolvePackageJsonImports:				false,
+	rewriteRelativeImportExtensions:		false,
+	rootDir:								undefined as string | undefined,
+	rootDirs:								undefined as string[] | undefined,
+	typeRoots:								undefined as string[] | undefined,
+	types:									undefined as string | undefined,
+};
+
+const reExt			= /\.[^/]+$/;
+const reReference	= /^\/\/\/\s*<reference\s+(path|types|lib)=["']([^"']+)["']\s*\/>/gm;
 
 function stripExt(file: string): string {
 	return file.replace(reExt, '');
@@ -12,23 +34,12 @@ function addMissingExt(file: string, ext: string) {
 	return reExt.test(file) ? file : file + ext;
 }
 
-async function tryLoadCode(full: string): Promise<string | undefined> {
+async function tryLoadFile(full: string): Promise<string | undefined> {
 	try {
-		return await fs.promises.readFile(full, 'utf8');
+		return await fs.readFile(full, 'utf8');
 	} catch {
 		return undefined;
 	}
-}
-
-async function load(root: string, canonical: string) : Promise<LoadedModule | undefined> {
-	const code = await tryLoadCode(path.join(root, canonical + '.ts'))
-			||	await tryLoadCode(path.join(root, canonical + '.d.ts'));
-	if (code)
-		try {
-			return {body: TS.parse(code).body, canonical: canonical };
-		} catch(e) {
-			console.error(`Failed to parse ${canonical}: ${e}`);
-		}
 }
 
 export interface LoadedModule {
@@ -37,24 +48,24 @@ export interface LoadedModule {
 }
 
 async function loadCodeFromPackage(pkgDir: string, pkg: string, subpath: string): Promise<{ code: string; canonical: string } | undefined> {
-	const code 	= await tryLoadCode(path.join(pkgDir, subpath) + '.d.ts');
+	const code 	= await tryLoadFile(path.join(pkgDir, subpath) + '.d.ts');
 	if (code)
 		return { code, canonical: path.join(pkg, subpath) };
 
 	try {
-		const pkgjson	= JSON.parse(await fs.promises.readFile(path.join(pkgDir, 'package.json'), 'utf8'));
+		const pkgjson	= JSON.parse(await fs.readFile(path.join(pkgDir, 'package.json'), 'utf8'));
 
 		if (subpath) {
 			const exp = pkgjson.exports?.['./' + subpath]?.['types'];
 			if (exp) {
-				const code = await tryLoadCode(path.join(pkgDir, exp));
+				const code = await tryLoadFile(path.join(pkgDir, exp));
 				if (code)
 					return { code, canonical: path.join(pkg, stripExt(exp)) };
 			}
 
 		} else {
 			const types = pkgjson.types ?? pkgjson.typings ?? (stripExt(pkgjson.main) ?? 'index');
-			const code	= await tryLoadCode(path.join(pkgDir, addMissingExt(types, '.d.ts')));
+			const code	= await tryLoadFile(path.join(pkgDir, addMissingExt(types, '.d.ts')));
 			if (code)
 				return { code, canonical: path.join(pkg, stripExt(types)) };
 		}
@@ -73,8 +84,6 @@ function joinSpecifier(from: string, rel: string): string {
 	return from.startsWith('.') && !joined.startsWith('.') ? './' + joined : joined;
 }
 
-const referenceRE = /^\/\/\/\s*<reference\s+(path|types|lib)=["']([^"']+)["']\s*\/>/gm;
-
 // ===================================================================
 // encapsulates a node_modules directory
 // ===================================================================
@@ -87,7 +96,7 @@ class NodeModules {
 			try {
 				let nm = this.found.get(root);
 				if (!nm) {
-					await fs.promises.access(path.join(root, 'node_modules'));
+					await fs.access(path.join(root, 'node_modules'));
 					nm = this.found.get(root);
 					if (!nm) {
 						nm = new NodeModules(root, restrictTypes);
@@ -110,8 +119,9 @@ class NodeModules {
 	}
 	private async scan(types: string, restrictTypes?: string[]) {
 		try {
-			const dirs = await fs.promises.readdir(types, {withFileTypes: true});
-			await Promise.all(dirs.filter(i => i.isDirectory() && (!restrictTypes || restrictTypes.includes(i.name))).map(i =>
+			await Promise.all((await fs.readdir(types, {withFileTypes: true})).filter(
+				i => i.isDirectory() && (!restrictTypes || restrictTypes.includes(i.name))
+			).map(i =>
 				this.loadDirectory(path.join(types, i.name))
 			));
 		} catch {
@@ -120,15 +130,11 @@ class NodeModules {
 	}
 
 	private async loadDirectory(dir: string): Promise<void> {
-		const entries = await fs.promises.readdir(dir, {withFileTypes: true});
-		await Promise.all(entries.map(async i => {
+		await Promise.all((await fs.readdir(dir, {withFileTypes: true})).map(async i => {
 			if (i.isDirectory())
 				return this.loadDirectory(path.join(dir, i.name));
-			if (i.name.endsWith('.d.ts')) {
-				const body	= fs.promises.readFile(path.join(dir, i.name), 'utf8').then(code => TS.parse(code).body);
-//				this.found.set(i.name, body);
-				this.registerDeclaredModules(await body);
-			}
+			if (i.name.endsWith('.d.ts'))
+				this.registerDeclaredModules(await fs.readFile(path.join(dir, i.name), 'utf8').then(code => TS.parse(code).body));
 		}));
 	}
 
@@ -158,7 +164,7 @@ class NodeModules {
 		seen.add(canonical);
 		try {
 			const body = TS.parse(code).body;
-			for (const [, kind, ref] of code.matchAll(referenceRE)) {
+			for (const [, kind, ref] of code.matchAll(reReference)) {
 				const refMod = kind === 'types' ? ref : joinSpecifier(canonical, kind === 'lib' ? './lib.' + ref : ref);
 				if (!seen.has(refMod)) {
 					const res = await this.tryLocalCode(refMod);
@@ -215,27 +221,52 @@ class NodeModules {
 export class ModuleLoader {
 	imported = new Map<string, Promise<LoadedModule|undefined>>;
 
-	constructor(public root: string, restrictTypes?: string[]) {
+	constructor(public root: string, public opts: typeof ModuleOptionsDefault, restrictTypes?: string[]) {
 		NodeModules.get(root, restrictTypes);
 	}
 
 	async local(resolved: string) {
-		return await load(this.root, resolved) || await load(this.root, resolved + '/index');
+		const load = async (canonical: string) => {
+			const code = await tryLoadFile(path.join(this.root, canonical + '.ts'))
+					||	await tryLoadFile(path.join(this.root, canonical + '.d.ts'));
+			if (code) {
+				try {
+					return {body: TS.parse(code).body, canonical };
+				} catch(e) {
+					console.error(`Failed to parse ${canonical}: ${e}`);
+				}
+			}
+		};
+
+		return await load(resolved) || await load(resolved + '/index');
+	}
+
+	private async get0(resolved: string): Promise<LoadedModule|undefined> {
+		if (this.opts.paths) {
+			for (const [alias, paths] of Object.entries(this.opts.paths)) {
+				if (resolved.startsWith(alias)) {
+					for (const i of paths) {
+						const candidate = i + resolved.slice(alias.length);
+						const loaded = await this.local(candidate);
+						if (loaded)
+							return loaded;
+					}
+				}
+			}
+		}
+		if (resolved.startsWith('.'))
+			return this.local(resolved);
+
+		const nm	= await NodeModules.get(this.root);
+		if (nm)
+			return nm.get(resolved);
 	}
 
 	async get(mod: string, from: string): Promise<LoadedModule | undefined> {
-		const resolved = mod.startsWith('.') ? joinSpecifier(from, mod) : mod;
+		const resolved = mod.startsWith('.') ? stripExt(joinSpecifier(from, mod)) : mod;
+		if (!this.imported.has(resolved))
+			this.imported.set(resolved, this.get0(resolved));
 
-		if (!this.imported.has(resolved)) {
-			if (resolved.startsWith('.')) {
-				this.imported.set(resolved, this.local(resolved));
-			} else {
-				const nm	= await NodeModules.get(this.root);
-				if (!nm)
-					return undefined;
-				this.imported.set(resolved, nm.get(resolved));
-			}
-		}
 		return await this.imported.get(resolved);
 	}
 }

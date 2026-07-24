@@ -14,7 +14,6 @@
 	"scripts": {
 		"build": "tsc",
 		"watch": "tsc -watch -p ./",
-		"examples": "tsc -b examples",
 		"lint": "eslint \"src/**/*.ts\""
 	},
 	"keywords": [
