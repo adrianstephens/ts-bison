@@ -1,10 +1,12 @@
-import {parser} from '../examples/TS/js-parser';
+import {parse} from '../examples/TS/js-parser';
+import {TSoutput} from '../examples/TS/tocode';
+const output = new TSoutput();
 
 function test(name: string, code: string) {
 	try {
-		console.log(name);
-        const ast = parser.parse(code);
-		console.log(JSON.stringify(ast, null, 2));
+		console.log('====' + name + '====');
+		const ast = parse(code);
+		console.log(output.toCode(ast));
 	} catch (e) {
 		console.error(`${name} failed:`, e);
 	}
@@ -14,8 +16,8 @@ console.log('Testing JS Parser...\n');
 
 test('ASI: restricted production (return)', `
 function f() {
-    return
-    1
+	return
+	1
 }
 `);
 
@@ -58,7 +60,7 @@ var b = x && y && z || w;
 
 test('for...of', `
 for (const item of items) {
-    console.log(item);
+	console.log(item);
 }
 `);
 
@@ -74,11 +76,11 @@ var b = x ?? y ? 1 : 2;
 
 test('object literal shorthand / computed keys', `
 var obj = {
-    x,
-    y,
-    foo() { return 1; },
-    bar(a, b) { return a + b; },
-    [key]: value,
+	x,
+	y,
+	foo() { return 1; },
+	bar(a, b) { return a + b; },
+	[key]: value,
 };
 `);
 
@@ -89,13 +91,13 @@ var b = f(1, ...args, 2);
 
 test('rest parameter', `
 function f(a, b, ...rest) {
-    return rest;
+	return rest;
 }
 var g = function(...all) {
-    return all;
+	return all;
 };
 var obj = {
-    method(...args) { return args; },
+	method(...args) { return args; },
 };
 `);
 
@@ -125,41 +127,41 @@ let a = 1;
 const b = 2;
 let c, d = 4;
 for (let i = 0; i < 5; i++) {
-    console.log(i);
+	console.log(i);
 }
 for (const key in obj) {
-    console.log(key);
+	console.log(key);
 }
 `);
 
 test('Program', `
 function fib(n) {
-    if (n < 2) {
-        return n;
-    } else {
-        return fib(n - 1) + fib(n - 2);
-    }
+	if (n < 2) {
+		return n;
+	} else {
+		return fib(n - 1) + fib(n - 2);
+	}
 }
 
 var results = [];
 for (var i = 0; i < 5; i++) {
-    results.push(fib(i));
+	results.push(fib(i));
 }
 
 var obj = {
-    name: "test",
-    get value() { return 42; },
-    items: [1, 2, 3],
+	name: "test",
+	get value() { return 42; },
+	items: [1, 2, 3],
 };
 
 for (var key in obj) {
-    console.log(key);
+	console.log(key);
 }
 `);
 
 test('default parameters', `
 function f(a, b = 1, c = a + b) {
-    return a + b + c;
+	return a + b + c;
 }
 var g = function(x = 10) { return x; };
 `);
@@ -189,16 +191,16 @@ var e = [];
 
 test('destructuring in for-of/for-in', `
 for (const {key, value} of entries) {
-    console.log(key, value);
+	console.log(key, value);
 }
 for (const [k, v] of pairs) {
-    console.log(k, v);
+	console.log(k, v);
 }
 `);
 
 test('destructuring in function params', `
 function f({a, b = 1}, [c, d]) {
-    return a + b + c + d;
+	return a + b + c + d;
 }
 var g = function({x: renamed}) { return renamed; };
 `);
@@ -256,11 +258,11 @@ var c = () => ({ x: 1 });
 
 test('generators', `
 function* gen() {
-    yield 1;
-    yield;
-    yield 1 + 2;
-    yield* other();
-    var x = yield 1;
+	yield 1;
+	yield;
+	yield 1 + 2;
+	yield* other();
+	var x = yield 1;
 }
 var g = function*() { yield 1; };
 var named = function* inner() { yield 1; };
@@ -270,24 +272,24 @@ export function* exported() { yield 1; }
 
 test('yield restricted production (ASI)', `
 function* gen() {
-    yield
-    foo()
+	yield
+	foo()
 }
 `);
 
 test('classes: basic', `
 class Foo {
-    constructor(x) {
-        this.x = x;
-    }
-    bar() {
-        return this.x;
-    }
+	constructor(x) {
+		this.x = x;
+	}
+	bar() {
+		return this.x;
+	}
 }
 class Bar extends Foo {
-    constructor() {
-        super(1);
-    }
+	constructor() {
+		super(1);
+	}
 }
 var anon = class { method() { return 1; } };
 var named = class Named { method() { return 1; } };
@@ -295,16 +297,16 @@ var named = class Named { method() { return 1; } };
 
 test('classes: members', `
 class Foo {
-    x = 1;
-    y;
-    static z = 2;
-    get value() { return this.x; }
-    set value(v) { this.x = v; }
-    static get staticValue() { return 1; }
-    *gen() { yield 1; }
-    static *staticGen() { yield 1; }
-    [computedKey]() { return 1; }
-    [computedField] = 1;
+	x = 1;
+	y;
+	static z = 2;
+	get value() { return this.x; }
+	set value(v) { this.x = v; }
+	static get staticValue() { return 1; }
+	*gen() { yield 1; }
+	static *staticGen() { yield 1; }
+	[computedKey]() { return 1; }
+	[computedField] = 1;
 }
 `);
 
@@ -316,7 +318,7 @@ export default class {}
 
 test('async functions', `
 async function foo() {
-    return await bar();
+	return await bar();
 }
 var f = async function() { return await bar(); };
 var named = async function inner() { return await bar(); };
@@ -335,19 +337,19 @@ arr.map(async x => await transform(x));
 
 test('async methods', `
 var obj = {
-    async foo() { return await bar(); },
-    async *gen() { yield await bar(); },
+	async foo() { return await bar(); },
+	async *gen() { yield await bar(); },
 };
 class Foo {
-    async foo() { return await bar(); }
-    async *gen() { yield await bar(); }
-    static async staticFoo() { return await bar(); }
+	async foo() { return await bar(); }
+	async *gen() { yield await bar(); }
+	static async staticFoo() { return await bar(); }
 }
 `);
 
 test('await precedence', `
 async function f() {
-    return await a + await b;
+	return await a + await b;
 }
 `);
 

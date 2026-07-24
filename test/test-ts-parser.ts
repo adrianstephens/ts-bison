@@ -1,74 +1,108 @@
-import {parse} from '../examples/TS/ts-parser';
-import {TSoutput} from '../examples/TS/tocode';
-import {TStoDecl, TStypeCheck, TStypeCheckAsync } from '../examples/TS/ts-codegen';
+import * as JSX from '../examples/TS/jsx-parser';
+import * as TS from '../examples/TS/ts-parser';
+import { TSoutput} from '../examples/TS/tocode';
+import { TStoDecl, TStoJS, TStypeCheck, TStypeCheckAsync, FixOptions } from '../examples/TS/transform';
+import { ModuleLoader } from '../examples/TS/module-loader';
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { SEVERITY } from '../examples/TS/checker';
 
 const output = new TSoutput();
-let total_diag = 0;
 const total_sev = [] as number[];
 
-function test(name: string, code: string, outputCode = false) {
+const parser = TS.make();
+type Parser = typeof parser;
+JSX.add();
+const parserX = TS.make();
+
+function test(name: string, code: string, format = 0) {
 	try {
 		console.log('====' + name + '====');
-		const ast = parse(code);
-		const diag = TStypeCheck(ast);
-		if (diag.length) {
-			console.error(`Type errors in ${name}:`);
-			for (const d of diag)
-				console.error(`  ${d.pos.line}:${d.pos.col} - ${d.message}`);
-			total_diag += diag.length;
+		const program		= parser.parse(code);
+		const diagnostics	= TStypeCheck(program);
+
+		for (const d of diagnostics) {
+			total_sev[d.severity] ??= 0;
+			++total_sev[d.severity];
 		}
-		if (outputCode) {
-			//output.toCode(ast);
-			//output.toCode(TStoJS(ast)!);
-			console.log(output.toCode(TStoDecl(ast)));
+
+		const filtered = diagnostics.filter(d => d.severity > SEVERITY.GAP);
+		if (filtered.length) {
+			console.error(`Type errors in ${name}:`);
+			for (const d of filtered)
+				console.error(`  ${d.pos.line}:${d.pos.col} - ${d.message}`);
+		}
+		switch (format) {
+			case 1: console.log(output.toCode(program)); break;
+			case 2: console.log(output.toCode(TStoJS(program)!)); break;
+			case 3: console.log(output.toCode(TStoDecl(program))); break;
 		}
 	} catch (e) {
 		console.error(`${name} failed:`, e);
 	}
 }
 
-async function testAsync(name: string, pathname: string, outputCode = false) {
+async function testAsync(parser: Parser, name: string, filename: string, format = 0) {
 	try {
-		console.log('====' + name + '====');
-		const {program, diagnostics} = await TStypeCheckAsync(pathname, SEVERITY.ERROR, {target: 'es2022'});
-		if (diagnostics.length) {
+		console.log('==== ' + name + ' ====');
+		const options	= FixOptions({target: 'es2022'});
+		const loader	= new ModuleLoader(path.dirname(filename), options);
+		const source	= await fs.readFile(filename, 'utf8');
+
+		const reDoc		= /^\/\*\*\s*@(\w+)\s*(.*?)\s*\*\/$/gm;
+		for (let m; (m = reDoc.exec(source)); ) {
+			const [_, doc, args] = m;
+			console.log(doc, args);//options[k] = arg;
+		}
+
+		const program	= parser.parse(source);
+		const diags 	= await TStypeCheckAsync(program, loader, options);
+
+		for (const d of diags) {
+			total_sev[d.severity] ??= 0;
+			++total_sev[d.severity];
+		}
+
+		const filtered = diags.filter(d => d.severity > SEVERITY.GAP);
+		if (filtered.length) {
 			console.error(`Type errors in ${name}:`);
-			for (const d of diagnostics) {
+			for (const d of filtered)
 				console.error(`  ${d.pos.line}:${d.pos.col} - ${d.message}`);
-				total_sev[d.severity] ??= 0;
-				++total_sev[d.severity];
+		}
+		switch (format) {
+			case 1: console.log(output.toCode(program)); break;
+			case 2: console.log(output.toCode(TStoJS(program)!)); break;
+			case 3: console.log(output.toCode(TStoDecl(program))); break;
+			case 13: {
+				const dest = path.join(path.dirname(filename), '../dist', path.basename(filename, '.ts') + '.debug.d.ts');
+				await fs.writeFile(dest, output.toCode(TStoDecl(program)));
+				break;
 			}
-			total_diag += diagnostics.length;
-		}
-		if (outputCode) {
-			//output.toCode(ast);
-			//output.toCode(TStoJS(ast)!);
-			console.log(output.toCode(TStoDecl(program)));
 		}
 	} catch (e) {
 		console.error(`${name} failed:`, e);
 	}
 }
 
-async function testDir(dir: string) {
-	for (const entry of await fs.readdir(dir, {withFileTypes: true})) {
-		if (entry.name === 'node_modules' || entry.name === 'hidden' || entry.name === 'assistant')
-			continue;
-		const full = path.join(dir, entry.name);
-		if (entry.isDirectory())
-			await testDir(full);
-		else if (full.endsWith('.ts') && !full.endsWith('.d.ts'))
-			await testAsync(full, full);
+async function testDir(dir: string, ext: string, parser: Parser, format = 0) {
+	async function recurse(dir: string) {
+		for (const entry of await fs.readdir(dir, {withFileTypes: true})) {
+			if (entry.name === 'node_modules' || entry.name === 'hidden' || entry.name === 'assistant')
+				continue;
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory())
+				await recurse(full);
+			else if (full.endsWith(ext) && !full.endsWith('.d.ts'))
+				await testAsync(parser, full, full, format);
+		}
 	}
+	await recurse(dir);
 }
 
 (async()=> {
 
-//await testAsync('source', '/Volumes/DevSSD/dev/packages/maths/src/geometry.ts');
+//await testAsync(parser, 'source', '/Volumes/DevSSD/dev/packages/binary-libs/src/pe.ts', 13);
 //await testAsync('source', path.join(__dirname, '../examples/TS/ts-codegen.ts'));
 
 test('1', `
@@ -167,14 +201,9 @@ type Dict = { [key: string]: number };
 const handler: Callback = (err, result) => {};
 `);
 
-
-//await testAsync('vector', '/Volumes/DevSSD/dev/packages/algebraic/src/index.ts', true);
-//await testAsync('source', path.join(__dirname, '../src/tison.ts'));
-//await testAsync('vector', '/Volumes/DevSSD/dev/packages/maths/src/vector.ts', true);
-
-await testDir(path.join(__dirname, '../..'));
+await testDir(path.join(__dirname, '../..'), '.tsx', parserX);
+await testDir(path.join(__dirname, '../..'), '.ts', parser);
 
 console.log('\nAll tests completed!');
-console.log(`Total Diagnostics: ${total_diag}`);
 total_sev.forEach((n, i) => console.log(`${['GAP', 'WARNING', 'ERROR'][i]}: ${n}`));
 })();
