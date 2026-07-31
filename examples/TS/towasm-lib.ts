@@ -1,7 +1,7 @@
 import * as TS from './ts-parser';
 
 // ===================================================================
-//  towasm prelude: non-callback String/Array/Uint8Array methods
+//  towasm lib: non-callback String/Array/Uint8Array methods
 // ===================================================================
 //
 // Written as ordinary TS in the same subset `towasm.ts`'s `emitStmt`/`emitExpr` already compile (loops,
@@ -99,12 +99,12 @@ function arrayMethodsSrc(className: string, arrType: string, elemType: string, a
 }
 
 const STRING_METHODS_SRC = `
-	// Not itself a JS-visible method -- stays a plain top-level function in the prelude source, dispatched
+	// Not itself a JS-visible method -- stays a plain top-level function in the lib source, dispatched
 	// as a bare identifier call, unrelated to the class/\`this\` machinery every real method goes through.
 	function strIsSpace(code: number): boolean {
 		return code === 32 || code === 9 || code === 10 || code === 13;
 	}
-	class StringBox {
+	class String {
 		indexOf(needle: string): number {
 			const n: number = this.length;
 			const m: number = needle.length;
@@ -224,6 +224,45 @@ const STRING_METHODS_SRC = `
 			return result;
 		}
 	}
+`;
+
+const BIGINT_METHODS_SRC = `
+//internally an array of i32
+function addbig(a: Uint32Array, b: Uint32Array): Uint32Array {
+	const result: Uint32Array = __towasm_arr_i32_alloc(a.length);
+	let carry = 0;
+	for (let i = 0; i < b.length; i++) {
+		const sum = a[i] + b[i] + carry;
+		result[i] = sum & 0xFFFFFFFF;
+		carry = sum > 0x100000000 ? 1 : 0;
+	}
+	const atop = (a[a.length - 1] >> 31) >>> 0;
+	const btop = (b[b.length - 1] >> 31) >>> 0;
+	for (let i = b.length; i < a.length; i++) {
+		const sum = a[i] + btop + carry;
+		result[i] = sum & 0xFFFFFFFF;
+		carry = sum > 0x100000000 ? 1 : 0;
+	}
+	if (atop + btop + carry > 1) {
+		//overflow
+
+	}
+	return result;
+}
+
+
+class BigInt {
+	array = new Uint32Array;
+	top() {
+		return this.array[this.array.length - 1];
+	}
+	add(other: BigInt): BigInt {
+		return this.array.length < other.array.length
+			? addbig(other.array, this.array)
+			: addbig(this.array, other.array);
+	}
+
+}
 `;
 
 const LIB_SRC =
