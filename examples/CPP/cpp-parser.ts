@@ -19,7 +19,7 @@ import * as C from './c-parser';
 //   - No user-defined literals, ref-qualified methods, placement new, `template` disambiguator,
 //     out-of-class definitions of template class members, `::x` global qualifier, `Box<int>::iterator`,
 //     or adjacent string-literal concatenation.
-//   - Functional casts work for registered names (`T(x)`) but not builtin types; cv-qualifiers on pointer levels parse but are discarded.
+//   - Functional casts work for registered names (`T(x)`) but not builtin types.
 //   - `override`/`final` are real keywords, not contextual; `goto` labels can't reuse type names.
 
 // ===================================================================
@@ -28,10 +28,29 @@ import * as C from './c-parser';
 
 export type AccessSpecifier = 'public' | 'private' | 'protected';
 
+// The cpp-only type-specifier variants -- see c-parser.ts's `TypeSpecifier<X>` extension seam. Declared first
+// since almost everything below threads it through.
+export type TypeSpecifierExt	= ClassSpecifier | CppEnumSpecifier | GenericType | QualifiedType | DecltypeSpecifier;
+export type TypeSpecifier		= C.TypeSpecifier<TypeSpecifierExt>;
+export type DeclSpec			= C.DeclSpec<TypeSpecifierExt>;
+export type DeclarationSpec		= C.DeclarationSpec<TypeSpecifierExt>;
+
+export interface Reference<T>			{ type: 'reference'; to: T }
+export interface RvalueReference<T>	{ type: 'rvalue_reference'; to: T }
+// `Declarator`/`AbstractDeclarator`/`TypeName` instantiate c-parser.ts's extension seams with cpp's own
+// widened pieces -- see c-parser.ts's `Declarator<R,P>`/`TypeName<D,X>` for the seam design.
+export type Declarator			= C.Declarator<Reference<Declarator> | RvalueReference<Declarator>, ParamDecl>;
+export type AbstractDeclarator	= C.AbstractDeclarator<Reference<AbstractDeclarator> | RvalueReference<AbstractDeclarator>, ParamDecl>;
+export type TypeName			= C.TypeName<AbstractDeclarator, TypeSpecifierExt>;
+
 // A variadic function parameter pack (`Args... args`, `Args&&... args`, or unnamed `Args...`) -- pushed onto
-// c-parser.ts's `parameter_declaration` alongside its own plain `ParameterDecl` (a `C.ParamList.params` element,
+// c-parser.ts's `parameter_declaration` alongside `ParameterDecl` below (a `C.ParamList.params` element,
 // distinct from the trailing `...` ellipsis, which is `ParamList.variadic`).
-export interface PackParameter			{ type: 'parameter'; specifiers: C.DeclarationSpecifiers; name?: string; byRef?: boolean; rvalueRef?: boolean; pack: true; }
+export interface PackParameter			{ type: 'parameter'; specifiers: DeclarationSpec; name?: string; byRef?: boolean; rvalueRef?: boolean; pack: true; }
+// A parameter carrying a default value (`int x = 5`) -- the one cpp-only addition to C's plain `ParameterDecl`
+// shape (default arguments don't exist in C). `ParamDecl` is what actually flows through every parameter list.
+export interface ParameterDecl			extends C.ParameterDecl<Declarator, TypeSpecifierExt> { default?: C.Expr; }
+export type ParamDecl			= ParameterDecl | PackParameter;
 
 export interface AccessLabel			{ type: 'access_label'; access: AccessSpecifier; }
 export interface MemberInitializer		{ name: string; arguments: C.Expr[]; }
@@ -40,53 +59,54 @@ export interface MemberInitializer		{ name: string; arguments: C.Expr[]; }
 // (a body, a bare declaration `;`, pure-virtual `= 0;`, `= default;`, or `= delete;`).
 export interface MethodTail {
 	isConst?: boolean; noexcept?: boolean; override?: boolean; final?: boolean;
-	body?: C.Block; declarationOnly?: boolean; pure?: boolean; defaulted?: boolean; deleted?: boolean;
+	body?: C.Block<Declarator, TypeSpecifierExt>; declarationOnly?: boolean; pure?: boolean; defaulted?: boolean; deleted?: boolean;
 }
 // How a constructor ends: an optional member-initializer list plus body, or `= default;`/`= delete;`/declaration-only.
-export interface CtorTail				{ initializerList?: MemberInitializer[]; body?: C.Block; declarationOnly?: boolean; defaulted?: boolean; deleted?: boolean; }
+export interface CtorTail				{ initializerList?: MemberInitializer[]; body?: C.Block<Declarator, TypeSpecifierExt>; declarationOnly?: boolean; defaulted?: boolean; deleted?: boolean; }
 
 const MemberMod = ['static', 'virtual', 'inline', 'constexpr', 'explicit', 'friend', 'mutable'] as const;
 export type MemberMod = typeof MemberMod[number];
 
-export interface ConstructorMember		extends CtorTail, C.ParamList { type: 'constructor'; name: string; modifiers?: MemberMod[]; }
+export interface ConstructorMember		extends CtorTail, C.ParamList<ParamDecl> { type: 'constructor'; name: string; modifiers?: MemberMod[]; }
 export interface DestructorMember		extends MethodTail { type: 'destructor'; name: string; modifiers?: MemberMod[]; }
-export interface MethodMember			extends MethodTail { type: 'method'; specifiers: C.DeclarationSpecifiers; declarator: C.Declarator; modifiers?: MemberMod[]; }
-export interface ConversionMember		extends MethodTail { type: 'conversion'; target: C.TypeName; modifiers?: MemberMod[]; }
+export interface MethodMember			extends MethodTail { type: 'method'; specifiers: DeclSpec; declarator: Declarator; modifiers?: MemberMod[]; }
+export interface ConversionMember		extends MethodTail { type: 'conversion'; target: TypeName; modifiers?: MemberMod[]; }
 export interface UsingDeclMember		{ type: 'using_decl'; scope: string[]; name: string; }
 
 // C's own StructDeclarator is bitfield/bare-name only; C++ struct/unknown-type fields also carry a full declarator (pointers, arrays, references) plus an optional initializer.
 export interface DeclaratorField		{ declarator: Declarator; initializer?: C.Expr; }
 export type StructDeclarator			= C.StructDeclarator | DeclaratorField;
 
-export interface StructMember			extends C.StructMember<StructDeclarator> { modifiers?: MemberMod[]; }
-export function StructMember(typeSpecifiers: C.DeclSpecItem[], declarators: StructDeclarator[], modifiers?: MemberMod[]): StructMember { return { type: 'struct_member', typeSpecifiers, declarators, modifiers}; }
+export interface StructMember			extends C.StructMember<StructDeclarator, TypeSpecifierExt> { modifiers?: MemberMod[]; }
+export function StructMember(specifiers: DeclSpec, declarators: StructDeclarator[], modifiers?: MemberMod[]): StructMember { return { type: 'struct_member', specifiers, declarators, modifiers}; }
 export interface MemberTemplate			{ type: 'member_template'; params: TemplateParam[]; declaration: ClassMember; }
 
 export type ClassMember = StructMember | AccessLabel | ConstructorMember | DestructorMember | MethodMember | ConversionMember | UsingDeclMember | UsingAlias | MemberTemplate;
 
 export interface BaseSpecifier			{ access?: AccessSpecifier; virtual?: boolean; name: string; args?: TemplateArg[]; }
 export interface ClassSpecifier			{ type: 'class' | 'struct' | 'union'; name?: string; final?: boolean; bases?: BaseSpecifier[]; body?: ClassMember[]; }
-export interface CppEnumSpecifier		{ type: 'enum'; name?: string; scoped?: boolean; base?: C.TypeSpecifier[]; members?: C.Enumerator[]; }
-
-export type Declarator = C.Declarator
-	| { type: 'reference'; to: C.Declarator }
-	| { type: 'rvalue_reference'; to: C.Declarator };
+export interface CppEnumSpecifier		{ type: 'enum'; name?: string; scoped?: boolean; base?: TypeSpecifier; members?: C.Enumerator[]; }
 
 export interface LambdaCapture { name?: string; byRef?: boolean; init?: C.Expr; thisCapture?: boolean; defaultCapture?: '=' | '&'; }
-export interface LambdaExpr extends C.ParamList { type: 'lambda'; captures: LambdaCapture[]; returnType?: C.TypeName; mutable?: boolean; body: C.Block; }
+export interface LambdaExpr extends C.ParamList<ParamDecl> { type: 'lambda'; captures: LambdaCapture[]; returnType?: TypeName; mutable?: boolean; body: C.Block<Declarator, TypeSpecifierExt>; }
 
+// `Expr` stays keyed off C's plain (never-extended) `cast`/`sizeof_type` `TypeName` -- casting/sizeof-ing an
+// inline class/enum-class type is vanishingly rare, not worth threading the seam into C's own Expr union for
+// (see c-parser.ts's `ArrayDecl.size` comment for the same call). cpp's *own* expression forms below all use
+// the widened `TypeName`/`TypeSpecifier`, since those positions (`static_cast<T>`, `new T`, ...) commonly do
+// need it (`static_cast<std::vector<int>&>(x)`).
 export type Expr = C.Expr
 	| { type: 'this' }
 	| Literal<boolean>
 	| { type: 'null_literal' }
 	| { type: 'qualified'; parts: string[] }
-	| { type: 'new'; typeName: C.TypeSpecifier; arguments?: C.Expr[]; size?: C.Expr; braced?: boolean; placement?: C.Expr[] }
+	| { type: 'new'; typeName: TypeSpecifier; arguments?: C.Expr[]; size?: C.Expr; braced?: boolean; placement?: C.Expr[] }
 	| { type: 'delete'; operand: C.Expr; array?: boolean }
 	| { type: 'pack_expansion'; operand: C.Expr }
 	| { type: 'sizeof_pack'; name: string }
-	| { type: 'cpp_cast'; kind: string; target: C.TypeName; expression: C.Expr }
-	| { type: 'typeid'; expression?: C.Expr; target?: C.TypeName }
-	| { type: 'alignof'; target: C.TypeName }
+	| { type: 'cpp_cast'; kind: string; target: TypeName; expression: C.Expr }
+	| { type: 'typeid'; expression?: C.Expr; target?: TypeName }
+	| { type: 'alignof'; target: TypeName }
 	| { type: 'functional_cast'; target: string; arguments: C.Expr[] }
 	| LambdaExpr;
 
@@ -94,38 +114,38 @@ export type Expr = C.Expr
 // also gates the shared IDENT callback into C++ mode, so TYPE_SCOPE reclassification never fires for plain cParser.
 export interface CppCtx extends C.Ctx { templateDepth: number; }
 
-export interface CatchClause			{ paramType?: C.TypeName; paramName?: string; byRef?: boolean; body: C.Block; }
+export interface CatchClause			{ paramType?: TypeName; paramName?: string; byRef?: boolean; body: C.Block<Declarator, TypeSpecifierExt>; }
 export interface UsingDirective			{ type: 'using_namespace'; name: string; }
-export interface UsingAlias				{ type: 'using_alias'; name: string; target: C.TypeName; }
+export interface UsingAlias				{ type: 'using_alias'; name: string; target: TypeName; }
 export interface NamespaceDecl			{ type: 'namespace'; name?: string; inline?: boolean; body: Definition[]; }
 export interface LinkageSpec			{ type: 'linkage'; language: string; body: Definition[]; }
 export interface StaticAssert			{ type: 'static_assert'; condition: C.Expr; message: string; }
-export interface TemplateParam			{ name: string; pack?: boolean; nonType?: C.DeclarationSpecifiers; default?: C.TypeName | C.Expr; }
-export interface TemplateDecl			{ type: 'template'; params: TemplateParam[]; declaration: C.Definition | ClassSpecifier | UsingAlias; }
+export interface TemplateParam			{ name: string; pack?: boolean; nonType?: DeclSpec; default?: TypeName | Expr; }
+export interface TemplateDecl			{ type: 'template'; params: TemplateParam[]; declaration: Definition | ClassSpecifier | UsingAlias; }
 
 // A type argument at a generic *use* site (`Box<int>`) -- `pack` marks a pack-expansion argument (`Tuple<Args...>`),
 // `value` is a TypeName for type arguments or an Expr for non-type ones (`array<int, 5>`).
-export interface TemplateArg			{ value: C.TypeName | C.Expr; pack?: boolean; }
+export interface TemplateArg			{ value: TypeName | Expr; pack?: boolean; }
 export interface GenericType			{ type: 'generic'; name: string; args: TemplateArg[]; }
 export interface QualifiedType			{ type: 'qualified_type'; parts: string[]; dependent?: boolean; }
 export interface DecltypeSpecifier		{ type: 'decltype'; expression?: C.Expr; auto?: boolean; }
 
-export interface OutOfClassMethod		extends C.ParamList { type: 'method_def'; specifiers?: C.DeclarationSpecifiers; pointer?: C.Levels; scope: string[]; name: string; tail: MethodTail; }
-export interface OutOfClassCtor			extends C.ParamList { type: 'constructor_def'; scope: string[]; name: string; tail: CtorTail; }
+export interface OutOfClassMethod		extends C.ParamList<ParamDecl> { type: 'method_def'; specifiers?: DeclarationSpec; pointer?: C.Levels; scope: string[]; name: string; tail: MethodTail; }
+export interface OutOfClassCtor			extends C.ParamList<ParamDecl> { type: 'constructor_def'; scope: string[]; name: string; tail: CtorTail; }
 export interface OutOfClassDtor			{ type: 'destructor_def'; scope: string[]; name: string; tail: MethodTail; }
-export interface OperatorDef			extends C.ParamList { type: 'operator_def'; specifiers: C.DeclarationSpecifiers; scope?: string[]; operator: string; tail: MethodTail; }
-export interface StaticMemberDef		{ type: 'static_member_def'; specifiers: C.DeclarationSpecifiers; pointer?: C.Levels; scope: string[]; name: string; initializer?: C.Expr; ctorArgs?: C.Expr[]; }
+export interface OperatorDef			extends C.ParamList<ParamDecl> { type: 'operator_def'; specifiers: DeclarationSpec; scope?: string[]; operator: string; tail: MethodTail; }
+export interface StaticMemberDef		{ type: 'static_member_def'; specifiers: DeclarationSpec; pointer?: C.Levels; scope: string[]; name: string; initializer?: C.Expr; ctorArgs?: C.Expr[]; }
 
-export type Statement = C.Statement
+export type Statement = C.Statement<Declarator, TypeSpecifierExt>
 	| { type: 'throw'; argument?: C.Expr }
-	| { type: 'try'; body: C.Block; handlers: CatchClause[] }
-	| { type: 'range_for'; specifiers: C.DeclarationSpecifiers; declarator: C.Declarator; range: C.Expr; body: Statement }
+	| { type: 'try'; body: C.Block<Declarator, TypeSpecifierExt>; handlers: CatchClause[] }
+	| { type: 'range_for'; specifiers: DeclarationSpec; declarator: Declarator; range: C.Expr; body: Statement }
 	| StaticAssert
 	| UsingDirective
 	| UsingAlias
 	| UsingDeclMember;
 
-export type Definition = C.Definition
+export type Definition = C.Definition<Declarator, TypeSpecifierExt>
 	| NamespaceDecl
 	| LinkageSpec
 	| UsingDirective
@@ -284,23 +304,23 @@ C.direct_declarator.push(
 // C's specifier_qualifier_list can only *trail* with qualifiers (`int const`); C++ style leads with them
 // (`const char*`, `const auto&`). A right-recursive leading alternative fixes all of those at once.
 C.specifier_qualifier_list.push(
-	Rule([C.type_qualifier, C.specifier_qualifier_list],	$ => [$[0], ...$[1]]),
+	Rule([C.type_qualifier, C.specifier_qualifier_list],	$ => ({ ...$[1], [$[0]]: true })),
 );
 
 // Unknown-type parameters (`f(CgStruct *Cg)`): a parameter list holds only declarations, so `IDENT * IDENT` can't
 // be an expression there. Bare `IDENT` alone stays an expression (`int x(a);` keeps its most-vexing-parse reading).
 C.parameter_declaration.push(
-	Rule([C.IDENT, C.pointer, C.IDENT],	$ => ({ type: 'parameter', specifiers: [C.RefType($[0])], declarator: C.Pointer($[1], Identifier($[2])) } as const)),
-	Rule([C.IDENT, C.pointer],			$ => ({ type: 'parameter', specifiers: [C.RefType($[0])], declarator: C.Pointer($[1], Identifier('')) } as const)),
-	Rule([C.IDENT, '&', C.IDENT],		$ => ({ type: 'parameter', specifiers: [C.RefType($[0])], declarator: { type: 'reference', to: Identifier($[2]) } as unknown as C.Declarator } as const)),
-	Rule([C.IDENT, C.IDENT],			$ => ({ type: 'parameter', specifiers: [C.RefType($[0])], declarator: Identifier($[1]) } as const)),
+	Rule([C.IDENT, C.pointer, C.IDENT],	$ => ({ type: 'parameter', specifiers: { type: C.RefType($[0]) }, declarator: C.Pointer($[1], Identifier($[2])) } as const)),
+	Rule([C.IDENT, C.pointer],			$ => ({ type: 'parameter', specifiers: { type: C.RefType($[0]) }, declarator: C.Pointer($[1], Identifier('')) } as const)),
+	Rule([C.IDENT, '&', C.IDENT],		$ => ({ type: 'parameter', specifiers: { type: C.RefType($[0]) }, declarator: { type: 'reference', to: Identifier($[2]) } as unknown as C.Declarator } as const)),
+	Rule([C.IDENT, C.IDENT],			$ => ({ type: 'parameter', specifiers: { type: C.RefType($[0]) }, declarator: Identifier($[1]) } as const)),
 );
 
 // Unknown-type members/globals (`FILE *fd;`): at member/external scope `IDENT * IDENT ;` can't be an expression,
 // so this narrow shape is safe. Statement scope is excluded -- there `A * b;` is genuinely ambiguous with multiplication.
 const unknown_type_field = Rules<StructMember>(
-	Rule([C.IDENT, C.pointer, C.IDENT, ';'],		$ => StructMember([C.RefType($[0])], [{ declarator: C.Pointer($[1], Identifier($[2])) }])),
-	Rule([C.IDENT, C.pointer, C.TYPE_NAME, ';'],	$ => StructMember([C.RefType($[0])], [{ declarator: C.Pointer($[1], Identifier($[2])) }])),
+	Rule([C.IDENT, C.pointer, C.IDENT, ';'],		$ => StructMember({ type: C.RefType($[0]) }, [{ declarator: C.Pointer($[1], Identifier($[2])) }])),
+	Rule([C.IDENT, C.pointer, C.TYPE_NAME, ';'],	$ => StructMember({ type: C.RefType($[0]) }, [{ declarator: C.Pointer($[1], Identifier($[2])) }])),
 );
 struct_declaration.push(
 	unknown_type_field,
@@ -309,8 +329,8 @@ struct_declaration.push(
 // Casts through unknown pointer types (`(MemoryPoolCleanup*)fn`). ForceFork: after `( IDENT` the `*` is
 // one-token-ambiguous with multiplication. `*`s are spelled inline, not via `pointer`, so the fork tag reaches this rule.
 assignment_expression.push(
-	ForceFork(Rule(['(', C.IDENT, '*', ')', C.assignment_expression],		$ => ({ type: 'cast', type1: { specifiers: [C.RefType($[1])], declarator: C.Pointer([1], undefined) }, expression: $[4] } as const))),
-	ForceFork(Rule(['(', C.IDENT, '*', '*', ')', C.assignment_expression],	$ => ({ type: 'cast', type1: { specifiers: [C.RefType($[1])], declarator: C.Pointer([2], undefined) }, expression: $[5] } as const))),
+	ForceFork(Rule(['(', C.IDENT, '*', ')', C.assignment_expression],		$ => ({ type: 'cast', type1: { specifiers: { type: C.RefType($[1]) }, declarator: C.Pointer([[]], undefined) }, expression: $[4] } as const))),
+	ForceFork(Rule(['(', C.IDENT, '*', '*', ')', C.assignment_expression],	$ => ({ type: 'cast', type1: { specifiers: { type: C.RefType($[1]) }, declarator: C.Pointer([[], []], undefined) }, expression: $[5] } as const))),
 );
 
 // Constructor-style init (`int x(5);`): an unregistered identifier inside the parens reads as an argument, matching
@@ -339,13 +359,6 @@ C.for_statement.push(
 	Rule([C.declaration, ';'],									$ => ({ init: $[0] })),
 	Rule([C.declaration, ';', C.expression],					$ => ({ init: $[0], update: $[2] })),
 	Rule([C.declaration, C.expression, ';'],					$ => ({ init: $[0], condition: $[1] })),
-);
-
-// cv-qualified pointer levels (`const char* const* p`). The qualifier is accepted and discarded --
-// C's Pointer AST shape has nowhere to hang it, and widening that is a c-parser.ts change.
-C.pointer.push(
-	Rule(['*', C.type_qualifier],				_ => [1]),
-	Rule(['*', C.type_qualifier, C.pointer],	$ => [$[2].length + 1, ...$[2]]),
 );
 
 // Functional casts (`T(3.14)`, `T()`) -- the ctor-call-shaped counterpart of C's `(T)x`. Only for
@@ -383,7 +396,11 @@ type_specifier.push(
 // C's declaration_specifiers allows at most one storage-class-like specifier; C++ regularly stacks two
 // (`static constexpr int x`). Two is enough in practice -- three-deep stacks are vanishingly rare.
 C.declaration_specifiers.push(
-	Rule([C.storage_class_specifier, C.storage_class_specifier, C.specifier_qualifier_list],	($, ctx) => { ctx.pendingTypedef = $[0] === 'typedef' || $[1] === 'typedef'; return [$[0], $[1], ...$[2]]; }),
+	Rule([C.storage_class_specifier, C.storage_class_specifier, C.specifier_qualifier_list],	($, ctx) => {
+		ctx.pendingTypedef = $[0] === 'typedef' || $[1] === 'typedef';
+		const storageClass = [$[0], $[1]].filter((s): s is C.StorageClass => s !== 'typedef');
+		return storageClass.length ? { ...$[2], storageClass } : { ...$[2] };
+	}),
 );
 
 // ===================================================================
@@ -623,9 +640,9 @@ type_specifier.push(
 
 // Qualified types (`Foo::Inner x;`) and scoped generics (`std::vector<int>`), as specifier_qualifier_list *starters*
 // -- see the scoped_generic_open comment above for why they must not be type_specifier alternatives.
-(C.specifier_qualifier_list as unknown as Rules<unknown[]>).push(
-	Rule([scope_prefix, C.TYPE_NAME],									$ => [{ type: 'qualified_type', parts: [...$[0], $[1]] }]),
-	Rule([scoped_generic_open, template_argument_list, '>'],			($, ctx) => { ctx.templateDepth--; return [{ type: 'generic', name: $[0], args: $[1] }]; }),
+(C.specifier_qualifier_list as unknown as Rules<unknown>).push(
+	Rule([scope_prefix, C.TYPE_NAME],									$ => ({ type: { type: 'qualified_type', parts: [...$[0], $[1]] } })),
+	Rule([scoped_generic_open, template_argument_list, '>'],			($, ctx) => { ctx.templateDepth--; return { type: { type: 'generic', name: $[0], args: $[1] } }; }),
 );
 
 // ===================================================================
@@ -723,8 +740,8 @@ const enum_head = Rules<{ name: string; scoped?: boolean }>(
 	Rule(['enum', termOneOf(['class', 'struct']), C.TYPE_NAME],	$ => ({ name: $[2], scoped: true } as const)),
 );
 
-const enum_base = Rules<C.TypeSpecifier[]>(
-	Rule([':', C.specifier_qualifier_list], $ => $[1] as C.TypeSpecifier[]),
+const enum_base = Rules<C.TypeSpecifier>(
+	Rule([':', C.specifier_qualifier_list], $ => $[1].type),
 );
 
 (C.enum_specifier as unknown as Rules<CppEnumSpecifier>).push(
@@ -877,8 +894,8 @@ for (const nameT of [C.IDENT, C.TYPE_NAME]) {
 	for (const lead of [[], [C.pointer]] as unknown[][]) {
 		const n = lead.length;
 		(C.struct_declarator as unknown as Rules<unknown>).push(
-			Rule([...lead, '(', '*', nameT, ')', '(', ')'] as any,							($: any[]) => ({ declarator: { type: 'function', name: C.Pointer([1], Identifier($[n + 2])), params: [], returnPointer: n ? $[0] : undefined } })),
-			Rule([...lead, '(', '*', nameT, ')', '(', C.parameter_type_list, ')'] as any,	($: any[]) => ({ declarator: { type: 'function', name: C.Pointer([1], Identifier($[n + 2])), ...$[n + 5], returnPointer: n ? $[0] : undefined } })),
+			Rule([...lead, '(', '*', nameT, ')', '(', ')'] as any,							($: any[]) => ({ declarator: { type: 'function', name: C.Pointer([[]], Identifier($[n + 2])), params: [], returnPointer: n ? $[0] : undefined } })),
+			Rule([...lead, '(', '*', nameT, ')', '(', C.parameter_type_list, ')'] as any,	($: any[]) => ({ declarator: { type: 'function', name: C.Pointer([[]], Identifier($[n + 2])), ...$[n + 5], returnPointer: n ? $[0] : undefined } })),
 		);
 	}
 }
@@ -906,8 +923,8 @@ struct_declaration.push(
 // own `TYPE_NAME (` shift otherwise beats the spec_qual reduce the struct_declarator shapes depend on.
 for (const nameT of [C.IDENT, C.TYPE_NAME]) {
 	struct_declaration.push(
-		Rule([C.TYPE_NAME, '(', '*', nameT, ')', '(', ')', ';'] as any,							($: any[]) => StructMember([C.RefType($[0])], [{ declarator: C.FunctionDecl(C.Pointer([1], Identifier($[3])), []) }])),
-		Rule([C.TYPE_NAME, '(', '*', nameT, ')', '(', C.parameter_type_list, ')', ';'] as any,	($: any[]) => StructMember([C.RefType($[0])], [{ declarator: C.FunctionDecl(C.Pointer([1], Identifier($[3])), $[6].params, $[6].variadic) }])),
+		Rule([C.TYPE_NAME, '(', '*', nameT, ')', '(', ')', ';'] as any,							($: any[]) => StructMember({ type: C.RefType($[0]) }, [{ declarator: C.FunctionDecl(C.Pointer([[]], Identifier($[3])), []) }])),
+		Rule([C.TYPE_NAME, '(', '*', nameT, ')', '(', C.parameter_type_list, ')', ';'] as any,	($: any[]) => StructMember({ type: C.RefType($[0]) }, [{ declarator: C.FunctionDecl(C.Pointer([[]], Identifier($[3])), $[6].params, $[6].variadic) }])),
 	);
 }
 struct_declaration.push(
@@ -1049,8 +1066,8 @@ external_definition.push(
 	// Unknown-type globals (`lheap *instance;`): storage classes spelled directly, not via declaration_specifiers --
 	// the general form never gets IDENT into the post-specifier state's lookahead (an LALR merged-state gap).
 	Rule([unknown_type_field], $ => $[0] as unknown as Definition),
-	Rule([C.storage_class_specifier, unknown_type_field],										$ => ({ ...($[1] as object), specifiers: [$[0]] }) as unknown as Definition),
-	Rule([C.storage_class_specifier, C.storage_class_specifier, unknown_type_field],			$ => ({ ...($[2] as object), specifiers: [$[0], $[1]] }) as unknown as Definition),
+	Rule([C.storage_class_specifier, unknown_type_field],										$ => ({ ...$[1], specifiers: { ...$[1].specifiers, storageClass: [$[0]] } }) as unknown as Definition),
+	Rule([C.storage_class_specifier, C.storage_class_specifier, unknown_type_field],			$ => ({ ...$[2], specifiers: { ...$[2].specifiers, storageClass: [$[0], $[1]] } }) as unknown as Definition),
 );
 
 // Trailing return types on ordinary functions (`auto f(int) -> int {...}`). The `->` can only be this rule here: nothing else follows a completed declarator with `->`.
@@ -1065,10 +1082,11 @@ external_definition.push(
 // Registering each parameter as a type name the moment it's parsed (not scoped) is what lets `T` be used as an
 // ordinary type inside the templated body. TYPE_NAME alternatives cover a name reused across two templates.
 const builtin_type_list = List(Rules<string>(Rule([termOneOf(C.BUILTIN_TYPE)], $ => $[0])));
-const nontype_param_type = Rules<C.DeclarationSpecifiers>(
-	Rule([builtin_type_list],	$ => $[0].map(name => C.RefType(name))),
-	Rule([CPP_SIMPLE_TYPE],		$ => [C.RefType($[0])]),
-	Rule([C.TYPE_NAME],			$ => [C.RefType($[0])]),
+const nontype_param_type = Rules<C.DeclSpec>(
+	// One or more builtin keywords still spell one type (`unsigned long`) -- join, don't collect separately.
+	Rule([builtin_type_list],	$ => ({ type: C.RefType($[0].join(' ')) })),
+	Rule([CPP_SIMPLE_TYPE],		$ => ({ type: C.RefType($[0]) })),
+	Rule([C.TYPE_NAME],			$ => ({ type: C.RefType($[0]) })),
 );
 
 const template_param = Rules<TemplateParam>(

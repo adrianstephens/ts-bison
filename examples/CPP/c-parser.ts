@@ -58,18 +58,34 @@ export type binaryOps	= ','|'+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'|'>>'
 						|'&&='|'||='
 
 export type TypeQualifier	= 'const' | 'volatile';
-export type StorageClass	= 'typedef' | 'extern' | 'static' | 'auto' | 'register';
+// `typedef` is recognized by the same terminal as these (see `storage_class_specifier`), but it isn't a storage
+// class at all -- it changes what KIND of declaration this is (a type alias, not a variable/function), so it's
+// promoted to its own `TypedefDecl` node (see `declaration`'s action) rather than living here.
+export type StorageClass	= 'extern' | 'static' | 'auto' | 'register';
 
 export interface RefType			{ type: 'ref'; name: string; }
 export function  RefType(name: string): RefType { return { type: 'ref', name }; }
 
-export type TypeSpecifier			= RefType | StructSpecifier | EnumSpecifier;
-export type DeclSpecItem			= TypeSpecifier | TypeQualifier;
-export type DeclarationSpecifiers	= (DeclSpecItem | StorageClass)[];
+// `X`: the type-specifier extension seam -- defaults to `never` (plain C), cpp instantiates it with
+// `ClassSpecifier | CppEnumSpecifier | GenericType | QualifiedType | DecltypeSpecifier` so those flow through
+// every `specifiers.type` position without a cast, the same way js-parser.ts's `Expr<T>`/`Param<T>` let
+// ts-parser.ts plug in its own `Type`.
+export type TypeSpecifier<X = never>	= RefType | StructSpecifier | EnumSpecifier | X;
+// Multiple builtin keywords (`unsigned long long int`) spell ONE type, not several -- merged into a single
+// RefType with a combined name (see `combineTypeSpecifier`) rather than collected as separate array entries.
+export interface DeclSpec<X = never>	{ type: TypeSpecifier<X>; const?: boolean; volatile?: boolean; }
+export interface DeclarationSpec<X = never> extends DeclSpec<X> { storageClass?: StorageClass[]; }
+
+// A struct/enum specifier, or a named-type reference, can't combine with anything else in valid C, so it's just
+// kept (permissively overwriting on conflict -- this parser doesn't validate). Two builtin-keyword RefTypes
+// concatenate into one, since that's genuinely one type spelled with multiple words.
+export function combineTypeSpecifier<X>(prev: TypeSpecifier<X>, next: TypeSpecifier<X>): TypeSpecifier<X> {
+	return (prev as RefType).type === 'ref' && (next as RefType).type === 'ref' ? RefType(`${(prev as RefType).name} ${(next as RefType).name}`) : next;
+}
 
 export interface StructDeclarator	{ name?: string; type?: 'bitfield'; width?: Expr; }
-export interface StructMember<D = StructDeclarator>		{ type: 'struct_member'; typeSpecifiers: DeclSpecItem[]; declarators: D[]; }
-export function StructMember<D> (typeSpecifiers: DeclSpecItem[], declarators: D[]): StructMember<D> { return { type: 'struct_member', typeSpecifiers, declarators}; }
+export interface StructMember<D = StructDeclarator, X = never>		{ type: 'struct_member'; specifiers: DeclSpec<X>; declarators: D[]; }
+export function StructMember<D, X = never> (specifiers: DeclSpec<X>, declarators: D[]): StructMember<D, X> { return { type: 'struct_member', specifiers, declarators}; }
 // `body` is absent for a tag-only reference (`struct Point p;`, naming a struct/union defined elsewhere) -- present (even if empty) for a definition (`struct Point { ... } p;`).
 export interface StructSpecifier	{ type: 'struct' | 'union'; name?: string; body?: StructMember[]; }
 
@@ -77,77 +93,106 @@ export interface Enumerator			{ name: string; init?: Expr; }
 // Same tag-only-vs-definition distinction as StructSpecifier above.
 export interface EnumSpecifier		{ type: 'enum'; name?: string; members?: Enumerator[]; }
 
-export interface Declaration		{ type: 'declaration'; specifiers: DeclarationSpecifiers; initDeclarators?: InitDeclarator[]; }
+export interface Declaration<D = Declarator, X = never>		{ type: 'declaration'; specifiers: DeclarationSpec<X>; initDeclarators?: InitDeclarator<D>[]; }
+// `typedef int foo, *foo_ptr;` -- a distinct declaration kind (declares type aliases, not variables), not a
+// `Declaration` tagged with a `typedef` storage class. `declarators` reuses `InitDeclarator` (rather than a
+// bare `Declarator[]`) purely to share `init_declarator_list`'s grammar production; typedefs never actually
+// carry an initializer.
+export interface TypedefDecl<D = Declarator, X = never>		{ type: 'typedef'; specifiers: DeclSpec<X>; declarators: InitDeclarator<D>[]; }
 
-export type Levels					= number[];
-export interface Pointer<T>			{ type: 'pointer'; to: T }
-// One node per `*`, matching how ArrayDecl/FunctionDecl each nest one level per node -- `levels` only ever
-// carries its own length (nothing reads the per-element values), so it's folded here rather than stored.
-// The intermediate wraps are genuinely `Pointer<T>` again (T's own recursive union already allows that), TS
-// just can't express "wrapped levels.length times" for a runtime-dynamic count, hence the cast.
+// One qualifier set per `*`, outermost (leftmost in source) first -- `int * const * volatile p` is
+// `[['const'], ['volatile']]` (the outer pointer is `const`, the inner one `volatile`).
+export type Levels					= TypeQualifier[][];
+export interface Pointer<T>			{ type: 'pointer'; qualifiers?: TypeQualifier[]; to: T }
+// One node per `*`, matching how ArrayDecl/FunctionDecl each nest one level per node. Builds innermost-out
+// (last element of `levels` wraps `to` directly, first element ends up outermost). The intermediate wraps
+// are genuinely `Pointer<T>` again (T's own recursive union already allows that); TS just can't express
+// "wrapped levels.length times" for a runtime-dynamic count, hence the single cast at the end.
 export function  Pointer<T>(levels: Levels, to: T): Pointer<T> {
-	let result: Pointer<T> = { type: 'pointer', to };
-	for (let i = 1; i < levels.length; i++)
-		result = { type: 'pointer', to: result as unknown as T };
-	return result;
+	let result: unknown = to;
+	for (let i = levels.length; i-- > 0;) {
+		const qualifiers = levels[i];
+		result = { type: 'pointer', qualifiers: qualifiers.length ? qualifiers : undefined, to: result };
+	}
+	return result as Pointer<T>;
 }
 
+// `size` uses the plain (never-extended) TypeSpecifier even under cpp -- the `[type_specifier]` array-size
+// form this covers is an obscure, barely-exercised grammar path (see direct_abstract_declarator), not worth
+// threading the `X` seam through the whole declarator system for.
 export interface ArrayDecl<T>		{ type: 'array'; element: T; size?: TypeSpecifier | Expr };
 export function  ArrayDecl<T>(element: T, size?: TypeSpecifier | Expr): ArrayDecl<T>	{ return { type: 'array', element, size }; };
 
-export interface FunctionDecl<T> extends ParamList { type: 'function'; name: T; }
-export function  FunctionDecl<T>(name: T, params: ParameterDecl[], variadic?: boolean): FunctionDecl<T> { return { type: 'function', name, params, variadic}; }
+// `P`: the parameter-shape extension seam -- defaults to `ParameterDecl` (plain C), cpp instantiates it with
+// its own `ParameterDecl | PackParameter` union so default-valued and variadic-pack parameters flow through
+// a function declarator's own `params` without a cast.
+export interface FunctionDecl<T, P = ParameterDecl> extends ParamList<P> { type: 'function'; name: T; }
+export function  FunctionDecl<T, P = ParameterDecl>(name: T, params: P[], variadic?: boolean): FunctionDecl<T, P> { return { type: 'function', name, params, variadic}; }
 
-export type Declarator =
+// `R`: the declarator-shape extension seam -- defaults to `never` (plain C), cpp instantiates it with
+// `Reference | RvalueReference` so `int &x`/`int &&x` flow through every declarator position without a cast
+// (mirrors js-parser.ts's `Expr<T>` pattern: the recursive positions re-supply the same `<R, P>` pair, and `R`
+// itself is a plain union member alongside the built-in wrapper shapes).
+export type Declarator<R = never, P = ParameterDecl> =
 	| Identifier
-	| FunctionDecl<Declarator>
-	| ArrayDecl<Declarator>		// `size` is absent for `int arr[]` (incomplete-array form, also used for unsized array parameters like `void f(int arr[])`).
-	| Pointer<Declarator>;		// `to` lets a pointer wrap a parenthesized sub-declarator, which is what makes function-pointer declarators (`int (*fp)(int)`) expressible: the parens are what let a pointer bind to the *name*, not to the function type as a whole
+	| FunctionDecl<Declarator<R, P>, P>
+	| ArrayDecl<Declarator<R, P>>		// `size` is absent for `int arr[]` (incomplete-array form, also used for unsized array parameters like `void f(int arr[])`).
+	| Pointer<Declarator<R, P>>			// `to` lets a pointer wrap a parenthesized sub-declarator, which is what makes function-pointer declarators (`int (*fp)(int)`) expressible: the parens are what let a pointer bind to the *name*, not to the function type as a whole
+	| R;
 
 // An abstract declarator -- the same shapes as Declarator (pointer/array/function, plus grouping), but never bottoming out in a name:
 // every level is optional since "nothing more" is itself a valid abstract declarator (e.g. plain `int *` has a pointer with no further `to`).
-export type AbstractDeclarator = undefined
-	| Pointer<AbstractDeclarator>
-	| FunctionDecl<AbstractDeclarator>
-	| ArrayDecl<AbstractDeclarator>;
+export type AbstractDeclarator<R = never, P = ParameterDecl> = undefined
+	| Pointer<AbstractDeclarator<R, P> | undefined>
+	| FunctionDecl<AbstractDeclarator<R, P> | undefined, P>
+	| ArrayDecl<AbstractDeclarator<R, P> | undefined>
+	| R;
 
 // A type-name for casts/sizeof: specifiers plus an optional abstract declarator (pointers, arrays, functions, and combinations
 // -- the same vocabulary as a real declarator, just never naming anything).
-export interface TypeName			{ specifiers: DeclSpecItem[]; declarator?: AbstractDeclarator; }
+export interface TypeName<D = AbstractDeclarator, X = never>			{ specifiers: DeclSpec<X>; declarator?: D; }
 
 // Initializers permissively allow a brace list anywhere an initializer can go (mirroring real C's `initializer-list`); designated initializers
 // (`.field = x`, `[i] = x`) aren't supported -- a known simplification.
 export type Initializer				= Expr | { type: 'initializer_list'; elements: Initializer[] };
-export type InitDeclarator			= Declarator | { declarator: Declarator; initializer: Initializer };
+export type InitDeclarator<D = Declarator>	= D | { declarator: D; initializer: Initializer };
 
-export interface ParameterDecl	{ type: 'parameter'; specifiers: DeclarationSpecifiers; declarator?: Declarator; }
-export function  ParameterDecl(specifiers: DeclarationSpecifiers, declarator?: Declarator): ParameterDecl { return {type: 'parameter', specifiers, declarator}; }
+// `Declarator`'s own default for `P` is (bare) `ParameterDecl`, so `ParameterDecl`'s default for `D` can't
+// also be (bare) `Declarator` -- TS can't resolve two type-parameter defaults that each depend on the other's
+// default. `PlainDeclarator` is a concrete (non-generic) recursive alias that breaks the cycle: it's
+// structurally identical to `Declarator<never, ParameterDecl>` (same shape, same fixed point), just spelled
+// via explicit type arguments instead of another default.
+export type PlainDeclarator = Identifier | FunctionDecl<PlainDeclarator> | ArrayDecl<PlainDeclarator> | Pointer<PlainDeclarator>;
+
+export interface ParameterDecl<D = PlainDeclarator, X = never>		{ type: 'parameter'; specifiers: DeclarationSpec<X>; declarator?: D; }
+export function  ParameterDecl<D = PlainDeclarator, X = never>(specifiers: DeclarationSpec<X>, declarator?: D): ParameterDecl<D, X> { return {type: 'parameter', specifiers, declarator}; }
 // The result shape of a parameter-type-list: a `...` trailing ellipsis is a boolean flag here rather than a
 // sentinel mixed into the array, mirroring JS/TS's `Params<T> = {params, rest?}` split.
-export interface ParamList		{ params: ParameterDecl[]; variadic?: boolean; }
+export interface ParamList<P = ParameterDecl>		{ params: P[]; variadic?: boolean; }
 
-export interface FunctionDef		{ type: 'function_def'; specifiers: DeclarationSpecifiers; declarator: Declarator; body: Block; }
-export type Definition				= Declaration | FunctionDef;
-export interface TranslationUnit	{ type: 'translation_unit'; body: Definition[]; }
+export interface FunctionDef<D = Declarator, X = never>		{ type: 'function_def'; specifiers: DeclarationSpec<X>; declarator: D; body: Block<D, X>; }
+export type Definition<D = Declarator, X = never>				= Declaration<D, X> | TypedefDecl<D, X> | FunctionDef<D, X>;
+export interface TranslationUnit<D = Declarator, X = never>	{ type: 'translation_unit'; body: Definition<D, X>[]; }
 
-export interface Block				{ type: 'block'; body: Statement[]; }
-export interface ForClauses			{ init: Expr | Declaration | undefined; condition?: Expr; update?: Expr; }
+export interface Block<D = Declarator, X = never>				{ type: 'block'; body: Statement<D, X>[]; }
+export interface ForClauses<D = Declarator, X = never>			{ init: Expr | Declaration<D, X> | TypedefDecl<D, X> | undefined; condition?: Expr; update?: Expr; }
 
-export type Statement =
-	| Block
-	| Declaration
-	| { type: 'if'; condition: Expr; then: Statement; else?: Statement }
-	| { type: 'while'; condition: Expr; body: Statement }
-	| { type: 'do_while'; body: Statement; condition: Expr }
-	| { type: 'for' } & ForClauses
-	| { type: 'switch'; condition: Expr; body: Statement }
-	| { type: 'case'; value: Expr; body: Statement }
-	| { type: 'default'; body: Statement }
+export type Statement<D = Declarator, X = never> =
+	| Block<D, X>
+	| Declaration<D, X>
+	| TypedefDecl<D, X>
+	| { type: 'if'; condition: Expr; then: Statement<D, X>; else?: Statement<D, X> }
+	| { type: 'while'; condition: Expr; body: Statement<D, X> }
+	| { type: 'do_while'; body: Statement<D, X>; condition: Expr }
+	| { type: 'for'; body: Statement<D, X> } & ForClauses<D, X>
+	| { type: 'switch'; condition: Expr; body: Statement<D, X> }
+	| { type: 'case'; value: Expr; body: Statement<D, X> }
+	| { type: 'default'; body: Statement<D, X> }
 	| { type: 'break' }
 	| { type: 'continue' }
 	| { type: 'return'; expression?: Expr }
 	| { type: 'goto'; label: string }
-	| { type: 'labeled'; label: string; body: Statement }
+	| { type: 'labeled'; label: string; body: Statement<D, X> }
 	| { type: 'empty' }
 	| Expr;
 
@@ -260,7 +305,7 @@ struct_declarator_list = List(struct_declarator, ','),
 
 // struct_declaration -> specifier_qualifier_list stays a string: cheapest cut in the type_specifier <-> struct/enum cycle (struct_declaration is specifier_qualifier_list's only consumer from this side).
 struct_declaration = Rules(
-	Rule([Forward<DeclSpecItem[]>(()=>specifier_qualifier_list), struct_declarator_list, ';'], $ => StructMember($[0], $[1])),
+	Rule([Forward<DeclSpec>(()=>specifier_qualifier_list), struct_declarator_list, ';'], $ => StructMember($[0], $[1])),
 ),
 
 struct_declaration_list = List(struct_declaration),
@@ -309,24 +354,32 @@ type_specifier = Rules<TypeSpecifier>(
 	Rule([TYPE_NAME], 											$ => RefType($[0])),
 ),
 
-specifier_qualifier_list = Rules<DeclSpecItem[]>(self => [
-	Rule([type_specifier], 										$ => [$[0]]),
-	Rule([self, type_specifier], 								$ => [...$[0], $[1]]),
-	Rule([self, type_qualifier], 								$ => [...$[0], $[1]]),
+specifier_qualifier_list = Rules<DeclSpec>(self => [
+	Rule([type_specifier], 										$ => ({ type: $[0] })),
+	Rule([self, type_specifier], 								$ => ({ ...$[0], type: combineTypeSpecifier($[0].type, $[1]) })),
+	Rule([self, type_qualifier], 								$ => ({ ...$[0], [$[1]]: true })),
 ]),
 
 // --- Declarators / declarations ---
 storage_class_specifier = OneOf(['typedef', 'extern', 'static', 'auto', 'register']),
 
-declaration_specifiers = Rules(
-	Rule([specifier_qualifier_list], 							($, ctx) => { ctx.pendingTypedef = false; return [...($[0])]; }),
-	Rule([specifier_qualifier_list, storage_class_specifier], 	($, ctx) => { ctx.pendingTypedef = $[1] === 'typedef'; return [...($[0]), $[1]]; }),
-	Rule([storage_class_specifier, specifier_qualifier_list], 	($, ctx) => { ctx.pendingTypedef = $[0] === 'typedef'; return [$[0], ...($[1])]; }),
+declaration_specifiers = Rules<DeclarationSpec>(
+	Rule([specifier_qualifier_list], 							($, ctx) => { ctx.pendingTypedef = false; return { ...$[0] }; }),
+	Rule([specifier_qualifier_list, storage_class_specifier], 	($, ctx) => {
+		ctx.pendingTypedef = $[1] === 'typedef';
+		return $[1] === 'typedef' ? { ...$[0] } : { ...$[0], storageClass: [$[1]] };
+	}),
+	Rule([storage_class_specifier, specifier_qualifier_list], 	($, ctx) => {
+		ctx.pendingTypedef = $[0] === 'typedef';
+		return $[0] === 'typedef' ? { ...$[1] } : { ...$[1], storageClass: [$[0]] };
+	}),
 ),
 
 pointer = Rules<Levels>(self => [
-	Rule(['*'], 												_ => [1]),
-	Rule(['*', self],											$ => [$[1].length + 1, ...$[1]]),
+	Rule(['*'], 												_ => [[]]),
+	Rule(['*', type_qualifier], 								$ => [[$[1]]]),
+	Rule(['*', self],											$ => [[], ...$[1]]),
+	Rule(['*', type_qualifier, self], 							$ => [[$[1]], ...$[2]]),
 ]),
 fwd_parameter_type_list = Forward<ParamList>(() => parameter_type_list),
 // Mirrors declarator but for abstract (nameless) declarators -- `*`, `[5]`, `(int)`, `(*)(int)`, etc.
@@ -404,9 +457,13 @@ init_declarator = Rules<InitDeclarator>(
 ),
 init_declarator_list = List(init_declarator, ','),
 
-declaration = Rules(
-	Rule([declaration_specifiers, ';'], 						$ => ({ type: 'declaration', specifiers: $[0] } as const)),
-	Rule([declaration_specifiers, init_declarator_list, ';'], 	$ => ({ type: 'declaration', specifiers: $[0], initDeclarators: $[1] } as const)),
+declaration = Rules<Declaration | TypedefDecl>(
+	Rule([declaration_specifiers, ';'], 						($, ctx) => ctx.pendingTypedef
+		? ({ type: 'typedef', specifiers: $[0], declarators: [] } as const)
+		: ({ type: 'declaration', specifiers: $[0] } as const)),
+	Rule([declaration_specifiers, init_declarator_list, ';'], 	($, ctx) => ctx.pendingTypedef
+		? ({ type: 'typedef', specifiers: $[0], declarators: $[1] } as const)
+		: ({ type: 'declaration', specifiers: $[0], initDeclarators: $[1] } as const)),
 ),
 
 // --- Statements ---
