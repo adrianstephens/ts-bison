@@ -69,6 +69,7 @@ function wasmTypeEq(a: WasmType, b: WasmType): boolean {
 interface FuncSig					{ params: WasmType[]; result: WasmType }
 interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody }
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
+type Inline2 = (args: (WasmType|undefined)[], ctx: FuncCtx)=>Inline
 
 // Anything a `.method(...)` call can dispatch against: a real user class (`this` a wasm-GC struct ref)
 // or a "builtin class" (`this` an array/string `WasmType` directly, see `arrayBoxOwners`) -- neither
@@ -215,53 +216,61 @@ const ARRAY: Record<TYPE, {index: number, methods: Map<string, MethodMember>}> =
 	i8:		{index: 3, methods: new Map}, 
 } as const;
 
-type Builtin = FunctionDecl | Inline
+type Builtin = FunctionDecl | Inline2
 const builtins: Record<string, Builtin> = {
-	'Math.sqrt':	{params: ['f64'], result: 'f64',		inline: [{op: 'f64.sqrt'}]},
-	'Math.abs':		{params: ['f64'], result: 'f64',		inline: [{op: 'f64.abs'}]},
-	'Math.floor':	{params: ['f64'], result: 'f64',		inline: [{op: 'f64.floor'}]},
-	'Math.ceil':	{params: ['f64'], result: 'f64',		inline: [{op: 'f64.ceil'}]},
-	'Math.min':		{params: ['f64', 'f64'], result: 'f64',	inline: [{op: 'f64.min'}]},
-	'Math.max':		{params: ['f64', 'f64'], result: 'f64',	inline: [{op: 'f64.max'}]},
+	'Math.sqrt':	() => ({params: ['f64'], result: 'f64',		inline: [{op: 'f64.sqrt'}]}),
+	'Math.abs':		() => ({params: ['f64'], result: 'f64',		inline: [{op: 'f64.abs'}]}),
+	'Math.floor':	() => ({params: ['f64'], result: 'f64',		inline: [{op: 'f64.floor'}]}),
+	'Math.ceil':	() => ({params: ['f64'], result: 'f64',		inline: [{op: 'f64.ceil'}]}),
+	'Math.min':		() => ({params: ['f64', 'f64'], result: 'f64',	inline: [{op: 'f64.min'}]}),
+	'Math.max':		() => ({params: ['f64', 'f64'], result: 'f64',	inline: [{op: 'f64.max'}]}),
 
-	__towasm_str_alloc:			{params: ['i32'], result: { arr: 'i16' }, inline: [{op: 'array.new_default', typeIndex: ARRAY.i16.index }]},
-	__towasm_arr_f64_alloc:		{params: ['i32'], result: { arr: 'f64' }, inline: [{op: 'array.new_default', typeIndex: ARRAY.f64.index }]},
-	__towasm_arr_i32_alloc:		{params: ['i32'], result: { arr: 'i32' }, inline: [{op: 'array.new_default', typeIndex: ARRAY.i32.index }]},
-	__towasm_arr_i8_alloc:		{params: ['i32'], result: { arr: 'i8' } , inline: [{op: 'array.new_default', typeIndex: ARRAY.i8.index }]},
-	__towasm_str_setChar:		{params: [{ arr: 'i16' }, 'i32', 'i32'], result: 'void', inline: [{ op: 'array.set', typeIndex: ARRAY.i16.index }]},
-	__towasm_str_copy:			{params: [{ arr: 'i16' }, 'i32', { arr: 'i16' }, 'i32', 'i32'], result: 'void', inline: [
+	__towasm_arr_f64_alloc:		() => ({params: ['i32'], result: { arr: 'f64' }, inline: [{op: 'array.new_default', typeIndex: ARRAY.f64.index }]}),
+	__towasm_arr_i32_alloc:		() => ({params: ['i32'], result: { arr: 'i32' }, inline: [{op: 'array.new_default', typeIndex: ARRAY.i32.index }]}),
+	__towasm_arr_i8_alloc:		() => ({params: ['i32'], result: { arr: 'i8' } , inline: [{op: 'array.new_default', typeIndex: ARRAY.i8.index }]}),
+
+	__towasm_str_alloc:			() => ({params: ['i32'], result: { arr: 'i16' }, inline: [{op: 'array.new_default', typeIndex: ARRAY.i16.index }]}),
+	__towasm_str_setChar:		() => ({params: [{ arr: 'i16' }, 'i32', 'i32'], result: 'void', inline: [{ op: 'array.set', typeIndex: ARRAY.i16.index }]}),
+	__towasm_str_copy:			() => ({params: [{ arr: 'i16' }, 'i32', { arr: 'i16' }, 'i32', 'i32'], result: 'void', inline: [
 		{ op: 'array.copy', dst: ARRAY.i16.index, src: ARRAY.i16.index },
-	]},
-	// Arithmetic/comparison operators -- always `f64,f64`, no persistent integer type means there's no
+	]}),
+	// Arithmetic/comparison operators -- always `f64,f64`, no persistent integer type means there's n)o
 	// other kind to disambiguate by (unlike equality below, or the array/string methods above).
-	'+':	{params: ['f64', 'f64'], result: 'f64', inline: [{op: 'f64.add'}]},
-	'-':	{params: ['f64', 'f64'], result: 'f64', inline: [{op: 'f64.sub'}]},
-	'*':	{params: ['f64', 'f64'], result: 'f64', inline: [{op: 'f64.mul'}]},
-	'/':	{params: ['f64', 'f64'], result: 'f64', inline: [{op: 'f64.div'}]},
-	'<':	{params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.lt'}]},
-	'>':	{params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.gt'}]},
-	'<=':	{params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.le'}]},
-	'>=':	{params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.ge'}]},
+	'+':	() => ({params: ['f64', 'f64'], result: 'f64', inline: [{op: 'f64.add'}]}),
+	'-':	() => ({params: ['f64', 'f64'], result: 'f64', inline: [{op: 'f64.sub'}]}),
+	'*':	() => ({params: ['f64', 'f64'], result: 'f64', inline: [{op: 'f64.mul'}]}),
+	'/':	() => ({params: ['f64', 'f64'], result: 'f64', inline: [{op: 'f64.div'}]}),
+	'<':	() => ({params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.lt'}]}),
+	'>':	() => ({params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.gt'}]}),
+	'<=':	() => ({params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.le'}]}),
+	'>=':	() => ({params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.ge'}]}),
 
 	// Bitwise/shift -- always `i32,i32`, same reasoning. Shift amounts don't need masking mod 32
 	// separately -- wasm's own `shl`/`shr_s`/`shr_u` already do that per spec.
-	'&':	{params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.and'}]},
-	'|':	{params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.or'}]},
-	'^':	{params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.xor'}]},
-	'<<':	{params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.shl'}]},
-	'>>':	{params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.shr_s'}]},
-	'>>>':	{params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.shr_u'}]},
+	'&':	() => ({params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.and'}]}),
+	'|':	() => ({params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.or'}]}),
+	'^':	() => ({params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.xor'}]}),
+	'<<':	() => ({params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.shl'}]}),
+	'>>':	() => ({params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.shr_s'}]}),
+	'>>>':	() => ({params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.shr_u'}]}),
 
-	// Equality on `f64`/`i32` -- genuinely polymorphic by operand kind (unlike the arithmetic/bitwise
-	// entries above), so named `<kind>_eq`/`_ne` and dispatched by `wtypeOf(e.left, ctx)` exactly like
-	// an array/string method dispatches by `arrayKindOf`. Reference equality (classes, non-string
-	// arrays) can't join this table the same way: `ref.eq` is polymorphic over *any* ref type at the
-	// wasm level, but a `builtins` entry's `sig.params` needs one exact, concrete type -- there's no
-	// "any ref" `WasmType` to declare -- so it stays a couple of direct-emission lines in `emitExpr`.
-	f64_eq:	{params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.eq'}]},
-	f64_ne:	{params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.ne'}]},
-	i32_eq:	{params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.eq'}]},
-	i32_ne:	{params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.ne'}]},
+	'===':		args => args[0] && typeof args[0] !== 'string'
+		? {params: [args[0], args[0]], result: 'i32', inline: [{op: 'ref.eq'}]}
+		:  args[0] === 'i32'
+		? {params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.eq'}]}
+		: {params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.eq'}]},
+	'==':		args => args[0] === 'i32'
+		? {params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.eq'}]}
+		: {params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.eq'}]},
+
+	'!==':		args => args[0] && typeof args[0] !== 'string'
+		? {params: [args[0], args[0]], result: 'i32', inline: [{op: 'ref.eq'}, {op: 'i32.eqz'}]}
+		: args[0] === 'i32'
+		? {params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.ne'}]}
+		: {params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.ne'}]},
+	'!=':		args => args[0] === 'i32'
+		? {params: ['i32', 'i32'], result: 'i32', inline: [{op: 'i32.ne'}]}
+		: {params: ['f64', 'f64'], result: 'i32', inline: [{op: 'f64.ne'}]},
 
 	...Object.fromEntries(LIB_AST.filter(n => n.type === 'function_decl').map(decl => [decl.name, decl]))
 };
@@ -270,7 +279,7 @@ const builtins: Record<string, Builtin> = {
 // `ARRAY[kind].methods` with pure decl data, shared read-only across every `TStoWasm` call (unlike
 // `arrayBoxOwners`'s own per-compilation `methods` map inside `TStoWasm`, built fresh each call).
 const LIB_BOX_KIND: Record<string, TYPE> = {
-	ArrF64Box: 'f64', ArrI32Box: 'i32', ArrI8Box: 'i8', StringBox: 'i16',
+	ArrF64Box: 'f64', ArrI32Box: 'i32', ArrI8Box: 'i8', String: 'i16',
 };
 for (const n of LIB_AST) {
 	if (n.type === 'class_decl' && n.name in LIB_BOX_KIND) {
@@ -444,19 +453,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			throw new Error('towasm: spread call arguments are not supported');
 
 		const builtin = builtins[name];
-		if (builtin && 'inline' in builtin) {
-			if (args.length !== builtin.params.length)
-				throw new Error(`towasm: '${name}' takes exactly ${builtin.params.length} argument(s)`);
-			args.forEach((a, i) => emitAs(a, ctx, builtin.params[i]));
-			ctx.emit(...builtin.inline);
-			return builtin.result;
+		if (builtin && typeof builtin === 'function') {
+			const inline = builtin(args.map(a => wtypeOf(a, ctx)), ctx);
+			if (args.length !== inline.params.length)
+				throw new Error(`towasm: '${name}' takes exactly ${inline.params.length} argument(s)`);
+			args.forEach((a, i) => emitAs(a, ctx, inline.params[i]));
+			ctx.emit(...inline.inline);
+			return inline.result;
 		}
 
 		let info = funcs.get(name);
 		if (!info) {
 			if (builtin) {
 				info = ensureFunc(name, builtin);
-
 			} else {
 				const decl = functionDeclByName.get(name);
 				if (decl)
@@ -706,13 +715,16 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						throw new Error("towasm: string '+' requires both operands to be strings");
 					return emitMethodCall(arrayBoxOwners.i16, 'concat', e.left, [e.right], ctx);
 				}
+				/*
 				if (op === '===' || op === '!==' || op === '==' || op === '!=') {
 					const kind = wtypeOf(e.left, ctx);
-					const suffix = op === '!==' || op === '!=' ? 'ne' : 'eq';
+					const op2 = op === '===' ? '==' : op === '!==' ? '!=' : op;
+
 					// Booleans are `i32` on the stack, not `f64` -- dispatched by kind, same idea as an
 					// array/string method dispatching by `arrayKindOf` (see the `builtins` comment above).
 					if (kind === 'i32')
-						return emitCall(`i32_${suffix}`, [e.left, e.right], ctx);
+						return emitCall(`${op2}.i32`, [e.left, e.right], ctx);
+
 					if (kind && typeof kind !== 'string') {
 						if ('arr' in kind && kind.arr === 'i16')
 							throw new Error("towasm: string equality (by value) is not supported in this pass -- only reference types (arrays/Uint8Array/class instances) support '=='/'==='");
@@ -722,23 +734,24 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						emitExpr(e.left, ctx);
 						emitExpr(e.right, ctx);
 						ctx.emit({ op: 'ref.eq' });
-						if (suffix === 'ne')
+						if (op2 === '!=')
 							ctx.emit({ op: 'i32.eqz' });
 						return 'i32';
 					}
-					return emitCall(`f64_${suffix}`, [e.left, e.right], ctx);
-				}
+					return emitCall(`${op2}.f64`, [e.left, e.right], ctx);
+				}*/
 				// Every remaining operator is single-kind (no persistent integer type means arithmetic/
 				// comparison is always `f64`; bitwise is always `i32`), so the raw symbol is already an
 				// unambiguous `builtins` key -- not dispatched through `emitBuiltinCall` itself so an
 				// unsupported operator gets a clear message instead of "unknown function".
 				const builtin = builtins[op];
-				if (!builtin || !('inline' in builtin))
+				if (!builtin || typeof builtin !== 'function')
 					throw new Error(`towasm: unsupported binary operator '${op}'`);
-				emitAs(e.left, ctx, builtin.params[0]);
-				emitAs(e.right, ctx, builtin.params[1]);
-				ctx.emit(...builtin.inline);
-				return builtin.result;
+				const inline = builtin([wtypeOf(e.left, ctx), wtypeOf(e.right, ctx)], ctx);
+				emitAs(e.left, ctx, inline.params[0]);
+				emitAs(e.right, ctx, inline.params[1]);
+				ctx.emit(...inline.inline);
+				return inline.result;
 			}
 
 			default:
@@ -1165,7 +1178,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Only top-level functions are exported -- class ctors/methods are reachable through them.
 	for (const s of ast.body) {
 		if (s.type === 'function_decl' && s.body)
-			mod.exports!.push({ name: s.name, kind: 'func', index: funcs.get(s.name)!.funcIndex });
+			(mod.exports??=[]).push({ name: s.name, kind: 'func', index: funcs.get(s.name)!.funcIndex });
 	}
 
 	return mod;
