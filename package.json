@@ -14,7 +14,9 @@
 	"scripts": {
 		"build": "tsc",
 		"watch": "tsc -watch -p ./",
-		"lint": "eslint \"src/**/*.ts\""
+		"examples": "tsc -b examples",
+		"lint": "eslint \"src/**/*.ts\"",
+		"link": "npm link @isopodlabs/binary_libs"
 	},
 	"keywords": [
 		"typescript",
@@ -23,5 +25,8 @@
 		"algorithm"
 	],
 	"author": "Adrian Stephens",
-	"license": "MIT"
+	"license": "MIT",
+	"dependencies": {
+		"@isopodlabs/binary_libs": "^1.10.0"
+	}
 }

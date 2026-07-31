@@ -108,14 +108,10 @@ export function makeChecker(diag: Diagnostics) {
 	// same as `returns` does for `return` statements, so an undeclared generator's return infers as `Generator<Y>`.
 	let yieldCollector: Type[] | undefined;
 
-	const makeErr = (sev: SEVERITY) => (pos: JS.Location) => (strings: TemplateStringsArray, ...values: any[]) => {
+	const err = (sev: SEVERITY, pos: JS.Location) => (strings: TemplateStringsArray, ...values: any[]) => {
 		if (!muted)
 			diag(sev, pos, strings, ...values);
 	};
-
-	const gap		= makeErr(SEVERITY.GAP);
-	const warning	= makeErr(SEVERITY.WARNING);
-	const error		= makeErr(SEVERITY.ERROR);
 
 	const runMuted	= <T,>(fn: () => T): T => {
 		try {
@@ -133,7 +129,7 @@ export function makeChecker(diag: Diagnostics) {
 			return true;
 		const lax = T.isAssignable(src, dst, scope, dstScope, false);
 		if (lax)
-			gap(pos)`Assignability of '${src}' to '${dst}' could not be fully verified ('keyof'/conditional/'infer'/mapped types aren't evaluated)`;
+			err(SEVERITY.GAP, pos)`Assignability of '${src}' to '${dst}' could not be fully verified ('keyof'/conditional/'infer'/mapped types aren't evaluated)`;
 		return lax;
 	};
 
@@ -467,7 +463,7 @@ export function makeChecker(diag: Diagnostics) {
 			return;		// spread/computed keys: shape is open
 		for (const p of lit.properties)
 			if (p.type !== 'spread' && typeof p.key === 'string' && !targets.some(t => t.members.some(m => (m.type === 'property' || m.type === 'method') && m.key === p.key)))
-				error(pos)` Object literal may only specify known properties, and '${p.key}' does not exist in type '${target}'`;
+				err(SEVERITY.ERROR, pos)` Object literal may only specify known properties, and '${p.key}' does not exist in type '${target}'`;
 	};
 
 	// ---- declaration hoisting / namespace resolution ------------------------------------------
@@ -580,7 +576,7 @@ export function makeChecker(diag: Diagnostics) {
 		}
 	};
 
-	const hoistVar = (scope: Scope, d: JS.VarDeclarator<Type>, widen: boolean, typeAnnotation = d.typeAnnotation) => {
+	const hoistVar = (scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation = d.typeAnnotation) => {
 		if (typeof d.name === 'string') {
 			const init = d.init && !typeAnnotation ? typeOf(d.init, scope) : undefined;
 			// A bare (no-typeArgs) ref's own `declScope` wins over the ambient `scope` here -- this bakes the result in once rather than
@@ -704,7 +700,7 @@ export function makeChecker(diag: Diagnostics) {
 						// A declared default is a correct, unremarkable fallback (real TS does it silently too) -- only worth flagging when
 						// some supplied argument's type actually mentions `p.name` and still couldn't pin it down.
 						if (!p.default && params.some((prm, i) => argTs[i] && prm.typeAnnotation && T.mentionsTypeParam(prm.typeAnnotation, p.name)))
-							gap(pos)`Type parameter '${p.name}' could not be inferred from the arguments; assumed '${map.get(p.name)}'`;
+							err(SEVERITY.GAP, pos)`Type parameter '${p.name}' could not be inferred from the arguments; assumed '${map.get(p.name)}'`;
 					}
 				});
 			}
@@ -756,10 +752,24 @@ export function makeChecker(diag: Diagnostics) {
 			}
 			case 'object': {
 				const members: TS.TypeMember[] = [];
+				// A later property overrides an earlier one with the same key -- real JS object-literal semantics,
+				// and what lets a spread's own members participate (`{...X, key: override}` or `{key, ...X}`).
+				const byKey = new Map<string, number>();
+				const push = (m: TS.TypeMember) => {
+					if ('key' in m && typeof m.key === 'string') {
+						const i = byKey.get(m.key);
+						if (i !== undefined) { members[i] = m; return; }
+						byKey.set(m.key, members.length);
+					}
+					members.push(m);
+				};
 				for (const p of e.properties) {
 					if (p.type === 'spread') {
-						typeOf(p.operand, scope);
-						return T.ANY;		// spread makes the shape unknowable here
+						const t = T.resolveOwn(typeOf(p.operand, scope), scope);
+						if (t.type !== 'object')
+							return T.ANY;	// not a determinable object shape -- shape unknowable here, as before
+						t.members.forEach(push);
+						continue;
 					}
 					// A `satisfies`/annotated-`var_decl` `expected` type propagates member-by-member: an unannotated arrow/method
 					// value (`{read: (pe, data) => ...}`) otherwise types its own params as `any`, same gap `applyContextualParams`
@@ -768,19 +778,13 @@ export function makeChecker(diag: Diagnostics) {
 					switch (p.type) {
 						case 'method':
 							applyContextualParams(p.params, expectedMember, scope);
-							checkFunctionBody(p, p.body, scope, hasMod(p, 'async'), false, false);
+							checkFunctionBody(p, p.body, scope, hasMod(p, 'async'), hasMod(p, 'generator'), hasMod(p, 'generator'));
 							if (typeof p.key === 'string')
-								members.push(TS.TypeMethod(p.key, T.FixSig(p, T.ANY)));
-							break;
-						case 'generator':
-							applyContextualParams(p.params, expectedMember, scope);
-							checkFunctionBody(p, p.body, scope, hasMod(p, 'async'), true, true);
-							if (typeof p.key === 'string')
-								members.push(TS.TypeMethod(p.key, T.FixSig(p, T.ANY)));
+								push(TS.TypeMethod(p.key, T.FixSig(p, T.ANY)));
 							break;
 						case 'get':
 							checkFunctionBody(p, p.body, scope, false, false, false);
-							members.push(TS.TypeProperty(p.key, p.returnType as Type ?? T.ANY));
+							push(TS.TypeProperty(p.key, p.returnType as Type ?? T.ANY));
 							break;
 						case 'set':
 							checkFunctionBody(p, p.body, scope, false, false, false);
@@ -788,7 +792,7 @@ export function makeChecker(diag: Diagnostics) {
 						case 'field': {
 							const _t = typeOf(p.value!, scope, true, expectedMember);
 							if (typeof p.key === 'string')
-								members.push(TS.TypeProperty(p.key, maybeWidenLiterals(_t)));
+								push(TS.TypeProperty(p.key, maybeWidenLiterals(_t)));
 							break;
 						}
 					}
@@ -816,7 +820,7 @@ export function makeChecker(diag: Diagnostics) {
 				const objT	= typeOf(e.object, scope);
 				const t		= T.lookupMember(objT, e.property, scope);
 				if (!muted && !t && !e.optional && T.sealed(objT, scope))
-					error(pos)`Property '${e.property}' does not exist on type '${objT}'`;
+					err(SEVERITY.ERROR, pos)`Property '${e.property}' does not exist on type '${objT}'`;
 				if (!t)
 					return T.ANY;
 				// `lookupMember` returns an optional property's type unwidened (callers needing "is this optional" use `memberOptional`);
@@ -831,13 +835,13 @@ export function makeChecker(diag: Diagnostics) {
 				if (objT.type === 'tuple' && T.isLiteral(e.property, 'number')) {
 					const el = objT.elements[e.property.value];
 					if (!muted && !el)
-						error(pos)`Tuple type '${objT}' has no element at index ${e.property.value}`;
+						err(SEVERITY.ERROR, pos)`Tuple type '${objT}' has no element at index ${e.property.value}`;
 					return (el && T.tupleElementType(el)) ?? T.ANY;
 				}
 				if (T.isLiteral(e.property, 'string')) {
 					const t = T.lookupMember(objT, e.property.value, scope);
 					if (!muted && !t && T.sealed(objT, scope))
-						error(pos)`Property '${e.property.value}' does not exist on type '${objT}'`;
+						err(SEVERITY.ERROR, pos)`Property '${e.property.value}' does not exist on type '${objT}'`;
 					if (!t)
 						return T.ANY;
 					return T.memberOptional(objT, e.property.value, scope) ? T.combineTypes([t, T.UNDEFINED]) : t;
@@ -891,7 +895,7 @@ export function makeChecker(diag: Diagnostics) {
 						overloads = calls;		// resolved below, once argument types are known
 					} else if (T.sealed(calleeT, scope)) {
 						if (!muted)
-							error(pos)`Type '${calleeT}' is not callable in '${e}'`;
+							err(SEVERITY.ERROR, pos)`Type '${calleeT}' is not callable in '${e}'`;
 						return T.ANY;
 					}
 				}
@@ -906,7 +910,7 @@ export function makeChecker(diag: Diagnostics) {
 					});
 				}
 				if (overloads && !sig)
-					warning(pos)`No overload of '${e.callee}' matches this call; arguments left unchecked`;
+					err(SEVERITY.WARNING, pos)`No overload of '${e.callee}' matches this call; arguments left unchecked`;
 
 				// Contextual parameter typing: an unannotated callback argument (`arr.map(x => x.foo)`) would otherwise type its own params as `any`.
 				// Fills them in here from the matching declared (pre-substitution) param type -- mutates the AST node; must run before `argTs` below, which triggers `checkFunctionBody` on each argument.
@@ -966,13 +970,13 @@ export function makeChecker(diag: Diagnostics) {
 						const required	= params.filter(p => !hasMod(p, 'optional')).length;
 						const max		= sig.rest ? Infinity : params.length;
 						if (argTs.length < required || argTs.length > max)
-							error(pos)`Expected ${required === max ? required : required + '-' + (max === Infinity ? 'more' : max)} arguments, but got ${argTs.length} in '${e}'`;
+							err(SEVERITY.ERROR, pos)`Expected ${required === max ? required : required + '-' + (max === Infinity ? 'more' : max)} arguments, but got ${argTs.length} in '${e}'`;
 						argTs.forEach((t, i) => {
 							const p = params[i];
 							if (t && p && p.typeAnnotation) {
 								// an optional parameter also accepts undefined
 								if (!checkAssignable(t, hasMod(p, 'optional') ? TS.UnionType([p.typeAnnotation, T.UNDEFINED]) : p.typeAnnotation, scope, pos, declScope))
-									error(pos)`Argument of type '${t}' is not assignable to parameter '${p.key}: ${p.typeAnnotation}' in '${e}'`;
+									err(SEVERITY.ERROR, pos)`Argument of type '${t}' is not assignable to parameter '${p.key}: ${p.typeAnnotation}' in '${e}'`;
 								else
 									checkExcessProps(e.arguments[i], p.typeAnnotation, scope, pos, declScope);
 							}
@@ -1016,7 +1020,7 @@ export function makeChecker(diag: Diagnostics) {
 					case '++':
 					case '--':
 						if (!muted && !T.isNumberLike(argT, scope))
-							error(pos)`Operand of '${e.operator}' must be numeric, got '${argT}' in '${e}'`;
+							err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${argT}' in '${e}'`;
 						return T.isAny(T.resolveOwn(argT, scope)) ? T.ANY : T.isBigint(argT, scope) ? T.BIGINT : T.NUMBER;
 					case 'await':	return T.awaitType(argT, scope);
 					default:		return argT;
@@ -1033,7 +1037,7 @@ export function makeChecker(diag: Diagnostics) {
 					return T.isNullish(t, scope) ? T.NEVER : t;
 				}
 				if (!muted && !T.isNumberLike(argT, scope))
-					error(pos)`Operand of '${e.operator}' must be numeric, got '${argT}' in '${e}'`;
+					err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${argT}' in '${e}'`;
 				return T.isAny(T.resolveOwn(argT, scope)) ? T.ANY : T.isBigint(argT, scope) ? T.BIGINT : T.NUMBER;
 			}
 
@@ -1080,7 +1084,7 @@ export function makeChecker(diag: Diagnostics) {
 
 						if (e.operator === '=') {
 							if (!checkAssignable(rt, lt, scope, pos)) {
-								error(pos)`Type '${rt}' is not assignable to type '${lt}' in '${e.left} = ...'`;
+								err(SEVERITY.ERROR, pos)`Type '${rt}' is not assignable to type '${lt}' in '${e.left} = ...'`;
 							} else {
 								checkExcessProps(e.right, lt, scope, pos);
 								// Later statements see the assigned type, not the wider declared one. `pathKey`, not just an identifier: a
@@ -1114,9 +1118,9 @@ export function makeChecker(diag: Diagnostics) {
 				}
 				if (!muted) {
 					if (!T.isNumberLike(lt, scope))
-						error(pos)`Operand of '${e.operator}' must be numeric, got '${lt}' in '${e.left}'`;
+						err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${lt}' in '${e.left}'`;
 					if (!T.isNumberLike(rt, scope))
-						error(pos)`Operand of '${e.operator}' must be numeric, got '${rt}' in '${e.right}'`;
+						err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${rt}' in '${e.right}'`;
 				}
 				return	T.isAny(T.resolveOwn(lt, scope)) || T.isAny(T.resolveOwn(rt, scope))	? T.ANY
 					:	T.isBigint(lt, scope) || T.isBigint(rt, scope)				? T.BIGINT
@@ -1170,7 +1174,7 @@ export function makeChecker(diag: Diagnostics) {
 				const t = typeOf(e.expression, scope, widen, anno);
 				if (!muted) {
 					if (!checkAssignable(t, anno, scope, pos))
-						error(pos)`Type '${t}' does not satisfy the expected type '${anno}'`;
+						err(SEVERITY.ERROR, pos)`Type '${t}' does not satisfy the expected type '${anno}'`;
 					else
 						checkExcessProps(e.expression, anno, scope, pos);
 				}
@@ -1210,7 +1214,7 @@ export function makeChecker(diag: Diagnostics) {
 			if (!muted && p.default) {
 				const dt = typeOf(p.default, inner);
 				if (anno && !checkAssignable(dt, anno, inner, (p as any).pos))
-					error((p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
+					err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
 			}
 			if (typeof p.key === 'string')
 				inner.addValue(p.key, anno ? (hasMod(p, 'optional') && !p.default ? T.combineTypes([anno, T.UNDEFINED]) : anno) : T.literalTypeOf(p.default) ?? T.ANY);
@@ -1230,7 +1234,7 @@ export function makeChecker(diag: Diagnostics) {
 					if (argument) {
 						const t = typeOf(argument, scope, false, expected);
 						if (!checkAssignable(T.unwrapIfAsync(t, scope, async), expected, scope, (argument as any).pos))
-							error((argument as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
+							err(SEVERITY.ERROR, (argument as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
 						else
 							checkExcessProps(argument, expected, scope, (argument as any).pos);
 					}
@@ -1266,7 +1270,7 @@ export function makeChecker(diag: Diagnostics) {
 			const t = typeOf(body, inner, true, expected);
 			if (expected) {
 				if (!checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos))
-					error((body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
+					err(SEVERITY.ERROR, (body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
 			} else if (!isPredicate) {
 				const widened = T.widenLiterals(t);
 				fn.returnType = T.wrapReturnIfAsync((T.isBoolean(widened) && inferredPredicate(fn, body, inner)) || widened, inner, async);
@@ -1287,16 +1291,13 @@ export function makeChecker(diag: Diagnostics) {
 					if (m.value) {
 						const t = typeOf(m.value, inner);
 						if (m.typeAnnotation && !checkAssignable(t, m.typeAnnotation, inner, (m as any).pos))
-							error((m as any).pos)`Type '${t}' is not assignable to type '${m.typeAnnotation}'`;
+							err(SEVERITY.ERROR, (m as any).pos)`Type '${t}' is not assignable to type '${m.typeAnnotation}'`;
 						else if (m.typeAnnotation)
 							checkExcessProps(m.value, m.typeAnnotation, inner, (m as any).pos);
 					}
 					break;
 				case 'method':
-					checkFunctionBody(m, m.body, inner, hasMod(m, 'async'), m.key === 'constructor', false);
-					break;
-				case 'generator':
-					checkFunctionBody(m, m.body, inner, hasMod(m, 'async'), true, true);
+					checkFunctionBody(m, m.body, inner, hasMod(m, 'async'), m.key === 'constructor' || hasMod(m, 'generator'), hasMod(m, 'generator'));
 					break;
 				case 'get':
 					checkFunctionBody(m, m.body, inner, false, false, false);
@@ -1377,7 +1378,7 @@ export function makeChecker(diag: Diagnostics) {
 							if (!init)
 								checkExcessProps(d.init, anno, scope, pos);
 							else if (!checkAssignable(init, anno, scope, pos))
-								error(pos)`Type '${init}' is not assignable to type '${anno}' in declaration of '${d.name}'`;
+								err(SEVERITY.ERROR, pos)`Type '${init}' is not assignable to type '${anno}' in declaration of '${d.name}'`;
 						}
 						hoistVar(scope, d, stmt.kind !== 'const');
 					}

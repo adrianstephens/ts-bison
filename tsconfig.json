@@ -1,7 +1,7 @@
 {
 	"compilerOptions": {
 		"composite": true,
-		"target": "ES2022",
+		"target": "ES2023",
 		"module": "commonjs",
 		"strict": true,
 		"declaration": true,
@@ -13,6 +13,13 @@
 		"outDir": "./dist",
 		"rootDir": "./src",
 		"types": ["node"],
+		// Classic/"node10" module resolution (the default under `module: commonjs`) predates
+		// package.json `exports` map support entirely, so it can't see `@isopodlabs/binary_libs`'s
+		// `./wasm` subpath export -- Node's own runtime `require()` resolves it fine, only tsc's
+		// own module resolution needs the assist.
+		"paths": {
+			"@isopodlabs/binary_libs/wasm": ["../binary-libs/dist/wasm"]
+		}
 	},
 	"include": [
 		"src/**/*.ts"
