@@ -1,7 +1,8 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import { Literal } from '../common';
-import { Expr, BindingTarget, Key, Rest } from './js-parser';
+import { Expr } from './jsx-parser';
+import { BindingTarget, Key, Rest } from './js-parser';
 import { Type } from './ts-parser';
 
 // ===================================================================
@@ -144,14 +145,14 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 		returnType:		mapTypeU,
 	};
 
-	const mapVarDeclarator = (x: JS.VarDeclarator<any>) =>
+	const mapVarDeclarator = (x: JS.Var<any>) =>
 		mapObject(x, {
 			name: mapBindingTarget,
 			init: mapExpression,
 			typeAnnotation: mapTypeU
 		});
 
-	const _ObjectProperty = (p: JS.ObjectProperty<any>): JS.ObjectProperty<any> => {
+	const objectProperty = (p: JS.ObjectProperty<any>): JS.ObjectProperty<any> => {
 		switch (p.type) {
 			case 'spread':	return mapObject(p, { operand: mapExpressionA });
 			case 'field':	return mapObject(p, { key: mapKey, value: mapExpressionA });
@@ -162,7 +163,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 		}
 	};
 
-	const _ClassMember = (m: TS.ClassMember): TS.ClassMember => {
+	const classMember = (m: TS.ClassMember): TS.ClassMember => {
 		switch (m.type) {
 			case 'field':	return mapObject(m, {
 				key:		mapKey,
@@ -171,8 +172,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 			});
 			case 'method':
 			case 'get':
-			case 'set':
-			case 'generator':	return mapObject(m, {
+			case 'set':		return mapObject(m, {
 				...mapSig,
 				key:		mapKey, 
 				body:		mapArrayA(mapStatementC),
@@ -187,7 +187,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 		}
 	};
 
-	const _TypeMember = (m: TS.TypeMember): TS.TypeMember => {
+	const typeMember = (m: TS.TypeMember): TS.TypeMember => {
 		switch (m.type) {
 			case 'property':
 				return mapObject(m, {key: mapKey, typeAnnotation: mapTypeA});
@@ -205,7 +205,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 		}
 	};
 
-	const _Type = (type: Type): Type => {
+	const type = (type: Type): Type => {
 		switch (type.type) {
 			case 'ref':					return mapObject(type, {typeArgs: mapArray(mapType)});
 			case 'typeof':
@@ -215,7 +215,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 					? mapObject(type as Literal<JS.TemplatePart<Type>[]>, { value: mapArray(p => p.exp ? mapObject(p, {exp: mapType}) : p)})
 					: type;
 			case 'array':				return mapObject(type, {element: mapTypeA});
-			case 'tuple':				return mapObject(type, {elements: mapArray(e =>
+			case 'tuple':				return mapObject(type, {elements: mapArrayA(e =>
 					e.type === 'spread'		? mapObject(e, {argument: mapTypeA})
 					: e.type === 'optional'	? mapObject(e, {element: mapTypeA})
 					: e.type === 'labeled'	? mapObject(e, {element: mapTypeA})
@@ -245,7 +245,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 		}
 	};
 
-	const _Expression = (expr: Expr): Expr => {
+	const expression = (expr: Expr): Expr => {
 		switch (expr.type) {
 			case 'literal':		return mapObject(expr, {
 				value: v => Array.isArray(v) ? v.map(p => p.exp ? mapObject(p, {exp: mapExpression}) : p) : v
@@ -254,7 +254,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 				elements: x => x.map(mapExpression)//mapArray0(mapExpression)
 			});
 			case 'object':		return mapObject(expr, {
-				properties: mapArrayA(_ObjectProperty)
+				properties: mapArrayA(objectProperty)
 			});
 			case 'function': 	return mapObject(expr, {...mapSigU,
 				body:		mapArrayA(mapStatementC),
@@ -312,14 +312,17 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 				return mapObject(expr, {
 				expression: 	mapExpressionA
 			});
-
+			case 'jsx':	return mapObject(expr, {
+				attributes:	mapArrayA(p => mapObject(p, {value: mapExpressionA})),
+				children:	mapArrayA(mapExpressionA)
+			});
 			case 'this':
 			case 'identifier':
 				return expr;
 		}
 	};
 
-	const _Statement = (stmt: TS.Statement): TS.Statement => {
+	const statement = (stmt: TS.Statement): TS.Statement => {
 		switch (stmt.type) {
 			case 'block':		return mapObject(stmt, {
 				body:			mapArrayA(mapStatementC)
@@ -407,11 +410,11 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 		}
 
 	};
-	const mapStatement		= makeProcess(_Statement, onStatement, true);
-	const mapExpression		= makeProcess(_Expression, onExpression);
-	const mapType			= makeProcess(_Type, onType);
-	const mapTypeMember		= makeProcess(_TypeMember, onTypeMember, true);
-	const mapClassMember	= makeProcess(_ClassMember, onClassMember, true);
+	const mapStatement		= makeProcess(statement, onStatement, true);
+	const mapExpression		= makeProcess(expression, onExpression);
+	const mapType			= makeProcess(type, onType);
+	const mapTypeMember		= makeProcess(typeMember, onTypeMember, true);
+	const mapClassMember	= makeProcess(classMember, onClassMember, true);
 
 	const mapTypeA			= mapDefined(mapType);
 	const mapExpressionA	= mapDefined(mapExpression);
@@ -471,10 +474,10 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 		|| !!sig.typeParams?.some(walkTypeParam);
 
 
-	const walkVarDeclarator = (d: JS.VarDeclarator<Type>) =>
+	const walkVarDeclarator = (d: JS.Var<Type>) =>
 		walkBindingTarget(d.name) || walkExpression(d.init) || walkType(d.typeAnnotation);
 
-	const _ObjectProperty = (p: JS.ObjectProperty<any>) => {
+	const objectProperty = (p: JS.ObjectProperty<any>) => {
 		switch (p.type) {
 		 	case 'spread':				return walkExpression(p.operand);
 			case 'field':				return walkKey(p.key) || walkExpression(p.value);
@@ -482,7 +485,7 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 		}
 	};
 
-	const _ClassMember = (m: TS.ClassMember) => {
+	const classMember = (m: TS.ClassMember) => {
 		switch (m.type) {
 			case 'field':				return walkKey(m.key) || walkExpression(m.value) || walkType(m.typeAnnotation);
 			case 'method':
@@ -493,7 +496,7 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 		}
 	};
 
-	const _TypeMember = (m: TS.TypeMember) => {
+	const typeMember = (m: TS.TypeMember) => {
 		switch (m.type) {
 			case 'property':			return walkKey(m.key) || walkType(m.typeAnnotation);
 			case 'method':				return walkKey(m.key) || walkSig(m);
@@ -504,7 +507,7 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 		}
 	};
 
-	const _Type = (t: Type): boolean => {
+	const type = (t: Type): boolean => {
 		switch (t.type) {
 			case 'ref':
 			case 'typeof':
@@ -530,11 +533,11 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 		}
 	};
 	
-	const _Expression = (e: Expr<Type>): boolean => {
+	const expression = (e: Expr): boolean => {
 		switch (e.type) {
 			case 'literal':				return Array.isArray(e.value) && e.value.some(i => i.exp && walkExpression(i.exp));
 			case 'array':				return e.elements.some(walkExpression);
-			case 'object':				return e.properties.some(_ObjectProperty);
+			case 'object':				return e.properties.some(objectProperty);
 			case 'function': 			return walkSig(e as TS.CallSig) || (!!e.body && e.body.some(walkStatementU));
 			case 'member':				return walkExpression(e.object);
 			case 'index':				return walkExpression(e.object) || walkExpression(e.property);
@@ -553,12 +556,13 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 			case 'instantiation':		return walkExpression(e.expression) || e.typeArgs.some(t => walkType(t as Type));
 			case 'as':
 			case 'satisfies': return walkExpression(e.expression);
+			case 'jsx':			return e.attributes.some(p => walkExpression(p.value)) || e.children.some(walkExpression);
 			case 'this':
 			case 'identifier':			return false;
 		}
 	};
 
-	const _Statement = (stmt: TS.Statement): boolean => {
+	const statement = (stmt: TS.Statement): boolean => {
 		switch (stmt.type) {
 			case 'block':				return stmt.body.some(walkStatement);
 			case 'var_decl':			return stmt.declarations.some(walkVarDeclarator);
@@ -593,11 +597,11 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 		}
 	};
 
-	const walkStatement		= makeProcessB(_Statement, onStatement, true);
-	const walkExpression	= makeProcessB(_Expression, onExpression);
-	const walkTypeMember 	= makeProcessB(_TypeMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, true);
-	const walkClassMember 	= makeProcessB(_ClassMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, true);
-	const walkType			= makeProcessB(_Type, onType);
+	const walkStatement		= makeProcessB(statement, onStatement, true);
+	const walkExpression	= makeProcessB(expression, onExpression);
+	const walkTypeMember 	= makeProcessB(typeMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, true);
+	const walkClassMember 	= makeProcessB(classMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, true);
+	const walkType			= makeProcessB(type, onType);
 
 	const walkStatementU	= (stmt: JS.Statement<any>) => walkStatement(stmt as TS.Statement);
 
@@ -612,4 +616,3 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 	return walkExpression(ast);
 
 }
-

@@ -1,7 +1,7 @@
 import { makeParser, Rules, Forward, Maybe, List, MaybeList, OneOf, terminal, ForceFork } from '../../src/tison';
 import * as JS from './js-parser';
 import { IDENT, NUM, STR, unquoteString, Rule } from './js-parser';
-import { Literal, Identifier, UnaryPost, mergeMods } from '../common';
+import { Literal, UnaryPost, mergeMods } from '../common';
 
 // ===================================================================
 //  TypeScript Parser -- an extension of js-parser
@@ -29,8 +29,8 @@ export type		Class		= JS.Class<Type, ClassMember>;
 export type		TypeParam	= JS.TypeParam<Type>;
 export function TypeParam(name: string, constraint?: Type, cnst?: boolean): TypeParam { return { name, constraint, const: cnst }; }
 
-export interface RefType { type: 'ref'; name: string; typeArgs?: Type[]; declScope?: unknown }
-export function  RefType(name: string, typeArgs?: Type[] ): RefType { return { type: 'ref', name, typeArgs }; }
+export interface RefType<T extends string = string> { type: 'ref'; name: T; typeArgs?: Type[]; declScope?: unknown }
+export function  RefType<T extends string>(name: T, typeArgs?: Type[] ): RefType<T> { return { type: 'ref', name, typeArgs }; }
 
 export interface UnionType { type: 'union'; types: Type[] }
 export function  UnionType(types: Type[]): UnionType { return { type: 'union', types }; }
@@ -237,18 +237,11 @@ const dotted_path = Rules<string>(self => [
 	Rule([self, '.', IDENT], $ => $[0] + '.' + $[2]),
 ]);
 
-// Rebuilds the flattened `"Symbol.iterator"`-style string back into a real `Expr` for a computed member name -- a general expression isn't an option,
-// since real TypeScript restricts a computed interface/type-literal key to a `unique symbol` reference anyway.
-function typeNameToExpr(name: string): Expr {
-	const parts = name.split('.');
-	return parts.slice(1).reduce<Expr>((object, property) => ({ type: 'member', object, property }), Identifier(parts[0]));
-}
-
 const type_member_id = Rules<Key>(
 	Rule([IDENT]),
 	Rule([STR],								$ => unquoteString($[0])),
 	Rule([NUM]),
-	Rule(['[', dotted_path, ']'],			$ => ({ computed: typeNameToExpr($[1]) } as const)),
+	Rule(['[', dotted_path, ']'],			$ => ({ computed: JS.dottedNameToExpr($[1]) } as const)),
 );
 
 const return_type = Rules(
@@ -480,16 +473,37 @@ const module_item  		= JS.module_item as unknown as Rules<Declaration>;
 const namespace_body	= MaybeList(module_item);
 const declared_body		= MaybeList(Forward<Declaration>(()=>declared_body_item));
 
-// can have real declare keyword
-const maybe_ambient = Rules<MaybeAmbient>(
+// A `namespace`/`module` declaration's own shape, parametrized by what its body is allowed to contain. Passing
+// `declared_body` (ambient-only, see `maybe_ambient` below) vs `namespace_body` (real implementations allowed,
+// the same body plain top-level `namespace X {...}` already uses) is what keeps a `declare namespace` from
+// accepting real function/class bodies while a plain `export namespace` still can.
+function namespaceOrModule(body: Rules<Declaration[]>) {
+	return Rules<MaybeAmbient>(
+		Rule(['namespace', IDENT, '{', body, '}'],	$ => NamespaceDecl($[1], $[3])),
+		Rule(['module', IDENT, '{', body, '}'],		$ => NamespaceDecl($[1], $[3])),
+		Rule(['module', STR, '{', body, '}'],		$ => ModuleDecl(unquoteString($[1]), $[3])),
+	);
+}
+const real_namespace	= namespaceOrModule(namespace_body);
+const ambient_namespace	= namespaceOrModule(declared_body);
+
+// Declarations that need no body-context split -- legal (as themselves) either under `declare` or plain `export`.
+const ambientable_item = Rules<MaybeAmbient>(
 	JS.variable_decl_statement,
 	JS.class_declaration,
 	enum_declaration,
 	bodyless_function,
-	Rule(['namespace', IDENT, '{', declared_body, '}'],	$ => NamespaceDecl($[1], $[3])),
-	Rule(['module', IDENT, '{', declared_body, '}'],	$ => NamespaceDecl($[1], $[3])),
-	Rule(['module', STR, '{', declared_body, '}'],		$ => ModuleDecl(unquoteString($[1]), $[3])),
 );
+
+// Reached via `declare` (top-level `declare namespace X {...}`, or any item nested inside one -- nesting stays
+// ambient without repeating `declare`, matching real TypeScript). Its own namespace/module alternative recurses
+// into `declared_body`, so a real function implementation can never sneak in this way.
+const maybe_ambient = Rules<MaybeAmbient>(ambientable_item, ambient_namespace);
+
+// Reached via a plain `export namespace X {...}` / `export module X {...}` (no `declare`). Unlike `maybe_ambient`,
+// its namespace/module alternative recurses into `namespace_body`, so ordinary, non-exported helper functions
+// with real bodies are legal inside -- e.g. `export namespace X { function helper() { return 1; } } }`.
+const exportable_item = Rules<MaybeAmbient>(ambientable_item, real_namespace);
 
 // can have meaningless declare keyword
 const fake_ambient = Rules(
@@ -503,15 +517,18 @@ const declared_body_item = Rules<Declaration>(
 	Rule(['import', JS.import_declaration],				$ => $[1] as Declaration),
 	Rule(['export', 'import', JS.import_declaration],	$ => $[2] as Declaration),
 	Rule(['export', '=', dotted_path, ';'],				$ => ({ type: 'export_assignment', expr: $[2] } as const)),
-	Rule(['export', JS.export_declaration],				$ => $[1] as Declaration),
+	// A member exported out of an already-ambient namespace/module stays ambient itself -- reuses
+	// `maybe_ambient`/`fake_ambient` directly rather than `JS.export_declaration`, which also carries the
+	// *real*-bodied `exportable_item`, only valid for a plain `export` at actual module top level.
+	Rule(['export', maybe_ambient],						$ => $[1] as Declaration),
+	Rule(['export', fake_ambient],							$ => $[1] as Declaration),
 	Rule(['module', IDENT, '{', declared_body, '}'],	$ => NamespaceDecl($[1], $[3])),
 	Rule(['module', STR, ';'],							$ => ModuleDecl(unquoteString($[2]), [])),
 	Rule([GLOBAL, '{', declared_body, '}'],				$ => ModuleDecl('global', $[2])),
 );
 
 module_item.push(
-	Rule(['namespace', IDENT, '{', namespace_body, '}'],	$ => NamespaceDecl($[1], $[3])),
-	Rule(['module', IDENT, '{', namespace_body, '}'],		$ => NamespaceDecl($[1], $[3])),
+	real_namespace,
 	Rule(['declare', maybe_ambient],						$ => Declare($[1])),
 	Rule(['declare', fake_ambient],							$ => $[1]),
 	// `export = X;` at the top level of a whole file, not just nested in a `declare module`/`namespace` body (`declared_body_item` covers that).
@@ -552,7 +569,7 @@ JS.import_declaration.push(
 	Rule([TYPE, '*', 'from', STR, ';'],					$ => ({ type: 'export', source: unquoteString($[3]), typeOnly: true } as const)),
 	Rule([TYPE, '*', 'as', IDENT, 'from', STR, ';'],	$ => ({ type: 'export', namespace: $[3], source: unquoteString($[5]), typeOnly: true } as const)),
 
-	Rule([maybe_ambient],								$ => JS.ExportDecl($[0] as JS.Declaration<any>)),
+	Rule([exportable_item],								$ => JS.ExportDecl($[0] as JS.Declaration<any>)),
 	Rule(['declare', maybe_ambient],					$ => JS.ExportDecl(Declare($[1]))),
 	Rule([fake_ambient],								$ => JS.ExportDecl($[0] as JS.Declaration<any>)),
 	Rule(['declare', fake_ambient],						$ => JS.ExportDecl($[1] as JS.Declaration<any>)),
@@ -695,8 +712,8 @@ for (const [relational, member, call] of [
 	call.push(
 		Rule([member, '!'],									$ => UnaryPost('!', $[0])),
 		Rule([call, '!'],									$ => UnaryPost('!', $[0])),
-		Rule([member, call_type_arguments, JS.arguments_],	$ => ({ type: 'call', callee: $[0], arguments: $[2], typeArgs: $[1] } as const)),
-		Rule([call, call_type_arguments, JS.arguments_],	$ => ({ type: 'call', callee: $[0], arguments: $[2], typeArgs: $[1] } as const)),
+		Rule([member, call_type_arguments, JS.arguments_],	$ => JS.Call($[0], $[2], undefined, $[1])),
+		Rule([call, call_type_arguments, JS.arguments_],	$ => JS.Call($[0], $[2], undefined, $[1])),
 		// Bare instantiation expression (TS 4.7+): `expr<T,U>` pins a generic function's type params without calling it.
 		Rule([member, call_type_arguments],					$ => ({ type: 'instantiation', expression: $[0], typeArgs: $[1] } as const)),
 		Rule([call, call_type_arguments],					$ => ({ type: 'instantiation', expression: $[0], typeArgs: $[1] } as const)),

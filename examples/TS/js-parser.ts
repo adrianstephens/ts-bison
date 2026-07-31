@@ -1,5 +1,5 @@
 import { type RecoveryCallback, type MergeValues, type Token, makeParser, makeRule, Rules, terminal, Forward, List, OneOf, ForceFork, WithPrec } from '../../src/tison';
-import { Literal, Identifier, Unary, UnaryPost, Binary } from '../common';
+import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods } from '../common';
 
 // ===================================================================
 //  JavaScript Parser using tison
@@ -21,6 +21,7 @@ export type binaryOps	= '+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'|'>>>'
 						|'<'|'>'|'<='|'>='|'instanceof'|'in'|'=='|'!='|'==='|'!=='
 						|'='|'+='|'-='|'*='|'/='|'%='|'&='|'|='|'^='|'<<='|'>>='|'>>>='
 						|'&&='|'||='|'??='
+export const JSBinary = Binary<Expr, binaryOps>;
 
 export interface TemplatePart<T> { str: string; exp?: T; }
 
@@ -76,8 +77,8 @@ export function  FunctionExpr<T>(sig: CallSig<T>, body: Statement<T>[], more?: P
 export interface Arrow<T> extends CallSig<T> { type: 'arrow'; body: Expr | Statement<T>[]; modifiers?: string[] }
 export function  Arrow<T>(sig: CallSig<T>, body: Expr | Statement<T>[], more?: Partial<Arrow<T>>): Arrow<T> { return { body, ...sig, ...more, type: 'arrow'}; }
 
-export interface Method<T> extends CallSig<T> { type: 'method' | 'get' | 'set' | 'generator'; key: Key<T>; body?: Statement<T>[], modifiers?: string[] }
-export function  Method<T>(type: 'method' | 'get' | 'set' | 'generator', key: Key<T>, sig: CallSig<T>, body?: Statement<T>[], modifiers?: string[]): Method<T> {
+export interface Method<T> extends CallSig<T> { type: 'method' | 'get' | 'set'; key: Key<T>; body?: Statement<T>[], modifiers?: string[] }
+export function  Method<T>(type: 'method' | 'get' | 'set', key: Key<T>, sig: CallSig<T>, body?: Statement<T>[], modifiers?: string[]): Method<T> {
 	return { type, key, body, modifiers, ...sig };
 }
 export interface Field<T> { type: 'field'; key: Key<T>; value?: Expr; typeAnnotation?: T; modifiers?: string[] }
@@ -90,6 +91,13 @@ export function  ObjectExpr<T>(properties: readonly ObjectProperty<T>[]): Object
 export type ClassMember<T>	= Method<T> | Field<T> | { type: 'static_block'; body: Statement<T>[] }
 export interface Class<T = unknown, M = ClassMember<T>> { name?: string; superClass?: Expr<T>; body: M[]; typeParams?: TypeParam<T>[]; implements?: T[]; abstract?: boolean };
 
+export interface Call<T = unknown> { type: 'call';	callee: Expr<T>; arguments: Expr<T>[]; optional?: boolean; typeArgs?: T[] }
+export function  Call<T>(callee: Expr<T>, args: Expr<T>[], optional?: boolean, typeArgs?: T[]): Call<T> { return {type: 'call', callee, arguments: args, optional, typeArgs}; }
+export interface Member<T> { type: 'member'; object: Expr<T>; property: string; optional?: boolean }
+export function  Member<T>(object: Expr<T>, property: string, optional?: boolean) : Member<T> { return { type: 'member', object, property, optional }; }
+export interface Index<T> { type: 'index';	object: Expr<T>; property: Expr<T>; optional?: boolean }
+export function  Index<T>(object: Expr<T>, property: Expr<T>, optional?: boolean): Index<T> { return { type: 'index', object, property, optional }; }
+
 export type Expr<T = any> =
 	| Literal<number | bigint | string | boolean | null | RegExp | TemplatePart<Expr>[]>
 	| ArrayLit<T>
@@ -101,11 +109,11 @@ export type Expr<T = any> =
 	| Binary<Expr<T>, binaryOps>
 	| ObjectExpr<T>
 	| Spread<T>
+	| Call<T>
 	| { type: 'conditional'; test: Expr<T>; consequent: Expr<T>; alternate: Expr<T> }
 	| { type: 'this' }
-	| { type: 'member'; object: Expr<T>; property: string; optional?: boolean }
-	| { type: 'index';	object: Expr<T>; property: Expr<T>; optional?: boolean }
-	| { type: 'call';	callee: Expr<T>; arguments: Expr<T>[]; optional?: boolean; typeArgs?: T[] }
+	| Member<T>
+	| Index<T>
 	| { type: 'new';	callee: Expr<T>; arguments: Expr<T>[]; typeArgs?: T[] }
 	| { type: 'sequence'; expressions: Expr<T>[] }
 	| { type: 'tagged_template'; tag: Expr<T>; quasi: TemplatePart<Expr<T>>[] }
@@ -115,17 +123,30 @@ export type Expr<T = any> =
 	| { type: 'satisfies';		expression: Expr<T>; typeAnnotation: unknown }
 	| { type: 'instantiation';	expression: Expr<T>; typeArgs: T[] }
 
+// Rebuilds the flattened `"Symbol.iterator"`-style string back into a real `Expr` for a computed member name -- a general expression isn't an option,
+// since real TypeScript restricts a computed interface/type-literal key to a `unique symbol` reference anyway.
+export function dottedNameToExpr(name: string): Expr {
+	const parts = name.split('.');
+	return parts.slice(1).reduce<Expr>((object, property) => Member(object, property), Identifier(parts[0]));
+}
 
+export function ExprToDottedName(e: Expr): string {
+	return	e.type === 'member' ? ExprToDottedName(e.object) + '.' + e.property
+		:	e.type === 'identifier' ? e.name
+		:	'??';
+}
 
 export interface FunctionDecl<T>	extends CallSig<T> { type: 'function_decl'; name: string; body?: Statement<T>[]; modifiers?: string[]; ambient?: boolean };
 export function  FunctionDecl<T>(name: string, sig: CallSig<T>, body?: Statement<T>[], more?: Partial<FunctionDecl<T>>): FunctionDecl<T> { return { type: 'function_decl', name, body, ...sig, ...more}; }
 
 export interface ClassDecl<T> extends Class<T> { type: 'class_decl'; name: string; ambient?: boolean; }
 
-export interface VarDeclarator<T> { name: BindingTarget; init?: Expr<T>; typeAnnotation?: T; definite?: boolean; }
+export interface Var<T> { name: BindingTarget; init?: Expr<T>; typeAnnotation?: T; definite?: boolean; }
+export function  Var<T>(name: BindingTarget, init?: Expr<T>, typeAnnotation?: T, definite?: boolean): Var<T> { return {name, init, typeAnnotation, definite}; }
 export type DeclarationKind			= 'var' | 'let' | 'const' | 'using' | 'await using';
-export interface VarDecl<T>	{ type: 'var_decl'; kind: DeclarationKind; ambient?: boolean; declarations: VarDeclarator<T>[] }
-export function  VarDecl<T>(kind: DeclarationKind, ...declarations: VarDeclarator<T>[]): VarDecl<T> { return { type: 'var_decl', kind, declarations }; }
+export interface VarDecl<T>	{ type: 'var_decl'; kind: DeclarationKind; ambient?: boolean; declarations: Var<T>[] }
+export function  VarDecl<T>(kind: DeclarationKind, ...declarations: Var<T>[]): VarDecl<T> { return { type: 'var_decl', kind, declarations }; }
+export function  AmbientVarDecl<T>(kind: DeclarationKind, ...declarations: Var<T>[]): VarDecl<T> { return { type: 'var_decl', kind, declarations, ambient: true }; }
 
 export type Declaration<T> = VarDecl<T> | FunctionDecl<T> | ClassDecl<T>;
 
@@ -163,7 +184,7 @@ export type Statement<T> = Declaration<T>
 	| ExportDecl<T>
 	| Import
 
-export interface Program<T> { type: 'program'; body: Statement<T>[]; }
+export interface Program<T = any> { type: 'program'; body: Statement<T>[]; }
 
 
 // ===================================================================
@@ -437,9 +458,9 @@ export const property_assignment = Rules<ObjectProperty<any>>(
 	// parameters can be parsed as a plain object literal and reinterpreted as a pattern (`exprToBindingTarget` below).
 	Rule([IDENT, '=', fwd_assignment_expression], 											$ => Field($[0], Binary('=', Identifier($[0]), $[2]))),
 	Rule([property_name_computed, parameter_clause, '{', function_body, '}'], 				$ => Method('method', $[0], $[1], $[3])),
-	Rule(['*', property_name_computed, parameter_clause, '{', function_body, '}'], 			$ => Method('generator', $[1], $[2], $[4])),
+	Rule(['*', property_name_computed, parameter_clause, '{', function_body, '}'], 			$ => Method('method', $[1], $[2], $[4], ['generator'])),
 	Rule([ASYNC, property_name_computed, parameter_clause, '{', function_body, '}'], 		$ => Method('method', $[1], $[2], $[4], ['async'])),
-	Rule([ASYNC, '*', property_name_computed, parameter_clause, '{', function_body, '}'],	$ => Method('generator', $[2], $[3], $[5], ['async'])),
+	Rule([ASYNC, '*', property_name_computed, parameter_clause, '{', function_body, '}'],	$ => Method('method', $[2], $[3], $[5], ['async', 'generator'])),
 	Rule(['[', fwd_assignment_expression, ']', ':', fwd_assignment_expression], 			$ => Field({ computed: $[1] }, $[4])),
 	Rule(['...', fwd_assignment_expression], 												$ => Spread($[1])),
 );
@@ -560,8 +581,8 @@ export const member_expression = Rules<Expr>(self => [
 	primary_expression,
 	function_expression,
 	Rule([Forward<Expr>(()=>class_expression)]),
-	Rule([self, '.', IDENT], 									$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
-	Rule([self, '[', expression, ']'], 							$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
+	Rule([self, '.', IDENT], 									$ => Member($[0], $[2])),
+	Rule([self, '[', expression, ']'], 							$ => Index($[0], $[2])),
 	Rule(['new', self, ()=>arguments_], 						$ => ({ type: 'new', callee: $[1], arguments: $[2] } as const)),
 ]);
 const new_expression = Rules<Expr>(self => [
@@ -582,18 +603,18 @@ export const arguments_ = Rules(
 // The full postfix-continuation set, parameterized over the member-expression chain that seeds it -- built once for the ordinary chain and once for the
 // NoBrace mirror below, so they can't drift apart. Optional chaining only marks each `?.` step, doesn't enforce real short-circuiting semantics.
 const callChainRules = (member: Rules<Expr>, self: () => Rules<Expr>): Rules<Expr> => [
-	Rule([member, arguments_], 									$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
-	Rule([self, arguments_], 									$ => ({ type: 'call', callee: $[0], arguments: $[1] } as const)),
-	Rule([self, '.', IDENT], 									$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
-	Rule([self, '[', expression, ']'], 							$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
+	Rule([member, arguments_], 									$ => Call($[0], $[1])),
+	Rule([self, arguments_], 									$ => Call($[0], $[1])),
+	Rule([self, '.', IDENT], 									$ => Member($[0], $[2])),
+	Rule([self, '[', expression, ']'], 							$ => Index($[0], $[2])),
 	Rule([member, '`', template_literal_parts, '`'], 			$ => ({ type: 'tagged_template', tag: $[0], quasi: $[2] } as const)),
 	Rule([self, '`', template_literal_parts, '`'],				$ => ({ type: 'tagged_template', tag: $[0], quasi: $[2] } as const)),
-	Rule([member, '?.', IDENT], 								$ => ({ type: 'member', object: $[0], property: $[2], optional: true } as const)),
-	Rule([self, '?.', IDENT], 									$ => ({ type: 'member', object: $[0], property: $[2], optional: true } as const)),
-	Rule([member, '?.', '[', expression, ']'], 					$ => ({ type: 'index', object: $[0], property: $[3], optional: true } as const)),
-	Rule([self, '?.', '[', expression, ']'], 					$ => ({ type: 'index', object: $[0], property: $[3], optional: true } as const)),
-	Rule([member, '?.', arguments_], 							$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
-	Rule([self, '?.', arguments_], 								$ => ({ type: 'call', callee: $[0], arguments: $[2], optional: true } as const)),
+	Rule([member, '?.', IDENT], 								$ => Member($[0], $[2], true)),
+	Rule([self, '?.', IDENT], 									$ => Member($[0], $[2], true)),
+	Rule([member, '?.', '[', expression, ']'], 					$ => Index($[0], $[3], true)),
+	Rule([self, '?.', '[', expression, ']'], 					$ => Index($[0], $[3], true)),
+	Rule([member, '?.', arguments_], 							$ => Call($[0], $[2], true)),
+	Rule([self, '?.', arguments_], 								$ => Call($[0], $[2], true)),
 ];
 export const call_expression = Rules<Expr>(self => callChainRules(member_expression, self));
 export const left_hand_side_expression = Rules(
@@ -707,8 +728,8 @@ const expression_noin = Rules<Expr>(self => [
 const primary_expression_nobrace = primaryRules();
 export const member_expression_nobrace = Rules<Expr>(self => [
 	primary_expression_nobrace,
-	Rule([self, '.', IDENT], 							$ => ({ type: 'member', object: $[0], property: $[2] } as const)),
-	Rule([self, '[', expression, ']'], 					$ => ({ type: 'index', object: $[0], property: $[2] } as const)),
+	Rule([self, '.', IDENT], 							$ => Member($[0], $[2])),
+	Rule([self, '[', expression, ']'], 					$ => Index($[0], $[2])),
 	Rule(['new', member_expression, ()=>arguments_],	$ => ({ type: 'new', callee: $[1], arguments: $[2] } as const)),
 ]);
 const new_expression_nobrace = Rules<Expr>(
@@ -770,11 +791,11 @@ export const class_member_name = Rules<KeyMods<any>>(
 
 export const class_member_body = Rules<Method<any> | Field<any>>(
 	Rule([class_member_name, parameter_clause, '{', function_body, '}'], 				$ => Method('method', $[0].key, $[1], $[3], $[0].modifiers)),
-	Rule(['*', class_member_name, parameter_clause, '{', function_body, '}'], 			$ => Method('generator', $[1].key, $[2], $[4], $[1].modifiers)),
+	Rule(['*', class_member_name, parameter_clause, '{', function_body, '}'], 			$ => Method('method', $[1].key, $[2], $[4], mergeMods($[1].modifiers, ['generator']))),
 	Rule([GET, property_name_computed, '(', ')', '{', function_body, '}'], 				$ => Method('get', $[1], {params: []}, $[5])),
 	Rule([SET, property_name_computed, '(', IDENT, ')', '{', function_body, '}'], 		$ => Method('set', $[1], {params: [{key: $[3]}]}, $[6])),
-	Rule([ASYNC, class_member_name, parameter_clause, '{', function_body, '}'], 		$ => Method('method', $[1].key, $[2], $[4], [...$[1].modifiers ?? [], 'async'])),
-	Rule([ASYNC, '*', class_member_name, parameter_clause, '{', function_body, '}'],	$ => Method('generator', $[2].key, $[3], $[5], [...$[2].modifiers ?? [], 'async'])),
+	Rule([ASYNC, class_member_name, parameter_clause, '{', function_body, '}'], 		$ => Method('method', $[1].key, $[2], $[4], mergeMods($[1].modifiers, ['async']))),
+	Rule([ASYNC, '*', class_member_name, parameter_clause, '{', function_body, '}'],	$ => Method('method', $[2].key, $[3], $[5], mergeMods($[2].modifiers, ['async', 'generator']))),
 	Rule([class_member_name, ';'], 														$ => Field($[0].key, undefined, undefined, $[0].modifiers)),
 	Rule([class_member_name, '=', assignment_expression, ';'], 							$ => Field($[0].key, $[2], undefined, $[0].modifiers)),
 );
@@ -814,13 +835,13 @@ export const function_declaration = Rules(
 
 // Reuses `optional_binding_name` rather than its own "just IDENT" nonterminal: an identically-shaped sibling would collide via state-merging, making a
 // bare `'='` here and `parameter`'s own `ASSIGN_OP` compete in the same merged state (and `'='` always wins the lexer tie-break, silently breaking typed defaults).
-export const variable_declaration = Rules<VarDeclarator<any>>(
+export const variable_declaration = Rules<Var<any>>(
 	Rule([optional_binding_name], 									$ => ({ name: $[0].key, ...$[0] } as const)),
 	Rule([optional_binding_name, '=', assignment_expression], 		$ => ({ name: $[0].key, ...$[0], init: $[2] } as const)),
 	Rule([binding_pattern, '=', assignment_expression], 			$ => ({ name: $[0], init: $[2] } as const)),
 );
 const variable_declaration_list = List(variable_declaration, ',');
-export const variable_declaration_noin = Rules<VarDeclarator<any>>(
+export const variable_declaration_noin = Rules<Var<any>>(
 	Rule([optional_binding_name], 									$ => ({ name: $[0].key, ...$[0] } as const)),
 	Rule([optional_binding_name, '=', assignment_expression_noin],	$ => ({ name: $[0].key, ...$[0], init: $[2] } as const)),
 	Rule([binding_pattern, '=', assignment_expression_noin], 		$ => ({ name: $[0], init: $[2] } as const)),

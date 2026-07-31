@@ -1,6 +1,8 @@
-import { makeParser, Rules, Forward, MaybeList, terminal, ForceFork } from '../../src/tison';
+import { Rules, Forward, MaybeList, terminal, ForceFork } from '../../src/tison';
 import * as JS from './js-parser';
-import { Literal } from '../common';
+import { Literal, Identifier } from '../common';
+import { CompilerOptions1 } from './transform';
+import { walk } from './walker';
 
 const Rule = JS.Rule;
 const IDENT = JS.IDENT;
@@ -8,87 +10,50 @@ const IDENT = JS.IDENT;
 //  JSX Parser -- an extension of js-parser, composable with ts-parser
 // ===================================================================
 //
-// Unlike ts-parser.ts, this file never imports ts-parser.ts: it only ever pushes onto js-parser.ts's own
-// shared expression-chain arrays (`member_expression`/`member_expression_nobrace`), the same array objects
-// ts-parser.ts reuses rather than copies. So importing *both* this file and ts-parser.ts (in either order --
-// neither imports the other) gives full TSX support for free: parse with `TS.parse`, not this file's own
-// `parse`, once both modules have been loaded. This file's own exported `parser`/`parse` is for plain
-// JSX-in-JS (no TypeScript) instead.
+// Never imports ts-parser.ts -- it only pushes onto js-parser.ts's own shared `member_expression`/
+// `member_expression_nobrace` arrays, which ts-parser.ts reuses rather than copies. So importing both this
+// file and ts-parser.ts gives full TSX support via `TS.parse`; this file's own `parse` is plain JSX-in-JS only.
 //
-// Known simplifications/omissions:
-//   - No generic-component type arguments (`<Foo<T> />`) -- ts-parser.ts has no `<Type>expr` cast syntax
-//     either, so there'd be no ambiguity to resolve, but the feature itself isn't implemented here.
-//   - The closing tag's own name is parsed but never checked against the opening tag's -- a real mismatch
-//     (`<div></span>`) is a semantic error, not a syntax one, out of scope for a syntax-only grammar.
-//   - JSX attribute string values don't process backslash escapes (matching the real JSX spec -- unlike a JS
-//     string literal, `attr="C:\path"` keeps the backslash literally); a dedicated `JSX_STR` terminal handles
-//     this rather than reusing js-parser.ts's own `STR`/`unquoteString`.
-//   - Whitespace-only text runs between tags (e.g. the indentation/newline in `<div>\n  <Child/>\n</div>`)
-//     are silently discarded by js-parser.ts's own `WS` skip terminal rather than kept as a `jsx_text` node --
-//     matches real JSX's own line-trimming for the common (has-a-newline) case, but real JSX preserves a
-//     single inter-tag space with no newline (`<div> </div>`) as literal text, which this simplification drops.
+// Known simplifications:
+//   - No generic-component type args (`<Foo<T> />`) -- unimplemented (no ambiguity to resolve since
+//     ts-parser.ts has no `<Type>expr` cast syntax either).
+//   - Closing tag name isn't checked against the opening tag's (a semantic, not syntax, concern).
+//   - JSX attribute strings don't process backslash escapes, matching the real spec (`JSX_STR` terminal,
+//     not js-parser.ts's `STR`).
+//   - Whitespace-only text between tags is discarded via `WS` skip rather than kept as `jsx_text` -- drops
+//     real JSX's preservation of a single inter-tag space with no newline.
 
 // ===================================================================
 //  AST
 // ===================================================================
 
-// Dotted (`Foo.Bar`) or namespaced (`svg:rect`) -- the grammar keeps the two forms mutually exclusive (like
-// the real spec), so a flat string round-trips either shape losslessly (split on `.`/`:` if the parts are
-// ever needed back) without carrying a nested structure nothing here actually uses -- same call ts-parser.ts
-// already made for its own `dotted_path`, down to reusing its self-recursive concatenation shape verbatim.
+export interface Attribute<T>	{ name?: string; value?: Expr<T> }
+export function  Attribute<T>(name: string, value?: Expr<T>): Attribute<T>	{ return { name, value }; }
+export function  SpreadAttribute<T>(value?: Expr<T>): Attribute<T>			{ return { value }; }
 
-export interface JSXAttribute<T>	{ name?: string; value?: Expr<T> }
-export function  JSXAttribute<T>(name: string, value?: Expr<T>): JSXAttribute<T>	{ return { name, value }; }
-export function  JSXSpreadAttribute<T>(value?: Expr<T>): JSXAttribute<T>			{ return { value }; }
-
-export interface JSXElement<T>		{ type: 'jsx_element'; name?: string; attributes: JSXAttribute<T>[]; children: Expr<T>[] }
-export function  JSXElement<T>(name: string, attributes: JSXAttribute<T>[], children: Expr<T>[]): JSXElement<T> {
-	return { type: 'jsx_element', name, attributes, children };
-}
-export function  JSXFragment<T>(children: Expr<T>[]): JSXElement<T> {
-	return { type: 'jsx_element', children, attributes: [] };
+export interface Element<T>		{ type: 'jsx'; name: string; attributes: Attribute<T>[]; children: Expr<T>[] }
+export function  Element<T>(name: string, attributes: Attribute<T>[], children: Expr<T>[]): Element<T> {
+	return { type: 'jsx', name, attributes, children };
 }
 
-export type Expr<T> = JS.Expr<T> | JSXElement<T>;
+export type Expr<T = any> = JS.Expr<T> | Element<T>;
 
 // ===================================================================
 //  terminals
 // ===================================================================
 
-// `jsx_element_or_fragment` is reachable both as a nested child (via `jsx_child`) and as a bare top-level
-// expression (pushed onto `member_expression`), so its own completion states end up shared between the two
-// call sites -- and LALR's reduce lookaheads are computed *per state*, not per call site, so a lookahead
-// that's only meaningful for the nested-child case (e.g. more `jsx-text`/another tag can follow a child)
-// leaks into the top-level one too (where, say, only `;` can really follow). That leaked terminal must never
-// *win* a same-length tokenizing tie against whatever's actually correct there (`const el = <Foo/>;` broke
-// exactly this way -- `;` and a leaked `jsx-text` both matched the trailing `;`, and `jsx-text` won the tie).
-// `loseTies` prefixes an optional literal NUL (not a space -- a space is real, legitimate input, e.g. the
-// one in `attr = "x"`, and an optional-but-real leading character would get swallowed into the very token
-// this is trying to protect): a NUL never appears in real source, so it changes nothing about what a pattern
-// can actually match, but its codepoint sorts below every ordinary character, which is exactly what the
-// tokenizer's own same-length tie-break compares (`pattern.source` order) -- so a leaked terminal can now only
-// win by being strictly *longer* than the alternative, never by sort order.
+// Prefixes an optional NUL (never real input, sorts lowest) so a leaked-lookahead terminal (see `jsx` below)
+// can only win a same-length tokenizing tie by matching strictly longer, never by sort order.
 function loseTies(re: RegExp): RegExp {
 	return new RegExp('\u0000?' + re.source, re.flags);
 }
 
-// A hyphenated JSX name (`data-foo`/`aria-label`/`my-element`) -- unlike a plain JS identifier, which can't
-// contain a `-` at all. Requires *at least one* hyphen (rather than allowing zero, which is what real JSX
-// itself does) so this terminal never matches anything js-parser.ts's own `IDENT` could also match: with
-// ts-parser.ts loaded, a generic arrow function (`<T>(x: T) => x`) is reachable from the very same
-// expression-start position as a JSX element, and if both a hyphen-less `jsx-name` and `IDENT` could match
-// the same plain identifier there, one has to silently win a lexer tie -- but this is a genuine grammar
-// ambiguity (only later tokens tell them apart), not a lexer one, so it needs GLR to explore both, which
-// requires both sides to shift the *same* token. `jsx_name_token` below is JSX's own actual name production;
-// it takes the hyphen-less case from plain `IDENT` instead, so a bare `<div` shifts identically either way.
+// Requires >=1 hyphen (real JSX allows zero) so it never collides with `IDENT` -- the hyphen-less case is
+// handled by `jsx_name_token`'s own `IDENT` alternative below, letting GLR fork on one shared token instead of a lexer tie.
 const JSX_NAME = terminal('jsx-name', loseTies(/[$_\p{ID_Start}][$\u200C\u200D\p{ID_Continue}]*-[$\u200C\u200D\p{ID_Continue}-]*/u));
 
-// The name production every JSX name/attribute-name position actually uses -- see `JSX_NAME`'s own comment
-// above. `ForceFork` on the `IDENT` alternative: with ts-parser.ts loaded, a bare `<identifier` is genuinely
-// ambiguous one token past LALR(1) between starting a JSX element and starting a generic arrow function's
-// `<T>` type-parameter list (both reduce the same shifted `IDENT` here, to a `type_parameter` or a JSX name
-// respectively) -- resolved only by what comes *after* (`>(` for the generic arrow vs anything else for JSX),
-// so GLR needs to explore both instead of committing to whichever reduce happens to run first.
+// `ForceFork` on `IDENT`: with ts-parser.ts loaded, `<identifier` is ambiguous past LALR(1) between a JSX
+// element and a generic arrow's `<T>` list -- resolved only by what follows (`>(` vs anything else), so GLR must explore both.
 const jsx_name_token = Rules<string>(
 	ForceFork(Rule([IDENT])),
 	Rule([JSX_NAME]),
@@ -109,10 +74,8 @@ const jsx_namespaced_name = Rules<string>(
 	Rule([jsx_name_token, ':', jsx_name_token],	$ => $[0] + ':' + $[2]),
 );
 
-// Element/component names can be dotted (`<Foo.Bar/>`, a member access on some outer binding) but never
-// namespaced; namespaced names (`<svg:rect/>`) can never be dotted -- the two forms are mutually exclusive in
-// the real spec, so they're kept as separate rules rather than one combined production. Shaped just like
-// ts-parser.ts's own `dotted_path` (self-recursive concatenation into one flat string).
+// Dotted (`<Foo.Bar/>`) and namespaced (`<svg:rect/>`) names are mutually exclusive in the real spec, so
+// they're kept as separate rules; shaped like ts-parser.ts's own `dotted_path` (self-recursive concatenation into one flat string).
 const jsx_member_name = Rules<string>(self => [
 	jsx_name_token,
 	Rule([self, '.', jsx_name_token],	$ => $[0] + '.' + $[2]),
@@ -131,7 +94,7 @@ const jsx_attribute_name = Rules<string>(
 // Reuses js-parser.ts's own `assignment_expression` array directly (not a copy) -- if ts-parser.ts is also
 // loaded, its own pushes onto that same array (`as`/`satisfies`/generic instantiation, etc.) apply here too.
 const assignment_expression = JS.assignment_expression as Rules<Expr<any>>;
-const fwd_jsx_element = Forward<JSXElement<any>>(() => jsx_element);
+const fwd_jsx_element = Forward<Element<any>>(() => jsx);
 
 const jsx_attribute_value = Rules<Expr<any>>(
 	Rule([JSX_STR],							$ => Literal($[0].slice(1, -1))),
@@ -139,10 +102,10 @@ const jsx_attribute_value = Rules<Expr<any>>(
 	fwd_jsx_element,
 );
 
-const jsx_attribute = Rules<JSXAttribute<any>>(
-	Rule([jsx_attribute_name],								$ => JSXAttribute($[0])),
-	Rule([jsx_attribute_name, '=', jsx_attribute_value],	$ => JSXAttribute($[0], $[2])),
-	Rule(['{', '...', assignment_expression, '}'],			$ => JSXSpreadAttribute($[2])),
+const jsx_attribute = Rules<Attribute<any>>(
+	Rule([jsx_attribute_name],								$ => Attribute($[0])),
+	Rule([jsx_attribute_name, '=', jsx_attribute_value],	$ => Attribute($[0], $[2])),
+	Rule(['{', '...', assignment_expression, '}'],			$ => SpreadAttribute($[2])),
 );
 const jsx_attributes = MaybeList(jsx_attribute);
 
@@ -153,13 +116,8 @@ const jsx_child = Rules<Expr<any>>(
 	fwd_jsx_element,
 );
 
-// `jsx_element` is reachable from three call sites:
-// 		- as a nested child (via `jsx_child`),
-// 		- as an attribute value (via `jsx_attribute_value`),
-//  	- as a bare top-level expression (pushed directly onto js-parser.ts's `member_expression`).
-// LALR computes reduce lookaheads *per automaton state*, not per call site, and since all three call sites reduce through the exact same rule objects, their
-// completion states end up shared -- so a lookahead that's only meaningful for the nested-child call site (e.g. more text, or another tag, can follow a child)
-// leaks into the top-level call site too, where nothing JSX-flavored can legitimately follow at all.
+// `jsx` is reachable as a nested child, an attribute value, and a bare top-level expression; LALR computes
+// lookaheads per automaton state, not per call site, so nested-child-only lookaheads leak into the top-level completion state too.
 
 function makeElement<T>(jsx_child: Rules<Expr<T>>) {
 	const opening_element = Rules(
@@ -173,16 +131,16 @@ function makeElement<T>(jsx_child: Rules<Expr<T>>) {
 		Rule([jsx_child],										$ => [$[0]]),
 		Rule([self, jsx_child],									$ => [...$[0], $[1]]),
 	]);
-	return Rules<JSXElement<T>>(
-		Rule(['<', jsx_element_name, jsx_attributes, '/', '>'],	$ => JSXElement($[1], $[2], [])),
-		Rule(['<', '>', children, '<', '/', '>'],				$ => JSXFragment($[2])),
-		Rule([opening_element, children, closing_element],		$ => JSXElement($[0].name, $[0].attributes, $[1])),
+	return Rules<Element<T>>(
+		Rule(['<', jsx_element_name, jsx_attributes, '/', '>'],	$ => Element($[1], $[2], [])),
+		Rule(['<', '>', children, '<', '/', '>'],				$ => Element('Fragment', [], $[2])),
+		Rule([opening_element, children, closing_element],		$ => Element($[0].name, $[0].attributes, $[1])),
 	);
 }
 
-// The nested/attribute-value copy -- `jsx_child` (and through it, `jsx_attribute_value`) recurses into this
-// one's `jsx_element_or_fragment` via `Forward`, since it's declared (right above) before this call.
-const jsx_element = makeElement(jsx_child);
+// The nested/attribute-value copy -- `jsx_child` (and through it, `jsx_attribute_value`) recurses back into
+// this `jsx` via `Forward`, since it's declared before this call.
+const jsx = makeElement(jsx_child);
 
 // ===================================================================
 //  Wire it up
@@ -212,28 +170,71 @@ export function remove() {
 	arrayRemove(JS.member_expression, jsx_toplevel_element as Rules<any>);
 	arrayRemove(JS.member_expression_nobrace, jsx_toplevel_element as Rules<any>);
 }
-/*
-JS.member_expression.push(jsx_toplevel_element as Rules<any>);
-JS.member_expression_nobrace.push(jsx_toplevel_element as Rules<any>);
 
-export const parser = makeParser({
-	skip:		JS.skip,
-	recover:	JS.recover,
-	merge:		JS.merge,
-	start:		JS.program,
-	// these are only needed for debugging
-	rules: {
-		...JS.rules,
-		jsx_element_name,
-		jsx_attribute_name,
-		jsx_attribute_value,
-		jsx_attribute,
-		jsx_attributes,
-		jsx_child,
-		jsx_element,
-		jsx_toplevel_element,
+//-----------------------------------------------------------------------------
+// JSX lowering
+//-----------------------------------------------------------------------------
+
+// Lowercase/namespaced (`svg:rect`) names are host elements -> string tag (real JSX rule); anything else is a component reference, evaluated as an expression.
+function elementName(name: string): JS.Expr {
+	return name.includes(':') || /^[a-z]/.test(name)
+		? Literal(name)
+		: JS.dottedNameToExpr(name);
+}
+
+function attrToFields(attr: Attribute<any>[]) {
+	return attr.map(a =>
+		a.name === undefined ? JS.Spread(a.value! as JS.Expr) : JS.Field(a.name, a.value as JS.Expr ?? Literal(true))
+	);
+}
+
+// Lowers JSX to the same calls real tsc's transform emits -- `jsx`/`jsxs` (automatic) or `factory` (classic) --
+// and, for automatic, prepends the implicit `jsx-runtime` import tsc synthesizes per file.
+export function lower(program: JS.Program, options: CompilerOptions1) {
+	const lower: ((jsx: Element<any>)=>JS.Expr) | undefined = 
+		options.jsx === 'react-jsx' || options.jsx === 'react-jsxdev' ? jsx => {
+			const props = attrToFields(jsx.attributes);
+			const func	= jsx.children.length > 1 ? 'jsxs' : 'jsx';
+			used[func] = true;
+			if (jsx.name === 'Fragment')
+				used.Fragment = true;
+			return JS.Call(Identifier(func), [
+				elementName(jsx.name),
+				JS.ObjectExpr([
+					...props, JS.Field('children', jsx.children.length === 1
+						? jsx.children[0] as JS.Expr
+						: JS.ArrayLit(jsx.children as JS.Expr[])
+					)
+				])
+			]);
+		} : options.jsx === 'react' ? jsx => {
+			const props = attrToFields(jsx.attributes);
+			return JS.Call(Identifier(options.jsxFactory), [
+				jsx.name === 'Fragment' ? Identifier(options.jsxFragmentFactory) : elementName(jsx.name),
+				props.length ? JS.ObjectExpr(props) : Literal(null),
+				...jsx.children as JS.Expr[],
+			]);
+		} :	undefined;
+
+	if (!lower)
+		return program;
+
+	const used: Record<string, boolean> = {};
+
+	const lowered = walk(program, undefined, (expr, process) =>
+		expr.type === 'jsx' ? lower(process(expr)) : process(expr)
+	)!;
+
+	const usedkeys = Object.keys(used);
+	if (usedkeys.length) {
+		lowered.body = [
+			{
+				type:		'import',
+				specifiers:	usedkeys.map(name => ({ imported: name, local: name })),
+				source:		options.jsxImportSource + '/jsx-runtime',
+			},
+			...lowered.body,
+		];
 	}
-});
-
-export const parse = (input: string) => parser.parse(input) as JS.Program<unknown>;
-*/
+	return lowered;
+}

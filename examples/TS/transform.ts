@@ -1,11 +1,12 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
+import * as JSX from './jsx-parser';
 import * as T from './type-utils';
-import { Identifier, Literal } from '../common';
+import { Identifier, Literal, Binary } from '../common';
 import { walk, hasMod, dropMod } from './walker';
 import { makeChecker, SEVERITY } from './checker';
 import { LoadedModule, ModuleLoader, ModuleOptionsDefault } from './module-loader';
-import { TSoutput } from './tocode';
+import { Output } from './tocode';
 
 type Location		= JS.Location;
 type Expr			= JS.Expr;
@@ -13,6 +14,8 @@ type BindingTarget	= JS.BindingTarget;
 type Type			= TS.Type;
 type Scope			= T.Scope;
 const Scope			= T.Scope;
+
+type JSX = 'preserve' | 'react-jsx' | 'react-jsxdev'	| 'automatic' | 'react' | 'classic';
 
 const CompilerOptionsDefault = {
 //Type Checking
@@ -49,7 +52,7 @@ const CompilerOptionsDefault = {
 	inlineSourceMap:						undefined,
 	inlineSources:							undefined,
 	mapRoot:								undefined,
-	newLine:								'lf',
+	newLine:								'\n',
 	noEmit:									undefined,
 	noEmitHelpers:							undefined,
 	noEmitOnError:							undefined,
@@ -90,14 +93,14 @@ const CompilerOptionsDefault = {
 	Environment:							undefined,
 	emitDecoratorMetadata:					undefined,
 	experimentalDecorators:					undefined,
-	jsx:									'preserve',
+	jsx:									'preserve' satisfies JSX,
 	jsxFactory:								'React.createElement',
 	jsxFragmentFactory:						'React.Fragment',
 	jsxImportSource:						'react',
-	lib:									undefined,
+	lib:									undefined as string[] | undefined,
 	libReplacement:							true,
 	moduleDetection:						'auto',
-	noLib:									undefined,
+	noLib:									false,
 	reactNamespace:							'React',
 	target:									'es5',
 	useDefineForClassFields:				false,
@@ -130,15 +133,6 @@ const CompilerOptionsDefault = {
 export type CompilerOptions1 = typeof CompilerOptionsDefault;
 export type CompilerOptions = Partial<CompilerOptions1>;
 
-export function FixOptions(options: CompilerOptions): CompilerOptions1 {
-	return {
-		...CompilerOptionsDefault,
-		...options,
-		// Normalize `target` to lower-case, as the TS parser expects.
-		target: options.target?.toLowerCase() ?? CompilerOptionsDefault.target,
-	};
-}
-
 const TARGET_DEFAULT_LIB: Record<string, string> = {
 	es3: 	'lib',
 	es5: 	'lib',
@@ -156,18 +150,52 @@ const TARGET_DEFAULT_LIB: Record<string, string> = {
 	esnext: 'lib.esnext.full',
 };
 
-function libSpecs(options: CompilerOptions1): string[] {
-	return	options.noLib ? []
-		:	options.lib ? Array.isArray(options.lib) ? options.lib : [options.lib]
-		:	['typescript/lib/' + (TARGET_DEFAULT_LIB[options.target.toLowerCase()] ?? TARGET_DEFAULT_LIB.es5)];
+export function FixOptions(options: CompilerOptions): CompilerOptions1 {
+	const target	= options.target?.toLowerCase() ?? CompilerOptionsDefault.target;
+	const lib		= options.lib ? Array.isArray(options.lib) ? options.lib : [options.lib]
+		:	options.noLib ? []
+		:	['typescript/lib/' + (TARGET_DEFAULT_LIB[target] ?? TARGET_DEFAULT_LIB.es5)];
+
+	return {
+		...CompilerOptionsDefault,
+		...options,
+		target,
+		lib
+	};
+}
+
+// Leading whitespace/comments/shebang -- matches js-parser.ts's own lexer `skip` list, so real tsc pragma scope.
+const reLeadingTrivia = /^(?:#![^\n]*\n)?(?:\s+|\/\/[^\n]*|\/\*[^]*?\*\/)*/;
+const rePragmaTag = /@(\w+)\s+(\S+)/g;
+
+// `@tag value` pragmas in the file's leading trivia -- same scope real tsc uses, no built-in tag knowledge here.
+export function scanPragmas(source: string): Record<string, string> {
+	const pragmas: Record<string, string> = {};
+	rePragmaTag.lastIndex = 0;
+	for (let m; (m = rePragmaTag.exec(source)); )
+		pragmas[m[1]] = m[2];
+	return pragmas;
+}
+
+// Tag -> compiler option for known pragmas; add an entry to support a new one.
+const pragmaOptionKey = {
+	jsx:				'jsxFactory',
+	jsxFrag:			'jsxFragmentFactory',
+	jsxImportSource:	'jsxImportSource',
+} as const satisfies Record<string, keyof CompilerOptions1>;
+
+export function applyPragmas(source: string, options: CompilerOptions1) {
+	const leading = reLeadingTrivia.exec(source)?.[0] ?? '';
+	for (const [tag, value] of Object.entries(scanPragmas(leading))) {
+		if (tag in pragmaOptionKey)
+			options[pragmaOptionKey[tag as keyof typeof pragmaOptionKey]] = value;
+	}
 }
 
 //-----------------------------------------------------------------------------
 // TS to JS
 //-----------------------------------------------------------------------------
 
-// Plain JS has no `?` -- drops the `'optional'` tag from a `Param`'s modifiers while keeping any others (e.g.
-// a parameter property's `public`/`readonly`, cleared separately by whichever caller also strips `modifiers`).
 const dropOptional = (p: JS.Param<any>) => dropMod(p, 'optional');
 
 export function TStoJS(ast: TS.Program) {
@@ -228,11 +256,10 @@ export function TStoJS(ast: TS.Program) {
 									.filter((p) => p.modifiers?.some(x => x !== 'optional'))
 									.map(p => ({
 										type: 'expression',
-										expression: {
-											type: 'binary', operator: '=',
-											left: { type: 'member', object: { type: 'this' }, property: p.key as string },
-											right: { type: 'identifier', name: p.key as string },
-										},
+										expression: Binary('=',
+											{ type: 'member', object: { type: 'this' }, property: p.key as string } as Expr,
+											Identifier(p.key as string),
+										),
 									})
 								);
 								if (prelude.length)
@@ -299,7 +326,7 @@ export interface Diagnostic {
 }
 
 function makeDiagnostic(func: (d: Diagnostic) => void) {
-	const renderer	= new TSoutput;
+	const renderer	= new Output;
 	const clip		= (s: string, max = 60)	=> s.length > max ? s.slice(0, max - 3) + '...' : s;
 	const toString	= (v: any) => v === undefined ? '' : typeof v === 'string' ? v : renderer.toCode(v);
 
@@ -310,9 +337,7 @@ function makeDiagnostic(func: (d: Diagnostic) => void) {
 	});
 }
 
-// Folds whatever `type-utils.ts`'s structural recursions (`resolve`/`lookupMember`/`isAssignable`/...) hit their depth
-// budget on during this check into one summary GAP diagnostic -- see `T.takeDepthExhaustion`'s own comment for why not
-// one diagnostic per occurrence.
+// Folds any depth-budget hits from type-utils.ts's structural recursion into one summary GAP diagnostic, not one per occurrence.
 function pushDepthExhaustionGap(diagnostics: Diagnostic[]) {
 	const depthHits = T.takeDepthExhaustion();
 	if (depthHits.size) {
@@ -333,31 +358,22 @@ export function TStypeCheck(ast: TS.Program): Diagnostic[] {
 	const global = T.makeGlobal();
 	checker.checkBlock(ast.body, global, undefined);
 	pushDepthExhaustionGap(diagnostics);
+	ast.scope = global;
 	return diagnostics;
 }
 
-// lib.*.d.ts content is cached at process lifetime already (`NodeModules.found`/`imported`, module-loader.ts) -- every
-// `TStypeCheckAsync` call was re-hoisting that *same shared AST* into a *fresh* `Scope` anyway, and `stampScope`
-// (type-utils.ts) mutates refs in place, skipping one that's already tagged. So whichever file got checked first
-// permanently claimed the `declScope` on every lib-sourced ref for the rest of the process -- every later file's own
-// lib refs carried a stale `declScope` pointing at an unrelated earlier file's `Scope`. Matching this cache's lifetime
-// to the AST's (build once per distinct `libSpecs`, reuse the same `Scope` object for every file) fixes that at the
-// source instead of working around it in `resolve()`. Safe to share: `global` only ever receives lib content here --
-// a file's own declarations go into its own child `entryScope` (below), never into `global` itself.
-// `skipLibCheck`/`skipDefaultLibCheck` only gate *diagnostic reporting* from inside the hoisted `.d.ts` content, not
-// what gets hoisted -- the resulting `Scope` is identical either way, so it's deliberately not part of the cache key.
-// A caller requesting `skipLibCheck: false` (nothing in this codebase does) would still have those diagnostics
-// silently dropped once another call has already built the cache -- an accepted, narrow tradeoff for a flag nothing uses.
+// Cached per `libSpecs`, not per-call -- `stampScope` (type-utils.ts) mutates lib refs in place, so a fresh `Scope`
+// per file left every ref pointing at whichever file's `Scope` got there first.
 const libScopeCache = new Map<string, Promise<Scope>>();
 
 async function getLibScope(loader: ModuleLoader, options: CompilerOptions1): Promise<Scope> {
-	const key = libSpecs(options).join('\0');
+	const key = options.lib!.join(';');
 	let cached = libScopeCache.get(key);
 	if (!cached) {
 		cached = (async () => {
 			const checker = makeChecker(makeDiagnostic(() => {}));
 			const global = T.makeGlobal();
-			for (const spec of libSpecs(options)) {
+			for (const spec of options.lib!) {
 				const lib = await loader.get(spec, '.');
 				if (lib)
 					checker.checkBlock(lib.body, global, true);
@@ -369,45 +385,17 @@ async function getLibScope(loader: ModuleLoader, options: CompilerOptions1): Pro
 	return cached;
 }
 
-// `tainted`: this module's own build (or one it transitively, successfully awaited) had to skip *something* because
-// resolving it would have deadlocked on a genuine import cycle (see `importScopeCache`'s comment) -- the shape is
-// real and usable, just incomplete in some way that isn't recorded more precisely than that.
+// `tainted`: this build (or one it awaited) had to skip something to avoid deadlocking on a genuine import cycle -- real and usable, just incomplete.
 interface ModuleShape { scope: Scope; value: Type; tainted: boolean }
 
-// A module's built `Scope` is cached process-wide, matching `libScopeCache`'s reasoning: a `node_modules`/workspace
-// package's `LoadedModule` is itself cached at process lifetime (`NodeModules`, module-loader.ts), so rebuilding a
-// fresh `Scope` from it per file hit the same `declScope` staleness that motivated `libScopeCache`.
-//
-// One real complication a plain process-wide cache doesn't handle: `wouldDeadlock` tolerates a *genuine* import
-// cycle (Node's own `fs` <-> `fs/promises` `.d.ts` graph references itself both ways, via their `node:`-prefixed
-// aliases) by skipping whichever side of the cycle asks second -- relied on already, not new. Which side asks
-// second depends on *resolution order*, which used to reset to nothing for every file (a fresh, empty `waitingFor`
-// each `TStypeCheckAsync` call) -- so whichever side a given file happened to need most wasn't guaranteed to be the
-// truncated one, but at least the decision was made fresh, per file, for that file's own entry point. Sharing
-// `waitingFor` process-wide instead means the *very first* file to ever touch the cycle, from wherever it happens
-// to enter, permanently decides which side comes back hollow for every other file for the rest of the process --
-// and unlike a plain stale-`declScope` mismatch (same value, wrong scope object), a truncated cycle can genuinely
-// lose real content (confirmed: entering via `fs/promises` first left `fs`'s own `promises` re-export empty).
-// `tainted` tracks exactly this, propagated up through everything that awaited the truncated part, and
-// `importScopeCache.delete` (in `makeScope`, below) evicts a tainted result once built rather than caching it --
-// so it doesn't poison anyone downstream, and the next file to need it gets a genuinely fresh attempt (which,
-// per the sequential-and-then-fully-settled nature of one `TStypeCheckAsync` call finishing before the next
-// starts, sees an empty `waitingFor` again, same as the old per-file behavior). Non-circular modules -- the
-// overwhelming majority -- are entirely unaffected and stay cached for real.
-const importScopeCache = new Map<LoadedModule, Promise<ModuleShape>>();
-const waitingFor = new Map<LoadedModule, Set<LoadedModule>>();
+// Process-wide, like `libScopeCache`. A genuine cycle (e.g. Node's `fs`<->`fs/promises` `.d.ts` graph) truncates
+// whichever side asks second; `tainted` marks that so it's evicted instead of poisoning later callers.
+const importScopeCache	= new Map<LoadedModule, Promise<ModuleShape>>();
+const waitingFor		= new Map<LoadedModule, Set<LoadedModule>>();
 
-// `src`'s own hoisted declarations (imports resolved, `export ... from` re-exports NOT yet merged in), recorded
-// synchronously the moment they're ready -- typically well before `importScopeCache`'s entry for the same module,
-// since re-export merging is what can hit a genuine cycle. A regular `import` only ever needs a target's own
-// declarations, never its re-exports, so `awaitScope`'s `fallbackToOwn` consults this to resolve what would
-// otherwise look like a deadlock through the full `importScopeCache` path -- e.g. `factors.ts` importing
-// `Polynomial` from `polynomial.ts`, which itself re-exports from `factors.ts`: not a genuine cycle at the
-// declaration level, only in how eagerly the re-export merge waits on it.
-// Deliberately a plain (not `Promise<...>`) map, checked synchronously, never awaited: if `waiter`'s own regular
-// imports genuinely, mutually depend on `target` (an actual cycle, not just this one-directional re-export shape),
-// `target`'s entry here won't exist yet either -- awaiting it would just deadlock on the very call in progress.
-const ownScopeSettled = new Map<LoadedModule, { scope: Scope; value: Type; isAlias: boolean }>();
+// Own declarations recorded before re-export merging (the part that can cycle) -- lets a plain `import`'s deadlock
+// fallback (`awaitScope`'s `fallbackToOwn`) resolve from here instead, since imports never need re-exports.
+const ownScopeSettled	= new Map<LoadedModule, { scope: Scope; value: Type; isAlias: boolean }>();
 
 function wouldDeadlock(waiter: LoadedModule, target: LoadedModule): boolean {
 	const seen = new Set<LoadedModule>([target]);
@@ -426,49 +414,45 @@ function wouldDeadlock(waiter: LoadedModule, target: LoadedModule): boolean {
 	return false;
 }
 
+// `func` must be awaited *inside* this try -- calling an async function returns immediately (it doesn't block
+// until its first await), so awaiting only at the call site would run `finally` before `func` actually finishes,
+// collapsing the window `wouldDeadlock` relies on to detect a real in-progress cycle.
+async function safely<T>(waiter: LoadedModule, target: LoadedModule, func: () => Promise<T>): Promise<T | undefined> {
+	if (wouldDeadlock(waiter, target))
+		return undefined;
+
+	let waits = waitingFor.get(waiter);
+	if (!waits)
+		waitingFor.set(waiter, waits = new Set());
+	waits.add(target);
+	try {
+		return await func();
+	} finally {
+		waits.delete(target);
+	}
+}
+
 export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, options: CompilerOptions1) {
 	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
 	const checker	= makeChecker(makeDiagnostic(d => diagnostics.push(d)));
 	const global	= await getLibScope(loader, options);
 
-	// Awaits `makeScope(target)` on `waiter`'s behalf, recording the wait so `wouldDeadlock` can see it -- or, if
-	// awaiting would deadlock, skips without recursing further, returning `undefined`. `fallbackToOwn` (set only by
-	// `resolveImport`, never by `makeScope`'s own `export ... from` handling) falls back to `target`'s own-scope-only
-	// result instead: a plain `import` never needs `target`'s re-exports, just its own declarations, which are already
-	// settled regardless of whether the deadlock is real or just an artifact of re-export merging waiting on `waiter`.
-	async function awaitScope(waiter: LoadedModule, target: LoadedModule, fallbackToOwn = false): Promise<ModuleShape | undefined> {
-		if (!wouldDeadlock(waiter, target)) {
-			let waits = waitingFor.get(waiter);
-			if (!waits)
-				waitingFor.set(waiter, waits = new Set());
-			waits.add(target);
-			try {
-				return await makeScope(target);
-			} finally {
-				waits.delete(target);
-			}
-		}
-		const own = fallbackToOwn && ownScopeSettled.get(target);
-		if (!own)
-			return undefined;
-		return { scope: own.scope, value: own.isAlias ? own.value : own.scope.toObject(), tainted: true };
-	}
-
-	// Resolves one `import` statement's bindings (default/namespace/named specifiers) from `imp.source` into `importScope`,
-	// shared by `makeScope` (building a dependency's own import scope) and the entry program (which has no `makeScope`
-	// call of its own, since nothing else ever imports it). `waiter` identifies who's asking, for `wouldDeadlock`.
-	// Returns whether this import resolved *cleanly* (no cycle truncation, directly or in what it pulled in) --
-	// `makeScope` folds these into its own `tainted` verdict.
+	// Resolves one `import` into `importScope` (shared by `makeScope` and the entry program); return value feeds
+	// `makeScope`'s own `tainted` verdict (false = cycle truncation).
 	const resolveImport = async (waiter: LoadedModule, importScope: Scope, imp: JS.Import, from: string): Promise<boolean> => {
 		const impSrc = await loader.get(imp.source, from);
 		if (!impSrc) {
 			diagnostics.push({ severity: 1, pos: (imp as any).pos, message: `Could not resolve import '${imp.source}'` });
 			return true;	// unresolvable specifier, not a cycle -- nothing for `makeScope` to retry later
 		}
-		const resolved = await awaitScope(waiter, impSrc, true);
-		if (!resolved)
-			return false;	// genuine import cycle -- contribute nothing further rather than deadlock
+		let resolved = await safely(waiter, impSrc, () => makeScope(impSrc));
+		if (!resolved) {
+			const own = ownScopeSettled.get(impSrc);
+			if (!own)
+				return false;	// genuine import cycle -- contribute nothing further rather than deadlock
+			resolved = { scope: own.scope, value: own.isAlias ? own.value : own.scope.toObject(), tainted: true };
+		}
 
 		const { scope: impScope, value } = resolved;
 
@@ -488,12 +472,8 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 		return !resolved.tainted;
 	};
 
-	// The result of `makeScope` is a `Scope` containing precisely `src`'s exported symbols (values, types, and nested
-	// namespaces alike), keyed by their public name -- callers never need to re-scan `src.body`'s statements themselves.
-	// The one exception is `export ... from` re-exports: `checker.exportScope` only sees local declarations and same-file
-	// `export {a, b}` (no `source`), since resolving a re-export's target needs the loader, which the checker itself
-	// doesn't have -- so that part alone is still handled here, by folding the target's own (recursively resolved) scope
-	// into this one.
+	// Returns `src`'s exported symbols as one `Scope`; also resolves `export ... from` re-exports here, since only
+	// this has the loader that `checker.exportScope` doesn't.
 	async function makeScope(src: LoadedModule): Promise<ModuleShape> {
 		const existing = importScopeCache.get(src);
 		if (existing)
@@ -503,8 +483,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 		const cached = Promise.all(src.body.filter(s => s.type === 'import').map(s => resolveImport(src, importScope, s, src.canonical))).then(async imports => {
 			let tainted = imports.some(clean => !clean);
 			const { scope, value, isAlias } = checker.exportScope(src.body, importScope);
-			// Recorded synchronously here, before the (possibly cyclic) re-export loop below ever awaits anything --
-			// see `ownScopeSettled`'s own comment for why this specific placement is what makes the fallback safe.
+			// Recorded before the (possibly cyclic) re-export loop awaits anything -- see `ownScopeSettled` for why placement matters.
 			ownScopeSettled.set(src, { scope, value, isAlias });
 			for (const stmt of src.body) {
 				if (stmt.type !== 'export' || !stmt.source)
@@ -512,7 +491,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 				const target = await loader.get(stmt.source, src.canonical);
 				if (!target)
 					continue;
-				const targetShape = await awaitScope(src, target);
+				const targetShape = await safely(src, target, () => makeScope(target));
 				if (!targetShape) {
 					tainted = true;
 					continue;	// genuine circular re-export chain -- contribute nothing further rather than deadlock/recurse forever
@@ -535,19 +514,16 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 			return { scope, value: isAlias ? value : scope.toObject(), tainted };
 		});
 		importScopeCache.set(src, cached);
-		// Only ever cache a clean build -- a tainted one stays valid for whoever's already awaiting `cached` (they're
-		// part of the same cyclic build attempt and would see the same truncation either way), but the next caller
-		// with no reason to inherit this attempt's particular truncation gets a genuinely fresh one instead of this
-		// poisoned result forever. Identity-checked before deleting: if a concurrent rebuild has already replaced
-		// this entry (e.g. a prior attempt for the same `src` was itself evicted and rebuilt), this stale `.then`
-		// firing later must not clobber whatever's there now.
-		cached.then(result => { if (result.tainted && importScopeCache.get(src) === cached) importScopeCache.delete(src); });
+		// Caches only clean builds; a tainted one stays valid for concurrent awaiters, then gets evicted (identity-checked,
+		// so a stale rebuild can't clobber a newer entry) so the next caller gets a fresh attempt.
+		cached.then(result => {
+			if (result.tainted && importScopeCache.get(src) === cached)
+				importScopeCache.delete(src);
+		});
 		return cached;
 	}
 
-	// The entry program itself never goes through `makeScope` -- nothing else ever imports it, so it needs no cache entry
-	// and no "exported symbols" view, just its own import bindings to check its body against. It's also not in
-	// `importScopeCache`, so it needs its own stable identity object purely for `wouldDeadlock`'s bookkeeping.
+	// The entry program never goes through `makeScope` (nothing imports it) -- just its own stable identity for `wouldDeadlock`'s bookkeeping.
 	const entrySrc: LoadedModule = { body: program.body, canonical: '.' };
 	const entryScope = new Scope(global);
 	await Promise.all(program.body.filter(s => s.type === 'import').map(s => resolveImport(entrySrc, entryScope, s, '.')));
@@ -562,150 +538,231 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 //  TStoDecl -- TypeScript AST to a .d.ts-shaped AST
 // ===================================================================
 
-// Resolves a (possibly dotted, `NS.Foo`) ref the same way `T.resolve`'s own `case 'ref'` walks it -- split on '.',
-// hop through `scope.namespace(...)` for every segment but the last, then look the last one up as a type -- except
-// this stops at one level (the raw `TypeEntry`, not `resolve`'s further recursive expansion): `qualifyForeignRefs`
-// below needs the *un-expanded* target to search for by identity, not what it structurally reduces to.
-function resolveRefEntry(ref: TS.RefType, scope: Scope): T.TypeEntry | undefined {
-	const parts	= ref.name.split('.');
-	for (const p of parts.slice(0, -1)) {
-		const ns = scope.namespace(p);
-		if (!ns)
-			return undefined;
-		scope = ns;
-	}
-	return scope.type(parts[parts.length - 1]);
-}
+// The type-node kinds `T.resolve` can actually simplify -- constructs with no printable name of their own
+// (unlike a plain `ref`, which should stay a name rather than get flattened to its structural body).
+const RESOLVABLE = new Set(['mapped', 'conditional', 'indexed_access', 'keyof', 'typeof']);
 
-// BFS from `root` through its own namespace imports (`bin`, then one hop further like `bin.interop`, ...) for one
-// whose `.type(leaf)` is *the same object* as `target` -- name-only matching risks a false positive (two unrelated
-// modules exporting an unrelated same-named type, which `export * from` re-exporting can genuinely collide on).
-function findQualifiedPath(root: Scope, leaf: string, target: Type): string[] | undefined {
-	const seen = new Set<Scope>([root]);
-	let frontier: { scope: Scope; path: string[] }[] = [{ scope: root, path: [] }];
-	while (frontier.length) {
-		const next: typeof frontier = [];
-		for (const { scope, path } of frontier) {
-			for (const [name, ns] of scope.ownNamespaces()) {
-				if (seen.has(ns))
-					continue;
-				seen.add(ns);
-				const here = [...path, name];
-				if (ns.type(leaf)?.type === target)
-					return here;
-				next.push({ scope: ns, path: here });
-			}
-		}
-		frontier = next;
-	}
-	return undefined;
-}
+// Combines two passes over the printed type tree, since `walk` takes one `onType` callback:
+//  1. Requalifies a `ref` pointing at another module's scope (e.g. an inferred type naming an unexported
+//     helper) through whatever namespace import reaches it, or inlines it in place if nothing does.
+//  2. Resolves otherwise-unprintable constructs (`mapped`/`conditional`/`indexed_access`/`keyof`/`typeof`)
+//     to their structural result via `T.resolve` -- the tison analogue of a tsc transform calling
+//     `typeChecker.typeToTypeNode` instead of re-emitting the raw syntax.
+// Plain named refs (interfaces/classes/type aliases) are deliberately left as names rather than expanded --
+// matches real declaration emit (which preserves alias identity) and avoids flattening self-referential types.
 
-// A type inferred for an un-annotated declaration can embed a `ref` whose `declScope` is some *other* module's own
-// scope (e.g. `uint16`'s inferred `{get: get<number>; ...}` names `get` from `@isopodlabs/binary`'s own
-// `interop.d.ts`) -- printed bare, by `tocode.ts`'s ref case, that name doesn't exist in this file's own scope at
-// all. Each such ref gets either requalified through whatever namespace import already reaches it (`get` ->
-// `bin.interop.get`), or, if it's not actually exported from its module (a private helper type that some other
-// export's inferred type happens to mention, e.g. binary's own unexported `FlagsObject`/`DiscrimSwitch`), inlined
-// in place instead -- safe since a type alias carries no nominal identity worth preserving.
-function qualifyForeignRefs(importScope: Scope) {
-	// An unexported type inlined in place of a bare ref can itself be self- or mutually-recursive (a linked-list-shaped
-	// alias, say) -- inlining loses the name that made that recursion finite, so re-entering the same `entry.type`
-	// while it's still being expanded on this same path would recurse forever. Tracks only what's currently on the
-	// stack (not "ever inlined"): the same type inlined again in an unrelated, sibling position is still fine.
-	const inlining = new Set<Type>();
+function resolveTypes(entryScope: Scope, importScope: Scope | undefined) {
+	// Tracks (alias, first type-argument) pairs currently on the inline/resolve stack -- not "ever expanded",
+	// since a type can be self/mutually recursive and re-entering it while still expanding would loop forever.
+	// Keyed on the *argument* too, not just the alias: a generic like `ReadType<T>` legitimately re-enters
+	// itself once per nested field with a *different* T -- that's ordinary finite recursion, not a cycle: only
+	// re-entering with the exact same argument is. The argument is keyed by `T.typeKey` (structural, printed-code
+	// equality), not object identity -- `T.substituteType` builds a fresh object at every instantiation step even
+	// when the same logical type genuinely recurs, so a reference-identity key would never catch a real cycle.
+	const inlining = new Map<Type, Set<string | undefined>>();
+	let depth = 0;	// nesting depth across *all* active inlines, not per-alias -- distinct from the per-(alias,argument) cycle check just above: bounds legitimately deep but finite recursion (real generic helper libraries chain many distinct instantiations), which the cycle check alone wouldn't catch since each level's argument genuinely differs.
+	let scope = entryScope;	// ambient scope for scope-less constructs (`typeof`, `mapped`'s `keyof` &c) -- tracks whichever module's body we're currently inlining through
+
+	// Thrown when a computed-type unwrap's own cycle guard (or the depth cap) fires (see the `RESOLVABLE` branch
+	// below) -- caught only by the top-level call that started the chain, which reverts to printing the original
+	// ref rather than committing to a partial expansion that dangles on an inaccessible self-recursive helper
+	// (e.g. a computed type built from a discriminated union of specs, recursing through an unexported helper).
+	class ComputedCycle {}
+
+	const MAX_DEPTH = 40;
 
 	return (type: Type, process: (t: Type, recall?: boolean) => Type | undefined): Type | undefined => {
-		if (type.type !== 'ref' || !type.declScope)
+		if (type.type === 'ref' && type.declScope) {
+			const declScope	= type.declScope as Scope;
+			const entry		= declScope.lookupType(type.name);
+			if (entry) {
+				// Requalifies this ref through whatever namespace import reaches it (e.g. `ReadType` -> `bin.ReadType`),
+				// or down to its bare leaf name if that alone already reaches it unqualified (e.g. a type declared in
+				// *this* module but referenced via `pe.PE` from within a signature written in some other module that
+				// imports this one as a namespace -- printed from this module's own perspective, `pe.` would be circular
+				// nonsense). Tried whenever we're not going to fully unwrap the ref in place -- either because its body
+				// isn't a nameless computed construct to begin with, or because unwrapping it bailed on a cycle/depth-
+				// exhaustion -- so neither the wrong qualifier nor a fully-bare foreign name ends up in the output just
+				// because the unwrap attempt gave up partway through.
+				const requalify = (): Type | undefined => {
+					if (!importScope)
+						return undefined;
+					const leaf = type.name.split('.').pop()!;
+					// Reference-identity match, same as `findQualifiedPath` -- the normal case.
+					if (importScope.type(leaf)?.type === entry.type)
+						return leaf === type.name ? process(type) : process(TS.RefType(leaf, type.typeArgs));
+					const path = importScope.findQualifiedPath(leaf, entry.type);
+					if (path)
+						return process(TS.RefType([...path, leaf].join('.'), type.typeArgs));
+					// Neither matched by identity -- a genuine import cycle (this module importing, directly or
+					// transitively, whatever declared `type`) settles one side for an independently-checked view
+					// of the other, so a *type declared in this very module* can come back as a non-identical
+					// object when referenced from within the cyclic partner. Same leaf name in this module's own
+					// top-level scope is as good a signal as we get short of structural equality -- print bare.
+					return importScope.type(leaf) ? process(TS.RefType(leaf, type.typeArgs)) : undefined;
+				};
+
+				// A ref whose own declared body is itself a nameless "computed" construct (mapped/conditional/&c,
+				// e.g. a type-level function like `bin.ReadType<T>`) never gets a stable printable identity in
+				// real TS either -- unwrap it one level rather than printing a name that just hides the
+				// computation the reader actually wants to see.
+				// `topLevel`/the try-catch wrap *both* branches below, not just the `RESOLVABLE` one -- a
+				// `ComputedCycle` thrown deep inside a foreign/unreachable (`else`-branch) inline still has to
+				// unwind to here, since that branch's own `inlineEntry` call has nothing to catch it locally.
+				const topLevel = inlining.size === 0;
+				try {
+					const resolvable = RESOLVABLE.has(entry.type.type);
+					if (!resolvable) {
+						const r = requalify();
+						if (r !== undefined)
+							return r;
+					}
+
+					// Substitutes `typeArgs` into `entry`'s declared body and recurses into it -- cycle-guarded, since an
+					// unexported or computed type can be self/mutually recursive. `bail`: throw `ComputedCycle` instead of
+					// quietly stopping, for the `RESOLVABLE` chain, which has nothing sensible to fall back to mid-expansion.
+
+					const argKey	= type.typeArgs?.[0] && T.typeKey(type.typeArgs[0]);
+					const active	= inlining.get(entry.type);
+					if (active?.has(argKey) || depth >= MAX_DEPTH) {
+						if (resolvable)
+							throw new ComputedCycle;
+					} else {
+						const set = active ?? new Set<string | undefined>();
+						if (!active)
+							inlining.set(entry.type, set);
+						set.add(argKey);
+						++depth;
+						const savedScope = scope;
+						scope = declScope;
+						try {
+							return process(entry.typeParams?.length
+								? T.substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, type.typeArgs?.[i] ?? p.default ?? T.ANY])))
+								: entry.type
+								, true);
+						} finally {
+							scope = savedScope;
+							--depth;
+							set.delete(argKey);
+							if (!set.size)
+								inlining.delete(entry.type);
+						}
+					}
+				} catch (e) {
+					if (!topLevel || !(e instanceof ComputedCycle))
+						throw e;
+					// The resolvable unwrap bailed -- still worth requalifying (e.g. `ReadType` -> `bin.ReadType`)
+					// before giving up to the original, possibly-unreachable-as-written bare ref.
+					const r = requalify();
+					if (r !== undefined)
+						return r;
+				}
+			}
 			return process(type);
-
-		const entry = resolveRefEntry(type, type.declScope as Scope);
-		if (!entry)
-			return process(type);	// unresolved (shouldn't happen for a real declScope) -- leave as printed
-
-		const leaf = type.name.split('.').pop()!;
-		if (importScope.type(leaf)?.type === entry.type)
-			return process(type);	// already reachable unqualified from the printed file's own scope
-
-		const path = findQualifiedPath(importScope, leaf, entry.type);
-		if (path)
-			return process(TS.RefType([...path, leaf].join('.'), type.typeArgs));
-
-		if (inlining.has(entry.type))
-			return process(type);	// recursive inline -- give up and leave the unreachable bare name rather than loop forever
-
-		inlining.add(entry.type);
-		try {
-			return process(entry.typeParams?.length
-				? T.substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, type.typeArgs?.[i] ?? p.default ?? T.ANY])))
-				: entry.type, true);	// recall -- the inlined subtree's own nested refs need this same treatment
-		} finally {
-			inlining.delete(entry.type);
 		}
+
+		if (RESOLVABLE.has(type.type)) {
+			// `stopAtRef` -- once resolution bottoms out at a named type (e.g. a conditional's chosen branch is just
+			// `MappedMemory`), print that name rather than recursing one hop further into its structural body.
+			const resolved = T.resolve(scope, type, undefined, true);
+			if (resolved !== type) {
+				const found = scope.findDeclaredName(resolved);
+				return process(found ? T.withScope(TS.RefType(found.name), found.scope) : resolved, true);	// recall
+			}
+		}
+		return process(type);
 	};
+}
+	// A single generic type parameter constrained to a union of literals, used directly (unparameterized) as exactly
+	// one parameter's type, expands into one non-generic overload per literal member -- each overload's return type
+	// collapses toward its own concrete result (e.g. a conditional keyed off the now-literal T narrows to one table
+	// entry) instead of the printed signature needing to expose whatever machinery type (often a big lookup table)
+	// computed the generic return for every member at once.
+function expandConstrainedGeneric(typeParams: TS.TypeParam[] | undefined, params: JS.Param<any>[], returnType: Type | undefined, scope: Scope) {
+	const tparam = typeParams?.length === 1 ? typeParams[0] : undefined;
+	if (!tparam?.constraint)
+		return undefined;
+	let target: JS.Param<any> | undefined;
+	for (const p of params) {
+		if (p.typeAnnotation?.type === 'ref' && !p.typeAnnotation.typeArgs && p.typeAnnotation.name === tparam.name) {
+			if (target)
+				return undefined;	// ambiguous -- more than one param depends directly on T
+			target = p;
+		}
+	}
+	if (!target)
+		return undefined;
+
+	const constraint	= T.resolve(scope, tparam.constraint);
+	const members		= constraint.type === 'union' ? constraint.types : [constraint];
+	if (!members.every(m => T.isLiteral(m, 'string') || T.isLiteral(m, 'number')))
+		return undefined;
+
+	return members.map(m => ({
+		params:		params.map(p => p === target ? { ...p, typeAnnotation: m } : p),
+		returnType:	returnType && T.expandRefOnce(scope, T.substituteType(returnType, new Map([[tparam.name, m]]))),
+	}));
 }
 
 export function TStoDecl(ast: TS.Program): TS.Program {
 	const importScope = ast.scope as Scope | undefined;
 
-	// ---- Gathering every top-level declaration, and the explicitly-exported roots ------------------
+	// ---- Gathering every top-level declaration, and seeding `reachable` with the explicit exports ----
 
-	type Owner = TS.Statement | JS.VarDeclarator<any>;
+	type Owner = TS.Statement | JS.Var<any>;
 	class Owners extends Map<string, Owner[]> {
+		exported	= false;
 		add(name: string, owner: Owner) {
 			this.set(name, [...(this.get(name) ?? []), owner]);
+			if (this.exported)
+				reachable.add(name);
 		}
 	}
 
 	const owners	= new Owners;
-	const roots		= new Set<string>();
+	const reachable = new Set<string>();
 
-	// Registers a statement's own name(s) into `owners`, and -- if `exported` -- into `roots` too.
-	const registerDecl = (stmt: TS.Statement, exported: boolean) => {
+	// ---- Shared checking/resolution machinery, needed by the strip helpers below --------------------
+
+	const checker	= makeChecker(()=>{});
+	const global	= importScope ? new Scope(importScope) : T.makeGlobal();
+	checker.checkBlock(ast.body, global);
+
+	// A class whose heritage is a call expression (e.g. `bin.Class(spec)`) can't keep that expression in a
+	// `declare class` -- collected here and prepended to `stripped`'s body (below) as `declare const <Name>_base:
+	// <computed type>;` ahead of the class, which then just extends the name (mirrors how tsc's own declaration
+	// emitter handles this). Names tracked separately so they can be seeded into `reachable`, below -- a
+	// synthesized base is always wanted whenever its class is, but nothing else ever references it by name for
+	// the normal reachability walk to find on its own.
+	const syntheticBases: TS.Statement[] = [];
+
+	// Cheap, non-recursive scan of every top-level name -- seeded before any stripping starts, so a
+	// synthesized base name can't collide with a real declaration the single pass below hasn't reached yet.
+	const usedNames = new Set<string>();
+	for (let stmt of ast.body) {
+		if (stmt.type === 'export_decl')
+			stmt = stmt.declaration;
 		switch (stmt.type) {
-			case 'function_decl':
-			case 'class_decl':
-			case 'interface_decl':
-			case 'type_alias_decl':
-			case 'enum_decl':
-			case 'namespace_decl':
-				owners.add(stmt.name, stmt);
-				if (exported)
-					roots.add(stmt.name);
+			case 'function_decl': case 'class_decl': case 'interface_decl':
+			case 'type_alias_decl': case 'enum_decl': case 'namespace_decl':
+				usedNames.add(stmt.name);
 				break;
 			case 'var_decl':
-				for (const d of stmt.declarations) {
-					for (const name of T.bindingNames(d.name)) {
-						owners.add(name, d);
-						if (exported)
-							roots.add(name);
-					}
-				}
+				for (const d of stmt.declarations)
+					for (const name of T.bindingNames(d.name))
+						usedNames.add(name);
 				break;
-			default:
-				break;
-		}
-	};
-
-	for (const stmt of ast.body) {
-		if (stmt.type === 'export') {
-			if (stmt.default?.type === 'identifier')
-				roots.add(stmt.default.name);
-			else if (stmt.specifiers && !stmt.source)
-				stmt.specifiers.forEach(s => roots.add(s.local));
-		} else if (stmt.type === 'export_decl') {
-			registerDecl(stmt.declaration, true);
-		} else {
-			registerDecl(stmt, false);
 		}
 	}
+	const uniqueName = (base: string) => {
+		let name = base;
+		for (let n = 1; usedNames.has(name); n++)
+			name = base + n;
+		usedNames.add(name);
+		return name;
+	};
 
-
-	// ---- Final rebuild: strip bodies/initializers, keep only what's reachable ----------------------
-
-	const checker		= makeChecker(()=>{});
-	const global		= importScope ? new Scope(importScope) : T.makeGlobal();
-	checker.checkBlock(ast.body, global);
+	// ---- Strip helpers -------------------------------------------------------------------------------
 
 	// `undefined` (rather than an explicit `: any` annotation) keeps unknowable types implicit, as before
 	const inferType		= (e: Expr, narrow: boolean): Type | undefined => {
@@ -720,6 +777,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 			return { ...t, properties: t.properties.map(p => ({ ...p, value: stripBindingDefaults(p.value), default: undefined })) };
 		return { ...t, elements: t.elements.map(el => el && ({ ...el, target: stripBindingDefaults(el.target), default: undefined })) };
 	};
+	
 	const stripParam = (p: JS.Param<any>): JS.Param<any> => ({ ...p,
 		key:			stripBindingDefaults(p.key),
 		typeAnnotation: p.typeAnnotation ?? (p.default && inferType(p.default, false)),
@@ -746,68 +804,125 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		const seen		= new Set<string>();
 		const extra:	TS.ClassMember[] = [];
 
-		const body = (stmt.body as TS.ClassMember[]).map((m): TS.ClassMember | undefined => {
+		const body = (stmt.body as TS.ClassMember[]).flatMap((m): TS.ClassMember[] => {
 			switch (m.type) {
 				case 'field':
-				return JS.Field(m.key, undefined, m.typeAnnotation ?? (m.value && inferType(m.value, false)) ?? T.ANY);
+					return [JS.Field(m.key, undefined, m.typeAnnotation ?? (m.value && inferType(m.value, false)) ?? T.ANY)];
 
-			case 'get':
-				if (typeof m.key === 'string') {
-					if (seen.has(m.key))
-						return undefined;
-					seen.add(m.key);
-				}
-				return JS.Field(m.key, undefined, m.returnType ?? T.ANY, typeof m.key === 'string' && !setKeys.has(m.key) ? ['readonly'] : undefined);
-
-			case 'set':
-				if (typeof m.key === 'string') {
-					if (seen.has(m.key))
-						return undefined;
-					seen.add(m.key);
-				}
-				return JS.Field(m.key, undefined, m.params[0]?.typeAnnotation ?? T.ANY);
-
-			case 'method':
-				if (m.key === 'constructor') {
-					for (const p of m.params) {
-						if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected') || hasMod(p, 'readonly'))
-							extra.push(JS.Field(typeof p.key === 'string' ? p.key : '?', undefined, p.typeAnnotation, p.modifiers));
+				case 'get':
+					if (typeof m.key === 'string') {
+						if (seen.has(m.key))
+							return [];
+						seen.add(m.key);
 					}
-					return JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams});
+					return [JS.Field(m.key, undefined, m.returnType ?? T.ANY, typeof m.key === 'string' && !setKeys.has(m.key) ? ['readonly'] : undefined)];
+
+				case 'set':
+					if (typeof m.key === 'string') {
+						if (seen.has(m.key))
+							return [];
+						seen.add(m.key);
+					}
+					return [JS.Field(m.key, undefined, m.params[0]?.typeAnnotation ?? T.ANY)];
+
+				case 'method': {
+					if (m.key === 'constructor') {
+						for (const p of m.params) {
+							if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected') || hasMod(p, 'readonly'))
+								extra.push(JS.Field(typeof p.key === 'string' ? p.key : '?', undefined, p.typeAnnotation, p.modifiers));
+						}
+						return [JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams})];
+					}
+					const params		= m.params.map(stripParam);
+					const returnType	= m.returnType ?? (m.body ? checker.inferReturn(m, m.body, global) : undefined);
+					const expansions	= expandConstrainedGeneric(m.typeParams, params, returnType, global);
+					if (expansions)
+						return expansions.map(o => JS.Method('method', m.key, { params: o.params, rest: m.rest, returnType: o.returnType, typeParams: undefined }, undefined, m.modifiers));
+
+					return [JS.Method('method', m.key, { params, rest: m.rest, returnType, typeParams: m.typeParams }, undefined, m.modifiers)];
 				}
-				return JS.Method('method', m.key, {
-					params:		m.params.map(stripParam),
-					rest:		m.rest,
-					returnType: m.returnType ?? (m.body ? checker.inferReturn(m, m.body, global) : undefined),
-					typeParams: m.typeParams
-				}, undefined, m.modifiers);
 			}
-			return undefined;
-		}).filter(m => m !== undefined).concat(...extra) as JS.ClassMember<any>[];
-		return { ...stmt, body, ambient: true};
+			return [];
+		}).concat(extra) as JS.ClassMember<any>[];
+
+		// `extends bin.Class(spec)` (or any non-identifier heritage) can't survive into a `.d.ts` -- there's no runtime call in an ambient declaration.
+		// Hoist its *type* into a synthesized `declare const _base` instead and extend that name instead.
+		let superClass = stmt.superClass;
+		if (superClass && superClass.type !== 'identifier') {
+			const name = uniqueName((stmt.name ?? '_default') + '_base');
+			reachable.add(name);
+			syntheticBases.push(JS.AmbientVarDecl('const', JS.Var(name, undefined, checker.typeOf(superClass, global))));
+			superClass = Identifier(name);
+		}
+		return { ...stmt, body, superClass, ambient: true};
 	};
 
-	// A destructured declarator (`const {a, b} = x;`) can't survive into a .d.ts as one statement -- ambient declarations have no initializer to
-	// destructure from. Split into one simple-name declarator per bound name instead (`declare const a: any, b: any;`), each typed `any`.
-	const stripVarDeclarator = (d: JS.VarDeclarator<any>, narrow: boolean): JS.VarDeclarator<any>[] => typeof d.name === 'string'
-		? [{...d,
-			typeAnnotation: (d.typeAnnotation as Type | undefined) ?? (d.init && inferType(d.init, narrow)) ?? { type: 'ref', name: 'any' },
-			init: undefined,
-		}]
-		: T.bindingNames(d.name).map(name => ({ name, typeAnnotation: T.ANY }));
+	// Ambient declarations have no initializer to destructure from -- split a destructured declarator into one
+	// simple-name declarator per bound name instead, each typed `any`.
+	const stripVarDeclarator = (d: JS.Var<any>, narrow: boolean): JS.Var<any>[] => typeof d.name === 'string'
+		? [JS.Var(d.name, undefined, (d.typeAnnotation as Type) ?? (d.init && inferType(d.init, narrow)) ?? T.ANY)]
+		: T.bindingNames(d.name).map(name => JS.Var(name, undefined, T.ANY));
 
 
-	const collectDeclRefs = (owner: TS.Statement|Expr|Type, refs: Set<string>) => {
-		walk(owner, 
-			(s, process) => {
-				switch (s.type) {
-					case 'class_decl':
-						return process(stripClassDecl(s));
-					case 'function_decl':
-						return process(stripFunctionDecl(s));
+	// ---- Strip bodies/initializers down to their essentials in one pass, registering owners as we go --
+
+	const stripped = walk(ast, (stmt, process) => {
+		switch (stmt.type) {
+			case 'import':
+				return stmt;
+
+			case 'export':
+				if (stmt.default?.type === 'identifier')
+					reachable.add(stmt.default.name);
+				else if (stmt.specifiers && !stmt.source)
+					stmt.specifiers.forEach(s => reachable.add(s.local));
+				return process(stmt);
+
+			case 'export_decl':
+				try {
+					owners.exported = true;
+					return process(stmt);
+				} finally {
+					owners.exported = false;
 				}
-				return process(s);
-			},
+			case 'function_decl': {
+				const s = stripFunctionDecl(stmt);
+				owners.add(stmt.name, s);
+				return s;
+			}
+			case 'class_decl': {
+				const s = stripClassDecl(stmt);
+				owners.add(stmt.name, s);
+				return s;
+			}
+			case 'interface_decl':
+			case 'type_alias_decl':
+			case 'enum_decl':
+			case 'namespace_decl':
+			case 'module_decl':
+				owners.add(stmt.name, stmt);
+				return process(stmt);	// namespace/module bodies can nest further declarations -- recurse so those get stripped too
+
+			case 'export_assignment':
+				// `export = Foo;` -- not a declaration itself, just marks whatever it names as always needed.
+				reachable.add(stmt.expr.split('.')[0]);
+				return stmt;
+
+			case 'var_decl':
+				for (const d of stmt.declarations) {
+					for (const name of T.bindingNames(d.name))
+						owners.add(name, d);
+				}
+				return stmt;
+			default:
+				return undefined;
+		}
+	})!;
+
+	// `owners` already holds the stripped form (function/class bodies reduced to signatures above) --
+	// just walk it for the identifiers/refs its signature depends on, no re-stripping needed.
+	const collectDeclRefs = (owner: TS.Statement|Expr|Type, refs: Set<string>) => {
+		walk(owner, undefined,
 			(e, process) => {
 				if (e.type === 'identifier')
 					refs.add(e.name.split('.')[0]);
@@ -821,8 +936,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		);
 	};
 
-	const reachable = new Set<string>(roots);
-	const worklist	= [...roots];
+	const worklist	= [...reachable];
 	while (worklist.length) {
 		const refs = new Set<string>();
 		for (const owner of owners.get(worklist.pop()!) ?? []) {
@@ -843,47 +957,12 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		}
 	}
 
-	const isReachable = (stmt: TS.Declaration) => {
-		switch (stmt.type) {
-			case 'function_decl':
-			case 'class_decl':
-			case 'interface_decl':
-			case 'type_alias_decl':
-			case 'enum_decl':
-			case 'namespace_decl':
-				return reachable.has(stmt.name);
-			case 'var_decl':
-				return stmt.declarations.some(d => T.bindingNames(d.name).some(n => reachable.has(n)));
-			default:
-				return false;
-		}
-	};
+	// ---- Final rebuild: keep only what's reachable, from the already-stripped tree above -------------
 
-	const processNamedDecl = (stmt: TS.Declaration): TS.Declaration => {
-		switch (stmt.type) {
-			case 'function_decl':	return stripFunctionDecl(stmt);
-			case 'class_decl':		return stripClassDecl(stmt);
-			case 'interface_decl':
-			case 'type_alias_decl':
-			case 'enum_decl':
-			case 'namespace_decl':
-			case 'module_decl':
-			case 'export_assignment':
-				return stmt;
-			case 'var_decl': {
-				return { ...stmt,
-					ambient:		true,
-					declarations:	stmt.declarations
-						.filter(d => T.bindingNames(d.name).some(n => reachable.has(n)))
-						.flatMap(d => stripVarDeclarator(d, stmt.kind === 'const'))
-				 };
-			}
-		}
-	};
+	const lastImport = stripped.body.findLastIndex(i => i.type === 'import');
 
-	const result: TS.Program = {
-		type: 'program',
-		body: ast.body.map((stmt: TS.Statement): TS.Statement|undefined => {
+	return walk({ ...stripped, body: [...stripped.body.slice(0, lastImport), ...syntheticBases, ...stripped.body.slice(lastImport)] },
+		(stmt, process) => {
 			switch (stmt.type) {
 				case 'import':
 					if (stmt.specifiers) {
@@ -899,10 +978,8 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 					return stmt;
 
 				case 'export_decl': {
-					const decl = stmt.declaration as JS.Declaration<any>;
-					if (isReachable(decl))
-						return { type: 'export_decl', declaration: processNamedDecl(decl) as JS.Declaration<any> };
-					return undefined;
+					const r = process(stmt);
+					return r.declaration ? r : undefined;
 				}
 
 				case 'export':
@@ -911,12 +988,12 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 							case 'identifier':
 								return stmt;
 							case 'function_decl':
-								return { ...stmt, default: stripFunctionDecl(stmt.default) };
 							case 'class_decl':
-								return { ...stmt, default: stripClassDecl(stmt.default) };
+								// already stripped in the earlier pass -- still needs `process` to run its types through `onType`
+								return process(stmt);
 							case 'function':
 								if (stmt.default.name)
-									return { ...stmt, default: stripFunctionDecl(JS.FunctionDecl(stmt.default.name, stmt.default))};
+									return process({ ...stmt, default: stripFunctionDecl(JS.FunctionDecl(stmt.default.name, stmt.default))});
 								//fallthrough
 							default:
 								// Anonymous default export -- ambient declarations can't have an inline value, so synthesize a name, the same trick `tsc` uses.
@@ -925,13 +1002,33 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 					}
 					return stmt;
 
+				case 'function_decl':
+				case 'class_decl':
+				case 'interface_decl':
+				case 'type_alias_decl':
+				case 'enum_decl':
+				case 'namespace_decl':
+				case 'module_decl':
+					return reachable.has(stmt.name) ? process(stmt) : undefined;
+
+				case 'export_assignment':
+					return stmt;
+
+				case 'var_decl': {
+					const declarations = stmt.declarations.filter(d => T.bindingNames(d.name).some(n => reachable.has(n)));
+					return declarations.length
+						? process({ ...stmt,
+							ambient:		true,
+							declarations:	declarations.flatMap(d => stripVarDeclarator(d, stmt.kind === 'const'))
+						})
+						: undefined;
+				}
+
 				default:
-					if (isReachable(stmt as JS.Declaration<any>))
-						return processNamedDecl(stmt as unknown as JS.Declaration<any>);
 					return undefined;
 			}
-		}).filter(s => s !== undefined)
-	};
-
-	return importScope ? walk(result, undefined, undefined, qualifyForeignRefs(importScope))! : result;
+		},
+		undefined,
+		resolveTypes(global, importScope)
+	)!;
 }

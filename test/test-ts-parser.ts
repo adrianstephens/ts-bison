@@ -1,14 +1,14 @@
 import * as JSX from '../examples/TS/jsx-parser';
 import * as TS from '../examples/TS/ts-parser';
-import { TSoutput} from '../examples/TS/tocode';
-import { TStoDecl, TStoJS, TStypeCheck, TStypeCheckAsync, FixOptions } from '../examples/TS/transform';
+import { Output} from '../examples/TS/tocode';
+import { TStoDecl, TStoJS, TStypeCheck, TStypeCheckAsync, FixOptions, applyPragmas } from '../examples/TS/transform';
 import { ModuleLoader } from '../examples/TS/module-loader';
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { SEVERITY } from '../examples/TS/checker';
 
-const output = new TSoutput();
+const output = new Output();
 const total_sev = [] as number[];
 
 const parser = TS.make();
@@ -46,15 +46,10 @@ function test(name: string, code: string, format = 0) {
 async function testAsync(parser: Parser, name: string, filename: string, format = 0) {
 	try {
 		console.log('==== ' + name + ' ====');
-		const options	= FixOptions({target: 'es2022'});
-		const loader	= new ModuleLoader(path.dirname(filename), options);
 		const source	= await fs.readFile(filename, 'utf8');
-
-		const reDoc		= /^\/\*\*\s*@(\w+)\s*(.*?)\s*\*\/$/gm;
-		for (let m; (m = reDoc.exec(source)); ) {
-			const [_, doc, args] = m;
-			console.log(doc, args);//options[k] = arg;
-		}
+		const options	= FixOptions({target: 'es2022'});
+		applyPragmas(source, options);
+		const loader	= new ModuleLoader(path.dirname(filename), options);
 
 		const program	= parser.parse(source);
 		const diags 	= await TStypeCheckAsync(program, loader, options);
@@ -102,7 +97,7 @@ async function testDir(dir: string, ext: string, parser: Parser, format = 0) {
 
 (async()=> {
 
-//await testAsync(parser, 'source', '/Volumes/DevSSD/dev/packages/binary-libs/src/pe.ts', 13);
+await testAsync(parser, 'source', '/Volumes/DevSSD/dev/packages/binary-libs/src/pe.ts', 13);
 //await testAsync('source', path.join(__dirname, '../examples/TS/ts-codegen.ts'));
 
 test('1', `
