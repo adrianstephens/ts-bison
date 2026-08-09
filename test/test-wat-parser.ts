@@ -1,11 +1,11 @@
-import { parse, watParser } from '../examples/wat-parser';
+import { parseWat, toWasm } from '../examples/wat-parser';
 
 function testWat(name: string, wat: string) {
 	console.log(`=== Test: ${name} ===`);
 	try {
-		const ast = watParser.parse(wat);
-		console.log('AST parsed successfully.');
-		const wmod = parse(wat);
+		const mod = parseWat(wat);
+		console.log('parsed successfully.');
+		const wmod = toWasm(mod);
 		const bytes = wmod.toBytes();
 		console.log(`Successfully parsed and encoded to ${bytes.length} bytes.`);
 		console.log('toWAT output:');
@@ -42,9 +42,9 @@ testWat('Factorial with Loop & Branching', `
         i32.const 1
         i32.le_s
         br_if $done
-        local.get $acc
-        local.get $n
-        i32.mul
+        ;;local.get $acc
+        ;;local.get $n
+        (i32.mul (local.get $acc) (local.get $n))
         local.set $acc
         local.get $n
         i32.const 1
@@ -88,6 +88,21 @@ testWat('Unnamed Import and Unnamed Data', `
   (data $namedSeg "named segment")
   (func $test
     data.drop $namedSeg
+  )
+)
+`);
+
+// A one-armed if (no else) has no `else` field on its AST node at all -- toWasm's resolution
+// pass must not unconditionally try to resolve one.
+testWat('If with no else branch', `
+(module
+  (global $hit (mut i32) (i32.const 0))
+  (func $f (export "f") (param $x i32)
+    local.get $x
+    if
+      i32.const 1
+      global.set $hit
+    end
   )
 )
 `);

@@ -84,6 +84,7 @@ export function isLiteral<K extends keyof TypeOfMap>(t: Type|Expr, type: K): t i
 export function typeofName(t: Type): string | undefined {
 	switch (t.type) {
 		case 'literal':				return Array.isArray(t.value) ? 'string' : typeof t.value;
+		case 'range':				return t.base;
 		case 'function':
 		case 'constructor':			return 'function';
 		case 'array':
@@ -94,6 +95,151 @@ export function typeofName(t: Type): string | undefined {
 		default:					return undefined;
 	}
 }
+
+// ===================================================================
+//  numeric/bigint range narrowing
+// ===================================================================
+// A canonical, base-uniform view of "how much do we know about a number/bigint value" -- consumed/produced by
+// `narrow()`'s relational/equality handling in checker.ts. `min`/`max` undefined means unbounded on that side;
+// `integer` is always true for `bigint` (every bigint value already is one).
+export interface NumRange { base: 'number' | 'bigint'; min?: number | bigint; max?: number | bigint; integer: boolean }
+
+// Reduces any resolved numeric-ish `Type` to a `NumRange`, or `undefined` if `t` isn't one at all.
+export function toRange(t?: Type): NumRange | undefined {
+	if (t) {
+		if (t.type === 'range')
+			return { base: t.base, min: t.min, max: t.max, integer: t.base === 'bigint' || !!t.integer };
+		if (t.type === 'literal' && typeof t.value === 'number')
+			return { base: 'number', min: t.value, max: t.value, integer: Number.isInteger(t.value) };
+		if (t.type === 'ref' && t.name === 'number')
+			return { base: 'number', integer: false };
+		if (t.type === 'ref' && t.name === 'bigint')
+			return { base: 'bigint', integer: true };
+	}
+	return undefined;
+}
+
+// The inverse of `toRange`: collapses back to the simplest `Type` representing `r` -- a plain `Literal` for an
+// exactly-known number, a bare ref when nothing is actually known, or a genuine `RangeType` otherwise (see
+// `RangeType`'s own comment for why an exact bigint value stays a degenerate range rather than becoming a `Literal`).
+export function rangeToType(r: NumRange): Type;
+export function rangeToType(r?: NumRange): Type | undefined;
+export function rangeToType(r?: NumRange): Type | undefined {
+	if (!r)
+		return undefined;
+	if (r.base === 'number') {
+		if (typeof r.min === 'number' && r.min === r.max)
+			return Literal(r.min);
+		if (r.min === undefined && r.max === undefined && !r.integer)
+			return NUMBER;
+		return TS.RangeType('number', r.min, r.max, r.integer);
+	}
+	return r.min === undefined && r.max === undefined ? BIGINT : TS.RangeType('bigint', r.min, r.max);
+}
+
+// Intersects two same-based ranges (e.g. a binding's current range with a new comparison's implied bound);
+// `undefined` means the intersection is provably empty (the comparison contradicts what's already known).
+export function rangeIntersect(a: NumRange, b: NumRange): NumRange | undefined {
+	if (a.base !== b.base)
+		return undefined;
+	const min = a.min === undefined ? b.min : b.min === undefined ? a.min : a.min > b.min ? a.min : b.min;
+	const max = a.max === undefined ? b.max : b.max === undefined ? a.max : a.max < b.max ? a.max : b.max;
+	if (min !== undefined && max !== undefined && min > max)
+		return undefined;
+	return { base: a.base, min, max, integer: a.integer || b.integer };
+}
+
+// Same-typed `number`/`bigint` arithmetic on a `number | bigint`-typed value, without mixing the two at the type level.
+function negValue(v: number | bigint): number | bigint { return typeof v === 'bigint' ? -v : -v; }
+function addValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a + (b as bigint) : a + (b as number); }
+function subValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a - (b as bigint) : a - (b as number); }
+function mulValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a * (b as bigint) : a * (b as number); }
+function divValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a / (b as bigint) : a / (b as number); }
+function minOfValues(vs: (number | bigint)[]): number | bigint { return vs.reduce((a, b) => a < b ? a : b); }
+function maxOfValues(vs: (number | bigint)[]): number | bigint { return vs.reduce((a, b) => a > b ? a : b); }
+
+// Interval arithmetic for `+`/`-`/unary `-`/`*`/`/` over possibly-unbounded ranges -- consumed by `typeOf`'s
+// `'binary'`/`'unary'` cases so e.g. `x + 1` for a bounded `x` stays bounded, instead of always collapsing to
+// the base `number`/`bigint`. `undefined` on either side of a range means "unbounded there", so any operation
+// touching it produces an unbounded result on that side too (a conservative, always-safe over-approximation).
+export function rangeNeg(a: NumRange): NumRange {
+	return { base: a.base, integer: a.integer,
+		min: a.max !== undefined ? negValue(a.max) : undefined,
+		max: a.min !== undefined ? negValue(a.min) : undefined };
+}
+export function rangeAdd(a: NumRange, b: NumRange): NumRange | undefined {
+	if (a.base !== b.base)
+		return undefined;
+	return { base: a.base, integer: a.integer && b.integer,
+		min: a.min !== undefined && b.min !== undefined ? addValue(a.min, b.min) : undefined,
+		max: a.max !== undefined && b.max !== undefined ? addValue(a.max, b.max) : undefined };
+}
+export function rangeSub(a: NumRange, b: NumRange): NumRange | undefined {
+	if (a.base !== b.base)
+		return undefined;
+	return { base: a.base, integer: a.integer && b.integer,
+		min: a.min !== undefined && b.max !== undefined ? subValue(a.min, b.max) : undefined,
+		max: a.max !== undefined && b.min !== undefined ? subValue(a.max, b.min) : undefined };
+}
+export function rangeMul(a: NumRange, b: NumRange): NumRange | undefined {
+	if (a.base !== b.base)
+		return undefined;
+	if (a.min === undefined || a.max === undefined || b.min === undefined || b.max === undefined)
+		return { base: a.base, integer: a.integer && b.integer };
+	const corners = [mulValue(a.min, b.min), mulValue(a.min, b.max), mulValue(a.max, b.min), mulValue(a.max, b.max)];
+	return { base: a.base, integer: a.integer && b.integer, min: minOfValues(corners), max: maxOfValues(corners) };
+}
+// Standard interval division (reciprocal-then-multiply, via the same 4-corner approach as `rangeMul`) -- only sound
+// when the divisor's sign is fixed away from zero, since a divisor interval straddling 0 can swing the result toward
+// +-Infinity on either side. `integer` is only ever claimed for `bigint` (its division always truncates to a bigint);
+// number division isn't claimed integer even for two integer operands (`5 / 2`), since that's not generally true.
+export function rangeDiv(a: NumRange, b: NumRange): NumRange | undefined {
+	if (a.base !== b.base)
+		return undefined;
+	if (a.min === undefined || a.max === undefined || b.min === undefined || b.max === undefined || (b.min <= 0 && b.max >= 0))
+		return { base: a.base, integer: a.base === 'bigint' };
+	const corners = [divValue(a.min, b.min), divValue(a.min, b.max), divValue(a.max, b.min), divValue(a.max, b.max)];
+	return { base: a.base, integer: a.base === 'bigint', min: minOfValues(corners), max: maxOfValues(corners) };
+}
+
+export function rangeMax(a: NumRange[]): NumRange | undefined {
+	if (a.length > 0) {
+		const mins = a.map(i => i.min);
+		const maxs = a.map(i => i.max);
+		return { base: a[0].base,
+			min: mins.every(v => v !== undefined) ? maxOfValues(mins) : undefined,
+			max: maxs.every(v => v !== undefined) ? maxOfValues(maxs) : undefined,
+			integer: a.every(r => r.integer)
+		};
+	}
+}
+export function rangeMin(a: NumRange[]): NumRange | undefined {
+	if (a.length > 0) {
+		const mins = a.map(i => i.min);
+		const maxs = a.map(i => i.max);
+		return { base: a[0].base,
+			min: mins.every(v => v !== undefined) ? minOfValues(mins) : undefined,
+			max: maxs.every(v => v !== undefined) ? minOfValues(maxs) : undefined,
+			integer: a.every(r => r.integer)
+		};
+	}
+}
+export function rangeLogic(a: NumRange, b: NumRange): NumRange | undefined {
+	const base = a.base;
+	if (base !== b.base)
+		return undefined;
+	return base === 'number' ? { base, integer: true, min: -0x80000000, max: 0x7fffffff} : {base, integer: true};
+}
+
+// Whether `r`'s span provably includes the value `0` -- used to decide truthy/falsy/nullish-adjacent questions for
+// a narrowed numeric type the same way a plain `number`/`bigint` ref is decided (both are always presumed to include 0).
+function rangeIncludesZero(r: { min?: number | bigint; max?: number | bigint }): boolean {
+	return (r.min === undefined || r.min <= 0) && (r.max === undefined || r.max >= 0);
+}
+
+// ===================================================================
+//  
+// ===================================================================
 
 // A spread (`...T`) contributes no single element value; an optional element (`T?`)'s contributed value type is just `T`, consistent with this
 // file not modeling "possibly absent" via `| undefined` for optional members elsewhere either.
@@ -206,6 +352,12 @@ export function makeNullish(type: Type) {
 			case 'string':	return Literal('');
 		}
 	}
+	if (type.type === 'range') {
+		// A range provably excluding 0 can never take its "one falsy value" -- that branch is unreachable for it.
+		if (!rangeIncludesZero(type))
+			return NEVER;
+		return type.base === 'number' ? Literal(0) : TS.RangeType('bigint', 0n, 0n);
+	}
 	return type;
 }
 
@@ -231,10 +383,25 @@ export function isNullish(t: Type, scope: Scope): boolean {
 		:	false;
 }
 
+// The non-nullish remainder of `t` -- `t` itself, unchanged, unless it resolves to a union with at least
+// one (but not every) nullish member, in which case those members are dropped. Shared by anything
+// implementing optional-chaining semantics (`?.`/`??`), which only ever cares about the non-nullish part
+// of a value's type -- e.g. `lookupMember`'s own union case requires *every* member to have the property
+// looked up, which a bare `null`/`undefined` member never does, so a `?.` member lookup needs this run on
+// the object type first (see `checker.ts`'s own `'member'` case) or it always misses, falling back to `any`.
+export function nonNullable(t: Type, scope: Scope): Type {
+	const r = resolveOwn(t, scope);
+	if (r.type !== 'union')
+		return t;
+	const kept = r.types.filter(m => !isNullish(m, scope));
+	return kept.length === 0 || kept.length === r.types.length ? t : combineTypes(kept);
+}
+
 export function isFalsy(t: Type, scope: Scope): boolean {
 	const r = resolveOwn(t, scope);
 	return	r.type === 'literal'	? !r.value
 		:	r.type === 'ref'		? r.name === 'undefined' || r.name === 'null' || r.name === 'void'
+		:	r.type === 'range'		? r.min !== undefined && r.min === r.max && rangeIncludesZero(r)	// the single point 0
 		:	r.type === 'union'		? r.types.every(t => isFalsy(t, scope))
 		:	false;
 }
@@ -242,6 +409,7 @@ export function isFalsy(t: Type, scope: Scope): boolean {
 export function isTruthy(t: Type, scope: Scope): boolean {
 	const r = resolveOwn(t, scope);
 	return	r.type === 'literal'		? !!r.value
+		:	r.type === 'range'			? !rangeIncludesZero(r)
 		:	r.type === 'union'			? r.types.every(m => isTruthy(m, scope))
 		:	r.type === 'intersection'	? r.types.some(m => isTruthy(m, scope))
 		:	['object', 'array', 'tuple', 'function', 'constructor'].includes(r.type);
@@ -255,6 +423,7 @@ export function isBigint(t: Type, scope: Scope): boolean {
 	const r = resolveOwn(t, scope);
 	return r.type === 'ref'		? r.name === 'bigint'
 		: r.type === 'literal'	? typeof r.value === 'bigint'
+		: r.type === 'range'	? r.base === 'bigint'
 		: r.type === 'union'	? r.types.every(m => isBigint(m, scope))
 		: false;
 };
@@ -293,6 +462,7 @@ function isLiteralOnly(t: Type, scope: Scope, depth = 6): boolean | undefined {
 
 export function widenLiterals(t: Type, keepBoolean = false): Type {
 	return	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(typeof t.value)
+		:	t.type === 'range' ? TS.RefType(t.base)
 		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean)))
 		:	t;
 }
@@ -793,6 +963,26 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 		if (src.type === 'intersection' && dst.type !== 'object')
 			return src.types.some(t => recurse(t, dst, depth - 1));
 
+		// A `range` on either side is a narrowed `number`/`bigint`. When `dst` is itself genuinely number/bigint-shaped
+		// (another range, or a plain `number`/`bigint` ref), assignability is precise: does the whole span fit (and,
+		// for an `integer`-flagged destination, is the integer-ness known)? Otherwise -- an unresolved named type, a
+		// structural object, anything `toRange` can't make sense of -- a `range` must be judged exactly like an
+		// ordinary un-narrowed `number`/`bigint` would be, so `src` widens back to its plain base and falls through
+		// to every check below (unresolved-name leniency, structural comparisons, etc.); short-circuiting to `false`
+		// here instead would reject cases a plain `number` src would have passed (e.g. an unresolvable cross-module
+		// type alias, which every other primitive src is leniently waved through here).
+		if (src.type === 'range' || dst.type === 'range') {
+			const sr = toRange(src), dr = toRange(dst);
+			if (dr) {
+				return !!sr && sr.base === dr.base
+					&& (dr.min === undefined || (sr.min !== undefined && sr.min >= dr.min))
+					&& (dr.max === undefined || (sr.max !== undefined && sr.max <= dr.max))
+					&& (!dr.integer || sr.integer);
+			}
+			if (sr)
+				src = sr.base === 'bigint' ? BIGINT : NUMBER;
+		}
+
 		if (dst.type === 'literal')
 			return src.type === 'literal'
 				? src.value === dst.value	// TODO: check template_literal equality
@@ -1155,10 +1345,16 @@ export function stampSig<T extends TS.CallSig>(sig: T, scope: Scope): T {
 
 // `instance` is `new C(...)`/`this`'s type; `value` is the class binding's type (construct sig ∩ static members).
 // `scope`: the class's declaring scope, stamped onto every result `ref` so a member resolved elsewhere still uses it.
-export function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type } {
+export function classShapes(c: TS.Class, scope: Scope, inferInit?: (e: Expr, scope: Scope) => Type | undefined): { instance: Type; value: Type } {
 	const members:			TS.TypeMember[] = [];
 	const staticMembers:	TS.TypeMember[] = [];
 	let ctorParams:			TS.Params | undefined;
+	// Fields needing `inferInit` (below) get their lazy getter installed only *after* this function's own
+	// `stampScope` call at the bottom -- that call already walks every member's `typeAnnotation` once, and
+	// installing the getter before it would make *that* walk the "first read", forcing `inferInit` right
+	// here (still mid-`hoist`, before later-in-file declarations like `__asm` are hoisted) instead of at
+	// whatever later, real, post-hoist read actually asks for this field's type.
+	const pendingFieldInit: { prop: TS.TypeMember; init: Expr }[] = [];
 
 	for (const m of c.body) {
 		if (m.type === 'index_signature') {
@@ -1170,9 +1366,19 @@ export function classShapes(c: TS.Class, scope: Scope): { instance: Type; value:
 
 		const list = hasMod(m, 'static') ? staticMembers : members;
 		switch (m.type) {
-			case 'field':
-				list.push(TS.TypeProperty(m.key, (m.typeAnnotation as Type) ?? ANY, m.modifiers));
+			case 'field': {
+				// No annotation falls back to inferring the initializer's own *widened* type, matching real TS' own field-inference.
+				// Anything else (a call, `new`, ...) is queued into `pendingFieldInit`, resolved once the whole shape (and `hoist`'s later declarations
+				const lit = m.typeAnnotation ? undefined : literalTypeOf(m.value);
+				if (m.typeAnnotation || lit || !m.value || !inferInit) {
+					list.push(TS.TypeProperty(m.key, (m.typeAnnotation as Type) ?? (lit && widenLiterals(lit)) ?? ANY, m.modifiers));
+				} else {
+					const prop = TS.TypeProperty(m.key, ANY, m.modifiers);
+					pendingFieldInit.push({ prop, init: m.value });
+					list.push(prop);
+				}
 				break;
+			}
 			case 'method':
 				if (m.key === 'constructor') {
 					ctorParams = FixParams(m);
@@ -1212,6 +1418,23 @@ export function classShapes(c: TS.Class, scope: Scope): { instance: Type; value:
 	const value = staticMembers.length ? TS.IntersectionType([ctor, TS.ObjectType(staticMembers)]) : ctor;
 	stampScope(instance, scope);
 	stampScope(value, scope);
+
+	// Installed only now, *after* the walks above -- a self-memoizing lazy getter
+	for (const { prop, init } of pendingFieldInit) {
+		let resolving = false;
+		Object.defineProperty(prop, 'typeAnnotation', {
+			configurable: true,
+			enumerable: true,
+			get(): Type {
+				if (resolving)
+					return ANY;
+				resolving = true;
+				const t = stampScope(widenLiterals(inferInit!(init, scope) ?? ANY), scope);
+				Object.defineProperty(prop, 'typeAnnotation', { value: t, writable: true, enumerable: true, configurable: true });
+				return t;
+			},
+		});
+	}
 	return { instance, value };
 }
 
@@ -1523,7 +1746,7 @@ export class Scope {
 	addValue(name: string, type: Type)				{ this.values.set(name, type); }
 	addType(name: string, type: Type, typeParams?: TS.TypeParam[])	{ this.types.set(name, {type, typeParams}); }
 	addNarrowing(name: string, t: Type)				{ (this.narrowings ??= new Map()).set(name, t); }
-	addAlias(d: JS.Var<any>)				{ (this.aliases ??= new Map()).set(d.name, d.init); }
+	addAlias(d: JS.Var<any>)						{ (this.aliases ??= new Map()).set(d.name, d.init); }
 	addNamespace(name: string, s: Scope)			{ (this.namespaces ??= new Map()).set(name, s); }
 
 	mergeType(name: string, type: Type, typeParams: TS.TypeParam[] | undefined) {
@@ -1621,6 +1844,7 @@ export function makeGlobal() {
 		TS.TypeMethod('isArray',	TS.CallSig([JS.Param('a', ANY)], TS.Predicate('a', TS.ArrayType(ANY)))),
 		TS.TypeMethod('of',			TS.CallSig({ params: [], rest: JS.Rest('items', TT) }, TS.ArrayType(TT), TP)),
 	]));
+
 /*
 	global.addValue('BigInt', TS.ObjectType([
 		TS.TypeCall(TS.CallSig([JS.Param('value', TS.UnionType([STRING, NUMBER, BOOLEAN, BIGINT]))], BIGINT)),

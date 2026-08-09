@@ -17,7 +17,7 @@ export function guard<R>(types: string[]) {
 const stmts = ['block', 'var_decl', 'expression', 'empty', 'if', 'do_while', 'while', 'for', 'for_in', 'continue', 'break', 'return', 'with', 'labeled', 'switch', 'throw', 'try', 'debugger', 'function_decl', 'import', 'export', 'export_decl', 'class_decl'];
 
 export const isProgram			= guard<TS.Program|JS.Program<any>>(['program']);
-export const isType				= guard<Type>(['ref', 'literal', 'template_literal', 'this', 'array', 'tuple', 'union', 'intersection', 'function', 'constructor', 'object', 'keyof', 'typeof', 'indexed_access', 'conditional', 'infer', 'mapped', 'predicate']);
+export const isType				= guard<Type>(['ref', 'literal', 'range', 'template_literal', 'this', 'array', 'tuple', 'union', 'intersection', 'function', 'constructor', 'object', 'keyof', 'typeof', 'indexed_access', 'conditional', 'infer', 'mapped', 'predicate']);
 export const isTsDeclaration	= guard<TS.Declaration>(['type_alias_decl', 'interface_decl', 'enum_decl', 'namespace_decl']);
 export const isJsStatement		= guard<JS.Statement<any>>(stmts);
 
@@ -242,6 +242,8 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 			case 'predicate':			return mapObject(type, {assertedType: mapTypeA});
 
 			case 'this':				return type;
+			// no nested `Type` position
+			case 'range':				return type;
 		}
 	};
 
@@ -411,7 +413,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 
 	};
 	const mapStatement		= makeProcess(statement, onStatement, true);
-	const mapExpression		= makeProcess(expression, onExpression);
+	const mapExpression		= makeProcess(expression, onExpression, !!onType);
 	const mapType			= makeProcess(type, onType);
 	const mapTypeMember		= makeProcess(typeMember, onTypeMember, true);
 	const mapClassMember	= makeProcess(classMember, onClassMember, true);

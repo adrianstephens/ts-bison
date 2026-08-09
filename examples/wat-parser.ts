@@ -1,18 +1,26 @@
 import { makeParser, Rules, Rule, List, MaybeList, Maybe, OneOf, Forward } from '../src/tison';
-import { Instr, ValType, Local, GlobalType, TableType, SubType, WasmModule, Import as WasmImport } from '@isopodlabs/binary_libs/wasm';
+import { Instr, ValType, Local, GlobalType, TableType, SubType, WasmModule, Limits, Import as WasmImport } from '@isopodlabs/binary_libs/wasm';
 import { ROOT_OPS, FB_OPS, FC_OPS, SIMD_OPS, THREAD_OPS, equalFuncSig } from '@isopodlabs/binary_libs/wasm';
 
 // ===================================================================
 //  WAT (WebAssembly Text Format) Parser
 // ===================================================================
+// Macros are parsed with the *same* grammar as everything else -- a macro
+// body is just a func body (reuses func_body_item below), so `$a`/`$b`
+// inside it already parse as ordinary local references via the $id
+// shortcut above. Expansion is a semantic substitution over the resulting
+// (already-typed) Instr[] AST at each call site, not a text/syntax pass:
+// - a reference to a declared param is replaced by the caller's own
+//   (already-parsed) argument subtree
+// - a reference to a local the macro declares for itself is renamed to a
+//   fresh name per expansion (hygiene), so two calls to the same macro in
+//   one function can't collide
+// Nested macro calls resolve for free: parsing is bottom-up, so a macro
+// call inside another macro's own body is already fully expanded by the
+// time that outer macro's own `(macro ...)` definition reduces -- nothing
+// stored in the macro table ever contains an unexpanded call.
 
-// --- Terminals ---
-
-const ID		= /\$[a-zA-Z0-9!#$%&'*+\-./:<=>?@\\^_`|~]*/;
-const NAT		= /[0-9]+|0x[0-9a-fA-F]+/;
-const INT		= /[+-]?(?:[0-9]+|0x[0-9a-fA-F]+)/;
-const FLOAT		= /[+-]?(?:inf|nan(?::0x[0-9a-fA-F]+)?|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?|0x[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?(?:[pP][+-]?[0-9]+)?)/;
-const STRING	= /"(?:[^"\\]|\\.)*"/;
+// A call site `(NAME arg...)` where NAME isn't a registered macro is instead treated as an implicit `call`: `($f a b)` === `(call $f a b)`.
 
 // ===================================================================
 //  WAT-only types (not in wasm.ts binary layer)
@@ -20,12 +28,38 @@ const STRING	= /"(?:[^"\\]|\\.)*"/;
 
 export type { Instr, ValType, GlobalType, TableType };
 
+type index = string | number
+
 // wasm.ts Limits is inlined into MemType/TableType; expose a plain shape for WAT
-interface Limits	{ min: number; max?: number }
-interface MemType	{ min: number; max?: number }
+//interface Limits	{ min: number; max?: number }
+//interface MemType	{ min: number; max?: number }
+type MemType	= Limits;
 interface FuncType	{ params: {id?: string; type: ValType}[]; results: ValType[] }
-interface TypeUse	{ typeIndex?: string | number; params: {id?: string; type: ValType}[]; results: ValType[] };
+interface TypeUse	{ typeIndex?: index; params: {id?: string; type: ValType}[]; results: ValType[] };
 interface Imp		{ module: string, name: string };
+
+// A type-parametric local's declared type, before `instantiateAsmBody` substitutes it for a real
+// numeric type -- `$T` is the one recognized placeholder name (a fixed, documented convention, the
+// same `$T` a typed-op reference elsewhere uses; not a general named-type-parameter system, nothing
+// in this codebase needs more than one). Every switch arm can declare locals (see `SwitchArm` below),
+// so `WatLocal.type` has to admit this alongside a real `ValType` -- a func/macro's own locals only
+// ever construct the real-`ValType` half; this placeholder only ever originates from a switch arm,
+// and only ever survives to `toWasm` if that arm's `$T` is never instantiated (a real authoring error
+// `toWasm` itself catches, see its own comment).
+export interface AsmTypeParam { typeParam: string }
+export type WatLocal = Omit<Local, 'type'> & { id?: string; type: ValType | AsmTypeParam };
+
+// A `switch` whose key names a macro parameter can't be resolved at parse time (the macro body is
+// fully reduced before it's ever stored in ctx.macros, long before any call site picks an argument)
+// -- it's left as this placeholder for expandCall's substInstr to resolve per call, once the
+// parameter is actually bound to a caller-supplied $tag. See the `switch` rule below.
+export interface SwitchArm { values: index[]; locals: WatLocal[]; body: WatInstr[] }
+export interface SwitchPlaceholder { op: '__switch'; key: string; arms: SwitchArm[] }
+
+export type WatInstr =
+	| Exclude<Instr, { op: 'block' | 'loop' | 'if' }>
+	| (Extract<Instr, { op: 'block' | 'loop' | 'if' }> & { label?: string })
+	| SwitchPlaceholder;
 
 interface Field<T extends string, V> {
 	type:		T;
@@ -34,34 +68,166 @@ interface Field<T extends string, V> {
 	import?:	Imp;
 	value:		V;
 }
-type Func	= Field<'func', TypeUse> & { locals: Local[]; body: Instr[] }
+type Func	= Field<'func', TypeUse> & { locals: WatLocal[]; body: WatInstr[] }
 type Table	= Field<'table', TableType>
 type Memory	= Field<'memory', MemType>
-type Global	= Field<'global', GlobalType> & { init: Instr[] }
+type Global	= Field<'global', GlobalType> & { init: WatInstr[] }
 
-interface Export	{ type: 'export'; name: string; kind: 'func' | 'table' | 'memory' | 'global'; index: string | number }
+interface Export	{ type: 'export'; name: string; kind: 'func' | 'table' | 'memory' | 'global'; index: index }
 interface Import	{ type: 'import'; module: string; name: string; desc: Func | Table | Memory | Global }
 interface TypeDef	{ type: 'type'; id?: string; functype: FuncType }
-interface Elem		{ type: 'elem'; id?: string; table?: string | number; offset?: Instr[]; init: (string | number)[] }
-interface Data		{ type: 'data'; id?: string; memory?: string | number; offset?: Instr[]; init: string }
-interface Start		{ type: 'start'; func: string | number }
+interface Elem		{ type: 'elem'; id?: string; table?: index; offset?: WatInstr[]; init: index[] }
+interface Data		{ type: 'data'; id?: string; memory?: index; offset?: WatInstr[]; init: Uint8Array }
+interface Start		{ type: 'start'; func: index }
 
 type ModuleField = TypeDef | Func | Table | Memory | Global | Export | Import | Elem | Data | Start;
-interface Module		{ id?: string; fields: ModuleField[] }
+interface Module	{ id?: string; fields: ModuleField[] }
 
 // ===================================================================
 //  Grammar
 // ===================================================================
 
-const id  		= Rules(Rule([ID],  	$ => $[0] as string));
+interface MacroDef { params: string[]; locals: WatLocal[]; body: WatInstr[] }
+
+class ParseCtx {
+	macros			= new Map<string, MacroDef>;
+	pendingLocals:	WatLocal[]	= [];
+	literalText		= new WeakMap<object, string>;
+	macroUid		= 0;
+	data			= new Uint8Array(0);
+	dataStrings		= new Map<string, number>;
+	// External, caller-supplied conditional-assembly symbols for `switch` (e.g. target/feature
+	// flags) -- keyed and valued the same $-prefixed way a `switch` key and its arm tags are
+	// written in source, so a resolved define slots into arm.values.includes(...) unchanged.
+	defines			= new Map<string, string|number>();
+
+	constructor(defines?: Record<string, string|number>) {
+		if (defines)
+			for (const k in defines)
+				this.defines.set('$'+ k, typeof defines[k] === 'string' ? '$' + defines[k] : defines[k]);
+	}
+
+	lookup(id: string) {
+		const x = this.defines.get(id);
+		if (x === 'undefined')
+			return id;
+		return x;
+	}
+
+	addData(data: Uint8Array, align = 1): number {
+		const adjust = this.data.byteLength % align;
+		const offset = this.data.byteLength + (adjust ? align - adjust : 0);
+		const total	= offset + data.byteLength;
+		if (this.data.buffer.byteLength < total) {
+			const buffer = new Uint8Array(Math.max(this.data.buffer.byteLength * 2, total));
+			this.data.set(buffer, 0);
+			this.data = buffer.subarray(0, total);
+		}
+		data.set(this.data, offset);
+		return offset;
+	}
+
+	internString(value: string): number {
+		const existing = this.dataStrings.get(value);
+		if (existing !== undefined)
+			return existing;
+		const offset = this.addData(new TextEncoder().encode(value + '\0'));
+		this.dataStrings.set(value, offset);
+		return offset;
+	}
+
+	expandCall(name: string, args: WatInstr[][]): WatInstr[] {
+		const macro = this.macros.get(name);
+		if (!macro)
+			return [...args.flat(), { op: 'call', funcIndex: name }];
+
+		if (args.length !== macro.params.length)
+			throw new Error(`macro '${name}' expects ${macro.params.length} argument(s), got ${args.length}`);
+
+		const paramSubst	= new Map(macro.params.map((p, i) => [p, args[i]]));
+		// Only named locals need renaming -- an anonymous `(local i32)` has no name a body reference
+		// could collide with, and is left as-is in the locals list below either way.
+		const renames		= new Map(macro.locals.flatMap(l => l.id !== undefined ? [[l.id, `${l.id}__${++this.macroUid}`]] : []));
+
+		const substInstr = (i: any): WatInstr[] => {
+			if (typeof i.localIndex === 'string') {
+				if (paramSubst.has(i.localIndex)) {
+					if (i.op !== 'local.get')
+						throw new Error(`macro '${name}': can't ${i.op} parameter '${i.localIndex}' -- parameters are read-only expressions`);
+					return paramSubst.get(i.localIndex)!;
+				}
+				if (renames.has(i.localIndex))
+					return [{ ...i, localIndex: renames.get(i.localIndex) }];
+			}
+			switch (i.op) {
+				case 'block': case 'loop':
+					return [{ ...i, body: i.body.flatMap(substInstr) }];
+				case 'if':
+					return [{ ...i, then: i.then.flatMap(substInstr), else: i.else && i.else.flatMap(substInstr) }];
+				case '__switch': {
+					// A switch key names one of *this* macro's own parameters: resolve it against the
+					// argument bound at this call site. That argument must itself be a bare `$tag` (the
+					// same shorthand `local.get $x` uses for "read local $x") -- a computed expression
+					// has no tag to switch on.
+					const arg = paramSubst.get(i.key);
+					if (!arg || arg.length !== 1 || arg[0].op !== 'local.get' || typeof arg[0].localIndex !== 'string')
+						throw new Error(`macro '${name}': switch key '${i.key}' isn't a parameter bound to a bare $tag argument at this call site`);
+					const tag = arg[0].localIndex;
+					for (const arm of i.arms) {
+						if (arm.values.includes(tag)) {
+							this.pendingLocals.push(...arm.locals);
+							return arm.body.flatMap(substInstr);
+						}
+					}
+					throw new Error(`macro '${name}': switch '${i.key}' -- no arm matches '${tag}'`);
+				}
+				default:
+					return [i];
+			}
+		};
+
+		this.pendingLocals.push(...macro.locals.map(l => l.id === undefined ? l : { ...l, id: renames.get(l.id)! }));
+
+		return macro.body.flatMap(substInstr);
+	}
+
+}
+
+// --- Terminals ---
+
+const ID		= /\$[a-zA-Z0-9!#$%&'*+\-./:<=>?@\\^_`|~]*/;
+const NAT		= /[0-9]+|0x[0-9a-fA-F]+/;
+const INT		= /[+-]?(?:[0-9]+|0x[0-9a-fA-F]+)/;
+const FLOAT		= /[+-]?(?:inf|nan(?::0x[0-9a-fA-F]+)?|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?|0x[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?(?:[pP][+-]?[0-9]+)?)/;
+// Same shape as FLOAT, but requires an actual decimal point/exponent/inf/nan marker -- unlike
+// FLOAT, it can never match a bare integer. Used only for the literal-instr shortcut below: that
+// rule needs its own terminal disjoint from NAT's, because a terminal that *overlaps* NAT (as
+// FLOAT does, since "3" matches both) can pick the wrong one for a token whose type only turns
+// out to matter several reduces later -- see the shortcut rule's own comment for why.
+const FLOAT_ONLY = /[+-]?(?:inf|nan(?::0x[0-9a-fA-F]+)?|[0-9]+(?:\.[0-9]*(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)|0x[0-9a-fA-F]+(?:\.[0-9a-fA-F]*(?:[pP][+-]?[0-9]+)?|[pP][+-]?[0-9]+))/;
+const STRING	= /"(?:[^"\\]|\\.)*"/;
+
+const id  		= Rules(Rule([ID],  	$ => $[0]));
 const nat 		= Rules(Rule([NAT], 	$ => parseInt($[0], $[0].startsWith('0x') ? 16 : 10)));
-const str 		= Rules(Rule([STRING], 	$ => JSON.parse($[0]) as string));
-
+const str 		= Rules(Rule([STRING], 	$ => JSON.parse($[0]) as string));	// JSON.parse returns any; recover the real type
 const maybe_id	= Maybe(id);
-const idx		= Rules<string | number>(id, nat);
+const idx		= Rules<index>(
+	Rule([ID],  	($, ctx: ParseCtx) => ctx.defines.get($[0]) ?? $[0]),
+	nat
+);
 
-const valtype	= OneOf(['i32', 'i64', 'f32', 'f64', 'v128', 'funcref', 'externref']) as Rules<ValType>;
-const reftype	= OneOf(['funcref', 'externref']) as Rules<ValType>;
+// funcref/externref aren't ValType values on their own -- ValType's reference-type case is the
+// object shape { ref: HeapType, nullable: boolean } (see wasm.ts's VALTYPE_SWITCH); a bare string
+// here would fall through the binary encoder's discriminator (which only special-cases
+// i32/i64/f32/f64 for the string branch) and silently encode as v128.
+const reftype	= Rules<ValType>(
+	Rule(['funcref'],	(): ValType => ({ ref: 'func', nullable: true })),
+	Rule(['externref'],	(): ValType => ({ ref: 'extern', nullable: true })),
+);
+const valtype	= Rules<ValType>(
+	OneOf(['i32', 'i64', 'f32', 'f64', 'v128']),
+	reftype,
+);
 
 const heaptype = Rules(
 	Rule([OneOf(['func', 'extern', 'any', 'eq', 'i31', 'struct', 'array', 'none', 'noextern', 'nofunc', 'exn', 'noexn'])], $ => $[0]),
@@ -69,8 +235,8 @@ const heaptype = Rules(
 );
 
 const param = Rules<{id?: string; type: ValType}>(
-	Rule(['(', 'param', valtype, ')'],		$ => ({ type: $[2] } as const)),
-	Rule(['(', 'param', id, valtype, ')'],	$ => ({ id: $[2], type: $[3] } as const)),
+	Rule(['(', 'param', valtype, ')'],		$ => ({ type: $[2] })),
+	Rule(['(', 'param', id, valtype, ')'],	$ => ({ id: $[2], type: $[3] })),
 );
 const result = Rules<ValType>(
 	Rule(['(', 'result', valtype, ')'],		$ => $[2])
@@ -109,11 +275,14 @@ function checkLabel(open: string | undefined, close: string | undefined) {
 	return open;
 }
 
-const memarg_offset	= Rules<number>(Rule([/offset=[0-9]+/], $ => parseInt(($[0] as string).split('=')[1])));
-const memarg_align	= Rules<number>(Rule([/align=[0-9]+/],  $ => parseInt(($[0] as string).split('=')[1])));
+const memarg_offset	= Rules<number>(Rule([/offset=[0-9]+/], $ => parseInt($[0].split('=')[1])));
+const memarg_align	= Rules<number>(Rule([/align=[0-9]+/],  $ => parseInt($[0].split('=')[1])));
 
-const fwd_instr	= Forward<Instr>(() => instr);
-const instrs	= MaybeList(fwd_instr);
+// `instr` yields a flat Instr[] rather than a single Instr: a folded operand expression like
+// `(i32.mul (local.get $x) (local.get $y))` desugars to the flat postfix sequence
+// [local.get $x, local.get $y, i32.mul], so folding one instr can produce several.
+const fwd_instr	= Forward<WatInstr[]>(() => instr);
+const instrs	= Rules<WatInstr[]>(Rule([MaybeList(fwd_instr)], $ => $[0].flat()));
 
 // blocktype -> wasm BlockType: undefined | ValType | {typeIndex}
 // WAT only supports the valtype form inline; typeIndex form uses typeuse
@@ -121,19 +290,26 @@ const blocktype = Maybe(Rules<ValType>(
 	Rule(['(', 'result', valtype, ')'], $ => $[2]),
 ));
 
-const instr = Rules<Instr>(
+// A few rules below still need `as Instr`: where the op comes from a OneOf(...) with more than 25 values (tsc limit)
+const plain_instr = Rules<WatInstr>(
 	// Block structures: imm=BlockType, body=Instr[], body2=Instr[] (else branch)
 	Rule(['block', maybe_id, blocktype, instrs, 'end', maybe_id],							$ => ({ op: 'block', blockType: $[2], body: $[3], label: checkLabel($[1], $[5]) })),
 	Rule(['loop', maybe_id, blocktype, instrs, 'end', maybe_id],							$ => ({ op: 'loop', blockType: $[2], body: $[3], label: checkLabel($[1], $[5]) })),
 	Rule(['if', maybe_id, blocktype, instrs, 'end', maybe_id],								$ => ({ op: 'if', blockType: $[2], then: $[3], label: checkLabel($[1], $[5]) })),
-	Rule(['if', maybe_id, blocktype, instrs, 'else', maybe_id, instrs, 'end', maybe_id],	$ => ({ op: 'if', blockType: $[2], then: $[3], else: $[6], label: checkLabel($[1], $[8]) })),
+	// No optional repeated label between 'else' and its instrs (unlike 'end'): since the $id
+	// shortcut makes a bare `$x` a valid instr on its own, `else $x ...` is genuinely ambiguous
+	// between "empty else + redundant repeated label" and "else-branch starting with `local.get
+	// $x`" -- and the parser's default shift-preference would silently swallow $x as the label,
+	// leaving the real else-branch content empty. Dropping the rarely-used relabel here removes
+	// the ambiguity outright instead of quietly mis-parsing.
+	Rule(['if', maybe_id, blocktype, instrs, 'else', instrs, 'end', maybe_id],	$ => ({ op: 'if', blockType: $[2], then: $[3], else: $[5], label: checkLabel($[1], $[7]) })),
 
-	Rule(['br_table', List(idx)],		$ => ({ op: 'br_table', labels: ($[1] as (string|number)[]).slice(0, -1), default: ($[1] as (string|number)[]).at(-1)! })),
+	Rule(['br_table', List(idx)],		$ => ({ op: 'br_table', labels: $[1].slice(0, -1), default: $[1].at(-1)! })),
 	Rule(['call_indirect', typeuse],	$ => ({ op: 'call_indirect', typeIndex: $[1].typeIndex ?? 0, tableIndex: 0 })),
 
 	Rule(['memory.size'],				_ => ({ op: 'memory.size', imm: 0 })),
 	Rule(['memory.grow'],				_ => ({ op: 'memory.grow', imm: 0 })),
-	Rule(['select', MaybeList(result)], $ => ($[1].length ? { op: 'select.t', imm: $[1] } : { op: 'select' })),
+	Rule(['select', MaybeList(result)], $ => ($[1].length ? { op: 'select', imm: $[1] } : { op: 'select' })),
 
 	// Numeric constants: imm field
 	Rule(['i32.const', INT],			$ => ({ op: 'i32.const', imm: parseIntImm($[1]) })),
@@ -142,27 +318,33 @@ const instr = Rules<Instr>(
 	Rule(['f64.const', FLOAT],			$ => ({ op: 'f64.const', imm: parseFloat($[1]) })),
 
 	Rule([OneOf(Object.values(ROOT_OPS.NONE))],				$ => ({ op: $[0] } as Instr)),
-	Rule([OneOf(Object.values(ROOT_OPS.INDEX)), idx],		$ => ({ op: $[0], index: $[1] })),
+	Rule([OneOf(Object.values(ROOT_OPS.INDEX.LOCAL)), idx],	$ => ({ op: $[0], localIndex: $[1] })),
+	Rule([OneOf(Object.values(ROOT_OPS.INDEX.GLOBAL)), idx],$ => ({ op: $[0], globalIndex: $[1] })),
+	Rule([OneOf(Object.values(ROOT_OPS.INDEX.TABLE)), idx],	$ => ({ op: $[0], tableIndex: $[1] })),
+	Rule([OneOf(Object.values(ROOT_OPS.INDEX.FUNC)), idx],	$ => ({ op: $[0], funcIndex: $[1] })),
+	Rule([OneOf(Object.values(ROOT_OPS.INDEX.LABEL)), idx],	$ => ({ op: $[0], label: $[1] })),
+
 	Rule([OneOf(Object.values(ROOT_OPS.MEM)), Maybe(memarg_offset), Maybe(memarg_align)], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0 })),
 
 	// 0xFC-prefixed
 	Rule([OneOf(Object.values(FC_OPS.NONE))],				$ => ({ op: $[0] })),
-	Rule([OneOf(Object.values(FC_OPS.INDEX)), idx],			$ => ({ op: $[0], index: $[1] })),
+	Rule(['data.drop', idx],								$ => ({ op: $[0], dataIndex: $[1] })),
+	Rule(['elem.drop', idx],								$ => ({ op: $[0], elemIndex: $[1] })),
+	Rule([OneOf(Object.values(FC_OPS.INDEX.TABLE)), idx],	$ => ({ op: $[0], tableIndex: $[1] })),
 	Rule([OneOf(Object.values(FC_OPS.INDEX2)), idx, idx],	$ => ({ op: $[0], seg: $[1], target: $[2] })),
 
 	// 0xFB-prefixed (GC)
 	Rule([OneOf(Object.values(FB_OPS.NONE))],				$ => ({ op: $[0] })),
 	Rule([OneOf(Object.values(FB_OPS.TYPE)), idx],			$ => ({ op: $[0], typeIndex: $[1] })),
-	Rule([OneOf(Object.values(FB_OPS.ARRAY_NOTYPE)), idx],	$ => ({ op: $[0], typeIndex: $[1] })),
-	Rule([OneOf(Object.values(FB_OPS.ONETYPE_NOIDX)), idx],	$ => ({ op: $[0], typeIndex: $[1] })),
 	Rule([OneOf(Object.values(FB_OPS.TYPE_FIELD)), idx, nat],$ =>({ op: $[0], typeIndex: $[1], field: $[2] })),
 	Rule([OneOf(Object.values(FB_OPS.TYPE_N)), idx, nat], 	$ => ({ op: $[0], typeIndex: $[1], n: $[2] })),
-	Rule([OneOf(Object.values(FB_OPS.TYPE_SEG)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], segIndex: $[2] })),
+	Rule([OneOf(Object.values(FB_OPS.TYPE_SEG.DATA)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], dataIndex: $[2] })),
+	Rule([OneOf(Object.values(FB_OPS.TYPE_SEG.ELEM)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], elemIndex: $[2] })),
 	Rule([OneOf(Object.values(FB_OPS.TYPE2)), idx, idx],	$ => ({ op: $[0], dst: $[1], src: $[2] })),
-	Rule(['ref.test', '(', 'ref', 'null', heaptype, ')'],	$ => ({ op: 'ref.test.nullable', typeIndex: $[4] } as Instr)),
-	Rule(['ref.test', '(', 'ref', heaptype, ')'],			$ => ({ op: 'ref.test',          typeIndex: $[3] } as Instr)),
-	Rule(['ref.cast', '(', 'ref', 'null', heaptype, ')'],	$ => ({ op: 'ref.cast.nullable', typeIndex: $[4] } as Instr)),
-	Rule(['ref.cast', '(', 'ref', heaptype, ')'],			$ => ({ op: 'ref.cast',          typeIndex: $[3] } as Instr)),
+	Rule(['ref.test', '(', 'ref', 'null', heaptype, ')'],	$ => ({ op: 'ref.test', typeIndex: $[4], nullable: true } as Instr)),
+	Rule(['ref.test', '(', 'ref', heaptype, ')'],			$ => ({ op: 'ref.test', typeIndex: $[3] } as Instr)),
+	Rule(['ref.cast', '(', 'ref', 'null', heaptype, ')'],	$ => ({ op: 'ref.cast', typeIndex: $[4], nullable: true } as Instr)),
+	Rule(['ref.cast', '(', 'ref', heaptype, ')'],			$ => ({ op: 'ref.cast', typeIndex: $[3] } as Instr)),
 
 	// 0xFD-prefixed (SIMD)
 	Rule([OneOf(Object.values(SIMD_OPS.NONE))], 			$ => ({ op: $[0] } as Instr)),
@@ -173,21 +355,164 @@ const instr = Rules<Instr>(
 	// 0xFE-prefixed (threads)
 	Rule([OneOf(Object.values(THREAD_OPS.MEM)), Maybe(memarg_offset), Maybe(memarg_align)], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0 } as Instr)),
 	Rule(['atomic.fence'], _ => ({ op: 'atomic.fence' })),
+);
 
-	// Folded (s-expression) form
-	Rule(['(', fwd_instr, ')'], $ => $[1]),
+// A switch arm's own item list -- locals (including a `$T`-typed placeholder, e.g. `(local $x $T)`,
+// the same convention a typed-op reference like `$T.rem_s` uses) plus instrs, exactly what a
+// func/macro body's own item list holds, widened by the one alternative real func/macro locals never
+// need. Shared by every switch arm, in both parsers: a plain conditional-assembly switch never
+// declares locals in practice, but there's no reason to forbid it, and a type-generic one (what
+// `(switch $T (i32 i64) (...) (f32 f64) (...))`-style conditional assembly needs, e.g. `%`'s own
+// `__towasm_mod`) genuinely does. `instr`'s own alternative uses `fwd_instr`, not `instr` directly,
+// since `instr` (below) is itself built from `switch_arm`, which is built from this.
+type AsmBodyItem = ({ kind: 'local' } & WatLocal) | { kind: 'instr'; value: WatInstr[] };
+
+const asm_body_item = Rules<AsmBodyItem>(
+	Rule(['(', 'local', valtype, ')'],			$ => ({ kind: 'local', count: 1, type: $[2] })),
+	Rule(['(', 'local', id, valtype, ')'],		$ => ({ kind: 'local', id: $[2], count: 1, type: $[3] })),
+	Rule(['(', 'local', id, id, ')'],			$ => ({ kind: 'local', id: $[2], count: 1, type: { typeParam: $[3] } })),
+	Rule([fwd_instr],							$ => ({ kind: 'instr', value: $[0] })),
+);
+
+function collectAsmItems(items: readonly AsmBodyItem[], ctx: ParseCtx): { locals: WatLocal[]; body: WatInstr[] } {
+	const locals: WatLocal[] = [];
+	const body: WatInstr[] = [];
+	for (const item of items) {
+		if (item.kind === 'local')
+			locals.push({ id: item.id, count: item.count, type: item.type });
+		else
+			body.push(...item.value);
+	}
+	locals.push(...ctx.pendingLocals);
+	ctx.pendingLocals = [];
+	return { locals, body };
+}
+
+// Body items sit directly after the tag(s), not behind their own extra wrapping parens (unlike the
+// old typecase_arm's `(TYPES) (items...)` this replaces) -- one paren pair per arm, matching how
+// `func_body_item`/`macro_field` already nest their own item lists directly inside a single paren
+// pair rather than double-wrapping them.
+const switch_arm = Rules<SwitchArm>(
+	Rule(['(', id, MaybeList(asm_body_item), ')'], ($, ctx: ParseCtx) => ({ values: [$[1]], ...collectAsmItems($[2], ctx) })),
+	Rule(['(', '(', MaybeList(id), ')', MaybeList(asm_body_item), ')'], ($, ctx: ParseCtx) => ({ values: $[2], ...collectAsmItems($[4], ctx) })),
+);
+
+const instr = Rules<WatInstr[]>(
+	Rule([plain_instr], $ => [$[0]]),
+
+	// Folded (s-expression) form: '(' op operand* ')', where each operand is itself a folded
+	// instr. Desugars to the flat postfix sequence: operands (in order), then op. A direct
+	// operand that's just a bare-number shortcut gets retyped to match `op`'s own numeric type
+	// (e.g. `(i64.add 3 4)` -> i64.const, not i32.const; `(f32.add 3 4)` -> f32.const).
+	Rule(['(', plain_instr, MaybeList(fwd_instr), ')'], ($, ctx: ParseCtx) => {
+		const op = $[1];
+		const prefix = op.op.split('.')[0];
+		return [...$[2].map(seq => {
+			const text = seq.length === 1 ? ctx.literalText.get(seq[0]) : undefined;
+			if (text === undefined)
+				return seq;
+			const isFloatLit = seq[0].op === 'f64.const';
+			switch (prefix) {
+				case 'i64':
+					if (isFloatLit)
+						throw new Error(`float literal '${text}' can't be used as i64 -- it's not an exact integer`);
+					return [{ op: 'i64.const', imm: BigInt(text) } as const];
+				case 'i32':
+					if (isFloatLit)
+						throw new Error(`float literal '${text}' can't be used as i32 -- it's not an exact integer`);
+					return seq;
+				case 'f32':
+					return [{ op: 'f32.const', imm: isFloatLit ? (seq[0] as { imm: number }).imm : parseFloat(text) } as const];
+				case 'f64':
+					return isFloatLit ? seq : [{ op: 'f64.const', imm: parseFloat(text) } as const];
+				default:
+					return seq;
+			}
+		}).flat(), op];
+	}),
+
+	// Convenient shortcuts (ala WAM): a bare number where an instr is expected defaults to
+	// i32.const (looks like a plain int) or f64.const (has a decimal point/exponent, or is
+	// inf/nan); as a direct operand of a folded op, the rule above retypes it to match. An
+	// int-shaped literal can become i32/i64/f32/f64.const (an exact integer fits any of them);
+	// a float-shaped one only f32/f64.const. literalText keeps the original source text
+	// alongside the default-typed Instr so retyping to i64 stays lossless -- a JS `number`
+	// (what `imm` holds here) can't exactly represent every 64-bit integer literal.
+	//
+	// Two separate, non-overlapping terminals (NAT and FLOAT_ONLY) rather than one shared
+	// "numeric literal" terminal covering both shapes: a terminal that can match *either* a
+	// plain int or a float (like FLOAT) can have its token type fixed by the lexer before the
+	// parser reduces far enough to discover only one of the two shapes was actually valid at
+	// this position -- LALR merges states with identical cores regardless of which rule they
+	// came from, so a state several reduces downstream needing specifically a float can still be
+	// reached through an earlier, shared reduce-only state where either type looked fine.
+	Rule([NAT], ($, ctx: ParseCtx) => {
+		const text = $[0];
+		const c: Instr = { op: 'i32.const', imm: Number(BigInt(text)) };
+		ctx.literalText.set(c, text);
+		return [c];
+	}),
+	Rule([FLOAT_ONLY], ($, ctx: ParseCtx) => {
+		const text = $[0];
+		const c: Instr = { op: 'f64.const', imm: parseFloat(text) };
+		ctx.literalText.set(c, text);
+		return [c];
+	}),
+
+	// A bare $id where an instr is expected means "read that local", so
+	// `(i32.mul $x $y)` is shorthand for `(i32.mul (local.get $x) (local.get $y))`.
+	Rule([id], ($, ctx: ParseCtx) => [{ op: 'local.get', localIndex: ctx.defines.get($[0]) ?? $[0] }]),
+
+	// A bare string literal where an instr is expected interns it into the module's data section
+	// (deduplicated) and pushes its byte offset: `"hi"` is shorthand for declaring a NUL-
+	// terminated data segment holding `"hi"` and pushing an i32.const of its offset -- NUL-
+	// terminated rather than offset+length since there's no statically-known length here to push
+	// a second value for anyway (strings might later be built dynamically). If the module never
+	// declares its own `(memory ...)`, moduleRule below synthesizes one.
+	Rule([str], ($, ctx: ParseCtx) => [{ op: 'i32.const', imm: ctx.internString($[0]) }]),
+	Rule(['STATIC_ARRAY', nat], ($, ctx: ParseCtx) => [{ op: 'i32.const', imm: ctx.addData(new Uint8Array($[1])) }]),
+	Rule(['STATIC_ARRAY', nat, nat], ($, ctx: ParseCtx) => [{ op: 'i32.const', imm: ctx.addData(new Uint8Array($[1]), $[2]) }]),
+
+	// Macro call / implicit call: '(' $name arg* ')'. Any locals the macro declares for itself
+	// can't be returned from here (this rule only produces Instr[]) -- they're queued on
+	// ctx.pendingLocals for the enclosing func/macro body to pick up once it closes.
+	Rule(['(', id, MaybeList(fwd_instr), ')'], ($, ctx: ParseCtx) => ctx.expandCall($[1], $[2])),
+
+	// `(switch $key (tag... (body)) ...)`: conditional assembly. `$key` is a *name*, not a value --
+	// looked up in ctx.defines (an external, caller-supplied define set) if present there, and
+	// matched against each arm's tags. If `$key` isn't a known define, it may still name one of the
+	// enclosing macro's own parameters, but that can't be resolved here: this reduce runs while the
+	// macro body is still being parsed, long before any call site picks an argument for it. In that
+	// case, defer by returning a placeholder for expandCall's substInstr to resolve per call (see
+	// its '__switch' case) -- and if it's neither a define nor ever resolved via a macro call, it
+	// reaches toWasm's resolveInstr unresolved, which throws. A winning arm's own locals (e.g. a
+	// `$T`-generic one -- see instantiateAsmBody) are queued on ctx.pendingLocals same as a macro
+	// call's, for the enclosing func/macro body to pick up once it closes.
+	Rule(['(', 'switch', id, MaybeList(switch_arm), ')'], ($, ctx: ParseCtx) => {
+		const key = $[2];
+		const tag = ctx.defines.get(key);
+		if (tag === undefined)
+			return [{ op: '__switch', key, arms: $[3] }];
+		for (const arm of $[3]) {
+			if (arm.values.includes(tag)) {
+				ctx.pendingLocals.push(...arm.locals);
+				return arm.body;
+			}
+		}
+		throw new Error(`switch '${key}': no arm matches '${tag}'`);
+	}),
 );
 
 
 // --- Module fields ---
 
 const inline_export = Rules(Rule(['(', 'export', str, ')'],			$ => $[2]));
-const inline_import = Rules(Rule(['(', 'import', str, str, ')'],	$ => ({module: $[2], name: $[3]} as const)));
+const inline_import = Rules(Rule(['(', 'import', str, str, ')'],	$ => ({module: $[2], name: $[3]})));
 
 type FuncHeaderItem =
 	| { kind: 'export'; name: string }
 	| { kind: 'import'; module: string; name: string }
-	| { kind: 'type'; typeIdx: string | number }
+	| { kind: 'type'; typeIdx: index }
 	| { kind: 'param'; id?: string; type: ValType }
 	| { kind: 'result'; type: ValType }
 	| { kind: 'local'; id?: string; count: number; type: ValType };
@@ -207,10 +532,10 @@ const func_header = Rules(
 	Rule([MaybeList(func_header_item)], $ => {
 		const exports: string[] = [];
 		let imp: Imp | undefined;
-		let typeIndex: string | number | undefined;
+		let typeIndex: index | undefined;
 		const params: { id?: string; type: ValType }[] = [];
 		const results: ValType[] = [];
-		const locals: Local[] = [];
+		const locals: WatLocal[] = [];
 
 		for (const item of $[0]) {
 			switch (item.kind) {
@@ -219,7 +544,7 @@ const func_header = Rules(
 				case 'type':	typeIndex = item.typeIdx; break;
 				case 'param':	params.push({ id: item.id, type: item.type }); break;
 				case 'result':	results.push(item.type); break;
-				case 'local':	locals.push({ id: item.id, count: item.count, type: item.type } as any); break;
+				case 'local':	locals.push({ id: item.id, count: item.count, type: item.type }); break;
 			}
 		}
 		return {
@@ -231,10 +556,54 @@ const func_header = Rules(
 	})
 );
 
+// A plain MaybeList(func_header_item) followed by `instrs` is ambiguous for an LALR(1) parser:
+// both a header item (e.g. `(param ...)`) and a folded instr (e.g. `(i32.mul ...)`) start with
+// '(', so at "end of header / start of body" the parser can't decide whether to keep matching
+// header items or start on instrs using only one token of lookahead. Folding header items and
+// body instrs into a single list sidesteps the ambiguity: there's no more list-to-list boundary,
+// just per-item alternatives (disambiguated by the token after '(', same as header items already
+// are from each other), so a func body consisting entirely of folded instrs now parses correctly.
+type FuncBodyItem = FuncHeaderItem | { kind: 'instr'; value: WatInstr[] };
+
+// Macro calls are recognized once, on `instr` itself (see the comment by ParseCtx above) -- any
+// locals a called macro declares arrive here via ctx.pendingLocals, drained below, not through a
+// separate func_body_item alternative.
+const func_body_item = Rules<FuncBodyItem>(
+	Rule([func_header_item],	$ => $[0]),
+	Rule([fwd_instr],			$ => ({ kind: 'instr', value: $[0] })),
+);
+
 const func_field = Rules<Func>(
-	Rule(['(', 'func', maybe_id, func_header, instrs, ')'], $ => {
-		const h = $[3];
-		return { type: 'func', id: $[2], export: h.export, import: h.import, value: h.typeuse, locals: h.locals, body: $[4] };
+	Rule(['(', 'func', maybe_id, MaybeList(func_body_item), ')'], ($, ctx: ParseCtx) => {
+		const exports: string[] = [];
+		let imp: Imp | undefined;
+		let typeIndex: index | undefined;
+		const params: { id?: string; type: ValType }[] = [];
+		const results: ValType[] = [];
+		const locals: WatLocal[] = [];
+		const body: WatInstr[] = [];
+
+		for (const item of $[3]) {
+			switch (item.kind) {
+				case 'export':	exports.push(item.name); break;
+				case 'import':	imp = { module: item.module, name: item.name }; break;
+				case 'type':	typeIndex = item.typeIdx; break;
+				case 'param':	params.push({ id: item.id, type: item.type }); break;
+				case 'result':	results.push(item.type); break;
+				case 'local':	locals.push({ id: item.id, count: item.count, type: item.type }); break;
+				case 'instr':	body.push(...item.value); break;
+			}
+		}
+		locals.push(...ctx.pendingLocals);
+		ctx.pendingLocals = [];
+		return {
+			type: 'func', id: $[2],
+			export: exports.length ? exports : undefined,
+			import: imp,
+			value: { typeIndex, params, results },
+			locals,
+			body,
+		};
 	}),
 );
 
@@ -250,14 +619,22 @@ const memory_field = Rules<Memory>(
 	Rule(['(', 'memory', maybe_id, limits, ')'], 					$ => ({ type: 'memory', id: $[2], value: $[3] })),
 );
 
+// Global init exprs and elem/data offset exprs are wasm "constant expressions": no locals are
+// ever valid there, so a locals-declaring macro used inside one is a real error, not something
+// to silently hoist anywhere -- there's no enclosing func for ctx.pendingLocals to drain into.
+function assertNoPendingLocals(ctx: ParseCtx, where: string) {
+	if (ctx.pendingLocals.length)
+		throw new Error(`${where}: can't use a macro that declares its own locals (${ctx.pendingLocals.map(l => l.id).join(', ')}) here -- only func/macro bodies can hold locals`);
+}
+
 const global_field = Rules<Global>(
-	Rule(['(', 'global', maybe_id, inline_export, globaltype, instrs, ')'], $ => ({ type: 'global', id: $[2], export: [$[3]], value: $[4], init: $[5] })),
+	Rule(['(', 'global', maybe_id, inline_export, globaltype, instrs, ')'], ($, ctx: ParseCtx) => { assertNoPendingLocals(ctx, 'global'); return { type: 'global', id: $[2], export: [$[3]], value: $[4], init: $[5] }; }),
 	Rule(['(', 'global', maybe_id, inline_import, globaltype, ')'],	$ => ({ type: 'global', id: $[2], import: $[3], value: $[4], init: [] })),
-	Rule(['(', 'global', maybe_id, globaltype, instrs, ')'],		$ => ({ type: 'global', id: $[2], value: $[3], init: $[4] })),
+	Rule(['(', 'global', maybe_id, globaltype, instrs, ')'],		($, ctx: ParseCtx) => { assertNoPendingLocals(ctx, 'global'); return { type: 'global', id: $[2], value: $[3], init: $[4] }; }),
 );
 
 const export_field = Rules<Export>(
-	Rule(['(', 'export', str, '(', OneOf(['func', 'table', 'memory', 'global']), ')'], $ => ({ type: 'export', name: $[2], kind: $[4], index: $[5] })),
+	Rule(['(', 'export', str, '(', OneOf(['func', 'table', 'memory', 'global']), idx, ')', ')'], $ => ({ type: 'export', name: $[2], kind: $[4], index: $[5] })),
 );
 
 const import_desc = Rules<Func | Table | Memory | Global>(
@@ -267,24 +644,58 @@ const import_desc = Rules<Func | Table | Memory | Global>(
 	Rule(['(', 'global', maybe_id, globaltype, ')'],				$ => ({ type: 'global', id: $[2], value: $[3], init: [] })),
 );
 
-const offset_expr = Rules<Instr[]>(
-	Rule(['(', 'offset', instrs, ')'], $ => $[2]),
-	Rule([fwd_instr], $ => [$[0]]),
+// Both alternatives require their own wrapping parens (`(offset ...)` or bare `(...)`, never a
+// naked instr with no parens at all) precisely so this can never sit directly against whatever
+// follows it in elem_field/data_field (a MaybeList(idx) or MaybeList(str)) with nothing to mark
+// where the offset ends -- a bare, unparenthesized single instr here (e.g. `i32.add` with no
+// operands, since ROOT_OPS.NONE ops don't grab trailing tokens without folded parens) would
+// desugar `(elem $t i32.add 5 6)` into offset=[i32.add], init=[5,6], with "5 6" silently
+// swallowed as elem's own index list rather than i32.add's operands -- syntactically legal,
+// semantically nonsense, and exactly the kind of position that forced NAT into the follow set of
+// every instr-ending state in the grammar (see the retyping/shortcut rules above).
+const offset_expr = Rules<WatInstr[]>(
+	Rule(['(', 'offset', instrs, ')'], ($, ctx: ParseCtx) => { assertNoPendingLocals(ctx, 'offset'); return $[2]; }),
+	Rule(['(', fwd_instr, ')'], ($, ctx: ParseCtx) => { assertNoPendingLocals(ctx, 'offset'); return $[1]; }),
 );
 
 const elem_field = Rules<Elem>(
-	Rule(['(', 'elem', maybe_id, '(', 'table', idx, ')', offset_expr, reftype, MaybeList(idx), ')'],	$ => ({ type: 'elem', id: $[2], table: $[5], offset: $[7], init: $[9] } as Elem)),
-	Rule(['(', 'elem', maybe_id, offset_expr, MaybeList(idx), ')'],										$ => ({ type: 'elem', id: $[2], offset: $[3], init: $[4] } as Elem)),
-	Rule(['(', 'elem', maybe_id, MaybeList(idx), ')'],													$ => ({ type: 'elem', id: $[2], init: $[3] } as Elem)),
+	Rule(['(', 'elem', maybe_id, '(', 'table', idx, ')', offset_expr, reftype, MaybeList(idx), ')'],	$ => ({ type: 'elem', id: $[2], table: $[5], offset: $[7], init: $[9] })),
+	Rule(['(', 'elem', maybe_id, offset_expr, MaybeList(idx), ')'],										$ => ({ type: 'elem', id: $[2], offset: $[3], init: $[4] })),
+	Rule(['(', 'elem', maybe_id, MaybeList(idx), ')'],													$ => ({ type: 'elem', id: $[2], init: $[3] })),
 );
 
 const data_field = Rules<Data>(
-	Rule(['(', 'data', maybe_id, '(', 'memory', idx, ')', offset_expr, MaybeList(str), ')'],			$ => ({ type: 'data', id: $[2], memory: $[5], offset: $[7], init: ($[8] as string[]).join('') })),
-	Rule(['(', 'data', maybe_id, offset_expr, MaybeList(str), ')'],										$ => ({ type: 'data', id: $[2], offset: $[3], init: ($[4] as string[]).join('') })),
-	Rule(['(', 'data', maybe_id, MaybeList(str), ')'],													$ => ({ type: 'data', id: $[2], init: ($[3] as string[]).join('') })),
+	Rule(['(', 'data', maybe_id, '(', 'memory', idx, ')', offset_expr, MaybeList(str), ')'],			$ => ({ type: 'data', id: $[2], memory: $[5], offset: $[7], init: new TextEncoder().encode($[8].join('')) })),
+	Rule(['(', 'data', maybe_id, offset_expr, MaybeList(str), ')'],										$ => ({ type: 'data', id: $[2], offset: $[3], init: new TextEncoder().encode($[4].join('')) })),
+	Rule(['(', 'data', maybe_id, MaybeList(str), ')'],													$ => ({ type: 'data', id: $[2], init: new TextEncoder().encode($[3].join('')) })),
 );
 
-const module_field = Rules<ModuleField>(
+// `(macro NAME (param $a $b ...) body...)`: not a real module field (produces nothing in the
+// output), just registers into ctx.macros as a side effect and disappears. Its body is parsed
+// with the same func_body_item list a func uses, so `(local ...)` declarations inside a macro
+// work the same way they do in a func body.
+const macro_params = Maybe(Rules<string[]>(Rule(['(', 'param', MaybeList(id), ')'], $ => $[2])));
+
+const macro_field = Rules<undefined>(
+	Rule(['(', 'macro', id, macro_params, MaybeList(func_body_item), ')'], ($, ctx: ParseCtx) => {
+		const locals: WatLocal[] = [];
+		const body: WatInstr[] = [];
+		for (const item of $[4]) {
+			if (item.kind === 'local')
+				locals.push({ id: item.id, count: item.count, type: item.type });
+			else if (item.kind === 'instr')
+				body.push(...item.value);
+			else
+				throw new Error(`macro '${$[2]}': '${item.kind}' isn't meaningful inside a macro body`);
+		}
+		locals.push(...ctx.pendingLocals);
+		ctx.pendingLocals = [];
+		ctx.macros.set($[2], { params: $[3] ?? [], locals, body });
+		return undefined;
+	}),
+);
+
+const module_field = Rules<ModuleField | undefined>(
 	Rule(['(', 'type', maybe_id, functype, ')'],		$ => ({ type: 'type', id: $[2], functype: $[3] })),
 	func_field,
 	table_field,
@@ -295,21 +706,148 @@ const module_field = Rules<ModuleField>(
 	elem_field,
 	data_field,
 	Rule(['(', 'start', idx, ')'], 						$ => ({ type: 'start', func: $[2] })),
+	macro_field,
 );
 
-const module = Rules<Module>(
-	Rule(['(', 'module', maybe_id, MaybeList(module_field), ')'],	$ => ({ id: $[2], fields: $[3] })),
-	Rule([MaybeList(module_field)],									$ => ({ fields: $[0] })),
-);
+// Filters out macro definitions (never real fields, see macro_field), then drains any interned
+// string literals into a synthesized data segment -- and a synthesized default memory too, if
+// the module didn't declare its own, since a data segment needs one to target.
+function definedFields($: (ModuleField | undefined)[], ctx: ParseCtx): ModuleField[] {
+	const fields = $.filter((f): f is ModuleField => f !== undefined);
+	if (ctx.data) {
+		if (!fields.some(f => f.type === 'memory'))
+			fields.push({ type: 'memory', value: { min: 1 } });
+		fields.push({ type: 'data', offset: [{ op: 'i32.const', imm: 0 }], init: ctx.data });
+	}
+	return fields;
+}
 
-export const watParser = makeParser({
-	skip: [/\s+/, /;;[^\n]*/, /\(;[^]*?;\)/],
-	start: module,
-	rules: { watModule: module },
+const SKIP = [/\s+/, /;;[^\n]*/, /\(;[^]*?;\)/];
+
+export const parser = makeParser({
+	skip: SKIP,
+	start: Rules<Module>(
+		Rule(['(', 'module', maybe_id, MaybeList(module_field), ')'],	($, ctx: ParseCtx) => ({ id: $[2], fields: definedFields($[3], ctx) })),
+		Rule([MaybeList(module_field)],									($, ctx: ParseCtx) => ({ fields: definedFields($[0], ctx) })),
+	)
 });
 
-export function parse(wat: string): WasmModule {
-	const mod	= watParser.parse(wat);
+export function parseWat(src: string, defines?: Record<string, string|number>): Module {
+	return parser.parse(src, new ParseCtx(defines));
+}
+
+//-----------------------------------------------------------------------------
+//	inline parser
+//-----------------------------------------------------------------------------
+
+// A second parser, for callers that only have a bare instruction sequence, not a whole module -- e.g.
+// towasm.ts's inline-asm strings, which are WAT text but never wrapped in `(module (func ...))`. Shares
+// every rule this transitively depends on (`plain_instr`, `instr`, macro-call handling, `asm_body_item`,
+// ...) with the main grammar; LALR table construction is per-parser, not shared, but that's a one-time
+// module-load cost, same as building `parser` itself.
+//
+// Doesn't run `toWasm`'s own `resolveInstr` pass (block/loop/if label resolution, local name->index
+// resolution, macro-locals draining into an enclosing func) -- there's no enclosing module/func here for
+// any of that to resolve against. Callers that need a real `Instr[]` are on the hook for known-flat
+// snippets themselves (no `block`/`loop`/`if`, the only shapes `WatInstr` and `Instr` differ on), and for
+// resolving `WatLocal.id` to a real index themselves (see towasm.ts's `resolveAsmLocals`).
+
+export interface GenericAsmBody { locals: WatLocal[]; body: WatInstr[] }
+export type ParsedAsmBody = GenericAsmBody;
+
+const asmBody = Rules<ParsedAsmBody>(
+	Rule([MaybeList(asm_body_item)], ($, ctx: ParseCtx) => collectAsmItems($[0], ctx)),
+);
+
+const asmBodyParser = makeParser({
+	skip: SKIP,
+	start: asmBody,
+	rules: { watAsmBody: asmBody },
+});
+
+// Parses *once* into a body that may still hold `$T` placeholders -- a type-parametric local (`(local $x
+// $T)`, real grammar, see `asm_body_item` above) and/or a typed-op reference (`$T.rem_s`: no new grammar at
+// all -- `$id` already lexes `.` as an ordinary identifier character, so it's just the existing bare-`$id`
+// "local.get shortcut" rule producing `{op:'local.get', localIndex:'$T.rem_s'}`; `instantiateAsmBody` below
+// is what gives that a different meaning) -- or, if the whole body is one `(typecase ...)`, a set of arms
+// each already explicit about which types they're for. Never reparsed per candidate type -- see
+// `instantiateAsmBody`.
+export function parseAsmBody(src: string, defines?: Record<string, string|number>) {
+	return asmBodyParser.parse(src, new ParseCtx(defines));
+}
+
+// Whether a `parseAsmBody` result is `$T`-generic -- real conditional assembly, requires a top-level
+// `(switch $T ...)` declaring exactly which types it's for (see the `switch` rule's own comment); a
+// bare `$T.<suffix>`/`(local $x $T)` with no enclosing switch has nothing to say which types it's
+// valid for, so it's not treated as generic at all -- it falls through to the fixed path, where
+// `assertConcreteLocals`/`assertFlatInstrs` (towasm.ts) reject the stray `$T` with a clear message
+// instead of silently guessing.
+export function isTypeGeneric(generic: GenericAsmBody): boolean {
+	return generic.body.some(i => i.op === '__switch' && i.key === '$T');
+}
+
+// Every no-immediate instruction mnemonic (`i32.rem_s`, `f64.sqrt`, ...) -- the real, closed set a typed-op
+// reference's *composed* name (`${type}.${suffix}`) is checked against below, explicit membership, not
+// "substitute the text and see if the parser throws".
+const NUMERIC_OP_NAMES = new Set<string>(Object.values(ROOT_OPS.NONE));
+
+// Instantiates a `parseAsmBody` result for one concrete numeric type -- real substitution over the already-
+// parsed tree (a type-parametric local's `.type`, and a `$T.suffix` op's *whole* `{op:'local.get',
+// localIndex}` node get replaced outright, not text-patched), returning `undefined` if `type` doesn't
+// actually have every op this body's typed-op references need (e.g. `'$T.rem_s'` instantiates for `i32`/
+// `i64` -- `i32.rem_s` is real -- but not `f32`/`f64`, since neither `f32.rem_s` nor `f64.rem_s` exist), or
+// if it isn't one of the types a `$T`-keyed switch it runs into actually has an arm for. A real local
+// reference (any name other than exactly `$T.<suffix>`) passes through untouched -- still unresolved by
+// name, same as before (see towasm.ts's `resolveAsmLocals`, the *other* substitution pass, over the
+// caller's own real function once one exists to resolve local names against).
+export function instantiateAsmBody(generic: GenericAsmBody, type: 'i32' | 'i64' | 'f32' | 'f64'): { locals: WatLocal[]; body: WatInstr[] } | undefined {
+	const locals: WatLocal[] = [];
+	const body: WatInstr[] = [];
+
+	const addLocals = (ls: WatLocal[]) => locals.push(...ls.map(l => ({
+		id:		l.id,
+		count:	l.count,
+		type:	typeof l.type === 'object' && 'typeParam' in l.type ? type : l.type,
+	})));
+
+	// A `$T`-keyed switch's winning arm can itself declare `$T`-typed locals and further `$T.suffix`
+	// references -- processed by recursing back into this same walk, exactly as if the arm's own
+	// {locals, body} were the whole generic body.
+	function process(items: WatInstr[]): boolean {
+		for (const i of items) {
+			if (i.op === 'local.get' && typeof i.localIndex === 'string' && i.localIndex.startsWith('$T.')) {
+				const opName = `${type}.${i.localIndex.slice('$T.'.length)}`;
+				if (!NUMERIC_OP_NAMES.has(opName))
+					return false;
+				// `opName`'s membership in `NUMERIC_OP_NAMES` -- real op names, not arbitrary strings -- is
+				// a genuine runtime check just above, not a bare assertion; `WatInstr` can't itself express
+				// "any member of this specific Set" as a type, so this cast is the same
+				// discriminated-by-real-check shape `bin.Switch`'s own dispatch already relies on elsewhere.
+				body.push({ op: opName } as WatInstr);
+			} else if (i.op === '__switch' && i.key === '$T') {
+				const tag = `$${type}`;
+				const arm = i.arms.find(a => a.values.includes(tag));
+				if (!arm)
+					return false;
+				addLocals(arm.locals);
+				if (!process(arm.body))
+					return false;
+			} else {
+				body.push(i);
+			}
+		}
+		return true;
+	}
+
+	addLocals(generic.locals);
+	return process(generic.body) ? { locals, body } : undefined;
+}
+
+//-----------------------------------------------------------------------------
+//	toWasm
+//-----------------------------------------------------------------------------
+
+export function toWasm(mod: Module): WasmModule {
 	const rawExports: { name: string; kind: 'func' | 'table' | 'memory' | 'global'; index: any }[] = [];
 	const imports: WasmImport[] = [];
 
@@ -325,7 +863,7 @@ export function parse(wat: string): WasmModule {
 			return typeof v === 'number' ? v : (v && this.ids[v] !== undefined ? this.ids[v] : (v ? parseInt(String(v).replace(/^\$/, '')) || d : d));
 		}
 	}
-	class Table2<T extends Func|Table|Memory|Global> extends IDTable {
+	class Container<T extends Func|Table|Memory|Global> extends IDTable {
 		entries:	T[] = [];
 		addExp(item: T) {
 			item.export?.forEach(e => rawExports.push({ name: e, kind: item.type, index: this.num }));
@@ -346,10 +884,10 @@ export function parse(wat: string): WasmModule {
 	const types		= new IDTable;
 	const elems		= new IDTable;
 	const datas		= new IDTable;
-	const funcs		= new Table2<Func>;
-	const tables	= new Table2<Table>;
-	const memories	= new Table2<Memory>;
-	const globals	= new Table2<Global>;
+	const funcs		= new Container<Func>;
+	const tables	= new Container<Table>;
+	const memories	= new Container<Memory>;
+	const globals	= new Container<Global>;
 	const typesList: SubType[] = [];
 
 	const allTables = {
@@ -357,16 +895,9 @@ export function parse(wat: string): WasmModule {
 		table:	tables,
 		memory:	memories,
 		global:	globals,
-	} as const;
-
-	const resLabel = (v: any, stk: (string | undefined)[]) => {
-		if (typeof v === 'number')
-			return v;
-		const i = stk.lastIndexOf(v);
-		return i >= 0 ? stk.length - 1 - i : (v ? parseInt(String(v).replace(/^\$/, '')) || 0 : 0);
 	};
 
-	function getTypeIdx(tu: TypeUse): number {
+	function getFuncTypeIdx(tu: TypeUse): number {
 		if (tu.typeIndex !== undefined)
 			return types.res(tu.typeIndex);
 		const sig = {kind: 'func', params: tu.params.map(p => p.type), results: tu.results} as const;
@@ -378,52 +909,70 @@ export function parse(wat: string): WasmModule {
 		return idx;
 	}
 
-	function resolveInstr(i: Instr, locals: IDTable, stk: (string | undefined)[]): Instr {
-		const op = i.op;
+	function resolveField(i: any, name: string, table: {res: (v: any) => number}) {
+		if (name in i)
+			i[name]	= table.res(i[name]);
+	}
+
+	// A `$T`-typed local only ever originates from a switch arm (see `WatLocal`'s own comment) -- one
+	// still carrying it here means whatever `switch` produced it was never resolved against a concrete
+	// type (only `instantiateAsmBody`, an inline-asm-only pass, ever does that), a real authoring error
+	// rather than something to silently pass through to the binary encoder.
+	function concreteLocalType(l: WatLocal): ValType {
+		if (typeof l.type === 'object' && 'typeParam' in l.type)
+			throw new Error(`local '${l.id ?? '(anonymous)'}': uninstantiated '$${l.type.typeParam}' type -- a switch arm's own $T-typed local only resolves via instantiateAsmBody (inline asm), never in a real module`);
+		return l.type;
+	}
+
+	function resolveInstr(i: WatInstr, locals: IDTable, stk: (string | undefined)[]): Instr {
+		const op		= i.op;
+		const labels	= { res: (v: any) => {
+			if (typeof v === 'number')
+				return v;
+			const i = stk.lastIndexOf(v);
+			return i >= 0 ? stk.length - 1 - i : (v ? parseInt(String(v).replace(/^\$/, '')) || 0 : 0);
+		}};
 		switch (op) {
 			case 'block': case 'loop': case 'if': {
-				const nStk = [...stk, (i as any).label];
+				const nStk = [...stk, i.label];
 				const blockType = typeof i.blockType === 'object' && 'typeIndex' in i.blockType ? { typeIndex: types.res(i.blockType.typeIndex) } : i.blockType;
 				return op === 'if'
-					? {...i, blockType, then: resolveInstrs(i.then as Instr[], locals, nStk), else: resolveInstrs(i.else as Instr[], locals, nStk)}
+					? {...i, blockType, then: resolveInstrs(i.then as Instr[], locals, nStk), else: i.else && resolveInstrs(i.else as Instr[], locals, nStk)}
 					: {...i, blockType, body: resolveInstrs(i.body as Instr[], locals, nStk)};
 			}
-			case 'br_table':		return {...i, labels: i.labels.map(l => resLabel(l, stk)), default: resLabel(i.default, stk) } as Instr;
-			case 'call_indirect':	return {...i, typeIndex: types.res(i.typeIndex), tableIndex: tables.res(i.tableIndex) } as Instr;
+			case 'br_table':		return {...i, labels: i.labels.map(l => labels.res(l)), default: labels.res(i.default) };
+//			case 'call_indirect':	return {...i, typeIndex: types.res(i.typeIndex), tableIndex: tables.res(i.tableIndex) } as Instr;
 			case 'br_on_cast':
-			case 'br_on_cast_fail':	return {...i, label: resLabel(i.label, stk), from: types.res(i.from), to: types.res(i.to) };
+			case 'br_on_cast_fail':	return {...i, label: labels.res(i.label), from: types.res(i.from), to: types.res(i.to) };
 			case 'memory.init':		return {...i, seg: datas.res(i.seg), target: memories.res(i.target)};
 			case 'memory.copy':
 			case 'memory.fill':		return {...i, seg: memories.res(i.seg), target: memories.res(i.target)};
 			case 'table.init':		return {...i, seg: elems.res(i.seg), target: tables.res(i.target)};
 			case 'table.copy':		return {...i, seg: tables.res(i.seg), target: tables.res(i.target)};
-			case 'data.drop':		return {...i, index: datas.res(i.index)};
-			case 'elem.drop':		return {...i, index: elems.res(i.index)};
+
+			case '__switch':
+				// Reached only if `switch '${i.key}'` was never resolved: not a known ctx.defines entry
+				// at parse time, and not (or not correctly) bound via a macro call's substInstr pass.
+				throw new Error(`switch '${i.key}': unresolved -- not a ctx.defines entry, and not inside a macro call binding it to a $tag argument`);
 
 			default: {
 				const resI = { ...i };
-				if ('index' in resI) {
-					resI.index = /^(local\.|param)/.test(op)		? locals.res(resI.index)
-						: /^global\./.test(op)						? globals.res(resI.index)
-						: /^(call|return_call|ref\.func)$/.test(op)	? funcs.res(resI.index)
-						: /^br/.test(op)							? resLabel(resI.index, stk)
-						: tables.res(resI.index);
-				}
-				if ('typeIndex' in resI)
-					resI.typeIndex = types.res(resI.typeIndex);
-				if ('dst' in resI)
-					resI.dst = types.res(resI.dst);
-				if ('src' in resI)
-					resI.src = types.res(resI.src);
-				if ('segIndex' in resI)
-					resI.segIndex = (op.includes('data') ? datas : elems).res(resI.segIndex);
-
+				resolveField(resI, 'localIndex',	locals);
+				resolveField(resI, 'globalIndex',	globals);
+				resolveField(resI, 'tableIndex',	tables);
+				resolveField(resI, 'funcIndex', 	funcs);
+				resolveField(resI, 'label',			labels);
+				resolveField(resI, 'typeIndex',		types);
+				resolveField(resI, 'dst',			types);
+				resolveField(resI, 'src',			types);
+				resolveField(resI, 'elemIndex',		elems);
+				resolveField(resI, 'dataIndex',		datas);
 				return resI;
 			}
 		}
 	}
 
-	function resolveInstrs(instrs: Instr[], locals = new IDTable, stk: (string | undefined)[] = []) {
+	function resolveInstrs(instrs: WatInstr[], locals = new IDTable, stk: (string | undefined)[] = []) {
 		return instrs.map(i => resolveInstr(i, locals, stk));
 	}
 
@@ -440,7 +989,7 @@ export function parse(wat: string): WasmModule {
 		switch (f.type) {
 			case 'import': {
 				switch (f.desc.type) {
-					case 'func':	funcs.addImp(f,		{ kind: 'func',		typeIndex: getTypeIdx(f.desc.value) }); break;
+					case 'func':	funcs.addImp(f,		{ kind: 'func',		typeIndex: getFuncTypeIdx(f.desc.value) }); break;
 					case 'table':	tables.addImp(f, 	{ kind: 'table',	type: f.desc.value }); break;
 					case 'memory':	memories.addImp(f,	{ kind: 'memory',	type: f.desc.value }); break;
 					case 'global':	globals.addImp(f,	{ kind: 'global',	type: f.desc.value }); break;
@@ -459,7 +1008,7 @@ export function parse(wat: string): WasmModule {
 	}
 
 	const wmod	= new WasmModule();
-	wmod.functionTypes	= funcs.entries.map(f => getTypeIdx(f.value));
+	wmod.functionTypes	= funcs.entries.map(f => getFuncTypeIdx(f.value));
 	wmod.tables			= tables.entries.map(t => t.value);
 	wmod.memories		= memories.entries.map(m => m.value);
 	wmod.globals		= globals.entries.map(g => ({ type: g.value, init: resolveInstrs(g.init) }));
@@ -467,8 +1016,8 @@ export function parse(wat: string): WasmModule {
 	wmod.code			= funcs.entries.map(f => {
 		const locals = new IDTable;
 		f.value.params.forEach(p => locals.add(p.id));
-		f.locals.forEach(l => locals.add((l as any).id, l.count));
-		return { locals: f.locals.map(l => ({ count: l.count, type: l.type })), body: resolveInstrs(f.body, locals) };
+		f.locals.forEach(l => locals.add(l.id, l.count));
+		return { locals: f.locals.map(l => ({ count: l.count, type: concreteLocalType(l) })), body: resolveInstrs(f.body, locals), id: f.id };
 	});
 
 	wmod.exports = rawExports.map(e => ({ name: e.name, kind: e.kind, index: allTables[e.kind].res(e.index) }));
@@ -487,7 +1036,7 @@ export function parse(wat: string): WasmModule {
 				break;
 			}
 			case 'data': {
-				const bytes = new TextEncoder().encode(f.init);
+				const bytes = f.init;
 				const memory = memories.res(f.memory);
 				(wmod.datas ??= []).push(f.offset
 					? { mode: 'active', ...(memory ? { memory } : {}), offset: resolveInstrs(f.offset), bytes }
