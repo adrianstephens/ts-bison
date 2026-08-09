@@ -9,6 +9,14 @@
 	"include": [
 		"**/*.ts"
 	],
+	"exclude": [
+		// Real TS syntax, but deliberately not standalone-valid TypeScript (e.g. `static` members
+		// referencing the class's own type parameter, `this[i]` with no index signature) -- towasm.ts
+		// reads this file's own text and reparses it with `TS.parse` for codegen, it's never `import`ed
+		// as a normal module. Matches `test/tsconfig.json`'s own exclusion; see towasm-lib.ts's header
+		// comment.
+		"TS/lib/**/*.ts"
+	],
 	"references": [
 		{"path": "../tsconfig.json"}
 	]

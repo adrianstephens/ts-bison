@@ -284,6 +284,14 @@ export class Output {
 			case 'literal':
 				return this.literal(type);
 
+			// Not real TS syntax -- narrowing-only. A degenerate (min === max) range is how a bigint literal is
+			// represented (`Literal` has no bigint value of its own), and prints back out as one (`10n`); anything
+			// else only ever reaches here via a diagnostic message, so a readable pseudo-type is enough.
+			case 'range':
+				return type.min !== undefined && type.min === type.max
+					? String(type.min) + (type.base === 'bigint' ? 'n' : '')
+					: type.base + '[' + (type.min ?? '-Infinity') + '..' + (type.max ?? 'Infinity') + ']' + (type.integer ? ' (int)' : '');
+
 			case 'this':
 				return 'this';
 

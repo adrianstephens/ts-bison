@@ -193,6 +193,126 @@ export function applyPragmas(source: string, options: CompilerOptions1) {
 }
 
 //-----------------------------------------------------------------------------
+// Constant folding
+//-----------------------------------------------------------------------------
+
+export function foldConstants(ast: JS.Program) {
+	return walk(ast,
+		undefined,
+		(expr, process) => {
+			expr = process(expr);
+			switch (expr.type) {
+				case 'literal': {
+					if (Array.isArray(expr.value)) {
+						const parts: JS.TemplatePart<Expr>[] = [];
+						let current = '';
+						for (const i of expr.value) {
+							current += i.str;
+							if (i.exp?.type === 'literal') {
+								current += i.exp.value?.toString();
+							} else {
+								parts.push({str: current, exp: i.exp});
+								current = '';
+							}
+						}
+						if (parts.length === 0)
+							return Literal(current);
+						parts.push({str: current});
+						return Literal(parts);
+					}
+					break;
+				}
+				case 'binary': {
+					if (expr.left.type === 'literal' && expr.right.type === 'literal') {
+						const a = expr.left.value, b = expr.right.value;
+						switch (expr.operator) {
+							case '&&':	return Literal(a && b);
+							case '||':	return Literal(a || b);
+							case '??':	return Literal(a ?? b);
+							case '!=':	return Literal(a != b);
+							case '!==':	return Literal(a !== b);
+							case '==':	return Literal(a == b);
+							case '===':	return Literal(a === b);
+						}
+						const num = typeof a === 'number' && typeof b === 'number';
+						const big = typeof a === 'bigint' && typeof b === 'bigint';
+						if (num || big) {
+							switch (expr.operator) {
+								case '<':	return Literal(a < b);
+								case '<=':	return Literal(a <= b);
+								case '>':	return Literal(a > b);
+								case '>=':	return Literal(a >= b);
+							}
+							if (num) {
+								switch (expr.operator) {
+									case '+':	return Literal(a + b);
+									case '-':	return Literal(a - b);
+									case '*':	return Literal(a * b);
+									case '/':	return Literal(a / b);
+									case '%':	return Literal(a % b);
+									case '&':	return Literal(a & b);
+									case '|':	return Literal(a | b);
+									case '^':	return Literal(a ^ b);
+									case '<<':	return Literal(a << b);
+									case '>>':	return Literal(a >> b);
+									case '>>>':	return Literal(a >>> b);
+									case '**':	return Literal(a ** b);
+								}
+							} else if (big) {
+								switch (expr.operator) {
+									case '+':	return Literal(a + b);
+									case '-':	return Literal(a - b);
+									case '*':	return Literal(a * b);
+									case '/':	return Literal(a / b);
+									case '%':	return Literal(a % b);
+									case '&':	return Literal(a & b);
+									case '|':	return Literal(a | b);
+									case '^':	return Literal(a ^ b);
+									case '<<':	return Literal(a << b);
+									case '>>':	return Literal(a >> b);
+									case '**':	return Literal(a ** b);
+								}
+							}
+						}
+					}
+					break;
+				}
+				case 'unary':
+					if (expr.operand.type === 'literal') {
+						const x = expr.operand.value;
+						if (expr.operator === '!')
+							return Literal(!x);
+
+						switch (typeof x) {
+							case 'number':
+								switch (expr.operator) {
+									case '~':	return Literal(~x);
+									case '-':	return Literal(-x);
+									case '+':	return Literal(+x);
+								}
+								break;
+							case 'bigint':
+								switch (expr.operator) {
+									case '~':	return Literal(~x);
+									case '-':	return Literal(-x);
+								}
+								break;
+						}
+					}
+					break;
+					
+				case 'conditional':
+					if (expr.test.type === 'literal')
+						return expr.test.value ? expr.consequent : expr.alternate;
+					break;
+			}
+			return expr;
+		},
+		undefined
+	);
+}
+
+//-----------------------------------------------------------------------------
 // TS to JS
 //-----------------------------------------------------------------------------
 
@@ -673,11 +793,12 @@ function resolveTypes(entryScope: Scope, importScope: Scope | undefined) {
 		return process(type);
 	};
 }
-	// A single generic type parameter constrained to a union of literals, used directly (unparameterized) as exactly
-	// one parameter's type, expands into one non-generic overload per literal member -- each overload's return type
-	// collapses toward its own concrete result (e.g. a conditional keyed off the now-literal T narrows to one table
-	// entry) instead of the printed signature needing to expose whatever machinery type (often a big lookup table)
-	// computed the generic return for every member at once.
+
+// A single generic type parameter constrained to a union of literals, used directly (unparameterized) as exactly
+// one parameter's type, expands into one non-generic overload per literal member -- each overload's return type
+// collapses toward its own concrete result (e.g. a conditional keyed off the now-literal T narrows to one table
+// entry) instead of the printed signature needing to expose whatever machinery type (often a big lookup table)
+// computed the generic return for every member at once.
 function expandConstrainedGeneric(typeParams: TS.TypeParam[] | undefined, params: JS.Param<any>[], returnType: Type | undefined, scope: Scope) {
 	const tparam = typeParams?.length === 1 ? typeParams[0] : undefined;
 	if (!tparam?.constraint)
@@ -802,48 +923,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 	const stripClassDecl = (stmt: JS.ClassDecl<any>): JS.Declaration<any> => {
 		const setKeys	= new Set(stmt.body.map(m => m.type === 'set' && typeof m.key === 'string' ? m.key : undefined).filter(m => m !== undefined));
 		const seen		= new Set<string>();
-		const extra:	TS.ClassMember[] = [];
-
-		const body = (stmt.body as TS.ClassMember[]).flatMap((m): TS.ClassMember[] => {
-			switch (m.type) {
-				case 'field':
-					return [JS.Field(m.key, undefined, m.typeAnnotation ?? (m.value && inferType(m.value, false)) ?? T.ANY)];
-
-				case 'get':
-					if (typeof m.key === 'string') {
-						if (seen.has(m.key))
-							return [];
-						seen.add(m.key);
-					}
-					return [JS.Field(m.key, undefined, m.returnType ?? T.ANY, typeof m.key === 'string' && !setKeys.has(m.key) ? ['readonly'] : undefined)];
-
-				case 'set':
-					if (typeof m.key === 'string') {
-						if (seen.has(m.key))
-							return [];
-						seen.add(m.key);
-					}
-					return [JS.Field(m.key, undefined, m.params[0]?.typeAnnotation ?? T.ANY)];
-
-				case 'method': {
-					if (m.key === 'constructor') {
-						for (const p of m.params) {
-							if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected') || hasMod(p, 'readonly'))
-								extra.push(JS.Field(typeof p.key === 'string' ? p.key : '?', undefined, p.typeAnnotation, p.modifiers));
-						}
-						return [JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams})];
-					}
-					const params		= m.params.map(stripParam);
-					const returnType	= m.returnType ?? (m.body ? checker.inferReturn(m, m.body, global) : undefined);
-					const expansions	= expandConstrainedGeneric(m.typeParams, params, returnType, global);
-					if (expansions)
-						return expansions.map(o => JS.Method('method', m.key, { params: o.params, rest: m.rest, returnType: o.returnType, typeParams: undefined }, undefined, m.modifiers));
-
-					return [JS.Method('method', m.key, { params, rest: m.rest, returnType, typeParams: m.typeParams }, undefined, m.modifiers)];
-				}
-			}
-			return [];
-		}).concat(extra) as JS.ClassMember<any>[];
+//		const extra:	TS.ClassMember[] = [];
 
 		// `extends bin.Class(spec)` (or any non-identifier heritage) can't survive into a `.d.ts` -- there's no runtime call in an ambient declaration.
 		// Hoist its *type* into a synthesized `declare const _base` instead and extend that name instead.
@@ -854,7 +934,56 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 			syntheticBases.push(JS.AmbientVarDecl('const', JS.Var(name, undefined, checker.typeOf(superClass, global))));
 			superClass = Identifier(name);
 		}
-		return { ...stmt, body, superClass, ambient: true};
+
+		return {
+			...stmt,
+			body: (stmt.body as TS.ClassMember[]).flatMap((m): TS.ClassMember[] => {
+				switch (m.type) {
+					case 'field':
+						return [JS.Field(m.key, undefined, m.typeAnnotation ?? (m.value && inferType(m.value, false)) ?? T.ANY)];
+
+					case 'get':
+						if (typeof m.key === 'string') {
+							if (seen.has(m.key))
+								return [];
+							seen.add(m.key);
+						}
+						return [JS.Field(m.key, undefined, m.returnType ?? T.ANY, typeof m.key === 'string' && !setKeys.has(m.key) ? ['readonly'] : undefined)];
+
+					case 'set':
+						if (typeof m.key === 'string') {
+							if (seen.has(m.key))
+								return [];
+							seen.add(m.key);
+						}
+						return [JS.Field(m.key, undefined, m.params[0]?.typeAnnotation ?? T.ANY)];
+
+					case 'method': {
+						const extra:	TS.ClassMember[] = [];
+						if (m.key === 'constructor') {
+							for (const p of m.params) {
+								if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected') || hasMod(p, 'readonly'))
+									extra.push(JS.Field(typeof p.key === 'string' ? p.key : '?', undefined, p.typeAnnotation, p.modifiers));
+							}
+							extra.push(JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams}));
+							return extra;
+							//return [JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams})];
+						}
+						const params		= m.params.map(stripParam);
+						const returnType	= m.returnType ?? (m.body ? checker.inferReturn(m, m.body, global) : undefined);
+						const expansions	= expandConstrainedGeneric(m.typeParams, params, returnType, global);
+						if (expansions)
+							return expansions.map(o => JS.Method('method', m.key, { params: o.params, rest: m.rest, returnType: o.returnType, typeParams: undefined }, undefined, m.modifiers));
+
+						return [JS.Method('method', m.key, { params, rest: m.rest, returnType, typeParams: m.typeParams }, undefined, m.modifiers)];
+					}
+				}
+				return [];
+			})/*.concat(extra)*/ as JS.ClassMember<any>[],
+			superClass,
+			ambient: true
+		};
+//		return { ...stmt, body, superClass, ambient: true};
 	};
 
 	// Ambient declarations have no initializer to destructure from -- split a destructured declarator into one
@@ -919,22 +1048,19 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		}
 	})!;
 
-	// `owners` already holds the stripped form (function/class bodies reduced to signatures above) --
-	// just walk it for the identifiers/refs its signature depends on, no re-stripping needed.
-	const collectDeclRefs = (owner: TS.Statement|Expr|Type, refs: Set<string>) => {
-		walk(owner, undefined,
-			(e, process) => {
-				if (e.type === 'identifier')
-					refs.add(e.name.split('.')[0]);
-				return process(e);
-			},
-			(t, process) =>{
-				if (t.type === 'ref')
-					refs.add(t.name.split('.')[0]);
-				return process(t);
-			}
-		);
-	};
+	const collectDeclRefs = (owner: TS.Statement|Expr|Type, refs: Set<string>) => walk(owner,
+		undefined,
+		(e, process) => {
+			if (e.type === 'identifier')
+				refs.add(e.name.split('.')[0]);
+			return process(e);
+		},
+		(t, process) =>{
+			if (t.type === 'ref')
+				refs.add(t.name.split('.')[0]);
+			return process(t);
+		}
+	);
 
 	const worklist	= [...reachable];
 	while (worklist.length) {
@@ -959,9 +1085,9 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 
 	// ---- Final rebuild: keep only what's reachable, from the already-stripped tree above -------------
 
-	const lastImport = stripped.body.findLastIndex(i => i.type === 'import');
+	stripped.body.splice(stripped.body.findLastIndex(i => i.type === 'import') + 1, 0, ...syntheticBases);
 
-	return walk({ ...stripped, body: [...stripped.body.slice(0, lastImport), ...syntheticBases, ...stripped.body.slice(lastImport)] },
+	return walk(stripped,
 		(stmt, process) => {
 			switch (stmt.type) {
 				case 'import':

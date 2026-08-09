@@ -7,6 +7,12 @@ let customPlugin = await maybeImport('../eslint-custom.mjs');
 // @ts-check
 
 export default tslint.config(
+	{
+		// Real TS syntax, but deliberately not standalone-valid TypeScript (see its header comment) --
+		// towasm.ts reads it as text and reparses it with its own `TS.parse`, never as a normal module.
+		// Excluded the same way it's excluded from test/tsconfig.json.
+		ignores: ["examples/TS/lib/**/*.ts"],
+	},
 	eslint.configs.recommended,
 	...tslint.configs.recommended,
 	...tslint.configs.stylistic,

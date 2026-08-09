@@ -43,6 +43,13 @@ export function  FunctionType(...args: JS.CallSigParams<Type>): FunctionType { r
 
 export interface ConstructorType extends CallSig { type: 'constructor'; abstract?: boolean }
 
+// A control-flow-narrowed `number`/`bigint`: bounds are inclusive, `undefined` on either side means unbounded there.
+// Not writable in source syntax -- only ever produced internally by narrowing (see `type-utils.ts`'s `toRange`/`rangeToType`).
+// A `bigint` has no `Literal` node of its own (see `Type` below), so an exact bigint value is represented as a
+// degenerate range (`min === max`); `tocode.ts` prints that case back out as a real bigint literal (e.g. `10n`).
+export interface RangeType { type: 'range'; base: 'number' | 'bigint'; min?: number | bigint; max?: number | bigint; integer?: boolean }
+export function  RangeType(base: 'number' | 'bigint', min?: number | bigint, max?: number | bigint, integer?: boolean): RangeType { return { type: 'range', base, min, max, integer }; }
+
 export type TypeMember =
 	| { type: 'property'; key: Key; typeAnnotation: Type, modifiers?: string[] }
 	| { type: 'method'; key: Key; modifiers?: string[] } & CallSig
@@ -76,6 +83,7 @@ export function  Predicate(paramName: string, assertedType?: Type, asserts?: boo
 export type Type =
 	| RefType
 	| Literal<string | number | boolean | null | JS.TemplatePart<Type>[]>
+	| RangeType
 	| ArrayType
 	| UnionType
 	| IntersectionType

@@ -10,5 +10,15 @@
 		"*.ts",
 		"../src/**/*.ts",
 		"../examples/**/*.ts", "../examples/TSR/js-parserR.ts", "../examples/TSR/ts-parserR.ts",
+	],
+	"exclude": [
+		// Real TS syntax, but deliberately not standalone-valid TypeScript (e.g. `this[i]` with no
+		// index signature, a `$E`-shaped generic param never meant to satisfy real type-checking) --
+		// towasm.ts reads every file here as plain text and reparses it with `TS.parse` for codegen,
+		// none of it is ever `import`ed as a normal module. Also covers `lib.d.ts`: its ambient
+		// declarations are meant only for `towasm.ts`'s own lib-parsing and the editor (via each lib
+		// file's own `/// <reference>`), not to leak globally into this project. Matches
+		// `examples/tsconfig.json`'s own exclusion; see towasm-lib.ts's header comment.
+		"../examples/TS/lib/**/*.ts"
 	]
 }
