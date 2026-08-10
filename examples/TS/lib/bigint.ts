@@ -21,19 +21,15 @@
 export const __towasm_mulWide	= __asm<[i64, i64], i64>('i64.mul');
 
 export function bigFromNumber(n: number): bigint {
-	let count: number = 1;
-	let t: number = Math.floor(n / 4294967296);
-	while (t > 0) {
-		count = count + 1;
-		t = Math.floor(t / 4294967296);
-	}
+	let count = 1;
+	for (let t = Math.floor(n / 0x100000000); t > 0; t = Math.floor(t / 0x100000000))
+		++count;
+
 	const r: u32[] = new Array<u32>(count + 1);
-	let i: number = 0;
-	let m: number = n;
-	while (i < count) {
-		r[i] = m - Math.floor(m / 4294967296) * 4294967296;
-		m = Math.floor(m / 4294967296);
-		i = i + 1;
+	for (let i = 0, m = n; i < count; i++) {
+		const j = Math.floor(m / 0x100000000);
+		r[i] = m - j * 0x100000000;
+		m = j;
 	}
 	return bigTrim(r) as unknown as bigint;
 }

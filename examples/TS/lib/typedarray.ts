@@ -65,20 +65,20 @@ class ArrayBuffer {
 // checker enhancement) can use it to catch drift between the three declarations.
 interface TypedArray<T> {
 	readonly buffer: ArrayBuffer;
-	readonly byteOffset: number;
-	readonly length: number;
-	readonly byteLength: number;
-	[i: number]: T;
-	get(i: number): T;
-	set(i: number, v: T): void;
-	indexOf(x: T): number;
-	lastIndexOf(x: T): number;
+	readonly byteOffset: i32;
+	readonly length: i32;
+	readonly byteLength: i32;
+	[i: i32]: T;
+	get(i: i32): T;
+	set(i: i32, v: T): void;
+	indexOf(x: T): i32;
+	lastIndexOf(x: T): i32;
 	includes(x: T): boolean;
 	reverse(): TypedArray<T>;
-	slice(start?: number, end?: number): TypedArray<T>;
-	fill(x: T, start?: number, end?: number): TypedArray<T>;
+	slice(start?: i32, end?: i32): TypedArray<T>;
+	fill(x: T, start?: i32, end?: i32): TypedArray<T>;
 	concat(other: TypedArray<T>): TypedArray<T>;
-	subarray(start?: number, end?: number): TypedArray<T>;
+	subarray(start?: i32, end?: i32): TypedArray<T>;
 }
 
 class Uint8Array implements TypedArray<u8> {
@@ -88,7 +88,7 @@ class Uint8Array implements TypedArray<u8> {
 	byteLength: i32	= 0;
 	base:		i32	= 0;
 
-	[i: number]: number;
+	[i: i32]: number;
 
 	// Real byte width per element, resolved the same `$elem`-switch way `get`/`set` below already are --
 	// lets the constructors below convert between element count and byte count without needing to know
@@ -106,7 +106,7 @@ class Uint8Array implements TypedArray<u8> {
 	// every field's value up front and a single `struct.new` -- see `ensureCtor` -- so `this` isn't a real,
 	// readable value until the last field is set): every intermediate value goes through a plain local
 	// (`elemSize`/`byteLength`) instead of writing then reading a field back.
-	constructor(length: number) {
+	constructor(length: i32) {
 		const elemSize = Uint8Array.elemSize();
 		this.buffer = new ArrayBuffer(length * elemSize);
 		this.byteOffset = 0;
@@ -123,7 +123,7 @@ class Uint8Array implements TypedArray<u8> {
 		this.length = byteLength / elemSize;
 		this.base = buffer.offset;
 	}
-	constructor(buffer: ArrayBuffer, byteOffset: number) {
+	constructor(buffer: ArrayBuffer, byteOffset: i32) {
 		const elemSize = Uint8Array.elemSize();
 		const byteLength = buffer.byteLength - byteOffset;
 		this.buffer = buffer;
@@ -132,7 +132,7 @@ class Uint8Array implements TypedArray<u8> {
 		this.length = byteLength / elemSize;
 		this.base = buffer.offset + byteOffset;
 	}
-	constructor(buffer: ArrayBuffer, byteOffset: number, length: number) {
+	constructor(buffer: ArrayBuffer, byteOffset: i32, length: i32) {
 		const elemSize = Uint8Array.elemSize();
 		this.buffer = buffer;
 		this.byteOffset = byteOffset;
@@ -153,7 +153,7 @@ class Uint8Array implements TypedArray<u8> {
 	get(i: i32): i32 { return __asm<[i32], i32>('(local $i i32) local.set $i struct.get $this 4 local.get $i (switch $elem (($u8) i32.add i32.load8_u) (($i32 $u32) i32.const 4 i32.mul i32.add i32.load))')(i); }
 	set(i: i32, v: i32): void { return __asm<[i32, i32], void>('(local $i i32) (local $v i32) local.set $v local.set $i struct.get $this 4 local.get $i (switch $elem (($u8) i32.add local.get $v i32.store8) (($i32 $u32) i32.const 4 i32.mul i32.add local.get $v i32.store))')(i, v); }
 
-	indexOf(x: number): number {
+	indexOf(x: number): i32 {
 		let i: number = 0;
 		while (i < this.length) {
 			if (this[i] === x)
@@ -162,7 +162,7 @@ class Uint8Array implements TypedArray<u8> {
 		}
 		return -1;
 	}
-	lastIndexOf(x: number): number {
+	lastIndexOf(x: number): i32 {
 		let i: number = this.length - 1;
 		while (i >= 0) {
 			if (this[i] === x)
@@ -186,7 +186,7 @@ class Uint8Array implements TypedArray<u8> {
 	// Same "omitted `end`" large-sentinel-clamped-to-`length` trick as `lib/array.ts`'s own `slice`/
 	// `fill` -- a call-site default must be a plain literal (towasm's `fillDefaultArgs`), and
 	// `this.length` isn't one.
-	slice(start: number = 0, end: number = 9007199254740991): Uint8Array {
+	slice(start: i32 = 0, end: i32 = 9007199254740991): Uint8Array {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;
@@ -196,7 +196,7 @@ class Uint8Array implements TypedArray<u8> {
 			result[i] = this[start + i];
 		return result;
 	}
-	fill(x: number, start: number = 0, end: number = 9007199254740991): Uint8Array {
+	fill(x: number, start: i32 = 0, end: i32 = 9007199254740991): Uint8Array {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;
@@ -221,7 +221,7 @@ class Uint8Array implements TypedArray<u8> {
 	}
 	// A real *view* over the same buffer -- no copy, no alloc -- unlike `slice`. Same clamp/saturate
 	// semantics as `slice`.
-	subarray(start: number = 0, end: number = 9007199254740991): Uint8Array {
+	subarray(start: i32 = 0, end: i32 = 9007199254740991): Uint8Array {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;
@@ -242,7 +242,7 @@ class Uint8Array implements TypedArray<u8> {
 // private static method is declared here too, not just the real public surface.
 declare class Int32Array implements TypedArray<i32> {
 	readonly buffer: ArrayBuffer;
-	readonly byteOffset: number;
+	readonly byteOffset: i32;
 	readonly length: number;
 	readonly byteLength: number;
 	[i: number]: number;
@@ -251,8 +251,8 @@ declare class Int32Array implements TypedArray<i32> {
 
 	constructor(length: number);
 	constructor(buffer: ArrayBuffer);
-	constructor(buffer: ArrayBuffer, byteOffset: number);
-	constructor(buffer: ArrayBuffer, byteOffset: number, length: number);
+	constructor(buffer: ArrayBuffer, byteOffset: i32);
+	constructor(buffer: ArrayBuffer, byteOffset: i32, length: number);
 	constructor(elements: number[]);
 
 	get(i: number): number;
@@ -269,7 +269,7 @@ declare class Int32Array implements TypedArray<i32> {
 
 declare class Uint32Array implements TypedArray<u32> {
 	readonly buffer: ArrayBuffer;
-	readonly byteOffset: number;
+	readonly byteOffset: i32;
 	readonly length: number;
 	readonly byteLength: number;
 	[i: number]: number;
@@ -278,8 +278,8 @@ declare class Uint32Array implements TypedArray<u32> {
 
 	constructor(length: number);
 	constructor(buffer: ArrayBuffer);
-	constructor(buffer: ArrayBuffer, byteOffset: number);
-	constructor(buffer: ArrayBuffer, byteOffset: number, length: number);
+	constructor(buffer: ArrayBuffer, byteOffset: i32);
+	constructor(buffer: ArrayBuffer, byteOffset: i32, length: number);
 	constructor(elements: number[]);
 
 	get(i: number): number;
@@ -332,74 +332,74 @@ class DataView {
 		this.byteLength = Math.min(byteLength, buffer.byteLength - byteOffset);
 	}
 
-	getUint8(byteOffset: number): number {
+	getUint8(byteOffset: i32): u32 {
 		return __asm<[i32], i32>('i32.load8_u')(this.byteOffset + byteOffset);
 	}
-	getInt8(byteOffset: number): number {
+	getInt8(byteOffset: i32): i32 {
 		return __asm<[i32], i32>('i32.load8_s')(this.byteOffset + byteOffset);
 	}
-	getUint16(byteOffset: number, littleEndian?: boolean): number {
+	getUint16(byteOffset: i32, littleEndian?: boolean): u32 {
 		const v = __asm<[i32], i32>('i32.load16_u')(this.byteOffset + byteOffset);
 		return littleEndian ? v : bswap16(v);
 	}
-	getInt16(byteOffset: number, littleEndian?: boolean): number {
+	getInt16(byteOffset: i32, littleEndian?: boolean): i32 {
 		const v = __asm<[i32], i32>('i32.load16_s')(this.byteOffset + byteOffset);
 		return littleEndian ? v : bswap16(v);
 	}
-	getUint32(byteOffset: number, littleEndian?: boolean): number {
+	getUint32(byteOffset: i32, littleEndian?: boolean): u32 {
 		const v = __asm<[i32], i32>('i32.load')(this.byteOffset + byteOffset);
 		return littleEndian ? v : bswap32(v);
 	}
-	getInt32(byteOffset: number, littleEndian?: boolean): number {
+	getInt32(byteOffset: i32, littleEndian?: boolean): i32 {
 		const v = __asm<[i32], i32>('i32.load')(this.byteOffset + byteOffset);
 		return littleEndian ? v : bswap32(v);
 	}
-	getUint64(byteOffset: number, littleEndian?: boolean): u64 {
+	getUint64(byteOffset: i32, littleEndian?: boolean): u64 {
 		const v = __asm<[i32], i64>('i64.load')(this.byteOffset + byteOffset);
 		return littleEndian ? v : bswap64(v);
 	}
-	getInt64(byteOffset: number, littleEndian?: boolean): i64 {
+	getInt64(byteOffset: i32, littleEndian?: boolean): i64 {
 		const v = __asm<[i32], i64>('i64.load')(this.byteOffset + byteOffset);
 		return littleEndian ? v : bswap32(v);
 	}
-	getFloat32(byteOffset: number, littleEndian?: boolean): number	{
+	getFloat32(byteOffset: i32, littleEndian?: boolean): number	{
 		const offset = this.byteOffset + byteOffset;
 		return littleEndian
 			? __asm<[i32], f32>('f32.load')(offset)
 			: asf32(bswap32(__asm<[i32], i32>('i32.load')(offset)));
 	}
-	getFloat64(byteOffset: number, littleEndian?: boolean): number {
+	getFloat64(byteOffset: i32, littleEndian?: boolean): number {
 		const offset = this.byteOffset + byteOffset;
 		return littleEndian
 			? __asm<[i32], f64>('f64.load')(offset)
 			: asf64(bswap64(__asm<[i32], i64>('i64.load')(offset)));
 	}
-	setUint8(byteOffset: number, value: i32): void {
+	setUint8(byteOffset: i32, value: u32): void {
 		__asm<[i32, i32], void>('i32.store8')(this.byteOffset + byteOffset, value);
 	}
-	setInt8(byteOffset: number, value: i32): void {
+	setInt8(byteOffset: i32, value: i32): void {
 		__asm<[i32, i32], i32>('i32.store8')(this.byteOffset + byteOffset, value);
 	}
-	setUint16(byteOffset: number, value: i32, littleEndian?: boolean): void {
+	setUint16(byteOffset: i32, value: u32, littleEndian?: boolean): void {
 		__asm<[i32, i32], void>('i32.store16')(this.byteOffset + byteOffset, littleEndian ? value : bswap16(value));
 	}
-	setInt16(byteOffset: number, value: i32, littleEndian?: boolean): void {
+	setInt16(byteOffset: i32, value: i32, littleEndian?: boolean): void {
 		__asm<[i32, i32], void>('i32.store16')(this.byteOffset + byteOffset, littleEndian ? value : bswap16(value));
 	}
-	setUint32(byteOffset: number, value: i32, littleEndian?: boolean): void {
+	setUint32(byteOffset: i32, value: u32, littleEndian?: boolean): void {
 		__asm<[i32, i32], void>('i32.store')(this.byteOffset + byteOffset, littleEndian ? value : bswap32(value));
 	}
-	setInt32(byteOffset: number, value: i32, littleEndian?: boolean): void {
+	setInt32(byteOffset: i32, value: i32, littleEndian?: boolean): void {
 		__asm<[i32, i32], void>('i32.store')(this.byteOffset + byteOffset, littleEndian ? value : bswap32(value));
 	}
-	setUint64(byteOffset: number, value: i64, littleEndian?: boolean): void {
+	setUint64(byteOffset: i32, value: u64, littleEndian?: boolean): void {
 		__asm<[i32, i64], void>('i64.store')(this.byteOffset + byteOffset, littleEndian ? value : bswap64(value));
 	}
-	setInt64(byteOffset: number, value: i64, littleEndian?: boolean): void {
+	setInt64(byteOffset: i32, value: i64, littleEndian?: boolean): void {
 		__asm<[i32, i64], void>('i64.store')(this.byteOffset + byteOffset, littleEndian ? value : bswap64(value));
 	}
 
-	setFloat32(byteOffset: number, value: number, littleEndian?: boolean): void {
+	setFloat32(byteOffset: i32, value: number, littleEndian?: boolean): void {
 		const offset = this.byteOffset + byteOffset;
 		if (littleEndian)
 			__asm<[i32, f32], void>('f32.store')(offset, value);
@@ -407,7 +407,7 @@ class DataView {
 			__asm<[i32, i32], void>('i32.store')(offset, bswap32(asi32(value)));
 
 	}
-	setFloat64(byteOffset: number, value: number, littleEndian?: boolean): void {
+	setFloat64(byteOffset: i32, value: number, littleEndian?: boolean): void {
 		const offset = this.byteOffset + byteOffset;
 		if (littleEndian)
 			__asm<[i32, f64], void>('f64.store')(offset, value);
