@@ -10,7 +10,7 @@ export function strIsSpace(code: number): boolean {
 	return code === 32 || code === 9 || code === 10 || code === 13;
 }
 
-export function stringTemplate(strings: string[], ...values: number[]): string {
+export function stringTemplate(strings: string[], ...values: any[]): string {
 	const n: number = values.length;
 	let result: string = strings[0];
 	let i: number = 0;

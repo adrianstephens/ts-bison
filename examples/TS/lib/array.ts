@@ -177,8 +177,7 @@ export class Array<T> {
 		for (let i = 0; i < this.length; i++)
 			callback(this[i], i, this);
 	}
-	join(separator?: string): string {
-		separator ??= ',';
+	join(separator: string = ','): string {
 		let result: string = '';
 		for (let i = 0; i < this.length; i++) {
 			if (i > 0)

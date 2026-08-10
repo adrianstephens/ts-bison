@@ -77,12 +77,14 @@ async function main() {
 	{
 		const { test } = await compile(`
 function test(): number {
+	const b: bigint = 42n;
 	const x = new Uint8Array(100);
 	const d = new DataView(x.buffer);
+	d.setFloat32(0, 42, true);
 	return d.getFloat32(0, true);
 }
 		`);
-		check('test', test(), 0);
+		check('test', test(), 42);
 	}
 
 /*
@@ -1459,7 +1461,7 @@ function alloc(size: i32): i32 {
 		// from (see towasm.ts's `emitTemplateLiteral`). Every interpolated value's type decides how it
 		// stringifies: `string` passes through, `number` calls `.toString()`, `boolean` is a ternary (no
 		// `Boolean` class in this lib to call a real `.toString()` on).
-		const { tplNum, tplNumFrac, tplStr, tplBoolTrue, tplBoolFalse, tplMulti, tplAdjacent, tplNoInterp } = await compile(`
+		const { tplNum, tplNumFrac, tplStr, tplBoolTrue, tplBoolFalse, tplMulti, tplAdjacent, tplNoInterp, tplClass } = await compile(`
 			function hashString(s: string): number {
 				let h: number = s.length;
 				let i: number = 0;
@@ -1477,6 +1479,12 @@ function alloc(size: i32): i32 {
 			function tplMulti(a: number, c: number): number { const b: string = "mid"; return hashString(\`a=\${a}, b=\${b}, c=\${c}\`); }
 			function tplAdjacent(a: number, b: number): number { return hashString(\`\${a}\${b}\`); }
 			function tplNoInterp(): number { return hashString(\`plain text\`); }
+			class Point {
+				x: number;
+				constructor(x: number) { this.x = x; }
+				toString(): string { return \`Point(\${this.x})\`; }
+			}
+			function tplClass(): number { const p = new Point(5); return hashString(\`p=\${p}\`); }
 		`);
 		check('template: number interpolation', tplNum(42), jsHash(`x=${42}`));
 		check('template: number interpolation (exact fraction)', tplNumFrac(0.5), jsHash(`x=${0.5}`));
@@ -1486,11 +1494,10 @@ function alloc(size: i32): i32 {
 		check('template: multiple interpolations', tplMulti(1, 3), jsHash(`a=${1}, b=${'mid'}, c=${3}`));
 		check('template: adjacent interpolations (no text between)', tplAdjacent(7, 8), jsHash(`${7}${8}`));
 		check('template: no interpolation (plain string)', tplNoInterp(), jsHash('plain text'));
-
-		await checkThrows('template: interpolating a class instance is rejected', () => compile(`
-			class Foo { x: number = 0; constructor() { this.x = 0; } }
-			function f(): string { const foo = new Foo(); return \`\${foo}\`; }
-		`), /towasm/);
+		// A class instance interpolates via its own `toString()` -- real dynamic dispatch on the boxed `any`
+		// value `stringTemplate`'s `values[i]` becomes, resolved at runtime (no single static owner at the
+		// call site inside `stringTemplate` itself, since it's generic over every possible interpolated type).
+		check('template: class instance interpolation (real toString())', tplClass(), jsHash(`p=Point(5)`));
 	}
 
 	{
@@ -1498,16 +1505,26 @@ function alloc(size: i32): i32 {
 		// side effect instead of a return value, so it's verified by spying on the real global `console.log`
 		// (the same binding `compile`'s own instantiation passes through as the `console` import) rather
 		// than checking a returned number.
-		const { logNumber, logBoolTrue, logBoolFalse } = await compile(`
-			function logNumber(x: number): void { console.log(x); }
-			function logBoolTrue(): void { console.log(true); }
-			function logBoolFalse(): void { console.log(false); }
-		`) as unknown as { logNumber: (x: number) => void; logBoolTrue: () => void; logBoolFalse: () => void };
-
+		// The spy must be installed *before* `compile()` -- `compile()`'s own instantiation resolves the
+		// `console` import by reading `console.log` at that moment, binding the wasm module to whatever
+		// function was there right then; reassigning `console.log` afterward doesn't reach an already-bound
+		// import (found via the capture staying empty even though the calls themselves ran fine). But
+		// `compile()` also calls the real `console.log` itself first (its own WAT debug dump) -- `recording`
+		// gates that out without needing a second, differently-bound spy (there's only one `console.log`
+		// property to bind an import to, so a "swap in the real spy after compile()" approach can't work
+		// either -- same binding-time problem, one step later).
 		const captured: unknown[] = [];
 		const realLog = console.log;
-		console.log = (...args: unknown[]) => { captured.push(args[0]); };
+		let recording = false;
+		console.log = (...args: unknown[]) => { if (recording) captured.push(args[0]); };
+		let logNumber!: (x: number) => void, logBoolTrue!: () => void, logBoolFalse!: () => void;
 		try {
+			({ logNumber, logBoolTrue, logBoolFalse } = await compile(`
+				function logNumber(x: number): void { console.log(x); }
+				function logBoolTrue(): void { console.log(true); }
+				function logBoolFalse(): void { console.log(false); }
+			`) as unknown as { logNumber: (x: number) => void; logBoolTrue: () => void; logBoolFalse: () => void });
+			recording = true;
 			logNumber(3.5);
 			logBoolTrue();
 			logBoolFalse();

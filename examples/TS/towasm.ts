@@ -23,7 +23,7 @@ type MethodMember	= JS.Method<Type>;
 type Scope			= T.Scope;
 const Scope			= T.Scope;
 
-const ASSIGN_OPS = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=']);
+const ASSIGN_OPS = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
 
 const I = wasm.I;
 
@@ -296,6 +296,22 @@ function resolvedWtype(ctx: FuncCtx, name: string): WasmType | undefined {
 	return ctx.closureEnv?.fields.get(name)?.wtype ?? ctx.lookup(name)?.wtype;
 }
 
+// `as`/`as unknown as X` never affects the actual compiled value (`case 'as'` in `emitExpr` is a pure
+// pass-through to `e.expression`) -- but the checker's own `typeOf` still honors the asserted type (needed
+// for its own diagnostics), so any codegen-facing type/owner lookup that feeds `checker.typeOf` an
+// unwrapped `as` node sees a *fictional* type that was never real to begin with, not the one the actual
+// emitted value has. An assertion used purely to silence an over-strict generic constraint --
+// `lib/array.ts`'s `(this[i] as any).toString()`, needed since a bare `T` has no guaranteed `.toString()`
+// -- otherwise breaks method/owner dispatch entirely (`ownerOf`/`wtypeOf` both collapse to `undefined` for
+// a genuinely `any`-asserted expression, even though the real underlying value compiles and dispatches
+// fine on its own). Mirrors the manual `while (e.type === 'as') e = e.expression;` unwrap `ctorReturnType`
+// already needed for the same reason.
+function unwrapAs(e: Expr): Expr {
+	while (e.type === 'as')
+		e = e.expression;
+	return e;
+}
+
 
 // The wasmElement kind for a T[]/Array<T>/ReadonlyArray<T> element type.
 function arrayElemKind(elemType: Type, global: Scope): 'f64' | 'i32' | 'u32' | 'ref' | undefined {
@@ -394,7 +410,7 @@ function isAsm(e?: Expr): e is JS.Call {
 	return e?.type === 'call' && e.callee.type === 'identifier' && e.callee.name === '__asm';
 }
 
-function makeAsmBuiltin(key: string, value: Expr | undefined, builtin: string, index: number, elemKind?: wasmElement, elemDefine?: TypedArrayTag): Builtin<Inline> | undefined {
+function makeAsmBuiltin(key: string, value: Expr | undefined, builtin: string, index: number, elemKind?: wasmElement, elemType?: Type, elemDefine?: TypedArrayTag): Builtin<Inline> | undefined {
 	try {
 		const	call	= value as JS.Call<Type>;
 		let		asm		= (call.arguments[0] as Literal<string | JS.TemplatePart<Expr>[]>).value;
@@ -428,8 +444,22 @@ function makeAsmBuiltin(key: string, value: Expr | undefined, builtin: string, i
 					case 'void': return 'void';
 				}
 			}
+			// `elemType` (the exact type-argument node substituted for the class's own `T`, e.g. `number[]`
+			// for `Array<number[]>`) disambiguates a bare `T` from a real `T[]` even when `T` itself resolves
+			// to something array-shaped -- without this, a bare `T` substituted to `number[]` and a real
+			// `T[]` substituted to `(number[])[]` are both `t.type === 'array'` and indistinguishable by shape
+			// alone, so a nested-array `get(i): T` was wrongly treated as the whole-array case below (found
+			// via `number[][]`'s `a[0].length`: "cannot convert {arr:ref} to {arr:f64}"). Reference equality
+			// is safe here -- `walk`'s substitution splices `elemType` in verbatim at a bare-`T` occurrence,
+			// never a clone of it.
+			// `nullable: true` on the `'ref'` case -- matches `ensureArrayType`'s own nullable `'ref'`-kind
+			// field declaration; a bare `T` (a single boxed element) physically reads as a nullable `anyref`
+			// no matter what the substituted TS element type claims (see `case 'index'`'s own identical fix,
+			// same root cause).
+			if (elemType !== undefined && t === elemType)
+				return elemKind === 'i16' ? ARR_WTYPE.i16 : elemKind === 'ref' ? { ref: 'any', nullable: true } : elemKind!;
 			if (elemKind !== undefined)
-				return t.type === 'array' ? ARR_WTYPE[elemKind] : elemKind === 'i16' ? ARR_WTYPE.i16 : elemKind === 'ref' ? { ref: 'any' } : elemKind;
+				return t.type === 'array' ? ARR_WTYPE[elemKind] : elemKind === 'i16' ? ARR_WTYPE.i16 : elemKind === 'ref' ? { ref: 'any', nullable: true } : elemKind;
 
 			if (t.type === 'ref') {
 				switch (t.name) {
@@ -523,7 +553,7 @@ function accessorKey(kind: 'get' | 'set', name: string): string {
 	return `${kind}:${name}`;
 }
 
-function scanInlineMethods(decl: TS.Class, builtin: string, index: number, elemKind?: wasmElement, elemDefine?: TypedArrayTag) {
+function scanInlineMethods(decl: TS.Class, builtin: string, index: number, elemKind?: wasmElement, elemType?: Type, elemDefine?: TypedArrayTag) {
 	const inlineDecls: { key: string; value: Expr }[] = [];
 	const asmMethodKeys = new Set<string>();
 
@@ -548,7 +578,7 @@ function scanInlineMethods(decl: TS.Class, builtin: string, index: number, elemK
 
 	const inlineMethods = new Map<string, Builtin<Inline>>();
 	for (const i of inlineDecls) {
-		const builtinFn = makeAsmBuiltin(i.key, i.value, builtin, index, elemKind, elemDefine);
+		const builtinFn = makeAsmBuiltin(i.key, i.value, builtin, index, elemKind, elemType, elemDefine);
 		if (builtinFn)
 			inlineMethods.set(i.key, builtinFn);
 	}
@@ -584,6 +614,13 @@ function substituteClassTypeParam(decl: JS.ClassDecl<Type>, PARAM: string, subs:
 // all, same as today).
 const builtinTypes: Record<string, { wtype: WasmType; class?: string }> = {
 	void:		{ wtype: 'void' },
+	// No `class` -- unlike every other entry here, `any` has no single owner to resolve a method call
+	// against (that's the whole premise of the dynamic-dispatch cascade, `ensureAnyDispatch`) -- this entry
+	// exists purely so a genuinely `any`-typed local/param/field has *some* real `WasmType` (`REF_ANY`, the
+	// same boxed representation `coerceTop`'s widen-to-`any` case already produces) instead of failing to
+	// compile at all ("local 'x' has an unsupported type") the moment it's declared, before any method call
+	// is even in the picture.
+	any:		{ wtype: REF_ANY },
 	boolean:	{ wtype: 'i32', 			class: 'Boolean' },
 	Boolean:	{ wtype: 'i32', 			class: 'Boolean' },
 	number:		{ wtype: 'f64', 			class: 'Number' },
@@ -795,6 +832,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	const types: wasm.SubType[] = [];
 	const functionDeclByName = new Map<string, FunctionDecl>();
 	const worklist: (()=>void)[] = [];
+	// Any-dispatch cascade bodies (`ensureAnyDispatch`) need the *full, final* candidate set -- every class
+	// that will ever be referenced -- so unlike `worklist` (drained inline, can still discover new work while
+	// running), these must wait until `worklist` has completely emptied at least once. See `ensureAnyDispatch`'s own comment.
+	const lateWorklist: (()=>void)[] = [];
+	const anyDispatchFuncs	= new Map<string, FuncInfo>();
 	// Every closure literal reached during compilation, in discovery order -- unlike `funcs`/`classes` these
 	// have no name to key a map by, so a flat array plus the final-assembly placement loop is simplest.
 	const closureLiterals: FuncInfo[] = [];
@@ -833,6 +875,22 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (typeIndex === undefined) {
 			typeIndex = registerType({ final: true, supertypes: [], type: { kind: 'array', field: { type: kind === 'ref' ? { ref: 'any', nullable: true } : kind === 'u32' ? 'i32' : kind as NumericType, mut: true } } });
 			arrayTypeIndices.set(kind, typeIndex);
+		}
+		return typeIndex;
+	}
+
+	// One shared box struct per boxable scalar kind -- lazily registered, same memoization shape as
+	// `ensureArrayType` just above -- purely so a raw scalar (a real wasm value type, no heap identity of
+	// its own) can be written into an `anyref` slot (a genuinely `any`-typed local/array element) at all.
+	// Only `f64`/`i32` (`number`/`boolean`, the two scalar kinds real TS surface code can put in an `any`):
+	// every other scalar `WasmType` (`i64`/`f32`/`u32`) is a towasm-internal pseudo-type for asm plumbing,
+	// never reachable as a real TS value flowing into an `any`.
+	const boxTypeIndices = new Map<'f64' | 'i32', number>();
+	function ensureBoxType(kind: 'f64' | 'i32'): number {
+		let typeIndex = boxTypeIndices.get(kind);
+		if (typeIndex === undefined) {
+			typeIndex = registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } });
+			boxTypeIndices.set(kind, typeIndex);
 		}
 		return typeIndex;
 	}
@@ -1023,8 +1081,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	}
 
 	// The `WasmType` a value expression resolves to -- `classOf`/`arrayKindOf` below are thin discriminating views over this one (previously identical) checker walk.
+	// `unwrapAs`: see that function's own comment -- the checker's `typeOf` must see the real (post-`as`) expression, not the asserted one.
 	function wtypeOf(e: Expr, ctx: FuncCtx): WasmType | undefined {
-		return typeOf(checker.typeOf(e, ctx.scope));
+		return typeOf(checker.typeOf(unwrapAs(e), ctx.scope));
 	}
 
 	// The class a value expression resolves to, or `undefined` if it isn't one. Goes through `ownerOf`
@@ -1064,9 +1123,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// would otherwise silently fall back to `f64` for e.g. `intArr[i] + intArr[j]`.
 	function operandInfo(e: Expr, ctx: FuncCtx): OperandInfo {
 		if (e.type === 'index') {
-			// A class's own `get(i)` (typed-array element reads, or any other class using the same
-			// convention) -- probed the same way `makeAsmBuiltin`'s own empty-args call does, since `get`
-			// is always fixed (non-`$T`) here and its result doesn't depend on the (nonexistent) arguments.
+			// A real element type (a genuine `T[]`/`Array<T>`, whose element is a class/string/etc, not
+			// just `f64`/`i32`/`u32`) resolves fine through the checker -- and *must* go through `ownerFor`
+			// here, not the `undefined`-owner fast paths below, since owner-sensitive operators (`+` on
+			// `string`, `bigintAware`'s `.name === 'String'`/identity checks) need the real owner to
+			// dispatch correctly, not just the raw `WasmType`.
+			const t = checker.typeOf(unwrapAs(e), ctx.scope);
+			if (!T.isAny(t))
+				return { wtype: typeOf(t), owner: ownerFor(t) };
+			// Only reached when the checker genuinely can't resolve an element type (typed-array-style
+			// classes probed via `get(i)`/`arrayKindOf`, where the checker gives `any`) -- a class's own
+			// `get(i)` (typed-array element reads, or any other class using the same convention) -- probed
+			// the same way `makeAsmBuiltin`'s own empty-args call does, since `get` is always fixed
+			// (non-`$T`) here and its result doesn't depend on the (nonexistent) arguments.
 			const getInline = classOf(e.object, ctx)?.inlineMethods?.get('get');
 			if (getInline)
 				return { wtype: getInline([], ctx).result, owner: undefined };
@@ -1074,7 +1143,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			if (kind === 'f64' || kind === 'i32' || kind === 'u32')
 				return { wtype: kind, owner: undefined };
 		}
-		const t = checker.typeOf(e, ctx.scope);
+		const t = checker.typeOf(unwrapAs(e), ctx.scope);
 		return { wtype: typeOf(t), owner: ownerFor(t) };
 	}
 
@@ -1135,7 +1204,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Field access stays `classOf`-only (arrays/scalars have no fields), but method-call dispatch is
 	// otherwise identical across real classes, array kinds, and scalar box kinds -- all handled by `ownerFor` above.
 	function ownerOf(e: Expr, ctx: FuncCtx): MethodOwner | undefined {
-		return ownerFor(checker.typeOf(e, ctx.scope));
+		return ownerFor(checker.typeOf(unwrapAs(e), ctx.scope));
 	}
 
 	// Populated by the "index space" pass below, before any body is built -- a class ref's `WasmType`
@@ -1256,6 +1325,15 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if ((got === 'u32' && want === 'i32') || (got === 'i32' && want === 'u32'))
 			return;
 
+		// A bare scalar has no heap identity of its own -- unlike the ref/array widen-to-`any` case just
+		// below (already a valid `anyref` as-is), a raw `f64`/`i32` needs a real box (`ensureBoxType`) before
+		// it can occupy an `any` slot at all. `u32` reads as `i32` here for the same reason `coerceTop`
+		// already treats them as the same physical value everywhere else.
+		if ((got === 'f64' || got === 'i32' || got === 'u32') && typeof want !== 'string' && 'ref' in want && want.ref === 'any') {
+			ctx.emit(I.struct.new(ensureBoxType(got === 'f64' ? 'f64' : 'i32')));
+			return;
+		}
+
 		if (typeof got !== 'string') {
 			if ('ref' in got && got.ref === 'any') {
 				if (typeof want !== 'string' && ('ref' in want || 'arr' in want || 'closure' in want || 'typeIndex' in want))
@@ -1291,12 +1369,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 		if (got === 'f64') {
 			switch (want) {
-				// Truncation direction doesn't care about the target's signedness -- `u32` wants exactly the
-				// same bit pattern `i32` would get here, only the *other* direction (`want === 'f64'` below)
-				// depends on which sign the bits should be read back as.
 				case 'i32':
 				case 'u32': ctx.emit(I.i64.trunc_sat_f64_s, I.i32.wrap_i64); return;
 				case 'i64': ctx.emit(I.i64.trunc_sat_f64_s); return;
+				case 'f32':	ctx.emit(I.f32.demote_f64); return;
 			}
 		}
 		if (want === 'f64') {
@@ -1307,9 +1383,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				case 'f32':	ctx.emit(I.f64.promote_f32); return;
 			}
 		}
-		// Sign matters for the *widening* direction (unlike the `f64`->`i32`/`u32` truncation above, which
-		// reads the same bits either way) -- needed e.g. for `bigint.ts`'s `__towasm_mulWide(a[i], b[j])`,
-		// whose `i64` params force each `u32` limb read to widen here rather than at its own call site.
+		if (want === 'f32') {
+			switch (got) {
+				case 'i32':	ctx.emit(I.f32.convert_i32_s); return;
+				case 'u32':	ctx.emit(I.f32.convert_i32_u); return;
+				case 'i64': ctx.emit(I.f32.convert_i64_s); return;
+			}
+		}
+
 		if (want === 'i64') {
 			switch (got) {
 				case 'i32': ctx.emit(I.i64.extend_i32_s); return;
@@ -1320,24 +1401,42 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		// `{arr:'u32'}` (a real `u32[]`, see `lib/bigint.ts`), not a fixed `{arr:'i32'}` -- this must track
 		// whatever that is, the same way `bigint`'s `wtype` itself does.
 		if (wasmTypeEq(want, ARR_WTYPE.u32)) {
-			if (got === 'i32' || got === 'u32') {
-				ctx.emit(I.array.new_fixed(ensureArrayType('u32'), 1));
-				return;
-			}
-			if (got === 'i64') {
-				const tmp64 = ctx.local('$tmp64', 'i64');
-				ctx.emit(
-					I.local.tee(tmp64),
-					I.i64.const(0xffffffffn),
-					I.i64.and,
-					I.i32.wrap_i64,
-					I.local.get(tmp64),
-					I.i64.const(32n),
-					I.i64.shr_u,
-					I.i32.wrap_i64,
-					I.array.new_fixed(ensureArrayType('u32'), 2)
-				);
-				return;
+			const array = I.array(ensureArrayType('u32'));
+
+			switch (got) {
+				case 'i32': case 'u32':
+					ctx.emit(array.new(1));
+					return;
+				case 'i64': {
+					const tmp64 = ctx.local('$tmp64', 'i64');
+					ctx.emit(
+						I.local.tee(tmp64),
+						I.i64.const(0xffffffffn),
+						I.i64.and,
+						I.i32.wrap_i64,
+						I.local.get(tmp64),
+						I.i64.const(32n),
+						I.i64.shr_u,
+						I.i32.wrap_i64,
+						array.new(2)
+					);
+					return;
+				}
+				case 'f32':
+					ctx.emit(I.f64.promote_f32);
+					//fall through
+				case 'f64': {
+					const tmp64 = ctx.local('$tmp64', 'i64');
+					const exp = ctx.local('$exp', 'i32');
+					const arr = ctx.local('$exp', {arr: 'u32'});
+					ctx.emit(I.local.tee(tmp64));
+					// get exponent
+					ctx.emit(I.i64.reinterpret_f64, I.i64(53), I.i64.shr_u, I.i32.wrap_i64, I.i32(0x7ff), I.i32.and, I.i32(1023), I.i32.add, I.local.tee(exp));
+					ctx.emit(array.new([I.i32(5), I.i32.shr_s]), I.local.set(arr));
+					ctx.emit(array.set(I.local.get(arr), 0, [I.local.get(tmp64), I.i64.const(0xffffffffn), I.i64.and, I.i32.wrap_i64]));
+					break;
+				}
+
 			}
 		}
 		throw new Error(`towasm: internal: cannot convert ${JSON.stringify(got)} to ${JSON.stringify(want)}`);
@@ -1352,7 +1451,21 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			ctx.emit(I.ref.null(heapTypeIndexOf(want)));
 			return;
 		}
-		coerceTop(emitExpr(e, ctx, want), ctx, want);
+		const got = emitExpr(e, ctx, want);
+		// Boxing into `any`: `i32` is this compiler's physical representation for *both* a real `boolean` and
+		// a numeric value narrowed to a compact integer (e.g. `1 + 2`'s own i32-add codegen shortcut,
+		// `operandInfo`'s own literal-type dispatch) -- by the time a bare `'i32'` `WasmType` reaches
+		// `coerceTop`, that distinction is already gone, so it always picked the boolean box (found via
+		// `const x: any = 1 + 2` boxing as a *Boolean*, not a Number -- `x.toString()` returned `"true"`).
+		// Disambiguated here using the checker's own real type for `e` -- only reached for the one physical
+		// kind (`i32`) with two possible meanings; every other kind (including a real `f64`) is already
+		// unambiguous and needs no extra care.
+		if (got === 'i32' && typeof want !== 'string' && 'ref' in want && want.ref === 'any' && ownerFor(checker.typeOf(unwrapAs(e), ctx.scope))?.name !== 'Boolean') {
+			coerceTop('i32', ctx, 'f64');
+			coerceTop('f64', ctx, want);
+			return;
+		}
+		coerceTop(got, ctx, want);
 	}
 
 	// Every `if`/`while`/`?:`/`&&`/`||` test used to just `emitAs(test, ctx, 'i32')`
@@ -1856,14 +1969,48 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		switch (e.type) {
 			case 'literal':
 				if (Array.isArray(e.value)) {
+					// No interpolation at all -- the only case a single part can mean, since a template
+					// consisting of just `${x}` (one part, but with `.exp` set) still needs the general path
+					// below, not this shortcut (previously matched on `e.value.length === 1` alone, silently
+					// dropping `x` entirely for that template).
+					if (e.value.length === 1 && !e.value[0].exp) {
+						emitStringConst(e.value[0].str, ctx);
+						return ARR_WTYPE.i16;
+					}
+
 					for (const p of e.value)
 						emitStringConst(p.str, ctx);
-					ctx.emit(I.array.new_fixed(ensureArrayType('ref'), e.value.length));
+					// `template_literal_part`'s second grammar rule (the trailing, `exp`-less part) only ever
+					// matches when there's real text between the last `${...}` and the closing backtick --
+					// found via `` `a=${a}, b=${b}` ``, which the parser hands back as exactly 2 parts (both
+					// with `.exp`), not 3: no third, empty, trailing part at all. `stringTemplate` itself
+					// (`lib/string.ts`) unconditionally needs `strings.length === values.length + 1` (it
+					// always reads `strings[i+1]` up to the last value) -- pad with one empty string constant
+					// here whenever the parser's own array doesn't already end with a trailing literal, so
+					// that invariant holds regardless of this parser-level quirk.
+					const hasTrailingLiteral = !e.value[e.value.length - 1].exp;
+					if (!hasTrailingLiteral)
+						emitStringConst('', ctx);
+					// `'ref'`, not `'i16'` -- this builds `strings: string[]`, an array *of strings*, each
+					// element itself a whole i16-array (`emitStringConst` already pushed one full string per
+					// part, not a single character) -- `arrayElemKind(string)` is `'ref'` for the same reason
+					// any other non-scalar element type is (`wasmTypeOf('string')` isn't `i32`/`f64`/`u32`).
+					// Each pushed string is already a valid `anyref` as-is (a concrete array/ref value
+					// structurally upcasts for free, same as `coerceTop`'s own ref-widening case), so no
+					// explicit per-element cast is needed before bundling them here.
+					ctx.emit(I.array.new_fixed(ensureArrayType('ref'), e.value.length + (hasTrailingLiteral ? 0 : 1)));
+					// The real interpolation count -- *not* `e.value.length - 1`, which undercounts by one
+					// whenever `hasTrailingLiteral` is false (same root cause as the strings-array padding
+					// just above: `e.value.length` alone no longer reliably implies "one more than the
+					// interpolation count" with this parser).
+					let valueCount = 0;
 					for (const p of e.value) {
-						if (p.exp)
-							emitAs(p.exp, ctx, 'f64');
+						if (p.exp) {
+							emitAs(p.exp, ctx, REF_ANY);
+							valueCount++;
+						}
 					}
-					ctx.emit(I.array.new_fixed(ensureArrayType('f64'), e.value.length - 1));
+					ctx.emit(I.array.new_fixed(ensureArrayType('ref'), valueCount));
 					const decl = LIB_DECL_MAP.get('stringTemplate');
 					if (decl && decl.type === 'function_decl') {
 						const info = funcs.get('stringTemplate') ?? ensureFunc('stringTemplate', decl);
@@ -1874,7 +2021,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				}
 				switch (typeof e.value) {
 					case 'number':
-						if (want !== 'f64' && e.value === (e.value | 0)) {
+						// `typeof want === 'string'`: the i32 shortcut only ever makes sense when the *caller*
+						// itself wants a plain scalar (an i32/u32/boolean-ish context) -- `want` being an
+						// object (e.g. `REF_ANY`, boxing a real `number` into an `any` slot) means the literal's
+						// true TS type is `number`, and returning a bare `'i32'` here would be indistinguishable
+						// from a real boolean by the time `coerceTop` has to decide which box to use.
+						if (typeof want === 'string' && want !== 'f64' && e.value === (e.value | 0)) {
 							ctx.emit(I.i32.const(e.value));
 							return 'i32';
 						}
@@ -2033,7 +2185,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				emitAs(e.object, ctx, ARR_WTYPE[kind]);
 				emitAs(e.property, ctx, 'i32');
 				ctx.emit(I.array.get(ensureArrayType(kind)));
-				return kind === 'ref' ? {ref: 'any'} : kind;
+				// `nullable: true` -- `ensureArrayType`'s own `'ref'`-kind field is declared nullable (its one
+				// shared physical storage for every non-scalar element kind), so `array.get` on it always
+				// really does produce a nullable `anyref` at the wasm level, whatever a caller's declared TS
+				// element type claims -- under-reporting this left `coerceTop` thinking a narrowing target
+				// already matched (nothing ever emits the needed `ref.as_non_null`/`ref.cast`), which only
+				// surfaced once a consumer became strict about it (a dynamic-dispatch cascade's non-null
+				// `(ref any)` receiver param).
+				return kind === 'ref' ? { ref: 'any', nullable: true } : kind;
 			}
 
 			// `as`/`as unknown as X` is compile-time-only in real TS too -- a no-op here: compile the inner
@@ -2046,7 +2205,16 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			// boxes each one (same mechanism `arr[i] = x`/`.push(x)` already use), not the bare `kind` string
 			// itself (never a real `WasmType`, only happens to coincide with one for the scalar kinds).
 			case 'array': {
-				const kind = arrayKindOf(e, ctx);
+				// `want`'s own kind wins when it's `'ref'` (a real `any[]`/ref-kind-element target) even if
+				// every element is naturally scalar (`const values: any[] = [1, 2, 3]`) -- the literal's own
+				// checker-inferred type (`arrayKindOf`) only sees the elements themselves, never the
+				// surrounding contextual target, so it would otherwise build a real `number[]` and then fail
+				// to widen it to the declared `any[]` (`coerceTop` converts *element-for-element* while
+				// building, via `emitArrayElements`'s own `REF_ANY` target below -- boxing each scalar the same
+				// way a plain `arr[i] = x`/`.push(x)` already does -- not as one bulk array-to-array coercion
+				// afterward, which only handles same-kind arrays).
+				const wantKind = typeof want !== 'undefined' && typeof want !== 'string' && 'arr' in want ? want.arr : undefined;
+				const kind = wantKind === 'ref' ? 'ref' : arrayKindOf(e, ctx);
 				if (!kind || kind === 'i16')
 					throw new Error('towasm: array literals are only supported for number[]/boolean[]/T[]');
 				emitArrayElements(e.elements, ctx, kind === 'ref' ? REF_ANY : kind, kind, ensureArrayType(kind));
@@ -2211,8 +2379,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						throw new Error('towasm: inline asm does not support spread call arguments');
 					const owner = ctx.owner;
 					const ownerCls = owner && 'fields' in owner ? owner as ClassInfo : undefined;
+					const ownerTypeArgs = ownerCls?.thisTsType.type === 'ref' ? ownerCls.thisTsType.typeArgs : undefined;
 					const builtin = makeAsmBuiltin('<inline>', e.callee, owner?.name ?? '<top-level>', owner?.typeIndex ?? -1,
-						ownerCls && typeof ownerCls.thisWtype !== 'string' && ownerCls.thisWtype && 'arr' in ownerCls.thisWtype ? ownerCls.thisWtype.arr : undefined);
+						ownerCls && typeof ownerCls.thisWtype !== 'string' && ownerCls.thisWtype && 'arr' in ownerCls.thisWtype ? ownerCls.thisWtype.arr : undefined,
+						ownerTypeArgs?.length === 1 ? ownerTypeArgs[0] : undefined);
 					if (!builtin)
 						throw new Error('towasm: inline asm failed to resolve (see the console warning above for details)');
 					return emitInline('<inline>', builtin(e.arguments.map(a => operandInfo(a, ctx)), ctx), e.arguments, ctx);
@@ -2264,8 +2434,25 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							return emitCall(name, e.arguments, ctx);
 					}
 					const owner = ownerOf(obj, ctx);
-					if (!owner)
+					if (!owner) {
+						// No single static owner -- if the receiver is genuinely `any` (not just checker-
+						// asserted, see `unwrapAs`), a real runtime dispatch can still resolve it, same as real
+						// JS would. Checked via the checker's own type, not `wtypeOf` -- a genuinely `any`-typed
+						// expression has no `WasmType` at all (nothing ever *produces* a bare, un-narrowed `any`
+						// value; `wtypeOf`/`wasmTypeOf` gives `undefined`, not `REF_ANY`, for one -- only
+						// explicit boxing/widening, via `emitAs` below, ever manufactures a real `{ref:'any'}`
+						// value). `want ?? REF_ANY`: a bare expression-statement calls `emitExpr` with no `want`
+						// at all (`case 'expression'`) -- `REF_ANY` is always a safe target (every candidate's
+						// real result already widens to it via `coerceTop`), and the statement-level caller
+						// drops it same as any other non-`void` result.
+						if (T.isAny(checker.typeOf(unwrapAs(obj), ctx.scope)) && e.arguments.length === 0) {
+							const info = ensureAnyDispatch(e.callee.property, want ?? REF_ANY, ctx);
+							emitAs(obj, ctx, REF_ANY);
+							ctx.emit(I.call(info.funcIndex));
+							return info.result;
+						}
 						throw new Error(`towasm: unknown method '${e.callee.property}'`);
+					}
 					// A method that reassigns `this` (`ensureMethod`'s `reassignsThis`, see `assignsToThis`)
 					// needs its receiver's real physical lvalue, not just its current value -- `emitAssignTarget`
 					// (`'keep'`) pushes that value for the call itself *and* sets up the write-back, reusing
@@ -2531,6 +2718,23 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 		if (operator === '=') {
 			emitAs(right, ctx, target.wtype);
+		} else if (operator === '??=') {
+			// `a ??= b` -- real JS short-circuits: `b` is only *evaluated* when `a` is null/undefined, not
+			// merely "combined in" the way every other compound-assignment op unconditionally is. Mirrors the
+			// plain `??` binary-op case's own `if`-based lowering exactly (same nullable-target restriction,
+			// same `local.set`-then-`ref.is_null`-then-`if` shape) -- this is just that same value now feeding
+			// `target.write` instead of being returned directly.
+			if (typeof wtype === 'string' || !wtype.nullable)
+				throw new Error("towasm: '??=' needs a nullable object-typed target (no boxing in this subset)");
+			const leftLocal = ctx.declareLocal(`$nullish$assign$${optionalTempCounter++}`, wtype);
+			ctx.emit(I.local.set(leftLocal.index));
+			ctx.emit(I.local.get(leftLocal.index), I.ref.is_null);
+			const old = ctx.swapOut();
+			emitAs(right, ctx, wtype);
+			const _then = ctx.swapOut();
+			ctx.emit(I.local.get(leftLocal.index));
+			const _else = ctx.swapOut(old);
+			ctx.emit(I.if(toValType(wtype), _then, _else));
 		} else {
 			const baseOp = operator.slice(0, -1);
 			const builtin = builtins[baseOp];
@@ -3095,8 +3299,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			// available to any plain class, not just those specially built in. `TYPED_ARRAY_ALIASES[name]
 			// ?.elem`: the one piece of non-name-substitutable info `get`/`set` need (see that table's comment).
 			// Comes from whatever `thisWtype` actually turned out to be, not a name check either.
+			// `typeArgs[0]` (single-type-param generics only, e.g. `Array<T>`): the exact node substituted
+			// for the class's own `T`, threaded through purely so `resolveType` can tell a bare `T` from a
+			// real `T[]` even when `T` itself is array-shaped (see `makeAsmBuiltin`'s own comment).
 			const { inlineMethods, asmMethodKeys } = scanInlineMethods(decl, name, info.typeIndex,
 				typeof info.thisWtype !== 'string' && info.thisWtype && 'arr' in info.thisWtype ? info.thisWtype.arr : undefined,
+				typeArgs?.length === 1 ? typeArgs[0] : undefined,
 				TYPED_ARRAY_ALIASES[name]?.elem);
 			for (const k of asmMethodKeys)
 				info.methodDecls.delete(k);
@@ -3287,6 +3495,92 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return info;
 	}
 
+	// Every owner (boxed `number`/`boxed `boolean`, plus every class ever reached) that declares a real,
+	// non-`this`-reassigning, zero-argument `name` -- the candidate set a dynamic (`any`-typed) dispatch of
+	// `name()` cascades over. Deduped by physical `heapType`: several `Array<T>` instantiations sharing one
+	// physical array kind (or any other case of two owners landing on the same physical type) only need one
+	// `ref.test` arm between them, since a `ref.test` can't tell them apart at the wasm level anyway.
+	// Zero-arg fit is probed the same way `resolveOverload` itself does internally (`T.argsFit`/`T.FixSig`
+	// with an empty arg-type list) -- `!assignsToThis` is the one extra exclusion beyond that: a method that
+	// replaces its own receiver (`Array<T>.push`/etc) has no sensible target to write back through a boxed
+	// `any` value, so it's simply not a candidate here.
+	function findAnyDispatchCandidates(name: string, ctx: FuncCtx): { heapType: number; isBoxedScalar: boolean; funcInfo: FuncInfo }[] {
+		const found = new Map<number, { heapType: number; isBoxedScalar: boolean; funcInfo: FuncInfo }>();
+		const probe = (owner: MethodOwner | undefined, heapType: number, isBoxedScalar: boolean) => {
+			if (!owner || found.has(heapType))
+				return;
+			const decl = owner.methodDecls.get(name)?.find(d => d.body && !assignsToThis(d.body) && T.argsFit(T.FixSig(d, T.ANY), [], ctx.scope));
+			if (!decl)
+				return;
+			const funcInfo = ensureMethod(owner, name, [], ctx);
+			if (funcInfo)
+				found.set(heapType, { heapType, isBoxedScalar, funcInfo });
+		};
+		probe(builtinTypeOwner('number'), ensureBoxType('f64'), true);
+		probe(builtinTypeOwner('boolean'), ensureBoxType('i32'), true);
+		for (const cls of classes.values()) {
+			// `-1` is `ensureClass`'s own sentinel for "scalar-backed, no physical heap type at all" (see its
+			// own comment) -- `Number`/`BigInt`-as-scalar/etc land here too (`classes` holds every class ever
+			// referenced, not just ref/array-backed ones), and `-1` is meaningless as a `ref.test` target (it
+			// isn't even a real type index, let alone a distinguishing one -- every scalar-backed class would
+			// collide on it). Already covered correctly above via `ensureBoxType` for the two real cases
+			// (`number`/`boolean`) that can actually reach an `any` slot.
+			if (cls.typeIndex !== -1)
+				probe(cls, cls.typeIndex, false);
+		}
+		return [...found.values()];
+	}
+
+	// A real dynamic-dispatch cascade for `recv.name()` where `recv`'s static type is genuinely `any` (no
+	// single owner -- `ownerOf` already returned `undefined`), not just checker-asserted (`unwrapAs` handles
+	// that narrower, already-known-statically case at the `wtypeOf`/`ownerOf` level instead). One shared
+	// function per `(name, want)` pair, reserved immediately (`registerFunc`, same "signature now, body
+	// later" shape `ensureMethod` uses) so call sites can `call` it right away -- but its *body* can only be
+	// built once the full, final candidate set is known, which needs every class the program will ever
+	// reference to have already been discovered. `worklist` alone doesn't guarantee that (an item can still
+	// be discovering new classes while it runs) -- `lateWorklist`, drained only after `worklist` has
+	// completely emptied (see the call site in `TStoWasm`'s own assembly section), is what does.
+	function ensureAnyDispatch(name: string, want: WasmType, ctx: FuncCtx): FuncInfo {
+		const key = `${name}=>${wasmTypeKey(want)}`;
+		const existing = anyDispatchFuncs.get(key);
+		if (existing)
+			return existing;
+		const { funcIndex, typeIndex } = registerFunc([toValType(REF_ANY)], toResultType(want));
+		const info: FuncInfo = { params: [REF_ANY], result: want, funcIndex, typeIndex };
+		anyDispatchFuncs.set(key, info);
+		funcs.set(`<any dispatch>.${key}`, info);
+		lateWorklist.push(() => {
+			const candidates = findAnyDispatchCandidates(name, ctx);
+			if (!candidates.length)
+				throw new Error(`towasm: no reachable class (or 'number'/'boolean') declares a matching zero-argument '${name}' -- a dynamic dispatch on 'any' needs at least one real candidate`);
+			const dctx = new FuncCtx(new Scope(libGlobal), want);
+			const recv = dctx.declareLocal('$recv', REF_ANY);
+			function buildArm(i: number): wasm.Instr[] {
+				if (i >= candidates.length)
+					return [I.unreachable];
+				const c = candidates[i];
+				dctx.emit(I.local.get(recv.index), I.ref.test(c.heapType));
+				const cond = dctx.swapOut();
+				dctx.emit(I.local.get(recv.index), I.ref.cast(c.heapType));
+				if (c.isBoxedScalar)
+					dctx.emit(I.struct.get(c.heapType, 0));
+				// The call site is zero-`args`, but the candidate method itself may still declare optional/
+				// defaulted trailing params beyond `this` (e.g. `Number.toString(radix?: number)`) -- wasm has
+				// no notion of "optional", so their default values must still be pushed, same as any other
+				// zero-arg call to a method with defaults (`emitCallArgs`, shared with `emitMethodCall`).
+				emitCallArgs(name, c.funcInfo.params, c.funcInfo.defaults, !!c.funcInfo.hasRest, [], dctx);
+				dctx.emit(I.call(c.funcInfo.funcIndex));
+				coerceTop(c.funcInfo.result, dctx, want);
+				const then = dctx.swapOut();
+				return [...cond, I.if(toResultType(want), then, buildArm(i + 1))];
+			}
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(1, toValType);
+			info.body.id = key.replace(/[^a-zA-Z0-9_]/g, '_');
+		});
+		return info;
+	}
+
 
 	// ===================================================================
 	//  Program lowering
@@ -3315,7 +3609,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		]));
 		mod.imports.push(
 			{ module: 'console', name: 'log', desc: { kind: 'func', typeIndex: registerFunc(['f64'], undefined).typeIndex } },
-			{ module: 'console', name: 'log', desc: { kind: 'func', typeIndex: registerFunc(['f32'], undefined).typeIndex } },
+			{ module: 'console', name: 'log', desc: { kind: 'func', typeIndex: registerFunc(['i32'], undefined).typeIndex } },
 		);
 	}
 
@@ -3333,7 +3627,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 			classes.set(s.name, {
 				name: 		s.name,
-				typeIndex:		-1,
+				typeIndex:	-1,
 				thisTsType:	TS.RefType(s.name),
 				decl:		s,
 				fields: 	[],
@@ -3347,6 +3641,17 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	while (worklist.length)
 		worklist.shift()!();
+
+	// `lateWorklist` (any-dispatch cascade bodies) needs the *full, final* candidate set -- every class the
+	// program will ever reference -- so it only starts once `worklist` has completely drained at least once.
+	// Building a cascade body can itself reach a not-yet-compiled candidate method (`ensureMethod`), which
+	// pushes back onto `worklist` -- drained again after every `lateWorklist` item, not just once, so that's
+	// still fully resolved before assembly too.
+	while (lateWorklist.length) {
+		lateWorklist.shift()!();
+		while (worklist.length)
+			worklist.shift()!();
+	}
 
 	// ---- assemble the module ----
 
