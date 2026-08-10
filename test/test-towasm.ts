@@ -1653,6 +1653,166 @@ function alloc(size: i32): i32 {
 	}
 
 	{
+		// RegExp ("core" scope -- see lib/regexp.ts's own header comment for exactly what's covered/not):
+		// literal/`.`/character classes (incl. negation), \d\s, greedy/lazy quantifiers (* + ? {n,m}),
+		// capturing groups + backreferences, alternation, ^$ anchors, i/g flags, exec()'s lastIndex
+		// stepping. Every `new RegExp(...)` is bound to a local before calling a method on it --
+		// `new RegExp(...).test(...)` chained directly is a real (separate, reported) towasm.ts bug:
+		// method-call dispatch resolves the receiver's class via an already-registered lookup that a
+		// directly-chained `new` expression hasn't triggered yet.
+		const {
+			literalMatch, literalNoMatch, dotAny, charClass, charClassNegate, digitClass,
+			starGreedyLength, starLazyLength, plusMatch, optionalBoth, braceExactTooShort, braceExactOk,
+			braceRangeLength, groupBackrefMatch, groupBackrefNoMatch, groupCaptureLength, alternation,
+			anchors, ignoreCaseFlag, globalExecCount, wordBoundary,
+		} = await compile(`
+			function literalMatch(): number { const re = new RegExp("abc"); return re.test("xxabcyy") ? 1 : 0; }
+			function literalNoMatch(): number { const re = new RegExp("abc"); return re.test("xyz") ? 1 : 0; }
+			function dotAny(): number { const re = new RegExp("a.c"); return re.test("aXc") ? 1 : 0; }
+			function charClass(): number { const re = new RegExp("[a-c]+"); return re.test("xxbbxx") ? 1 : 0; }
+			function charClassNegate(): number { const re = new RegExp("[^0-9]+"); return re.test("123abc") ? 1 : 0; }
+			function digitClass(): number { const re = new RegExp("\\\\d+"); return re.test("abc123") ? 1 : 0; }
+			function starGreedyLength(): number {
+				const re = new RegExp("a*");
+				const m = re.exec("aaab");
+				if (m === null) return -1;
+				const g0 = m.group(0);
+				return g0.length;
+			}
+			function starLazyLength(): number {
+				const re = new RegExp("a.*?c");
+				const m = re.exec("axxcxxc");
+				if (m === null) return -1;
+				const g0 = m.group(0);
+				return g0.length;
+			}
+			function plusMatch(): number { const re = new RegExp("a+"); return re.test("baaab") ? 1 : 0; }
+			function optionalBoth(): number {
+				const re = new RegExp("colou?r");
+				return (re.test("color") ? 1 : 0) * 10 + (re.test("colour") ? 1 : 0);
+			}
+			function braceExactTooShort(): number { const re = new RegExp("a{3}"); return re.test("aa") ? 1 : 0; }
+			function braceExactOk(): number { const re = new RegExp("a{3}"); return re.test("aaa") ? 1 : 0; }
+			function braceRangeLength(): number {
+				const re = new RegExp("a{2,4}");
+				const m = re.exec("aaaaa");
+				if (m === null) return -1;
+				const g0 = m.group(0);
+				return g0.length;
+			}
+			function groupBackrefMatch(): number { const re = new RegExp("(\\\\w+) \\\\1"); return re.test("hello hello") ? 1 : 0; }
+			function groupBackrefNoMatch(): number { const re = new RegExp("(\\\\w+) \\\\1"); return re.test("hello world") ? 1 : 0; }
+			function groupCaptureLength(): number {
+				const re = new RegExp("(ab)+c");
+				const m = re.exec("ababc");
+				if (m === null) return -1;
+				const g1 = m.group(1);
+				return m.length * 1000 + g1.length;
+			}
+			function alternation(): number {
+				const re = new RegExp("cat|dog");
+				return (re.test("I have a dog") ? 1 : 0) * 10 + (re.test("I have a cat") ? 1 : 0);
+			}
+			function anchors(): number {
+				const re = new RegExp("^abc$");
+				return (re.test("abc") ? 1 : 0) * 10 + (re.test("xabc") ? 1 : 0);
+			}
+			function ignoreCaseFlag(): number { const re = new RegExp("abc", "i"); return re.test("ABC") ? 1 : 0; }
+			function globalExecCount(): number {
+				const re = new RegExp("a", "g");
+				let count = 0;
+				while (re.exec("banana") !== null)
+					count = count + 1;
+				return count;
+			}
+			function wordBoundary(): number {
+				const re = new RegExp("\\\\bcat\\\\b");
+				return (re.test("a cat sat") ? 1 : 0) * 10 + (re.test("category") ? 1 : 0);
+			}
+		`);
+		check('RegExp: literal match', literalMatch(), 1);
+		check('RegExp: literal no-match', literalNoMatch(), 0);
+		check('RegExp: "." matches any char', dotAny(), 1);
+		check('RegExp: [a-c]+ character class', charClass(), 1);
+		check('RegExp: [^0-9]+ negated class', charClassNegate(), 1);
+		check('RegExp: \\d+ shorthand class', digitClass(), 1);
+		check('RegExp: a* greedy ("aaab" -> "aaa", length 3)', starGreedyLength(), 3);
+		check('RegExp: a.*?c lazy ("axxcxxc" -> "axxc", length 4)', starLazyLength(), 4);
+		check('RegExp: a+ one-or-more', plusMatch(), 1);
+		check('RegExp: colou?r optional (matches both spellings)', optionalBoth(), 11);
+		check('RegExp: a{3} rejects too-short input', braceExactTooShort(), 0);
+		check('RegExp: a{3} accepts exact-length input', braceExactOk(), 1);
+		check('RegExp: a{2,4} greedy bounded ("aaaaa" -> 4 a\'s)', braceRangeLength(), 4);
+		check('RegExp: (\\w+) \\1 backreference matches', groupBackrefMatch(), 1);
+		check('RegExp: (\\w+) \\1 backreference rejects mismatch', groupBackrefNoMatch(), 0);
+		check('RegExp: (ab)+c captures group 1 (2 groups incl. whole match, group 1 length 2)', groupCaptureLength(), 2002);
+		check('RegExp: cat|dog alternation', alternation(), 11);
+		check('RegExp: ^abc$ anchors', anchors(), 10);
+		check('RegExp: "i" flag case-insensitive', ignoreCaseFlag(), 1);
+		check('RegExp: "g" flag exec() steps lastIndex (3 "a"s in "banana")', globalExecCount(), 3);
+		check('RegExp: \\bcat\\b word boundary', wordBoundary(), 10);
+	}
+
+	{
+		// String integration: match/search/replace/split, all built on RegExp above.
+		const {
+			matchFound, matchNotFound, searchFound, searchNotFound,
+			replaceFirstOnly, replaceGlobalAll, replaceBackrefSwap,
+			splitBasicCount, splitBasicPart, splitWithLimit, splitOnWhitespace,
+		} = await compile(`
+			function matchFound(): number {
+				const s: string = "hello world";
+				const re = new RegExp("wor\\\\w+");
+				const m = s.match(re);
+				if (m === null) return -1;
+				const g0 = m.group(0);
+				return g0.length;
+			}
+			function matchNotFound(): number {
+				const s: string = "hello world";
+				const re = new RegExp("xyz");
+				const m = s.match(re);
+				return m === null ? 1 : 0;
+			}
+			function searchFound(): number { const s: string = "hello world"; const re = new RegExp("world"); return s.search(re); }
+			function searchNotFound(): number { const s: string = "hello world"; const re = new RegExp("xyz"); return s.search(re); }
+			function replaceFirstOnly(): number {
+				const s: string = "cat cat cat";
+				const re = new RegExp("cat");
+				const t: string = s.replace(re, "dog");
+				return t.length;
+			}
+			function replaceGlobalAll(): number {
+				const s: string = "cat cat cat";
+				const re = new RegExp("cat", "g");
+				const t: string = s.replace(re, "dog");
+				return t.length;
+			}
+			function replaceBackrefSwap(): number {
+				const s: string = "John Smith";
+				const re = new RegExp("(\\\\w+) (\\\\w+)");
+				const t: string = s.replace(re, "$2 $1");
+				return t.length;
+			}
+			function splitBasicCount(): number { const s: string = "a,b,c,d"; const re = new RegExp(","); const parts = s.split(re); return parts.length; }
+			function splitBasicPart(): number { const s: string = "a,b,c,d"; const re = new RegExp(","); const parts = s.split(re); return parts.get(2).length; }
+			function splitWithLimit(): number { const s: string = "a,b,c,d"; const re = new RegExp(","); const parts = s.split(re, 2); return parts.length; }
+			function splitOnWhitespace(): number { const s: string = "the quick brown fox"; const re = new RegExp("\\\\s+"); const parts = s.split(re); return parts.length; }
+		`);
+		check('String.match() finds a match', matchFound(), 5);
+		check('String.match() returns null on no match', matchNotFound(), 1);
+		check('String.search() returns match index', searchFound(), 6);
+		check('String.search() returns -1 on no match', searchNotFound(), -1);
+		check('String.replace() (non-global) replaces only the first "cat"', replaceFirstOnly(), 11);
+		check('String.replace() ("g" flag) replaces every "cat"', replaceGlobalAll(), 11);
+		check('String.replace() with $1/$2 backreferences ("John Smith" -> "Smith John")', replaceBackrefSwap(), 10);
+		check('String.split() splits into the right number of parts', splitBasicCount(), 4);
+		check('String.split() part content ("a,b,c,d"[2] === "c")', splitBasicPart(), 1);
+		check('String.split() honors a limit', splitWithLimit(), 2);
+		check('String.split() on a \\s+ separator', splitOnWhitespace(), 4);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
