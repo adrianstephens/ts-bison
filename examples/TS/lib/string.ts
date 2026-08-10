@@ -1,4 +1,5 @@
 /// <reference path="./lib.d.ts" />
+import { RegExp, RegExpMatch, StringParts, expandReplacement, growInt32 } from './regexp';
 
 //-----------------------------------------------------------------------------
 //	String
@@ -187,4 +188,75 @@ export class String {
 	}
 
 	toString(): string { return this as unknown as string; }
+
+	match(regexp: RegExp): RegExpMatch | null {
+		return regexp.exec(this as unknown as string);
+	}
+	search(regexp: RegExp): number {
+		const s: string = this as unknown as string;
+		const m: RegExpMatch | null = regexp.exec(s);
+		return m === null ? -1 : m.index;
+	}
+	// `$1`.."$9"/`$&`/`$$` substitution (see regexp.ts's `expandReplacement`) -- the function-replacer
+	// overload real JS also has is out of scope. Honors `g` (all matches) vs first-only.
+	replace(regexp: RegExp, replacement: string): string {
+		const s: string = this as unknown as string;
+		let result: string = '';
+		let last: number = 0;
+		let go: boolean = true;
+		regexp.lastIndex = 0;
+		while (go) {
+			const m: RegExpMatch | null = regexp.exec(s);
+			if (m === null) {
+				go = false;
+			} else {
+				result = result.concat(s.slice(last, m.index)).concat(expandReplacement(replacement, m));
+				last = m.groupEnd(0);
+				if (!regexp.global) go = false;
+			}
+		}
+		return result.concat(s.slice(last, s.length));
+	}
+	// Capture groups aren't interleaved into the result (unlike real JS's `split(/(\d)/)`) -- explicit
+	// scope simplification (see StringParts's own comment), not an oversight.
+	split(separator: RegExp, limit: number = 4294967295): StringParts {
+		const s: string = this as unknown as string;
+		const max: number = limit;
+		let offsets: Int32Array = new Int32Array(16);
+		let count: number = 0;
+		if (max > 0) {
+			let last: number = 0;
+			let pos: number = 0;
+			while (pos <= s.length && count < max) {
+				// `execFrom`, not `exec` -- split scans the whole string regardless of `separator`'s own
+				// `g`/`lastIndex` state (real JS split() ignores them the same way).
+				const m: RegExpMatch | null = separator.execFrom(s, pos);
+				if (m === null)
+					break;
+				const ms: number = m.groupStart(0);
+				const me: number = m.groupEnd(0);
+				if (ms >= s.length)
+					break;
+				if (me === ms) {
+					pos = pos + 1;
+				} else {
+					while (count * 2 + 2 > offsets.length)
+						offsets = growInt32(offsets);
+					offsets[count * 2] = last;
+					offsets[count * 2 + 1] = ms;
+					count = count + 1;
+					last = me;
+					pos = me;
+				}
+			}
+			if (count < max) {
+				while (count * 2 + 2 > offsets.length)
+					offsets = growInt32(offsets);
+				offsets[count * 2] = last;
+				offsets[count * 2 + 1] = s.length;
+				count = count + 1;
+			}
+		}
+		return new StringParts(s, count, offsets);
+	}
 }
