@@ -35,8 +35,9 @@ function cos_core(r: number): number {
 	const C3 = -1.38888888888741095749e-3;
 	const C4 = 2.48015872894767294178e-5;
 
-	const z2 = z * z;
-	return C1 * z + C2 * z2 + C3 * z2 * z + C4 * z2 * z2 + 1.0;
+//	const z2 = z * z;
+//	return C1 * z + C2 * z2 + C3 * z2 * z + C4 * z2 * z2 + 1.0;
+	return z * (C1 + z * (C2 + z * (C3 + z * C4))) + 1.0;
 }
 function sin_core(r: number): number {
 	const z = r * r;
@@ -46,8 +47,16 @@ function sin_core(r: number): number {
 	const S4 = 2.75573137070700676789e-6;
 
 	const r3 = r * z;
-	const poly = S1 * r3 + S2 * r3 * z + S3 * r3 * z * z + S4 * r3 * z * z * z;
+//	const poly = S1 * r3 + S2 * r3 * z + S3 * r3 * z * z + S4 * r3 * z * z * z;
+	const poly = r3 * (S1 + z * (S2 + z * (S3 + z * S4)));
 	return r + poly;
+}
+
+// Leibniz series x - x^3/3 + x^5/5 - x^7/7 + x^9/9 -- only accurate for small |x| (converges slowly near
+// its domain edge), so callers must range-reduce down to roughly |x| <= 1/3 first.
+function atanPoly(x: number): number {
+	const x2 = x * x;
+	return x * (1 + x2 * (-1 / 3 + x2 * (1 / 5 + x2 * (-1 / 7 + x2 / 9))));
 }
 
 function intPow(x: number, y: number): number {
@@ -61,6 +70,17 @@ function intPow(x: number, y: number): number {
 			result *= x;
 	}
 	return result;
+}
+//-----------------------------------------------------------------------------
+//	Boolean
+//-----------------------------------------------------------------------------
+
+export class Boolean {
+	constructor(value: i32) {
+		return value as unknown as Boolean;
+	}
+	valueOf():	boolean { return this as unknown as boolean; }
+	toString(): string	{ return (this as unknown as boolean) ? 'true' : 'false'; }
 }
 
 //-----------------------------------------------------------------------------
@@ -174,7 +194,11 @@ function fracToString(f: number, digits: number): string {
 }
 
 export class Number {
-	constructor(value?: any) {}
+	// A real `f64` -- lets `towasm.ts`'s `ensureClass` read this class's own physical `this`-type
+	// straight off the (stripped-of-casts) return expression's real type, same as every other class.
+	constructor(value: number) {
+		return value as unknown as Number;
+	}
 
 	static readonly EPSILON = 2.2204460492503130808472633361816e-16;
 	static readonly MAX_SAFE_INTEGER: number = 9007199254740991;
@@ -221,6 +245,8 @@ export class Number {
 
 		return sign * value * intPow(10, exp);
 	}
+
+	valueOf():	number { return this as unknown as number; }
 
 	toString(radix: number = 10): string {
 		let x = this as unknown as number;
@@ -318,8 +344,10 @@ export class Math {
 		if (x < -745.133219101941)
 			return 0;
 	
-		// x = k*ln2 + r, |r| <= ln2/2
-		const k	= (x * Math.LOG2E) | 0;
+		// x = k*ln2 + r, |r| <= ln2/2 -- needs a real round-to-nearest: `|0` truncates toward zero, so for
+		// negative x (e.g. x=-0.675) k came out 0 instead of -1, leaving |r| well outside the ln2/2 bound
+		// the Taylor series below assumes (found via a direct sweep against real Math.exp).
+		const k	= Math.round(x * Math.LOG2E);
 		const r	= x - k * Math.LN2;
 		const r2 = r * r;
 		const p = 1 + r + r2 / 2 + r2 * r / 6 + r2 * r2 / 24 + r2 * r2 * r / 120;
@@ -327,23 +355,29 @@ export class Math {
 	}
 	
 	static log(x: number): number {
+		// `Number.isNaN`/`x === Infinity` are checked explicitly: falling through to the ieeeSplit/ieeeFrom
+		// bit-twiddling below for either would silently reconstruct a finite mantissa from NaN's or
+		// Infinity's own all-1s exponent field, producing a large finite garbage value instead of NaN/Infinity.
+		if (Number.isNaN(x))
+			return NaN;
 		if (x < 0)
 			return NaN;
 		if (x === 0)
 			return -Infinity;
-	
+		if (x === Infinity)
+			return Infinity;
+
 		const i = ieeeSplit(x) as unknown as u32[];
-		const exp = (i[1] >>> 20) - 1023;
+		const e = (i[1] >>> 20) - 1023;
+		const m = ieeeFrom(i[0], (i[1] & 0x000FFFFF) | 0x3FF00000);		// Normalize mantissa to [1,2)
 	
-		// Normalize mantissa to [1,2)
-		const mantHi = (i[1] & 0x000FFFFF) | 0x3FF00000;
-		const m = ieeeFrom(i[0], mantHi);
-	
-		const f = m - 1.0; // small
-		const f2 = f * f;
-	
-		// log(1+f) ~ f - f^2/2 + f^3/3
-		return exp * Math.LN2 + (f - f2 / 2 + (f2 * f) / 3);
+		// ln(m) = 2*atanh(u), u = (m-1)/(m+1) in [0, 1/3) for m in [1,2) -- converges far faster than the
+		// bare f - f^2/2 + f^3/3 series (f = m-1 ranges up to ~1, not small; that series was off by up to
+		// ~2.7% relative, e.g. Math.log(100)).
+		const u = (m - 1) / (m + 1);
+		const u2 = u * u;
+		const atanh_u = u * (1 + u2 * (1 / 3 + u2 * (1 / 5 + u2 * (1 / 7 + u2 / 9))));
+		return e * Math.LN2 + 2 * atanh_u;
 	}
 	static log2(x: number): number  { return Math.log(x) * Math.LOG2E; }
 	static log10(x: number): number { return Math.log(x) * Math.LOG10E; }
@@ -412,8 +446,10 @@ export class Math {
 
 		const ax = Math.abs(x);
 		if (ax > 0.5) {
-			const t = Math.sqrt(1 - ax);
-			// asin(x) = pi/2 - atan(t / x')
+			// t = cos(asin(ax)) = sqrt(1 - ax^2), not sqrt(1 - ax) -- the latter isn't even the right
+			// identity (confirmed against a direct sweep: it was off by up to 13% around x=+-0.77).
+			const t = Math.sqrt(1 - ax * ax);
+			// asin(ax) = pi/2 - atan(t / ax): t/ax = cos(theta)/sin(theta) = cot(theta) = tan(pi/2-theta).
 			const r = Math.PI_2 - Math.atan(t / ax);
 			return x < 0 ? -r : r;
 		}
@@ -430,20 +466,26 @@ export class Math {
 	}
 
 	static atan(x: number): number {
-		if (!Number.isFinite(x))
-			return NaN;
-	
 		const ax = Math.abs(x);
 		if (ax > 1) {
 			const r = Math.PI_2 - Math.atan(1 / ax);
 			return x < 0 ? -r : r;
 		}
-	
-		const x2	= x * x;
-		return x * (1 + x2 * (-1 / 3 + x2 * (1 / 5 - x2 * (-1 / 7 + x2 / 9))));
+		if (ax > 0.5) {
+			// atan(a) - atan(b) = atan((a-b)/(1+ab)) with b=1 -- atan(ax) = pi/4 + atan((ax-1)/(ax+1)),
+			// which keeps atanPoly's argument within [-1/3, 0] instead of up to 1 (needs dozens of terms
+			// to converge there, e.g. atan(1) via the bare series was off by ~14%).
+			const t = (ax - 1) / (ax + 1);
+			const r2 = Math.PI / 4 + atanPoly(t);
+			return x < 0 ? -r2 : r2;
+		}
+
+		return atanPoly(x);
 	}
 	
 	static atan2(y: number, x: number): number {
+		if (Number.isNaN(x) || Number.isNaN(y))
+			return NaN;
 		return	x > 0 ? Math.atan(y / x)
 			:	x < 0 ? (y >= 0 ? Math.atan(y / x) + Math.PI : Math.atan(y / x) - Math.PI)
 			:	y > 0 ? Math.PI_2 : y < 0 ? -Math.PI_2 : 0;
@@ -477,6 +519,16 @@ export class Math {
 		return Math.seed / 0xFFFFFFFF;
 	}
 	static pow(x: number, y: number): number {
+		// An integer exponent goes through `intPow`'s plain repeated-squaring multiplication instead of
+		// `exp(log(x)*y)`: exact to floating-point rounding (vs. the transcendentals' ~1e-4 relative
+		// error), and it already gets a negative base right on its own -- no separate sign-factoring
+		// needed (`intPow(-2, 3) === -8`, `intPow(-2, 4) === 16`, `intPow(0, -3) === Infinity`, all via
+		// plain multiplication, verified against real `Math.pow` directly).
+		if (Number.isInteger(y))
+			return intPow(x, y);
+		// log(negative) is NaN, so a negative base only has a real result for an integer exponent.
+		if (x < 0)
+			return NaN;
 		return Math.exp(Math.log(x) * y);
 	}
 
@@ -487,7 +539,7 @@ export class Math {
 		return Math.sqrt(total);
 	}
 	static cbrt(x: number): number {
-		return x < 0 ? -((-x) ** (1/3)) : x ** (1/3);
+		return x < 0 ? -Math.pow(-x, 1 / 3) : Math.pow(x, 1 / 3);
 	}
 
 }

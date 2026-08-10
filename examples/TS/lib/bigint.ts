@@ -270,6 +270,13 @@ function bigDivModMag(a: u32[], b: u32[], mod: boolean): u32[] {
 }
 
 export class BigInt {
+	// `value` is never actually read -- this exists purely so `towasm.ts`'s `ensureClass` has a real,
+	// explicit-return constructor to determine this class's own physical `this`-type from (a `u32[]`,
+	// same representation real bigint arithmetic already reinterprets `this` as everywhere below).
+	constructor(value?: any) {
+		return new Array<u32>(0) as unknown as BigInt;
+	}
+
     valueOf(): bigint { return this as unknown as bigint; }
 //	static readonly [Symbol.toStringTag]: "BigInt";
 

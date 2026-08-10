@@ -28,14 +28,17 @@ export class String {
 	// `u32`, not `i32`: `array.len` can in principle exceed i32's signed range.
 	get length(): number { return __asm<[], u32>('array.len')(); }
 
-	// Never actually compiled -- `towasm.ts`'s `'new'` case intercepts `new String(...)` by name before it
-	// ever reaches the generic `ensureClass`/`ensureCtor` path (its real zero-arg/one-existing-string
-	// construction is handled entirely there). This exists purely so the *general checker* has a
-	// permissive (any arg count) constructor signature to validate `new String(...)` against once `String`
-	// is hoisted into it -- see `TStoWasm`'s own comment on why `String`/`Number`/`Math`/`Array`/`Boolean`
-	// need care here (a *strict*, e.g. zero-arg, constructor would make `new String(existing)` a real type
-	// error the moment this class's shape is visible to the checker at all).
-	constructor(value?: any) {}
+	// `new String(...)`'s own real zero-arg/one-existing-string construction is handled entirely by
+	// `towasm.ts`'s `'new'` case (irregular, argument-count-dependent -- not expressible as one ordinary
+	// constructor body); this one's `value` param exists purely so the *general checker* has a permissive
+	// (any arg count) signature to validate `new String(...)` against once `String` is hoisted into it. Its
+	// body, though, *is* real and used: `towasm.ts`'s `ensureClass` reads this class's own physical
+	// representation from whatever it returns (`ctorReturnHelper`) -- a fresh, empty string is exactly
+	// `String`'s own "default" value, and `alloc`'s declared `string` return type is what tells
+	// `ensureClass` this class is array-backed at all, with no name check anywhere.
+	constructor(value?: any) {
+		return String.alloc(0) as unknown as String;
+	}
 
 	// Every count/index/code-unit param here is a genuine wasm i32 (array length, array index, packed
 	// i16 element value widened to i32 on write) -- `number`'s usual f64 would leave the wrong type on

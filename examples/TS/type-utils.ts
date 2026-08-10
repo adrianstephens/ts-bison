@@ -12,6 +12,14 @@ import { Output } from './tocode';
 // ===================================================================
 
 const ALL_PRIMITIVES	= new Set(['any', 'unknown', 'never', 'void', 'number', 'string', 'boolean', 'bigint', 'symbol', 'object', 'undefined', 'null']);
+// `declare type i32 = number` etc (lib.d.ts) -- wasm-level pseudo-types, deliberately never resolved past
+// their own `ref` form (see that file's own comment: "not used for arithmetic, never resolved by the
+// general checker either"). Every real consumer (towasm.ts's `builtinTypes`) matches these *by name*,
+// ahead of `resolve`'s own alias-unwrapping. Exported for `hoistVar`'s own narrow use (see there) -- NOT
+// folded into `resolve`'s general unwrapping or into `ALL_PRIMITIVES` itself: doing either globally breaks
+// every *other* place a resolved `number` was relied on to unify structurally with an `i32` (e.g. a
+// ternary's two branches, one `i32` one `number`, need to combine into one type same as before).
+export const WASM_PSEUDO_TYPES	= new Set(['i32', 'i64', 'f32', 'f64', 'u32']);
 const OPAQUE		= new Set(['keyof', 'indexed_access', 'conditional', 'infer', 'mapped', 'this', 'predicate']);
 
 // The subset of `OPAQUE` that's a genuinely unevaluated computation, as opposed to `this`/`predicate` (opaque by design, not a gap).
@@ -1348,7 +1356,7 @@ export function stampSig<T extends TS.CallSig>(sig: T, scope: Scope): T {
 export function classShapes(c: TS.Class, scope: Scope, inferInit?: (e: Expr, scope: Scope) => Type | undefined): { instance: Type; value: Type } {
 	const members:			TS.TypeMember[] = [];
 	const staticMembers:	TS.TypeMember[] = [];
-	let ctorParams:			TS.Params | undefined;
+	const ctorMembers:		TS.ClassMethod[] = [];
 	// Fields needing `inferInit` (below) get their lazy getter installed only *after* this function's own
 	// `stampScope` call at the bottom -- that call already walks every member's `typeAnnotation` once, and
 	// installing the getter before it would make *that* walk the "first read", forcing `inferInit` right
@@ -1381,7 +1389,7 @@ export function classShapes(c: TS.Class, scope: Scope, inferInit?: (e: Expr, sco
 			}
 			case 'method':
 				if (m.key === 'constructor') {
-					ctorParams = FixParams(m);
+					ctorMembers.push(m);
 					// A parameter-property modifier is anything but the unrelated `'optional'` tag.
 					for (const p of m.params)
 						if (p.modifiers?.some(x => x !== 'optional') && typeof p.key === 'string')
@@ -1407,14 +1415,16 @@ export function classShapes(c: TS.Class, scope: Scope, inferInit?: (e: Expr, sco
 		:	c.superClass?.type === 'instantiation' && c.superClass.expression.type === 'identifier' ? TS.RefType(c.superClass.expression.name, c.superClass.typeArgs as Type[])
 		:	c.superClass ? ANY : undefined;
 	const instance = superType ? TS.IntersectionType([obj, superType]) : obj;
-	if (!ctorParams)
-		ctorParams = {params: [], rest: c.superClass ? JS.Rest('args', TS.ArrayType(ANY)) : undefined};
 	// The named ref carries its own type params back as its own typeArgs (`Box<T>` -> `new(...): Box<T>`) -- without this,
 	// a bare `RefType(c.name)` never mentions `T`, so `new Box<number>(...)` produced a `Box` with no type args at all.
-	const ctor:		Type = {
-		type: 'constructor',
-		...withScope(TS.CallSig(ctorParams, c.name ? TS.RefType(c.name, c.typeParams?.map(p => TS.RefType(p.name))) : instance, c.typeParams), scope)
-	};
+	const ctorReturn = c.name ? TS.RefType(c.name, c.typeParams?.map(p => TS.RefType(p.name))) : instance;
+	const makeCtorSig = (params: TS.Params) => withScope(TS.CallSig(params, ctorReturn, c.typeParams), scope);
+	// >1 real constructor body: a genuine overload set, same multi-signature shape `lookupMember` builds
+	// for same-named methods and `hoist` builds for free-function overloads -- `case 'new'`'s existing
+	// arity+type-fit resolution (via `T.collectMembers`'s `'construct'`-member filter) already handles it.
+	const ctor: Type = ctorMembers.length > 1
+		? TS.ObjectType(ctorMembers.map(m => TS.TypeConstruct(makeCtorSig(FixParams(m)))))
+		: { type: 'constructor', ...makeCtorSig(ctorMembers.length ? FixParams(ctorMembers[0]) : {params: [], rest: c.superClass ? JS.Rest('args', TS.ArrayType(ANY)) : undefined}) };
 	const value = staticMembers.length ? TS.IntersectionType([ctor, TS.ObjectType(staticMembers)]) : ctor;
 	stampScope(instance, scope);
 	stampScope(value, scope);

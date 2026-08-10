@@ -25,6 +25,12 @@ declare type i64 = number;
 declare type f32 = number;
 declare type f64 = number;
 declare type u32 = number;
+declare type u64 = number;
+
+// Not matched in towasm.ts's `builtinTypes`/`wasmTypeOf` like the others above -- never used as a real
+// value's type (`Uint8Array`'s own storage width is picked by `$elem`, a separate towasm-only mechanism,
+// not by a declared type), only as `TypedArray<T>`'s documentation-only type argument (`lib/typedarray.ts`).
+declare type u8 = number;
 
 declare var NaN: number;
 declare var Infinity: number;
