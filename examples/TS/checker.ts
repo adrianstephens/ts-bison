@@ -711,11 +711,19 @@ export function makeChecker(diag: Diagnostics) {
 	const hoistVar = (scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation = d.typeAnnotation) => {
 		if (typeof d.name === 'string') {
 			const init = d.init && !typeAnnotation ? typeOf(d.init, scope) : undefined;
+			// A wasm-level pseudo-type annotation (`i32`/etc, see `T.WASM_PSEUDO_TYPES`) must survive
+			// resolution intact -- every real consumer (towasm.ts's `builtinTypes`) matches it *by name*,
+			// ahead of ordinary alias-unwrapping; resolving it here (to `number`, its real declared alias
+			// target) would bake that into `scope` permanently, losing the name for every later read of this
+			// variable (found via a top-level `let heap: i32 = 0;` being silently treated as `f64`
+			// throughout). Scoped to just this one call site, not `resolve` globally -- unwrapping still has
+			// to happen everywhere else (e.g. so an `i32` and a `number` branch of a ternary still unify).
+			const stopAtPseudoType = typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs && T.WASM_PSEUDO_TYPES.has(typeAnnotation.name);
 			// A bare (no-typeArgs) ref's own `declScope` wins over the ambient `scope` here -- this bakes the result in once rather than
 			// re-resolving lazily, so it must resolve in the declaring module now, before a generic ref's own type args get lost.
 			scope.addValue(d.name, typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs && typeAnnotation.declScope
-				? T.resolve(typeAnnotation.declScope as Scope, typeAnnotation)
-				: typeAnnotation ? T.resolve(scope, typeAnnotation) : init ? (widen ? T.widenLiterals(init) : init) : T.ANY);
+				? T.resolve(typeAnnotation.declScope as Scope, typeAnnotation, undefined, stopAtPseudoType)
+				: typeAnnotation ? T.resolve(scope, typeAnnotation, undefined, stopAtPseudoType) : init ? (widen ? T.widenLiterals(init) : init) : T.ANY);
 			// TS 4.4 aliased conditions: a `const`'s initializer stays true for its whole lifetime, so narrowing the const
 			// also narrows through what its initializer itself would narrow (`narrow()`'s `case 'identifier'` reads this).
 			if (!widen && d.init)

@@ -75,6 +75,18 @@ async function main() {
 	};
 
 	{
+		const { test } = await compile(`
+function test(): number {
+	const x = new Uint8Array(100);
+	const d = new DataView(x.buffer);
+	return d.getFloat32(0, true);
+}
+		`);
+		check('test', test(), 0);
+	}
+
+/*
+	{
 		const { strTemplate } = await compile(`
 			function strTemplate(): number {
 				const s: string = \`hello \${1+2} world\`;
@@ -83,17 +95,25 @@ async function main() {
 		`);
 		check('strTemplate', strTemplate(), 13);
 	}
-/*
-	{
-		const {big} = await compile(`
-			function big() {
-				const b = 100n;
-				return b;
-			}
-		`);
-		check('big', big(), 100n);
-	}
 */
+	{
+		const {alloc} = await compile(`
+type i32 = number;
+let heap: i32 = 0;
+function alloc(size: i32): i32 {
+	const ret  = heap;
+	heap += size;
+
+	// Grow by just enough whole pages (64KiB) to cover the new heap pointer, if it now exceeds the memory's current size.
+	const mem = __asm<[], i32>('memory.size')();
+	if (heap > (mem << 16)) {
+		const extra = (heap - (mem << 16) + 65535) >> 16;
+		__asm<[i32], i32>('memory.grow')(extra);
+	}
+	return ret;
+}		`);
+		check('alloc', alloc(10), 0);
+	}
 	{
 		const { factorial } = await compile(`
 			function factorial(n: number): number {

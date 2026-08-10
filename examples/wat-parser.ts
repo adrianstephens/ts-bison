@@ -196,8 +196,8 @@ class ParseCtx {
 // --- Terminals ---
 
 const ID		= /\$[a-zA-Z0-9!#$%&'*+\-./:<=>?@\\^_`|~]*/;
-const NAT		= /[0-9]+|0x[0-9a-fA-F]+/;
-const INT		= /[+-]?(?:[0-9]+|0x[0-9a-fA-F]+)/;
+const NAT		= /0x[0-9a-fA-F]+|[0-9]+/;
+const INT		= /[+-]?(?:0x[0-9a-fA-F]+|[0-9]+)/;
 const FLOAT		= /[+-]?(?:inf|nan(?::0x[0-9a-fA-F]+)?|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?|0x[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?(?:[pP][+-]?[0-9]+)?)/;
 // Same shape as FLOAT, but requires an actual decimal point/exponent/inf/nan marker -- unlike
 // FLOAT, it can never match a bare integer. Used only for the literal-instr shortcut below: that
@@ -452,13 +452,13 @@ const instr = Rules<WatInstr[]>(
 		ctx.literalText.set(c, text);
 		return [c];
 	}),
-	Rule([FLOAT_ONLY], ($, ctx: ParseCtx) => {
+/*	Rule([FLOAT_ONLY], ($, ctx: ParseCtx) => {
 		const text = $[0];
 		const c: Instr = { op: 'f64.const', imm: parseFloat(text) };
 		ctx.literalText.set(c, text);
 		return [c];
 	}),
-
+*/
 	// A bare $id where an instr is expected means "read that local", so
 	// `(i32.mul $x $y)` is shorthand for `(i32.mul (local.get $x) (local.get $y))`.
 	Rule([id], ($, ctx: ParseCtx) => [{ op: 'local.get', localIndex: ctx.defines.get($[0]) ?? $[0] }]),
