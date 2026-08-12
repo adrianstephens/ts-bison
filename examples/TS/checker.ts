@@ -179,6 +179,8 @@ export function makeChecker(diag: Diagnostics) {
 		}
 	};
 
+	const maybeMuted	= <T,>(mute: boolean, fn: () => T): T => mute ? runMuted(fn) : fn();
+
 	// Tries `T.isAssignable` strict then lax; a GAP means strict failed only due to an opaque type (keyof/conditional/infer/mapped).
 	// Every real assignability check should go through this, not `T.isAssignable` directly. `dstScope` resolves `dst`'s own structure.
 	const checkAssignable = (src: Type, dst: Type, scope: Scope, pos: JS.Location, dstScope: Scope = scope): boolean => {
@@ -1432,6 +1434,10 @@ export function makeChecker(diag: Diagnostics) {
 			return;
 
 		const inner = new Scope(scope);
+		// First (real, unmuted) check wins: `narrow`'s speculative re-walks always run under `muted` and only ever
+		// reach this same node *after* the real pass already checked it (e.g. `case 'if'` checks `stmt.test` before
+		// narrowing it), so `??=` can never let a narrowed/speculative scope clobber the real one.
+		fn.scope ??= inner;
 		for (const p of fn.params) {
 			const anno = p.typeAnnotation;
 			if (!muted && p.default) {
@@ -1501,7 +1507,7 @@ export function makeChecker(diag: Diagnostics) {
 		}
 	};
 
-	const checkClassMembers = (name: string | undefined, body: TS.ClassMember[], instance: Type, classValue: Type, scope: Scope) => {
+	const checkClassMembers = (name: string | undefined, body: TS.ClassMember[], instance: Type, classValue: Type, scope: Scope): Scope => {
 		const instScope = new Scope(scope);
 		// prefer the named entry: declaration merging can extend it beyond this declaration's shape
 		instScope.addValue('this', name && scope.type(name) ? { type: 'ref', name } : instance);
@@ -1533,6 +1539,7 @@ export function makeChecker(diag: Diagnostics) {
 					break;
 			}
 		}
+		return instScope;
 	};
 
 	// Every leaf of an if/else chain (or a block's final statement) assigns the same variable:
@@ -1736,10 +1743,15 @@ export function makeChecker(diag: Diagnostics) {
 	return {
 		typeOf, exportScope,
 
-		checkBlock: (stmts: TS.Statement[], scope: Scope, muted = false) => {
-			return muted ? runMuted(()=>checkBlock(stmts, scope)) : checkBlock(stmts, scope);
-		},
+		scopeOf: (fnj: JS.CallSig<any>): Scope | undefined => (fnj as TS.CallSig).scope as Scope | undefined,
 
+		checkBlock: (stmts: TS.Statement[], scope: Scope, muted = false) => {
+			return maybeMuted(muted, ()=>checkBlock(stmts, scope));
+		},
+		checkClass: (cls: TS.Class, scope: Scope, muted = false) => {
+			const { instance, value } = T.classShapes(cls, scope, (e3, s) => runMuted(() => typeOf(e3, s)));
+			return maybeMuted(muted, ()=>checkClassMembers(cls.name, cls.body, instance, value, scope));
+		},
 		inferReturn: (fnj: JS.CallSig<any>, body: JS.Statement<any>[], outer: Scope): Type => {
 			if (fnj.returnType)
 				return fnj.returnType as Type;

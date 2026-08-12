@@ -21,6 +21,7 @@ export type binaryOps	= '+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'|'>>>'
 						|'<'|'>'|'<='|'>='|'instanceof'|'in'|'=='|'!='|'==='|'!=='
 						|'='|'+='|'-='|'*='|'/='|'%='|'&='|'|='|'^='|'<<='|'>>='|'>>>='
 						|'&&='|'||='|'??='
+export const JSUnary = Unary<Expr, unaryOps>;
 export const JSBinary = Binary<Expr, binaryOps>;
 
 export interface TemplatePart<T> { str: string; exp?: T; }
@@ -47,7 +48,7 @@ export interface Param<T>					{ key: BindingTarget; default?: Expr<T>; typeAnnot
 export function  Param<T>(key: BindingTarget, typeAnnotation?: T, modifiers?: string[]): Param<T> { return { key, typeAnnotation, modifiers }; }
 export interface Params<T>					{ params: Param<T>[]; rest?: Rest<T>; }
 export function  Params<T>(params: Param<T>[], rest?: Rest<T>) : Params<T> { return {params, rest }; }
-export interface CallSig<T> extends Params<T> { typeParams?: TypeParam<T>[]; returnType?: T; declScope?: unknown }
+export interface CallSig<T> extends Params<T> { typeParams?: TypeParam<T>[]; returnType?: T; declScope?: unknown; scope?: unknown }
 
 export function  withDefault<T extends {default?: U}, U>(p: T, def: U) { p.default = def; return p; }
 
@@ -161,6 +162,8 @@ export interface Export<T> { type: 'export'; specifiers?: ExportSpecifier[]; sou
 
 export type ForInit<T> = Expr<T> | VarDecl<T>;
 export interface SwitchCase<T> { test?: Expr<T>; consequent: Statement<T>[]; }
+export function Block<T>(...body: Statement<T>[]): Statement<T> { return { type: 'block', body }; }
+export function For<T>(init: ForInit<T>|undefined, test: Expr|undefined, update: Expr|undefined, body: Statement<T>): Statement<T> { return { type: 'for', kind: 'normal', init, test, update, body }; }
 
 export type Statement<T> = Declaration<T>
 	| { type: 'block'; body: Statement<T>[] }
@@ -280,7 +283,7 @@ function binaryChainLeft(lowerLeft: Rules<Expr>, lowerRight: Rules<Expr>, ops: b
 }
 
 // Hand-decoded rather than round-tripped through `JSON.parse`: JSON's escape set is a strict subset of JS's, so valid JS strings like `'\0'` threw there.
-export const unquoteString = (s: string) => s.slice(1, -1).replace(
+export const unescapeString = (s: string) => s.replace(
 	/\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|\r\n|\n|(.))/g,
 	(_, hex, ubrace, u4, ch) =>
 		hex !== undefined ? String.fromCharCode(parseInt(hex, 16))
@@ -289,6 +292,7 @@ export const unquoteString = (s: string) => s.slice(1, -1).replace(
 		: ch === 'n' ? '\n' : ch === 't' ? '\t' : ch === 'r' ? '\r' : ch === 'b' ? '\b' : ch === 'f' ? '\f' : ch === 'v' ? '\v' : ch === '0' ? '\0'
 		: ch
 );
+export const unquoteString = (s: string) => unescapeString(s.slice(1, -1));
 
 const fwd_assignment_expression	= Forward<Expr>(() => assignment_expression);
 
@@ -531,8 +535,9 @@ function exprToParams(e: Expr): Param<any>[] {
 // A bare `$` only stops the match when starting `${` -- anywhere else (a real case that broke this once)
 // it's ordinary text, same as real JS/TS.
 const template_literal_part = Rules<TemplatePart<Expr>>(
-	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=\$\{)/, '${', expression, '}'],	$ => ({ str: $[0], exp: $[2] })),
-	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=`)/], 							$ => ({ str: $[0] })),
+	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=\$\{)/, '${', expression, '}'],	$ =>
+		 ({ str: unescapeString($[0]), exp: $[2] })),
+	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=`)/], 							$ => ({ str: unescapeString($[0]) })),
 );
 const template_literal_parts = List(template_literal_part);
 

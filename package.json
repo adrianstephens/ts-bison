@@ -7,6 +7,9 @@
 		"url": "git+https://github.com/adrianstephens/ts-bison.git"
 	},
 	"main": "dist/tison.js",
+	"bin": {
+		"tsw": "dist/examples/TS/tsw.js"
+	},
 	"files": [
 		"dist/**/*.{js,d.ts}",
 		"README.md"
@@ -15,6 +18,7 @@
 		"build": "tsc",
 		"watch": "tsc -watch -p ./",
 		"examples": "tsc -b examples",
+		"postexamples": "cp -r examples/TS/lib dist/examples/TS/lib && node -e \"const f='dist/examples/TS/tsw.js',fs=require('fs'),c=fs.readFileSync(f,'utf8');if(!c.startsWith('#!'))fs.writeFileSync(f,'#!/usr/bin/env node\\n'+c);fs.chmodSync(f,0o755);\"",
 		"lint": "eslint \"src/**/*.ts\"",
 		"link": "npm link @isopodlabs/binary_libs"
 	},
