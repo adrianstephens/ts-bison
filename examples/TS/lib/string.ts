@@ -5,20 +5,45 @@ import { RegExp, RegExpMatch, StringParts, expandReplacement, growInt32 } from '
 //	String
 //-----------------------------------------------------------------------------
 
-// Not itself a JS-visible method -- stays a plain top-level function, dispatched as a bare identifier
-// call, unrelated to the class/`this` machinery every real method goes through.
 export function strIsSpace(code: number): boolean {
 	return code === 32 || code === 9 || code === 10 || code === 13;
 }
 
+export class StringParser {
+	str: string;
+	pos: number;
+	n: number;
+	constructor(str: string, pos: number = 0) {
+		this.str = str;
+		this.pos = pos;
+		this.n = str.length;
+	}
+
+	remaining(): number { return this.n - this.pos; }
+	remainder(): string { return this.str.slice(this.pos); }
+	processed(): string { return this.str.slice(0, this.pos); }
+
+	code(): number { return this.pos < this.n ? this.str.charCodeAt(this.pos) : 0; }
+	skipCode(c: number): boolean {
+		if (this.code() === c) {
+			++this.pos;
+			return true;
+		}
+		return false;
+	}
+	skipWhitespace(): void {
+		while (this.pos < this.n && strIsSpace(this.code()))
+			++this.pos;
+	}
+}
+
+
+
 export function stringTemplate(strings: string[], ...values: any[]): string {
 	const n: number = values.length;
 	let result: string = strings[0];
-	let i: number = 0;
-	while (i < n) {
+	for (let i = 0; i < n; ++i)
 		result = result.concat(values[i].toString()).concat(strings[i + 1]);
-		i = i + 1;
-	}
 	return result;
 }
 
@@ -37,8 +62,11 @@ export class String {
 	// representation from whatever it returns (`ctorReturnHelper`) -- a fresh, empty string is exactly
 	// `String`'s own "default" value, and `alloc`'s declared `string` return type is what tells
 	// `ensureClass` this class is array-backed at all, with no name check anywhere.
-	constructor(value?: any) {
+	constructor() {
 		return String.alloc(0) as unknown as String;
+	}
+	constructor(s: any) {
+		return s.toString();
 	}
 
 	// Every count/index/code-unit param here is a genuine wasm i32 (array length, array index, packed
@@ -259,4 +287,21 @@ export class String {
 		}
 		return new StringParts(s, count, offsets);
 	}
+
+	add(b: string) { return this.concat(b); }
+	compare(b: string): number {
+		const len = Math.min(this.length, b.length);
+		for (let i = 0; i < len; i++) {
+			const d = this.charCodeAt(i) - b.charCodeAt(i);
+			if (d)
+				return d;
+		}
+		return this.length - b.length;
+	}
+	lt(b: string): boolean { return this.compare(b) < 0; }
+	gt(b: string): boolean { return this.compare(b) > 0; }
+	le(b: string): boolean { return this.compare(b) <= 0; }
+	ge(b: string): boolean { return this.compare(b) >= 0; }
+	eq(b: string): boolean { return this.compare(b) === 0; }
+	ne(b: string): boolean { return this.compare(b) !== 0; }
 }

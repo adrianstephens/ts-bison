@@ -35,9 +35,9 @@
 // directly, would silently resolve to `any`. See that declaration's own comment for the full story.
 
 let heap: i32 = 0;
-export function __towasm_alloc(size: i32): i32 {
-	const ret  = heap;
-	heap += size;
+export function __towasm_alloc(size: i32, align: i32): i32 {
+	const ret  = (heap + align - 1) & -align;
+	heap = ret + size;
 
 	// Grow by just enough whole pages (64KiB) to cover the new heap pointer, if it now exceeds the memory's current size.
 	const mem = __asm<[], i32>('memory.size')();
@@ -52,10 +52,11 @@ class ArrayBuffer {
 	offset: i32;
 	byteLength: i32;
 	constructor(byteLength: i32) {
-		this.offset = __towasm_alloc(byteLength);
+		this.offset = __towasm_alloc(byteLength, 4);
 		this.byteLength = byteLength;
 	}
 }
+
 
 // Purely a documentation contract: towasm.ts's `ensureClass` only ever rejects a real `superClass`
 // (`extends`), never reads `implements` at all, and this project's own checker parses `implements` into
@@ -186,7 +187,7 @@ class Uint8Array implements TypedArray<u8> {
 	// Same "omitted `end`" large-sentinel-clamped-to-`length` trick as `lib/array.ts`'s own `slice`/
 	// `fill` -- a call-site default must be a plain literal (towasm's `fillDefaultArgs`), and
 	// `this.length` isn't one.
-	slice(start: i32 = 0, end: i32 = 9007199254740991): Uint8Array {
+	slice(start: i32 = 0, end: i32 = 0x7fffffff): Uint8Array {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;
@@ -196,7 +197,7 @@ class Uint8Array implements TypedArray<u8> {
 			result[i] = this[start + i];
 		return result;
 	}
-	fill(x: number, start: i32 = 0, end: i32 = 9007199254740991): Uint8Array {
+	fill(x: number, start: i32 = 0, end: i32 = 0x7fffffff): Uint8Array {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;
@@ -221,7 +222,7 @@ class Uint8Array implements TypedArray<u8> {
 	}
 	// A real *view* over the same buffer -- no copy, no alloc -- unlike `slice`. Same clamp/saturate
 	// semantics as `slice`.
-	subarray(start: i32 = 0, end: i32 = 9007199254740991): Uint8Array {
+	subarray(start: i32 = 0, end: i32 = 0x7fffffff): Uint8Array {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;

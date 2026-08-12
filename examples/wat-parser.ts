@@ -27,6 +27,7 @@ import { ROOT_OPS, FB_OPS, FC_OPS, SIMD_OPS, THREAD_OPS, equalFuncSig } from '@i
 // ===================================================================
 
 export type { Instr, ValType, GlobalType, TableType };
+export { ROOT_OPS };
 
 type index = string | number
 
@@ -740,11 +741,8 @@ export function parseWat(src: string, defines?: Record<string, string|number>): 
 //	inline parser
 //-----------------------------------------------------------------------------
 
-// A second parser, for callers that only have a bare instruction sequence, not a whole module -- e.g.
-// towasm.ts's inline-asm strings, which are WAT text but never wrapped in `(module (func ...))`. Shares
-// every rule this transitively depends on (`plain_instr`, `instr`, macro-call handling, `asm_body_item`,
-// ...) with the main grammar; LALR table construction is per-parser, not shared, but that's a one-time
-// module-load cost, same as building `parser` itself.
+// A second parser, for callers that only have a bare instruction sequence, not a whole module.
+// Shares every rule this transitively depends on with the main grammar.
 //
 // Doesn't run `toWasm`'s own `resolveInstr` pass (block/loop/if label resolution, local name->index
 // resolution, macro-locals draining into an enclosing func) -- there's no enclosing module/func here for
@@ -752,8 +750,7 @@ export function parseWat(src: string, defines?: Record<string, string|number>): 
 // snippets themselves (no `block`/`loop`/`if`, the only shapes `WatInstr` and `Instr` differ on), and for
 // resolving `WatLocal.id` to a real index themselves (see towasm.ts's `resolveAsmLocals`).
 
-export interface GenericAsmBody { locals: WatLocal[]; body: WatInstr[] }
-export type ParsedAsmBody = GenericAsmBody;
+export interface ParsedAsmBody { locals: WatLocal[]; body: WatInstr[] }
 
 const asmBody = Rules<ParsedAsmBody>(
 	Rule([MaybeList(asm_body_item)], ($, ctx: ParseCtx) => collectAsmItems($[0], ctx)),
@@ -762,85 +759,11 @@ const asmBody = Rules<ParsedAsmBody>(
 const asmBodyParser = makeParser({
 	skip: SKIP,
 	start: asmBody,
-	rules: { watAsmBody: asmBody },
+	rules: { asmBody },
 });
 
-// Parses *once* into a body that may still hold `$T` placeholders -- a type-parametric local (`(local $x
-// $T)`, real grammar, see `asm_body_item` above) and/or a typed-op reference (`$T.rem_s`: no new grammar at
-// all -- `$id` already lexes `.` as an ordinary identifier character, so it's just the existing bare-`$id`
-// "local.get shortcut" rule producing `{op:'local.get', localIndex:'$T.rem_s'}`; `instantiateAsmBody` below
-// is what gives that a different meaning) -- or, if the whole body is one `(typecase ...)`, a set of arms
-// each already explicit about which types they're for. Never reparsed per candidate type -- see
-// `instantiateAsmBody`.
 export function parseAsmBody(src: string, defines?: Record<string, string|number>) {
 	return asmBodyParser.parse(src, new ParseCtx(defines));
-}
-
-// Whether a `parseAsmBody` result is `$T`-generic -- real conditional assembly, requires a top-level
-// `(switch $T ...)` declaring exactly which types it's for (see the `switch` rule's own comment); a
-// bare `$T.<suffix>`/`(local $x $T)` with no enclosing switch has nothing to say which types it's
-// valid for, so it's not treated as generic at all -- it falls through to the fixed path, where
-// `assertConcreteLocals`/`assertFlatInstrs` (towasm.ts) reject the stray `$T` with a clear message
-// instead of silently guessing.
-export function isTypeGeneric(generic: GenericAsmBody): boolean {
-	return generic.body.some(i => i.op === '__switch' && i.key === '$T');
-}
-
-// Every no-immediate instruction mnemonic (`i32.rem_s`, `f64.sqrt`, ...) -- the real, closed set a typed-op
-// reference's *composed* name (`${type}.${suffix}`) is checked against below, explicit membership, not
-// "substitute the text and see if the parser throws".
-const NUMERIC_OP_NAMES = new Set<string>(Object.values(ROOT_OPS.NONE));
-
-// Instantiates a `parseAsmBody` result for one concrete numeric type -- real substitution over the already-
-// parsed tree (a type-parametric local's `.type`, and a `$T.suffix` op's *whole* `{op:'local.get',
-// localIndex}` node get replaced outright, not text-patched), returning `undefined` if `type` doesn't
-// actually have every op this body's typed-op references need (e.g. `'$T.rem_s'` instantiates for `i32`/
-// `i64` -- `i32.rem_s` is real -- but not `f32`/`f64`, since neither `f32.rem_s` nor `f64.rem_s` exist), or
-// if it isn't one of the types a `$T`-keyed switch it runs into actually has an arm for. A real local
-// reference (any name other than exactly `$T.<suffix>`) passes through untouched -- still unresolved by
-// name, same as before (see towasm.ts's `resolveAsmLocals`, the *other* substitution pass, over the
-// caller's own real function once one exists to resolve local names against).
-export function instantiateAsmBody(generic: GenericAsmBody, type: 'i32' | 'i64' | 'f32' | 'f64'): { locals: WatLocal[]; body: WatInstr[] } | undefined {
-	const locals: WatLocal[] = [];
-	const body: WatInstr[] = [];
-
-	const addLocals = (ls: WatLocal[]) => locals.push(...ls.map(l => ({
-		id:		l.id,
-		count:	l.count,
-		type:	typeof l.type === 'object' && 'typeParam' in l.type ? type : l.type,
-	})));
-
-	// A `$T`-keyed switch's winning arm can itself declare `$T`-typed locals and further `$T.suffix`
-	// references -- processed by recursing back into this same walk, exactly as if the arm's own
-	// {locals, body} were the whole generic body.
-	function process(items: WatInstr[]): boolean {
-		for (const i of items) {
-			if (i.op === 'local.get' && typeof i.localIndex === 'string' && i.localIndex.startsWith('$T.')) {
-				const opName = `${type}.${i.localIndex.slice('$T.'.length)}`;
-				if (!NUMERIC_OP_NAMES.has(opName))
-					return false;
-				// `opName`'s membership in `NUMERIC_OP_NAMES` -- real op names, not arbitrary strings -- is
-				// a genuine runtime check just above, not a bare assertion; `WatInstr` can't itself express
-				// "any member of this specific Set" as a type, so this cast is the same
-				// discriminated-by-real-check shape `bin.Switch`'s own dispatch already relies on elsewhere.
-				body.push({ op: opName } as WatInstr);
-			} else if (i.op === '__switch' && i.key === '$T') {
-				const tag = `$${type}`;
-				const arm = i.arms.find(a => a.values.includes(tag));
-				if (!arm)
-					return false;
-				addLocals(arm.locals);
-				if (!process(arm.body))
-					return false;
-			} else {
-				body.push(i);
-			}
-		}
-		return true;
-	}
-
-	addLocals(generic.locals);
-	return process(generic.body) ? { locals, body } : undefined;
 }
 
 //-----------------------------------------------------------------------------

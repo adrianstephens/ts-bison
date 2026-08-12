@@ -23,7 +23,7 @@ export class Array<T> {
 	// Not a real wasm-GC struct (see the header comment), so there's no `this` to default-init before this
 	// runs -- the body directly constructs and returns the value, same idea as `fill`'s `as unknown as T[]`.
 	constructor(n: number) {
-		return Array._alloc(n) as unknown as Array<T>;
+		return Array._alloc<T>(n) as unknown as Array<T>;
 	}
 
 	// `push`/`pop`/`shift`/`unshift`: real bodies -- growing/shrinking means allocating a fresh physical array
@@ -36,7 +36,7 @@ export class Array<T> {
 		const len = this.length;
 		if (len) {
 			const last = this[len - 1];
-			const result: T[] = Array._alloc(len - 1);
+			const result: T[] = Array._alloc<T>(len - 1);
 			Array._copy(result, 0, this as unknown as T[], 0, len - 1);
 			this = result as unknown as Array<T>;
 			return last;
@@ -46,7 +46,7 @@ export class Array<T> {
 	push(...items: T[]): i32 {
 		const len = this.length;
 		const n = items.length;
-		const result: T[] = Array._alloc(len + n);
+		const result: T[] = Array._alloc<T>(len + n);
 		Array._copy(result, 0, this as unknown as T[], 0, len);
 		Array._copy(result, len, items, 0, n);
 		this = result as unknown as Array<T>;
@@ -56,7 +56,7 @@ export class Array<T> {
 		const len = this.length;
 		if (len) {
 			const first = this[0];
-			const result: T[] = Array._alloc(len - 1);
+			const result: T[] = Array._alloc<T>(len - 1);
 			Array._copy(result, 0, this as unknown as T[], 1, len - 1);
 			this = result as unknown as Array<T>;
 			return first;
@@ -66,7 +66,7 @@ export class Array<T> {
 	unshift(...items: T[]): i32 {
 		const len = this.length;
 		const n = items.length;
-		const result: T[] = Array._alloc(len + n);
+		const result: T[] = Array._alloc<T>(len + n);
 		Array._copy(result, 0, items, 0, n);
 		Array._copy(result, n, this as unknown as T[], 0, len);
 		this = result as unknown as Array<T>;
@@ -75,7 +75,7 @@ export class Array<T> {
     splice(start: i32, deleteCount: i32 = 0, ...items: T[]): T[] {
 		const len = this.length;
 		const n = items.length;
-		const result: T[] = Array._alloc(len - deleteCount + n);
+		const result: T[] = Array._alloc<T>(len - deleteCount + n);
 		Array._copy(result, 0, this as unknown as T[], 0, start);
 		Array._copy(result, start, items, 0, n);
 		Array._copy(result, start + n - deleteCount, this as unknown as T[], start + deleteCount, len - start - deleteCount);
@@ -108,22 +108,22 @@ export class Array<T> {
 	// literals -- see towasm.ts's `paramWasmType`), and a nullable `number` isn't supported either (no
 	// boxing) -- so a large literal sentinel stands in for "omitted", clamped down to `len` below,
 	// same as real JS already clamps an over-long `end` to the array's length.
-	slice(start: number = 0, end: number = 9007199254740991): T[] {
+	slice(start: i32 = 0, end: i32 = 0x7fffffff): T[] {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;
 		const rlen = end - start;
-		const result: T[] = Array._alloc(rlen);
+		const result: T[] = Array._alloc<T>(rlen);
 		Array._copy(result, 0, this as unknown as T[], start, rlen);
 		return result;
 	}
 	concat(b: T[]): T[] {
-		const result: T[] = Array._alloc(this.length + b.length);
+		const result: T[] = Array._alloc<T>(this.length + b.length);
 		Array._copy(result, 0, this as unknown as T[], 0, this.length);
 		Array._copy(result, this.length, b, 0, b.length);
 		return result;
 	}
-	fill(x: T, start: number = 0, end: number = 9007199254740991): T[] {
+	fill(x: T, start: i32 = 0, end: i32 = 0x7fffffff): T[] {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;
@@ -131,7 +131,7 @@ export class Array<T> {
 		return this as any;
 	}
 
-	copyWithin(target: number, start: number, end: number = 9007199254740991): T[] {
+	copyWithin(target: i32, start: i32, end: i32 = 0x7fffffff): T[] {
 		const len = this.length;
 		if (end > len)
 			end = len;
@@ -153,7 +153,7 @@ export class Array<T> {
 		return true;
 	}
 	filter(callback: (value: T, index: number, array: this) => any, thisArg?: any): T[] {
-		const result: T[] = Array._alloc(this.length);
+		const result: T[] = Array._alloc<T>(this.length);
 		for (let i = 0, j = 0; i < this.length; i++) {
 			if (callback(this[i], i, this))
 				result[j++] = this[i];

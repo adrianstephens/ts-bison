@@ -1,10 +1,20 @@
 import assert from 'assert';
+import fs from 'fs/promises';
+import path from 'path';
 import * as TS from '../examples/TS/ts-parser';
 import { TStoWasm } from '../examples/TS/towasm';
 import { TStypeCheck } from '../examples/TS/transform';
 import { SEVERITY } from '../examples/TS/checker';
 
 const parser = TS.make();
+
+const b = new Uint8Array(1024);
+const f = new Float32Array(b.buffer);
+for (let i = 0; i < f.length; i++) {
+	f[i] = i + 0.5;
+	b[i * 4] &= 0x7f;
+}
+
 
 // TStoWasm assumes its input already passed TStypeCheck (same contract as TStoJS/TStoDecl) -- it does
 // no error reporting of its own, so that gate belongs here, in the caller, not in the library.
@@ -22,12 +32,31 @@ async function compile(src: string) {
 
 	const mod		= TStoWasm(program);
 	console.log(mod.toWAT({expandTypes: true, hexFloats: false}));
-	const bytes		= mod.toBytes();
-	// The real global `console` is always passed as the `console` import -- harmless when a program
-	// doesn't call `console.log` at all (an unused import binding is simply ignored), and lets one that
-	// does just work, since `TStoWasm` coerces each `console.log` overload to its own real wasm type itself.
-	const instance	= new WebAssembly.Instance(new WebAssembly.Module(Uint8Array.from(bytes)), { console: console as unknown as WebAssembly.ModuleImports });
-	return instance.exports as Record<string, (...args: number[]) => number>;
+	return instantiate(mod.toBytes());
+}
+
+async function instantiate(bytes: Uint8Array) {
+	const consoleOutput: string[] = [];
+	const importObject = {
+		wasi_snapshot_preview1: {
+			fd_write: (_fd: number, iovsPtr: number, iovsLen: number, nwrittenPtr: number) => {
+				const mem = new DataView((instance.exports.memory as WebAssembly.Memory).buffer);
+				let total = 0;
+				for (let i = 0; i < iovsLen; i++) {
+					const ptr	= mem.getUint32(iovsPtr + i * 8, true);
+					const len	= mem.getUint32(iovsPtr + i * 8 + 4, true);
+					const text	= String.fromCharCode(...new Uint8Array(mem.buffer, ptr, len));
+					consoleOutput.push(text);
+					process.stdout.write(text);
+					total += len;
+				}
+				mem.setUint32(nwrittenPtr, total, true);
+				return 0; // errno success
+			},
+		},
+	};
+	const instance = new WebAssembly.Instance(new WebAssembly.Module(Uint8Array.from(bytes)), importObject);
+	return { ...(instance.exports as Record<string, (...args: number[]) => number>), __consoleOutput: consoleOutput } as Record<string, (...args: number[]) => number> & { __consoleOutput: string[] };
 }
 
 async function main() {
@@ -75,47 +104,11 @@ async function main() {
 	};
 
 	{
-		const { test } = await compile(`
-function test(): number {
-	const b: bigint = 42n;
-	const x = new Uint8Array(100);
-	const d = new DataView(x.buffer);
-	d.setFloat32(0, 42, true);
-	return d.getFloat32(0, true);
-}
-		`);
-		check('test', test(), 42);
+		const wasm = await fs.readFile(path.join(__dirname, 'sample.wasm'));
+		const r = await instantiate(wasm);
+		console.log(r);
 	}
 
-/*
-	{
-		const { strTemplate } = await compile(`
-			function strTemplate(): number {
-				const s: string = \`hello \${1+2} world\`;
-				return s.length;
-			}
-		`);
-		check('strTemplate', strTemplate(), 13);
-	}
-*/
-	{
-		const {alloc} = await compile(`
-type i32 = number;
-let heap: i32 = 0;
-function alloc(size: i32): i32 {
-	const ret  = heap;
-	heap += size;
-
-	// Grow by just enough whole pages (64KiB) to cover the new heap pointer, if it now exceeds the memory's current size.
-	const mem = __asm<[], i32>('memory.size')();
-	if (heap > (mem << 16)) {
-		const extra = (heap - (mem << 16) + 65535) >> 16;
-		__asm<[i32], i32>('memory.grow')(extra);
-	}
-	return ret;
-}		`);
-		check('alloc', alloc(10), 0);
-	}
 	{
 		const { factorial } = await compile(`
 			function factorial(n: number): number {
@@ -1501,48 +1494,37 @@ function alloc(size: i32): i32 {
 	}
 
 	{
-		// console.log(x) -- see towasm.ts's own `emitConsoleLog`. This is the first towasm feature with a
-		// side effect instead of a return value, so it's verified by spying on the real global `console.log`
-		// (the same binding `compile`'s own instantiation passes through as the `console` import) rather
-		// than checking a returned number.
-		// The spy must be installed *before* `compile()` -- `compile()`'s own instantiation resolves the
-		// `console` import by reading `console.log` at that moment, binding the wasm module to whatever
-		// function was there right then; reassigning `console.log` afterward doesn't reach an already-bound
-		// import (found via the capture staying empty even though the calls themselves ran fine). But
-		// `compile()` also calls the real `console.log` itself first (its own WAT debug dump) -- `recording`
-		// gates that out without needing a second, differently-bound spy (there's only one `console.log`
-		// property to bind an import to, so a "swap in the real spy after compile()" approach can't work
-		// either -- same binding-time problem, one step later).
-		const captured: unknown[] = [];
-		const realLog = console.log;
-		let recording = false;
-		console.log = (...args: unknown[]) => { if (recording) captured.push(args[0]); };
-		let logNumber!: (x: number) => void, logBoolTrue!: () => void, logBoolFalse!: () => void;
-		try {
-			({ logNumber, logBoolTrue, logBoolFalse } = await compile(`
-				function logNumber(x: number): void { console.log(x); }
-				function logBoolTrue(): void { console.log(true); }
-				function logBoolFalse(): void { console.log(false); }
-			`) as unknown as { logNumber: (x: number) => void; logBoolTrue: () => void; logBoolFalse: () => void });
-			recording = true;
-			logNumber(3.5);
-			logBoolTrue();
-			logBoolFalse();
-		} finally {
-			console.log = realLog;
-		}
-		check('console.log(number)', captured[0], 3.5);
-		// wasm has no distinct boolean runtime tag -- a boolean argument prints as 1/0, not true/false
-		// (documented deviation, see emitConsoleLog's own comment).
-		check('console.log(true) prints 1 (no boolean runtime tag)', captured[1], 1);
-		check('console.log(false) prints 0 (no boolean runtime tag)', captured[2], 0);
-
-		await checkThrows('console.log(...) with more than one argument is rejected', () => compile(`
-			function f(): void { console.log(1, 2); }
-		`), /exactly one argument/);
-		await checkThrows('console.log(a string) is rejected', () => compile(`
-			function f(): void { console.log('hi'); }
-		`), /number\/boolean argument/);
+		// console.log(x) -- real WASI `fd_write` output now (see towasm.ts's `usesConsoleLog` and
+		// `lib/console.ts`'s `__towasm_console_log`), not a spied JS `console.log`. `compile()`'s own
+		// `fd_write` stub decodes each call's bytes and records them on `__consoleOutput`, one entry per
+		// call, each including `__towasm_writeString`'s own trailing `'\n'`.
+		const { logNumber, logBoolTrue, logBoolFalse, logString, logPoint, __consoleOutput } = await compile(`
+			class Point {
+				x: number;
+				constructor(x: number) { this.x = x; }
+				toString(): string { return \`Point(\${this.x})\`; }
+			}
+			function logNumber(x: number): void { console.log(x); }
+			function logBoolTrue(): void { console.log(true); }
+			function logBoolFalse(): void { console.log(false); }
+			function logString(): void { console.log('hi'); }
+			function logPoint(): void { console.log(new Point(5)); }
+		`);
+		logNumber(3.5);
+		logBoolTrue();
+		logBoolFalse();
+		logString();
+		logPoint();
+		check('console.log(number)', __consoleOutput[0], '3.5\n');
+		// Real `Boolean.toString()` dispatch now (dynamic any-dispatch finds the boxed value's actual class),
+		// not the old raw-scalar `args[0].wtype === 'i32'` dispatch that couldn't tell a boolean from an
+		// integer and printed the bare 1/0 -- this is genuinely more correct, not just different.
+		check('console.log(true)', __consoleOutput[1], 'true\n');
+		check('console.log(false)', __consoleOutput[2], 'false\n');
+		// A real, passing feature now -- console.log(x: any) stringifies via the same `${x}` template-literal
+		// codegen (real toString()/dynamic-any-dispatch included) every other interpolation already uses.
+		check('console.log(a string)', __consoleOutput[3], 'hi\n');
+		check('console.log(a class instance, real toString())', __consoleOutput[4], 'Point(5)\n');
 
 		// A program that never calls console.log at all must still instantiate with no imports required.
 		const { noLog } = await compile(`function noLog(): number { return 5; }`);

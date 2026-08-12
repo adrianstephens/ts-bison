@@ -87,66 +87,40 @@ export class Boolean {
 //	Number
 //-----------------------------------------------------------------------------
 
-export class StringParser {
-	str: string;
-	pos: number;
-	n: number;
-	constructor(str: string, pos: number = 0) {
-		this.str = str;
-		this.pos = pos;
-		this.n = str.length;
+function getSign(p: StringParser): number {
+	const c = p.code();
+	if (c === 45) {
+		++p.pos;
+		return -1;
+	} else if (c === 43) {
+		++p.pos;
 	}
-
-	remaining(): number { return this.n - this.pos; }
-	remainder(): string { return this.str.slice(this.pos); }
-	processed(): string { return this.str.slice(0, this.pos); }
-
-	code(): number { return this.pos < this.n ? this.str.charCodeAt(this.pos) : 0; }
-	skipCode(c: number): boolean {
-		if (this.code() === c) {
-			++this.pos;
-			return true;
-		}
-		return false;
-	}
-	skipWhitespace(): void {
-		while (this.pos < this.n && this.code() <= 32)
-			++this.pos;
-	}
-	getSign(): number {
-		const c = this.code();
-		if (c === 45) {
-			++this.pos;
-			return -1;
-		} else if (c === 43) {
-			++this.pos;
-		}
-		return 1;
-	}
-	getUnsigned(radix: number = 10, value: number = 0): number {
-		// `break` isn't supported (see towasm.ts's own statement dispatch) -- the stop condition folds
-		// into the loop condition itself instead of exiting from the middle of the body.
-		let stop = false;
-		while (!stop && this.pos < this.n) {
-			let d = this.code() - 48;
-			if (d > 9)
-				d = (d + 48 - 65 + 10) & 0x1f
-			if (d < 0 || d > radix) {
-				stop = true;
-			} else {
-				value = value * radix + d;
-				++this.pos;
-			}
-		}
-		return value;
-	}
-	getInt(radix: number = 10): number {
-		const sign = this.getSign();
-		const pos = this.pos;
-		const value = this.getUnsigned(radix);
-		return this.pos === pos ? NaN : sign * value;
-	}
+	return 1;
 }
+function getUnsigned(p: StringParser, radix: number = 10, value: number = 0): number {
+	// `break` isn't supported (see towasm.ts's own statement dispatch) -- the stop condition folds
+	// into the loop condition itself instead of exiting from the middle of the body.
+	let stop = false;
+	while (!stop && p.pos < p.n) {
+		let d = p.code() - 48;
+		if (d > 9)
+			d = (d + 48 - 65 + 10) & 0x1f
+		if (d < 0 || d > radix) {
+			stop = true;
+		} else {
+			value = value * radix + d;
+			++p.pos;
+		}
+	}
+	return value;
+}
+function getInt(p: StringParser, radix: number = 10): number {
+	const sign = getSign(p);
+	const pos = p.pos;
+	const value = getUnsigned(p, radix);
+	return p.pos === pos ? NaN : sign * value;
+}
+
 
 class NormalizedFloat {
 	m: number;
@@ -216,31 +190,30 @@ export class Number {
 	static isFinite(x: number): boolean			{ return Math.abs(x) < Infinity; }
 
 	static parseInt(s: string, radix: number = 10): number {
-		const p = new StringParser(s);
-		return p.getInt(radix);
+		return getInt(new StringParser(s), radix);
 	}
 
 	static parseFloat(str: string): number {
 		const p = new StringParser(str);
-		const sign = p.getSign();
+		const sign = getSign(p);
 
 		let exp		= 0;
 		let pos		= p.pos;
-		let value	= p.getUnsigned();
+		let value	= getUnsigned(p);
 		if (p.pos === pos)
 			return NaN;
 
 		// fractional part
 		if (p.skipCode(46)) {
 			pos		= p.pos;
-			value	= p.getUnsigned(10, value);
+			value	= getUnsigned(p, 10, value);
 			exp		= pos - p.pos;
 		}
 
 		const c = p.code();
 		if (c === 101 || c === 69) { // 'e' or 'E'
 			p.pos++;
-			exp += p.getInt();
+			exp += getInt(p);
 		}
 
 		return sign * value * intPow(10, exp);

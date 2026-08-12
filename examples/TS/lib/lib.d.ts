@@ -1,6 +1,16 @@
 // Ambient declarations shared by every `lib/*.ts` file -- read and parsed alongside them (see towasm.ts's
 // own `LIB_AST`), never `import`ed as a normal module, so none of this needs an `export`.
-//
+
+
+declare module 'wasi_snapshot_preview1' {
+	export function fd_write(fd: i32, iovsPtr: i32, iovsLen: i32, nwrittenPtr: i32): i32;
+}
+// Declaring standard modern WASI resource management functions
+declare module 'wasi:io/resource-error' {
+    // Standard WASI function to drop a host resource handle
+    export function drop(resourceHandle: i32): void;
+}
+
 // `__asm(asmText)` is how a lib file embeds real wasm assembly -- towasm.ts's own `isAsm`/`makeAsmBuiltin`
 // recognize a call to this exact name and compile `asmText` as real instructions (see `WAT.parseAsmBody`),
 // so `Math.floor = __asm<[number], number>('(switch $T (($f32 $f64) $T.floor))')` really does emit an
@@ -256,5 +266,21 @@ declare var Math: {
 //-----------------------------------------------------------------------------
 //
 //-----------------------------------------------------------------------------
+declare class StringParser {
+	str: string;
+	pos: number;
+	n: number;
+	constructor(str: string, pos?: number);
 
+	remaining(): number;
+	remainder(): string;
+	processed(): string;
+
+	code(): number;
+	skipCode(c: number): boolean;
+	skipWhitespace(): void;
+}
 declare function UnsignedToString(n: number, radix?: number, digits?: number): string;
+declare function strIsSpace(code: number): boolean;
+declare function __towasm_alloc(size: i32, align: i32): i32;
+
