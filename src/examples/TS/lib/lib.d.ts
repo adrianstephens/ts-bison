@@ -1,3 +1,6 @@
+/* eslint-disable @typescript-eslint/no-empty-object-type */
+/* eslint-disable no-shadow-restricted-names */
+/* eslint-disable no-var */
 // Ambient declarations shared by every `lib/*.ts` file -- read and parsed alongside them (see towasm.ts's
 // own `LIB_AST`), never `import`ed as a normal module, so none of this needs an `export`.
 
@@ -30,24 +33,16 @@ declare function __asm<P extends any[], R>(asm: string): (...args: P) => R;
 // so a *plain* class field/method can use one too, not just an `__asm<P,R>` type argument (see
 // `lib/typedarray.ts`'s own fields/`get`/`set`). `u32` is wasm's usual `i32` storage, just tagged so a
 // caller/comparison knows to treat it as unsigned (see `Uint32Array.get`).
+declare type u8 = number;
+declare type i8 = number;
+declare type i16 = number;
+declare type u16 = number;
 declare type i32 = number;
 declare type i64 = number;
 declare type f32 = number;
 declare type f64 = number;
 declare type u32 = number;
 declare type u64 = number;
-
-// Not matched in towasm.ts's `builtinTypes`/`wasmTypeOf` like the others above -- never used as a real
-// value's type, only as `TypedArray<T>`'s own real type argument (`lib/typedarray.ts`): `Uint8Array`/etc are
-// `declare type X = TypedArray<u8>`-style aliases (below), and towasm.ts's `ensureClass` reads the real
-// instantiation's own type argument name straight off `TypedArray<T>`'s real generic instantiation to pick
-// `$elem` (each one's real physical storage width), the same general mechanism any generic class's own
-// type argument already flows through -- not a separate per-name table. `i8` lives in `lib/typedarray.ts`
-// itself (only place it's used); `u8`/`i16`/`u16`/etc live here alongside the others since ambient
-// `TypedArray<T>` (below) references them too.
-declare type u8 = number;
-declare type i16 = number;
-declare type u16 = number;
 
 declare var NaN: number;
 declare var Infinity: number;
@@ -65,7 +60,7 @@ interface Number {}
 declare var Number: {
 	new (value?: any): Number;
 	(value?: any): number;
-}
+};
 
 //-----------------------------------------------------------------------------
 //	String

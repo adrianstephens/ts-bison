@@ -13,7 +13,7 @@ export class StringParser {
 	str: string;
 	pos: number;
 	n: number;
-	constructor(str: string, pos: number = 0) {
+	constructor(str: string, pos = 0) {
 		this.str = str;
 		this.pos = pos;
 		this.n = str.length;
@@ -48,11 +48,11 @@ export function stringTemplate(strings: string[], ...values: any[]): string {
 export class String {
 	get length(): number { return __asm<[], u32>('array.len')(); }
 
-	// @ts-ignore - tison extension: multiple constructor implementations
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor() {
 		return String._alloc(0) as unknown as String;
 	}
-	// @ts-ignore - tison extension: multiple constructor implementations
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(s: any) {
 		return s.toString();
 	}
@@ -190,9 +190,9 @@ export class String {
 	// overload real JS also has is out of scope. Honors `g` (all matches) vs first-only.
 	replace(regexp: RegExp, replacement: string): string {
 		const s: string = this as unknown as string;
-		let result: string = '';
-		let last: number = 0;
-		let go: boolean = true;
+		let result = '';
+		let last = 0;
+		let go = true;
 		regexp.lastIndex = 0;
 		while (go) {
 			const m: RegExpMatch | null = regexp.exec(s);
@@ -201,7 +201,8 @@ export class String {
 			} else {
 				result = result.concat(s.slice(last, m.index)).concat(expandReplacement(replacement, m));
 				last = m.groupEnd(0);
-				if (!regexp.global) go = false;
+				if (!regexp.global)
+					go = false;
 			}
 		}
 		return result.concat(s.slice(last, s.length));

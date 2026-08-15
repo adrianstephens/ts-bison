@@ -1,3 +1,4 @@
+/* eslint-disable no-loss-of-precision */
 /// <reference path="./lib.d.ts" />
 
 export const __towasm_mod = __asm<[number, number], number>(`
@@ -29,14 +30,10 @@ export const ieeeFrom	= __asm<[i64, i64], f64>(`
 
 function cos_core(r: number): number {
 	const z = r * r;
-	// cos(r) ~ 1 + z*C1 + z^2*C2 + ...
 	const C1 = -0.5;
 	const C2 = 4.16666666666665929218e-2;
 	const C3 = -1.38888888888741095749e-3;
 	const C4 = 2.48015872894767294178e-5;
-
-//	const z2 = z * z;
-//	return C1 * z + C2 * z2 + C3 * z2 * z + C4 * z2 * z2 + 1.0;
 	return z * (C1 + z * (C2 + z * (C3 + z * C4))) + 1.0;
 }
 function sin_core(r: number): number {
@@ -45,11 +42,7 @@ function sin_core(r: number): number {
 	const S2 = 8.33333333332248946124e-3;
 	const S3 = -1.98412698298579493134e-4;
 	const S4 = 2.75573137070700676789e-6;
-
-	const r3 = r * z;
-//	const poly = S1 * r3 + S2 * r3 * z + S3 * r3 * z * z + S4 * r3 * z * z * z;
-	const poly = r3 * (S1 + z * (S2 + z * (S3 + z * S4)));
-	return r + poly;
+	return r + r * z * (S1 + z * (S2 + z * (S3 + z * S4)));
 }
 
 // Leibniz series x - x^3/3 + x^5/5 - x^7/7 + x^9/9 -- only accurate for small |x| (converges slowly near
@@ -97,14 +90,14 @@ function getSign(p: StringParser): number {
 	}
 	return 1;
 }
-function getUnsigned(p: StringParser, radix: number = 10, value: number = 0): number {
+function getUnsigned(p: StringParser, radix = 10, value = 0): number {
 	// `break` isn't supported (see towasm.ts's own statement dispatch) -- the stop condition folds
 	// into the loop condition itself instead of exiting from the middle of the body.
 	let stop = false;
 	while (!stop && p.pos < p.n) {
 		let d = p.code() - 48;
 		if (d > 9)
-			d = (d + 48 - 65 + 10) & 0x1f
+			d = (d + 48 - 65 + 10) & 0x1f;
 		if (d < 0 || d > radix) {
 			stop = true;
 		} else {
@@ -114,7 +107,7 @@ function getUnsigned(p: StringParser, radix: number = 10, value: number = 0): nu
 	}
 	return value;
 }
-function getInt(p: StringParser, radix: number = 10): number {
+function getInt(p: StringParser, radix = 10): number {
 	const sign = getSign(p);
 	const pos = p.pos;
 	const value = getUnsigned(p, radix);
@@ -142,7 +135,7 @@ class NormalizedFloat {
 	}
 }
 
-function UnsignedToString(n: number, radix: number = 10, digits: number = 1): string {
+function UnsignedToString(n: number, radix = 10, digits = 1): string {
 	let s = '';
 	while (n > 0 || digits > 0) {
 		digits--;
@@ -152,7 +145,7 @@ function UnsignedToString(n: number, radix: number = 10, digits: number = 1): st
 	}
 	return s;
 }
-function SignedToString(n: number, radix: number = 10): string {
+function SignedToString(n: number, radix = 10): string {
 	return (n < 0 ? '-' : '+') + UnsignedToString(Math.abs(n), radix);
 }
 
@@ -189,7 +182,7 @@ export class Number {
 	static isSafeInteger(x: number): boolean	{ return Math.abs(x) < Number.MAX_SAFE_INTEGER; }
 	static isFinite(x: number): boolean			{ return Math.abs(x) < Infinity; }
 
-	static parseInt(s: string, radix: number = 10): number {
+	static parseInt(s: string, radix = 10): number {
 		return getInt(new StringParser(s), radix);
 	}
 
@@ -221,7 +214,7 @@ export class Number {
 
 	valueOf():	number { return this as unknown as number; }
 
-	toString(radix: number = 10): string {
+	toString(radix = 10): string {
 		let x = this as unknown as number;
 		const sign = x < 0 ? '-' : '';
 		x = Math.abs(x);
@@ -251,7 +244,7 @@ export class Number {
 		const e		= nf.e;
 		const scale	= intPow(10, digits);
 		const n		= Math.floor(m * scale + 0.5);
-		return sign + String.fromCharCode(48 + Math.floor(n / scale)) + (digits > 0 ? '.' + UnsignedToString(n % scale, 10, digits) : '') + 'e' + SignedToString(e)
+		return sign + String.fromCharCode(48 + Math.floor(n / scale)) + (digits > 0 ? '.' + UnsignedToString(n % scale, 10, digits) : '') + 'e' + SignedToString(e);
 	}
 	toPrecision(precision: number): string {
 		const x		= this as unknown as number;

@@ -1,4 +1,6 @@
-import { type RecoveryCallback, type MergeValues, type Token, makeParser, makeRule, Rules, terminal, Forward, List, OneOf, ForceFork, WithPrec } from '../../tison';
+import * as path from 'path';
+import { type RecoveryCallback, type MergeValues, type Token, makeRule, Rules, terminal, Forward, List, OneOf, ForceFork, WithPrec } from '../../tison';
+import { makeCachedParser } from '../../tableCache';
 import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods } from '../common';
 
 // ===================================================================
@@ -1039,14 +1041,14 @@ export const rules = {
 };
 
 export function make() {
-	return makeParser({
+	return makeCachedParser({
 		skip,
 		recover,
 		merge,
 		start: program,
 		// these are only needed for debugging
 		rules
-	});
+	}, path.join(__dirname, '../../../.tables-cache/js-parser.json.gz'));
 }
 
 export const parser = make();

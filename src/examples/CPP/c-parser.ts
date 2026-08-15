@@ -1,4 +1,6 @@
-import { makeParser, makeRule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../../tison';
+import * as path from 'path';
+import { makeRule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../../tison';
+import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
 import { Literal, Identifier, Unary, UnaryPost, Binary } from '../common';
 
@@ -519,7 +521,7 @@ translation_unit = Rules<TranslationUnit>(self => [
 	Rule([self, external_definition], 							$ => ({ ...$[0], body: [...$[0].body, $[1]] })),
 ]);
 
-const parser = makeParser({
+const parser = makeCachedParser({
 	skip: [/\s+/, /\/\/[^\n]*/, /\/\*[^]*?\*\//],
 	// IDENT must be lexed even where only TYPE_NAME is grammatically valid: it's the only terminal whose pattern
 	// matches the text, and its callback is what reclassifies a known typedef name into the pattern-less TYPE_NAME.
@@ -527,7 +529,7 @@ const parser = makeParser({
 	precedence: PREC,
 	start: translation_unit,
 	rules: {translation_unit}
-});
+}, path.join(__dirname, '../../../.tables-cache/c-parser.json.gz'));
 
 export const cParser = {
 	...parser,

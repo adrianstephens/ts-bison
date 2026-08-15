@@ -347,7 +347,8 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 			});
 			case 'for': 		return mapObject(stmt, {
 				init:			init => init.type === 'var_decl'
-					? mapObject(init, {declarations: mapArray(mapVarDeclarator)})
+					//? mapObject(init, {declarations: mapArray(mapVarDeclarator)})
+					? mapStatement(init)
 					: mapExpressionA(init),
 				...(stmt.kind === 'normal' ? {
 					test:			mapExpression,
@@ -582,7 +583,8 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 			case 'if':					return walkExpression(stmt.test) || walkStatement(stmt.consequent) || (!!stmt.alternate && walkStatement(stmt.alternate));
 			case 'do_while':
 			case 'while':				return walkExpression(stmt.test) || walkStatement(stmt.body);
-			case 'for':					return (stmt.init ? (stmt.init.type === 'var_decl' ? stmt.init.declarations.some(walkVarDeclarator) : walkExpression(stmt.init)) : false)
+//			case 'for':					return (stmt.init ? (stmt.init.type === 'var_decl' ? stmt.init.declarations.some(walkVarDeclarator) : walkExpression(stmt.init)) : false)
+			case 'for':					return (stmt.init ? (stmt.init.type === 'var_decl' ? walkStatement(stmt.init) : walkExpression(stmt.init)) : false)
 				|| (stmt.kind === 'normal' ? (walkExpression(stmt.test) || walkExpression(stmt.update)) : walkExpression(stmt.right))
 				|| walkStatement(stmt.body);
 			case 'with':

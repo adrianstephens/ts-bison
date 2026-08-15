@@ -254,6 +254,23 @@ export interface ParseTables {
 	conflicts:	ConflictReport[];
 }
 
+// Every state must have an explicit entry for every `alwaysTerminals`/`alwaysSkip` terminal (so the
+// lexer's candidate set is byte-identical everywhere), but the entries themselves are just the default
+// 'error'/'ignore' wherever nothing more specific already won -- deterministic from the grammar alone,
+// so `deserializeTables` reapplies this instead of `serializeTables` writing it to disk.
+function fillAlwaysEntries(g: GrammarBuilder, action: Map<Terminal, ActionEntry>[]) {
+	for (const row of action) {
+		for (const term of g.alwaysTerminals) {
+			if (!row.has(term))
+				row.set(term, { kind: 'error' });
+		}
+		for (const term of g.alwaysSkip) {
+			if (!row.has(term))
+				row.set(term, { kind: 'ignore' });
+		}
+	}
+}
+
 // ===================================================================
 //  Grammar builder
 // ===================================================================
@@ -617,15 +634,8 @@ export class GrammarBuilder {
 						this.setAction(action[s], la, { kind: 'reduce', rule: item.rule }, s, shiftRule[s].get(la)?.prec, conflicts);
 				}
 			}
-			for (const term of this.alwaysTerminals) {
-				if (!action[s].has(term))
-					action[s].set(term, {'kind': 'error'} );
-			}
-			for (const term of this.alwaysSkip) {
-				if (!action[s].has(term))
-					action[s].set(term, {'kind': 'ignore'} );
-			}
 		}
+		fillAlwaysEntries(this, action);
 
 		return {
 			action,
@@ -1113,15 +1123,225 @@ function eliminateUnitGotos(tables: ParseTables): number {
 }
 
 // ===================================================================
+//  Table (de)serialization
+// ===================================================================
+// `buildTables` (the LR(0)/LALR automaton construction) depends only on grammar *shape* -- which
+// terminals/nonterminals appear where, precedence, `lalr`/`optimize` -- never on the action closures
+// themselves. So a cache only needs `action`/`goto`; `rules` (which carries the live `.action` closures)
+// is regenerated for free as a side effect of reconstructing `GrammarBuilder` from the spec, which
+// callers must do anyway to get a fingerprint to validate the cache against.
+//
+// `conflicts` is deliberately NOT part of this: it's diagnostic-only (`runParser`/`runGlrFork` never
+// read it, only tooling like test-cpp-parser.ts's conflict dump does), and unlike `rules` or the
+// 'error'/'ignore' action fill, it can't be regenerated cheaply -- reproducing it needs the very
+// `buildTables` pass caching exists to skip. So a cache hit's `tables.conflicts` is always `[]`; for
+// grammars with many precedence-resolved conflicts (e.g. C's) this was also over half the file's bytes,
+// for one field nothing at runtime reads.
+//
+// Bump TABLE_FORMAT_VERSION whenever `buildTables`/`eliminateUnitGotos` change in a way that could change
+// the tables produced for the same grammar shape, OR the SerializedTables encoding itself changes -- the
+// fingerprint alone can't detect either, and an old cache file would otherwise be misread as valid.
+export const TABLE_FORMAT_VERSION = 4;
+
+// Rows are flat number arrays, not `[key, value]` pairs -- every terminal/nonterminal is already an
+// index into a namespace `deserializeTables` reconstructs from the live `GrammarBuilder` (see
+// `indexTerminals`/`indexNonTerminals`), so nothing here is ever a string: entries are effectively
+// tables of small integers, the same shape the built-in `Map`/`Terminal` objects hide.
+//
+// action row: `[...defaultEntry, ...(termIndex*2 | isException)*]` -- an instruction-set-sized grammar
+// (hundreds of terminals) has states where nearly every terminal reduces by the *same* rule (e.g. "any
+// terminal that can start another instruction"), so most of a row's entries are one repeated value.
+// Rather than writing that value out per terminal, the row leads with its single most-common entry as
+// a default (chosen by `serializeTables`, same shape as `encodeEntry` produces for any entry), then
+// lists every terminal as just its tagged index: even (`i*2`) means "use the row default", odd
+// (`i*2+1`) means an explicit entry follows, encoded the same way as the header. Genuinely dense/varied
+// rows (e.g. WAT's ~25 "start of instruction" dispatch states, one real shift target per opcode) get
+// no benefit from this -- nothing there repeats -- but cost only one extra number per entry to allow it.
+// goto row: repeated (ntIndex, state) pairs.
+export type SerializedActionRow	= number[];
+export type SerializedGotoRow		= number[];
+
+const enum EntryTag { Shift, Reduce, Accept, Conflict }
+
+export interface SerializedTables {
+	action:		SerializedActionRow[];
+	goto:		SerializedGotoRow[];
+}
+
+// Deterministic index for each NonTerminal, in first-encounter order over `g.rules`. NonTerminal
+// identity (not `.name`) is what matters -- anonymous/inlined rules can share the literal name
+// 'unknown name' -- but re-running `new GrammarBuilder(spec)` from the same spec always walks rules in
+// the same order, so the indices line up again on reload.
+function indexNonTerminals(g: GrammarBuilder): Map<NonTerminal, number> {
+	const index = new Map<NonTerminal, number>();
+	const add = (nt: NonTerminal) => { if (!index.has(nt)) index.set(nt, index.size); };
+	for (const r of g.rules) {
+		add(r.lhs);
+		for (const sym of r.rhs) {
+			if (sym instanceof NonTerminal)
+				add(sym);
+		}
+	}
+	return index;
+}
+
+// Terminal identity is already stable-and-unique by `.name` (see `GrammarBuilder`'s interning), so
+// `g.terminalsByName`'s own (deterministic, insertion-ordered) iteration doubles as the index -- plus
+// EOF/ERROR, the two terminals that live outside that map.
+function terminalsByIndex(g: GrammarBuilder): Terminal[] {
+	return [...g.terminalsByName.values(), EOF, ERROR];
+}
+
+function encodeEntry(out: number[], entry: ActionEntry) {
+	switch (entry.kind) {
+		case 'shift':		out.push(EntryTag.Shift, entry.state); break;
+		case 'reduce':		out.push(EntryTag.Reduce, entry.rule); break;
+		case 'accept':		out.push(EntryTag.Accept); break;
+		case 'conflict':
+			out.push(EntryTag.Conflict, entry.entries.length);
+			for (const e of entry.entries)
+				encodeEntry(out, e);
+			break;
+		// 'error'/'ignore' never reach here -- `serializeTables` filters them out below.
+	}
+}
+
+// `cursor` is mutated in place so nested `conflict` entries can keep consuming from the same row.
+function decodeEntry(row: number[], cursor: { i: number }): ActionEntry {
+	switch (row[cursor.i++] as EntryTag) {
+		case EntryTag.Shift:	return { kind: 'shift', state: row[cursor.i++] };
+		case EntryTag.Reduce:	return { kind: 'reduce', rule: row[cursor.i++] };
+		case EntryTag.Accept:	return { kind: 'accept' };
+		case EntryTag.Conflict: {
+			const n = row[cursor.i++];
+			return { kind: 'conflict', entries: Array.from({ length: n }, () => decodeEntry(row, cursor)) };
+		}
+	}
+}
+
+// 'error'/'ignore' entries are never anything but `fillAlwaysEntries`'s own default (see its comment) --
+// skip them here, `deserializeTables` regenerates them instead of storing millions of redundant entries
+// for grammars with large `alwaysTerminals`/`alwaysSkip` sets.
+export function serializeTables(g: GrammarBuilder, tables: ParseTables): SerializedTables {
+	const termIndex	= new Map(terminalsByIndex(g).map((t, i) => [t, i]));
+	const ntIndex	= indexNonTerminals(g);
+	return {
+		action: tables.action.map(row => {
+			const real = [...row]
+				.filter(([, entry]) => entry.kind !== 'error' && entry.kind !== 'ignore')
+				.map(([term, entry]) => ({ idx: termIndex.get(term)!, entry, key: JSON.stringify(entry) }));
+			if (!real.length)
+				return [];
+
+			// Pick the entry (by structural value, not identity) that recurs most often in this row as
+			// the default -- ties broken by first-seen, which only affects which encoding is chosen,
+			// never correctness.
+			const counts = new Map<string, { entry: ActionEntry; count: number }>();
+			for (const { entry, key } of real) {
+				const found = counts.get(key);
+				if (found)
+					found.count++;
+				else
+					counts.set(key, { entry, count: 1 });
+			}
+			let best = counts.values().next().value!;
+			for (const c of counts.values()) {
+				if (c.count > best.count)
+					best = c;
+			}
+			const defaultKey = JSON.stringify(best.entry);
+
+			const out: number[] = [];
+			encodeEntry(out, best.entry);
+			for (const { idx, entry, key } of real) {
+				if (key === defaultKey) {
+					out.push(idx * 2);
+				} else {
+					out.push(idx * 2 + 1);
+					encodeEntry(out, entry);
+				}
+			}
+			return out;
+		}),
+		goto: tables.goto.map(row => {
+			const out: number[] = [];
+			for (const [nt, state] of row)
+				out.push(ntIndex.get(nt)!, state);
+			return out;
+		}),
+	};
+}
+
+// `g` must come from a fresh `new GrammarBuilder(spec)` for the *same* spec the tables were serialized
+// from -- that's what supplies both the live `.action` closures (via `g.rules`) and the terminal/index
+// namespaces the serialized rows were written against. The returned `conflicts` is always `[]` (see the
+// comment on `TABLE_FORMAT_VERSION`) -- callers that want real conflict diagnostics need an uncached
+// `g.buildTables(...)`.
+export function deserializeTables(g: GrammarBuilder, s: SerializedTables): ParseTables {
+	const termByIndex	= terminalsByIndex(g);
+	const ntByIndex		= [...indexNonTerminals(g).entries()].sort((a, b) => a[1] - b[1]).map(([nt]) => nt);
+	const action = s.action.map(row => {
+		const m = new Map<Terminal, ActionEntry>();
+		if (!row.length)
+			return m;
+		const cursor = { i: 0 };
+		const defaultEntry = decodeEntry(row, cursor);
+		while (cursor.i < row.length) {
+			const tagged	= row[cursor.i++];
+			const term		= termByIndex[tagged >> 1];
+			m.set(term, (tagged & 1) ? decodeEntry(row, cursor) : defaultEntry);
+		}
+		return m;
+	});
+	fillAlwaysEntries(g, action);
+	return {
+		action,
+		goto: s.goto.map(row => {
+			const m = new Map<NonTerminal, number>();
+			for (let i = 0; i < row.length; i += 2)
+				m.set(ntByIndex[row[i]], row[i + 1]);
+			return m;
+		}),
+		rules:		g.rules,
+		conflicts:	[],
+	};
+}
+
+// A plain JSON-serializable snapshot of everything that can affect `buildTables`'s output. Callers hash
+// this (e.g. sha256 of `JSON.stringify(...)`) to decide whether a cached `SerializedTables` is still
+// valid for the current grammar -- cheaper and more robust than a source-file mtime check, since it
+// also catches grammar-equivalent edits (renames, reformatting) that don't need to invalidate the cache,
+// and is naturally versioned via TABLE_FORMAT_VERSION for engine-side algorithm changes.
+export function grammarFingerprint(g: GrammarBuilder, spec: GrammarSpec<any>): unknown {
+	const ntIndex = indexNonTerminals(g);
+	const symKey = (sym: InternalSym) => sym instanceof Terminal ? `t:${sym.name}` : `n:${ntIndex.get(sym)}`;
+	return {
+		version:			TABLE_FORMAT_VERSION,
+		lalr:				spec.lalr ?? true,
+		optimize:			spec.optimize !== false,
+		terminals:			[...g.terminalsByName.values()].map(t => [t.name, t.pattern?.source ?? null]),
+		alwaysTerminals:	g.alwaysTerminals.map(t => t.name),
+		alwaysSkip:			g.alwaysSkip.map(t => t.name),
+		rules:				g.rules.map(r => [symKey(r.lhs), r.rhs.map(symKey), r.prec ?? null]),
+	};
+}
+
+// ===================================================================
 //  Main entry point
 // ===================================================================
 
-export function makeParser<T>(spec: GrammarSpec<T>): Parser<T> {
-	const g			= new GrammarBuilder(spec);
-	const tables	= g.buildTables(spec.lalr ?? true);
-
-	if (spec.optimize !== false)
-		eliminateUnitGotos(tables);
+// `prebuilt.g` lets a caching layer (see tableCache.ts) reuse a `GrammarBuilder` it already
+// constructed (e.g. to compute a fingerprint) instead of rebuilding it. `prebuilt.tables`, if given,
+// is used as-is (already-optimized tables loaded from a cache); otherwise tables are built and
+// optimized from `g` exactly as when no `prebuilt` is passed at all.
+export function makeParser<T>(spec: GrammarSpec<T>, prebuilt?: { g: GrammarBuilder; tables?: ParseTables }): Parser<T> {
+	const g			= prebuilt?.g ?? new GrammarBuilder(spec);
+	const tables	= prebuilt?.tables ?? (() => {
+		const tables = g.buildTables(spec.lalr ?? true);
+		if (spec.optimize !== false)
+			eliminateUnitGotos(tables);
+		return tables;
+	})();
 
 	const resolveSym = (sym: Token|Terminal|string|RegExp|undefined): Token|Terminal|undefined =>
 		typeof sym === 'string'		? g.terminalsByName.get(sym)

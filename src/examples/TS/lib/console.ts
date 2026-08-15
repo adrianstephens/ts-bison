@@ -44,7 +44,7 @@ export function __towasm_writeString(s: string): void {
 
 export class console {
 	static log(...x: any[]): void {
-		let result: string = '';
+		let result = '';
 		for (let i = 0; i < x.length; ++i) {
 			if (i)
 				result += ' ';

@@ -1,4 +1,6 @@
-import { makeParser, Rules, makeRule, List, MaybeList, Maybe, OneOf, Forward } from '../tison';
+import * as path from 'path';
+import { Rules, makeRule, List, MaybeList, Maybe, OneOf, Forward } from '../tison';
+import { makeCachedParser } from '../tableCache';
 import { Instr, ValType, Local, GlobalType, TableType, SubType, WasmModule, Limits, Import as WasmImport } from '@isopodlabs/binary_libs/wasm';
 import { ROOT_OPS, FB_OPS, FC_OPS, SIMD_OPS, THREAD_OPS, equalFuncSig } from '@isopodlabs/binary_libs/wasm';
 
@@ -648,13 +650,13 @@ function definedFields($: (ModuleField | undefined)[], ctx: ParseCtx): ModuleFie
 
 const SKIP = [/\s+/, /;;[^\n]*/, /\(;[^]*?;\)/];
 
-export const parser = makeParser({
+export const parser = makeCachedParser({
 	skip: SKIP,
 	start: Rules<Module>(
 		Rule(['(', 'module', maybe_id, MaybeList(module_field), ')'],	($, ctx) => ({ id: $[2], fields: definedFields($[3], ctx) })),
 		Rule([MaybeList(module_field)],									($, ctx) => ({ fields: definedFields($[0], ctx) })),
 	)
-});
+}, path.join(__dirname, '../../.tables-cache/wat-parser.json.gz'));
 
 export function parseWat(src: string, defines?: Record<string, string|number>): Module {
 	return parser.parse(src, new ParseCtx(defines));
@@ -676,12 +678,12 @@ export function parseWat(src: string, defines?: Record<string, string|number>): 
 
 export interface ParsedAsmBody { locals: WatLocal[]; body: WatInstr[] }
 
-const asmBodyParser = makeParser({
+const asmBodyParser = makeCachedParser({
 	skip: SKIP,
 	start: Rules<ParsedAsmBody>(
 		Rule([MaybeList(instr)], $ => collectAsmItems($[0])),
 	)
-});
+}, path.join(__dirname, '../../.tables-cache/wat-parser-asm.json.gz'));
 
 export function parseAsmBody(src: string, defines?: Record<string, string|number>) {
 	return asmBodyParser.parse(src, new ParseCtx(defines));
