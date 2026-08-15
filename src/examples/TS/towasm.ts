@@ -13,23 +13,21 @@ import * as WAT from '../wat-parser';
 // TStoWasm -- TS-AST-to-wasm backend for a narrow static subset.
 // Assumes ast already passed TStypeCheck. Emits a wasm.WasmModule directly (no WAT stage).
 // Every gap below throws a clear error rather than silently miscompiling -- missing for full TS:
-//  - Control flow: exceptions (try/catch/throw/finally), do-while, labeled break/continue, for-in (only
+//  - Control flow: exceptions (try/catch/throw/finally), labeled break/continue, for-in (only
 //    for-of, and only over number[]/boolean[]/typed arrays, not string or a general iterable)
 //  - Async: async/await, Promises, generators
 //  - Classes: inheritance (extends/abstract), computed field names, a field cycle (a field can't be of its
 //    own class's type, directly or indirectly), generic methods (only a class's own single type param)
-//  - Functions: generic top-level functions/arrow/function expressions, a rest param in an arrow/function
-//    expression (only in declarations), a function expression's own 'this' (only arrow's lexical 'this'),
-//    a named function expression referencing its own name
-//  - Expressions: object literals, the comma/sequence operator, array literals with holes, spread call
-//    arguments (except the compiler's own internal rest-param bundling), tagged templates
-//  - Destructuring: a rest element or a default value inside a pattern
+//  - Functions: generic top-level functions/arrow/function expressions, a function expression's own
+//    'this' (only arrow's lexical 'this'), a named function expression referencing its own name
+//  - Expressions: object literals, the comma/sequence operator, array literals with holes, tagged templates
+//  - Destructuring: a rest property inside an *object* pattern (`{a, ...rest}` -- needs a genuinely new
+//    object type holding an arbitrary 'all fields except these' shape, not modeled yet; array rest and a
+//    default value in either kind of pattern are both supported)
 //  - Optional chaining ('?.'): only one step ('a?.b.c' chains further, rejected), only a plain user method
 //    (not a 'Math'/prelude intrinsic), can't return 'void'
-//  - Types: a nullable primitive ('number | null'/'boolean | null' -- a *declared* nullable type has no
-//    boxing, distinct from the real dynamic-any boxing an `any`-typed value already gets), enums,
-//    namespaces, decorators
-//  - Other: shadowing (redeclaring a local name in a nested scope)
+//  - Types: enums, namespaces, decorators; '++'/'--' on a nullable primitive (needs narrowing to
+//    non-null first, which codegen has no way to track -- narrow into a local first instead)
 
 type Expr			= JS.Expr;
 type Type			= TS.Type;
@@ -50,7 +48,7 @@ const LIB_AST		= ['lib.d.ts', 'number.ts', 'bigint.ts', 'string.ts', 'array.ts',
 const LIB_EXPORTS	= LIB_AST.filter(n => n.type === 'export_decl').map(n =>n.declaration);
 const LIB_DECLS		= [
 	...[...LIB_EXPORTS, ...LIB_AST].filter(n => n.type === 'function_decl' || n.type === 'class_decl'),
-	...[...LIB_EXPORTS, ...LIB_AST].filter(n => n.type === 'var_decl').flatMap(d => d.declarations.map(decl => ({type: 'var_decl', ambient: d.ambient, ...decl} as const)))
+	...[...LIB_EXPORTS, ...LIB_AST].filter(n => n.type === 'var_decl').flatMap(d => d.declarations.map(decl => ({type: 'var_decl', ambient: d.ambient, kind: d.kind, ...decl} as const)))
 ];
 
 // An ambient `declare class`/`declare function` stub (`.ambient === true`, no body) exists only for the checker -- codegen must prefer a real same-named implementation.
@@ -81,7 +79,12 @@ type WasmType		= 'i32' | 'u32' | 'i64' | 'f32' | 'f64' | 'void'
 	| { ref: string; nullable?: boolean }
 	| { arr: wasmElement; nullable?: boolean }
 	| { closure: FuncSig; nullable?: boolean }
-	| { typeIndex: number; nullable?: boolean };
+	| { typeIndex: number; nullable?: boolean }
+	// A boxed nullable primitive ('number | null'/'boolean | null'): a real class/closure env struct
+	// never sets `primKind`, so it's what tells a `typeIndex`-shaped type apart from those -- see
+	// `unboxedPrimitive`. Structural, not a side-table, since `registerType`'s memoization could
+	// otherwise coincidentally share a type index with an unrelated single-scalar-field struct.
+	| { typeIndex: number; nullable?: boolean; primKind: 'f64' | 'i32' };
 
 // Shared singletons -- ctx.local compares WasmType by object identity (not structural equality).
 // Two separate array writes in one function would throw "redeclared with different type" without these.
@@ -92,6 +95,11 @@ const ARR_WTYPE: Record<wasmElement, WasmType> = {
 
 // Shared singleton for the same identity-comparison reason as ARR_WTYPE.
 const REF_ANY: WasmType = { ref: 'any' };
+// A 'ref'-kind array element's real per-slot target -- `array.get`/`array.set` on that shared storage
+// always deal in a nullable `anyref` (see `ensureArrayType`), so a `null`/`undefined` literal element
+// (`[1, null, 3]`, `a[i] = null`) needs a target `emitAs` actually recognizes as nullable, not the
+// bare (non-nullable) `REF_ANY` singleton itself.
+const REF_ANY_NULLABLE: WasmType = { ref: 'any', nullable: true };
 
 function wasmTypeEq(a: WasmType, b: WasmType): boolean {
 	if (typeof a === 'string' || typeof b === 'string')
@@ -108,12 +116,17 @@ function wasmTypeEq(a: WasmType, b: WasmType): boolean {
 }
 
 // Structural equality -- two independently-obtained FuncSigs for the same TS type must compare equal.
+// `hasRest` matters here (not just per-`FuncInfo` bookkeeping, unlike a plain named function) because a
+// closure's `FuncSig` *is* its wasm-level type identity -- two closures with the same `params`/`result`
+// but different rest-ness genuinely have different physical signatures (the rest param materializes as
+// one more real, array-typed parameter), so treating them as the same type would let `call_ref` invoke
+// the wrong shape.
 function funcSigEq(a: FuncSig, b: FuncSig): boolean {
-	return a.params.length === b.params.length && wasmTypeEq(a.result, b.result) && a.params.every((p, i) => wasmTypeEq(p, b.params[i]));
+	return a.params.length === b.params.length && wasmTypeEq(a.result, b.result) && a.params.every((p, i) => wasmTypeEq(p, b.params[i])) && !a.hasRest === !b.hasRest;
 }
 
-interface FuncSig					{ params: WasmType[]; result: WasmType }
-interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; defaults?: (Expr | undefined)[]; hasRest?: boolean; reassignsThis?: boolean }
+interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean }
+interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; defaults?: (Expr | undefined)[]; reassignsThis?: boolean }
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
 interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number }
@@ -157,6 +170,10 @@ class FuncCtx {
 	freeSlots	= new Map<string, number[]>();
 	out:	wasm.Instr[]	= [];
 	ctorThis?: Local;
+	// Set only while a struct-collecting constructor (see `ensureCtor`) gathers field values into scratch
+	// locals ahead of `struct.new` -- lets `this.field` resolve to the field's own local, for a field already
+	// collected, before a real `this` exists. Cleared the moment `ctorThis` is set.
+	ctorFields?: Map<string, Local>;
 	// depth counts open block/loop/if labels; breakTargets/continueTargets record depth at each label
 	// so `br(depth - target)` gives the correct relative index from any nesting depth. Only ever touched
 	// via the enter*/exit* pairs below, which mirror `openScope`/`closeScope`'s own pairing but for WAT's
@@ -285,11 +302,12 @@ class FuncCtx {
 	declareParams(params: JS.Param<Type>[], wtypes: WasmType[]): JS.Statement<Type>[] {
 		const pending: JS.Statement<Type>[] = [];
 		params.forEach((p, i) => {
+			const typeAnnotation = p.typeAnnotation ?? T.literalTypeOf(p.default);
 			if (typeof p.key === 'string') {
-				this.declareValue(p.key, wtypes[i], p.typeAnnotation!);
+				this.declareValue(p.key, wtypes[i], typeAnnotation!);
 			} else {
 				const tmpName = `#param$${i}`;
-				this.declareValue(tmpName, wtypes[i], p.typeAnnotation!);
+				this.declareValue(tmpName, wtypes[i], typeAnnotation!);
 				pending.push(...patternBindings(p.key, { type: 'identifier', name: tmpName }));
 			}
 		});
@@ -306,9 +324,9 @@ class FuncCtx {
 	}
 
 	swapOut(out: wasm.Instr[] = []) {
-		const old	= this.out;
+		const _old	= this.out;
 		this.out	= out;
-		return old;
+		return _old;
 	}
 
 	emit(...instr: wasm.Instr[]) {
@@ -331,28 +349,36 @@ function describeBinding(t: BindingTarget): string {
 }
 
 // Desugars a destructuring BindingTarget into flat var_decls reading off valueExpr (must be side-effect-free).
+// A default value (`el.default`/`prop.default`) just becomes a real `??` (`rawExpr ?? dflt`) -- reuses
+// `??`'s own codegen wholesale, including its single-evaluation-of-the-left materialization, rather than
+// hand-rolling a second copy of that logic here. `??`'s codegen also needs to tolerate a non-nullable
+// left for this to work (see its own comment) -- a default on an already-non-nullable value (an ordinary
+// array element, or a non-optional object field) is provably dead code, same as real TS itself would
+// prove, not a reason to reject it.
 function patternBindings(target: BindingTarget, valueExpr: Expr): JS.Statement<Type>[] {
 	if (typeof target === 'string')
 		return [JS.VarDecl('const', JS.Var(target, valueExpr))];
 
 	if (target.type === 'array_pattern') {
-		if (target.rest)
-			throw new Error("towasm: a rest element ('...') in a destructuring pattern is not supported");
-		return target.elements.flatMap((el, i) => {
+		const stmts = target.elements.flatMap((el, i) => {
 			if (!el)
 				return [];
-			if (el.default)
-				throw new Error('towasm: a default value in a destructuring pattern is not supported');
-			return patternBindings(el.target, JS.Index(valueExpr, Literal(i)));
+			const elemExpr: Expr = JS.Index(valueExpr, Literal(i));
+			return patternBindings(el.target, el.default ? Binary('??', elemExpr, el.default) : elemExpr);
 		});
+		if (target.rest) {
+			// Real JS semantics: the rest collects the remaining elements into a genuinely new array, not
+			// a view -- `.slice(n)` (already a real `Array<T>` method) gives exactly that.
+			stmts.push(JS.VarDecl('const', JS.Var(target.rest, JS.Call(JS.Member(valueExpr, 'slice'), [Literal(target.elements.length)]))));
+		}
+		return stmts;
 	}
 
 	if (target.rest)
-		throw new Error("towasm: a rest property ('...') in a destructuring pattern is not supported");
+		throw new Error("towasm: a rest property ('...') in an object destructuring pattern is not supported -- unlike array rest (a plain '.slice()'), this needs a genuinely new object type holding an arbitrary 'all fields except these' shape, which isn't modeled yet");
 	return target.properties.flatMap(prop => {
-		if (prop.default)
-			throw new Error('towasm: a default value in a destructuring pattern is not supported');
-		return patternBindings(prop.value, JS.Member(valueExpr, prop.key));
+		const propExpr: Expr = JS.Member(valueExpr, prop.key);
+		return patternBindings(prop.value, prop.default ? Binary('??', propExpr, prop.default) : propExpr);
 	});
 }
 
@@ -360,8 +386,9 @@ function patternBindings(target: BindingTarget, valueExpr: Expr): JS.Statement<T
 //  Closures -- free-variable analysis
 // ===================================================================
 
-function paramNames(params: JS.Param<Type>[]): string[] {
-	return params.flatMap(p => T.bindingNames(p.key));
+function paramNames(params: JS.Param<Type>[], rest?: JS.Rest<Type>): string[] {
+	const names = params.flatMap(p => T.bindingNames(p.key));
+	return rest ? [...names, ...T.bindingNames(rest.key)] : names;
 }
 
 // Every name body binds directly (own params + var_decls), not descending into nested arrow/function bodies.
@@ -369,6 +396,9 @@ function ownBoundNames(names: string[], body: Statement[] | Expr, selfName?: str
 	const bound = new Set(names);
 	if (selfName)
 		bound.add(selfName);
+	// A `for`'s own `init` (e.g. `for (let i = ...)`) reaches this same `var_decl` case too -- walker.ts
+	// routes it through the real statement walk, not just a bare declarator walk, so no separate case is
+	// needed here to keep a closure's own loop variable from being mistaken for a free (captured) one.
 	walkB(body as JS.Statement<any>[] | Expr,
 		(s, process) => {
 			if (s.type === 'var_decl') {
@@ -400,7 +430,7 @@ function collectFreeVars(bound: Set<string>, body: Statement[] | Expr, free: Set
 			}
 			if (e.type === 'arrow' || e.type === 'function') {
 				const nestedBody = e.body ?? [];
-				collectFreeVars(new Set([...bound, ...ownBoundNames(paramNames(e.params), nestedBody, e.type === 'function' ? e.name : undefined)]), nestedBody, free);
+				collectFreeVars(new Set([...bound, ...ownBoundNames(paramNames(e.params, e.rest), nestedBody, e.type === 'function' ? e.name : undefined)]), nestedBody, free);
 				return false;
 			}
 			return process(e);
@@ -834,20 +864,39 @@ const BINARY_OP_NAMES = {
 	'>=':	'ge',
 };
 
+// If `wtype` is a boxed nullable primitive (see `nullableWtype`/`ensureBoxType`), its underlying
+// scalar kind and box type index; otherwise `undefined` (a real class/array/closure-env-struct, or
+// already a bare scalar). Structural (checks `primKind` on the object itself), not a lookup table --
+// `registerType`'s structural memoization means an unrelated single-scalar-field struct (e.g. a
+// closure's env struct capturing exactly one `f64`) could otherwise coincidentally share a box's
+// type index, which a table keyed by type index alone couldn't tell apart.
+function unboxedPrimitive(wtype: WasmType): { kind: 'f64' | 'i32'; typeIndex: number } | undefined {
+	return typeof wtype !== 'string' && 'primKind' in wtype ? { kind: wtype.primKind, typeIndex: wtype.typeIndex } : undefined;
+}
+// The plain scalar kind a value acts as for arithmetic/comparison dispatch -- unwraps a boxed
+// nullable primitive the same way `coerceTop` does, or passes a bare scalar through unchanged.
+// `undefined` for anything else (a real class/array/closure).
+function scalarKind(wtype: WasmType | undefined): WasmType | undefined {
+	return typeof wtype === 'string' ? wtype : wtype && unboxedPrimitive(wtype)?.kind;
+}
+
 // The wasm numeric type a 2-operand op should run in -- widened across *both* operands, not just the left
 // one, or an i32-typed left operand (e.g. literal `1`) would silently truncate a fractional right operand.
 function numericPairWtype(a: OperandInfo, b: OperandInfo): 'i32' | 'i64' | 'f64' {
-	if (a.wtype === 'i64' || b.wtype === 'i64')
+	const at = scalarKind(a.wtype), bt = scalarKind(b.wtype);
+	if (at === 'i64' || bt === 'i64')
 		return 'i64';
-	if (a.wtype === 'i32' && b.wtype === 'i32')
+	if (at === 'i32' && bt === 'i32')
 		return 'i32';
 	return 'f64';
 }
 
 // bigint/string equality checked by owner name, not physical shape -- {arr:'i16'} could mean something else later.
+// A boxed nullable primitive is excluded from the ref.eq path (`unboxedPrimitive` check) even though
+// it's object-shaped -- it needs a value comparison after unboxing, not an identity comparison.
 function equalityInline(args: OperandInfo[], negate: boolean): Inline | MethodDelegate {
 	const t = args[0].wtype;
-	if (t && typeof t !== 'string')
+	if (t && typeof t !== 'string' && !unboxedPrimitive(t))
 		return { params: [t, t], result: 'i32', inline: negate ? [I.ref.eq, I.i32.eqz] : [I.ref.eq] };
 	return numericPairWtype(args[0], args[1]) === 'i32'
 		? { params: ['i32', 'i32'], result: 'i32', inline: [negate ? I.i32.ne : I.i32.eq] }
@@ -863,9 +912,10 @@ function arithInline(args: OperandInfo[], f64instr: wasm.Instr[], i32instr: wasm
 		: { params: ['f64', 'f64'], result: boolResult ? 'i32' : 'f64', inline: f64instr };
 }
 function arithInline1(args: OperandInfo[], f64instr: wasm.Instr[], i32instr: wasm.Instr[], i64instr: wasm.Instr[]): Inline {
-	return args[0].wtype === 'i32'
+	const t = scalarKind(args[0].wtype);
+	return t === 'i32'
 		? { params: ['i32'], result: 'i32', inline: i32instr }
-		: args[0].wtype === 'i64'
+		: t === 'i64'
 		? { params: ['i64'], result: 'i64', inline: i64instr }
 		: { params: ['f64'], result: 'f64', inline: f64instr };
 }
@@ -938,6 +988,128 @@ const builtins: Record<string, Builtin> = {
 
 interface AssignTarget { wtype: WasmType; old?: number; write(tee: boolean): number }
 
+// For every `let`/`var` declarator with no explicit annotation, widens the numeric range beyond
+// what its own initializer alone gives, by unioning in every later reassignment provably safe to
+// fold in -- `var_decl`'s own codegen otherwise picks a local's wasm storage type purely from its
+// initializer, so e.g. `let scale = 1; ...; scale = scale * 4294967296;` inside a loop gets typed
+// `i32` and silently wraps at runtime; unioning in every reassignment's own range catches that.
+//
+// Classification per reassignment:
+//  - `x++`/`x--`/`x += <int literal>`/`x -= <int literal>`/`x = x +- <int literal>`: exempt, no
+//    range change -- preserves today's accidentally-correct behavior for ordinary loop counters.
+//  - self-referential (RHS/compound operand mentions `x`) and inside a loop: give up, mark fully
+//    unbounded. Always safe -- f64 exactly represents every integer up to 2^53, so falling back to
+//    it never loses correctness, only the narrow-type optimization.
+//  - self-referential but not inside a loop (executes at most once, no compounding risk): union in
+//    the RHS's own range.
+//  - not self-referential (`x = freshExpr`, doesn't mention `x`): always safe to union in,
+//    regardless of loop nesting -- no dependency on `x`'s own prior value, so no compounding.
+//
+// Built on `walkB`, matching `ownBoundNames`/`collectFreeVars`'s own idiom -- every hook here only
+// ever relays `process(x)`'s own result, or `false` at a closure boundary, never intentionally
+// `true` as a signal (see walkB's own doc comment in walker.ts for why that matters). Scope
+// open/close is expressed as "do work, call `process(s)`, do more work with what it returns" --
+// `for`'s own init declarator opens via the ordinary `case 'var_decl'` handling below it (walker.ts
+// routes a `for`'s `init` through the real statement walk, so that case fires for it same as any
+// other `var_decl`), while `case 'for'` itself just bounds the loop variable's scope, same as a
+// shared `try`/`catch`/`finally` scope (three separate `Statement[]` fields, not wrapped in their
+// own `block` nodes) gets handled with the same mark/close primitive as an ordinary `block`.
+//
+// One accepted imprecision: a `for`'s `init`/`test`/`update`/`body` are all visited within one
+// `process(s)` call, so `loopDepth` can't be incremented for only part of it -- an assignment to
+// some *other*, already-open variable sitting in the `init` clause itself (e.g. `for (let i = (x =
+// 5); ...)`) is (rarely, harmlessly) treated as "inside the loop" even though `init` only runs
+// once. Safe (only causes extra conservative widening, never incorrect narrowing).
+//
+// Known limitation: does not scan reassignments made from inside a nested closure body (mirrors
+// ownBoundNames/collectFreeVars's own closure-boundary stop, needed there for correctness) -- a
+// captured `let` mutated only via a closure write keeps today's (possibly too-narrow) behavior.
+function collectRangeWidenings(body: Statement[], checker: any, scope: Scope): Map<JS.Var<Type>, Type> {
+	interface OpenTarget { d: JS.Var<Type>; range?: T.NumRange; touched: boolean }
+	const open: OpenTarget[] = [];
+	const result = new Map<JS.Var<Type>, Type>();
+	let loopDepth = 0;
+
+	const findOpen = (name: string) => {
+		for (let i = open.length - 1; i >= 0; i--)
+			if (open[i].d.name === name)
+				return open[i];
+	};
+	const contribute = (o: OpenTarget, r: T.NumRange | undefined) => {
+		o.touched = true;
+		o.range = r && o.range ? T.rangeUnion(o.range, r) : undefined;
+	};
+	function openDecl(d: JS.Var<Type>) {
+		if (typeof d.name !== 'string' || d.typeAnnotation || !d.init)
+			return;
+		const seed = T.toRange(checker.typeOf(d.init, scope));
+		if (seed && seed.base === 'number')
+			open.push({ d, range: seed, touched: false });
+	}
+	function looped<T>(fn: ()=>T): T {
+		loopDepth++;
+		const r = fn();
+		loopDepth--;
+		return r;
+	}
+	function scoped<T>(fn: ()=>T): T {
+		const mark = open.length;
+		const r = fn();
+		while (open.length > mark) {
+			const o = open.pop()!;
+			if (o.touched)
+				result.set(o.d, o.range ? T.rangeToType(o.range) : T.NUMBER);
+		}
+		return r;
+	}
+	const isSmallIntLit = (x: Expr) => x.type === 'literal' && typeof x.value === 'number' && Number.isInteger(x.value);
+
+	return scoped(() => { walkB(body,
+		(s, process) => {
+			switch (s.type) {
+				case 'block': case 'switch': case 'try':
+					return scoped(() => process(s));
+				case 'var_decl': {
+					const r = process(s); // visits each declarator's own init first
+					if (s.kind === 'let' || s.kind === 'var')
+						s.declarations.forEach(openDecl); // open AFTER, so init can't self-reference
+					return r;
+				}
+				case 'do_while': case 'while':
+					return looped(()=> process(s));
+				case 'for':
+					return scoped(()=> looped(() => process(s)));
+				default:
+					return process(s);
+			}
+		},
+		(e, process) => {
+			if (e.type === 'arrow' || e.type === 'function')
+				return false; // separate FuncCtx, own pre-pass
+			if (e.type === 'binary' && ASSIGN_OPS.has(e.operator) && e.left.type === 'identifier') {
+				const o = findOpen(e.left.name);
+				if (o) {
+					const op = e.operator;
+					const isExempt = ((op === '+=' || op === '-=') && isSmallIntLit(e.right))
+						|| (op === '='
+							&& e.right.type === 'binary'
+							&& (e.right.operator === '+' || e.right.operator === '-')
+							&& e.right.left.type === 'identifier' && e.right.left.name === e.left.name
+							&& isSmallIntLit(e.right.right)
+						);
+					if (!isExempt)
+						contribute(o,
+							op === '=' ? (loopDepth > 0 && exprMentionsName(e.left.name, e.right) ? undefined : T.toRange(checker.typeOf(e.right, scope)))
+						:	op === '??=' || loopDepth > 0 ? undefined // every other compound op is self-referential by definition
+						:	T.toRange(checker.typeOf({ type: 'binary', operator: op.slice(0, -1), left: e.left, right: e.right } as Expr, scope))
+					);
+				}
+			}
+			return process(e);
+		}
+	); return result; });
+}
+
 export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
@@ -970,6 +1142,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	let data				= new Uint8Array(0);
 	const strings			= new Map<string, number>;
 	const globals			= new Map<string, Local>;
+	// Real declared initializer, and whether it's a `const` (vs `let`), per global (by name), consumed
+	// once at the very end to build `mod.globals`'s own `init`/`mut` -- see `constGlobalInit`. Keyed
+	// separately from `globals` since `Local` (locals and globals share that shape) has no notion of
+	// an initializer or of `const`-ness at all.
+	const globalInits		= new Map<string, Expr>();
+	const globalMut			= new Map<string, boolean>();
 
 	let forTempCounter			= 0;
 	let destructureTempCounter	= 0;
@@ -1007,6 +1185,20 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	function ensureBoxType(kind: 'f64' | 'i32'): number {
 		return registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } });
 	}
+	// `base`, but nullable -- boxes a bare scalar (via `ensureBoxType`) so it has a heap
+	// representation to be nullable *of*, tagging the box with its own `primKind` (see `unboxedPrimitive`);
+	// passes an already-object-shaped type through with `nullable` set, same as the
+	// `{ ...base, nullable: true }` idiom used elsewhere in this file.
+	// Only 'f64'/'i32' (real `number`/`boolean`) box -- 'u32' physically collapses onto the same
+	// boxed struct as 'i32' (both a single wasm i32 field), and 'i64'/'f32' never arise from a plain
+	// `number`/`boolean` union member anyway.
+	function nullableWtype(base: WasmType): WasmType {
+		if (typeof base !== 'string')
+			return { ...base, nullable: true };
+		if (base !== 'f64' && base !== 'i32')
+			throw new Error(`towasm: a nullable '${base}'-kind value is not supported -- only 'number'/'boolean' can be null-boxed`);
+		return { typeIndex: ensureBoxType(base), nullable: true, primKind: base };
+	}
 
 	function toResults(w: WasmType): wasm.ValType[] {
 		return w === 'void' ? [] : [toValType(w)];
@@ -1034,10 +1226,41 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return bt?.class ? ensureClass(bt.class) : undefined;
 	}
 
-	function ensureGlobal(name: string, wtype: WasmType): Local {
-		if (!globals.has(name))
+	function ensureGlobal(name: string, wtype: WasmType, init: Expr, mut: boolean): Local {
+		if (!globals.has(name)) {
 			globals.set(name, {wtype, index: globals.size});
+			globalInits.set(name, init);
+			globalMut.set(name, mut);
+		}
 		return globals.get(name)!;
+	}
+
+	// A wasm global's own declared initializer must be a genuine constant expression (no function calls,
+	// no reads of anything else) -- covers exactly the literal kinds a plain top-level `let`/`const` can
+	// realistically need (mirrors `case 'literal'`'s own number/boolean/bigint handling in `emitExpr`,
+	// kept separate rather than reused since a general expression's compiled instructions aren't
+	// guaranteed to be valid as a wasm const-expr).
+	function constGlobalInit(name: string, init: Expr | undefined, wtype: WasmType): wasm.Instr[] {
+		if (init && isNullLiteral(init)) {
+			if (typeof wtype === 'string' || !wtype.nullable)
+				throw new Error(`towasm: global '${name}' can't be initialized to 'null'/'undefined' -- its type isn't nullable`);
+			return [I.ref.null(heapTypeIndexOf(wtype))];
+		}
+		if (init?.type === 'literal') {
+			if (typeof init.value === 'number') {
+				switch (wtype) {
+					case 'i32': case 'u32': return [I.i32.const(init.value)];
+					case 'i64': return [I.i64.const(BigInt(init.value))];
+					case 'f32': return [I.f32.const(init.value)];
+					case 'f64': return [I.f64.const(init.value)];
+				}
+			} else if (typeof init.value === 'boolean' && wtype === 'i32') {
+				return [I.i32.const(init.value ? 1 : 0)];
+			} else if (typeof init.value === 'bigint' && wtype === 'i64') {
+				return [I.i64.const(init.value)];
+			}
+		}
+		throw new Error(`towasm: global '${name}' needs a compile-time-constant initializer`);
 	}
 
 	function addData(newdata: Uint8Array, align = 1): number {
@@ -1093,9 +1316,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				const base = typeOf(nonNullish.length === 1 ? nonNullish[0] : TS.UnionType(nonNullish));
 				if (!base)
 					return undefined;
-				if (typeof base === 'string')
-					throw new Error("towasm: a nullable number/boolean ('T | null'/'T | undefined') is not supported -- only nullable object types (classes/arrays/strings) are, since a raw number/boolean has no null representation without boxing");
-				return { ...base, nullable: true };
+				return nullableWtype(base);
 			}
 		}
 		if (resolved.type === 'function')
@@ -1114,8 +1335,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	function closureFuncSigType(t: TS.FunctionType): WasmType {
 		if (t.typeParams?.length)
 			throw new Error('towasm: a generic function type is not supported');
-		if (t.rest)
-			throw new Error('towasm: a function type with a rest parameter is not supported');
 		const params = t.params.map(p => {
 			if (p.default)
 				throw new Error(`towasm: function type parameter '${describeBinding(p.key)}' cannot have a default value`);
@@ -1126,13 +1345,21 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				throw new Error(`towasm: function type parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`);
 			return wt;
 		});
+		if (t.rest?.typeAnnotation) {
+			const wt = typeOf(t.rest.typeAnnotation as Type);
+			if (!wt || wt === 'void')
+				throw new Error("towasm: a function type's rest parameter needs an explicit array type");
+			params.push(wt);
+		}
 		const result = t.returnType ? typeOf(t.returnType as Type) : 'void';
 		if (!result)
 			throw new Error('towasm: a function type has an unsupported return type');
-		const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}`;
+		// `hasRest` folded into the memoization key too -- see `funcSigEq`'s own comment on why it's part
+		// of a closure's real type identity, not just incidental metadata.
+		const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${t.rest ? '...' : ''}`;
 		let wt = closureWasmTypes.get(key);
 		if (!wt)
-			closureWasmTypes.set(key, wt = { closure: { params, result } });
+			closureWasmTypes.set(key, wt = { closure: { params, result, hasRest: !!t.rest } });
 		return wt;
 	}
 
@@ -1302,6 +1529,28 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if ((got === 'u32' && want === 'i32') || (got === 'i32' && want === 'u32'))
 			return;
 
+		// A nullable primitive (`number | null`/`boolean | null`, boxed via `ensureBoxType`) meeting a
+		// bare-scalar consumer: unbox unconditionally, trusting the checker already required narrowing
+		// (same `ref.as_non_null`-traps-on-null contract `coerceTop` already uses for nullable objects).
+		// Reassigning `got` lets every scalar-conversion branch below run unmodified, as if `got` had
+		// been bare all along.
+		const gotBox = unboxedPrimitive(got);
+		if (gotBox) {
+			ctx.emit(I.ref.as_non_null, I.struct.get(gotBox.typeIndex, 0));
+			got = gotBox.kind;
+			if (wasmTypeEq(got, want))
+				return;
+		}
+		// The opposite direction: a bare scalar meeting a nullable-primitive consumer -- widen/convert
+		// to the box's own kind first (recursing into this same function), then box it.
+		const wantBox = unboxedPrimitive(want);
+		if (wantBox && typeof got === 'string') {
+			if (got !== wantBox.kind)
+				coerceTop(got, ctx, wantBox.kind);
+			ctx.emit(I.struct.new(wantBox.typeIndex));
+			return;
+		}
+
 		// A bare scalar has no heap identity of its own -- unlike ref/array (already a valid `anyref`), a raw
 		// `f64`/`i32` needs a real box (`ensureBoxType`) to occupy an `any` slot. `u32` reads as `i32` here, same as everywhere else.
 		if ((got === 'f64' || got === 'i32' || got === 'u32') && typeof want !== 'string' && 'ref' in want && want.ref === 'any') {
@@ -1311,8 +1560,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 		if (typeof got !== 'string') {
 			if ('ref' in got && got.ref === 'any') {
+				// `want.nullable`, not the 1-arg default (non-nullable) -- narrowing an `any`/`ref`-kind-array
+				// read into a *nullable* target (e.g. a `(number | null)[]` element, physically stored as a
+				// shared nullable `anyref` slot) must cast to the nullable form too, or a genuinely-null
+				// element traps here instead of surviving to be checked against `null` afterward.
 				if (typeof want !== 'string' && ('ref' in want || 'arr' in want || 'closure' in want || 'typeIndex' in want))
-					ctx.emit(I.ref.cast(heapTypeIndexOf(want)));
+					ctx.emit(I.ref.cast(heapTypeIndexOf(want), !!want.nullable));
 				return;
 			}
 
@@ -1429,7 +1682,16 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	}
 
 	function emitTruthy(e: Expr, ctx: FuncCtx): void {
-		switch (emitExpr(e, ctx)) {
+		let got = emitExpr(e, ctx);
+		// A boxed nullable primitive (`number | null`/`boolean | null`) has no truthiness of its own --
+		// unbox it first (same unconditional-narrowing contract `coerceTop` uses everywhere else), then
+		// test the underlying scalar. A genuinely-null value traps here, same as any other unguarded use.
+		const box = unboxedPrimitive(got);
+		if (box) {
+			coerceTop(got, ctx, box.kind);
+			got = box.kind;
+		}
+		switch (got) {
 			case 'i32': return;
 			case 'f64': ctx.emit(I.f64.const(0), I.f64.ne); return;
 			case 'f32': ctx.emit(I.f32.const(0), I.f32.ne); return;
@@ -1443,12 +1705,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	function emitOptionalAccess(ctx: FuncCtx, objWtype: WasmType, resultWtype: WasmType, readCore: (objLocal: number) => void): WasmType {
 		const objLocal = ctx.local(`$opt$obj$${optionalTempCounter++}`, objWtype);
 		ctx.emit(I.local.set(objLocal), I.local.get(objLocal), I.ref.is_null);
-		const old = ctx.swapOut();
+		const _old = ctx.swapOut();
 		ctx.emit(I.ref.null(heapTypeIndexOf(resultWtype)));
 		const _then = ctx.swapOut();
 		readCore(objLocal);
-		const _else = ctx.swapOut(old);
-		ctx.emit(I.if(toValType(resultWtype), _then, _else));
+		ctx.emit(I.if(toValType(resultWtype), _then, ctx.swapOut(_old)));
 		return resultWtype;
 	}
 
@@ -1456,13 +1717,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	function rejectChainedOptional(inner: Expr): void {
 		if ((inner.type === 'member' || inner.type === 'index' || inner.type === 'call') && inner.optional)
 			throw new Error("towasm: chaining another access onto an optional ('?.') result (e.g. 'a?.b.c' or 'a?.b?.c') is not supported -- only a single '?.' step is");
-	}
-
-	// Shared by every optional (`?.`) lowering: the guarded type is number/boolean-typed, so the optional
-	// expression's own type (`T | undefined`) would need a nullable number/boolean -- unsupported.
-	function rejectNullablePrimitive(wtype: WasmType, what: string): asserts wtype is { ref: string; nullable?: boolean } | { arr: wasmElement; nullable?: boolean } {
-		if (typeof wtype === 'string')
-			throw new Error(`towasm: '${what}' is not supported here -- it's number/boolean-typed, and 'T | undefined' needs an object type (no boxing in this subset)`);
 	}
 
 	// Shared by array literals and `new Uint8Array([...])` -- both reject holes and coerce every plain
@@ -1551,24 +1805,36 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return [...args, ...missing as Expr[]];
 	}
 
-	// Emits a call's arguments, shared by `emitCall`/`emitMethodCall`. A rest param's trailing call-site
-	// arguments (a compile-time-known count in this subset) bundle into one array via `emitArrayElements`, instead of a fixed one-argument-per-param match.
+	// Emits a call's arguments, shared by every call site (`emitCall`/`emitMethodCall`/`new`/a closure
+	// value's own call, etc). A rest param's trailing call-site arguments (a compile-time-known count in
+	// this subset) bundle into one array via `emitArrayElements`, instead of a fixed one-argument-per-param
+	// match -- and `emitArrayElements` already handles a spread element wholesale (same machinery an array
+	// *literal*'s own `[...a, b]` uses), so a spread argument Just Works once it lands in that trailing
+	// portion. The one thing this can't do: a spread crossing into the *fixed* portion (`f(...a, b)`) --
+	// its length isn't known until runtime, so there's no way to know how many of the fixed params it
+	// fills. Every caller used to duplicate (inconsistently, some not at all) an "any spread anywhere is
+	// rejected" check of its own; centralized here instead, precisely scoped to what's actually unsupported.
 	function emitCallArgs(label: string, params: WasmType[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FuncCtx): void {
 		if (!hasRest) {
+			if (args.some(a => a.type === 'spread'))
+				throw new Error(`towasm: '${label}' takes no rest parameter -- a spread argument has nowhere to expand into`);
 			fillDefaultArgs(label, params, defaults, args).forEach((a, i) => emitAs(a, ctx, params[i]));
 			return;
 		}
 		const fixedCount = params.length - 1;
 		if (args.length < fixedCount)
 			throw new Error(`towasm: '${label}' needs at least ${fixedCount} argument(s)`);
-		args.slice(0, fixedCount).forEach((a, i) => emitAs(a, ctx, params[i]));
+		const fixedArgs = args.slice(0, fixedCount);
+		if (fixedArgs.some(a => a.type === 'spread'))
+			throw new Error(`towasm: '${label}': a spread argument can only appear among the trailing rest arguments -- its length isn't known at compile time, so it can't fill a fixed parameter position`);
+		fixedArgs.forEach((a, i) => emitAs(a, ctx, params[i]));
 		const restArrWtype = params[fixedCount];
 		if (typeof restArrWtype === 'string' || !('arr' in restArrWtype))
 			throw new Error(`towasm: internal: '${label}' rest param has a non-array type`);
 		const kind = restArrWtype.arr;
 		if (kind === 'i16' || kind === 'i8')
 			throw new Error(`towasm: '${label}' rest param: a 'string[]'/packed-byte-array element is not supported`);
-		emitArrayElements(args.slice(fixedCount), ctx, kind === 'ref' ? REF_ANY : kind, kind, ensureArrayType(kind));
+		emitArrayElements(args.slice(fixedCount), ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind));
 	}
 
 	// Dispatches every `builtins` entry, coercing args via `emitAs`; falls back to `ensureFunc` for a plain user-declared function not in `builtins` at all.
@@ -1614,9 +1880,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (!method)
 			throw new Error(`towasm: unknown method '${name}' on ${owner.name}`);
 		// A spread argument is only meaningful bundled into a rest param (`arr.push(...other)`) --
-		// `emitCallArgs`/`emitArrayElements` already handle that; anywhere else it's still rejected.
-		if (!method.hasRest && args.some(a => a.type === 'spread'))
-			throw new Error('towasm: spread call arguments are not supported');
+		// `emitCallArgs` validates and handles that itself.
 		emitCallArgs(name, method.params, method.defaults, !!method.hasRest, args, ctx);
 		ctx.emit(I.call(method.funcIndex));
 		return method.result;
@@ -1772,7 +2036,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			const typeIndex = ensureArrayType(kind);
 			// Mirrors `case 'index'`'s own read-side result exactly -- a ref-kind array's write target is a boxed `any`, not a raw i32.
-			const wtype		= kind === 'ref' ? REF_ANY : kind;
+			const wtype		= kind === 'ref' ? REF_ANY_NULLABLE : kind;
 			const objWtype	= emitExpr(target.object, ctx);
 			const obj		= ctx.local(scratchName('$obj', objWtype), objWtype);
 			ctx.emit(I.local.set(obj));
@@ -1883,12 +2147,20 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					ctx.emit(I.local.get(local.index));
 					return local.wtype;
 				}
+				// User-level top-level `let`/`const` globals are registered eagerly (see the top-level
+				// scan below), so by the time any function body compiles, they're already here -- no
+				// lazy `ensureGlobal` needed, unlike the `LIB_DECL_MAP` fallback right below.
+				const g = globals.get(name);
+				if (g) {
+					ctx.emit(I.global.get(g.index));
+					return g.wtype;
+				}
 				const global = LIB_DECL_MAP.get(name);
 				if (global) {
 					if (global.type === 'var_decl') {
-						const g = ensureGlobal(name, typeOf(global.typeAnnotation!)!);
-						ctx.emit(I.global.get(g.index));
-						return g.wtype;
+						const g2 = ensureGlobal(name, typeOf(global.typeAnnotation!)!, global.init!, global.kind !== 'const');
+						ctx.emit(I.global.get(g2.index));
+						return g2.wtype;
 					}
 					throw new Error(`towasm: unsupported global type '${global.type}'`);
 				}
@@ -1923,32 +2195,29 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					return emitMethodCall(cls, accessorKey('get', e.property), [], ctx);
 				}
 
-				if (e.property === 'length') {
-					const arrKind = arrayKindOf(e.object, ctx);
-					if (arrKind) {
-						if (e.optional)
-							rejectNullablePrimitive('f64', "a?.length");
-						// `emitAs`, not a raw `emitExpr` -- `e.object` may be a ref-kind array element read, boxed `anyref` -- `array.len` needs the real narrowed array type first or wasm validation rejects it.
-						emitAs(e.object, ctx, ARR_WTYPE[arrKind]);
-						ctx.emit(I.array.len);
-						// Unsigned: `array.len` can in principle exceed i32's signed range, so this needs
-						// `convert_i32_u` specifically, not `emitAs`'s generic signed coercion.
-						ctx.emit(I.f64.convert_i32_u);
-						return 'f64';
-					}
-				}
 				const fieldIdx	= cls?.fieldIndex.get(e.property);
 				if (!cls || fieldIdx === undefined)
 					throw new Error(`towasm: unknown field '${e.property}'`);
 				const fieldWtype = cls.fields[fieldIdx].wtype;
 
+				// Mid-construction, before a real `this` exists (see `ensureCtor`'s struct-collecting path) --
+				// an already-initialized field reads straight from its own scratch local instead.
+				if (e.object.type === 'this' && ctx.ctorFields?.has(e.property)) {
+					const local = ctx.ctorFields.get(e.property)!;
+					ctx.emit(I.local.get(local.index));
+					return local.wtype;
+				}
+
 				if (e.optional) {
-					rejectNullablePrimitive(fieldWtype, `a?.${e.property}`);
 					const objWtype = wtypeOf(e.object, ctx);
 					if (!objWtype)
 						throw new Error(`towasm: 'a?.${e.property}' has an unsupported object type`);
 					emitAs(e.object, ctx, objWtype);
-					return emitOptionalAccess(ctx, objWtype, { ...fieldWtype, nullable: true }, objLocal => ctx.emit(I.local.get(objLocal), I.struct.get(cls.typeIndex, fieldIdx)));
+					const resultWtype = nullableWtype(fieldWtype);
+					return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
+						ctx.emit(I.local.get(objLocal), I.struct.get(cls.typeIndex, fieldIdx));
+						coerceTop(fieldWtype, ctx, resultWtype);
+					});
 				}
 
 				// `emitAs`, not a raw `emitExpr` -- `e.object` may itself be a ref-kind array element read,
@@ -1960,14 +2229,26 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			case 'index': {
 				rejectChainedOptional(e.object);
-				// An element is always number/boolean-typed (no array-of-refs in this subset), so `a?.[i]`'s
-				// result always hits `rejectNullablePrimitive`'s restriction -- throws unconditionally up front.
-				if (e.optional)
-					rejectNullablePrimitive('f64', 'a?.[i]');
 				// Any class with its own `get(i)` (typed-array views, or any other class using the same
 				// convention) -- real index syntax dispatched generically, not by name.
 				const cls = classOf(e.object, ctx);
-				if (cls && methodSig(cls, 'get', ctx)) {
+				const sig = cls && methodSig(cls, 'get', ctx);
+				if (cls && sig) {
+					if (e.optional) {
+						if (sig.result === 'void')
+							throw new Error("towasm: 'a?.[i]' is not supported -- 'get' returns 'void', which can't become 'void | undefined'");
+						const objWtype = wtypeOf(e.object, ctx);
+						if (!objWtype)
+							throw new Error("towasm: 'a?.[i]' has an unsupported object type");
+						emitAs(e.object, ctx, objWtype);
+						const resultWtype = nullableWtype(sig.result);
+						return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
+							// Receiver pushed directly, skipping `emitMethodCall`'s own receiver-push -- needs an
+							// explicit `ref.as_non_null` here, always sound since `readCore` only runs in the proven-non-null arm.
+							ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
+							coerceTop(emitMethodCall(cls, 'get', [e.property], ctx), ctx, resultWtype);
+						});
+					}
 					// `emitAs`, not a raw `emitExpr` -- `e.object` may itself be boxed `anyref` (`a[i][j]`), same reasoning as the field-read cast above.
 					emitAs(e.object, ctx, cls.thisWtype!);
 					return emitMethodCall(cls, 'get', [e.property], ctx);
@@ -1975,12 +2256,27 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				const kind = arrayKindOf(e.object, ctx);
 				if (!kind || kind === 'i16' || kind === 'i8')
 					throw new Error("towasm: indexing is only supported on number[]/boolean[]/Uint8Array/Int32Array/Uint32Array ('string' is immutable and not indexable in this pass)");
+				// `nullable: true` on the 'ref' case -- `ensureArrayType`'s `'ref'`-kind field is declared
+				// nullable (shared physical storage for every non-scalar kind), so `array.get` always really
+				// produces a nullable `anyref`, whatever the caller's declared TS element type claims.
+				const elemWtype: WasmType = kind === 'ref' ? { ref: 'any', nullable: true } : kind;
+				if (e.optional) {
+					const objWtype = wtypeOf(e.object, ctx);
+					if (!objWtype)
+						throw new Error("towasm: 'a?.[i]' has an unsupported object type");
+					emitAs(e.object, ctx, objWtype);
+					const resultWtype = nullableWtype(elemWtype);
+					return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
+						ctx.emit(I.local.get(objLocal));
+						emitAs(e.property, ctx, 'i32');
+						ctx.emit(I.array.get(ensureArrayType(kind)));
+						coerceTop(elemWtype, ctx, resultWtype);
+					});
+				}
 				emitAs(e.object, ctx, ARR_WTYPE[kind]);
 				emitAs(e.property, ctx, 'i32');
 				ctx.emit(I.array.get(ensureArrayType(kind)));
-				// `nullable: true` -- `ensureArrayType`'s `'ref'`-kind field is declared nullable (shared
-				// physical storage for every non-scalar kind), so `array.get` always really produces a nullable `anyref`, whatever the caller's declared TS element type claims.
-				return kind === 'ref' ? { ref: 'any', nullable: true } : kind;
+				return elemWtype;
 			}
 
 			// `as`/`as unknown as X` is compile-time-only in real TS too -- a no-op here: compile the inner
@@ -1996,7 +2292,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				const kind = typeof want === 'object' && 'arr' in want && want.arr === 'ref' ? 'ref' : arrayKindOf(e, ctx);
 				if (!kind || kind === 'i16' || kind === 'i8')
 					throw new Error('towasm: array literals are only supported for number[]/boolean[]/T[]');
-				emitArrayElements(e.elements, ctx, kind === 'ref' ? REF_ANY : kind, kind, ensureArrayType(kind));
+				emitArrayElements(e.elements, ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind));
 				return ARR_WTYPE[kind];
 			}
 
@@ -2004,8 +2300,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				if (e.operator === '++' || e.operator === '--') {
 					const target = emitAssignTarget(e.operand, ctx, 'discard');
 					const wtype = target.wtype;
-					if (wtype !== 'i32' && wtype !== 'f64')
+					if (wtype !== 'i32' && wtype !== 'f64') {
+						// A nullable primitive gets a specific, actionable message -- narrowing it (`if (x !== null)`)
+						// to a real non-null occurrence would need codegen to track that narrowing per-read, which
+						// it doesn't do for any type (see `coerceTop`'s soundness contract); out of scope here.
+						if (unboxedPrimitive(wtype))
+							throw new Error("towasm: '++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then");
 						throw new Error("towasm: '++'/'--' is only supported on number/boolean-kind locals");
+					}
 
 					ctx.emit(I[wtype].const(1), I[wtype][e.operator === '++' ? 'add' : 'sub']);
 					if (want === 'void') {
@@ -2056,8 +2358,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				if (e.operator === '++' || e.operator === '--') {
 					const target = emitAssignTarget(e.operand, ctx, 'keep');
 					const wtype = target.wtype;
-					if (wtype !== 'i32' && wtype !== 'f64')
+					if (wtype !== 'i32' && wtype !== 'f64') {
+						// A nullable primitive gets a specific, actionable message -- narrowing it (`if (x !== null)`)
+						// to a real non-null occurrence would need codegen to track that narrowing per-read, which
+						// it doesn't do for any type (see `coerceTop`'s soundness contract); out of scope here.
+						if (unboxedPrimitive(wtype))
+							throw new Error("towasm: '++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then");
 						throw new Error("towasm: '++'/'--' is only supported on number/boolean-kind locals");
+					}
 
 					ctx.emit(I[wtype].const(1), I[wtype][e.operator === '++' ? 'add' : 'sub']);
 					target.write(false);
@@ -2078,38 +2386,42 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						emitTruthy(e.left, ctx);
 						const _old = ctx.swapOut();
 						emitTruthy(e.right, ctx);
-						const _right = ctx.swapOut(_old);
-						ctx.emit(I.if('i32', _right, [I.i32.const(0)]));
+						ctx.emit(I.if('i32', ctx.swapOut(_old), [I.i32.const(0)]));
 						return 'i32';
 					}
 					case '||': {
 						emitTruthy(e.left, ctx);
 						const _old = ctx.swapOut();
 						emitTruthy(e.right, ctx);
-						const _right = ctx.swapOut(_old);
-						ctx.emit(I.if('i32', [I.i32.const(1)], _right));
+						ctx.emit(I.if('i32', [I.i32.const(1)], ctx.swapOut(_old)));
 						return 'i32';
 					}
-					// `a ?? b` -- `a`'s combined-with-`b` type drives the `if`'s result; `a` itself must actually
-					// be nullable (real TS itself flags the "b could never run" case, not this pass).
+					// `a ?? b` -- `a`'s combined-with-`b` type drives the `if`'s result. A left that can never
+					// actually be null/undefined makes `b` provably dead code -- same conclusion real TS's
+					// own type checker would reach -- so it's evaluated and returned directly, no runtime
+					// check at all; `patternBindings` relies on exactly this for a destructuring default on
+					// an already-non-nullable value (an ordinary array element, a non-optional object field).
 					case '??': {
 						const wtype = wtypeOf(e, ctx);
 						if (!wtype)
 							throw new Error("towasm: '??' has an unsupported result type");
 						const leftWtype = wtypeOf(e.left, ctx);
-						if (!leftWtype || typeof leftWtype === 'string' || !leftWtype.nullable)
-							throw new Error("towasm: '??' needs a nullable object-typed value on its left (the right side is only evaluated when the left is null/undefined)");
+						if (!leftWtype)
+							throw new Error("towasm: '??' has an unsupported left-hand type");
+						if (typeof leftWtype === 'string' || !leftWtype.nullable) {
+							emitAs(e.left, ctx, wtype);
+							return wtype;
+						}
 						emitAs(e.left, ctx, leftWtype);
 						const leftLocal = ctx.declareLocal(`$nullish$left$${optionalTempCounter++}`, leftWtype);
 						ctx.emit(I.local.set(leftLocal.index));
 						ctx.emit(I.local.get(leftLocal.index), I.ref.is_null);
-						const old = ctx.swapOut();
+						const _old = ctx.swapOut();
 						emitAs(e.right, ctx, wtype);
 						const _then = ctx.swapOut();
 						ctx.emit(I.local.get(leftLocal.index));
 						coerceTop(leftWtype, ctx, wtype);
-						const _else = ctx.swapOut(old);
-						ctx.emit(I.if(toValType(wtype), _then, _else));
+						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
 						return wtype;
 					}
 					// `x === null`/`x !== undefined`/etc -- checked ahead of `equalityInline` (picks its comparison
@@ -2166,7 +2478,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 
 			case 'conditional': {
-				const wtype = wtypeOf(e, ctx);
+				// `want`, when the caller has one, not just this expression's own self-inferred type --
+				// self-inference can legitimately pick a *narrower* physical representation than the
+				// context needs (e.g. a small integer literal branch of a `number | null` conditional
+				// self-infers as an `i32` box, not the `f64` box the declared type actually uses), and
+				// both branches need to agree with whatever the caller will consume regardless.
+				const wtype = want ?? wtypeOf(e, ctx);
 				if (!wtype)
 					throw new Error('towasm: conditional expression has an unsupported type');
 				emitTruthy(e.test, ctx);
@@ -2192,9 +2509,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				if (!cls)
 					throw new Error(`towasm: 'new' is only supported for a known class`);
 				const ctor = ensureCtor(cls, e.arguments, ctx);
-				if (e.arguments.some(a => a.type === 'spread'))
-					throw new Error(`towasm: '${e.callee.name}''s constructor takes exactly ${ctor.params.length} (non-spread) argument(s)`);
-				fillDefaultArgs(`${e.callee.name}'s constructor`, ctor.params, ctor.defaults, e.arguments).forEach((a, i) => emitAs(a, ctx, ctor.params[i]));
+				emitCallArgs(`${e.callee.name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, e.arguments, ctx);
 				ctx.emit(I.call(ctor.funcIndex));
 				return cls.thisWtype!;
 			}
@@ -2233,13 +2548,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						throw new Error(`towasm: 'a?.${methodName}(...)' is not supported -- only a plain user-defined method (not a 'Math'/prelude intrinsic) can be guarded by '?.' in this pass`);
 					if (method.result === 'void')
 						throw new Error(`towasm: 'a?.${methodName}(...)' is not supported -- '${methodName}' returns 'void', which can't become 'void | undefined'`);
-					rejectNullablePrimitive(method.result, `a?.${methodName}(...)`);
 					emitAs(objExpr, ctx, objWtype);
-					return emitOptionalAccess(ctx, objWtype, { ...method.result, nullable: true }, objLocal => {
+					const resultWtype = nullableWtype(method.result);
+					return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
 						// Receiver pushed directly, skipping `emitMethodCall`'s own `receiver` param
 						// needs an explicit `ref.as_non_null` here, always sound since `readCore` only runs in the proven-non-null arm.
 						ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
-						emitMethodCall(owner, methodName, e.arguments, ctx);
+						coerceTop(emitMethodCall(owner, methodName, e.arguments, ctx), ctx, resultWtype);
 					});
 				}
 
@@ -2285,16 +2600,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				if (e.callee.type === 'identifier' && ctx.resolvesName(e.callee.name)) {
 					const calleeWtype = resolvedWtype(ctx, e.callee.name);
 					if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
-						if (e.arguments.some(a => a.type === 'spread'))
-							throw new Error('towasm: spread call arguments are not supported');
 						const sig = calleeWtype.closure;
-						if (e.arguments.length !== sig.params.length)
-							throw new Error(`towasm: closure call needs exactly ${sig.params.length} argument(s)`);
 						const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 						emitExpr(e.callee, ctx);
 						const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
 						ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-						sig.params.forEach((pt, i) => emitAs(e.arguments[i], ctx, pt));
+						// No defaults for a closure (an explicit restriction above, on the literal side) --
+						// same rest-packing as a plain named function's own call site, reusing `emitCallArgs`.
+						emitCallArgs(e.callee.name, sig.params, undefined, !!sig.hasRest, e.arguments, ctx);
 						// The code pointer (funcref) is pushed last -- `call_ref` consumes it off the stack top, after every real argument.
 						ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 						return sig.result;
@@ -2317,8 +2630,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					throw new Error('towasm: a generator function expression is not supported');
 				if (e.typeParams?.length)
 					throw new Error('towasm: a generic arrow/function expression is not supported');
-				if (e.rest)
-					throw new Error('towasm: a rest parameter in an arrow/function expression is not supported');
 
 				const body: Statement[] | Expr = e.type === 'arrow' ? e.body : (e.body ?? []);
 				const selfName = e.type === 'function' ? e.name : undefined;
@@ -2335,12 +2646,21 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						throw new Error(`towasm: closure parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`);
 					return wt;
 				});
+				// A rest param materializes as one more real, array-typed parameter -- same shape as a
+				// plain named function's own rest handling (`compileFunc`), and reused identically at the
+				// call site below via `emitCallArgs`.
+				if (e.rest?.typeAnnotation) {
+					const wt = typeOf(e.rest.typeAnnotation as Type);
+					if (!wt || wt === 'void')
+						throw new Error("towasm: a closure's rest parameter needs an explicit array type");
+					params.push(wt);
+				}
 				const result = e.returnType ? typeOf(e.returnType as Type) : 'void';
 				if (!result)
 					throw new Error('towasm: closure has an unsupported return type');
 
 				const free = new Set<string>();
-				collectFreeVars(ownBoundNames(paramNames(e.params), body, selfName), body, free);
+				collectFreeVars(ownBoundNames(paramNames(e.params, e.rest), body, selfName), body, free);
 
 				if (e.type === 'function' && free.has('this'))
 					throw new Error("towasm: 'this' inside a function expression is not supported -- only an arrow function's lexical 'this' is");
@@ -2363,17 +2683,17 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					}) } });
 				}
 
-				const sig: FuncSig = { params, result };
+				const sig: FuncSig = { params, result, hasRest: !!e.rest };
 				const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 				const { funcIndex, typeIndex } = registerFuncAtType(funcTypeIndex);
-				const info: FuncInfo = { params, result, funcIndex, typeIndex };
+				const info: FuncInfo = { params, result, hasRest: sig.hasRest, funcIndex, typeIndex };
 				closureLiterals.push(info);
 
 				worklist.push(() => {
 					const fnCtx = new FuncCtx(new Scope(libGlobal), result, undefined);
 					// Env param first (real wasm param index 0), then this literal's own params -- `toFuncBody`'s `numParams` assumes the first `1 + params.length` declared locals are the real wasm params, in order.
 					const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
-					const pending	= fnCtx.declareParams(e.params, params);
+					const pending	= fnCtx.declareParams(e.rest ? [...e.params, e.rest] : e.params, params);
 					// The cast-down env local (or, with no captures, just the param itself) is declared after the real params, so it's a genuine local, not mistaken for one more wasm param.
 					let envLocal	= envParam;
 					if (fields) {
@@ -2387,7 +2707,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							fnCtx.declareCaptured(name, tsType);
 					}
 					if (Array.isArray(body))
-						fnCtx.widenedTypes = collectRangeWidenings(body, fnCtx.scope);
+						fnCtx.widenedTypes = collectRangeWidenings(body, checker, fnCtx.scope);
 					pending.forEach(st => emitStmt(st, fnCtx));
 					if (Array.isArray(body)) {
 						body.forEach(st => emitStmt(st, fnCtx));
@@ -2432,12 +2752,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			const leftLocal = ctx.declareLocal(`$nullish$assign$${optionalTempCounter++}`, wtype);
 			ctx.emit(I.local.set(leftLocal.index));
 			ctx.emit(I.local.get(leftLocal.index), I.ref.is_null);
-			const old = ctx.swapOut();
+			const _old = ctx.swapOut();
 			emitAs(right, ctx, wtype);
 			const _then = ctx.swapOut();
 			ctx.emit(I.local.get(leftLocal.index));
-			const _else = ctx.swapOut(old);
-			ctx.emit(I.if(toValType(wtype), _then, _else));
+			ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
 
 		} else {
 			const op = operator.slice(0, -1);
@@ -2474,140 +2793,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	//  Statement lowering
 	// ===================================================================
 
-	// Runs once per function body, before `emitStmt` walks it for real (see its 5 call sites).
-	// For every `let`/`var` declarator with no explicit annotation, widens the numeric range beyond
-	// what its own initializer alone gives, by unioning in every later reassignment provably safe to
-	// fold in -- `var_decl`'s own codegen otherwise picks a local's wasm storage type purely from its
-	// initializer, so e.g. `let scale = 1; ...; scale = scale * 4294967296;` inside a loop gets typed
-	// `i32` and silently wraps at runtime; unioning in every reassignment's own range catches that.
-	//
-	// Classification per reassignment:
-	//  - `x++`/`x--`/`x += <int literal>`/`x -= <int literal>`/`x = x +- <int literal>`: exempt, no
-	//    range change -- preserves today's accidentally-correct behavior for ordinary loop counters.
-	//  - self-referential (RHS/compound operand mentions `x`) and inside a loop: give up, mark fully
-	//    unbounded. Always safe -- f64 exactly represents every integer up to 2^53, so falling back to
-	//    it never loses correctness, only the narrow-type optimization.
-	//  - self-referential but not inside a loop (executes at most once, no compounding risk): union in
-	//    the RHS's own range.
-	//  - not self-referential (`x = freshExpr`, doesn't mention `x`): always safe to union in,
-	//    regardless of loop nesting -- no dependency on `x`'s own prior value, so no compounding.
-	//
-	// Built on `walkB`, matching `ownBoundNames`/`collectFreeVars`'s own idiom -- every hook here only
-	// ever relays `process(x)`'s own result, or `false` at a closure boundary, never intentionally
-	// `true` as a signal (see walkB's own doc comment in walker.ts for why that matters). Scope
-	// open/close is expressed as "do work, call `process(s)`, do more work with what it returns",
-	// which lets a `for` loop's own init declarators (bypassing `onStatement` entirely -- see
-	// `walkVarDeclarator` in walker.ts) and a shared `try`/`catch`/`finally` scope (three separate
-	// `Statement[]` fields, not wrapped in their own `block` nodes) both get handled with the same
-	// mark/close primitive as an ordinary `block`.
-	//
-	// One accepted imprecision: a `for`'s `init`/`test`/`update`/`body` are all visited within one
-	// `process(s)` call, so `loopDepth` can't be incremented for only part of it -- a for-init's own
-	// initializer expression is (rarely, harmlessly) treated as "inside the loop" too. Safe (only
-	// causes extra conservative widening, never incorrect narrowing).
-	//
-	// Known limitation: does not scan reassignments made from inside a nested closure body (mirrors
-	// ownBoundNames/collectFreeVars's own closure-boundary stop, needed there for correctness) -- a
-	// captured `let` mutated only via a closure write keeps today's (possibly too-narrow) behavior.
-	function collectRangeWidenings(body: Statement[], scope: Scope): Map<JS.Var<Type>, Type> {
-		interface OpenTarget { d: JS.Var<Type>; range?: T.NumRange; touched: boolean }
-		const open: OpenTarget[] = [];
-		const result = new Map<JS.Var<Type>, Type>();
-		let loopDepth = 0;
-
-		const findOpen = (name: string) => {
-			for (let i = open.length - 1; i >= 0; i--)
-				if (open[i].d.name === name)
-					return open[i];
-		};
-		const contribute = (o: OpenTarget, r: T.NumRange | undefined) => {
-			o.touched = true;
-			o.range = r && o.range ? T.rangeUnion(o.range, r) : undefined;
-		};
-		function openDecl(d: JS.Var<Type>) {
-			if (typeof d.name !== 'string' || d.typeAnnotation || !d.init)
-				return;
-			const seed = T.toRange(checker.typeOf(d.init, scope));
-			if (seed && seed.base === 'number')
-				open.push({ d, range: seed, touched: false });
-		}
-		function closeSince(mark: number) {
-			while (open.length > mark) {
-				const o = open.pop()!;
-				if (o.touched)
-					result.set(o.d, o.range ? T.rangeToType(o.range) : T.NUMBER);
-			}
-		}
-		const isSmallIntLit = (x: Expr) => x.type === 'literal' && typeof x.value === 'number' && Number.isInteger(x.value);
-
-		walkB(body,
-			(s, process) => {
-				switch (s.type) {
-					case 'block': case 'switch': case 'try': {
-						const mark = open.length;
-						const r = process(s);
-						closeSince(mark);
-						return r;
-					}
-					case 'var_decl': {
-						const r = process(s); // visits each declarator's own init first
-						if (s.kind === 'let' || s.kind === 'var')
-							s.declarations.forEach(openDecl); // open AFTER, so init can't self-reference
-						return r;
-					}
-					case 'do_while': case 'while': {
-						loopDepth++;
-						const r = process(s);
-						loopDepth--;
-						return r;
-					}
-					case 'for': {
-						const mark = open.length;
-						if (s.init?.type === 'var_decl')
-							s.init.declarations.forEach(openDecl);
-						loopDepth++;
-						const r = process(s);
-						loopDepth--;
-						closeSince(mark);
-						return r;
-					}
-					default:
-						return process(s);
-				}
-			},
-			(e, process) => {
-				if (e.type === 'arrow' || e.type === 'function')
-					return false; // separate FuncCtx, own pre-pass
-				if (e.type === 'binary' && ASSIGN_OPS.has(e.operator) && e.left.type === 'identifier') {
-					const o = findOpen(e.left.name);
-					if (o) {
-						const op = e.operator;
-						const isExempt =
-							((op === '+=' || op === '-=') && isSmallIntLit(e.right)) ||
-							(op === '=' && e.right.type === 'binary' && (e.right.operator === '+' || e.right.operator === '-')
-								&& e.right.left.type === 'identifier' && e.right.left.name === e.left.name
-								&& isSmallIntLit(e.right.right));
-						if (!isExempt) {
-							if (op === '=') {
-								contribute(o, loopDepth > 0 && exprMentionsName(e.left.name, e.right)
-									? undefined
-									: T.toRange(checker.typeOf(e.right, scope)));
-							} else if (op === '??=' || loopDepth > 0) {
-								contribute(o, undefined); // every other compound op is self-referential by definition
-							} else {
-								contribute(o, T.toRange(checker.typeOf(
-									{ type: 'binary', operator: op.slice(0, -1), left: e.left, right: e.right } as Expr, scope)));
-							}
-						}
-					}
-				}
-				return process(e);
-			}
-		);
-		closeSince(0);
-		return result;
-	}
-
 	function emitStmt(s: Statement, ctx: FuncCtx): void {
 		switch (s.type) {
 			case 'block':
@@ -2634,13 +2819,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						continue;
 					}
 					// Type computed before emitting the init, so the init can be emitted via `emitAs` straight into the local's declared representation
-					const {methodOwner, methodName} = d.init.type === 'call' && d.init.callee.type === 'member'
-						? {methodOwner: ownerOf(d.init.callee.object, ctx), methodName: d.init.callee.property}
+					const {methodOwner, methodName, calleeOptional} = d.init.type === 'call' && d.init.callee.type === 'member'
+						? {methodOwner: ownerOf(d.init.callee.object, ctx), methodName: d.init.callee.property, calleeOptional: d.init.callee.optional}
 						: {};
 
 					// No `Array<T>` substitution needed -- `substElemMethods` already monomorphized a method's whole body once, up front, so `d.typeAnnotation` is already concrete here.
 
-					let tsType = d.typeAnnotation;
+					let tsType = d.typeAnnotation ?? T.literalTypeOf(d.init);
 					if (!tsType && d.init.type === 'index') {
 						// The real declared element `Type` of an array-like container -- `T[]`/`Array<T>`'s `T` directly, or the fixed element type real TS gives `Uint8Array`/`Int32Array`/etc indexing.
 						// `Uint8Array`/etc resolve (`resolveClassAlias`, before `T.resolve` ever expands the bare
@@ -2661,9 +2846,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 								}
 							}
 						}
+						// `arr?.[i]` short-circuits to `undefined` same as any other `?.` -- this bypasses
+						// `checker.typeOf` (a fast structural read of the element type instead), so the optional
+						// flag has to be reattached here too, same as `case 'member'`'s own `e.optional` handling.
+						if (tsType && d.init.optional)
+							tsType = T.combineTypes([tsType, T.UNDEFINED]);
 					}
-					if (!tsType && methodOwner)
-						tsType = (methodOwner.decl.body.find(m => m.type === 'method' && m.key === methodName) as MethodMember)?.returnType;
+					if (!tsType && methodOwner) {
+						const methodReturn = (methodOwner.decl.body.find(m => m.type === 'method' && m.key === methodName) as MethodMember)?.returnType;
+						// `obj?.method(...)`: this reads the method's raw declared return type directly off the
+						// class decl, bypassing `checker.typeOf`'s own `calleeOptional` wrapping (`case 'call'`)
+						// -- so a `?.`-guarded call's short-circuit-to-`undefined` has to be reattached here too.
+						tsType = methodReturn && calleeOptional ? T.combineTypes([methodReturn, T.UNDEFINED]) : methodReturn;
+					}
 
 					tsType ??= ctx.widenedTypes?.get(d) ?? checker.typeOf(d.init, ctx.scope);
 
@@ -2707,16 +2902,25 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 
 			case 'while': {
-				// A `block` wrapping a `loop`: branching to the loop re-enters it ("continue"), to the block
-				// exits it ("break"). Relative label depths are computed from `ctx.depth`, not hardcoded, so a `break`/`continue` still resolves correctly nested inside an `if`/`switch` in this loop's body.
 				const _old = ctx.swapOut();
 				emitTruthy(s.test, ctx);
-				ctx.emit(I.i32.eqz);
 				ctx.enterBreakTarget();
 				ctx.enterContinueTarget();
-				ctx.emit(I.br_if(1));
+				ctx.emit(I.i32.eqz, I.br_if(1));
 				emitStmt(s.body, ctx);
 				ctx.emit(I.br(0));
+				ctx.exitContinueTarget();
+				ctx.exitBreakTarget();
+				ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(_old))]));
+				return;
+			}
+			case 'do_while': {
+				const _old = ctx.swapOut();
+				ctx.enterBreakTarget();
+				ctx.enterContinueTarget();
+				emitStmt(s.body, ctx);
+				emitTruthy(s.test, ctx);
+				ctx.emit(I.br_if(0));
 				ctx.exitContinueTarget();
 				ctx.exitBreakTarget();
 				ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(_old))]));
@@ -2969,9 +3173,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	function paramType(p: JS.Param<Type>): WasmType {
 		// A default value is only resolved at each omitted call site (see `fillDefaultArgs`), not evaluated
 		// dynamically the way real JS does -- so it must be a plain literal, safe to re-emit verbatim.
-		if (p.default && p.default.type !== 'literal')
-			throw new Error(`towasm: 'param '${describeBinding(p.key)}''s default value must be a literal`);
-		const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
+		let tsType = p.typeAnnotation;
+		if (p.default) {
+			if (p.default.type !== 'literal')
+				throw new Error(`towasm: 'param '${describeBinding(p.key)}''s default value must be a literal`);
+			tsType ??= checker.typeOf(p.default, libGlobal);
+		}
+		const wt = tsType && typeOf(tsType);
 		if (!wt)
 			throw new Error(`towasm: 'param '${describeBinding(p.key)}' needs an explicit type`);
 		if (wt === 'void')
@@ -2999,7 +3207,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		funcs.set(name, info);
 		worklist.push(() => {
 			const ctx	= new FuncCtx(new Scope(libGlobal), result, undefined);
-			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
+			ctx.widenedTypes = collectRangeWidenings(decl.body!, checker, ctx.scope);
 			ctx.declareParams(decl.rest ? [...decl.params, decl.rest] : decl.params, params).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
@@ -3111,7 +3319,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 					if (typeof m.key !== 'string')
 						throw new Error(`towasm: computed field names in '${name}' are not supported`);
-					addField(m.key, m.typeAnnotation);
+					addField(m.key, m.typeAnnotation ?? (m.value ? checker.typeOf(m.value, libGlobal) : undefined));
 
 				} else if (m.type === 'method') {
 					// A computed name can't be stored as a decl key -- and can never be called via `.name()` syntax either, so it's simply never reachable, no need to throw.
@@ -3123,13 +3331,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
 								if (typeof p.key !== 'string')
 									throw new Error(`towasm: computed field names in '${name}' are not supported`);
-								addField(p.key, p.typeAnnotation);
+								addField(p.key, p.typeAnnotation ?? T.literalTypeOf(p.default));
 							}
 						}
 
 						if (!returnType && m.body) {
 							const last = m.body[m.body.length - 1];
-							if (last.type === 'return' && last.argument)
+							if (last?.type === 'return' && last.argument)
 								returnType = checker.typeOf(unwrapAs(last.argument), m.scope as Scope);
 						}
 					}
@@ -3207,27 +3415,37 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			return existing;
 
 		const params		= ctor.params.map(p => paramType(p));
+		const names			= ctor.params.map(p => typeof p.key === 'string' ? p.key : undefined);
+		if (ctor.rest?.typeAnnotation) {
+			params.push(typeOf(ctor.rest.typeAnnotation)!);
+			names.push(typeof ctor.rest.key === 'string' ? ctor.rest.key : undefined);
+		}
 		//const thisWtype	= ownerThisType(cls);
 		const thisWtype		= cls.thisWtype!;
 
-		const {funcIndex, typeIndex} = registerFunc(toParams(params, ctor.params.map(p => typeof p.key === 'string' ? p.key : undefined)), toResults(thisWtype));
-		const info: FuncInfo = { params, result: thisWtype, funcIndex, typeIndex, defaults: ctor.params.map(p => p.default) };
+		const {funcIndex, typeIndex} = registerFunc(toParams(params, names), toResults(thisWtype));
+		const info: FuncInfo = { params, result: thisWtype, funcIndex, typeIndex, defaults: ctor.params.map(p => p.default), hasRest: !!ctor.rest?.typeAnnotation };
 		funcs.set(key, info);
 
 		worklist.push(() => {
 			const ctx		= new FuncCtx(new Scope(libGlobal), thisWtype, cls);
-			ctx.widenedTypes = collectRangeWidenings(ctor.body!, ctx.scope);
-			ctx.declareParams(ctor.params, params).forEach(st => emitStmt(st, ctx));
+			ctx.widenedTypes = collectRangeWidenings(ctor.body!, checker, ctx.scope);
+			ctx.declareParams(ctor.rest ? [...ctor.params, ctor.rest] : ctor.params, params).forEach(st => emitStmt(st, ctx));
 			// This constructor supplies `this` directly via its own return value (`ctorReturnsValue`)
 			// `cls`'s own `thisWtype`/`typeIndex` already say so; ordinary statement compilation does the right thing once `ctx.ctorThis` is unset.
 			const last = ctor.body?.at(-1);
-			if (last && last.type === 'return' && last.argument) {
+			if (last?.type === 'return' && last.argument) {
 				ctor.body!.forEach(st => emitStmt(st, ctx));
 
 			// Defaultability is a whole-struct-type property, not per-field -- one object-typed field forces the collect-then-`struct.new` path for the whole class.
 			} else if (cls.fields.some(f => typeof f.wtype !== 'string')) {
 				const remaining	= new Set(cls.fields.map(f => f.name));
 				const values	= new Map<string, Local>();
+				ctx.ctorFields	= values;
+				// No real local for `this` yet, but `checker.typeOf` still needs its static type to resolve a
+				// chained read like `this.p.x` (`p` already collected) down to `p`'s own class -- same no-real-
+				// local, scope-only registration `declareCaptured` uses for closure captures.
+				ctx.scope.addValue('this', cls.thisTsType);
 
 				const setField = (field: string, wtype: WasmType) => {
 					const local = ctx.declareLocal(`$field$${field}`, wtype);
@@ -3240,6 +3458,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						ctx.emit(I.struct.new(cls.typeIndex));
 						const thisLocal = ctx.declareValue('this', thisWtype, cls.thisTsType);
 						ctx.ctorThis = thisLocal;
+						ctx.ctorFields = undefined;
 						ctx.emit(I.local.set(thisLocal.index));
 					}
 				};
@@ -3255,7 +3474,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						initField(m.key as string, m.value);
 				}
 				for (const p of ctor.params) {
-					if (hasMod(p, 'public')) {
+					if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
 						const loc = ctx.lookup(p.key as string)!;
 						ctx.emit(I.local.get(loc.index));
 						setField(p.key as string, loc.wtype);
@@ -3294,7 +3513,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				ctx.emit(I.local.get(ctx.ctorThis!.index), I.return);
 			}
 
-			info.body = ctx.toFuncBody(ctor.params.length, toValType);
+			info.body = ctx.toFuncBody(ctor.params.length + (ctor.rest ? 1 : 0), toValType);
 			info.body.id = key;
 		});
 		return info;
@@ -3344,7 +3563,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				ctx.declareValue('this', thisWtype, owner.thisTsType);
 			if (reassignsThis)
 				ctx.appendThisOnReturn = true;
-			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
+			ctx.widenedTypes = collectRangeWidenings(decl.body!, checker, ctx.scope);
 			ctx.declareParams(decl.rest ? [...decl.params, decl.rest] : decl.params, params).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
@@ -3439,6 +3658,23 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return { module: hi.source, name: hi.name, desc: { kind: 'func', typeIndex, id: undefined } };
 	});
 
+	// A `const name = (...) => ...` (or `= function(...) {...}`) at the top level is, for this
+	// compiler's purposes, exactly as callable-by-name as a real `function` declaration -- it can
+	// never be reassigned, so there's no dynamic-value story to model, just a named entry point.
+	// But nothing here recognized that shape at all: it fell through to being compiled as an
+	// ordinary top-level local (a real closure value assigned into a `__toplevel`-scoped slot),
+	// invisible to every other top-level function's own `emitCall` lookup (`functionDeclByName`).
+	// Promoted the same way a `function_decl` already is; `promotedConsts` then keeps the
+	// `__toplevel` body below from *also* compiling it as a wasted local closure.
+	function arrowOrFunctionToDecl(name: string, e: JS.Arrow<Type> | JS.FunctionExpr<Type>): FunctionDecl {
+		return {
+			type: 'function_decl', name,
+			params: e.params, rest: e.rest, typeParams: e.typeParams, returnType: e.returnType,
+			body: Array.isArray(e.body) ? e.body : e.body !== undefined ? [{ type: 'return', argument: e.body }] : [],
+		};
+	}
+	const promotedConsts = new Set<string>();
+
 	// Seed with every exported (real, user-level top-level) function and reserve every class name eagerly
 	for (let s of ast.body) {
 		if (s.type === 'export_decl')
@@ -3459,6 +3695,29 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					methodDecls: new Map(),
 				});
 			}
+		} else if (s.type === 'var_decl' && s.kind !== 'var') {
+			for (const d of s.declarations) {
+				if (typeof d.name !== 'string' || !d.init)
+					continue;
+				if (s.kind === 'const' && (d.init.type === 'arrow' || d.init.type === 'function')) {
+					functionDeclByName.set(d.name, arrowOrFunctionToDecl(d.name, d.init));
+					promotedConsts.add(d.name);
+				} else if (d.init.type === 'literal') {
+					// A top-level `let`/`const` primitive with a compile-time-constant initializer
+					// becomes a real wasm global -- the same mechanism a library declaration (e.g.
+					// `lib/console.ts`'s `heap`) already uses, just registered *eagerly* here rather than
+					// lazily on first reference, since a user declaration's own position in `ast.body`
+					// stops mattering once it's a global: every function sees the same slot regardless
+					// of compile order. `mut: false` for `const` -- a genuine wasm-level compile-time
+					// constant, not just a same-value-never-checked mutable slot.
+					const tsType = d.typeAnnotation ?? checker.typeOf(d.init, libGlobal);
+					const wtype = typeOf(tsType);
+					if (wtype && wtype !== 'void') {
+						ensureGlobal(d.name, wtype, d.init, s.kind !== 'const');
+						promotedConsts.add(d.name);
+					}
+				}
+			}
 		}
 	}
 
@@ -3469,10 +3728,17 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	mod.start	= funcIndex;
 	worklist.push(() => {
 		const ctx	= new FuncCtx(new Scope(libGlobal), 'void', undefined);
-		ctx.widenedTypes = collectRangeWidenings(ast.body!, ctx.scope);
+		ctx.widenedTypes = collectRangeWidenings(ast.body!, checker, ctx.scope);
 		ast.body!.forEach(st => {
 			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl')
 				return;
+			if (st.type === 'var_decl' && promotedConsts.size) {
+				const declarations = st.declarations.filter(d => typeof d.name !== 'string' || !promotedConsts.has(d.name));
+				if (!declarations.length)
+					return;
+				emitStmt({ ...st, declarations }, ctx);
+				return;
+			}
 			emitStmt(st, ctx);
 		});
 		//emitTrailingUnreachable(ctx, result);
@@ -3522,17 +3788,34 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		// any consumer of real linear memory benefits, not just console.log specifically.
 		(mod.exports ??= []).push({ name: 'memory', kind: 'memory', index: 0 });
 	}
-	mod.globals			= Array.from(globals.values()).map(g => ({type: { mut: true, type: toValType(g.wtype) }, init: [I.i32(0)]}));
+	mod.globals			= Array.from(globals.entries()).map(([name, g]) => ({
+		type: { mut: globalMut.get(name) ?? true, type: toValType(g.wtype) },
+		init: constGlobalInit(name, globalInits.get(name), g.wtype),
+	}));
 	mod.datas			= [{ mode: 'passive', bytes: data }];
 
 	// Every closure literal's `funcIndex` is taken by `ref.func` at its creation site -- wasm requires any function referenced that way to be "declared" first, which a declarative element segment satisfies.
 	if (closureLiterals.length)
 		mod.elements = [{ mode: 'declarative', reftype: { ref: 'func', nullable: true }, funcIndices: closureLiterals.map(info => info.funcIndex) }];
 
-	// Only top-level functions are exported -- class ctors/methods are reachable through them.
-	for (const s of ast.body) {
-		if (s.type === 'function_decl' && s.body)
+	// Only *explicitly `export`-marked* top-level functions are exported -- class ctors/methods are
+	// reachable through them, and an un-exported top-level function is just a private helper, same as
+	// real JS module semantics (a bare `function` in a module isn't visible outside it either). Also
+	// covers `export const name = (...) => ...`/`= function(...) {...}` -- `functionDeclByName.has`
+	// (not just `promotedConsts.has`, which also covers plain-value globals) distinguishes it from an
+	// `export`-marked value global, which isn't a function export at all.
+	for (const outer of ast.body) {
+		if (outer.type !== 'export_decl')
+			continue;
+		const s = outer.declaration;
+		if (s.type === 'function_decl' && s.body) {
 			(mod.exports??=[]).push({ name: s.name, kind: 'func', index: funcs.get(s.name)!.funcIndex });
+		} else if (s.type === 'var_decl') {
+			for (const d of s.declarations) {
+				if (typeof d.name === 'string' && promotedConsts.has(d.name) && functionDeclByName.has(d.name))
+					(mod.exports??=[]).push({ name: d.name, kind: 'func', index: funcs.get(d.name)!.funcIndex });
+			}
+		}
 	}
 
 	return mod;

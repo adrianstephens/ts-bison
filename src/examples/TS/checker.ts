@@ -998,16 +998,23 @@ export function makeChecker(diag: Diagnostics) {
 				// (real class + ambient interface) shape, an intersection it never flattens, so a resolved check
 				// would never match.
 				if (rawObjT.type === 'ref' && !rawObjT.typeArgs && rawObjT.name in TYPED_ARRAY_RANGES)
-					return T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]);
-				const objT = T.resolve(scope, rawObjT);
+					return e.optional ? T.combineTypes([T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]), T.UNDEFINED]) : T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]);
+				// Same reasoning as `case 'member'`'s own `T.nonNullable` use just above: `?.` only ever indexes
+				// the non-nullish part of `objT` -- left as the full (possibly nullish) union, none of the
+				// branches below (`'array'`/`'tuple'`/index-signature/named-key) would ever match at all, since
+				// `T.resolve` never collapses a union on its own, and every one would silently fall through to
+				// the bare `T.ANY` at the end.
+				const objT = T.resolve(scope, e.optional ? T.nonNullable(rawObjT, scope) : rawObjT);
 				typeOf(e.property, scope);
+				const wrap = (t: Type) => e.optional ? T.combineTypes([t, T.UNDEFINED]) : t;
 				if (objT.type === 'array')
-					return objT.element;
+					return wrap(objT.element);
 				if (objT.type === 'tuple' && T.isLiteral(e.property, 'number')) {
 					const el = objT.elements[e.property.value];
 					if (!muted && !el)
 						err(SEVERITY.ERROR, pos)`Tuple type '${objT}' has no element at index ${e.property.value}`;
-					return (el && T.tupleElementType(el)) ?? T.ANY;
+					const t = el && T.tupleElementType(el);
+					return t ? wrap(t) : T.ANY;
 				}
 				// A declared `[i: number]: T` index signature (real lib.d.ts typed arrays once `TStypeCheckAsync`
 				// loads one, `Record<number, T>`-shaped types, etc) -- `indexSignatureOf` also searches every
@@ -1019,7 +1026,7 @@ export function makeChecker(diag: Diagnostics) {
 				if (!T.isLiteral(e.property, 'string')) {
 					const idxT = T.indexSignatureOf(objT, scope);
 					if (idxT)
-						return idxT;
+						return wrap(idxT);
 				}
 				if (T.isLiteral(e.property, 'string')) {
 					const t = T.lookupMember(objT, e.property.value, scope);
@@ -1027,7 +1034,7 @@ export function makeChecker(diag: Diagnostics) {
 						err(SEVERITY.ERROR, pos)`Property '${e.property.value}' does not exist on type '${objT}'`;
 					if (!t)
 						return T.ANY;
-					return T.memberOptional(objT, e.property.value, scope) ? T.combineTypes([t, T.UNDEFINED]) : t;
+					return (e.optional || T.memberOptional(objT, e.property.value, scope)) ? T.combineTypes([t, T.UNDEFINED]) : t;
 				}
 				return T.ANY;
 			}

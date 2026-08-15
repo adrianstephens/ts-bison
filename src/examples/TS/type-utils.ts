@@ -79,10 +79,26 @@ interface TypeOfMap {
 }
 
 export function literalType(t: Literal<any>): keyof TypeOfMap {
-	return Array.isArray(t.value) ? 'template' : t.value === null ? 'null' : typeof t.value;
+	return Array.isArray(t.value) ? 'string' : t.value === null ? 'null' : typeof t.value;
 }
 export function literalTypeOf(e: Expr | undefined): Type | undefined {
-	return e?.type === 'literal' ? TS.RefType(literalType(e)) : undefined;
+	if (e?.type === 'literal') {;
+		switch (typeof e.value) {
+			case 'string':	return STRING;
+			case 'boolean':	return BOOLEAN;
+			case 'number':	
+				return	e.value !== (e.value | 0)						? NUMBER
+					:	e.value >= -0x80000000 && e.value <= 0x7fffffff ? TS.RefType('i32')
+					:	e.value >= 0 && e.value <= 0xffffffff			? TS.RefType('u32')
+					:	NUMBER;
+			case 'bigint':
+				return	e.value >= -0x8000000000000000n && e.value <= 0x7fffffffffffffffn	? TS.RefType('i64')
+					:	e.value >= 0n && e.value <= 0xffffffffffffffffn						? TS.RefType('u64')
+					:	BIGINT;
+			case 'object':	return e.value === null ? Literal(e.value) : Array.isArray(e.value) ? STRING : REGEXP;
+		}
+	}
+//	return e?.type === 'literal' ? TS.RefType(literalType(e)) : undefined;
 }
 export function isLiteral<K extends keyof TypeOfMap>(t: Type|Expr, type: K): t is Literal<TypeOfMap[K]> {
 	return t.type === 'literal' && literalType(t) === type;
@@ -455,7 +471,6 @@ export function isStringLike(t: Type, scope: Scope): boolean {
 	const r = resolveOwn(t, scope);
 	return isString(t)
 		|| isLiteral(t, 'string')
-		|| isLiteral(t, 'template')
 		|| (r.type === 'union' && r.types.some(t => isStringLike(t, scope)));
 }
 

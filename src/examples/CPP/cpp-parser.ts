@@ -1,4 +1,6 @@
-import { makeRule, Rules, List, OneOf, termOneOf, makeParser, terminal, WithPrec, removeRules, ForceFork} from '../../tison';
+import * as path from 'path';
+import { makeRule, Rules, List, OneOf, termOneOf, terminal, WithPrec, removeRules, ForceFork} from '../../tison';
+import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
 import { Literal, Identifier } from '../common';
 import * as C from './c-parser';
@@ -1201,7 +1203,7 @@ C.init_declarator.push(
 const RIGHT_SHIFT			= terminal('>>',  />>/,		(_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : RIGHT_SHIFT);
 const RIGHT_SHIFT_ASSIGN	= terminal('>>=', />>=/,	(_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : RIGHT_SHIFT_ASSIGN);
 
-export const parser = makeParser({
+export const parser = makeCachedParser({
 	// On top of C's skips: attributes (`[[nodiscard]]`), `alignas(...)`, and MS calling-convention attributes are
 	// recognized and discarded at the lexer level -- valid input parses but they leave no trace in the AST.
 	skip: [/\s+/, /\/\/[^\n]*/, /\/\*[^]*?\*\//, /\[\[[^]*?\]\]/, /alignas\s*\([^()]*\)/, /__(?:stdcall|cdecl|fastcall|thiscall|forceinline)(?!\w)/, /__declspec\s*\([^()]*\)/],
@@ -1214,7 +1216,7 @@ export const parser = makeParser({
 	// each GLR branch mutates its own ctx (typedef registration, templateDepth); a dying branch's
 	// mutations no longer leak into the survivor
 	forkCtx: (ctx: CppCtx) => ({...ctx, typedefNames: new Set(ctx.typedefNames)}),
-});
+}, path.join(__dirname, '../../../.tables-cache/cpp-parser.json.gz'));
 
 export interface Options extends PreprocessOptions {
 	knownTypes?: Iterable<string>;

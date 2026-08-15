@@ -1,4 +1,6 @@
-import { makeParser, Rules, Forward, Maybe, List, MaybeList, OneOf, terminal, ForceFork } from '../../tison';
+import * as path from 'path';
+import { Rules, Forward, Maybe, List, MaybeList, OneOf, terminal, ForceFork } from '../../tison';
+import { makeCachedParser } from '../../tableCache';
 import * as JS from './js-parser';
 import { IDENT, NUM, STR, unquoteString, Rule } from './js-parser';
 import { Literal, UnaryPost, mergeMods } from '../common';
@@ -750,7 +752,7 @@ JS.relational_expression_noin.push(
 
 
 export function make() {
-	return makeParser({
+	return makeCachedParser({
 		skip:		JS.skip,
 		recover:	JS.recover,
 		merge:		JS.merge,
@@ -782,7 +784,7 @@ export function make() {
 			class_member_modifier_list,
 			implements_clause,
 		}
-	});
+	}, path.join(__dirname, '../../../.tables-cache/ts-parser.json.gz'));
 }
 
 const parser = make();

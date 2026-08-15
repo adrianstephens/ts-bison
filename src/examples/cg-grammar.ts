@@ -1,5 +1,7 @@
 /* eslint-disable @typescript-eslint/no-this-alias */
-import { makeParser, makeRule, Rules, List, terminal, Forward, TextPos } from '../tison';
+import * as path from 'path';
+import { makeRule, Rules, List, terminal, Forward, TextPos } from '../tison';
+import { makeCachedParser } from '../tableCache';
 import { makeRuleR } from '../rrule';
 
 function claim(condition: any): asserts condition {}
@@ -1897,7 +1899,7 @@ const compilation_unit = Rules(self => [
 	Rule([self, external_declaration]),
 ]);
 
-export const parser = makeParser({
+export const parser = makeCachedParser({
 	start: compilation_unit,
 	skip: [/\s+/]
-});
+}, path.join(__dirname, '../../.tables-cache/cg-grammar.json.gz'));

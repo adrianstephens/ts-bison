@@ -30,10 +30,9 @@ function swapCase(code: number): number {
 }
 
 function hasFlag(flags: string, code: number): boolean {
-	let i: number = 0;
-	while (i < flags.length) {
-		if (flags.charCodeAt(i) === code) return true;
-		i = i + 1;
+	for (let i = 0; i < flags.length; i++) {
+		if (flags.charCodeAt(i) === code)
+			return true;
 	}
 	return false;
 }
@@ -72,27 +71,17 @@ class RegExpCompiler {
 	static readonly OP_SPACE:	number = 13;
 	static readonly OP_NSPACE:	number = 14;
 
-	pat:		string;
-	pos:		number;
-	nextGroup:	number;
-	failed:		boolean;
-	braceMin:	number;
-	braceMax:	number;
-	groupCount:	number;
-	prog:		i32[];
-	progLen:	number;
+//	pat:		string;
+	pos			= 0;
+	nextGroup	= 1;
+	failed		= false;
+	braceMin	= 0;
+	braceMax	= 0;
+	groupCount	= 0;
+	prog		= new Array<i32>(16);
+	progLen		= 0;
 
-	constructor(pattern: string) {
-		this.pat		= pattern;
-		this.pos		= 0;
-		this.nextGroup	= 1;
-		this.failed		= false;
-		this.braceMin	= 0;
-		this.braceMax	= 0;
-		this.groupCount	= 0;
-		this.prog		= new Array<i32>(16);
-		this.progLen	= 0;
-	}
+	constructor(public pat: string) {}
 
 	run(): void {
 		this.emit2(RegExpCompiler.OP_SAVE, 0);
@@ -175,16 +164,18 @@ class RegExpCompiler {
 		const c: number = this.charAt(this.pos);
 		if (c === -1) { this.failed = true; return; }
 		if (c === 40) {
-			let depth: number = 1;
-			this.pos = this.pos + 1;
+			let depth = 1;
+			this.pos++;
 			while (depth > 0) {
 				const d: number = this.charAt(this.pos);
 				if (d === -1) { this.failed = true; return; }
 				if (d === 92) { this.pos = this.pos + 2; continue; }
 				if (d === 91) { this.skipClass(); continue; }
-				if (d === 40) depth = depth + 1;
-				else if (d === 41) depth = depth - 1;
-				this.pos = this.pos + 1;
+				if (d === 40)
+					++depth;
+				else if (d === 41)
+					--depth;
+				this.pos++;
 			}
 		} else if (c === 91) {
 			this.skipClass();
@@ -195,9 +186,9 @@ class RegExpCompiler {
 		}
 	}
 	private tryParseBraceAt(p: number): number {
-		let i: number = p + 1;
-		let min: number = 0;
-		let sawDigit: boolean = false;
+		let i = p + 1;
+		let min = 0;
+		let sawDigit = false;
 		while (this.charAt(i) >= 48 && this.charAt(i) <= 57) {
 			min = min * 10 + (this.charAt(i) - 48);
 			i = i + 1;
@@ -218,8 +209,8 @@ class RegExpCompiler {
 			this.braceMax = -1;
 			return i + 1;
 		}
-		let max: number = 0;
-		let sawDigit2: boolean = false;
+		let max = 0;
+		let sawDigit2 = false;
 		while (this.charAt(i) >= 48 && this.charAt(i) <= 57) {
 			max = max * 10 + (this.charAt(i) - 48);
 			i = i + 1;
@@ -263,24 +254,24 @@ class RegExpCompiler {
 	parseDisjunction(): void {
 		if (this.failed)
 			return;
-		const altPos: number = this.pos;
+		const altPos = this.pos;
 		this.skipAlternative();
 		if (this.failed)
 			return;
-		const hasAlt: boolean = this.charAt(this.pos) === 124;
+		const hasAlt = this.charAt(this.pos) === 124;
 		this.pos = altPos;
 		if (!hasAlt) {
 			this.parseAlternative();
 			return;
 		}
 		const splitPos: number = this.emit3(RegExpCompiler.OP_SPLIT, -1, -1);
-		const l1: number = this.progLen;
+		const l1 = this.progLen;
 		this.parseAlternative();
 		const jmpPos: number = this.emit2(RegExpCompiler.OP_JMP, -1);
-		const l2: number = this.progLen;
+		const l2 = this.progLen;
 		this.pos = this.pos + 1; // consume '|'
 		this.parseDisjunction();
-		const l3: number = this.progLen;
+		const l3 = this.progLen;
 		this.patchWord(splitPos + 1, l1);
 		this.patchWord(splitPos + 2, l2);
 		this.patchWord(jmpPos + 1, l3);
@@ -303,8 +294,8 @@ class RegExpCompiler {
 		if (this.failed)
 			return;
 		const afterAtom: number = this.pos;
-		const qc: number = this.charAt(afterAtom);
-		let kind: number = 0; // 0 none, 1 '?', 2 '*', 3 '+', 4 '{n,m}'
+		const qc = this.charAt(afterAtom);
+		let kind = 0; // 0 none, 1 '?', 2 '*', 3 '+', 4 '{n,m}'
 		let quantEnd: number = afterAtom;
 		switch (qc) {
 			case 63: kind = 1; quantEnd = afterAtom + 1; break;
@@ -319,7 +310,7 @@ class RegExpCompiler {
 				break;
 			}
 		}
-		let lazy = kind !== 0 && this.charAt(quantEnd) === 63;
+		const lazy = kind !== 0 && this.charAt(quantEnd) === 63;
 		if (lazy)
 			++quantEnd;
 
@@ -344,21 +335,16 @@ class RegExpCompiler {
 			case 4: {
 				const min: number = this.braceMin;
 				const max: number = this.braceMax;
-				let i: number = 0;
-				while (i < min) {
+				for (let i = 0; i < min; i++) {
 					this.pos = atomPos;
 					this.nextGroup = groupBase;
 					this.parseAtom();
-					i = i + 1;
 				}
 				if (max === -1) {
 					this.emitStarLoop(atomPos, groupBase, lazy);
 				} else {
-					let j: number = min;
-					while (j < max) {
+					for (let j = min; j < max; j++)
 						this.emitOptional(atomPos, groupBase, lazy);
-						j = j + 1;
-					}
 				}
 				this.pos = quantEnd;
 				return;
@@ -432,16 +418,15 @@ class RegExpCompiler {
 		}
 	}
 	private parseGroup(): void {
-		let capturing: boolean = true;
+		let capturing = true;
 		if (this.charAt(this.pos) === 63) {
-			const k: number = this.charAt(this.pos + 1);
-			if (k === 58) {
+			if (this.charAt(this.pos + 1) === 58) {
 				capturing = false;
 				this.pos = this.pos + 2;
 			}
 			else { this.failed = true; return; } // '?=' '?!' '?<' -- lookaround/named groups, out of scope
 		}
-		let idx: number = 0;
+		let idx = 0;
 		if (capturing) {
 			idx = this.nextGroup;
 			this.nextGroup = this.nextGroup + 1;
@@ -514,23 +499,24 @@ class RegExpCompiler {
 		this.appendRange(c, c);
 	}
 	private parseClass(): void {
-		let negate = this.charAt(this.pos) === 94;
+		const negate = this.charAt(this.pos) === 94;
 		if (negate)
 			++this.pos;
 		const headerPos = this.emitClassHeader(negate, 0);
-		let first: boolean = true;
+		let first = true;
 		while (true) {
 			const c: number = this.charAt(this.pos++);
 			if (c === -1) { this.failed = true; --this.pos; return; }
-			if (c === 93 && !first) break;
+			if (c === 93 && !first)
+				break;
 			first = false;
 			if (c === 92) {
 				this.parseClassEscapeRanges();
 				if (this.failed)
 					return;
 			} else {
-				let lo: number = c;
-				let hi: number = c;
+				const lo = c;
+				let hi = c;
 				if (this.charAt(this.pos) === 45 && this.charAt(this.pos + 1) !== 93 && this.charAt(this.pos + 1) !== -1) {
 					++this.pos;
 					const hc: number = this.charAt(this.pos);
@@ -578,39 +564,24 @@ export class RegExp {
 	static readonly OP_SPACE: 	number = 13;
 	static readonly OP_NSPACE: 	number = 14;
 
-	source: 	string;
 	global: 	boolean;
 	ignoreCase: boolean;
 	multiline: 	boolean;
-	lastIndex: 	number;
+	lastIndex	= 0;
 
 	private compiled: 	RegExpCompiler;
 	private groups: 	i32[];
-	private stack: 		i32[];
-	private stackTop: 	number;
-	private bpc: 		number;
-	private bsp: 		number;
+	private stack		= new Array<i32>(64);
+	private stackTop	= 0;
+	private bpc			= 0;
+	private bsp			= 0;
 
-	// Every statement here must be a plain `this.field = value` (towasm.ts's field-collecting-ctor
-	// requirement for any class with an object-typed field) -- no local temporaries, no loops. Flag
-	// parsing lives in the top-level `hasFlag` for that reason; the compiler's whole result collapses
-	// into one `compiled` field instead of several derived ones, so it's only built once.
-	constructor(pattern: string, flags: string = '') {
-		this.source		= pattern;
-		this.global		= hasFlag(flags, 103);      // 'g'
-		this.ignoreCase = hasFlag(flags, 105);  // 'i'
-		this.multiline	= hasFlag(flags, 109);   // 'm'
-		this.lastIndex	= 0;
-		this.compiled	= compilePattern(pattern);
-		// Deliberately re-compiles rather than reading `this.compiled.groupCount` back -- towasm.ts's
-		// field-collecting ctor can't read a subfield of a field assigned earlier in the same
-		// constructor (confirmed: "unknown field 'groupCount'"). Cheap: construction-time only, short
-		// pattern string.
-		this.groups		= new Array<i32>((compilePattern(pattern).groupCount + 1) * 2);
-		this.stack		= new Array<i32>(64);
-		this.stackTop	= 0;
-		this.bpc		= 0;
-		this.bsp		= 0;
+	constructor(public source: string, flags = '') {
+		this.global		= hasFlag(flags, 103);	// 'g'
+		this.ignoreCase = hasFlag(flags, 105);	// 'i'
+		this.multiline	= hasFlag(flags, 109);	// 'm'
+		this.compiled	= compilePattern(source);
+		this.groups		= new Array<i32>((this.compiled.groupCount + 1) * 2);
 	}
 
 	private charEq(a: number, b: number): boolean {
@@ -618,7 +589,7 @@ export class RegExp {
 	}
 	private classMatch(c: number, pc: number, rangeCount: number, negate: number): boolean {
 		const alt: number = swapCase(c);
-		let found: boolean = false;
+		let found = false;
 		for (let i = 0; i < rangeCount && !found; i++) {
 			const lo: number = this.compiled.prog[pc + 3 + i * 2];
 			const hi: number = this.compiled.prog[pc + 3 + i * 2 + 1];
@@ -627,7 +598,7 @@ export class RegExp {
 		return negate === 1 ? !found : found;
 	}
 	private pushFrame(pc: number, sp: number): void {
-		const frameWidth: number = 2 + this.groups.length;
+		const frameWidth = 2 + this.groups.length;
 		//while (this.stackTop + frameWidth > this.stack.length)
 		//	this.stack = growInt32(this.stack);
 		this.stack[this.stackTop] = pc;
@@ -637,8 +608,9 @@ export class RegExp {
 		this.stackTop = this.stackTop + frameWidth;
 	}
 	private popFrame(): boolean {
-		const frameWidth: number = 2 + this.groups.length;
-		if (this.stackTop === 0) return false;
+		if (this.stackTop === 0)
+			return false;
+		const frameWidth = 2 + this.groups.length;
 		this.stackTop = this.stackTop - frameWidth;
 		this.bpc = this.stack[this.stackTop];
 		this.bsp = this.stack[this.stackTop + 1];
@@ -652,11 +624,11 @@ export class RegExp {
 		for (let gi = 0; gi < this.groups.length; gi++)
 			this.groups[gi] = -1;
 
-		let pc: number = 0;
-		let sp: number = start;
+		let pc = 0;
+		let sp = start;
 		while (true) {
-			let ok: boolean = false;
-			const op: number = this.compiled.prog[pc];
+			let ok = false;
+			const op = this.compiled.prog[pc];
 			switch (op) {
 				case RegExp.OP_MATCH:
 					return true;
@@ -696,22 +668,20 @@ export class RegExp {
 					ok = true;
 					break;
 				case RegExp.OP_BACKREF: {
-					const g: number = this.compiled.prog[pc + 1];
-					const gs: number = this.groups[g * 2];
-					const ge: number = this.groups[g * 2 + 1];
+					const g = this.compiled.prog[pc + 1];
+					const gs = this.groups[g * 2];
+					const ge = this.groups[g * 2 + 1];
 					if (gs === -1) {
 						pc = pc + 2;
 						ok = true;
 					} else {
 						const len: number = ge - gs;
-						let match: boolean = true;
-						let j: number = 0;
-						while (j < len) {
+						let match = true;
+						for (let j = 0; j < len; j++) {
 							if (sp + j >= s.length || !this.charEq(s.charCodeAt(sp + j), s.charCodeAt(gs + j))) {
 								match = false;
 								break;
 							}
-							j = j + 1;
 						}
 						if (match) {
 							sp = sp + len;
@@ -748,10 +718,9 @@ export class RegExp {
 					}
 					break;
 				case RegExp.OP_WORDB: case RegExp.OP_NWORDB: {
-					const before: boolean = sp > 0 && isWordChar(s.charCodeAt(sp - 1));
-					const after: boolean = sp < s.length && isWordChar(s.charCodeAt(sp));
-					const boundary: boolean = before !== after;
-					if ((op === RegExp.OP_WORDB) === boundary) {
+					const before	= sp > 0 && isWordChar(s.charCodeAt(sp - 1));
+					const after		= sp < s.length && isWordChar(s.charCodeAt(sp));
+					if ((op === RegExp.OP_WORDB) === (before !== after)) {
 						pc = pc + 1;
 						ok = true;
 					}
@@ -779,27 +748,25 @@ export class RegExp {
 	// `global`-vs-not `lastIndex` contract on top of this; `String.split` (string.ts) also calls
 	// this directly, since split must scan the whole string regardless of the separator's own flags.
 	execFrom(s: string, from: number): RegExpMatch | null {
-		let pos: number = from;
-		while (pos <= s.length) {
+		for (let pos = from; pos <= s.length; pos++) {
 			if (this.runVM(s, pos))
 				return this.buildMatch(s);
-			pos = pos + 1;
 		}
 		return null;
 	}
 	exec(s: string): RegExpMatch | null {
-		const start: number = this.global ? this.lastIndex : 0;
+		const start = this.global ? this.lastIndex : 0;
 		if (start > s.length) {
 			if (this.global)
 				this.lastIndex = 0;
 			return null;
 		}
-		const result: RegExpMatch | null = this.execFrom(s, start);
+		const result = this.execFrom(s, start);
 		if (this.global) {
 			if (result === null) {
 				this.lastIndex = 0;
 			} else {
-				const end: number = result.groupEnd(0);
+				const end = result.groupEnd(0);
 				this.lastIndex = end > result.index ? end : end + 1;
 			}
 		}
@@ -817,23 +784,14 @@ export class RegExp {
 // from the two other real bugs found building this file. `group(i)` slices on demand off
 // `offsets` instead -- entirely proven machinery (Int32Array, String.slice), no Array<T> at all.
 export class RegExpMatch {
-	input: string;
-	index: number;
-	count: number;
-	private offsets: i32[];
-
-	constructor(input: string, index: number, count: number, offsets: i32[]) {
-		this.input = input;
-		this.index = index;
-		this.count = count;
-		this.offsets = offsets;
+	constructor(public input: string, public index: number, public count: number, private offsets: i32[]) {
 	}
 	get length(): number { return this.count; }
 	groupStart(i: number): number { return this.offsets[i * 2]; }
 	groupEnd(i: number): number { return this.offsets[i * 2 + 1]; }
 	group(i: number): string {
-		const gs: number = this.offsets[i * 2];
-		const ge: number = this.offsets[i * 2 + 1];
+		const gs = this.offsets[i * 2];
+		const ge = this.offsets[i * 2 + 1];
 		return gs === -1 ? '' : this.input.slice(gs, ge);
 	}
 }
@@ -841,27 +799,30 @@ export class RegExpMatch {
 // `$1`.."$9"/`$&`/`$$` substitution for String.replace -- a plain fixed digit 1-9 (see the
 // header comment's documented multi-digit-backreference exclusion, same limit here for consistency).
 export function expandReplacement(pattern: string, m: RegExpMatch): string {
-	let result: string = '';
-	let i: number = 0;
-	const n: number = pattern.length;
-	while (i < n) {
-		const c: number = pattern.charCodeAt(i);
+	let result = '';
+	const n = pattern.length;
+	for (let i = 0; i < n; i++) {
+		const c = pattern.charCodeAt(i);
 		if (c === 36 && i + 1 < n) {
-			const d: number = pattern.charCodeAt(i + 1);
-			if (d === 36) { result = result.concat('$'); i = i + 2; }
-			else if (d === 38) { result = result.concat(m.group(0)); i = i + 2; }
-			else if (d >= 49 && d <= 57) {
+			const d = pattern.charCodeAt(i + 1);
+			if (d === 36) {
+				result = result.concat('$');
+				++i;
+			} else if (d === 38) {
+				result = result.concat(m.group(0));
+				++i;
+			} else if (d >= 49 && d <= 57) {
 				const g: number = d - 48;
-				if (g < m.length) result = result.concat(m.group(g));
-				else result = result.concat('$').concat(String.fromCharCode(d));
-				i = i + 2;
+				if (g < m.length)
+					result = result.concat(m.group(g));
+				else
+					result = result.concat('$').concat(String.fromCharCode(d));
+				++i;
 			} else {
 				result = result.concat(String.fromCharCode(c));
-				i = i + 1;
 			}
 		} else {
 			result = result.concat(String.fromCharCode(c));
-			i = i + 1;
 		}
 	}
 	return result;

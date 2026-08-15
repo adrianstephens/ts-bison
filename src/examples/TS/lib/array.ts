@@ -30,7 +30,7 @@ export class Array<T> {
 		const len = this.length;
 		const result: T[] = Array._alloc<T>(len + n);
 		Array._copy(result, 0, this as unknown as T[], 0, len);
-		// @ts-ignore - tison extension: reassigning `this` swaps the backing array
+		// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
 		this = result as unknown as Array<T>;
 		return len;
 	}
@@ -47,7 +47,7 @@ export class Array<T> {
 			const last = this[len - 1];
 			const result: T[] = Array._alloc<T>(len - 1);
 			Array._copy(result, 0, this as unknown as T[], 0, len - 1);
-			// @ts-ignore - tison extension: reassigning `this` swaps the backing array
+			// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
 			this = result as unknown as Array<T>;
 			return last;
 		}
@@ -59,7 +59,7 @@ export class Array<T> {
 		const result: T[] = Array._alloc<T>(len + n);
 		Array._copy(result, 0, this as unknown as T[], 0, len);
 		Array._copy(result, len, items, 0, n);
-		// @ts-ignore - tison extension: reassigning `this` swaps the backing array
+		// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
 		this = result as unknown as Array<T>;
 		return len + n;
 	}
@@ -69,7 +69,7 @@ export class Array<T> {
 			const first = this[0];
 			const result: T[] = Array._alloc<T>(len - 1);
 			Array._copy(result, 0, this as unknown as T[], 1, len - 1);
-			// @ts-ignore - tison extension: reassigning `this` swaps the backing array
+			// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
 			this = result as unknown as Array<T>;
 			return first;
 		}
@@ -81,7 +81,7 @@ export class Array<T> {
 		const result: T[] = Array._alloc<T>(len + n);
 		Array._copy(result, 0, items, 0, n);
 		Array._copy(result, n, this as unknown as T[], 0, len);
-		// @ts-ignore - tison extension: reassigning `this` swaps the backing array
+		// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
 		this = result as unknown as Array<T>;
 		return len + n;
 	}
@@ -92,26 +92,22 @@ export class Array<T> {
 		Array._copy(result, 0, this as unknown as T[], 0, start);
 		Array._copy(result, start, items, 0, n);
 		Array._copy(result, start + n - deleteCount, this as unknown as T[], start + deleteCount, len - start - deleteCount);
-		// @ts-ignore - tison extension: reassigning `this` swaps the backing array
+		// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
 		this = result as unknown as Array<T>;
 		return this as unknown as T[];
 	}
 
 	indexOf(x: T): number {
-		let i: number = 0;
-		while (i < this.length) {
+		for (let i = 0; i < this.length; i++) {
 			if (this[i] === x)
 				return i;
-			i = i + 1;
 		}
 		return -1;
 	}
 	lastIndexOf(x: T): number {
-		let i: number = this.length - 1;
-		while (i >= 0) {
+		for (let i = this.length - 1; i >= 0; --i) {
 			if (this[i] === x)
 				return i;
-			i = i - 1;
 		}
 		return -1;
 	}
@@ -191,8 +187,8 @@ export class Array<T> {
 		for (let i = 0; i < this.length; i++)
 			callback(this[i], i, this);
 	}
-	join(separator: string = ','): string {
-		let result: string = '';
+	join(separator = ','): string {
+		let result = '';
 		for (let i = 0; i < this.length; i++) {
 			if (i > 0)
 				result = result.concat(separator);

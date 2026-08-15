@@ -36,7 +36,7 @@
 
 declare type i8 = number;
 
-class ArrayBuffer {
+export class ArrayBuffer {
 	get byteLength(): number { return __asm<[], u32>('array.len')(); }
 	[i: number]: u8;
 	get(i: i32): u8				{ return __asm<[i32], i32>('array.get_u $this')(i); }
@@ -47,11 +47,11 @@ class ArrayBuffer {
 	}
 }
 
-class TypedArray<T> {
+export class TypedArray<T> {
 	buffer:		ArrayBuffer	= new ArrayBuffer(0);
 	byteOffset:	i32	= 0;
 	byteLength:	i32	= 0;
-	length:		i32	= 0;
+	length:		i32 = 0;
 
 	[i: i32]: number;
 
@@ -77,7 +77,7 @@ class TypedArray<T> {
 	// every field's value up front and a single `struct.new` -- see `ensureCtor` -- so `this` isn't a real,
 	// readable value until the last field is set): every intermediate value goes through a plain local
 	// (`elemSize`/`byteLength`) instead of writing then reading a field back.
-	// @ts-ignore - tison extension: multiple constructor implementations
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(length: i32) {
 		const elemSize = TypedArray.elemSize();
 		this.buffer = new ArrayBuffer(length * elemSize);
@@ -91,7 +91,7 @@ class TypedArray<T> {
 	// specifically could in principle skip that intermediate array and fill the buffer straight from each
 	// element expression -- a real optimization, but a general one (any array-typed argument shape, not
 	// just this one constructor), so left for later rather than a special case here.
-	// @ts-ignore - tison extension: multiple constructor implementations
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(elements: number[]) {
 		const elemSize = TypedArray.elemSize();
 		this.buffer = new ArrayBuffer(elements.length * elemSize);
@@ -101,7 +101,7 @@ class TypedArray<T> {
 		for (let i = 0; i < elements.length; i++)
 			this[i] = elements[i];
 	}
-	// @ts-ignore - tison extension: multiple constructor implementations
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(buffer: ArrayBuffer) {
 		const elemSize = TypedArray.elemSize();
 		const byteLength = buffer.byteLength;
@@ -110,7 +110,7 @@ class TypedArray<T> {
 		this.byteLength = byteLength;
 		this.length = byteLength / elemSize;
 	}
-	// @ts-ignore - tison extension: multiple constructor implementations
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(buffer: ArrayBuffer, byteOffset: i32) {
 		const elemSize = TypedArray.elemSize();
 		const byteLength = buffer.byteLength - byteOffset;
@@ -119,7 +119,7 @@ class TypedArray<T> {
 		this.byteLength = byteLength;
 		this.length = byteLength / elemSize;
 	}
-	// @ts-ignore - tison extension: multiple constructor implementations
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(buffer: ArrayBuffer, byteOffset: i32, length: i32) {
 		const elemSize = TypedArray.elemSize();
 		this.buffer = buffer;
@@ -150,20 +150,16 @@ class TypedArray<T> {
 	}
 
 	indexOf(x: number): i32 {
-		let i: number = 0;
-		while (i < this.length) {
+		for (let i = 0; i < this.length; i++) {
 			if (this[i] === x)
 				return i;
-			i = i + 1;
 		}
 		return -1;
 	}
 	lastIndexOf(x: number): i32 {
-		let i: number = this.length - 1;
-		while (i >= 0) {
+		for (let i = this.length - 1; i >= 0; --i) {
 			if (this[i] === x)
 				return i;
-			i = i - 1;
 		}
 		return -1;
 	}
@@ -202,17 +198,11 @@ class TypedArray<T> {
 	}
 	concat(other: TypedArray<T>): TypedArray<T> {
 		const result = new TypedArray<T>(this.length + other.length);
-		let i: number = 0;
-		while (i < this.length) {
+		const len = this.length;
+		for (let i = 0; i < len; i++)
 			result[i] = this[i];
-			i = i + 1;
-		}
-		let j: number = 0;
-		while (j < other.length) {
-			result[i] = other[j];
-			i = i + 1;
-			j = j + 1;
-		}
+		for (let i = 0; i < other.length; i++)
+			result[i + len] = other[i];
 		return result;
 	}
 	// A real *view* over the same buffer -- no copy, no alloc -- unlike `slice`. Same clamp/saturate
@@ -223,7 +213,7 @@ class TypedArray<T> {
 		end		= end < 0 ? end + len : end > len ? len : end;
 		if (end < start)
 			end = start;
-		// @ts-ignore - tison extension: multiple constructor implementations
+		// @ts-expect-error - tison extension: multiple constructor implementations
 		return new TypedArray<T>(this.buffer, this.byteOffset + start, end - start);
 	}
 }
