@@ -1,3 +1,6 @@
+/* eslint-disable @typescript-eslint/no-inferrable-types */
+/* eslint-disable @typescript-eslint/triple-slash-reference */
+/* eslint-disable @typescript-eslint/prefer-for-of */
 /// <reference path="./lib.d.ts" />
 
 //-----------------------------------------------------------------------------
@@ -27,9 +30,9 @@ export function bigFromNumber(n: number): bigint {
 
 	const r: u32[] = new Array<u32>(count + 1);
 	for (let i = 0, m = n; i < count; i++) {
-		const j = Math.floor(m / 0x100000000);
-		r[i] = m - j * 0x100000000;
-		m = j;
+		const t = Math.floor(m / 0x100000000);
+		r[i] = m - t * 0x100000000;
+		m = t;
 	}
 	return bigTrim(r) as unknown as bigint;
 }
@@ -40,12 +43,9 @@ export function bigToNumber(a: bigint): number {
 	const limbs: u32[] = bigApplySign(raw, neg);
 	let result: number = 0;
 	let scale: number = 1;
-	let i: number = 0;
-	while (i < limbs.length) {
-		const digit: number = limbs[i];
-		result = result + digit * scale;
+	for (let i = 0; i < limbs.length; i++) {
+		result = result + limbs[i] * scale;
 		scale = scale * 4294967296;
-		i = i + 1;
 	}
 	if (neg)
 		return -result;
@@ -57,17 +57,14 @@ function bigSign(a: u32[]): boolean {
 }
 
 export function bigTrim(a: u32[]): u32[] {
-	let n: number = a.length;
+	let n = a.length;
 	while (n > 1 && a[n - 1] === ((a[n - 2] & 0x80000000) !== 0 ? 0xffffffff : 0))
 		n = n - 1;
 	if (n === a.length)
 		return a;
 	const r: u32[] = new Array<u32>(n);
-	let i: number = 0;
-	while (i < n) {
+	for (let i = 0; i < n; i++)
 		r[i] = a[i];
-		i = i + 1;
-	}
 	return r;
 
 }
@@ -81,38 +78,26 @@ function toU32(x: i32): u32 {
 }
 
 function bigAdd(a: u32[], b: u32[], negb: boolean): u32[] {
-	const	bx: number = negb ? 0xffffffff : 0;
-	let		carry: number = negb ? 1 : 0;
+	const	bx = negb ? 0xffffffff : 0;
+	let		carry = negb ? 1 : 0;
 
-	const	na: number = a.length;
-	const	nb: number = b.length;
-	const	n: number = na > nb ? na : nb;
-	const	at: number = bigSign(a) ? 0xffffffff : 0;
-	const	bSign: boolean = bigSign(b);
-	const	bt: number = bSign !== negb ? 0xffffffff : 0;
+	const	na = a.length;
+	const	nb = b.length;
+	const	n = na > nb ? na : nb;
+	const	at = bigSign(a) ? 0xffffffff : 0;
+	const	bt = bigSign(b) !== negb ? 0xffffffff : 0;
 
-	const	r: u32[] = new Array<u32>(n + 1);
-	let		i: number = 0;
-	while (i <= n) {
-		// A ternary can't take an indexed read as one of its branches here (the checker can't unify
-		// `a[i]`'s type with the other branch's) -- `if`/`else` into a `let` instead.
-		let av: number = at;
-		if (i < na)
-			av = a[i];
-		let bv: number = bt;
-		if (i < nb)
-			bv = toU32(b[i] ^ bx);
-
-		const sum: number	= av + bv + carry;
+	const	r = new Array<u32>(n + 1);
+	for (let i = 0; i <= n; ++i) {
+		const sum = (i < na ? a[i] : at) + (i < nb ? toU32(b[i] ^ bx) : bt) + carry;
 		carry	= sum > 0xffffffff ? 1 : 0;
 		r[i]	= sum & 0xffffffff;
-		i = i + 1;
 	}
 	return r;
 }
 
 function bigCompare(a: u32[], b: u32[]): number {
-	let i: number = a.length;
+	let i = a.length;
 	if (i !== b.length)
 		return i < b.length ? -1 : 1;
 	while (i--) {
@@ -123,8 +108,7 @@ function bigCompare(a: u32[], b: u32[]): number {
 }
 
 function bigNeg(a: u32[]): u32[] {
-	const zero: u32[] = new Array<u32>(1);
-	return bigAdd(zero, a, true);
+	return bigAdd(new Array<u32>(1), a, true);
 }
 
 function bigApplySign(a: u32[], neg: boolean): u32[] {
@@ -138,34 +122,26 @@ function bigApplySign(a: u32[], neg: boolean): u32[] {
 // -- a raw 32x32 product needs up to 64 bits, past what `number` can hold exactly at 2^53) -- read back
 // as a 2-limb `bigint` (see towasm.ts's own comment on the intrinsic), low limb at index 0.
 function bigMulMag(a: u32[], b: u32[]): u32[] {
-	const na: number = a.length;
-	const nb: number = b.length;
-	const r: u32[] = new Array<u32>(na + nb + 1);
-	let i: number = 0;
-	while (i < na) {
-		let carry: number = 0;
-		let j: number = 0;
+	const na = a.length;
+	const nb = b.length;
+	const r = new Array<u32>(na + nb + 1);
+	for (let i = 0; i < na; i++) {
+		let carry = 0;
+		let j = 0;
 		while (j < nb) {
 			const prod: u32[] = __towasm_mulWide(a[i], b[j]) as unknown as u32[];
-			const prodLo: number = prod[0];
-			const prodHi: number = prod[1];
-
-			const t: number = r[i + j] + prodLo + carry;
+			const t: number = r[i + j] + prod[0] + carry;
 			r[i + j] = t & 0xffffffff;
-			carry = prodHi + Math.floor(t / 4294967296);
+			carry = prod[1] + Math.floor(t / 4294967296);
 			j = j + 1;
 		}
 		// Flushes the row's leftover carry into the columns above it -- a ripple, not a single add, since
 		// a column here can receive contributions from both this row's flush and the next row's own pass.
-		let k: number = i + nb;
-		let c: number = carry;
-		while (c > 0) {
+		for (let k = i + nb, c = carry; c > 0; ++k) {
 			const tf: number = r[k] + c;
 			r[k] = tf & 0xffffffff;
 			c = Math.floor(tf / 4294967296);
-			k = k + 1;
 		}
-		i = i + 1;
 	}
 	return r;
 }
@@ -189,16 +165,12 @@ function bigGeMag(a: u32[], b: u32[]): boolean {
 
 // `a - b` by magnitude, assuming `a >= b` (no borrow past `a`'s own top limb) and `a.length >= b.length`.
 function bigSubMag(a: u32[], b: u32[]): u32[] {
-	const n: number = a.length;
-	const nb: number = b.length;
-	const r: u32[] = new Array<u32>(n);
-	let borrow: number = 0;
-	let i: number = 0;
-	while (i < n) {
-		let bi: number = 0;
-		if (i < nb)
-			bi = b[i];
-		const t: number = a[i] - bi - borrow;
+	const n		= a.length;
+	const nb	= b.length;
+	const r		= new Array<u32>(n);
+	let borrow = 0;
+	for (let i = 0; i < n; i++) {
+		const t = a[i] - (i < nb ? b[i] : 0) - borrow;
 		if (t < 0) {
 			r[i] = t + 4294967296;
 			borrow = 1;
@@ -206,7 +178,6 @@ function bigSubMag(a: u32[], b: u32[]): u32[] {
 			r[i] = t;
 			borrow = 0;
 		}
-		i = i + 1;
 	}
 	return r;
 }
@@ -217,15 +188,13 @@ function bigSubMag(a: u32[], b: u32[]): u32[] {
 // always 0 by construction (the remainder never exceeds twice the divisor, and the buffer holds one full
 // extra limb beyond the divisor's own length).
 function bigShl1(a: u32[], bit: number): u32[] {
-	const n: number = a.length;
-	const r: u32[] = new Array<u32>(n);
+	const n = a.length;
+	const r = new Array<u32>(n);
 	let carry: number = bit;
-	let i: number = 0;
-	while (i < n) {
-		const v: number = a[i];
+	for (let i = 0; i < n; i++) {
+		const v = a[i];
 		r[i] = ((v << 1) | carry) & 0xffffffff;
 		carry = v >>> 31;
-		i = i + 1;
 	}
 	return r;
 }
@@ -246,17 +215,15 @@ function bigPow2(k: number): u32[] {
 // that comes with one) -- each step's decision is an exact compare, so this is the version that's
 // actually easy to get right.
 function bigDivModMag(a: u32[], b: u32[], mod: boolean): u32[] {
-	const na: number = a.length;
-	const nb: number = b.length;
-	const q: u32[] = new Array<u32>(na);
-	let r: u32[] = new Array<u32>(nb + 1);
+	const na = a.length;
+	const q = new Array<u32>(na);
+	let r = new Array<u32>(b.length + 1);
 
-	let bit: number = na * 32;
+	let bit = na * 32;
 	while (bit--) {
-		const limb: number = Math.floor(bit / 32);
-		const off: number = bit - limb * 32;
-		const abit: number = (a[limb] >>> off) & 1;
-		r = bigShl1(r, abit);
+		const limb = bit >> 5;
+		const off = bit & 31;
+		r = bigShl1(r, (a[limb] >>> off) & 1);
 		if (bigGeMag(r, b)) {
 			r = bigSubMag(r, b);
 			q[limb] = q[limb] | (1 << off);
@@ -287,29 +254,26 @@ export class BigInt {
 	}
 
 	mul(b: bigint): bigint {
-		const av: u32[] = this as unknown as u32[];
-		const bv: u32[] = b as unknown as u32[];
-		const nega: boolean = bigSign(av);
-		const negb: boolean = bigSign(bv);
-		const r: u32[] = bigMulMag(bigApplySign(av, nega), bigApplySign(bv, negb));
-		return bigTrim(bigApplySign(r, nega !== negb)) as unknown as bigint;
+		const av = this as unknown as u32[];
+		const bv = b as unknown as u32[];
+		const nega = bigSign(av);
+		const negb = bigSign(bv);
+		return bigTrim(bigApplySign(bigMulMag(bigApplySign(av, nega), bigApplySign(bv, negb)), nega !== negb)) as unknown as bigint;
 	}
 
 	div(b: bigint): bigint {
-		const av: u32[] = this as unknown as u32[];
-		const bv: u32[] = b as unknown as u32[];
-		const nega: boolean = bigSign(av);
-		const negb: boolean = bigSign(bv);
-		const r: u32[] = bigDivModMag(bigApplySign(av, nega), bigApplySign(bv, negb), false);
-		return bigTrim(bigApplySign(r, nega !== negb)) as unknown as bigint;
+		const av = this as unknown as u32[];
+		const bv = b as unknown as u32[];
+		const nega = bigSign(av);
+		const negb = bigSign(bv);
+		return bigTrim(bigApplySign(bigDivModMag(bigApplySign(av, nega), bigApplySign(bv, negb), false), nega !== negb)) as unknown as bigint;
 	}
 	mod(b: bigint): bigint {
-		const av: u32[] = this as unknown as u32[];
-		const bv: u32[] = b as unknown as u32[];
-		const nega: boolean = bigSign(av);
-		const negb: boolean = bigSign(bv);
-		const r: u32[] = bigDivModMag(bigApplySign(av, nega), bigApplySign(bv, negb), true);
-		return bigTrim(bigApplySign(r, nega)) as unknown as bigint;
+		const av = this as unknown as u32[];
+		const bv = b as unknown as u32[];
+		const nega = bigSign(av);
+		const negb = bigSign(bv);
+		return bigTrim(bigApplySign(bigDivModMag(bigApplySign(av, nega), bigApplySign(bv, negb), true), nega)) as unknown as bigint;
 	}
 
 	// `this << b` -- `b` is itself a `bigint` (real TS only allows shifting a `bigint` by a `bigint`),
@@ -317,8 +281,7 @@ export class BigInt {
 	// realistic amount to shift by anyway. Reuses `mul` (`x << k` is exactly `x * 2^k`, for either sign)
 	// rather than hand-rolling its own sign-extension.
 	shl(b: bigint): bigint {
-		const k: number = bigToNumber(b);
-		return this.mul(bigTrim(bigPow2(k)) as unknown as bigint);
+		return this.mul(bigTrim(bigPow2(bigToNumber(b))) as unknown as bigint);
 	}
 
 	// Arithmetic (signed) right shift -- `this >> b`, floor-rounding like real `bigint` `>>` (which
@@ -326,28 +289,17 @@ export class BigInt {
 	// That's exactly what a bit-level shift with sign-extension from the top gives for free, so this
 	// shifts limbs directly rather than going through `div`/`bigPow2`.
 	shrs(b: bigint): bigint {
-		const k: number = bigToNumber(b);
-		const limbShift: number = Math.floor(k / 32);
-		const bitShift: number	= k - limbShift * 32;
-		const a: u32[]	= this as unknown as u32[];
-		const na: number		= a.length;
-		const ext: number		= bigSign(a) ? 0xffffffff : 0;
-		const r: u32[]	= new Array<u32>(na);
-		let i: number = 0;
-		while (i < na) {
-			const srcLo: number = i + limbShift;
-			let lo: number = ext;
-			if (srcLo < na)
-				lo = a[srcLo];
-			let hi: number = ext;
-			if (srcLo + 1 < na)
-				hi = a[srcLo + 1];
-			if (bitShift === 0) {
-				r[i] = lo;
-			} else {
-				r[i] = ((lo >>> bitShift) | (hi << (32 - bitShift))) & 0xffffffff;
-			}
-			i = i + 1;
+		const k			= bigToNumber(b);
+		const limbShift = k >>> 5;
+		const bitShift	= k & 31;
+		const a			= this as unknown as u32[];
+		const na		= a.length;
+		const ext		= bigSign(a) ? 0xffffffff : 0;
+		const r			= new Array<u32>(na);
+		for (let i = 0; i < na; i++) {
+			const srcLo = i + limbShift;
+			const lo = srcLo < na ? a[srcLo] : ext;
+			r[i] = bitShift === 0 ? lo : ((lo >>> bitShift) | ((srcLo + 1 < na ?a[srcLo + 1] : ext) << (32 - bitShift))) & 0xffffffff;
 		}
 		return bigTrim(r) as unknown as bigint;
 	}
@@ -359,27 +311,16 @@ export class BigInt {
 	// guard limb above the result (unlike `shrs`) forces a non-negative read even when a negative input's
 	// shifted-down bits leave the new top limb's own top bit set.
 	shru(b: bigint): bigint {
-		const k: number			= bigToNumber(b);
-		const limbShift: number = Math.floor(k / 32);
-		const bitShift: number	= k - limbShift * 32;
-		const a: u32[]	= this as unknown as u32[];
-		const na: number		= a.length;
-		const r: u32[]	= new Array<u32>(na + 1);
-		let i: number = 0;
-		while (i < na) {
-			const srcLo: number = i + limbShift;
-			let lo: number = 0;
-			if (srcLo < na)
-				lo = a[srcLo];
-			let hi: number = 0;
-			if (srcLo + 1 < na)
-				hi = a[srcLo + 1];
-			if (bitShift === 0) {
-				r[i] = lo;
-			} else {
-				r[i] = ((lo >>> bitShift) | (hi << (32 - bitShift))) & 0xffffffff;
-			}
-			i = i + 1;
+		const k			= bigToNumber(b);
+		const limbShift = k >>> 5;
+		const bitShift	= k & 31;
+		const a			= this as unknown as u32[];
+		const na		= a.length;
+		const r			= new Array<u32>(na + 1);
+		for (let i = 0; i < na; i++) {
+			const srcLo = i + limbShift;
+			const lo = srcLo < na ? a[srcLo] : 0;
+			r[0] = bitShift === 0 ? lo: ((lo >>> bitShift) | ((srcLo + 1 < na ? a[srcLo + 1] : 0) << (32 - bitShift))) & 0xffffffff;
 		}
 		return bigTrim(r) as unknown as bigint;
 	}
@@ -401,12 +342,10 @@ export class BigInt {
 
 	toString(radix?: number): string {
 		let s = '';
-		let i = this as unknown as bigint;
-		let radixb = radix ? bigFromNumber(radix) : 10n;
-		while (i > 0) {
+		const radixb = radix ? bigFromNumber(radix) : 10n;
+		for (let i = this as unknown as bigint; i > 0; i /= radixb) {
 			const d = Number(i % radixb);
 			s = String.fromCharCode(d < 10 ? 48 + d : 65 + d - 10) + s;
-			i /= radixb;
 		}
 		return s;
 	}

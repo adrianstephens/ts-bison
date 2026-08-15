@@ -7,8 +7,8 @@ declare module 'wasi_snapshot_preview1' {
 }
 // Declaring standard modern WASI resource management functions
 declare module 'wasi:io/resource-error' {
-    // Standard WASI function to drop a host resource handle
-    export function drop(resourceHandle: i32): void;
+	// Standard WASI function to drop a host resource handle
+	export function drop(resourceHandle: i32): void;
 }
 
 // `__asm(asmText)` is how a lib file embeds real wasm assembly -- towasm.ts's own `isAsm`/`makeAsmBuiltin`
@@ -38,13 +38,20 @@ declare type u32 = number;
 declare type u64 = number;
 
 // Not matched in towasm.ts's `builtinTypes`/`wasmTypeOf` like the others above -- never used as a real
-// value's type (`Uint8Array`'s own storage width is picked by `$elem`, a separate towasm-only mechanism,
-// not by a declared type), only as `TypedArray<T>`'s documentation-only type argument (`lib/typedarray.ts`).
+// value's type, only as `TypedArray<T>`'s own real type argument (`lib/typedarray.ts`): `Uint8Array`/etc are
+// `declare type X = TypedArray<u8>`-style aliases (below), and towasm.ts's `ensureClass` reads the real
+// instantiation's own type argument name straight off `TypedArray<T>`'s real generic instantiation to pick
+// `$elem` (each one's real physical storage width), the same general mechanism any generic class's own
+// type argument already flows through -- not a separate per-name table. `i8` lives in `lib/typedarray.ts`
+// itself (only place it's used); `u8`/`i16`/`u16`/etc live here alongside the others since ambient
+// `TypedArray<T>` (below) references them too.
 declare type u8 = number;
+declare type i16 = number;
+declare type u16 = number;
 
 declare var NaN: number;
 declare var Infinity: number;
-/*
+
 interface Object {}
 interface Function {}
 interface CallableFunction {}
@@ -52,13 +59,21 @@ interface NewableFunction {}
 interface IArguments {}
 interface Symbol {}
 interface Boolean {}
+interface BigInt {}
+
 interface Number {}
+declare var Number: {
+	new (value?: any): Number;
+	(value?: any): number;
+}
 
 //-----------------------------------------------------------------------------
 //	String
 //-----------------------------------------------------------------------------
 
 interface String {
+	readonly length: number;
+
 	toString(): string;
 	charAt(pos: number): string;
 	charCodeAt(index: number): number;
@@ -66,7 +81,7 @@ interface String {
 	concat(b: string): string;
 	indexOf(searchString: string, position?: number): number;
 	lastIndexOf(searchString: string, position?: number): number;
-	localeCompare(that: string): number;
+//	localeCompare(that: string): number;
 	match(regexp: string | RegExp): RegExpMatchArray | null;
 	replace(searchValue: string | RegExp, replaceValue: string): string;
 	replace(searchValue: string | RegExp, replacer: (substring: string, ...args: any[]) => string): string;
@@ -79,10 +94,7 @@ interface String {
 	toUpperCase(): string;
 	toLocaleUpperCase(locales?: string | string[]): string;
 	trim(): string;
-	readonly length: number;
 
-	// IE extensions
-	substr(from: number, length?: number): string;
 	valueOf(): string;
 
 	readonly [index: number]: string;
@@ -128,8 +140,8 @@ interface RegExp {
 //-----------------------------------------------------------------------------
 
 interface ArrayLike<T> {
-    readonly length: number;
-    readonly [n: number]: T;
+	readonly length: number;
+	readonly [n: number]: T;
 }
 
 interface ConcatArray<T> {
@@ -139,10 +151,13 @@ interface ConcatArray<T> {
 	slice(start?: number, end?: number): T[];
 }
 
-interface Array<T> {
+declare class Array<T> {
 	[i: number]: T;
 	length: number;
 
+	constructor(n: number);
+
+	grow(n: i32): i32;
 	toString(): string;
 	toLocaleString(): string;
 	pop(): T | undefined;
@@ -180,53 +195,68 @@ interface Array<T> {
 //-----------------------------------------------------------------------------
 //	TypedArray
 //-----------------------------------------------------------------------------
+interface ArrayBuffer {
+//	byteLength: number;
+}
 
 interface TypedArray<T> {
-    readonly BYTES_PER_ELEMENT: number;
-    readonly buffer: ArrayBuffer;
-    readonly byteLength: number;
-    readonly byteOffset: number;
-    copyWithin(target: number, start: number, end?: number): this;
-    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
-    fill(value: number, start?: number, end?: number): this;
-    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): TypedArray<T>;
-    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
-    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
-    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
-    indexOf(searchElement: number, fromIndex?: number): number;
-    join(separator?: string): string;
-    lastIndexOf(searchElement: number, fromIndex?: number): number;
-    readonly length: number;
-    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): TypedArray<T>;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
-    reverse(): this;
-    set(array: ArrayLike<number>, offset?: number): void;
-    slice(start?: number, end?: number): TypedArray<T>;
-    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
-    sort(compareFn?: (a: number, b: number) => number): this;
-    subarray(begin?: number, end?: number): TypedArray<T>;
-    toLocaleString(): string;
-    toString(): string;
-    valueOf(): this;
+	readonly BYTES_PER_ELEMENT: number;
+	/*readonly*/ buffer: ArrayBuffer;
+	/*readonly*/ byteOffset: number;
+	/*readonly*/ byteLength: number;
+	/*readonly*/ length: number;
+//	[i: i32]: number;
 
-    [index: number]: number;
-}
+	copyWithin(target: number, start: number, end?: number): this;
+	every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
+	fill(value: number, start?: number, end?: number): this;
+	filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): TypedArray<T>;
+	find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
+	findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
+	forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
+	indexOf(searchElement: number, fromIndex?: number): number;
+	join(separator?: string): string;
+	lastIndexOf(searchElement: number, fromIndex?: number): number;
+	map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): TypedArray<T>;
+	reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+	reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
+	reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
+	reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+	reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
+	reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
+	reverse(): this;
+//	set(array: ArrayLike<number>, offset?: number): void;
+	slice(start?: number, end?: number): TypedArray<T>;
+	some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
+	sort(compareFn?: (a: number, b: number) => number): this;
+	subarray(begin?: number, end?: number): TypedArray<T>;
+	toLocaleString(): string;
+	toString(): string;
+	valueOf(): this;
 
-declare var TypedArray: {
-    new (length: number): TypedArray<any>;
-    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): TypedArray<any>;
-    new (array: ArrayBuffer): TypedArray<any>;
-    new <T>(array: ArrayLike<T>): TypedArray<any>;
-    readonly BYTES_PER_ELEMENT: number;
-    of<T>(...items: T[]): TypedArray<T>;
-    from<T>(arrayLike: ArrayLike<T>): TypedArray<T>;
-    from<T, U>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => U, thisArg?: any): TypedArray<U>;
 }
+declare type Int8Array = TypedArray<i8>;
+declare type Uint8Array = TypedArray<u8>;
+declare type Uint8ClampedArray = TypedArray<u8>;
+declare type Int16Array = TypedArray<i16>;
+declare type Uint16Array = TypedArray<u16>;
+declare type Int32Array = TypedArray<i32>;
+declare type Uint32Array = TypedArray<u32>;
+declare type Float32Array = TypedArray<f32>;
+declare type Float64Array = TypedArray<f64>;
+declare type BigInt64Array = TypedArray<i64>;
+declare type BigUint64Array = TypedArray<u64>;
+
+//declare var TypedArray: {
+//	new (length: number): TypedArray<any>;
+//	new (buffer: ArrayBuffer, byteOffset?: number, length?: number): TypedArray<any>;
+//	new (array: ArrayBuffer): TypedArray<any>;
+//	new <T>(array: ArrayLike<T>): TypedArray<any>;
+//	readonly BYTES_PER_ELEMENT: number;
+//	of<T>(...items: T[]): TypedArray<T>;
+//	from<T>(arrayLike: ArrayLike<T>): TypedArray<T>;
+//	from<T, U>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => U, thisArg?: any): TypedArray<U>;
+//}
 
 //-----------------------------------------------------------------------------
 //	Math
@@ -262,7 +292,7 @@ declare var Math: {
 	sqrt(x: number): number;
 	tan(x: number): number;
 };
-*/
+
 //-----------------------------------------------------------------------------
 //
 //-----------------------------------------------------------------------------

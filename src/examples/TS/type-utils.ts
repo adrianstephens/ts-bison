@@ -157,6 +157,15 @@ export function rangeIntersect(a: NumRange, b: NumRange): NumRange | undefined {
 	return { base: a.base, min, max, integer: a.integer || b.integer };
 }
 
+// Widens a range to cover both `a` and `b` -- the union counterpart of `rangeIntersect`. Same-base only.
+export function rangeUnion(a: NumRange, b: NumRange): NumRange | undefined {
+	if (a.base !== b.base)
+		return undefined;
+	const min = a.min === undefined || b.min === undefined ? undefined : a.min < b.min ? a.min : b.min;
+	const max = a.max === undefined || b.max === undefined ? undefined : a.max > b.max ? a.max : b.max;
+	return { base: a.base, min, max, integer: a.integer && b.integer };
+}
+
 // Same-typed `number`/`bigint` arithmetic on a `number | bigint`-typed value, without mixing the two at the type level.
 function negValue(v: number | bigint): number | bigint { return typeof v === 'bigint' ? -v : -v; }
 function addValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a + (b as bigint) : a + (b as number); }
@@ -739,7 +748,11 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 		);
 	}
 	const ret =	prop === 'pop' || prop === 'shift' ? combineTypes([elem, UNDEFINED])
-			:	prop === 'push' || prop === 'unshift' || prop === 'indexOf' || prop === 'lastIndexOf' || prop === 'findIndex' ? NUMBER
+			// Bounded (not bare `number`) so a loop comparing against these stays in `i32` instead of
+			// promoting to `f64` -- see `towasm.ts`'s `numericPairWtype`, which requires both operands
+			// already `i32`. `0x7fffffff`, not `0xffffffff`, so `intWasmType` picks `i32` not `u32`.
+			:	prop === 'push' || prop === 'unshift' ? TS.RangeType('number', 0, 0x7fffffff, true)
+			:	prop === 'indexOf' || prop === 'lastIndexOf' || prop === 'findIndex' ? TS.RangeType('number', -1, 0x7fffffff, true)
 			:	prop === 'includes' || prop === 'some' ? BOOLEAN
 			:	prop === 'join' ? STRING
 			:	prop === 'slice' || prop === 'concat' || prop === 'reverse' || prop === 'flat' ? { type: 'array', element: elem } as Type
@@ -758,6 +771,28 @@ function objectPrototypeMember(prop: string): Type | undefined {
 
 // `skipObjectFallback`: an intersection part must not resolve `Object.prototype` members on its own, or the "first match wins" search would
 // stop before reaching a later part's real declaration (e.g. a superclass). Only set by `case 'intersection'`'s own recursive per-part search.
+// The declared value type of a numeric index signature (`[i: number]: T`) reachable from `t` -- searches
+// every part of an intersection (declaration merging's usual shape, e.g. an ambient interface merged with
+// a real implementing class, see `lib/typedarray.ts`'s own header comment), not just a bare object, since
+// `resolve` never flattens one into the other. Shared by `lookupMember`'s own intersection fallback below
+// and `checker.ts`'s `case 'index'` (a computed, non-string key has no *named* member to look up at all,
+// only ever a numeric index signature).
+export function indexSignatureOf(t: Type, scope: Scope, depth = 6): Type | undefined {
+	if (depth < 0)
+		return undefined;
+	const r = resolveOwn(t, scope);
+	if (r.type === 'object')
+		return r.members.find((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index' && isNumberLike(m.paramType, scope))?.typeAnnotation;
+	if (r.type === 'intersection') {
+		for (const part of r.types) {
+			const found = indexSignatureOf(part, scope, depth - 1);
+			if (found)
+				return found;
+		}
+	}
+	return undefined;
+}
+
 export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, skipObjectFallback = false): Type | undefined {
 	if (depth < 0) {
 		hitDepthLimit('lookupMember');
@@ -766,7 +801,16 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 	// A bare `ref` stamped with its own `declScope` resolves there instead of in `scope` -- the caller's chain may shadow it
 	// (e.g. DOM's `Element`). `resolve()` itself stays unaware of `declScope`; this is the one bounded place that consults it.
 	t = resolveOwn(t, scope);
-	if (prop === 'length' && (t.type === 'array' || t.type === 'tuple' || isString(t)))
+	// Bounded, not bare `number` -- see the `arrayMethod` comment above for why. `tuple`/`string`
+	// only, not a plain `array` -- a real JS array's `.length` is writable (`a.length = 0` to
+	// truncate), so it must stay assignable from a general `number`; narrowing it here as a
+	// *target* type too (this checker has no separate read/write type for one property) rejected
+	// real corpus code (`a.length = someGeneralNumber`). Confirmed via the whole-workspace scan
+	// (test-ts-parser.ts) -- narrowing all three initially regressed 7 files with exactly this
+	// "not assignable to number[0..2147483647]" error, all on plain arrays.
+	if (prop === 'length' && (t.type === 'tuple' || isString(t)))
+		return TS.RangeType('number', 0, 0x7fffffff, true);
+	if (prop === 'length' && t.type === 'array')
 		return NUMBER;
 	if (prop === 'constructor')
 		return ANY;		// every object has one; its shape isn't modeled
@@ -804,7 +848,14 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				return undefined;
 			// `Object.prototype`'s own members are checked after the index signature, so a type that declares its own override
 			// (e.g. a custom `toString(x?: string): string`) still wins.
-			return t.members.find(m => m.type === 'index')?.typeAnnotation ?? objectPrototypeMember(prop);
+			// A *numeric* index signature (`[i: number]: T`) only covers a numeric-looking key (real TS/JS array-index
+			// semantics) -- unguarded, it used to match *any* named lookup at all (`'byteLength'` on a plain `[i:number]:u8`
+			// class read the element type back as if `byteLength` were itself an element), which then let e.g. a plain
+			// `number[]` (itself index-signature-shaped) structurally satisfy a class it shares no real members with,
+			// silently misrouting overload resolution (`isAssignable`'s own `dst.type === 'object'` case). A *string*
+			// index signature is untouched -- it always did (and still does) cover every named key, correctly.
+			return t.members.find((m): m is Extract<TS.TypeMember, { type: 'index' }> =>
+				m.type === 'index' && (!isNumberLike(m.paramType, scope) || /^(0|[1-9]\d*)$/.test(prop)))?.typeAnnotation ?? objectPrototypeMember(prop);
 		}
 		case 'intersection': {
 			const matches: Type[] = [];
@@ -830,14 +881,23 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				return matches[0];
 			// Declaration merging is the common reason more than one part declares `prop`, usually with the *identical* type --
 			// dedupe first, which collapses back to the `matches.length === 1` case and keeps single-declaration behavior untouched.
-			const distinct = [...new Map(matches.map(m => [typeKey(m), m])).values()];
+			// A wasm pseudo-type (`i32`/etc, see `WASM_PSEUDO_TYPES`) keys as its real alias target `number` here -- an ambient
+			// interface merged with a towasm-internal class implementing it (e.g. `TypedArray`/`lib/typedarray.ts`) commonly
+			// redeclares the same member once each way (`number` vs `i32`), which are the *same* declared type, not a genuine
+			// conflict; `hoist`'s own pre-pass always processes interfaces before classes, so `matches`' later (class) entry -
+			// the physically-precise one towasm.ts itself needs - is what survives this `Map`'s last-write-wins dedup.
+			const dedupKey = (m: Type) => typeKey(m.type === 'ref' && !m.typeArgs && WASM_PSEUDO_TYPES.has(m.name) ? NUMBER : m);
+			const distinct = [...new Map(matches.map(m => [dedupKey(m), m])).values()];
 			if (distinct.length === 1)
 				return distinct[0];
 			// Genuinely different same-named methods across parts is real TS's cross-file overload-merging shape -- combine into
 			// one multi-signature set, same as the `object` case; flatten each match's own single-or-already-merged shape first.
+			// Reversed (interface-before-class per `hoist`'s pass ordering above): overload resolution's "first arity+type
+			// fit wins" (checker.ts's `case 'call'`) must try the concrete class's own signature before an ambiguously-fitting
+			// ambient interface stub -- same "most concrete wins" precedent as the dedup path just above.
 			const sigs: TS.CallSig[] = [];
 			let allSigs = true;
-			for (const m of distinct) {
+			for (const m of [...distinct].reverse()) {
 				if (m.type === 'function') {
 					sigs.push(m);
 				} else if (m.type === 'object' && m.members.length && m.members.every(mem => mem.type === 'call')) {

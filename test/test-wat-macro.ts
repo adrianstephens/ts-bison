@@ -1,4 +1,4 @@
-import { parseWat, toWasm } from '../examples/wat-parser';
+import { parseWat, toWasm } from '../src/examples/wat-parser';
 
 function test(name: string, wat: string, check: (mod: ReturnType<typeof parseWat>) => void, defines?: Record<string, string>) {
 	console.log(`=== Test: ${name} ===`);

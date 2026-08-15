@@ -1,7 +1,7 @@
-import {preprocess} from '../examples/CPP/preprocessor';
-import {fileResolver} from '../examples/CPP/include-resolver';
-import {cParser} from '../examples/CPP/c-parser';
-import {parse as cppParse} from '../examples/CPP/cpp-parser';
+import {preprocess} from '../src/examples/CPP/preprocessor';
+import {fileResolver} from '../src/examples/CPP/include-resolver';
+import {cParser} from '../src/examples/CPP/c-parser';
+import {parse as cppParse} from '../src/examples/CPP/cpp-parser';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -26,8 +26,11 @@ async function throws(name: string, fn: () => Promise<unknown>, contains?: strin
 		++fail;
 		console.error(`FAIL ${name}: did not throw`);
 	} catch (e) {
-		if (!contains || String(e).includes(contains)) ++pass;
-		else { ++fail; console.error(`FAIL ${name}: wrong error:`, e); }
+		if (!contains || String(e).includes(contains)) {
+			++pass;
+		} else {
+			++fail; console.error(`FAIL ${name}: wrong error:`, e);
+		}
 	}
 }
 
@@ -73,8 +76,11 @@ await eq('block-comment',	preprocess('int a; /* foo\nbar */ int b;'), 'int a; in
 await eq('line-file',		preprocess('a = __LINE__;\nb = __FILE__;', {filename: 'f.c'}), 'a = 1; b = "f.c";');
 {
 	const lines = (await preprocess('#define X 1\nint a = X;\n#if 0\nskipped\n#endif\nint b;\n')).split('\n');
-	if (lines.length === 7 && lines[1] === 'int a = 1;' && lines[5] === 'int b;') ++pass;
-	else { ++fail; console.error('FAIL line-preserve', JSON.stringify(lines)); }
+	if (lines.length === 7 && lines[1] === 'int a = 1;' && lines[5] === 'int b;') {
+		++pass;
+	} else {
+		++fail; console.error('FAIL line-preserve', JSON.stringify(lines));
+	}
 }
 
 // --- #include ---
@@ -117,8 +123,11 @@ int arr[SIZE];
 int arr[1];
 #endif
 `);
-	if (JSON.stringify(ast).includes('4')) ++pass;
-	else { ++fail; console.error('FAIL c-parser-e2e', JSON.stringify(ast)); }
+	if (JSON.stringify(ast).includes('4')) {
+		++pass;
+	} else {
+		++fail; console.error('FAIL c-parser-e2e', JSON.stringify(ast));
+	}
 }
 {
 	const ast = await cppParse(`
@@ -126,8 +135,11 @@ int arr[1];
 #define T int
 std::vector<T> v;
 `, {knownTypes: ['std', 'vector']});
-	if (JSON.stringify(ast).includes('vector')) ++pass;
-	else { ++fail; console.error('FAIL cpp-parser-e2e'); }
+	if (JSON.stringify(ast).includes('vector')) {
+		++pass;
+	} else {
+		++fail; console.error('FAIL cpp-parser-e2e');
+	}
 }
 
 console.log(`\nPreprocessor tests: ${pass} passed, ${fail} failed`);

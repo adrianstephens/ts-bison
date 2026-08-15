@@ -1,4 +1,4 @@
-import { makeParser, makeRule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../../src/tison';
+import { makeParser, makeRule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../../tison';
 import { preprocess, PreprocessOptions } from './preprocessor';
 import { Literal, Identifier, Unary, UnaryPost, Binary } from '../common';
 

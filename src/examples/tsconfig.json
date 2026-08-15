@@ -1,7 +1,7 @@
 {
-	"extends": "../tsconfig.json",
+	"extends": "../../tsconfig.json",
 	"compilerOptions": {
-		"outDir": "../dist/examples",
+		"outDir": "../../dist/examples",
 		"rootDir": "./"
 	},
 	"include": [
@@ -16,6 +16,6 @@
 		"TS/lib/**/*.ts"
 	],
 	"references": [
-		{"path": "../tsconfig.json"}
+		{"path": "../../tsconfig.json"}
 	]
 }

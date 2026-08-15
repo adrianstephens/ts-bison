@@ -439,6 +439,16 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 // walkB
 //-----------------------------------------------------------------------------
 
+// A boolean-returning walk -- every list of siblings a node is composed from (a block's
+// statements, an `if`'s branches, etc) is combined with `.some()`, so a hook returning `true`
+// doesn't just stop the current subtree, it short-circuits traversal of *every remaining sibling
+// at every enclosing level too*. That's exactly right for an existence query ("does this
+// expression reference name X anywhere?" -- see e.g. `exprMentionsName`/`towasm.ts`'s named-
+// function self-reference check: found it, stop looking). It's wrong for a "visit everything,
+// accumulate side effects" walk -- a hook built for that must never intentionally return `true`
+// as a signal (only ever relay `process(x)`'s own result, or `false` to skip a subtree, same as
+// `ownBoundNames`/`collectFreeVars` in towasm.ts already do), or it will silently skip later
+// siblings it should have visited.
 type ProcessB<U>	= <T extends U>(x?: T, recall?: boolean)=>boolean;
 type OnASTB<U>		= (x: U, process: ProcessB<U>) => boolean;
 

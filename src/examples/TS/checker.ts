@@ -958,19 +958,23 @@ export function makeChecker(diag: Diagnostics) {
 				if (refined)
 					return refined;
 				const objT	= typeOf(e.object, scope);
-				// `Uint8Array`/`Int32Array`/`Uint32Array`/`ArrayBuffer` have no backing class/interface
-				// declaration -- only the 'index' case above special-cases the typed-array element type, so
-				// these would otherwise fall through to `lookupMember`, find nothing, and silently resolve
-				// as `any` (they're never `sealed`).
-				const resolvedObjT = T.resolve(scope, e.optional ? T.nonNullable(objT, scope) : objT);
-				if (resolvedObjT.type === 'ref' && resolvedObjT.name in TYPED_ARRAY_RANGES) {
+				// `Uint8Array`/`Int32Array`/`Uint32Array`/etc are aliases to `TypedArray<T>` (`lib.d.ts`) --
+				// checked here by name, on the *unresolved* `objT`, before `T.resolve` expands the alias into
+				// `TypedArray<T>`'s own merged (real class + ambient interface, `lib/typedarray.ts`'s own
+				// header comment) shape: `T.resolve` doesn't flatten an intersection, so a resolved check here
+				// would never match at all, same reason `i32`/`u8`/etc are checked by name before resolving.
+				if (objT.type === 'ref' && !objT.typeArgs && objT.name in TYPED_ARRAY_RANGES) {
+					// Bounded, not bare `number` -- a loop comparing against these should stay `i32` in
+					// towasm.ts rather than promoting to `f64` (see `numericPairWtype`, which requires
+					// both operands already `i32`).
 					if (e.property === 'length' || e.property === 'byteOffset' || e.property === 'byteLength')
-						return T.NUMBER;
+						return TS.RangeType('number', 0, 0x7fffffff, true);
 					if (e.property === 'buffer')
 						return TS.RefType('ArrayBuffer');
 				}
+				const resolvedObjT = T.resolve(scope, e.optional ? T.nonNullable(objT, scope) : objT);
 				if (resolvedObjT.type === 'ref' && resolvedObjT.name === 'ArrayBuffer' && e.property === 'byteLength')
-					return T.NUMBER;
+					return TS.RangeType('number', 0, 0x7fffffff, true);
 				// `?.` only ever looks the property up on the non-nullish part of `objT` -- `lookupMember`'s
 				// own union case requires *every* member to have it (a bare `null`/`undefined` member never
 				// does), so an unguarded `T.lookupMember(objT, ...)` here would always miss and fall back to
@@ -988,12 +992,17 @@ export function makeChecker(diag: Diagnostics) {
 				return (e.optional || T.memberOptional(objT, e.property, scope)) ? T.combineTypes([t, T.UNDEFINED]) : t;
 			}
 			case 'index': {
-				const objT = T.resolve(scope, typeOf(e.object, scope));
+				const rawObjT = typeOf(e.object, scope);
+				// Checked by name on the *unresolved* type, same reason `case 'member'`'s own `TYPED_ARRAY_RANGES`
+				// check above is -- `T.resolve` below expands a typed-array alias into `TypedArray<T>`'s merged
+				// (real class + ambient interface) shape, an intersection it never flattens, so a resolved check
+				// would never match.
+				if (rawObjT.type === 'ref' && !rawObjT.typeArgs && rawObjT.name in TYPED_ARRAY_RANGES)
+					return T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]);
+				const objT = T.resolve(scope, rawObjT);
 				typeOf(e.property, scope);
 				if (objT.type === 'array')
 					return objT.element;
-				if (objT.type === 'ref' && objT.name in TYPED_ARRAY_RANGES)
-					return T.rangeToType(TYPED_ARRAY_RANGES[objT.name]);
 				if (objT.type === 'tuple' && T.isLiteral(e.property, 'number')) {
 					const el = objT.elements[e.property.value];
 					if (!muted && !el)
@@ -1001,13 +1010,16 @@ export function makeChecker(diag: Diagnostics) {
 					return (el && T.tupleElementType(el)) ?? T.ANY;
 				}
 				// A declared `[i: number]: T` index signature (real lib.d.ts typed arrays once `TStypeCheckAsync`
-				// loads one, `Record<number, T>`-shaped types, etc). Not a fallback from something more precise --
-				// for a computed/non-literal numeric key there's no possible *named* property to prefer over it,
-				// so this is the only thing that can type `obj[i]` against an object-shaped type at all.
-				if (objT.type === 'object' && !T.isLiteral(e.property, 'string')) {
-					const idx = objT.members.find((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index' && T.isNumberLike(m.paramType, scope));
-					if (idx)
-						return idx.typeAnnotation;
+				// loads one, `Record<number, T>`-shaped types, etc) -- `indexSignatureOf` also searches every
+				// part of an intersection (e.g. `TypedArray<T>`'s own merged interface+class shape, reached
+				// through `this` inside its own method bodies with no alias name left to special-case by).
+				// Not a fallback from something more precise -- for a computed/non-literal numeric key there's
+				// no possible *named* property to prefer over it, so this is the only thing that can type
+				// `obj[i]` against an object-shaped (or intersection) type at all.
+				if (!T.isLiteral(e.property, 'string')) {
+					const idxT = T.indexSignatureOf(objT, scope);
+					if (idxT)
+						return idxT;
 				}
 				if (T.isLiteral(e.property, 'string')) {
 					const t = T.lookupMember(objT, e.property.value, scope);
@@ -1022,16 +1034,17 @@ export function makeChecker(diag: Diagnostics) {
 
 			case 'call':
 			case 'new': {
-				// `a.indexOf(...)`/`a.slice(...)`/etc on a typed array: these have no backing class/interface
-				// declaration either (same reason as `TYPED_ARRAY_RANGES`'s `.length`/`.buffer` above -- see
-				// towasm.ts's `TA_METHODS`, which implements them directly, bypassing `MethodOwner`/`ownerOf`
-				// entirely), so without this they'd fall through to `any`. Type-only, no arg validation --
-				// same leniency the generic signature path below gives an unresolvable callee.
+				// `a.indexOf(...)`/`a.slice(...)`/etc on a typed array -- likely redundant now that
+				// `TypedArray<T>` (`lib/typedarray.ts`) declares real methods for all of these, reached via
+				// the ordinary `case 'member'`/`lookupMember` path below regardless (`lookupMember` already
+				// searches every part of a merged intersection), but left as a harmless, explicit fallback.
+				// Checked by name on the *unresolved* type -- same reason `TYPED_ARRAY_RANGES`'s other checks
+				// above are: `T.resolve` would expand the alias into an intersection this never matches.
 				if (e.type === 'call' && e.callee.type === 'member') {
-					const objT = T.resolve(scope, typeOf(e.callee.object, scope));
-					if (objT.type === 'ref' && objT.name in TYPED_ARRAY_RANGES) {
+					const objT = typeOf(e.callee.object, scope);
+					if (objT.type === 'ref' && !objT.typeArgs && objT.name in TYPED_ARRAY_RANGES) {
 						switch (e.callee.property) {
-							case 'indexOf': case 'lastIndexOf':	return T.NUMBER;
+							case 'indexOf': case 'lastIndexOf':	return TS.RangeType('number', -1, 0x7fffffff, true);
 							case 'includes':						return T.BOOLEAN;
 							case 'reverse': case 'slice': case 'concat': case 'fill': case 'subarray':
 								return TS.RefType(objT.name);
@@ -1288,8 +1301,9 @@ export function makeChecker(diag: Diagnostics) {
 							// A typed-array write accepts any real `number` (silently truncated/wrapped via the
 							// element's own real JS coercion, never a type error) -- unlike a read, so the narrow
 							// element range `typeOf`'s 'index' case gives typed-array reads doesn't apply here.
-							const objT = T.resolve(scope, typeOf(e.left.object, scope));
-							if (objT.type === 'ref' && objT.name in TYPED_ARRAY_RANGES)
+							// Checked by name, unresolved, same reason `typeOf`'s own 'index' case checks it that way.
+							const objT = typeOf(e.left.object, scope);
+							if (objT.type === 'ref' && !objT.typeArgs && objT.name in TYPED_ARRAY_RANGES)
 								lt = T.NUMBER;
 						}
 
@@ -1608,6 +1622,15 @@ export function makeChecker(diag: Diagnostics) {
 				// as a plain "unknown identifier" fallback, not a real error -- found via `lib/number.ts`'s
 				// `export const ieeeFrom = __asm<...>(...)`, whose call result silently became `any` deep
 				// inside `Math.log`, well past where the missing registration actually happened.
+				// `stmt.ambient`: skip here -- `hoist`'s own pre-pass already registered it, in the same
+				// sequential order as every other top-level declaration (so a same-named real `class` later
+				// in the file correctly wins, last-declaration-wins). Re-running `hoistVar` here too would
+				// re-register it a second time at *this* statement's own position in the sequential walk --
+				// earlier than that later class -- silently clobbering the class's binding back to the
+				// ambient stub for the rest of this pass (found via `String`: `declare var String` in
+				// lib.d.ts plus the real `class String` in string.ts, both bind the name `String`, and the
+				// real class's own constructor -- checked *after* this re-clobber -- saw the ambient stub's
+				// type when resolving its own self-referential `String.alloc(...)` call).
 				const pos = (stmt as any).pos;
 				for (const d of stmt.declarations) {
 					if (!muted && d.typeAnnotation && d.init) {
@@ -1618,7 +1641,8 @@ export function makeChecker(diag: Diagnostics) {
 						else if (!checkAssignable(init, anno, scope, pos))
 							err(SEVERITY.ERROR, pos)`Type '${init}' is not assignable to type '${anno}' in declaration of '${d.name}'`;
 					}
-					hoistVar(scope, d, stmt.kind !== 'const');
+					if (!stmt.ambient)
+						hoistVar(scope, d, stmt.kind !== 'const');
 				}
 				break;
 			}

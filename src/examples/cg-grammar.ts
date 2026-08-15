@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-this-alias */
-import { makeParser, makeRule, Rules, List, terminal, Forward, TextPos } from '../src/tison';
-import { makeRuleR } from '../src/rrule';
+import { makeParser, makeRule, Rules, List, terminal, Forward, TextPos } from '../tison';
+import { makeRuleR } from '../rrule';
 
 function claim(condition: any): asserts condition {}
 

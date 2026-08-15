@@ -1,4 +1,4 @@
-import { makeParser, Rules, Forward, Maybe, List, MaybeList, OneOf, terminal, ForceFork } from '../../src/tison';
+import { makeParser, Rules, Forward, Maybe, List, MaybeList, OneOf, terminal, ForceFork } from '../../tison';
 import * as JS from './js-parser';
 import { IDENT, NUM, STR, unquoteString, Rule } from './js-parser';
 import { Literal, UnaryPost, mergeMods } from '../common';
@@ -733,6 +733,16 @@ for (const [relational, member, call] of [
 		Rule(['new', JS.member_expression, call_type_arguments],				$ => ({ type: 'new', callee: $[1], arguments: [], typeArgs: $[2] } as const)),
 	);
 }
+
+// `for(...)`'s init/test/update clauses parse through js-parser.ts's own ECMA-262 In/NoIn split
+// (kept separate so a bare `in` isn't ambiguous with `for(x in y)`) -- `relational_expression_noin`
+// shares `shift_expression` and everything below it with the ordinary chain above (so `!`/generic-call/
+// `new` are already reachable there), but it's its own nonterminal at the relational level, so it needs
+// its own `as`/`satisfies` rules or `for (let i = x as T; ...)` can't parse.
+JS.relational_expression_noin.push(
+	Rule([JS.relational_expression_noin, 'as', type],			$ => ({ type: 'as', expression: $[0], typeAnnotation: $[2] } as const)),
+	Rule([JS.relational_expression_noin, 'satisfies', type],	$ => ({ type: 'satisfies', expression: $[0], typeAnnotation: $[2] } as const)),
+);
 
 // ===================================================================
 //  Wire it up

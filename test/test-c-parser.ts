@@ -1,4 +1,4 @@
-import {cParser} from '../examples/CPP/c-parser';
+import {cParser} from '../src/examples/CPP/c-parser';
 
 // parse() is async now (see the preprocessor's include resolver); one chain keeps output ordered.
 let chain = Promise.resolve();

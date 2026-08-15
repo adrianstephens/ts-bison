@@ -1,5 +1,20 @@
 /// <reference path="./lib.d.ts" />
 
+
+let heap: i32 = 0;
+export function __towasm_alloc(size: i32, align: i32): i32 {
+	const ret  = (heap + align - 1) & -align;
+	heap = ret + size;
+
+	// Grow by just enough whole pages (64KiB) to cover the new heap pointer, if it now exceeds the memory's current size.
+	const mem = __asm<[], i32>('memory.size')();
+	if (heap > (mem << 16)) {
+		const extra = (heap - (mem << 16) + 65535) >> 16;
+		__asm<[i32], i32>('memory.grow')(extra);
+	}
+	return ret;
+}
+
 //-----------------------------------------------------------------------------
 //	console.log
 //-----------------------------------------------------------------------------
