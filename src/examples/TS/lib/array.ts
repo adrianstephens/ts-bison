@@ -26,6 +26,15 @@ export class Array<T> {
 		return Array._alloc<T>(n) as unknown as Array<T>;
 	}
 
+	grow(n: i32): i32 {
+		const len = this.length;
+		const result: T[] = Array._alloc<T>(len + n);
+		Array._copy(result, 0, this as unknown as T[], 0, len);
+		// @ts-ignore - tison extension: reassigning `this` swaps the backing array
+		this = result as unknown as Array<T>;
+		return len;
+	}
+
 	// `push`/`pop`/`shift`/`unshift`: real bodies -- growing/shrinking means allocating a fresh physical array
 	// (a wasm-GC array's length is fixed at `array.new_default` time), and assigning it to `this` is how this
 	// compiler's subset spells "replace my own receiver's physical value" (real TS never allows assigning to
@@ -38,6 +47,7 @@ export class Array<T> {
 			const last = this[len - 1];
 			const result: T[] = Array._alloc<T>(len - 1);
 			Array._copy(result, 0, this as unknown as T[], 0, len - 1);
+			// @ts-ignore - tison extension: reassigning `this` swaps the backing array
 			this = result as unknown as Array<T>;
 			return last;
 		}
@@ -49,6 +59,7 @@ export class Array<T> {
 		const result: T[] = Array._alloc<T>(len + n);
 		Array._copy(result, 0, this as unknown as T[], 0, len);
 		Array._copy(result, len, items, 0, n);
+		// @ts-ignore - tison extension: reassigning `this` swaps the backing array
 		this = result as unknown as Array<T>;
 		return len + n;
 	}
@@ -58,6 +69,7 @@ export class Array<T> {
 			const first = this[0];
 			const result: T[] = Array._alloc<T>(len - 1);
 			Array._copy(result, 0, this as unknown as T[], 1, len - 1);
+			// @ts-ignore - tison extension: reassigning `this` swaps the backing array
 			this = result as unknown as Array<T>;
 			return first;
 		}
@@ -69,6 +81,7 @@ export class Array<T> {
 		const result: T[] = Array._alloc<T>(len + n);
 		Array._copy(result, 0, items, 0, n);
 		Array._copy(result, n, this as unknown as T[], 0, len);
+		// @ts-ignore - tison extension: reassigning `this` swaps the backing array
 		this = result as unknown as Array<T>;
 		return len + n;
 	}
@@ -79,6 +92,7 @@ export class Array<T> {
 		Array._copy(result, 0, this as unknown as T[], 0, start);
 		Array._copy(result, start, items, 0, n);
 		Array._copy(result, start + n - deleteCount, this as unknown as T[], start + deleteCount, len - start - deleteCount);
+		// @ts-ignore - tison extension: reassigning `this` swaps the backing array
 		this = result as unknown as Array<T>;
 		return this as unknown as T[];
 	}

@@ -1,6 +1,6 @@
-import {parse} from '../examples/TS/js-parser';
-import {TSoutput} from '../examples/TS/tocode';
-const output = new TSoutput();
+import {parse} from '../src/examples/TS/js-parser';
+import {Output} from '../src/examples/TS/tocode';
+const output = new Output();
 
 function test(name: string, code: string) {
 	try {

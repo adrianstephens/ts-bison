@@ -1,4 +1,4 @@
-import { Rules, Forward, MaybeList, terminal, ForceFork } from '../../src/tison';
+import { Rules, Forward, MaybeList, terminal, ForceFork } from '../../tison';
 import * as JS from './js-parser';
 import { Literal, Identifier } from '../common';
 import { CompilerOptions1 } from './transform';

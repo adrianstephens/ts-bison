@@ -1,10 +1,10 @@
 import assert from 'assert';
 import fs from 'fs/promises';
 import path from 'path';
-import * as TS from '../examples/TS/ts-parser';
-import { TStoWasm } from '../examples/TS/towasm';
-import { TStypeCheck } from '../examples/TS/transform';
-import { SEVERITY } from '../examples/TS/checker';
+import * as TS from '../src/examples/TS/ts-parser';
+import { TStoWasm } from '../src/examples/TS/towasm';
+import { TStypeCheck } from '../src/examples/TS/transform';
+import { SEVERITY } from '../src/examples/TS/checker';
 
 const parser = TS.make();
 
@@ -103,11 +103,34 @@ async function main() {
 		return h;
 	};
 
+	//{
+	//	const wasm = await fs.readFile(path.join(__dirname, 'sample.wasm'));
+	//	const r = await instantiate(wasm);
+	//	console.log(r);
+	//}
+
 	{
-		const wasm = await fs.readFile(path.join(__dirname, 'sample.wasm'));
-		const r = await instantiate(wasm);
-		console.log(r);
+		const { factorial } = await compile(`
+			function factorial(n: number): number {
+				switch (n) {
+					case -0.5: return 1.77245385091;
+					case 0: return 1;
+					case 1: return 1;
+					case 2: return 2;
+					case 3: return 6;
+					case 4: return 24;
+					case 5: return 120;
+					default: return 0;
+				}
+			}
+		`);
+		check('factorial(0)', factorial(0), 1);
+		check('factorial(0.5)', factorial(0.5), 0);
+		check('factorial(-0.5)', factorial(-.5), 1.77245385091);
+		check('factorial(1)', factorial(1), 1);
+		check('factorial(5)', factorial(5), 120);
 	}
+
 
 	{
 		const { factorial } = await compile(`

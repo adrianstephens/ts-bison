@@ -196,7 +196,7 @@ export function applyPragmas(source: string, options: CompilerOptions1) {
 // Constant folding
 //-----------------------------------------------------------------------------
 
-export function foldConstants(ast: JS.Program) {
+export function foldConstants(ast: any) {
 	return walk(ast,
 		undefined,
 		(expr, process) => {

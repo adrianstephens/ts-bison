@@ -1,4 +1,4 @@
-import { type RecoveryCallback, type MergeValues, type Token, makeParser, makeRule, Rules, terminal, Forward, List, OneOf, ForceFork, WithPrec } from '../../src/tison';
+import { type RecoveryCallback, type MergeValues, type Token, makeParser, makeRule, Rules, terminal, Forward, List, OneOf, ForceFork, WithPrec } from '../../tison';
 import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods } from '../common';
 
 // ===================================================================
@@ -658,7 +658,7 @@ const bitwise_or_expression			= binaryChain(bitwise_xor_expression,		['|'], 				
 const logical_and_expression		= binaryChain(bitwise_or_expression,		['&&'], 									'logicalAnd');
 const logical_or_expression			= binaryChain(logical_and_expression,		['||'], 									'logicalOr');
 
-const relational_expression_noin	= binaryChain(shift_expression,				['<', '>', '<=', '>=', 'instanceof'], 		'relational');
+export const relational_expression_noin	= binaryChain(shift_expression,				['<', '>', '<=', '>=', 'instanceof'], 		'relational');
 const equality_expression_noin		= binaryChain(relational_expression_noin,	['==', '!=', '===', '!=='], 				'equality');
 const bitwise_and_expression_noin	= binaryChain(equality_expression_noin,		['&'], 										'bitwiseAnd');
 const bitwise_xor_expression_noin	= binaryChain(bitwise_and_expression_noin,	['^'], 										'bitwiseXor');

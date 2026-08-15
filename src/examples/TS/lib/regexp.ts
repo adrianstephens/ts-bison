@@ -38,20 +38,6 @@ function hasFlag(flags: string, code: number): boolean {
 	return false;
 }
 
-// Shared by RegExpCompiler.ensure (program buffer) and RegExp.pushFrame (backtrack stack) --
-// both need "allocate bigger, copy elementwise, reassign" over an Int32Array, same idiom
-// array.ts's Array<T>.push already uses for its own growth, just hand-rolled here since a
-// private static helper on one class isn't visible to the other.
-export function growInt32(a: Int32Array): Int32Array {
-	const bigger = new Int32Array(a.length * 2);
-	let i: number = 0;
-	while (i < a.length) {
-		bigger[i] = a[i];
-		i = i + 1;
-	}
-	return bigger;
-}
-
 //-----------------------------------------------------------------------------
 //	Compiler -- pattern string -> bytecode. A separate class (not methods on RegExp
 //	itself): RegExp has object-typed fields, so its own constructor can't call instance
@@ -93,7 +79,7 @@ class RegExpCompiler {
 	braceMin:	number;
 	braceMax:	number;
 	groupCount:	number;
-	prog:		Int32Array;
+	prog:		i32[];
 	progLen:	number;
 
 	constructor(pattern: string) {
@@ -104,7 +90,7 @@ class RegExpCompiler {
 		this.braceMin	= 0;
 		this.braceMax	= 0;
 		this.groupCount	= 0;
-		this.prog		= new Int32Array(16);
+		this.prog		= new Array<i32>(16);
 		this.progLen	= 0;
 	}
 
@@ -117,7 +103,7 @@ class RegExpCompiler {
 		this.emit1(RegExpCompiler.OP_MATCH);
 		this.groupCount = this.nextGroup - 1;
 		if (this.failed) {
-			this.prog = new Int32Array(1);
+			this.prog = new Array<i32>(1);
 			this.prog[0] = RegExpCompiler.OP_FAIL;
 			this.progLen = 1;
 			this.groupCount = 0;
@@ -130,7 +116,7 @@ class RegExpCompiler {
 
 	private ensure(n: number): void {
 		while (this.progLen + n > this.prog.length)
-			this.prog = growInt32(this.prog);
+			this.prog.grow(16);
 	}
 	private appendWord(v: number): number {
 		this.ensure(1);
@@ -599,8 +585,8 @@ export class RegExp {
 	lastIndex: 	number;
 
 	private compiled: 	RegExpCompiler;
-	private groups: 	Int32Array;
-	private stack: 		Int32Array;
+	private groups: 	i32[];
+	private stack: 		i32[];
 	private stackTop: 	number;
 	private bpc: 		number;
 	private bsp: 		number;
@@ -620,8 +606,8 @@ export class RegExp {
 		// field-collecting ctor can't read a subfield of a field assigned earlier in the same
 		// constructor (confirmed: "unknown field 'groupCount'"). Cheap: construction-time only, short
 		// pattern string.
-		this.groups		= new Int32Array((compilePattern(pattern).groupCount + 1) * 2);
-		this.stack		= new Int32Array(64);
+		this.groups		= new Array<i32>((compilePattern(pattern).groupCount + 1) * 2);
+		this.stack		= new Array<i32>(64);
 		this.stackTop	= 0;
 		this.bpc		= 0;
 		this.bsp		= 0;
@@ -642,8 +628,8 @@ export class RegExp {
 	}
 	private pushFrame(pc: number, sp: number): void {
 		const frameWidth: number = 2 + this.groups.length;
-		while (this.stackTop + frameWidth > this.stack.length)
-			this.stack = growInt32(this.stack);
+		//while (this.stackTop + frameWidth > this.stack.length)
+		//	this.stack = growInt32(this.stack);
 		this.stack[this.stackTop] = pc;
 		this.stack[this.stackTop + 1] = sp;
 		for (let i = 0; i < this.groups.length; i++)
@@ -783,7 +769,7 @@ export class RegExp {
 	}
 
 	private buildMatch(s: string): RegExpMatch {
-		const offsets = new Int32Array(this.groups.length);
+		const offsets = new Array<i32>(this.groups.length);
 		for (let i = 0; i < this.groups.length; ++i)
 			offsets[i] = this.groups[i];
 		return new RegExpMatch(s, this.groups[0], this.compiled.groupCount + 1, offsets);
@@ -834,9 +820,9 @@ export class RegExpMatch {
 	input: string;
 	index: number;
 	count: number;
-	private offsets: Int32Array;
+	private offsets: i32[];
 
-	constructor(input: string, index: number, count: number, offsets: Int32Array) {
+	constructor(input: string, index: number, count: number, offsets: i32[]) {
 		this.input = input;
 		this.index = index;
 		this.count = count;
@@ -879,23 +865,4 @@ export function expandReplacement(pattern: string, m: RegExpMatch): string {
 		}
 	}
 	return result;
-}
-
-// String.split's result -- same offset-based reasoning as RegExpMatch above (no Array<string>).
-// Capture groups are not interleaved into the result (unlike real JS's split(/(\d)/)) -- explicit
-// scope simplification, not an oversight.
-export class StringParts {
-	input: string;
-	count: number;
-	private offsets: Int32Array;
-
-	constructor(input: string, count: number, offsets: Int32Array) {
-		this.input = input;
-		this.count = count;
-		this.offsets = offsets;
-	}
-	get length(): number { return this.count; }
-	get(i: number): string {
-		return this.input.slice(this.offsets[i * 2], this.offsets[i * 2 + 1]);
-	}
 }

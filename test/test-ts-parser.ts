@@ -1,12 +1,12 @@
-import * as JSX from '../examples/TS/jsx-parser';
-import * as TS from '../examples/TS/ts-parser';
-import { Output} from '../examples/TS/tocode';
-import { TStoDecl, TStoJS, TStypeCheck, TStypeCheckAsync, FixOptions, applyPragmas } from '../examples/TS/transform';
-import { ModuleLoader } from '../examples/TS/module-loader';
+import * as JSX from '../src/examples/TS/jsx-parser';
+import * as TS from '../src/examples/TS/ts-parser';
+import { Output} from '../src/examples/TS/tocode';
+import { TStoDecl, TStoJS, TStypeCheck, TStypeCheckAsync, FixOptions, applyPragmas } from '../src/examples/TS/transform';
+import { ModuleLoader } from '../src/examples/TS/module-loader';
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { SEVERITY } from '../examples/TS/checker';
+import { SEVERITY } from '../src/examples/TS/checker';
 
 const output = new Output();
 const total_sev = [] as number[];

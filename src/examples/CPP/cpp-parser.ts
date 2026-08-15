@@ -1,6 +1,4 @@
-import {
-	makeRule, Rules, List, OneOf, termOneOf, makeParser, terminal, WithPrec, removeRules, ForceFork
-} from '../../src/tison';
+import { makeRule, Rules, List, OneOf, termOneOf, makeParser, terminal, WithPrec, removeRules, ForceFork} from '../../tison';
 import { preprocess, PreprocessOptions } from './preprocessor';
 import { Literal, Identifier } from '../common';
 import * as C from './c-parser';

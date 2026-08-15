@@ -17,8 +17,8 @@
 	"scripts": {
 		"build": "tsc",
 		"watch": "tsc -watch -p ./",
-		"examples": "tsc -b examples",
-		"postexamples": "cp -r examples/TS/lib dist/examples/TS/lib && node -e \"const f='dist/examples/TS/tsw.js',fs=require('fs'),c=fs.readFileSync(f,'utf8');if(!c.startsWith('#!'))fs.writeFileSync(f,'#!/usr/bin/env node\\n'+c);fs.chmodSync(f,0o755);\"",
+		"examples": "tsc -b src/examples",
+		"postexamples": "cp -r src/examples/TS/lib dist/examples/TS/lib && node -e \"const f='dist/examples/TS/tsw.js',fs=require('fs'),c=fs.readFileSync(f,'utf8');if(!c.startsWith('#!'))fs.writeFileSync(f,'#!/usr/bin/env node\\n'+c);fs.chmodSync(f,0o755);\"",
 		"lint": "eslint \"src/**/*.ts\"",
 		"link": "npm link @isopodlabs/binary_libs"
 	},
