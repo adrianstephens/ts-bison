@@ -1,5 +1,5 @@
 import * as path from 'path';
-import { Rules, makeRule, List, MaybeList, Maybe, OneOf, Forward } from '../tison';
+import { Rules, makeRule, List, MaybeList, Maybe, OneOf, Forward, termOneOf } from '../tison';
 import { makeCachedParser } from '../tableCache';
 import { Instr, ValType, Local, GlobalType, TableType, SubType, WasmModule, Limits, Import as WasmImport } from '@isopodlabs/binary_libs/wasm';
 import { ROOT_OPS, FB_OPS, FC_OPS, SIMD_OPS, THREAD_OPS, equalFuncSig } from '@isopodlabs/binary_libs/wasm';
@@ -295,43 +295,43 @@ const plain_instr = Rules<Instr>(
 	Rule(['f32.const', FLOAT],								$ => ({ op: 'f32.const', imm: parseFloat($[1]) })),
 	Rule(['f64.const', FLOAT],								$ => ({ op: 'f64.const', imm: parseFloat($[1]) })),
 
-	Rule([OneOf(Object.values(ROOT_OPS.NONE))],				$ => ({ op: $[0] } as Instr)),
-	Rule([OneOf(Object.values(ROOT_OPS.INDEX.LOCAL)), idx],	$ => ({ op: $[0], localIndex: $[1] })),
-	Rule([OneOf(Object.values(ROOT_OPS.INDEX.GLOBAL)), idx],$ => ({ op: $[0], globalIndex: $[1] })),
-	Rule([OneOf(Object.values(ROOT_OPS.INDEX.TABLE)), idx],	$ => ({ op: $[0], tableIndex: $[1] })),
-	Rule([OneOf(Object.values(ROOT_OPS.INDEX.FUNC)), idx],	$ => ({ op: $[0], funcIndex: $[1] })),
-	Rule([OneOf(Object.values(ROOT_OPS.INDEX.LABEL)), idx],	$ => ({ op: $[0], label: $[1] })),
+	Rule([termOneOf(Object.values(ROOT_OPS.NONE))],				$ => ({ op: $[0] } as Instr)),
+	Rule([termOneOf(Object.values(ROOT_OPS.INDEX.LOCAL)), idx],	$ => ({ op: $[0], localIndex: $[1] })),
+	Rule([termOneOf(Object.values(ROOT_OPS.INDEX.GLOBAL)), idx],$ => ({ op: $[0], globalIndex: $[1] })),
+	Rule([termOneOf(Object.values(ROOT_OPS.INDEX.TABLE)), idx],	$ => ({ op: $[0], tableIndex: $[1] })),
+	Rule([termOneOf(Object.values(ROOT_OPS.INDEX.FUNC)), idx],	$ => ({ op: $[0], funcIndex: $[1] })),
+	Rule([termOneOf(Object.values(ROOT_OPS.INDEX.LABEL)), idx],	$ => ({ op: $[0], label: $[1] })),
 
-	Rule([OneOf(Object.values(ROOT_OPS.MEM)), Maybe(memarg_offset), Maybe(memarg_align)], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0 })),
+	Rule([termOneOf(Object.values(ROOT_OPS.MEM)), Maybe(memarg_offset), Maybe(memarg_align)], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0 })),
 
 	// 0xFC-prefixed
-	Rule([OneOf(Object.values(FC_OPS.NONE))],				$ => ({ op: $[0] })),
+	Rule([termOneOf(Object.values(FC_OPS.NONE))],				$ => ({ op: $[0] })),
 	Rule(['data.drop', idx],								$ => ({ op: $[0], dataIndex: $[1] })),
 	Rule(['elem.drop', idx],								$ => ({ op: $[0], elemIndex: $[1] })),
-	Rule([OneOf(Object.values(FC_OPS.INDEX.TABLE)), idx],	$ => ({ op: $[0], tableIndex: $[1] })),
-	Rule([OneOf(Object.values(FC_OPS.INDEX2)), idx, idx],	$ => ({ op: $[0], seg: $[1], target: $[2] })),
+	Rule([termOneOf(Object.values(FC_OPS.INDEX.TABLE)), idx],	$ => ({ op: $[0], tableIndex: $[1] })),
+	Rule([termOneOf(Object.values(FC_OPS.INDEX2)), idx, idx],	$ => ({ op: $[0], seg: $[1], target: $[2] })),
 
 	// 0xFB-prefixed (GC)
-	Rule([OneOf(Object.values(FB_OPS.NONE))],				$ => ({ op: $[0] })),
-	Rule([OneOf(Object.values(FB_OPS.TYPE)), idx],			$ => ({ op: $[0], typeIndex: $[1] })),
-	Rule([OneOf(Object.values(FB_OPS.TYPE_FIELD)), idx, nat],$ =>({ op: $[0], typeIndex: $[1], field: $[2] })),
-	Rule([OneOf(Object.values(FB_OPS.TYPE_N)), idx, nat], 	$ => ({ op: $[0], typeIndex: $[1], n: $[2] })),
-	Rule([OneOf(Object.values(FB_OPS.TYPE_SEG.DATA)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], dataIndex: $[2] })),
-	Rule([OneOf(Object.values(FB_OPS.TYPE_SEG.ELEM)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], elemIndex: $[2] })),
-	Rule([OneOf(Object.values(FB_OPS.TYPE2)), idx, idx],	$ => ({ op: $[0], dst: $[1], src: $[2] })),
+	Rule([termOneOf(Object.values(FB_OPS.NONE))],				$ => ({ op: $[0] })),
+	Rule([termOneOf(Object.values(FB_OPS.TYPE)), idx],			$ => ({ op: $[0], typeIndex: $[1] })),
+	Rule([termOneOf(Object.values(FB_OPS.TYPE_FIELD)), idx, nat],$ =>({ op: $[0], typeIndex: $[1], field: $[2] })),
+	Rule([termOneOf(Object.values(FB_OPS.TYPE_N)), idx, nat], 	$ => ({ op: $[0], typeIndex: $[1], n: $[2] })),
+	Rule([termOneOf(Object.values(FB_OPS.TYPE_SEG.DATA)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], dataIndex: $[2] })),
+	Rule([termOneOf(Object.values(FB_OPS.TYPE_SEG.ELEM)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], elemIndex: $[2] })),
+	Rule([termOneOf(Object.values(FB_OPS.TYPE2)), idx, idx],	$ => ({ op: $[0], dst: $[1], src: $[2] })),
 	Rule(['ref.test', '(', 'ref', 'null', heaptype, ')'],	$ => ({ op: 'ref.test', typeIndex: $[4], nullable: true } as Instr)),
 	Rule(['ref.test', '(', 'ref', heaptype, ')'],			$ => ({ op: 'ref.test', typeIndex: $[3] } as Instr)),
 	Rule(['ref.cast', '(', 'ref', 'null', heaptype, ')'],	$ => ({ op: 'ref.cast', typeIndex: $[4], nullable: true } as Instr)),
 	Rule(['ref.cast', '(', 'ref', heaptype, ')'],			$ => ({ op: 'ref.cast', typeIndex: $[3] } as Instr)),
 
 	// 0xFD-prefixed (SIMD)
-	Rule([OneOf(Object.values(SIMD_OPS.NONE))], 			$ => ({ op: $[0] } as Instr)),
-	Rule([OneOf(Object.values(SIMD_OPS.MEM)), Maybe(memarg_offset), Maybe(memarg_align)], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0 })),
-	Rule([OneOf(Object.values(SIMD_OPS.LANE)), nat],		$ => ({ op: $[0], lane: $[1] })),
-	Rule([OneOf(Object.values(SIMD_OPS.LANEMEM)), Maybe(memarg_offset), Maybe(memarg_align), nat], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0, lane: $[3] })),
+	Rule([termOneOf(Object.values(SIMD_OPS.NONE))], 			$ => ({ op: $[0] } as Instr)),
+	Rule([termOneOf(Object.values(SIMD_OPS.MEM)), Maybe(memarg_offset), Maybe(memarg_align)], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0 })),
+	Rule([termOneOf(Object.values(SIMD_OPS.LANE)), nat],		$ => ({ op: $[0], lane: $[1] })),
+	Rule([termOneOf(Object.values(SIMD_OPS.LANEMEM)), Maybe(memarg_offset), Maybe(memarg_align), nat], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0, lane: $[3] })),
 
 	// 0xFE-prefixed (threads)
-	Rule([OneOf(Object.values(THREAD_OPS.MEM)), Maybe(memarg_offset), Maybe(memarg_align)], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0 } as Instr)),
+	Rule([termOneOf(Object.values(THREAD_OPS.MEM)), Maybe(memarg_offset), Maybe(memarg_align)], $ => ({ op: $[0], offset: $[1] ?? 0, align: $[2] ?? 0 } as Instr)),
 	Rule(['atomic.fence'], _ => ({ op: 'atomic.fence' })),
 );
 
@@ -653,6 +653,7 @@ const SKIP = [/\s+/, /;;[^\n]*/, /\(;[^]*?;\)/];
 export const parser = makeCachedParser({
 	skip: SKIP,
 	start: Rules<Module>(
+
 		Rule(['(', 'module', maybe_id, MaybeList(module_field), ')'],	($, ctx) => ({ id: $[2], fields: definedFields($[3], ctx) })),
 		Rule([MaybeList(module_field)],									($, ctx) => ({ fields: definedFields($[0], ctx) })),
 	)

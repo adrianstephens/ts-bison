@@ -20,24 +20,16 @@ function hash(value: unknown): string {
 // indices, entry tags, rule/state numbers) -- exactly what gzip's dictionary-based compression targets,
 // and cheaply: cutting the on-disk size by another order of magnitude costs nothing but a `gzipSync`.
 // Files are gzip'd, so `cachePath` should carry a `.gz`-ish name (not enforced, just convention).
-function writeCache(cachePath: string, file: CacheFile) {
-	fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-	fs.writeFileSync(cachePath, zlib.gzipSync(JSON.stringify(file)));
-}
-
-function readCache(cachePath: string): CacheFile {
-	return JSON.parse(zlib.gunzipSync(fs.readFileSync(cachePath)).toString('utf8'));
-}
 
 // `cachePath` should be specific to the grammar it's caching (one file per `makeCachedParser` call
 // site) -- there's no namespacing beyond the fingerprint check.
-export function makeCachedParser<T>(spec: GrammarSpec<T>, cachePath: string): Parser<T> {
+export function makeCachedParser<T>(spec: GrammarSpec<T>, cachePath: string, gz = true): Parser<T> {
 	const g				= new GrammarBuilder(spec);
 	const fingerprint	= hash(grammarFingerprint(g, spec));
 
 	let cached: CacheFile | undefined;
 	try {
-		cached = readCache(cachePath);
+		cached = JSON.parse(gz ? zlib.gunzipSync(fs.readFileSync(cachePath)).toString('utf8') : fs.readFileSync(cachePath, 'utf8'));
 	} catch {
 		// missing or unreadable cache -- fall through to a fresh build
 	}
@@ -53,7 +45,9 @@ export function makeCachedParser<T>(spec: GrammarSpec<T>, cachePath: string): Pa
 	// No `tables` given: makeParser builds and (unless `spec.optimize === false`) optimizes them itself.
 	const parser = makeParser(spec, { g });
 	try {
-		writeCache(cachePath, { fingerprint, tables: serializeTables(g, parser.tables) });
+		const json = JSON.stringify({ fingerprint, tables: serializeTables(g, parser.tables) });
+		fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+		fs.writeFileSync(cachePath, gz ? zlib.gzipSync(json) : json);
 	} catch {
 		// best-effort: a failed write just means next run rebuilds too
 	}

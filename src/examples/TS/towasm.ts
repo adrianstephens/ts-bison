@@ -4,7 +4,7 @@ import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
 import { Literal, Binary } from '../common';
-import { makeChecker } from './checker';
+import { makeChecker, isOptionalChainLink } from './checker';
 import { walk, walkB, hasMod } from './walker';
 import { foldConstants } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
@@ -17,15 +17,17 @@ import * as WAT from '../wat-parser';
 //    for-of, and only over number[]/boolean[]/typed arrays, not string or a general iterable)
 //  - Async: async/await, Promises, generators
 //  - Classes: inheritance (extends/abstract), computed field names, a field cycle (a field can't be of its
-//    own class's type, directly or indirectly), generic methods (only a class's own single type param)
-//  - Functions: generic top-level functions/arrow/function expressions, a function expression's own
+//    own class's type, directly or indirectly)
+//  - Functions: generic arrow/function expressions (a generic top-level 'function' declaration, or a
+//    'const' bound directly to one, is supported -- see 'ensureGenericFunc'), a function expression's own
 //    'this' (only arrow's lexical 'this'), a named function expression referencing its own name
 //  - Expressions: object literals, the comma/sequence operator, array literals with holes, tagged templates
 //  - Destructuring: a rest property inside an *object* pattern (`{a, ...rest}` -- needs a genuinely new
 //    object type holding an arbitrary 'all fields except these' shape, not modeled yet; array rest and a
 //    default value in either kind of pattern are both supported)
-//  - Optional chaining ('?.'): only one step ('a?.b.c' chains further, rejected), only a plain user method
-//    (not a 'Math'/prelude intrinsic), can't return 'void'
+//  - Optional chaining ('?.'): chaining onto a getter isn't supported (direct or continued from an earlier
+//    '?.'); a guarded method call must be a plain user method (not a 'Math'/prelude intrinsic), can't
+//    return 'void'
 //  - Types: enums, namespaces, decorators; '++'/'--' on a nullable primitive (needs narrowing to
 //    non-null first, which codegen has no way to track -- narrow into a local first instead)
 
@@ -299,15 +301,17 @@ class FuncCtx {
 	}
 
 	// Destructured params get a hidden #param$<i> local; returns var_decl stmts to bind the real names.
-	declareParams(params: JS.Param<Type>[], wtypes: WasmType[]): JS.Statement<Type>[] {
+	// `tsTypes` -- the caller already resolved each param's effective `Type` (annotation, or inferred
+	// from a default) via `paramType`, to pick `wtypes` in the first place; reused here rather than
+	// re-deriving it a second time (which would also need a `checker` this top-level class doesn't have).
+	declareParams(params: JS.Param<Type>[], wtypes: WasmType[], tsTypes: Type[]): JS.Statement<Type>[] {
 		const pending: JS.Statement<Type>[] = [];
 		params.forEach((p, i) => {
-			const typeAnnotation = p.typeAnnotation ?? T.literalTypeOf(p.default);
 			if (typeof p.key === 'string') {
-				this.declareValue(p.key, wtypes[i], typeAnnotation!);
+				this.declareValue(p.key, wtypes[i], tsTypes[i]);
 			} else {
 				const tmpName = `#param$${i}`;
-				this.declareValue(tmpName, wtypes[i], typeAnnotation!);
+				this.declareValue(tmpName, wtypes[i], tsTypes[i]);
 				pending.push(...patternBindings(p.key, { type: 'identifier', name: tmpName }));
 			}
 		});
@@ -800,6 +804,18 @@ function substituteClassTypeParam(decl: JS.ClassDecl<Type>, PARAM: string, subs:
 	)!;
 }
 
+// General N-type-param substitution, for a generic top-level function/method's own type params -- unlike
+// `substituteClassTypeParam` (one name, re-invoked once per class type param), takes every substitution at
+// once via a plain `Map`, one `walk` pass regardless of how many type params `node` has. Also unlike a
+// class reference (`Box<number>`, always an explicit type argument at the use site), unifies both the
+// explicit-type-args and inferred-from-arguments cases: the caller resolves `map` either way (see
+// `ensureGenericFunc`), this just applies it structurally through params/return type/body alike.
+function substituteTypeParams<N extends TS.Program | Statement | Expr | Type | Statement[]>(node: N, map: ReadonlyMap<string, Type>): N {
+	return walk(node, undefined, undefined, (t, process) =>
+		t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
+	)!;
+}
+
 // `Uint8Array`/`Int32Array`/`Uint32Array` are real generic instantiations of `TypedArray<T>`
 // (`lib/typedarray.ts`, reached through `ensureClass`'s alias resolution -- see its own comment), a struct
 // wrapping a real GC byte-array `ArrayBuffer`, so they skip `ensureArrayType`'s own monomorphization entirely.
@@ -1062,7 +1078,10 @@ function collectRangeWidenings(body: Statement[], checker: any, scope: Scope): M
 		}
 		return r;
 	}
-	const isSmallIntLit = (x: Expr) => x.type === 'literal' && typeof x.value === 'number' && Number.isInteger(x.value);
+	// "Small" means it can't itself push a value out of i32 range -- despite the name, this previously only
+	// checked `Number.isInteger`, exempting `i = i + 3000000000` (a real out-of-i32-range literal) from
+	// widening too, silently overflowing `i`'s wasm local once reassigned.
+	const isSmallIntLit = (x: Expr) => x.type === 'literal' && typeof x.value === 'number' && Number.isInteger(x.value) && x.value >= -0x80000000 && x.value <= 0x7fffffff;
 
 	return scoped(() => { walkB(body,
 		(s, process) => {
@@ -1110,15 +1129,46 @@ function collectRangeWidenings(body: Statement[], checker: any, scope: Scope): M
 	); return result; });
 }
 
+// Builds the `Scope` holding every lib declaration `TStoWasm` needs (`String`, `RegExpMatch`, ...),
+// rooted in a fresh `T.makeGlobal()`, not in any particular user program's own scope -- callers pass
+// the *same* returned `Scope` to both `TStypeCheck`/`TStypeCheckAsync` (as `libScope`, so user code is
+// checked with lib members already in view -- a scope only sees its own ancestors, so a user program's
+// `global` needs the lib scope as an actual ancestor, not a sibling branch) and `TStoWasm` (which needs
+// it directly too, e.g. to compile a lib method's own body in isolation from user-declared names).
+// A throwaway `makeChecker` instance here is fine -- `Scope` is plain data, not tied to whichever
+// checker instance populated it, so this result is equally usable by any later, separate instance.
+// Muted, deliberately -- tried unmuted once (its diag sink is already a no-op, so muting itself buys
+// nothing directly): that DOES fix `checker.scopeOfStmt` for a declared-return-type lib method's body
+// (`checkFunctionBody`'s `if (expected && muted) return;` otherwise skips the walk that would stamp it,
+// found via `String.split`'s `m.groupStart(0)` resolving to `any` post-narrowing instead of `number`) --
+// but it simultaneously breaks every GENERIC lib class method (`Array<T>.reverse`/`.fill`/...): the stamp
+// it leaves is the template's own, with `T` still unresolved, and `??=` first-wins then blocks the real,
+// per-instantiation substituted scope from ever overriding it (`ctx.scope`, built fresh per monomorphized
+// instantiation, used to be the *only* thing var_decl's codegen ever saw here, precisely because muted
+// left the template unstamped). No fix found yet that satisfies both narrowing-dependent AND
+// generic-instantiation-dependent lib bodies through the same stamp -- reverted to muted, keeping
+// `ctx.scope` as the sole (unnarrowed but instantiation-correct) fallback var_decl's codegen relies on
+// for lib method bodies. `methodOwner`'s special-case in `var_decl` (below) still needed for this reason.
+export function makeLibScope(): Scope {
+	const libScope = new Scope(T.makeGlobal());
+	makeChecker(() => {}).checkBlock(LIB_AST, libScope, true);
+	return libScope;
+}
+
 export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new Error('towasm: ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
 
-	// `global` knows nothing about the lib's own internal plain classes (`StringParser`, ...) since `LIB_AST` is compiled separately -- without hoisting them, e.g. `this.str.charCodeAt(...)` would resolve `any`.
-	// `String`/`Number`/`Math` are hoisted too (real methods needed for `x.toString()`'s return type); `Array`/`Boolean` are excluded (richer real ambient `Array` exists, `Boolean` has no lib methods).
 	const checker			= makeChecker(() => {});
-	const libGlobal			= new Scope(global);
+	// `global` (`ast.scope`) already has every lib declaration (`String`, `RegExpMatch`, ...) reachable
+	// via its own ancestor chain, when the caller passed `makeLibScope()`'s result into `TStypeCheck` --
+	// same object used here as `libGlobal`, not a bare `libScope` parameter: a lib-only scope would sever
+	// that chain and hide every *user* declaration from anything built off it (`ctx.scope`, in particular)
+	// -- confirmed real, not just theoretical, this way once (`Point`/`Wrapper` field lookups broke).
+	// This also matches the old behavior: `libGlobal` here was never actually isolated from user names
+	// either (it was always `new Scope(global)`, i.e. `global` was always its own ancestor too).
+	const libGlobal			= global;
 
 	const classes			= new Map<string, ClassInfo>();
 	// User-declared *generic* top-level classes can't be eagerly seeded into `classes` under their bare name
@@ -1432,8 +1482,21 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const generic = resolveGenericClassRef(t);
 		if (generic)
 			return generic;
-		if (T.isRefOf(t, classes))
-			return ensureClass(t.name);
+		// Tries the raw, unresolved reference's own name directly (via `ensureClass`'s own shallow,
+		// single-level `resolveClassAlias` lookup and its own `classes` cache check -- this subsumes the
+		// old, separate `T.isRefOf(t, classes)`-guarded cache check that used to sit here) before falling
+		// to `T.resolve`'s full structural expansion below. Necessary now that `global` sees lib
+		// declarations: `T.resolve` no longer just unwraps one alias level (`Uint8Array` -> `TypedArray<u8>`)
+		// -- for a name with *both* a real class and a separate ambient `interface` declaration sharing it
+		// (`TypedArray`, same dual-declaration pattern as `String`), it fully expands and merges both into
+		// an `intersection` type, which no longer carries a traceable class name/typeArgs at all. Safe
+		// unconditionally: `ensureClass` returns `undefined`, no throw, for a name that's neither a real
+		// class nor a valid alias, so this simply falls through to the existing logic below when it doesn't apply.
+		if (t.type === 'ref') {
+			const direct = ensureClass(t.name, t.typeArgs);
+			if (direct)
+				return direct;
+		}
 		const w = T.widenLiterals(T.resolve(global, t));
 		// `obj?.method(...)`'s receiver is nullable by construction -- strip `null`/`undefined` before
 		// dispatching; there's no "owner of `null`", only "owner of the non-nullish part `?.` already guarded".
@@ -1451,13 +1514,31 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				case 'ReadonlyArray':
 					return ensureClass('Array', w.typeArgs);
 			}
-			// A plain lib class (or alias -- `resolveClassAlias`) not yet reached through `T.isRefOf` above --
-			// e.g. a param typed `Uint8Array` with no earlier `new Uint8Array(...)` call in this compile to
-			// have lazily populated `classes` already. Safe to call unconditionally: `ensureClass` returns
-			// `undefined`, no throw, for a name that's neither.
-			return builtinTypeOwner(w.name) ?? ensureClass(w.name);
+			// A plain lib class (or alias -- `resolveClassAlias`) not yet reached through the raw-`t.name`
+			// `ensureClass` try above -- e.g. a param typed `Uint8Array` with no earlier `new Uint8Array(...)`
+			// call in this compile to have lazily populated `classes` already. Safe to call unconditionally: `ensureClass` returns
+			// `undefined`, no throw, for a name that's neither. `w.typeArgs` (not just `w.name`) -- now that
+			// `global` sees lib type aliases too, `T.resolve` can already expand a bare alias name like
+			// `Uint8Array` into its real generic form (`TypedArray<u8>`) by this point, and a generic class
+			// needs its type arguments to resolve at all, same as the `Array`/`ReadonlyArray` case just above.
+			return builtinTypeOwner(w.name) ?? ensureClass(w.name, w.typeArgs);
 		}
 		return undefined;
+	}
+
+	// A namespace-style reference (`Box.describe()`) never carries real type arguments the way a genuine
+	// instantiation (`new Box<number>()`, or a value typed `Box<number>`) does -- and real TS forbids a
+	// static member from ever referencing its class's own type parameters in the first place (checker-
+	// enforced, trusted here same as everywhere else in this file), so the *choice* of type argument can't
+	// matter for whatever static member is actually being looked up. `T.ANY` uniformly fills every type
+	// param instead of `ensureClass`'s ordinary "needs N explicit type argument(s)" throw -- always resolves
+	// to `REF_ANY`, so even some *other* member's type that happens to mention the type param (the static
+	// member itself never does) still resolves without failing. `undefined` for a non-generic class (or any
+	// other name `ensureClass` already handles, e.g. a typed-array alias) leaves `ensureClass(name)` exactly
+	// as it was.
+	function staticTypeArgsFor(name: string): Type[] | undefined {
+		const decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
+		return decl?.type === 'class_decl' ? decl.typeParams?.map(() => T.ANY) : undefined;
 	}
 
 	// The owner for a *namespace-style* reference (`Math.sqrt`, `Array.alloc`) -- not a value expression, so
@@ -1466,7 +1547,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		// A self-referential call site (`X.method()`) can match either name a class goes by: a generic
 		// instantiation's `name` is the composite cache key while `decl.name` stays plain `Array`; a typed-array alias's `decl.name` stays canonical `Uint8Array` while `name` is the real alias, e.g. `Int32Array`.
 		return builtinTypeOwner(name) ?? (ctx.owner && (ctx.owner.decl.name === name || ctx.owner.name === name) ? ctx.owner : undefined)
-			?? ensureClass(name);
+			?? ensureClass(name, staticTypeArgsFor(name));
 	}
 
 	// Field access stays `classOf`-only (arrays/scalars have no fields), but method-call dispatch is
@@ -1713,12 +1794,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return resultWtype;
 	}
 
-	// Rejects chaining another access onto an already-optional result (`a?.b.c`) -- real chaining short-circuits the whole remaining chain, which this pass doesn't track; only a single `?.` step is supported.
-	function rejectChainedOptional(inner: Expr): void {
-		if ((inner.type === 'member' || inner.type === 'index' || inner.type === 'call') && inner.optional)
-			throw new Error("towasm: chaining another access onto an optional ('?.') result (e.g. 'a?.b.c' or 'a?.b?.c') is not supported -- only a single '?.' step is");
-	}
-
 	// Shared by array literals and `new Uint8Array([...])` -- both reject holes and coerce every plain
 	// element to `want`. A spread element forces the slower `emitArrayElementsWithSpread` path (runtime length, not `array.new_fixed`'s compile-time count).
 	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FuncCtx, want: WasmType, kind: wasmElement, typeIndex: number): void {
@@ -1838,7 +1913,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	}
 
 	// Dispatches every `builtins` entry, coercing args via `emitAs`; falls back to `ensureFunc` for a plain user-declared function not in `builtins` at all.
-	function emitCall(name: string, args: Expr[], ctx: FuncCtx): WasmType {
+	// `typeArgs`: only ever meaningful for a plain user-declared generic function (`builtins` entries and
+	// host imports are never generic) -- an explicit `identity<number>(5)` call-site type argument list, or
+	// `undefined` when left implicit (the common case, inferred by `ensureGenericFunc`).
+	function emitCall(name: string, args: Expr[], ctx: FuncCtx, typeArgs?: Type[]): WasmType {
 		let decl;
 		const builtin = builtins[name];
 		if (builtin) {
@@ -1858,7 +1936,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				throw new Error(`towasm: call to unknown function '${name}'`);
 		}
 
-		const info = funcs.get(name) ?? compileFunc(name, decl!);
+		const info = decl?.typeParams?.length ? ensureGenericFunc(name, decl, args, typeArgs, ctx)
+			: funcs.get(name) ?? compileFunc(name, decl!);
 		if (!info)
 			throw new Error(`towasm: call to unknown function '${name}'`);
 		emitCallArgs(name, info.params, info.defaults, !!info.hasRest, args, ctx);
@@ -1868,7 +1947,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	// Dispatches a `receiver.name(...args)` call against any `MethodOwner` -- `inlineMethods` (checked first) splices its instructions directly into the caller with no `call` at all.
 	// `receiver` is `undefined` for a namespace-style call (`Math.sqrt(x)`, `Array.alloc(n)` from inside `Array<T>`'s own methods) -- no real value to push, just a bare name used to look up `owner`.
-	function emitMethodCall(owner: ClassInfo, name: string, args: Expr[], ctx: FuncCtx): WasmType {
+	// `typeArgs`: an explicit `obj.method<T>(...)` call-site type argument list -- only ever meaningful for
+	// a real user method call (an inline/accessor/index/operator dispatch is never independently generic).
+	function emitMethodCall(owner: ClassInfo, name: string, args: Expr[], ctx: FuncCtx, typeArgs?: Type[]): WasmType {
 		const inline = owner.inlineMethods?.get(name);
 		if (inline) {
 			if (args.some(a => a.type === 'spread'))
@@ -1876,7 +1957,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			return emitInline(name, inline(args.map(a => operandInfo(a, ctx)), ctx), args, ctx);
 		}
 
-		const method = ensureMethod(owner, name, args, ctx);
+		const method = ensureMethod(owner, name, args, ctx, typeArgs);
 		if (!method)
 			throw new Error(`towasm: unknown method '${name}' on ${owner.name}`);
 		// A spread argument is only meaningful bundled into a rest param (`arr.push(...other)`) --
@@ -2168,8 +2249,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 
 			case 'member': {
-				rejectChainedOptional(e.object);
-
 				if (e.object.type === 'identifier') {
 					const owner = namespaceOwner(e.object.name, ctx);
 					if (owner) {
@@ -2188,7 +2267,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				// A `get` accessor -- checked before both the `.length` special case and the ordinary
 				// struct-field read, so a real getter (e.g. `Array<T>.length`) takes priority over either.
 				if (cls?.getterNames?.has(e.property)) {
-					if (e.optional)
+					// `isOptionalChainLink`, not a bare `e.optional` -- `a?.b.getter` continues `a?.b`'s own
+					// chain even though *this* access has no `?.` of its own written on it (see the checker's
+					// own `isOptionalChainLink` comment, shared verbatim). Same restriction either way: a
+					// getter can't be guarded in this pass, direct `?.` or chain-continued.
+					if (isOptionalChainLink(e))
 						throw new Error(`towasm: 'a?.${e.property}' on a getter is not supported`);
 					// `emitAs`, not a raw `emitExpr` -- `e.object` may itself be a ref-kind array element read, boxed `anyref` regardless of its declared class -- the getter call needs the real narrowed receiver type first.
 					emitAs(e.object, ctx, cls.thisWtype!);
@@ -2208,7 +2291,17 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					return local.wtype;
 				}
 
-				if (e.optional) {
+				// `isOptionalChainLink`, not a bare `e.optional` -- covers both a direct `a?.b` step and a
+				// non-optional continuation of an earlier one (`a?.b.c`'s `.c`). `wtypeOf(e.object, ctx)`
+				// already reflects the real (possibly chain-induced) nullability -- the checker's own
+				// `isOptionalChainLink`-aware inference makes sure of that -- so `emitAs(e.object, ctx,
+				// objWtype)` recursing into `e.object` (itself possibly *another* chain link) naturally
+				// composes: each link gets its own null check on whatever came before, which is observably
+				// identical to one combined chain-wide short-circuit (no side effect ever runs twice, since
+				// each link's object is only ever evaluated once, into its own scratch local) -- just several
+				// nested `if`s instead of one flat guard. Simpler to get right than flattening the whole
+				// chain into a single guard, and this file already leans "correct first" over "most compact".
+				if (isOptionalChainLink(e)) {
 					const objWtype = wtypeOf(e.object, ctx);
 					if (!objWtype)
 						throw new Error(`towasm: 'a?.${e.property}' has an unsupported object type`);
@@ -2228,13 +2321,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 
 			case 'index': {
-				rejectChainedOptional(e.object);
 				// Any class with its own `get(i)` (typed-array views, or any other class using the same
 				// convention) -- real index syntax dispatched generically, not by name.
 				const cls = classOf(e.object, ctx);
 				const sig = cls && methodSig(cls, 'get', ctx);
 				if (cls && sig) {
-					if (e.optional) {
+					// `isOptionalChainLink`, not a bare `e.optional` -- see `case 'member'`'s own comment.
+					if (isOptionalChainLink(e)) {
 						if (sig.result === 'void')
 							throw new Error("towasm: 'a?.[i]' is not supported -- 'get' returns 'void', which can't become 'void | undefined'");
 						const objWtype = wtypeOf(e.object, ctx);
@@ -2260,7 +2353,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				// nullable (shared physical storage for every non-scalar kind), so `array.get` always really
 				// produces a nullable `anyref`, whatever the caller's declared TS element type claims.
 				const elemWtype: WasmType = kind === 'ref' ? { ref: 'any', nullable: true } : kind;
-				if (e.optional) {
+				// `isOptionalChainLink`, not a bare `e.optional` -- see `case 'member'`'s own comment.
+				if (isOptionalChainLink(e)) {
 					const objWtype = wtypeOf(e.object, ctx);
 					if (!objWtype)
 						throw new Error("towasm: 'a?.[i]' has an unsupported object type");
@@ -2531,11 +2625,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					return emitInline('<inline>', builtin(e.arguments.map(a => operandInfo(a, ctx)), ctx), e.arguments, ctx);
 				}
 
-				// `obj?.method(...)` -- the `?.` sits on the `member` callee. Treated as one guarded operation:
+				// `obj?.method(...)` -- the `?.` sits on the `member` callee (or a chain further out
+				// continues one, e.g. `obj?.a.method(...)` -- `isOptionalChainLink`, not a bare
+				// `e.callee.optional`, see `case 'member'`'s own comment). Treated as one guarded operation:
 				// `obj` evaluated once, checked for null, call only in the non-null arm -- restricted to a real user method (`ensureMethod`), not a `Math`/prelude intrinsic whose result type depends on the call site.
-				if (e.callee.type === 'member' && e.callee.optional) {
+				if (e.callee.type === 'member' && isOptionalChainLink(e.callee)) {
 					const objExpr = e.callee.object;
-					rejectChainedOptional(objExpr);
 					const methodName = e.callee.property;
 					const objWtype = wtypeOf(objExpr, ctx);
 					if (!objWtype || typeof objWtype === 'string')
@@ -2543,7 +2638,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					const owner = ownerOf(objExpr, ctx);
 					if (!owner)
 						throw new Error(`towasm: unknown method '${methodName}'`);
-					const method = ensureMethod(owner, methodName, e.arguments, ctx);
+					const typeArgs = e.typeArgs as Type[] | undefined;
+					const method = ensureMethod(owner, methodName, e.arguments, ctx, typeArgs);
 					if (!method)
 						throw new Error(`towasm: 'a?.${methodName}(...)' is not supported -- only a plain user-defined method (not a 'Math'/prelude intrinsic) can be guarded by '?.' in this pass`);
 					if (method.result === 'void')
@@ -2554,17 +2650,17 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						// Receiver pushed directly, skipping `emitMethodCall`'s own `receiver` param
 						// needs an explicit `ref.as_non_null` here, always sound since `readCore` only runs in the proven-non-null arm.
 						ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
-						coerceTop(emitMethodCall(owner, methodName, e.arguments, ctx), ctx, resultWtype);
+						coerceTop(emitMethodCall(owner, methodName, e.arguments, ctx, typeArgs), ctx, resultWtype);
 					});
 				}
 
 				if (e.callee.type === 'member') {
-					rejectChainedOptional(e.callee.object);
 					const obj = e.callee.object;
+					const typeArgs = e.typeArgs as Type[] | undefined;
 					if (obj.type === 'identifier') {
 						const owner = namespaceOwner(obj.name, ctx);
 						if (owner)
-							return emitMethodCall(owner, e.callee.property, e.arguments, ctx);
+							return emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
 						const name = `${obj.name}.${e.callee.property}`;
 						if (name in builtins)
 							return emitCall(name, e.arguments, ctx);
@@ -2585,15 +2681,15 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					// A method that reassigns `this` (`reassignsThis`/`assignsToThis`) needs its receiver's real
 					// physical lvalue -- `emitAssignTarget('keep')` pushes that value for the call and sets up the write-back, reusing the same machinery compound assignment/`++`/`--` use. `target.write` then consumes
 					// the callee's own extra wasm-level updated-`this` result, leaving the declared result underneath. A receiver with nothing to write back to gets `emitAssignTarget`'s own error, for free.
-					if (ensureMethod(owner, e.callee.property, e.arguments, ctx)?.reassignsThis) {
+					if (ensureMethod(owner, e.callee.property, e.arguments, ctx, typeArgs)?.reassignsThis) {
 						const target = emitAssignTarget(obj, ctx, 'keep');
-						const result = emitMethodCall(owner, e.callee.property, e.arguments, ctx);
+						const result = emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
 						target.write(false);
 						return result;
 					}
 					// `emitAs`, not a raw `emitExpr` -- `obj` may be a ref-kind array element read, boxed `anyref` -- the call needs the real narrowed receiver type first, same as `case 'member'`'s getter/field reads.
 					emitAs(obj, ctx, (owner as ClassInfo).thisWtype!);
-					return emitMethodCall(owner, e.callee.property, e.arguments, ctx);
+					return emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
 				}
 				// A closure value, called directly (`callback(x)`) -- checked via `ctx.resolvesName` so a local
 				// shadowing a same-named global function takes priority, matching JS scoping. Bare identifier callee only for now (not e.g. `obj.field(x)`) -- v1 scope, not a fundamental limit.
@@ -2617,7 +2713,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				if (e.callee.type !== 'identifier')
 					throw new Error('towasm: only direct calls to named functions, methods, or Math intrinsics are supported');
 
-				return emitCall(e.callee.name, e.arguments, ctx);
+				return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs as Type[] | undefined);
 			}
 
 			// Closures: a captured arrow/function-expression literal compiles to a 2-field `{code, env}`
@@ -2693,7 +2789,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					const fnCtx = new FuncCtx(new Scope(libGlobal), result, undefined);
 					// Env param first (real wasm param index 0), then this literal's own params -- `toFuncBody`'s `numParams` assumes the first `1 + params.length` declared locals are the real wasm params, in order.
 					const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
-					const pending	= fnCtx.declareParams(e.rest ? [...e.params, e.rest] : e.params, params);
+					const allParams	= e.rest ? [...e.params, e.rest] : e.params;
+					// A closure parameter always has an explicit annotation (no defaults, checked above), so
+					// there's no inference to do here -- just the annotations themselves, param then rest.
+					const pending	= fnCtx.declareParams(allParams, params, allParams.map(p => p.typeAnnotation as Type));
 					// The cast-down env local (or, with no captures, just the param itself) is declared after the real params, so it's a genuine local, not mistaken for one more wasm param.
 					let envLocal	= envParam;
 					if (fields) {
@@ -2818,21 +2917,32 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							emitStmt(stmt, ctx);
 						continue;
 					}
-					// Type computed before emitting the init, so the init can be emitted via `emitAs` straight into the local's declared representation
+					// Type computed before emitting the init, so the init can be emitted via `emitAs` straight into the local's declared representation.
+					// `checker.scopeOfStmt(s)` -- the real, narrowing-aware scope the checker type-checked
+					// this statement under -- not `ctx.scope` (towasm's own, separately-tracked scope, which
+					// never reflects flow-sensitive narrowing the way the checker's internal scope tree does).
+					// Without it, a narrowed-non-null receiver (e.g. `if (m === null) return; ...; m.group(0)`)
+					// would still look nullable to `checker.typeOf` here and member/call resolution could fail
+					// on it. Falls back to `ctx.scope` only if somehow unset (shouldn't happen post-`TStypeCheck`).
+					const stmtScope = checker.scopeOfStmt(s) ?? ctx.scope;
 					const {methodOwner, methodName, calleeOptional} = d.init.type === 'call' && d.init.callee.type === 'member'
 						? {methodOwner: ownerOf(d.init.callee.object, ctx), methodName: d.init.callee.property, calleeOptional: d.init.callee.optional}
 						: {};
 
 					// No `Array<T>` substitution needed -- `substElemMethods` already monomorphized a method's whole body once, up front, so `d.typeAnnotation` is already concrete here.
 
-					let tsType = d.typeAnnotation ?? T.literalTypeOf(d.init);
+					// `ctx.widenedTypes` checked before `T.literalTypeOf` -- a loop-reassigned local's own
+					// widened range (covering every value it's ever set to, not just its initial one) must
+					// win over the initializer's own narrower literal type, or its wasm local gets fixed too
+					// tight and a later in-range-exceeding reassignment corrupts it.
+					let tsType = d.typeAnnotation ?? ctx.widenedTypes?.get(d) ?? T.literalTypeOf(d.init);
 					if (!tsType && d.init.type === 'index') {
 						// The real declared element `Type` of an array-like container -- `T[]`/`Array<T>`'s `T` directly, or the fixed element type real TS gives `Uint8Array`/`Int32Array`/etc indexing.
 						// `Uint8Array`/etc resolve (`resolveClassAlias`, before `T.resolve` ever expands the bare
 						// alias) to `TypedArray<T>` -- but every element there reads back as `number` regardless
 						// of `T` (a physical-storage tag, not the real TS element type), unlike `Array<T>` below,
 						// where iterating genuinely gives `T` itself.
-						const objT = checker.typeOf(d.init.object, ctx.scope);
+						const objT = checker.typeOf(d.init.object, stmtScope);
 						if (objT.type === 'ref' && !objT.typeArgs && resolveClassAlias(objT.name)?.name === 'TypedArray') {
 							tsType = T.NUMBER;
 						} else {
@@ -2853,14 +2963,21 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							tsType = T.combineTypes([tsType, T.UNDEFINED]);
 					}
 					if (!tsType && methodOwner) {
+						// This reads the method's raw declared return type directly off the class decl, not
+						// `checker.typeOf(d.init, stmtScope)` -- `stmtScope`'s stamp only exists for a lib
+						// method body when `makeLibScope`'s one-time check wasn't muted for it, and (see
+						// `makeLibScope`'s own comment) that's deliberately not always the case: a GENERIC lib
+						// class method (`Array<T>.reverse`/`.fill`/...) would get a stamp reflecting the
+						// template's own unresolved `T` if unmuted, permanently blocking (`??=` first-wins)
+						// the real, per-instantiation substituted scope (`ctx.scope`) that codegen actually
+						// needs. This bypass sidesteps that tension entirely for method-call return types,
+						// same as it always has. A `?.`-guarded call's short-circuit-to-`undefined` also isn't
+						// reflected in the class decl's own return type, so it's reattached here too.
 						const methodReturn = (methodOwner.decl.body.find(m => m.type === 'method' && m.key === methodName) as MethodMember)?.returnType;
-						// `obj?.method(...)`: this reads the method's raw declared return type directly off the
-						// class decl, bypassing `checker.typeOf`'s own `calleeOptional` wrapping (`case 'call'`)
-						// -- so a `?.`-guarded call's short-circuit-to-`undefined` has to be reattached here too.
 						tsType = methodReturn && calleeOptional ? T.combineTypes([methodReturn, T.UNDEFINED]) : methodReturn;
 					}
 
-					tsType ??= ctx.widenedTypes?.get(d) ?? checker.typeOf(d.init, ctx.scope);
+					tsType ??= checker.typeOf(d.init, stmtScope);
 
 					const wtype = typeOf(tsType);
 					if (!wtype) {
@@ -3170,7 +3287,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return info;
 	}
 
-	function paramType(p: JS.Param<Type>): WasmType {
+	// Returns both the resolved `Type` and its `WasmType` -- callers that go on to declare this param as
+	// a real local (`declareParams`) need the former too, and shouldn't have to re-derive it a second
+	// time (which would also need a `checker` instance FuncCtx, a top-level class, doesn't have access to).
+	function paramType(p: JS.Param<Type>): { wtype: WasmType; tsType: Type } {
 		// A default value is only resolved at each omitted call site (see `fillDefaultArgs`), not evaluated
 		// dynamically the way real JS does -- so it must be a plain literal, safe to re-emit verbatim.
 		let tsType = p.typeAnnotation;
@@ -3179,12 +3299,59 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				throw new Error(`towasm: 'param '${describeBinding(p.key)}''s default value must be a literal`);
 			tsType ??= checker.typeOf(p.default, libGlobal);
 		}
-		const wt = tsType && typeOf(tsType);
-		if (!wt)
+		if (!tsType)
 			throw new Error(`towasm: 'param '${describeBinding(p.key)}' needs an explicit type`);
-		if (wt === 'void')
+		const wtype = typeOf(tsType);
+		if (!wtype)
+			throw new Error(`towasm: 'param '${describeBinding(p.key)}' needs an explicit type`);
+		if (wtype === 'void')
 			throw new Error(`towasm: 'param '${describeBinding(p.key)}' cannot be 'void'`);
-		return wt;
+		return { wtype, tsType };
+	}
+
+	// Resolves the type-argument substitution map for a generic call (top-level function or method) --
+	// shared by `ensureGenericFunc` and `ensureMethod`'s own generic-method case. Explicit call-site type
+	// args win outright; otherwise each param's declared type is matched against its argument's real type
+	// via the exact inference the checker itself uses (`T.inferTypeArgs`), matching checker.ts's own
+	// `instantiate`, not a reimplementation. Falls back to each remaining type param's own `default`/
+	// `constraint`/`any` in turn when nothing inferred it, same as the checker's own final fallback.
+	// No contextual/expected-return-type inference (`instantiate` also tries that, via its own `expected`
+	// param) -- towasm's codegen has no comparable "expected type" threaded through a call expression today.
+	// `libGlobal` doubles as both `scope` (resolving each argument's own type) and `declScope` (resolving
+	// the declared param types a type param is matched against) -- every declaration this is ever called
+	// for (a top-level function, or a class method -- its class's own type params already concrete by the
+	// time `ensureMethod` reaches here) is declared relative to the one module scope this file ever has,
+	// same as `paramType`/`compileFunc` already assume elsewhere -- no separate "declaring module" to track
+	// the way `T.declScopeOf` exists for (a cross-module signature, which nothing here ever is).
+	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, ctx: FuncCtx): Map<string, Type> {
+		const map = new Map<string, Type>();
+		if (typeArgs) {
+			typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
+		} else {
+			const names = new Map(typeParams.map(p => [p.name, p] as const));
+			args.forEach((a, i) => {
+				const p = params[i];
+				if (p?.typeAnnotation && a.type !== 'spread')
+					T.inferTypeArgs(p.typeAnnotation as Type, checker.typeOf(a, ctx.scope), names, map, libGlobal);
+			});
+			typeParams.forEach(p => {
+				if (!map.has(p.name))
+					map.set(p.name, p.default ?? p.constraint ?? T.ANY);
+			});
+		}
+		return map;
+	}
+
+	// Resolves a generic top-level function call to its monomorphized `FuncInfo`, cached under the same
+	// composite-key shape `ensureClass` already uses for `Box<number>` (`identity<number>`) -- one real
+	// difference from a class reference: a function's type arguments are usually left implicit at the call
+	// site, inferred from the arguments (`inferTypeArgMap`, above). Explicit call-site type args
+	// (`identity<number>(5)`) are honored too, same as a class's are.
+	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, ctx: FuncCtx): FuncInfo {
+		const typeParams = decl.typeParams!;
+		const map = inferTypeArgMap(typeParams, decl.params, args, typeArgs, ctx);
+		const key = `${name}<${typeParams.map(p => T.typeKey(T.resolve(global, map.get(p.name)!))).join(',')}>`;
+		return funcs.get(key) ?? compileFunc(key, { ...substituteTypeParams(decl, map), typeParams: undefined })!;
 	}
 
 	function compileFunc(name: string, decl: FunctionDecl): FuncInfo | undefined {
@@ -3196,10 +3363,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const result = decl.returnType ? typeOf(decl.returnType as Type) : 'void';
 		if (!result)
 			throw new Error(`towasm: '${name}' has an unsupported return type`);
-		const params	= decl.params.map(p => paramType(p));
+		const resolved	= decl.params.map(p => paramType(p));
+		const params	= resolved.map(r => r.wtype);
+		const tsTypes	= resolved.map(r => r.tsType);
 		const names		= decl.params.map(p => typeof p.key === 'string' ? p.key : undefined);
 		if (decl.rest?.typeAnnotation) {
 			params.push(typeOf(decl.rest.typeAnnotation)!);
+			tsTypes.push(decl.rest.typeAnnotation as Type);
 			names.push(typeof decl.rest.key === 'string' ? decl.rest.key : undefined);
 		}
 		const {funcIndex, typeIndex} = registerFunc(toParams(params, names), toResults(result));
@@ -3208,7 +3378,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		worklist.push(() => {
 			const ctx	= new FuncCtx(new Scope(libGlobal), result, undefined);
 			ctx.widenedTypes = collectRangeWidenings(decl.body!, checker, ctx.scope);
-			ctx.declareParams(decl.rest ? [...decl.params, decl.rest] : decl.params, params).forEach(st => emitStmt(st, ctx));
+			ctx.declareParams(decl.rest ? [...decl.params, decl.rest] : decl.params, params, tsTypes).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
 			info.body = ctx.toFuncBody(params.length, toValType);
@@ -3331,7 +3501,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
 								if (typeof p.key !== 'string')
 									throw new Error(`towasm: computed field names in '${name}' are not supported`);
-								addField(p.key, p.typeAnnotation ?? T.literalTypeOf(p.default));
+								addField(p.key, p.typeAnnotation ?? (p.default ? checker.typeOf(p.default, libGlobal) : undefined));
 							}
 						}
 
@@ -3414,10 +3584,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (existing)
 			return existing;
 
-		const params		= ctor.params.map(p => paramType(p));
+		const resolved		= ctor.params.map(p => paramType(p));
+		const params		= resolved.map(r => r.wtype);
+		const tsTypes		= resolved.map(r => r.tsType);
 		const names			= ctor.params.map(p => typeof p.key === 'string' ? p.key : undefined);
 		if (ctor.rest?.typeAnnotation) {
 			params.push(typeOf(ctor.rest.typeAnnotation)!);
+			tsTypes.push(ctor.rest.typeAnnotation as Type);
 			names.push(typeof ctor.rest.key === 'string' ? ctor.rest.key : undefined);
 		}
 		//const thisWtype	= ownerThisType(cls);
@@ -3430,7 +3603,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		worklist.push(() => {
 			const ctx		= new FuncCtx(new Scope(libGlobal), thisWtype, cls);
 			ctx.widenedTypes = collectRangeWidenings(ctor.body!, checker, ctx.scope);
-			ctx.declareParams(ctor.rest ? [...ctor.params, ctor.rest] : ctor.params, params).forEach(st => emitStmt(st, ctx));
+			ctx.declareParams(ctor.rest ? [...ctor.params, ctor.rest] : ctor.params, params, tsTypes).forEach(st => emitStmt(st, ctx));
 			// This constructor supplies `this` directly via its own return value (`ctorReturnsValue`)
 			// `cls`'s own `thisWtype`/`typeIndex` already say so; ordinary statement compilation does the right thing once `ctx.ctorThis` is unset.
 			const last = ctor.body?.at(-1);
@@ -3520,19 +3693,45 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	}
 
 	// `args`/`callerCtx` pick which overload applies when `name` has more than one real body (`resolveOverload`) -- irrelevant, safe to pass an empty probe list, when there's only one (the common case).
-	function ensureMethod(owner: ClassInfo, name: string, args: Expr[], callerCtx: FuncCtx): FuncInfo | undefined {
+	// `typeArgs`: an explicit call-site type argument list for a generic *method*'s own type params
+	// (`obj.map<number>(f)`) -- distinct from, and layered on top of, `owner`'s own class-level type
+	// params, which are already fully concrete by the time `owner` (a real `ClassInfo`) exists at all.
+	function ensureMethod(owner: ClassInfo, name: string, args: Expr[], callerCtx: FuncCtx, typeArgs?: Type[]): FuncInfo | undefined {
 		const decls = owner.methodDecls.get(name);
 		if (!decls)
 			return undefined;
-		const decl = resolveOverload(`${owner.name}.${name}`, decls, args, callerCtx);
+		let decl = resolveOverload(`${owner.name}.${name}`, decls, args, callerCtx);
 		// Qualified so it can share `funcs` with plain top-level functions (bare identifiers can't contain
 		// '.') without colliding; only suffixed when there's a real overload set to disambiguate.
-		const key = decls.length > 1 ? `${owner.name}.${name}#${decls.indexOf(decl)}` : `${owner.name}.${name}`;
+		let key = decls.length > 1 ? `${owner.name}.${name}#${decls.indexOf(decl)}` : `${owner.name}.${name}`;
+
+		// A generic method's own type params (beyond whatever `owner`'s class-level ones already resolved
+		// to, e.g. `class Box<T> { map<U>(f: (t: T) => U): Box<U> {...} }`) -- same composite-key/substitution
+		// shape `ensureGenericFunc` uses for a top-level generic function, just layered on top of `owner`'s
+		// own already-instantiated key instead of a bare function name. `decl` here is `owner.methodDecls`'
+		// own copy, which already has the class's `T` substituted throughout (from `ensureClass`) -- only
+		// `U` is left to resolve.
+		// A `MethodMember` (unlike a whole `FunctionDecl`) isn't one of `walk`'s own root node types, so this
+		// can't reuse `substituteTypeParams` as one call the way `ensureGenericFunc` does -- signature pieces
+		// go through `T.substituteType` individually (matching checker.ts's own `instantiate`, which does the
+		// exact same per-piece substitution for a signature), the body still through `substituteTypeParams`
+		// (a plain `Statement[]`, which `walk` does accept directly).
+		if (decl.typeParams?.length) {
+			const map = inferTypeArgMap(decl.typeParams, decl.params, args, typeArgs, callerCtx);
+			key += `<${decl.typeParams.map(p => T.typeKey(T.resolve(global, map.get(p.name)!))).join(',')}>`;
+			decl = {
+				...decl,
+				typeParams: undefined,
+				params: decl.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation as Type, map) } : p),
+				rest: decl.rest?.typeAnnotation ? { ...decl.rest, typeAnnotation: T.substituteType(decl.rest.typeAnnotation as Type, map) } : decl.rest,
+				returnType: decl.returnType ? T.substituteType(decl.returnType as Type, map) : decl.returnType,
+				body: decl.body ? substituteTypeParams(decl.body, map) : decl.body,
+			};
+		}
+
 		const existing = funcs.get(key);
 		if (existing)
 			return existing;
-		if (decl.typeParams?.length)
-			throw new Error(`towasm: generic methods ('${owner.name}.${name}') are not supported`);
 		if (!decl.body)
 			throw new Error(`towasm: '${owner.name}.${name}' needs a body (overload signatures are not supported)`);
 
@@ -3540,10 +3739,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (!result)
 			throw new Error(`towasm: '${owner.name}.${name}' has an unsupported return type`);
 
-		const params = decl.params.map(p => paramType(p));
+		const resolved = decl.params.map(p => paramType(p));
+		const params = resolved.map(r => r.wtype);
+		const tsTypes = resolved.map(r => r.tsType);
 		const names = decl.params.map(p => typeof p.key === 'string' ? p.key : undefined);
 		if (decl.rest?.typeAnnotation) {
 			params.push(typeOf(decl.rest.typeAnnotation)!);
+			tsTypes.push(decl.rest.typeAnnotation as Type);
 			names.push(typeof decl.rest.key === 'string' ? decl.rest.key : undefined);
 		}
 
@@ -3564,7 +3766,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			if (reassignsThis)
 				ctx.appendThisOnReturn = true;
 			ctx.widenedTypes = collectRangeWidenings(decl.body!, checker, ctx.scope);
-			ctx.declareParams(decl.rest ? [...decl.params, decl.rest] : decl.params, params).forEach(st => emitStmt(st, ctx));
+			ctx.declareParams(decl.rest ? [...decl.params, decl.rest] : decl.params, params, tsTypes).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
 			info.body = ctx.toFuncBody((isStatic ? 0 : 1) + params.length, toValType);
@@ -3645,13 +3847,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	//  Program lowering
 	// ===================================================================
 
-	checker.checkBlock(LIB_AST, libGlobal, true);
-
 	const mod		= new wasm.WasmModule();
 
 	const reached	= reachedNames(ast);
 	mod.imports = LIB_HOST_IMPORTS.filter(hi => reached.has(hi.name)).map(hi => {
-		const params = hi.params.map(p => paramType({ key: '', typeAnnotation: p }));
+		const params = hi.params.map(p => paramType({ key: '', typeAnnotation: p }).wtype);
 		const result = hi.returnType ? typeOf(hi.returnType) ?? 'void' : 'void';
 		const { funcIndex, typeIndex } = registerFunc(toParams(params), toResults(result));
 		funcs.set(hi.name, { params, result, funcIndex, typeIndex });
@@ -3747,8 +3947,36 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	});
 
 
-	for (const f of functionDeclByName)
+	// The exported function name(s) a top-level `export_decl`'s inner declaration represents, or `[]` if
+	// it isn't a function export at all (a plain value global, a class, ...) -- shared below by the eager-
+	// compile loop (needs the *names*) and the exports-list-building loop further down (needs the same
+	// classification to build each `mod.exports` entry), so the two can't silently drift apart.
+	function exportedFuncNames(s: Statement): string[] {
+		if (s.type === 'function_decl' && s.body)
+			return [s.name];
+		if (s.type === 'var_decl')
+			return s.declarations.filter(d => typeof d.name === 'string' && promotedConsts.has(d.name) && functionDeclByName.has(d.name)).map(d => d.name as string);
+		return [];
+	}
+	const exportedNames = new Set(ast.body.filter(s => s.type === 'export_decl').flatMap(s => exportedFuncNames(s.declaration)));
+
+	// Only *exported* top-level functions need to be compiled unconditionally here -- the exports-list
+	// loop further down reads `funcs.get(name)!.funcIndex` for each and needs it to already exist. Every
+	// other top-level function (reachable or not) is only ever discovered indirectly, from a real call site
+	// (`emitCall`'s own `funcs.get(name) ?? compileFunc(...)`), same worklist-driven "only what's actually
+	// reached gets processed" design classes/generic instantiations already get -- this file's own header
+	// comment on unreachable-code handling only actually held for those, not top-level functions, until now.
+	// A generic entry additionally has no single physical function to eagerly compile at all (like a generic
+	// top-level class, kept out of the eagerly-seeded `classes` map for the same reason) -- only a real call
+	// site (`ensureGenericFunc`) can ever produce a concrete instantiation, so an *exported* generic function
+	// (no fixed signature to give the export) is a real error, not silently skipped.
+	for (const f of functionDeclByName) {
+		if (!exportedNames.has(f[0]))
+			continue;
+		if (f[1].typeParams?.length)
+			throw new Error(`towasm: exported function '${f[0]}' is generic -- a generic function has no single fixed signature to export`);
 		compileFunc(f[0], f[1]);
+	}
 
 	while (worklist.length)
 		worklist.shift()!();
@@ -3801,21 +4029,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Only *explicitly `export`-marked* top-level functions are exported -- class ctors/methods are
 	// reachable through them, and an un-exported top-level function is just a private helper, same as
 	// real JS module semantics (a bare `function` in a module isn't visible outside it either). Also
-	// covers `export const name = (...) => ...`/`= function(...) {...}` -- `functionDeclByName.has`
-	// (not just `promotedConsts.has`, which also covers plain-value globals) distinguishes it from an
-	// `export`-marked value global, which isn't a function export at all.
+	// covers `export const name = (...) => ...`/`= function(...) {...}` via `exportedFuncNames` (defined
+	// above, alongside the eager-compile loop that already guarantees `funcs.get(name)` exists here).
 	for (const outer of ast.body) {
 		if (outer.type !== 'export_decl')
 			continue;
-		const s = outer.declaration;
-		if (s.type === 'function_decl' && s.body) {
-			(mod.exports??=[]).push({ name: s.name, kind: 'func', index: funcs.get(s.name)!.funcIndex });
-		} else if (s.type === 'var_decl') {
-			for (const d of s.declarations) {
-				if (typeof d.name === 'string' && promotedConsts.has(d.name) && functionDeclByName.has(d.name))
-					(mod.exports??=[]).push({ name: d.name, kind: 'func', index: funcs.get(d.name)!.funcIndex });
-			}
-		}
+		for (const name of exportedFuncNames(outer.declaration))
+			(mod.exports??=[]).push({ name, kind: 'func', index: funcs.get(name)!.funcIndex });
 	}
 
 	return mod;
