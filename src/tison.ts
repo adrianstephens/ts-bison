@@ -1130,22 +1130,11 @@ function eliminateUnitGotos(tables: ParseTables): number {
 // themselves. So a cache only needs `action`/`goto`; `rules` (which carries the live `.action` closures)
 // is regenerated for free as a side effect of reconstructing `GrammarBuilder` from the spec, which
 // callers must do anyway to get a fingerprint to validate the cache against.
-//
-// `conflicts` is deliberately NOT part of this: it's diagnostic-only (`runParser`/`runGlrFork` never
-// read it, only tooling like test-cpp-parser.ts's conflict dump does), and unlike `rules` or the
-// 'error'/'ignore' action fill, it can't be regenerated cheaply -- reproducing it needs the very
-// `buildTables` pass caching exists to skip. So a cache hit's `tables.conflicts` is always `[]`; for
-// grammars with many precedence-resolved conflicts (e.g. C's) this was also over half the file's bytes,
-// for one field nothing at runtime reads.
-//
-// Bump TABLE_FORMAT_VERSION whenever `buildTables`/`eliminateUnitGotos` change in a way that could change
-// the tables produced for the same grammar shape, OR the SerializedTables encoding itself changes -- the
-// fingerprint alone can't detect either, and an old cache file would otherwise be misread as valid.
+
 export const TABLE_FORMAT_VERSION = 4;
 
 // Rows are flat number arrays, not `[key, value]` pairs -- every terminal/nonterminal is already an
-// index into a namespace `deserializeTables` reconstructs from the live `GrammarBuilder` (see
-// `indexTerminals`/`indexNonTerminals`), so nothing here is ever a string: entries are effectively
+// index into a namespace `deserializeTables` reconstructs from the live `GrammarBuilder`, so nothing here is ever a string: entries are effectively
 // tables of small integers, the same shape the built-in `Map`/`Terminal` objects hide.
 //
 // action row: `[...defaultEntry, ...(termIndex*2 | isException)*]` -- an instruction-set-sized grammar
@@ -1158,14 +1147,12 @@ export const TABLE_FORMAT_VERSION = 4;
 // rows (e.g. WAT's ~25 "start of instruction" dispatch states, one real shift target per opcode) get
 // no benefit from this -- nothing there repeats -- but cost only one extra number per entry to allow it.
 // goto row: repeated (ntIndex, state) pairs.
-export type SerializedActionRow	= number[];
-export type SerializedGotoRow		= number[];
 
-const enum EntryTag { Shift, Reduce, Accept, Conflict }
+const EntryTag = { Shift: 0, Reduce: 1, Accept: 2, Conflict: 3 } as const;
 
 export interface SerializedTables {
-	action:		SerializedActionRow[];
-	goto:		SerializedGotoRow[];
+	action:		number[][];
+	goto:		number[][];
 }
 
 // Deterministic index for each NonTerminal, in first-encounter order over `g.rules`. NonTerminal
@@ -1208,14 +1195,11 @@ function encodeEntry(out: number[], entry: ActionEntry) {
 
 // `cursor` is mutated in place so nested `conflict` entries can keep consuming from the same row.
 function decodeEntry(row: number[], cursor: { i: number }): ActionEntry {
-	switch (row[cursor.i++] as EntryTag) {
+	switch (row[cursor.i++] as 0|1|2|3) {
 		case EntryTag.Shift:	return { kind: 'shift', state: row[cursor.i++] };
 		case EntryTag.Reduce:	return { kind: 'reduce', rule: row[cursor.i++] };
 		case EntryTag.Accept:	return { kind: 'accept' };
-		case EntryTag.Conflict: {
-			const n = row[cursor.i++];
-			return { kind: 'conflict', entries: Array.from({ length: n }, () => decodeEntry(row, cursor)) };
-		}
+		case EntryTag.Conflict: return { kind: 'conflict', entries: Array.from({ length: row[cursor.i++] }, () => decodeEntry(row, cursor)) };
 	}
 }
 

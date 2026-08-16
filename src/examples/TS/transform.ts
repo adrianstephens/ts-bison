@@ -471,11 +471,17 @@ function pushDepthExhaustionGap(diagnostics: Diagnostic[]) {
 	}
 }
 
-export function TStypeCheck(ast: TS.Program): Diagnostic[] {
+// `libScope`: a scope populated with lib declarations a later consumer needs in view while checking
+// this program (e.g. `TStoWasm`'s `makeLibScope()`, for `String`/`RegExpMatch`/etc) -- `global` (and so
+// every statement's own checked-under scope, and `ast.scope` itself) descends from it when given, so
+// that consumer doesn't need to re-check the program a second time just to see those declarations from
+// a scope its own code actually reaches. Optional and defaults to a bare `T.makeGlobal()`, unchanged
+// from before, for callers with no such consumer (e.g. `TStoDecl`-only or checker-only use).
+export function TStypeCheck(ast: TS.Program, libScope?: Scope): Diagnostic[] {
 	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
 	const checker = makeChecker(makeDiagnostic(d => diagnostics.push(d)));
-	const global = T.makeGlobal();
+	const global = libScope ? new Scope(libScope) : T.makeGlobal();
 	checker.checkBlock(ast.body, global, undefined);
 	pushDepthExhaustionGap(diagnostics);
 	ast.scope = global;
@@ -491,8 +497,8 @@ async function getLibScope(loader: ModuleLoader, options: CompilerOptions1): Pro
 	let cached = libScopeCache.get(key);
 	if (!cached) {
 		cached = (async () => {
-			const checker = makeChecker(makeDiagnostic(() => {}));
-			const global = T.makeGlobal();
+			const checker	= makeChecker(makeDiagnostic(() => {}));
+			const global	= T.makeGlobal();
 			for (const spec of options.lib!) {
 				const lib = await loader.get(spec, '.');
 				if (lib)
@@ -534,9 +540,6 @@ function wouldDeadlock(waiter: LoadedModule, target: LoadedModule): boolean {
 	return false;
 }
 
-// `func` must be awaited *inside* this try -- calling an async function returns immediately (it doesn't block
-// until its first await), so awaiting only at the call site would run `finally` before `func` actually finishes,
-// collapsing the window `wouldDeadlock` relies on to detect a real in-progress cycle.
 async function safely<T>(waiter: LoadedModule, target: LoadedModule, func: () => Promise<T>): Promise<T | undefined> {
 	if (wouldDeadlock(waiter, target))
 		return undefined;
@@ -552,11 +555,15 @@ async function safely<T>(waiter: LoadedModule, target: LoadedModule, func: () =>
 	}
 }
 
-export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, options: CompilerOptions1) {
+// `libScope`: see `TStypeCheck`'s own comment -- same purpose here, but only chained in as an extra
+// ancestor on top of whatever `options.lib` already loads (not merged with it); no current caller needs
+// both a real module-loaded lib set *and* a `TStoWasm`-style `libScope` at once, so a real combination
+// (e.g. copying `libScope`'s own bindings into the loaded scope) is left for whenever one actually does.
+export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, options: CompilerOptions1, libScope?: Scope) {
 	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
 	const checker	= makeChecker(makeDiagnostic(d => diagnostics.push(d)));
-	const global	= await getLibScope(loader, options);
+	const global	= libScope ? new Scope(libScope) : await getLibScope(loader, options);
 
 	// Resolves one `import` into `importScope` (shared by `makeScope` and the entry program); return value feeds
 	// `makeScope`'s own `tainted` verdict (false = cycle truncation).

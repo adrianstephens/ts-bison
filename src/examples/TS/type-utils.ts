@@ -184,10 +184,10 @@ export function rangeUnion(a: NumRange, b: NumRange): NumRange | undefined {
 
 // Same-typed `number`/`bigint` arithmetic on a `number | bigint`-typed value, without mixing the two at the type level.
 function negValue(v: number | bigint): number | bigint { return typeof v === 'bigint' ? -v : -v; }
-function addValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a + (b as bigint) : a + (b as number); }
-function subValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a - (b as bigint) : a - (b as number); }
-function mulValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a * (b as bigint) : a * (b as number); }
-function divValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a / (b as bigint) : a / (b as number); }
+function addValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a + BigInt(b) : a + Number(b); }
+function subValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a - BigInt(b) : a - Number(b); }
+function mulValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a * BigInt(b) : a * Number(b); }
+function divValue(a: number | bigint, b: number | bigint): number | bigint { return typeof a === 'bigint' ? a / BigInt(b) : a / Number(b); }
 function minOfValues(vs: (number | bigint)[]): number | bigint { return vs.reduce((a, b) => a < b ? a : b); }
 function maxOfValues(vs: (number | bigint)[]): number | bigint { return vs.reduce((a, b) => a > b ? a : b); }
 
@@ -268,6 +268,22 @@ export function rangeLogic(a: NumRange, b: NumRange): NumRange | undefined {
 // a narrowed numeric type the same way a plain `number`/`bigint` ref is decided (both are always presumed to include 0).
 function rangeIncludesZero(r: { min?: number | bigint; max?: number | bigint }): boolean {
 	return (r.min === undefined || r.min <= 0) && (r.max === undefined || r.max >= 0);
+}
+
+export function rangeClamp(a: NumRange, bound: number|bigint, isUpper: boolean, strict?: boolean): NumRange | undefined {
+	if (isUpper) {
+		if (strict && a.integer)
+			--bound;
+		if (a.min !== undefined && a.min > bound)
+			return undefined;
+		return {...a, max: a.max !== undefined && a.max < bound ? a.max : bound};
+	} else {
+		if (strict && a.integer)
+			++bound;
+		if (a.max !== undefined && a.max < bound)
+			return undefined;
+		return {...a, min: a.min !== undefined && a.min > bound ? a.min : bound};
+	}
 }
 
 // ===================================================================

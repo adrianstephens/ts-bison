@@ -58,6 +58,23 @@ function applyContextualParams(params: JS.Param<Type>[], expected: Type | undefi
 	}
 }
 
+// Whether `e` is a link in an *active* optional chain -- either `e` itself is a real `?.`/`?.[`/`?.(`
+// step, or it continues one further out (`a?.b.c`: `.c` isn't itself optional, but its own object `a?.b`
+// is, so real TS still short-circuits `.c` when `a` is nullish, same chain). Recurses through the
+// receiver position only (`member`/`index`'s `object`, `call`'s `callee`) -- a chain can't restart once
+// broken by anything else (a binary op, a parenthesized sub-expression losing its own `optional` marker,
+// etc), matching real TS's own "optional chaining is contiguous" rule.
+// Exported: `towasm.ts`'s own codegen needs the exact same "is this link part of a live chain" test (its
+// own equivalent of the checker's `T.nonNullable`-before-lookup use here) -- one shared implementation,
+// not two that could silently drift apart on what counts as "still the same chain".
+export function isOptionalChainLink(e: Expr): boolean {
+	if (e.type === 'member' || e.type === 'index')
+		return !!e.optional || isOptionalChainLink(e.object);
+	if (e.type === 'call')
+		return !!e.optional || isOptionalChainLink(e.callee);
+	return false;
+}
+
 // Conservative "this statement never falls through" -- powers guard-clause narrowing
 function alwaysExits(stmt: JS.Statement<any>): boolean {
 	switch (stmt.type) {
@@ -153,9 +170,6 @@ function narrowMath(func: string, params: TS.Param[]): Type | undefined {
 		}
 	}
 }
-// `v - 1` / `v + 1` without mixing `number`/`bigint` arithmetic on a `number | bigint`-typed value.
-function decrement(v: number | bigint): number | bigint { return typeof v === 'bigint' ? v - 1n : v - 1; }
-function increment(v: number | bigint): number | bigint { return typeof v === 'bigint' ? v + 1n : v + 1; }
 
 // The engine behind `TStypeCheck`, also reused by `TStoDecl` (with `report` off) for its scope resolution and expression-type synthesis.
 // `mute` suppresses diagnostics while typing speculatively (lazy return-type inference re-walks bodies the reporting pass also visits).
@@ -434,22 +448,13 @@ export function makeChecker(diag: Diagnostics) {
 							const bound = isUpper ? other.max : other.min;
 							if (bound === undefined)
 								return base;
+
 							return narrowValue(base, key, m => {
 								const mr = T.toRange(m);
 								if (!mr || mr.base !== other.base)
 									return true;
-								let merged = T.rangeIntersect(mr, isUpper ? { base: mr.base, max: bound, integer: false } : { base: mr.base, min: bound, integer: false });
-								if (!merged)
-									return false;
-								// A strict `<`/`>` against a provably-integer result excludes the boundary value itself.
-								if (strict && merged.integer) {
-									merged = isUpper
-										? { ...merged, max: merged.max !== undefined ? decrement(merged.max) : undefined }
-										: { ...merged, min: merged.min !== undefined ? increment(merged.min) : undefined };
-									if (merged.min !== undefined && merged.max !== undefined && merged.min > merged.max)
-										return false;
-								}
-								return T.rangeToType(merged);
+								const merged = T.rangeClamp(mr, bound, isUpper, strict);
+								return !merged ? false : T.rangeToType(merged);
 							}, base.value(key) ?? typeOf(target, base));
 						};
 
@@ -972,41 +977,52 @@ export function makeChecker(diag: Diagnostics) {
 					if (e.property === 'buffer')
 						return TS.RefType('ArrayBuffer');
 				}
-				const resolvedObjT = T.resolve(scope, e.optional ? T.nonNullable(objT, scope) : objT);
+				// `chained`, not a bare `e.optional` -- `a?.b.c`'s `.c` isn't itself an `?.` step, but it
+				// continues one (`a?.b` is), so real TS still short-circuits it when `a` is nullish. Using
+				// only `e.optional` here (the original bug) left `objT` as the *full* `Inner | undefined`
+				// for a chain-continuation's own lookup -- `lookupMember`'s union case requires *every*
+				// member to have the property, and `undefined` never does, so it silently fell back to `any`
+				// for the whole rest of the chain (see `isOptionalChainLink`'s own comment).
+				const chained = isOptionalChainLink(e);
+				const resolvedObjT = T.resolve(scope, chained ? T.nonNullable(objT, scope) : objT);
 				if (resolvedObjT.type === 'ref' && resolvedObjT.name === 'ArrayBuffer' && e.property === 'byteLength')
 					return TS.RangeType('number', 0, 0x7fffffff, true);
-				// `?.` only ever looks the property up on the non-nullish part of `objT` -- `lookupMember`'s
-				// own union case requires *every* member to have it (a bare `null`/`undefined` member never
-				// does), so an unguarded `T.lookupMember(objT, ...)` here would always miss and fall back to
-				// `any` the moment `objT` includes either. A non-optional access keeps the full (possibly
-				// nullish) `objT` -- real TS itself only allows that when it's already known non-nullish, so
-				// leaving it as-is is what lets the `sealed`/`err` check below still flag `x.y` on a
-				// possibly-null `x` (dropping nullish members here unconditionally would silently accept it).
-				const t		= T.lookupMember(e.optional ? T.nonNullable(objT, scope) : objT, e.property, scope);
+				// `?.` (direct or chained) only ever looks the property up on the non-nullish part of `objT`
+				// -- `lookupMember`'s own union case requires *every* member to have it (a bare
+				// `null`/`undefined` member never does), so an unguarded `T.lookupMember(objT, ...)` here
+				// would always miss and fall back to `any` the moment `objT` includes either. A genuinely
+				// non-chained access keeps the full (possibly nullish) `objT` -- real TS itself only allows
+				// that when it's already known non-nullish, so leaving it as-is is what lets the
+				// `sealed`/`err` check below still flag `x.y` on a possibly-null `x` (dropping nullish
+				// members here unconditionally would silently accept it).
+				const t		= T.lookupMember(chained ? T.nonNullable(objT, scope) : objT, e.property, scope);
 				if (!muted && !t && !e.optional && T.sealed(objT, scope))
 					err(SEVERITY.ERROR, pos)`Property '${e.property}' does not exist on type '${objT}'`;
 				if (!t)
 					return T.ANY;
 				// `lookupMember` returns an optional property's type unwidened (callers needing "is this optional" use `memberOptional`);
-				// a plain read here must still see the `| undefined` an optional field or `?.` actually allows.
-				return (e.optional || T.memberOptional(objT, e.property, scope)) ? T.combineTypes([t, T.UNDEFINED]) : t;
+				// a plain read here must still see the `| undefined` a chained (direct or continued) optional access actually allows.
+				return (chained || T.memberOptional(objT, e.property, scope)) ? T.combineTypes([t, T.UNDEFINED]) : t;
 			}
 			case 'index': {
 				const rawObjT = typeOf(e.object, scope);
+				// `chained`, not a bare `e.optional` -- see `case 'member'`'s own comment on `isOptionalChainLink`;
+				// same "a chain continuation isn't itself `?.` but still short-circuits" reasoning applies here.
+				const chained = isOptionalChainLink(e);
 				// Checked by name on the *unresolved* type, same reason `case 'member'`'s own `TYPED_ARRAY_RANGES`
 				// check above is -- `T.resolve` below expands a typed-array alias into `TypedArray<T>`'s merged
 				// (real class + ambient interface) shape, an intersection it never flattens, so a resolved check
 				// would never match.
 				if (rawObjT.type === 'ref' && !rawObjT.typeArgs && rawObjT.name in TYPED_ARRAY_RANGES)
-					return e.optional ? T.combineTypes([T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]), T.UNDEFINED]) : T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]);
-				// Same reasoning as `case 'member'`'s own `T.nonNullable` use just above: `?.` only ever indexes
-				// the non-nullish part of `objT` -- left as the full (possibly nullish) union, none of the
-				// branches below (`'array'`/`'tuple'`/index-signature/named-key) would ever match at all, since
-				// `T.resolve` never collapses a union on its own, and every one would silently fall through to
-				// the bare `T.ANY` at the end.
-				const objT = T.resolve(scope, e.optional ? T.nonNullable(rawObjT, scope) : rawObjT);
+					return chained ? T.combineTypes([T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]), T.UNDEFINED]) : T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]);
+				// Same reasoning as `case 'member'`'s own `T.nonNullable` use just above: `?.` (direct or
+				// chained) only ever indexes the non-nullish part of `objT` -- left as the full (possibly
+				// nullish) union, none of the branches below (`'array'`/`'tuple'`/index-signature/named-key)
+				// would ever match at all, since `T.resolve` never collapses a union on its own, and every
+				// one would silently fall through to the bare `T.ANY` at the end.
+				const objT = T.resolve(scope, chained ? T.nonNullable(rawObjT, scope) : rawObjT);
 				typeOf(e.property, scope);
-				const wrap = (t: Type) => e.optional ? T.combineTypes([t, T.UNDEFINED]) : t;
+				const wrap = (t: Type) => chained ? T.combineTypes([t, T.UNDEFINED]) : t;
 				if (objT.type === 'array')
 					return wrap(objT.element);
 				if (objT.type === 'tuple' && T.isLiteral(e.property, 'number')) {
@@ -1034,7 +1050,7 @@ export function makeChecker(diag: Diagnostics) {
 						err(SEVERITY.ERROR, pos)`Property '${e.property.value}' does not exist on type '${objT}'`;
 					if (!t)
 						return T.ANY;
-					return (e.optional || T.memberOptional(objT, e.property.value, scope)) ? T.combineTypes([t, T.UNDEFINED]) : t;
+					return (chained || T.memberOptional(objT, e.property.value, scope)) ? T.combineTypes([t, T.UNDEFINED]) : t;
 				}
 				return T.ANY;
 			}
@@ -1058,13 +1074,15 @@ export function makeChecker(diag: Diagnostics) {
 						}
 					}
 				}
-				// `obj?.method(...)`: `e.callee` (`obj?.method`) already resolved to `MethodType | undefined`
-				// (the `'member'` case's own optional-wrapping, correct for reading it as a plain value) --
-				// but *calling* it needs the real, non-nullish method signature to resolve against (an
-				// unstripped `| undefined` union isn't `'function'`/`'constructor'`-shaped, so signature
-				// lookup below would just fail and fall back to `any`). The call's own short-circuit-to-
-				// `undefined` is instead reattached to the result once, right before the final `return`.
-				const calleeOptional = e.callee.type === 'member' && e.callee.optional;
+				// `obj?.method(...)` (or a chain continuing one further out, `obj?.a.method(...)` --
+				// `isOptionalChainLink`, same reasoning as `case 'member'`'s own use of it): `e.callee`
+				// (`obj?.method`) already resolved to `MethodType | undefined` (the `'member'` case's own
+				// optional-wrapping, correct for reading it as a plain value) -- but *calling* it needs the
+				// real, non-nullish method signature to resolve against (an unstripped `| undefined` union
+				// isn't `'function'`/`'constructor'`-shaped, so signature lookup below would just fail and
+				// fall back to `any`). The call's own short-circuit-to-`undefined` is instead reattached to
+				// the result once, right before the final `return`.
+				const calleeOptional = e.callee.type === 'member' && isOptionalChainLink(e.callee);
 				const calleeT	= T.resolveOwn(calleeOptional ? T.nonNullable(typeOf(e.callee, scope), scope) : typeOf(e.callee, scope), scope);
 				// Explicit call-site type args (`f<Foo>(...)`) are raw AST, never stamped like a declaration's own annotations --
 				// unstamped, a ref substituted into the callee's generic body would resolve against the callee's scope, not the caller's.
@@ -1461,13 +1479,14 @@ export function makeChecker(diag: Diagnostics) {
 		fn.scope ??= inner;
 		for (const p of fn.params) {
 			const anno = p.typeAnnotation;
-			if (!muted && p.default) {
-				const dt = typeOf(p.default, inner);
-				if (anno && !checkAssignable(dt, anno, inner, (p as any).pos))
-					err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
-			}
+			// Computed unconditionally (not just `!muted`) so it's available below for a defaulted,
+			// unannotated param's own type too -- `typeOf`'s own diagnostics are already self-gated by
+			// the ambient `muted` counter, so only the explicit assignability check+report needs the guard.
+			const dt = p.default && typeOf(p.default, inner);
+			if (!muted && dt && anno && !checkAssignable(dt, anno, inner, (p as any).pos))
+				err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
 			if (typeof p.key === 'string')
-				inner.addValue(p.key, anno ? (hasMod(p, 'optional') && !p.default ? T.combineTypes([anno, T.UNDEFINED]) : anno) : T.literalTypeOf(p.default) ?? T.ANY);
+				inner.addValue(p.key, anno ? (hasMod(p, 'optional') && !p.default ? T.combineTypes([anno, T.UNDEFINED]) : anno) : dt ?? T.ANY);
 			else
 				T.bindingNames(p.key).forEach(n => inner.addValue(n, T.ANY));
 		}
@@ -1618,6 +1637,16 @@ export function makeChecker(diag: Diagnostics) {
 
 
 	const checkStmt = (stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|undefined, scope: Scope)=>void): void => {
+		// The real (post-narrowing, where applicable) `Scope` this statement was type-checked under --
+		// stamped directly on the node (like `pos`, `CallSig.scope`), not tracked as checker state, so a
+		// consumer with no narrowing-aware scope of its own (towasm.ts's codegen, whose own scope tracking
+		// never reflects flow narrowing) can read back the same scope the checker concluded for this
+		// statement instead of only ever seeing the function-entry scope. Untyped (`any`), not a formal
+		// field on `Statement` -- that union is large enough that a shared field added via an intersection
+		// broke unrelated generic AST-mapping code elsewhere (`walker.ts`'s `keyof`-based `NodeMap`).
+		// `??=`: first (real, unmuted) check wins, same reasoning as `fn.scope ??=` above -- a speculative
+		// (muted) re-walk always reaches a given statement only after the real pass already has.
+		(stmt as any).scope ??= scope;
 		switch (stmt.type) {
 			case 'var_decl': {
 				// `hoistVar` (which actually *registers* each declared name's type in `scope`) must run
@@ -1775,6 +1804,9 @@ export function makeChecker(diag: Diagnostics) {
 		typeOf, exportScope,
 
 		scopeOf: (fnj: JS.CallSig<any>): Scope | undefined => (fnj as TS.CallSig).scope as Scope | undefined,
+		// The real, narrowing-aware scope `stmt` was type-checked under -- see `checkStmt`'s own comment
+		// on the stamp itself (untyped, like `pos`, not a formal `Statement` field).
+		scopeOfStmt: (stmt: TS.Statement): Scope | undefined => (stmt as any).scope,
 
 		checkBlock: (stmts: TS.Statement[], scope: Scope, muted = false) => {
 			return maybeMuted(muted, ()=>checkBlock(stmts, scope));

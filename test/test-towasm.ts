@@ -2,11 +2,13 @@ import assert from 'assert';
 import fs from 'fs/promises';
 import path from 'path';
 import * as TS from '../src/examples/TS/ts-parser';
-import { TStoWasm } from '../src/examples/TS/towasm';
+import { TStoWasm, makeLibScope } from '../src/examples/TS/towasm';
 import { TStypeCheck } from '../src/examples/TS/transform';
 import { SEVERITY } from '../src/examples/TS/checker';
 
 const parser = TS.make();
+// Built once, reused across every `compile()` call below -- same lib declarations either way.
+const libScope = makeLibScope();
 
 const b = new Uint8Array(1024);
 const f = new Float32Array(b.buffer);
@@ -25,7 +27,7 @@ for (let i = 0; i < f.length; i++) {
 // own size for what's fundamentally a fixed, self-controlled instruction set -- see the write-up).
 async function compile(src: string) {
 	const program		= parser.parse(src);
-	const diagnostics	= TStypeCheck(program);
+	const diagnostics	= TStypeCheck(program, libScope);
 	const errors		= diagnostics.filter(d => d.severity === SEVERITY.ERROR);
 	if (errors.length)
 		throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
@@ -926,19 +928,38 @@ async function main() {
 		check("a?.b (number-typed field, receiver non-null)", fieldNonNull(), 9);
 	}
 
-	// This surfaces via '??'s own combined-result-type lookup (checker.typeOf can't resolve a chained
-	// access through an optional result any better than towasm.ts can), not the more specific "chaining"
-	// message emitExpr's 'member' case would throw if it got as far as actually lowering the chain --
-	// still a real, safe rejection either way, just a more generic one.
-	await checkThrows("chaining another access onto an optional result ('a?.b.c') is rejected", () => compile(`
-		class Inner { v: number; constructor(v: number) { this.v = v; } }
-		class Outer { inner: Inner; constructor(inner: Inner) { this.inner = inner; } }
-		class Wrapper { o: Outer | null; constructor(o: Outer | null) { this.o = o; } }
-		export function f(): number {
-			const w = new Wrapper(null);
-			return w.o?.inner.v ?? -1;
-		}
-	`), /towasm/);
+	{
+		// `a?.b.c` -- a plain (non-`?.`) continuation of an earlier optional step still short-circuits the
+		// whole chain, same as real JS: `.inner.v` never runs at all when `w.o` is null, not just "reads
+		// `.v` off `undefined` and fails". `a?.b?.c` (every step optional) composes the same way.
+		const { chainNull, chainNonNull, doubleOptNull, doubleOptNonNull } = await compile(`
+			class Inner { v: number; constructor(v: number) { this.v = v; } }
+			class Outer { inner: Inner; constructor(inner: Inner) { this.inner = inner; } }
+			class Wrapper { o: Outer | null; constructor(o: Outer | null) { this.o = o; } }
+			export function chainNull(): number {
+				const w = new Wrapper(null);
+				return w.o?.inner.v ?? -1;
+			}
+			export function chainNonNull(): number {
+				const w = new Wrapper(new Outer(new Inner(7)));
+				return w.o?.inner.v ?? -1;
+			}
+			class OptInner { v: number; constructor(v: number) { this.v = v; } }
+			class OptOuter { inner: OptInner | null; constructor(inner: OptInner | null) { this.inner = inner; } }
+			export function doubleOptNull(): number {
+				const o: OptOuter | null = null;
+				return o?.inner?.v ?? -1;
+			}
+			export function doubleOptNonNull(): number {
+				const o: OptOuter | null = new OptOuter(new OptInner(9));
+				return o?.inner?.v ?? -1;
+			}
+		`);
+		check("a?.b.c (chain continuation, root null)", chainNull(), -1);
+		check("a?.b.c (chain continuation, root non-null)", chainNonNull(), 7);
+		check("a?.b?.c (every step optional, root null)", doubleOptNull(), -1);
+		check("a?.b?.c (every step optional, root non-null)", doubleOptNonNull(), 9);
+	}
 
 	{
 		// `a?.[i]` -- the whole array (not an element) is nullable; the indexed read is itself a boxed
