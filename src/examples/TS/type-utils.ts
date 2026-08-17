@@ -508,10 +508,27 @@ function isLiteralOnly(t: Type, scope: Scope, depth = 6): boolean | undefined {
 	}
 }
 
+// Deep: also widens literal element/property types nested inside array/object structure (matching real TS, which widens a freshly-
+// inferred array/object literal's members too, not just a bare literal expression) -- not just this type's own top-level shape.
+// `frozen` leaves (see `common.ts`'s `Literal.frozen`) are left exactly as they are, at any nesting depth -- an `as const`
+// value's own literal identity survives being embedded in a container that's itself later widened (`[1, x as const]`).
 export function widenLiterals(t: Type, keepBoolean = false): Type {
-	return	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(typeof t.value)
+	return	(t.type === 'literal' || t.type === 'range') && t.frozen ? t
+		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(typeof t.value)
 		:	t.type === 'range' ? TS.RefType(t.base)
 		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean)))
+		:	t.type === 'array' ? TS.ArrayType(widenLiterals(t.element, keepBoolean), t.readonly)
+		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, widenLiterals(m.typeAnnotation, keepBoolean), m.modifiers) : m))
+		:	t;
+}
+
+// The inverse of `widenLiterals`'s own recursion shape: marks every literal/range leaf within `t` as `frozen`, matching
+// an `as const` assertion's real TS semantics -- used once, where `typeOf`'s `'as'` case computes the asserted value.
+export function freeze(t: Type): Type {
+	return	t.type === 'literal' || t.type === 'range' ? { ...t, frozen: true }
+		:	t.type === 'union' ? TS.UnionType(t.types.map(freeze))
+		:	t.type === 'array' ? TS.ArrayType(freeze(t.element), t.readonly)
+		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, freeze(m.typeAnnotation), m.modifiers) : m))
 		:	t;
 }
 
@@ -1440,103 +1457,6 @@ export function stampSig<T extends TS.CallSig>(sig: T, scope: Scope): T {
 			stampScope(p.default as Type, scope);
 	});
 	return sig;
-}
-
-// `instance` is `new C(...)`/`this`'s type; `value` is the class binding's type (construct sig ∩ static members).
-// `scope`: the class's declaring scope, stamped onto every result `ref` so a member resolved elsewhere still uses it.
-export function classShapes(c: TS.Class, scope: Scope, inferInit?: (e: Expr, scope: Scope) => Type | undefined): { instance: Type; value: Type } {
-	const members:			TS.TypeMember[] = [];
-	const staticMembers:	TS.TypeMember[] = [];
-	const ctorMembers:		TS.ClassMethod[] = [];
-	// Fields needing `inferInit` (below) get their lazy getter installed only *after* this function's own
-	// `stampScope` call at the bottom -- that call already walks every member's `typeAnnotation` once, and
-	// installing the getter before it would make *that* walk the "first read", forcing `inferInit` right
-	// here (still mid-`hoist`, before later-in-file declarations like `__asm` are hoisted) instead of at
-	// whatever later, real, post-hoist read actually asks for this field's type.
-	const pendingFieldInit: { prop: TS.TypeMember; init: Expr }[] = [];
-
-	for (const m of c.body) {
-		if (m.type === 'index_signature') {
-			members.push(TS.TypeIndex(m.paramName, m.paramType, m.typeAnnotation));
-			continue;
-		}
-		if (!('key' in m) || typeof m.key !== 'string')
-			continue;
-
-		const list = hasMod(m, 'static') ? staticMembers : members;
-		switch (m.type) {
-			case 'field': {
-				// No annotation falls back to inferring the initializer's own *widened* type, matching real TS' own field-inference.
-				// Anything else (a call, `new`, ...) is queued into `pendingFieldInit`, resolved once the whole shape (and `hoist`'s later declarations
-				const lit = m.typeAnnotation ? undefined : literalTypeOf(m.value);
-				if (m.typeAnnotation || lit || !m.value || !inferInit) {
-					list.push(TS.TypeProperty(m.key, (m.typeAnnotation as Type) ?? (lit && widenLiterals(lit)) ?? ANY, m.modifiers));
-				} else {
-					const prop = TS.TypeProperty(m.key, ANY, m.modifiers);
-					pendingFieldInit.push({ prop, init: m.value });
-					list.push(prop);
-				}
-				break;
-			}
-			case 'method':
-				if (m.key === 'constructor') {
-					ctorMembers.push(m);
-					// A parameter-property modifier is anything but the unrelated `'optional'` tag.
-					for (const p of m.params)
-						if (p.modifiers?.some(x => x !== 'optional') && typeof p.key === 'string')
-							members.push(TS.TypeProperty(p.key, p.typeAnnotation ?? literalTypeOf(p.default) ?? ANY, m.modifiers));
-				} else {
-					list.push(TS.TypeMethod(m.key, withScope(FixSig(m, ANY), scope), m.modifiers));
-				}
-				break;
-			case 'get':
-				list.push(TS.TypeProperty(m.key, m.returnType ?? ANY));
-				break;
-			case 'set':
-				if (!list.some(x => x.type === 'property' && x.key === m.key))
-					list.push(TS.TypeProperty(m.key, m.params[0]?.typeAnnotation ?? ANY));
-				break;
-		}
-	}
-	const obj = TS.ObjectType(members);
-	// a base the checker can't model (mixin call, namespace member, imported class) leaves the instance unsealed; likewise an inherited constructor accepts any arguments.
-	// Own members come first: lookupMember's first match implements override precedence
-	const superType: Type | undefined =
-			c.superClass?.type === 'identifier' ? TS.RefType(c.superClass.name)
-		:	c.superClass?.type === 'instantiation' && c.superClass.expression.type === 'identifier' ? TS.RefType(c.superClass.expression.name, c.superClass.typeArgs as Type[])
-		:	c.superClass ? ANY : undefined;
-	const instance = superType ? TS.IntersectionType([obj, superType]) : obj;
-	// The named ref carries its own type params back as its own typeArgs (`Box<T>` -> `new(...): Box<T>`) -- without this,
-	// a bare `RefType(c.name)` never mentions `T`, so `new Box<number>(...)` produced a `Box` with no type args at all.
-	const ctorReturn = c.name ? TS.RefType(c.name, c.typeParams?.map(p => TS.RefType(p.name))) : instance;
-	const makeCtorSig = (params: TS.Params) => withScope(TS.CallSig(params, ctorReturn, c.typeParams), scope);
-	// >1 real constructor body: a genuine overload set, same multi-signature shape `lookupMember` builds
-	// for same-named methods and `hoist` builds for free-function overloads -- `case 'new'`'s existing
-	// arity+type-fit resolution (via `T.collectMembers`'s `'construct'`-member filter) already handles it.
-	const ctor: Type = ctorMembers.length > 1
-		? TS.ObjectType(ctorMembers.map(m => TS.TypeConstruct(makeCtorSig(FixParams(m)))))
-		: { type: 'constructor', ...makeCtorSig(ctorMembers.length ? FixParams(ctorMembers[0]) : {params: [], rest: c.superClass ? JS.Rest('args', TS.ArrayType(ANY)) : undefined}) };
-	const value = staticMembers.length ? TS.IntersectionType([ctor, TS.ObjectType(staticMembers)]) : ctor;
-	stampScope(instance, scope);
-	stampScope(value, scope);
-
-	// Installed only now, *after* the walks above -- a self-memoizing lazy getter
-	for (const { prop, init } of pendingFieldInit) {
-		let resolving = false;
-		Object.defineProperty(prop, 'typeAnnotation', {
-			configurable: true,
-			enumerable: true,
-			get(): Type {
-				if (resolving)
-					return ANY;
-				resolving = true;
-				const t = stampScope(widenLiterals(inferInit!(init, scope) ?? ANY), scope);
-				Object.defineProperty(prop, 'typeAnnotation', { value: t, writable: true, enumerable: true, configurable: true });
-				return t;
-			},
-		});
-	}
-	return { instance, value };
 }
 
 // Does `argTs` fit `sig` (arity, then every provided argument assignable)? `hasSpread`: a spread argument's real element

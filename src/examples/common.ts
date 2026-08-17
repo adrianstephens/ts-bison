@@ -1,4 +1,7 @@
-export interface Literal<T> { type: 'literal'; value: T }
+// `frozen`: TS.Type-context only (this interface is shared with JS.Expr's own literal AST nodes, which never set it) --
+// marks a literal produced by an `as`/`as const` assertion, so `type-utils.ts`'s `widenLiterals` leaves it exactly as
+// asserted even once it's nested inside a container (an array/object/union) that's itself later widened.
+export interface Literal<T> { type: 'literal'; value: T; frozen?: boolean }
 export function  Literal<T>(value: T): Literal<T> { return { type: 'literal', value }; }
 
 export interface Identifier {type: 'identifier', name: string}

@@ -4,7 +4,7 @@ import * as JSX from './jsx-parser';
 import * as T from './type-utils';
 import { Identifier, Literal, Binary } from '../common';
 import { walk, hasMod, dropMod } from './walker';
-import { makeChecker, SEVERITY } from './checker';
+import { SEVERITY, makeErr, checkBlock, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader, ModuleOptionsDefault } from './module-loader';
 import { Output } from './tocode';
 
@@ -480,9 +480,8 @@ function pushDepthExhaustionGap(diagnostics: Diagnostic[]) {
 export function TStypeCheck(ast: TS.Program, libScope?: Scope): Diagnostic[] {
 	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
-	const checker = makeChecker(makeDiagnostic(d => diagnostics.push(d)));
 	const global = libScope ? new Scope(libScope) : T.makeGlobal();
-	checker.checkBlock(ast.body, global, undefined);
+	checkBlock(ast.body, global, undefined, undefined, makeErr(makeDiagnostic(d => diagnostics.push(d))));
 	pushDepthExhaustionGap(diagnostics);
 	ast.scope = global;
 	return diagnostics;
@@ -497,12 +496,12 @@ async function getLibScope(loader: ModuleLoader, options: CompilerOptions1): Pro
 	let cached = libScopeCache.get(key);
 	if (!cached) {
 		cached = (async () => {
-			const checker	= makeChecker(makeDiagnostic(() => {}));
+			//const checker	= makeChecker(makeDiagnostic(() => {}));
 			const global	= T.makeGlobal();
 			for (const spec of options.lib!) {
 				const lib = await loader.get(spec, '.');
 				if (lib)
-					checker.checkBlock(lib.body, global, true);
+					checkBlock(lib.body, global);
 			}
 			return global;
 		})();
@@ -562,7 +561,7 @@ async function safely<T>(waiter: LoadedModule, target: LoadedModule, func: () =>
 export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, options: CompilerOptions1, libScope?: Scope) {
 	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
-	const checker	= makeChecker(makeDiagnostic(d => diagnostics.push(d)));
+	const err		= makeErr(makeDiagnostic(d => diagnostics.push(d)));
 	const global	= libScope ? new Scope(libScope) : await getLibScope(loader, options);
 
 	// Resolves one `import` into `importScope` (shared by `makeScope` and the entry program); return value feeds
@@ -609,7 +608,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 		const importScope = new Scope(global);
 		const cached = Promise.all(src.body.filter(s => s.type === 'import').map(s => resolveImport(src, importScope, s, src.canonical))).then(async imports => {
 			let tainted = imports.some(clean => !clean);
-			const { scope, value, isAlias } = checker.exportScope(src.body, importScope);
+			const { scope, value, isAlias } = exportScope(src.body, importScope);
 			// Recorded before the (possibly cyclic) re-export loop awaits anything -- see `ownScopeSettled` for why placement matters.
 			ownScopeSettled.set(src, { scope, value, isAlias });
 			for (const stmt of src.body) {
@@ -655,7 +654,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 	const entryScope = new Scope(global);
 	await Promise.all(program.body.filter(s => s.type === 'import').map(s => resolveImport(entrySrc, entryScope, s, '.')));
 
-	checker.checkBlock(program.body, entryScope);
+	checkBlock(program.body, entryScope, undefined, undefined, err);
 	pushDepthExhaustionGap(diagnostics);
 	program.scope = entryScope;
 	return diagnostics;
@@ -852,9 +851,8 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 
 	// ---- Shared checking/resolution machinery, needed by the strip helpers below --------------------
 
-	const checker	= makeChecker(()=>{});
 	const global	= importScope ? new Scope(importScope) : T.makeGlobal();
-	checker.checkBlock(ast.body, global);
+	checkBlock(ast.body, global);
 
 	// A class whose heritage is a call expression (e.g. `bin.Class(spec)`) can't keep that expression in a
 	// `declare class` -- collected here and prepended to `stripped`'s body (below) as `declare const <Name>_base:
@@ -894,7 +892,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 
 	// `undefined` (rather than an explicit `: any` annotation) keeps unknowable types implicit, as before
 	const inferType		= (e: Expr, narrow: boolean): Type | undefined => {
-		const t = narrow ? checker.typeOf(e, global) : T.widenLiterals(checker.typeOf(e, global));
+		const t = typeOf(e, global, !narrow);
 		return t.type === 'ref' && t.name === 'any' ? undefined : t;
 	};
 
@@ -917,7 +915,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 	const GENERATOR_TYPES	= new Set(['Generator', 'IterableIterator', 'Iterator', 'Iterable']);
 
 	const stripFunctionDecl = (stmt: JS.FunctionDecl<any>): JS.Declaration<any> => {
-		const returnType: Type = stmt.returnType ? stmt.returnType as Type : stmt.body ? checker.inferReturn(stmt, stmt.body, global) : T.ANY;
+		const returnType: Type = stmt.returnType ? stmt.returnType as Type : stmt.body ? inferReturn(stmt, stmt.body, global) : T.ANY;
 		return JS.FunctionDecl(stmt.name, {
 			params:		stmt.params.map(stripParam),
 			typeParams:	stmt.typeParams,
@@ -938,7 +936,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		if (superClass && superClass.type !== 'identifier') {
 			const name = uniqueName((stmt.name ?? '_default') + '_base');
 			reachable.add(name);
-			syntheticBases.push(JS.AmbientVarDecl('const', JS.Var(name, undefined, checker.typeOf(superClass, global))));
+			syntheticBases.push(JS.AmbientVarDecl('const', JS.Var(name, undefined, typeOf(superClass, global))));
 			superClass = Identifier(name);
 		}
 
@@ -977,7 +975,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 							//return [JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams})];
 						}
 						const params		= m.params.map(stripParam);
-						const returnType	= m.returnType ?? (m.body ? checker.inferReturn(m, m.body, global) : undefined);
+						const returnType	= m.returnType ?? (m.body ? inferReturn(m, m.body, global) : undefined);
 						const expansions	= expandConstrainedGeneric(m.typeParams, params, returnType, global);
 						if (expansions)
 							return expansions.map(o => JS.Method('method', m.key, { params: o.params, rest: m.rest, returnType: o.returnType, typeParams: undefined }, undefined, m.modifiers));

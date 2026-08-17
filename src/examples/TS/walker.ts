@@ -319,6 +319,7 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 				children:	mapArrayA(mapExpressionA)
 			});
 			case 'this':
+			case 'super':
 			case 'identifier':
 				return expr;
 		}
@@ -571,6 +572,7 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 			case 'satisfies': return walkExpression(e.expression);
 			case 'jsx':			return e.attributes.some(p => walkExpression(p.value)) || e.children.some(walkExpression);
 			case 'this':
+			case 'super':
 			case 'identifier':			return false;
 		}
 	};

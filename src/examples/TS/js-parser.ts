@@ -115,6 +115,7 @@ export type Expr<T = any> =
 	| Call<T>
 	| { type: 'conditional'; test: Expr<T>; consequent: Expr<T>; alternate: Expr<T> }
 	| { type: 'this' }
+	| { type: 'super' }
 	| Member<T>
 	| Index<T>
 	| { type: 'new';	callee: Expr<T>; arguments: Expr<T>[]; typeArgs?: T[] }
@@ -559,6 +560,7 @@ function parseNumber(text: string): Literal<number|bigint> {
 // differs, spliced in at its original position (not appended) so relative reduce-reduce rule order is preserved.
 const primaryRules = (objectLiteral?: Rules<Expr>): Rules<Expr> => [
 	Rule(['this'], 					_ => ({ type: 'this' } as const)),
+	Rule(['super'], 				_ => ({ type: 'super' } as const)),
 	Rule([IDENT],					$ => Identifier($[0])),
 	Rule([NUM], 					$ => parseNumber($[0])),
 	Rule([STR], 					$ => Literal(unquoteString($[0]))),
