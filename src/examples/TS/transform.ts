@@ -3,13 +3,14 @@ import * as JS from './js-parser';
 import * as JSX from './jsx-parser';
 import * as T from './type-utils';
 import { Identifier, Literal, Binary } from '../common';
-import { walk, hasMod, dropMod } from './walker';
+import { walk, walkB, hasMod, dropMod } from './walker';
 import { SEVERITY, makeErr, checkBlock, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader, ModuleOptionsDefault } from './module-loader';
 import { Output } from './tocode';
 
 type Location		= JS.Location;
 type Expr			= JS.Expr;
+type Statement		= TS.Statement;
 type BindingTarget	= JS.BindingTarget;
 type Type			= TS.Type;
 type Scope			= T.Scope;
@@ -310,6 +311,254 @@ export function foldConstants(ast: any) {
 		},
 		undefined
 	);
+}
+
+//-----------------------------------------------------------------------------
+// State-machine flattening (generators/async functions)
+//-----------------------------------------------------------------------------
+
+// A suspend point recognized directly in statement position -- v1's only supported shape. A
+// `yield`/`await` embedded anywhere else inside a larger expression ('foo(yield x)', '(await p) +
+// 1', ...) is rejected by `containsSuspend` below rather than silently mishandled.
+export interface SuspendBoundary {
+	kind: 'yield' | 'await';
+	operand?: Expr;
+	delegate?: boolean;	// 'yield*' -- recognized here so it isn't caught by the generic "nested" rejection below; towasm.ts's own consumer currently still rejects delegation itself (a separate, later gap).
+	resultVar?: string;	// set when the source binds the resumed/settled value directly: 'const v = yield x;' / 'const v = await p;'
+}
+
+// Every transition out of a segment is one of these -- 'goto'/'branch' are the state-machine
+// equivalent of an unconditional/conditional jump (real control flow, not structured wasm nesting,
+// since a *resumed* call has none of the original call's block/loop context left -- see towasm.ts's
+// own 'emitGeneratorDispatch'). 'complete' is the single shared "done" landing point: reached once,
+// by whatever naturally falls off the function's own end, and again by every subsequent call.
+export type SegmentNext =
+	| { type: 'goto'; target: number }
+	| { type: 'branch'; test: Expr; then: number; else: number }
+	| (SuspendBoundary & { type: 'suspend'; resumeId: number })
+	| { type: 'complete' };
+
+export interface StateMachineSegment {
+	id: number;
+	stmts: Statement[];
+	next: SegmentNext;
+}
+
+export interface StateMachine {
+	segments: StateMachineSegment[];
+	entryId: number;
+	completeId: number;
+}
+
+function suspendExpr(e: Expr): SuspendBoundary | undefined {
+	return e.type === 'yield' ? { kind: 'yield', operand: e.operand, delegate: e.delegate }
+		: e.type === 'unary' && e.operator === 'await' ? { kind: 'await', operand: e.operand }
+		: undefined;
+}
+
+// The only statement shapes v1 recognizes as a suspend boundary: a bare 'yield x;'/'await p;'
+// expression statement, 'return await p;', or a single-declarator 'const v = yield x;'/'= await p;'.
+function suspendBoundary(stmt: Statement): SuspendBoundary | undefined {
+	if (stmt.type === 'expression')
+		return suspendExpr(stmt.expression);
+	if (stmt.type === 'return' && stmt.argument) {
+		// 'return (yield x)' isn't recognized here (only 'return await p;') -- real but rare, deferred.
+		const b = suspendExpr(stmt.argument);
+		return b?.kind === 'await' ? b : undefined;
+	}
+	if (stmt.type === 'var_decl' && stmt.declarations.length === 1) {
+		const d = stmt.declarations[0];
+		if (typeof d.name === 'string' && d.init) {
+			const b = suspendExpr(d.init);
+			if (b)
+				return { ...b, resultVar: d.name };
+		}
+	}
+	return undefined;
+}
+
+// Stops at a nested closure boundary (a yield/await inside it belongs to *that* function, not this
+// one) -- same reasoning as towasm.ts's own 'ownBoundNames'/'collectFreeVars' closure-boundary stop.
+function containsSuspend(stmt: Statement): boolean {
+	return walkB(stmt,
+		undefined,
+		(e, process) => suspendExpr(e as Expr) ? true : (e.type === 'arrow' || e.type === 'function') ? false : process(e)
+	);
+}
+
+// A bare (unlabeled -- labeled break/continue is unsupported everywhere else in towasm.ts too) break
+// or continue that would target the loop/switch containing `stmts` directly, not a nested one (which
+// establishes its own break/continue scope, same reasoning `case 'switch'`'s own scoping needs).
+function containsOwnBreakOrContinue(stmts: Statement[]): boolean {
+	return walkB(stmts,
+		(s, process) => {
+			if (s.type === 'break' || s.type === 'continue')
+				return true;
+			if (s.type === 'while' || s.type === 'do_while' || s.type === 'for' || s.type === 'switch')
+				return false;
+			return process(s);
+		},
+		(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
+	);
+}
+
+function bodyStmtsOf(stmt: Statement): Statement[] {
+	return stmt.type === 'block' ? stmt.body : [stmt];
+}
+
+// Every plain-identifier local a generator/async function's own body declares via `var_decl` (its
+// enclosing statement kept alongside, for its own checker-stamped scope -- see towasm.ts's own
+// `compileGeneratorFunc`, which needs it to resolve each local's type the same way `case 'var_decl'`
+// does) -- stops at a nested closure boundary, whose locals belong to *that* function, not this one.
+// towasm.ts hoists every one of these into the resumable step function's frame (no precise liveness
+// analysis -- conservative, but simple and correct: a local that never actually crosses a suspend
+// point just costs an unused frame field). A destructured declarator ('const {a,b} = x') is skipped
+// here -- real, but narrower and deferred; only a plain 'let x = ...'/'const x = ...' is hoisted.
+export function collectHoistedLocals(body: Statement[]): Map<string, { stmt: Statement; decl: JS.Var<Type> }> {
+	const decls = new Map<string, { stmt: Statement; decl: JS.Var<Type> }>();
+	walkB(body,
+		(s, process) => {
+			if (s.type === 'var_decl') {
+				for (const d of s.declarations) {
+					if (typeof d.name === 'string' && !decls.has(d.name))
+						decls.set(d.name, { stmt: s, decl: d });
+				}
+			}
+			return process(s);
+		},
+		(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
+	);
+	return decls;
+}
+
+// A mutable, id-addressable segment list -- `reserve()` hands out an id before its content is known
+// (needed for a forward jump target, e.g. a branch's own 'then'/'else', or a loop head a body's
+// `continue` needs to reach), `define()` fills it in once the content is actually built. Every
+// reserved id must end up defined -- `flattenStateMachine` asserts this before returning.
+class Builder {
+	segments: (StateMachineSegment | undefined)[] = [];
+	reserve(): number {
+		return this.segments.push(undefined) - 1;
+	}
+	define(id: number, stmts: Statement[], next: SegmentNext) {
+		this.segments[id] = { id, stmts, next };
+	}
+}
+
+// Flattens `stmts`, returning the id of its own entry segment. `contId`: where control goes once
+// `stmts` completes normally (falls off its own end) -- always a real, already-known id (the whole
+// point of processing backward below: by the time a statement is handled, everything textually after
+// it is already built, so its own "what happens next" is always a concrete target, never a forward
+// reference needing a later patch-up).
+function flattenList(stmts: Statement[], b: Builder, contId: number): number {
+	let cont = contId;
+	let trailing: Statement[] = [];	// ordinary statements seen so far, nearest-to-`cont` first
+	const flush = (): number => {
+		if (trailing.length === 0)
+			return cont;
+		const id = b.reserve();
+		b.define(id, trailing.reverse(), { type: 'goto', target: cont });
+		trailing = [];
+		cont = id;
+		return id;
+	};
+	for (let i = stmts.length - 1; i >= 0; i--) {
+		const stmt = stmts[i];
+		const boundary = suspendBoundary(stmt);
+		if (boundary) {
+			const id = b.reserve();
+			b.define(id, [], { ...boundary, type: 'suspend', resumeId: flush() });
+			cont = id;
+			continue;
+		}
+		if (isFlattenable(stmt) && containsSuspend(stmt)) {
+			cont = flattenControlFlow(stmt, b, flush());
+			continue;
+		}
+		if (containsSuspend(stmt))
+			throw new Error("towasm: a yield/await here is not yet supported (only a bare 'yield x;'/'await x;' statement, 'return await x;', 'const v = yield x;', or one of those nested in a plain 'if'/'while'/'do..while'/'for' -- not embedded in a larger expression, and not inside a 'switch'/'try')");
+		trailing.push(stmt);
+	}
+	return flush();
+}
+
+type Flattenable = Extract<Statement, { type: 'if' | 'while' | 'do_while' | 'block' }> | Extract<Statement, { type: 'for'; kind: 'normal' }>;
+
+function isFlattenable(stmt: Statement): stmt is Flattenable {
+	return stmt.type === 'if' || stmt.type === 'while' || stmt.type === 'do_while' || stmt.type === 'block' || (stmt.type === 'for' && stmt.kind === 'normal');
+}
+
+function flattenControlFlow(stmt: Flattenable, b: Builder, contId: number): number {
+	switch (stmt.type) {
+		case 'block':
+			return flattenList(stmt.body, b, contId);
+
+		case 'if': {
+			const id = b.reserve();
+			b.define(id, [], {
+				type: 'branch', test: stmt.test,
+				then: flattenList(bodyStmtsOf(stmt.consequent), b, contId),
+				else: stmt.alternate ? flattenList(bodyStmtsOf(stmt.alternate), b, contId) : contId,
+			});
+			return id;
+		}
+		case 'while': {
+			const body = bodyStmtsOf(stmt.body);
+			if (containsOwnBreakOrContinue(body))
+				throw new Error("towasm: 'break'/'continue' inside a yield-containing loop is not yet supported");
+			const loopHeadId = b.reserve();
+			b.define(loopHeadId, [], { type: 'branch', test: stmt.test, then: flattenList(body, b, loopHeadId), else: contId });
+			return loopHeadId;
+		}
+		case 'do_while': {
+			const body = bodyStmtsOf(stmt.body);
+			if (containsOwnBreakOrContinue(body))
+				throw new Error("towasm: 'break'/'continue' inside a yield-containing loop is not yet supported");
+			const testId = b.reserve();
+			const bodyEntry = flattenList(body, b, testId);
+			b.define(testId, [], { type: 'branch', test: stmt.test, then: bodyEntry, else: contId });
+			return bodyEntry;
+		}
+		case 'for': {
+			const body = bodyStmtsOf(stmt.body);
+			if (containsOwnBreakOrContinue(body))
+				throw new Error("towasm: 'break'/'continue' inside a yield-containing loop is not yet supported");
+			const loopHeadId = b.reserve();
+			const updateId = b.reserve();
+			const bodyEntry = flattenList(body, b, updateId);
+			b.define(updateId, stmt.update ? [{ type: 'expression', expression: stmt.update } as Statement] : [], { type: 'goto', target: loopHeadId });
+			b.define(loopHeadId, [], stmt.test ? { type: 'branch', test: stmt.test, then: bodyEntry, else: contId } : { type: 'goto', target: bodyEntry });
+			if (stmt.init) {
+				const initId = b.reserve();
+				b.define(initId, [stmt.init.type === 'var_decl' ? stmt.init : { type: 'expression', expression: stmt.init } as Statement], { type: 'goto', target: loopHeadId });
+				return initId;
+			}
+			return loopHeadId;
+		}
+	}
+}
+
+// Splits a generator/async function's body into a flat, id-addressable graph of segments --
+// towasm.ts's 'emitGeneratorDispatch' turns this into one resumable step function (a dispatch + one
+// nested block per segment, the same shape 'case switch' already lowers a real switch statement to,
+// wrapped in one more outer 'loop' so a 'goto'/'branch' transition can redispatch instead of relying
+// on structured block nesting, which a *resumed* call has none of). Pure AST-in/out, no wasm
+// concepts. `containsSuspend`/`isFlattenable` reject anything not directly expressible this way (a
+// suspend point embedded in a larger expression, or nested inside a 'switch'/'try') with a clear
+// error rather than silently mishandling it.
+export function flattenStateMachine(body: Statement[]): StateMachine {
+	const b = new Builder();
+	const completeId = b.reserve();
+	const entryId = flattenList(body, b, completeId);
+	b.define(completeId, [], { type: 'complete' });
+	return {
+		entryId, completeId,
+		segments: b.segments.map((s, id) => {
+			if (!s)
+				throw new Error(`towasm: internal: state-machine segment ${id} was reserved but never defined`);
+			return s;
+		}),
+	};
 }
 
 //-----------------------------------------------------------------------------

@@ -1933,6 +1933,58 @@ async function main() {
 	}
 
 	{
+		// Nested function declarations (a `function` statement inside another function's body, distinct
+		// from a top-level `function` and from the `case 'arrow'/'function'` closure *expressions* above)
+		// -- reuses the same closure-literal machinery, bound to a named local. No hoisting: only callable
+		// from below its own declaration point in the same block.
+		const { basic } = await compile(`
+			export function basic(): number {
+				function double(x: number): number { return x * 2; }
+				return double(21);
+			}
+		`);
+		check('nested function declaration: basic call', basic(), 42);
+
+		const { capturesOuter } = await compile(`
+			export function capturesOuter(): number {
+				const a = 100;
+				function addA(x: number): number { return x + a; }
+				return addA(23);
+			}
+		`);
+		check('nested function declaration: captures an outer local', capturesOuter(), 123);
+
+		const { recursive } = await compile(`
+			export function recursive(): number {
+				function sumTo(n: number): number {
+					return n <= 0 ? 0 : n + sumTo(n - 1);
+				}
+				return sumTo(5);
+			}
+		`);
+		check('nested function declaration: self-recursive call', recursive(), 15);
+
+		const { recursiveWithCapture } = await compile(`
+			export function recursiveWithCapture(): number {
+				const step = 2;
+				function countDown(n: number): number {
+					return n <= 0 ? 0 : step + countDown(n - step);
+				}
+				return countDown(6);
+			}
+		`);
+		check('nested function declaration: recursion combined with an outer capture', recursiveWithCapture(), 6);
+
+		await checkThrows('nested function declaration: a call above its own declaration point is rejected (no hoisting)', () => compile(`
+			export function forwardRef(): number {
+				const r = helper(1);
+				function helper(x: number): number { return x + 1; }
+				return r;
+			}
+		`), /unknown function 'helper'/);
+	}
+
+	{
 		// RegExp ("core" scope -- see lib/regexp.ts's own header comment for exactly what's covered/not):
 		// literal/`.`/character classes (incl. negation), \d\s, greedy/lazy quantifiers (* + ? {n,m}),
 		// capturing groups + backreferences, alternation, ^$ anchors, i/g flags, exec()'s lastIndex
@@ -2192,6 +2244,441 @@ async function main() {
 		check('virtual dispatch: structurally-identical sibling subclasses stay distinct', siblingsDistinct(), 123);
 		check('virtual dispatch: this.method() inside a base method body dispatches virtually', thisDispatchesVirtually(), 200);
 		check("virtual dispatch: non-overriding grandchild inherits its nearest ancestor's override", grandchildInherits(), 2);
+	}
+
+	{
+		// `(a, b, c)` -- every expression but the last runs purely for its side effects.
+		const { sideEffects, forLoopUpdate } = await compile(`
+			export function sideEffects(): number {
+				let x = 0;
+				return (x = 1, x = x + 10, x + 2);
+			}
+			export function forLoopUpdate(): number {
+				let total = 0;
+				for (let i = 0, j = 10; i < 3; i++, j--)
+					total += j;
+				return total;
+			}
+		`);
+		check('sequence operator: side effects run in order, last value wins', sideEffects(), 13);
+		check('sequence operator: for-loop update clause', forLoopUpdate(), 27);
+	}
+
+	{
+		// A hole (`[1, , 3]`) reads back as the element kind's own zero/default value -- close enough to
+		// real JS's "hole reads as undefined" for a fixed-element-kind array, which has no way to
+		// represent a genuinely distinct "empty" slot.
+		const { numberHole, booleanHole, refHole, holeWithSpread } = await compile(`
+			class Box { v: number; constructor(v: number) { this.v = v; } }
+			export function numberHole(): number {
+				const a: number[] = [1, , 3];
+				return a[0] + a[1] + a[2];
+			}
+			export function booleanHole(): number {
+				const a: boolean[] = [true, , true];
+				return (a[0] ? 1 : 0) + (a[1] ? 1 : 0) + (a[2] ? 1 : 0);
+			}
+			export function refHole(): number {
+				const a: (Box | null)[] = [new Box(5), null, new Box(7)];
+				const x0: Box | null = a[0];
+				const x1: Box | null = a[1];
+				const x2: Box | null = a[2];
+				return (x0?.v ?? -1) + (x1?.v ?? -1) + (x2?.v ?? -1);
+			}
+			export function holeWithSpread(): number {
+				const rest: number[] = [10, 20];
+				const a: number[] = [1, , ...rest];
+				return a[0] + a[1] + a[2] + a[3];
+			}
+		`);
+		check('array literal hole: number[] reads as 0', numberHole(), 4);
+		check('array literal hole: boolean[] reads as false', booleanHole(), 2);
+		check('array literal hole: nullable ref element reads as null', refHole(), 11);
+		check('array literal hole combined with a spread element', holeWithSpread(), 31);
+	}
+
+	{
+		// `` tag`...${x}...` `` desugars to `tag(strings, ...values)`, reusing the ordinary call-resolution
+		// path -- `.raw` isn't modeled, only the plain (cooked) `string[]` real untagged templates already use.
+		const { valuesSum, noInterpolation, tagIsAMethod } = await compile(`
+			function tag(strings: string[], ...values: number[]): number {
+				let sum = 0;
+				for (let i = 0; i < values.length; i++)
+					sum += values.get(i);
+				return sum + strings.length;
+			}
+			export function valuesSum(): number {
+				const a = 10, b = 20, c = 12;
+				return tag\`\${a}-\${b}-\${c}\`;
+			}
+			function justStrings(strings: string[]): number { return strings.get(0).length; }
+			export function noInterpolation(): number {
+				return justStrings\`hello\`;
+			}
+			class Tagger {
+				constructor() {}
+				tag(strings: string[], ...values: number[]): number { return strings.length + values.length; }
+			}
+			export function tagIsAMethod(): number {
+				const t = new Tagger();
+				const n = 5;
+				return t.tag\`a\${n}b\`;
+			}
+		`);
+		check('tagged template: strings + interpolated values reach the tag function', valuesSum(), 46);
+		check('tagged template: no interpolations', noInterpolation(), 5);
+		check('tagged template: tag is a class method', tagIsAMethod(), 3);
+	}
+
+	{
+		// Narrow object-literal support: only when the literal's target type is a plain `type X = {...}`
+		// alias, resolved (`ensureObjectShape`) the same way a real class already is -- not general
+		// structural inference. Fields push in the shape's own declared order, looked up from the
+		// literal's own properties by name (real TS itself allows any written order).
+		const { fromVarDecl, reordered, shorthand, asArgument, asReturn } = await compile(`
+			type Point = { x: number; y: number };
+			export function fromVarDecl(): number {
+				const p: Point = { x: 3, y: 4 };
+				return p.x + p.y;
+			}
+			export function reordered(): number {
+				const p: Point = { y: 4, x: 3 };
+				return p.x * 10 + p.y;
+			}
+			export function shorthand(): number {
+				const x = 5, y = 6;
+				const p: Point = { x, y };
+				return p.x + p.y;
+			}
+			function dist(p: Point): number { return p.x + p.y; }
+			export function asArgument(): number {
+				return dist({ x: 2, y: 9 });
+			}
+			function make(x: number, y: number): Point { return { x, y }; }
+			export function asReturn(): number {
+				const p = make(3, 8);
+				return p.x + p.y;
+			}
+		`);
+		check('object literal: var_decl with a known alias target type', fromVarDecl(), 7);
+		check("object literal: properties in a different order than the alias's own", reordered(), 34);
+		check('object literal: shorthand properties', shorthand(), 11);
+		check('object literal: passed as a function argument', asArgument(), 11);
+		check('object literal: returned from a function', asReturn(), 11);
+
+		await checkThrows('object literal with no known target type is rejected', () => compile(`
+			export function f(): number {
+				const p = { x: 1, y: 2 };
+				return 0;
+			}
+		`), /towasm/);
+	}
+
+	{
+		// Generators (checkpoint 1: a straight-line body, no loops/ifs/params/captures around a yield --
+		// proves the resumable-step-function shape itself; `.next()` calling the closure-typed `step`
+		// field also exercises the new general closure-through-a-field call path in `emitMethodCall`.
+		const { driveGen } = await compile(`
+			function* countUp(): Generator<number, number, number> {
+				yield 1;
+				yield 2;
+				return 99;
+			}
+			export function driveGen(): number {
+				const g = countUp();
+				const a = g.next(0);
+				const b = g.next(0);
+				const c = g.next(0);
+				const d = g.next(0);
+				let result = a.value + b.value * 10 + c.value * 100;
+				if (a.done) result += 1000000;
+				if (!b.done) result += 2000000;
+				if (c.done) result += 3000000;
+				if (d.done) result += 4000000;
+				// Real generator semantics: a call past completion resets 'value' to the type's default
+				// (undefined in real JS; 0 here, no 'undefined' for numbers), not the original return value.
+				if (d.value === 0) result += 5000000;
+				return result;
+			}
+		`);
+		check('generator: yield/yield/return, plus an idempotent call past completion', driveGen(), 14009921);
+
+		// Checkpoint 2: a yield inside a 'for' loop, with the loop counter (`i`, declared *outside* any
+		// suspend point but read/written on every resumed iteration) hoisted into the frame -- the part
+		// that makes control flow actually useful, not just parseable (`compileGeneratorFunc`'s
+		// `collectHoistedLocals` + `case 'var_decl'`'s new closure-field write path).
+		const { loopGen } = await compile(`
+			function* gen(): Generator<number, number, number> {
+				for (let i = 0; i < 3; i++)
+					yield i;
+				return 99;
+			}
+			export function loopGen(): number {
+				const g = gen();
+				const a = g.next(0);
+				const b = g.next(0);
+				const c = g.next(0);
+				const d = g.next(0);
+				const e = g.next(0);
+				let result = a.value + b.value * 10 + c.value * 100 + d.value * 1000;
+				if (a.done || b.done || c.done) result += 1000000;
+				if (!d.done) result += 2000000;
+				if (!e.done) result += 3000000;
+				if (e.value !== 0) result += 4000000;
+				return result;
+			}
+		`);
+		check('generator: yield inside a for loop, counter hoisted across suspends', loopGen(), 99210);
+
+		await checkThrows("generator: 'break'/'continue' inside a yield-containing loop is rejected (deferred)", () => compile(`
+			function* gen(): Generator<number, void, number> {
+				while (true) {
+					yield 1;
+					break;
+				}
+			}
+			export function f(): number {
+				const g = gen();
+				return g.next(0).done ? 1 : 0;
+			}
+		`), /not yet supported/);
+
+		await checkThrows('generator: a yield embedded in a larger expression is rejected', () => compile(`
+			function* gen(): Generator<number, void, number> {
+				const x = (yield 1) + 1;
+			}
+			export function f(): number {
+				const g = gen();
+				return g.next(0).done ? 1 : 0;
+			}
+		`), /not yet supported/);
+
+		// 'if'/'else' each containing a yield -- only the taken branch's arm should ever fire, and both
+		// the with-alternate and without-alternate shapes need their own coverage (different merge wiring).
+		const { branchGen } = await compile(`
+			function* gen(): Generator<number, number, number> {
+				let flag = true;
+				if (flag) {
+					yield 10;
+				} else {
+					yield 20;
+				}
+				let skip = false;
+				if (skip) {
+					yield 30;
+				}
+				yield 40;
+				return 5;
+			}
+			export function branchGen(): number {
+				const g = gen();
+				const a = g.next(0);
+				const b = g.next(0);
+				const c = g.next(0);
+				return a.value + b.value * 100 + c.value * 10000 + (c.done ? 1000000 : 0);
+			}
+		`);
+		check("generator: yield inside 'if'/'else' (with and without an alternate)", branchGen(), 1054010);
+
+		// 'while' with two locals hoisted across the loop's own yield -- an accumulator built from the
+		// loop counter, not just the counter itself (checkpoint 2's 'for' test only exercises that).
+		const { whileGen } = await compile(`
+			function* gen(): Generator<number, number, number> {
+				let sum = 0;
+				let i = 0;
+				while (i < 3) {
+					sum = sum + i;
+					yield sum;
+					i = i + 1;
+				}
+				return sum;
+			}
+			export function whileGen(): number {
+				const g = gen();
+				const a = g.next(0);
+				const b = g.next(0);
+				const c = g.next(0);
+				const d = g.next(0);
+				return a.value + b.value * 10 + c.value * 100 + d.value * 1000 + (d.done ? 1000000 : 0);
+			}
+		`);
+		check("generator: 'while' with an accumulator hoisted alongside the loop counter", whileGen(), 1003310);
+
+		// Checkpoint 3, part 1: real parameters -- threaded into the frame the same way a hoisted local
+		// is, but written once at construction time (the outer wrapper's own real params) rather than by
+		// a 'var_decl' inside the body.
+		const { paramGen } = await compile(`
+			function* gen(start: number, step: number): Generator<number, number, number> {
+				let i = start;
+				while (i < start + step * 3) {
+					yield i;
+					i = i + step;
+				}
+				return i;
+			}
+			export function paramGen(): number {
+				const g = gen(10, 2);
+				const a = g.next(0);
+				const b = g.next(0);
+				const c = g.next(0);
+				const d = g.next(0);
+				return a.value + b.value * 100 + c.value * 10000 + d.value * 1000000 + (d.done ? 100000000 : 0);
+			}
+		`);
+		check('generator: real parameters, read across every suspend', paramGen(), 116141210);
+
+		// Checkpoint 3, part 2: two-way communication -- 'const v = yield x;' binds whatever the
+		// *following* '.next(v)' call sends back, not the value just yielded out.
+		const { sentGen } = await compile(`
+			function* gen(): Generator<number, number, number> {
+				let total = 0;
+				const a = yield 1;
+				total = total + a;
+				const b = yield 2;
+				total = total + b;
+				return total;
+			}
+			export function sentGen(): number {
+				const g = gen();
+				const r1 = g.next(0);
+				const r2 = g.next(100);
+				const r3 = g.next(1000);
+				return r1.value + r2.value * 10 + r3.value * 100;
+			}
+		`);
+		check("generator: 'const v = yield x;' binds the next .next(v)'s sent value", sentGen(), 110021);
+	}
+
+	{
+		// Async/await -- reuses the exact same resumable-function machinery a generator does (frame,
+		// `flattenStateMachine`, the loop+block dispatch), but driven very differently: an async function
+		// runs immediately up to its first real suspend, and a suspended `await` resumes via
+		// `Promise.then()`, not an external caller (see towasm.ts's own `compileAsyncFunc` header
+		// comment). A top-level mutable global is used to observe results below, not a captured closure
+		// variable -- capturing a *mutation* back out to the enclosing scope is a separate, pre-existing
+		// limitation (captures snapshot by value at creation time), not something these tests are about.
+		const { alreadySettled } = await compile(`
+			let output: number = 0;
+			async function addOne(p: Promise<number>): Promise<number> {
+				const v = await p;
+				output = v + 1;
+				return v + 1;
+			}
+			export function alreadySettled(): number {
+				const p = new Promise<number>(0);
+				p.resolve(41);
+				const result = addOne(p);
+				return output;
+			}
+		`);
+		check('async: await on an already-settled Promise resumes synchronously via .then()', alreadySettled(), 42);
+
+		const { resolvedLater } = await compile(`
+			let output: number = 0;
+			async function addOne(p: Promise<number>): Promise<number> {
+				const v = await p;
+				output = v;
+				return v + 1;
+			}
+			export function resolvedLater(): number {
+				const p = new Promise<number>(0);
+				const result = addOne(p);
+				const before = output;
+				p.resolve(41);
+				const after = output;
+				return before * 1000 + after;
+			}
+		`);
+		check('async: await on a not-yet-settled Promise really suspends, resuming once resolve() runs', resolvedLater(), 41);
+
+		const { twoAwaits } = await compile(`
+			let output: number = 0;
+			async function addTwo(p1: Promise<number>, p2: Promise<number>): Promise<number> {
+				const a = await p1;
+				const b = await p2;
+				output = a + b;
+				return a + b;
+			}
+			export function twoAwaits(): number {
+				const p1 = new Promise<number>(0);
+				const p2 = new Promise<number>(0);
+				p1.resolve(10);
+				p2.resolve(20);
+				const result = addTwo(p1, p2);
+				return output;
+			}
+		`);
+		check('async: two sequential awaits in the same function', twoAwaits(), 30);
+
+		const { nonPromise } = await compile(`
+			let output: number = 0;
+			async function identity(x: number): Promise<number> {
+				const v = await x;
+				output = v;
+				return v + 1;
+			}
+			export function nonPromise(): number {
+				identity(41);
+				return output;
+			}
+		`);
+		check('async: awaiting a non-Promise value unwraps immediately (no real suspension)', nonPromise(), 41);
+
+		// 'Promise.all' -- a static method with its own generic type param (deliberately named 'U', not
+		// 'T', to avoid colliding with the class's own 'T': a static member's own type param sharing the
+		// class's name confirmed the hard way to corrupt the method's own return-type substitution,
+		// independent of Promise specifically -- a real, general generic-static-method gap, worked around
+		// here rather than fixed given the risk of touching shared substitution machinery for it).
+		// Resolves only once every input has, regardless of resolution order -- a bare 'await all;' (no
+		// binding) sidesteps a separate, also pre-existing gap (a non-nullable ref/array-typed *hoisted*
+		// local -- as opposed to a param, which already works -- crossing a suspend isn't supported yet,
+		// `emitDefaultValue`'s own clear throw), which reading the resolved array back out would need.
+		const { promiseAll } = await compile(`
+			let output: number = 0;
+			async function markDone(all: Promise<number[]>): Promise<number> {
+				await all;
+				output = 999;
+				return 999;
+			}
+			export function promiseAll(): number {
+				const p1 = new Promise<number>(0);
+				const p2 = new Promise<number>(0);
+				const p3 = new Promise<number>(0);
+				const all = Promise.all<number>([p1, p2, p3]);
+				const result = markDone(all);
+				p1.resolve(10);
+				const afterP1 = output;
+				p2.resolve(20);
+				const afterP2 = output;
+				p3.resolve(30);
+				const afterP3 = output;
+				return afterP1 * 1000000 + afterP2 * 1000 + afterP3;
+			}
+		`);
+		check("async: 'Promise.all' resolves only once every input has, order-independent", promiseAll(), 999);
+	}
+
+	{
+		// A negative-literal (or other foldable, e.g. `!true`) top-level `const`/`let` initializer parses
+		// as a real `unary`/`binary` AST node, not a bare `literal` one -- `foldConstants` (already used by
+		// `case 'switch'`'s own jump-table detection) recognizes it as a compile-time constant so it still
+		// becomes a real wasm global instead of being silently left unregistered.
+		const { negGlobal } = await compile(`
+			const negOne: number = -1;
+			export function negGlobal(): number { return negOne * 958; }
+		`);
+		check('a negative-literal top-level global is recognized as a compile-time constant', negGlobal(), -958);
+
+		// A closure value read directly off an array element, called in one expression (`arr[i](x)`) --
+		// generalizes the existing bare-identifier closure-call case via the callee's own static type
+		// instead of a name-based lookup.
+		const { indexCall } = await compile(`
+			export function indexCall(): number {
+				const fns: Array<(x: number) => number> = [(x: number) => x + 1, (x: number) => x * 2];
+				return fns[0](10) + fns[1](10);
+			}
+		`);
+		check("calling a closure read directly off an array element ('arr[i](x)')", indexCall(), 31);
 	}
 
 	{
