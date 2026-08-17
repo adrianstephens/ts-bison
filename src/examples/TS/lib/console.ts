@@ -1,8 +1,9 @@
 /// <reference path="./lib.d.ts" />
 
+import { fd_write } from 'wasi_snapshot_preview1';
 
 let heap: i32 = 0;
-export function __towasm_alloc(size: i32, align: i32): i32 {
+export function __alloc(size: i32, align: i32): i32 {
 	const ret  = (heap + align - 1) & -align;
 	heap = ret + size;
 
@@ -19,8 +20,6 @@ export function __towasm_alloc(size: i32, align: i32): i32 {
 //	console.log
 //-----------------------------------------------------------------------------
 
-import { fd_write } from 'wasi_snapshot_preview1';
-
 // ASCII-only: each `string` code unit's low byte is written directly (`i32.store8` truncates automatically)
 // -- a documented limitation, same spirit as `console.log(false)` already printing `0`, not `"false"` (no
 // boolean runtime tag). Every ASCII byte written this way is simultaneously valid UTF-8, so this is a safe
@@ -28,18 +27,22 @@ import { fd_write } from 'wasi_snapshot_preview1';
 
 // Copies `s`'s code units into a fresh linear-memory buffer, builds a 2-field (ptr, len) WASI iovec right
 // after it, and writes it via `fd_write` to fd 1 (stdout).
-export function __towasm_writeString(s: string): void {
+function __writeString(s: string): void {
+	const save_heap = heap;
+
 	const len = s.length;
-	const buf = __towasm_alloc(len, 1);
+	const buf = __alloc(len, 1);
 	for (let i = 0; i < len; i++)
 		__asm<[i32, i32], void>('i32.store8')(buf + i, s.charCodeAt(i));
 
-	const iov = __towasm_alloc(8, 4);
+	const iov = __alloc(8, 4);
 	__asm<[i32, i32], void>('i32.store')(iov, buf);
 	__asm<[i32, i32], void>('i32.store')(iov + 4, len);
 
-	const nwritten = __towasm_alloc(4, 4);
+	const nwritten = __alloc(4, 4);
 	fd_write(1, iov, 1, nwritten);
+
+	heap = save_heap;
 }
 
 export class console {
@@ -50,6 +53,6 @@ export class console {
 				result += ' ';
 			result += x[i].toString();
 		}
-		__towasm_writeString(result + '\n');
+		__writeString(result + '\n');
 	}
 };
