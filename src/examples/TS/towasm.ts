@@ -4,7 +4,7 @@ import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
 import { Literal, Binary } from '../common';
-import { makeChecker, isOptionalChainLink } from './checker';
+import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink } from './checker';
 import { walk, walkB, hasMod } from './walker';
 import { foldConstants } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
@@ -16,8 +16,14 @@ import * as WAT from '../wat-parser';
 //  - Control flow: exceptions (try/catch/throw/finally), labeled break/continue, for-in (only
 //    for-of, and only over number[]/boolean[]/typed arrays, not string or a general iterable)
 //  - Async: async/await, Promises, generators
-//  - Classes: inheritance (extends/abstract), computed field names, a field cycle (a field can't be of its
-//    own class's type, directly or indirectly)
+//  - Classes: 'abstract', computed field names, a field cycle (a field can't be of its own class's type,
+//    directly or indirectly), an object-typed field anywhere in a hierarchy that also uses 'extends' (needs
+//    'struct.new' with real values up front, instead of 'struct.new_default' -- not yet taught the same
+//    inheritance-awareness the plain-fields path has), a generic superclass reference's own type args being
+//    anything but a plain name/instantiation, extending an array/scalar-backed class (a constructor with
+//    its own explicit 'return', e.g. 'Array<T>'-style). 'extends' itself, 'super(...)', 'super.method()',
+//    and virtual dispatch through a base-typed reference are all supported -- see 'ensureClass'/
+//    'emitCtorStatements'/'ensureVirtualDispatch'
 //  - Functions: generic arrow/function expressions (a generic top-level 'function' declaration, or a
 //    'const' bound directly to one, is supported -- see 'ensureGenericFunc'), a function expression's own
 //    'this' (only arrow's lexical 'this'), a named function expression referencing its own name
@@ -153,6 +159,12 @@ interface ClassInfo extends MethodOwner {
 	// This class's own real physical `this`-type -- `{ref: name}` for an ordinary struct, or whatever its constructor's own `return` compiles to (`ensureCtor`) -- never guessed from the name.
 	// `undefined` only while that constructor is still being compiled (`ownerThisType` falls back to `{ref: name}` then, safe since only a static method's own unused this-type can be in flight).
 	thisWtype?:		WasmType;
+	// Set once, in `ensureClass`, only for a real `extends`. `fields`/`fieldIndex` are pre-seeded with the
+	// superclass's own (in order, so wasm-GC struct subtyping's "subtype's fields are the supertype's
+	// fields as an ordered prefix, plus its own appended" requirement holds automatically) -- so most code
+	// never needs to walk this chain itself; it exists for the few places that specifically care about the
+	// *class* hierarchy (constructor `super(...)` inlining, method-resolution delegation, `super.method()`).
+	superClass?:	ClassInfo;
 }
 
 interface Local {
@@ -447,7 +459,7 @@ function resolvedWtype(ctx: FuncCtx, name: string): WasmType | undefined {
 	return ctx.closureEnv?.fields.get(name)?.wtype ?? ctx.lookup(name)?.wtype;
 }
 
-// `as` is a pure pass-through in codegen (`case 'as'` just compiles `e.expression`), but `checker.typeOf`
+// `as` is a pure pass-through in codegen (`case 'as'` just compiles `e.expression`), but `checkerTypeOf`
 // still honors the asserted type -- any codegen-facing type/owner lookup must unwrap it first or it sees a fictional type, wrongly losing method/owner dispatch on the real underlying value.
 function unwrapAs(e: Expr): Expr {
 	while (e.type === 'as')
@@ -1040,7 +1052,7 @@ interface AssignTarget { wtype: WasmType; old?: number; write(tee: boolean): num
 // Known limitation: does not scan reassignments made from inside a nested closure body (mirrors
 // ownBoundNames/collectFreeVars's own closure-boundary stop, needed there for correctness) -- a
 // captured `let` mutated only via a closure write keeps today's (possibly too-narrow) behavior.
-function collectRangeWidenings(body: Statement[], checker: any, scope: Scope): Map<JS.Var<Type>, Type> {
+function collectRangeWidenings(body: Statement[], scope: Scope): Map<JS.Var<Type>, Type> {
 	interface OpenTarget { d: JS.Var<Type>; range?: T.NumRange; touched: boolean }
 	const open: OpenTarget[] = [];
 	const result = new Map<JS.Var<Type>, Type>();
@@ -1058,7 +1070,7 @@ function collectRangeWidenings(body: Statement[], checker: any, scope: Scope): M
 	function openDecl(d: JS.Var<Type>) {
 		if (typeof d.name !== 'string' || d.typeAnnotation || !d.init)
 			return;
-		const seed = T.toRange(checker.typeOf(d.init, scope));
+		const seed = T.toRange(checkerTypeOf(d.init, scope));
 		if (seed && seed.base === 'number')
 			open.push({ d, range: seed, touched: false });
 	}
@@ -1118,9 +1130,9 @@ function collectRangeWidenings(body: Statement[], checker: any, scope: Scope): M
 						);
 					if (!isExempt)
 						contribute(o,
-							op === '=' ? (loopDepth > 0 && exprMentionsName(e.left.name, e.right) ? undefined : T.toRange(checker.typeOf(e.right, scope)))
+							op === '=' ? (loopDepth > 0 && exprMentionsName(e.left.name, e.right) ? undefined : T.toRange(checkerTypeOf(e.right, scope)))
 						:	op === '??=' || loopDepth > 0 ? undefined // every other compound op is self-referential by definition
-						:	T.toRange(checker.typeOf({ type: 'binary', operator: op.slice(0, -1), left: e.left, right: e.right } as Expr, scope))
+						:	T.toRange(checkerTypeOf({ type: 'binary', operator: op.slice(0, -1), left: e.left, right: e.right } as Expr, scope))
 					);
 				}
 			}
@@ -1151,7 +1163,7 @@ function collectRangeWidenings(body: Statement[], checker: any, scope: Scope): M
 // for lib method bodies. `methodOwner`'s special-case in `var_decl` (below) still needed for this reason.
 export function makeLibScope(): Scope {
 	const libScope = new Scope(T.makeGlobal());
-	makeChecker(() => {}).checkBlock(LIB_AST, libScope, true);
+	checkBlock(LIB_AST, libScope);
 	return libScope;
 }
 
@@ -1160,7 +1172,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	if (!global)
 		throw new Error('towasm: ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
 
-	const checker			= makeChecker(() => {});
 	// `global` (`ast.scope`) already has every lib declaration (`String`, `RegExpMatch`, ...) reachable
 	// via its own ancestor chain, when the caller passed `makeLibScope()`'s result into `TStypeCheck` --
 	// same object used here as `libGlobal`, not a bare `libScope` parameter: a lib-only scope would sever
@@ -1425,7 +1436,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// The `WasmType` a value expression resolves to -- `classOf`/`arrayKindOf` below are thin discriminating views over this one (previously identical) checker walk.
 	// `unwrapAs`: see that function's own comment -- the checker's `typeOf` must see the real (post-`as`) expression, not the asserted one.
 	function wtypeOf(e: Expr, ctx: FuncCtx): WasmType | undefined {
-		return typeOf(checker.typeOf(unwrapAs(e), ctx.scope));
+		return typeOf(checkerTypeOf(unwrapAs(e), ctx.scope));
 	}
 
 	// The class a value expression resolves to, or `undefined`. Goes through `ownerOf` (the checker type,
@@ -1457,7 +1468,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (e.type === 'index') {
 			// A real element type (a class/string/etc, not just `f64`/`i32`/`u32`) resolves through the
 			// checker, and must go through `ownerFor` here (not the undefined-owner fast paths below) since owner-sensitive operators (`+` on `string`, bigint identity checks) need the real owner to dispatch.
-			const t = checker.typeOf(unwrapAs(e), ctx.scope);
+			const t = checkerTypeOf(unwrapAs(e), ctx.scope);
 			if (!T.isAny(t))
 				return { wtype: typeOf(t), owner: ownerFor(t) };
 			// Only reached when the checker genuinely can't resolve an element type (typed-array-style
@@ -1469,7 +1480,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			if (kind === 'f64' || kind === 'i32' || kind === 'u32')
 				return { wtype: kind, owner: undefined };
 		}
-		const t = checker.typeOf(unwrapAs(e), ctx.scope);
+		const t = checkerTypeOf(unwrapAs(e), ctx.scope);
 		return { wtype: typeOf(t), owner: ownerFor(t) };
 	}
 
@@ -1553,7 +1564,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Field access stays `classOf`-only (arrays/scalars have no fields), but method-call dispatch is
 	// otherwise identical across real classes, array kinds, and scalar box kinds -- all handled by `ownerFor` above.
 	function ownerOf(e: Expr, ctx: FuncCtx) {
-		return ownerFor(checker.typeOf(unwrapAs(e), ctx.scope));
+		return ownerFor(checkerTypeOf(unwrapAs(e), ctx.scope));
 	}
 
 	// Populated by the "index space" pass below, before any body is built -- a class ref's `WasmType`
@@ -1599,6 +1610,20 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		// `array.new_data`'s two `i32` operands are a byte offset and an *element* count into the module's
 		// one shared passive data segment -- `internString`'s return value and `s.length` already match both, no conversion needed.
 		ctx.emit(I.i32.const(internString(s)), I.i32.const(s.length), I.array.new_data(ensureArrayType('i16'), 0));
+	}
+
+	// Whether the real class named `subName` is `baseName` itself or (transitively) extends it -- looked up
+	// by name against `classes` (already resolved by the time this is ever asked, since a value of a class
+	// ref type can't exist without that class having gone through `ensureClass` first) rather than taking
+	// `ClassInfo`s directly, since `coerceTop`'s callers only ever have the bare `WasmType`'s own ref name.
+	function isSubclassOf(subName: string, baseName: string): boolean {
+		let cls = classes.get(subName);
+		while (cls) {
+			if (cls.name === baseName)
+				return true;
+			cls = cls.superClass;
+		}
+		return false;
 	}
 
 	function coerceTop(got: WasmType, ctx: FuncCtx, want: WasmType): void {
@@ -1658,11 +1683,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				return;
 			}
 
-		// Nullable<->non-null, same underlying ref/array kind
+		// Nullable<->non-null, same underlying ref/array kind -- or `got` a real subclass of `want`
+		// (`super.method()`'s receiver, or any other upcast): wasm-GC struct subtyping (`ensureClass`'s
+		// own `supertypes`) already makes the *value* valid wherever `want`'s ref type is declared, with
+		// zero instructions -- only nullability might still need narrowing.
 			if (typeof want !== 'string') {
 				const gotKind	= 'ref' in got ? got.ref : 'arr' in got ? got.arr : undefined;
 				const wantKind	= 'ref' in want ? want.ref : 'arr' in want ? want.arr : undefined;
-				if (gotKind !== undefined && gotKind === wantKind) {
+				if (gotKind !== undefined && (gotKind === wantKind || ('ref' in got && wantKind !== undefined && isSubclassOf(gotKind, wantKind)))) {
 					if (got.nullable && !want.nullable)
 						ctx.emit(I.ref.as_non_null);
 					return;
@@ -1754,7 +1782,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const got = emitExpr(e, ctx, want);
 		// Boxing into `any`: `i32` is this compiler's physical representation for *both* a real `boolean` and
 		// a compact-integer `number` -- by the time a bare `'i32'` reaches `coerceTop` that distinction is gone, so it always picked the boolean box. Disambiguated here via the checker's own real type for `e`.
-		if (got === 'i32' && typeof want !== 'string' && 'ref' in want && want.ref === 'any' && ownerFor(checker.typeOf(unwrapAs(e), ctx.scope))?.name !== 'Boolean') {
+		if (got === 'i32' && typeof want !== 'string' && 'ref' in want && want.ref === 'any' && ownerFor(checkerTypeOf(unwrapAs(e), ctx.scope))?.name !== 'Boolean') {
 			coerceTop('i32', ctx, 'f64');
 			coerceTop('f64', ctx, want);
 			return;
@@ -1949,7 +1977,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// `receiver` is `undefined` for a namespace-style call (`Math.sqrt(x)`, `Array.alloc(n)` from inside `Array<T>`'s own methods) -- no real value to push, just a bare name used to look up `owner`.
 	// `typeArgs`: an explicit `obj.method<T>(...)` call-site type argument list -- only ever meaningful for
 	// a real user method call (an inline/accessor/index/operator dispatch is never independently generic).
-	function emitMethodCall(owner: ClassInfo, name: string, args: Expr[], ctx: FuncCtx, typeArgs?: Type[]): WasmType {
+	// `bypassVirtual`: set only by `super.method(...)`'s own call site -- by definition never virtual (see
+	// that call site's own comment), regardless of whether `owner` has overriding subclasses elsewhere.
+	function emitMethodCall(owner: ClassInfo, name: string, args: Expr[], ctx: FuncCtx, typeArgs?: Type[], bypassVirtual?: boolean): WasmType {
 		const inline = owner.inlineMethods?.get(name);
 		if (inline) {
 			if (args.some(a => a.type === 'spread'))
@@ -1957,7 +1987,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			return emitInline(name, inline(args.map(a => operandInfo(a, ctx)), ctx), args, ctx);
 		}
 
-		const method = ensureMethod(owner, name, args, ctx, typeArgs);
+		// `owner.decl.name`, not `owner.name` -- `hasDeclaredOverride` (like `directSubclasses` it reads)
+		// is keyed by the bare declared name; `owner.name` is a generic instantiation's mangled composite
+		// key instead, for a generic class (which `ensureVirtualDispatch` doesn't support -- see its own
+		// header comment -- so this condition simply never matches one, rather than needing its own guard).
+		const method = !bypassVirtual && !typeArgs && owner.decl.name && hasDeclaredOverride(owner.decl.name, name) ? ensureVirtualDispatch(owner, name, ctx)
+			: ensureMethod(owner, name, args, ctx, typeArgs);
 		if (!method)
 			throw new Error(`towasm: unknown method '${name}' on ${owner.name}`);
 		// A spread argument is only meaningful bundled into a rest param (`arr.push(...other)`) --
@@ -2654,6 +2689,24 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					});
 				}
 
+				// `super.method(...)` -- by definition never virtual: real TS's own `super.x()` semantics
+				// mean "the ancestor's own implementation, whichever one actually defines it," never "redo
+				// the receiver's runtime-type dispatch" (that's exactly what distinguishes it from
+				// `this.method()`). `emitMethodCall(superClass, ...)` -- not the cascade `ensureVirtualDispatch`
+				// might otherwise route a same-named call through -- reaches `ensureMethod`'s own ordinary
+				// "not overridden by `superClass` itself -> delegate further up the chain" fallback for free,
+				// so this resolves correctly even when `superClass` itself doesn't define `method` either.
+				if (e.callee.type === 'member' && e.callee.object.type === 'super') {
+					const superClass = (ctx.owner && 'fields' in ctx.owner ? ctx.owner as ClassInfo : undefined)?.superClass;
+					if (!superClass)
+						throw new Error(`towasm: 'super.${e.callee.property}(...)' has no superclass to resolve against`);
+					// `this`'s own static type is the current class (more derived than `superClass`) --
+					// wasm-GC struct subtyping (`ensureClass`'s own `supertypes`) makes it directly usable as
+					// `superClass`'s own receiver type, no cast needed, same as any other upcast in this file.
+					emitAs({ type: 'this' }, ctx, superClass.thisWtype!);
+					return emitMethodCall(superClass, e.callee.property, e.arguments, ctx, e.typeArgs as Type[] | undefined, true);
+				}
+
 				if (e.callee.type === 'member') {
 					const obj = e.callee.object;
 					const typeArgs = e.typeArgs as Type[] | undefined;
@@ -2670,7 +2723,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						// No single static owner -- if the receiver is genuinely `any`, a real runtime dispatch can still resolve it, same as real JS would.
 						// Checked via the checker's own type, not `wtypeOf` (gives `undefined`, not `REF_ANY`,
 						// for a genuinely `any`-typed expression). `want ?? REF_ANY`: a bare expression-statement calls `emitExpr` with no `want` at all, and `REF_ANY` is always a safe target (`coerceTop` widens to it).
-						if (T.isAny(checker.typeOf(unwrapAs(obj), ctx.scope)) && e.arguments.length === 0) {
+						if (T.isAny(checkerTypeOf(unwrapAs(obj), ctx.scope)) && e.arguments.length === 0) {
 							const info = ensureAnyDispatch(e.callee.property, want ?? REF_ANY, ctx);
 							emitAs(obj, ctx, REF_ANY);
 							ctx.emit(I.call(info.funcIndex));
@@ -2806,7 +2859,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							fnCtx.declareCaptured(name, tsType);
 					}
 					if (Array.isArray(body))
-						fnCtx.widenedTypes = collectRangeWidenings(body, checker, fnCtx.scope);
+						fnCtx.widenedTypes = collectRangeWidenings(body, fnCtx.scope);
 					pending.forEach(st => emitStmt(st, fnCtx));
 					if (Array.isArray(body)) {
 						body.forEach(st => emitStmt(st, fnCtx));
@@ -2922,9 +2975,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					// this statement under -- not `ctx.scope` (towasm's own, separately-tracked scope, which
 					// never reflects flow-sensitive narrowing the way the checker's internal scope tree does).
 					// Without it, a narrowed-non-null receiver (e.g. `if (m === null) return; ...; m.group(0)`)
-					// would still look nullable to `checker.typeOf` here and member/call resolution could fail
+					// would still look nullable to `checkerTypeOf` here and member/call resolution could fail
 					// on it. Falls back to `ctx.scope` only if somehow unset (shouldn't happen post-`TStypeCheck`).
-					const stmtScope = checker.scopeOfStmt(s) ?? ctx.scope;
+					const stmtScope = (s as any).scope as Scope ?? ctx.scope;
 					const {methodOwner, methodName, calleeOptional} = d.init.type === 'call' && d.init.callee.type === 'member'
 						? {methodOwner: ownerOf(d.init.callee.object, ctx), methodName: d.init.callee.property, calleeOptional: d.init.callee.optional}
 						: {};
@@ -2942,7 +2995,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						// alias) to `TypedArray<T>` -- but every element there reads back as `number` regardless
 						// of `T` (a physical-storage tag, not the real TS element type), unlike `Array<T>` below,
 						// where iterating genuinely gives `T` itself.
-						const objT = checker.typeOf(d.init.object, stmtScope);
+						const objT = checkerTypeOf(d.init.object, stmtScope);
 						if (objT.type === 'ref' && !objT.typeArgs && resolveClassAlias(objT.name)?.name === 'TypedArray') {
 							tsType = T.NUMBER;
 						} else {
@@ -2957,14 +3010,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							}
 						}
 						// `arr?.[i]` short-circuits to `undefined` same as any other `?.` -- this bypasses
-						// `checker.typeOf` (a fast structural read of the element type instead), so the optional
+						// `checkerTypeOf` (a fast structural read of the element type instead), so the optional
 						// flag has to be reattached here too, same as `case 'member'`'s own `e.optional` handling.
 						if (tsType && d.init.optional)
 							tsType = T.combineTypes([tsType, T.UNDEFINED]);
 					}
 					if (!tsType && methodOwner) {
 						// This reads the method's raw declared return type directly off the class decl, not
-						// `checker.typeOf(d.init, stmtScope)` -- `stmtScope`'s stamp only exists for a lib
+						// `checkerTypeOf(d.init, stmtScope)` -- `stmtScope`'s stamp only exists for a lib
 						// method body when `makeLibScope`'s one-time check wasn't muted for it, and (see
 						// `makeLibScope`'s own comment) that's deliberately not always the case: a GENERIC lib
 						// class method (`Array<T>.reverse`/`.fill`/...) would get a stamp reflecting the
@@ -2977,7 +3030,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						tsType = methodReturn && calleeOptional ? T.combineTypes([methodReturn, T.UNDEFINED]) : methodReturn;
 					}
 
-					tsType ??= checker.typeOf(d.init, stmtScope);
+					tsType ??= checkerTypeOf(d.init, stmtScope);
 
 					const wtype = typeOf(tsType);
 					if (!wtype) {
@@ -3297,7 +3350,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (p.default) {
 			if (p.default.type !== 'literal')
 				throw new Error(`towasm: 'param '${describeBinding(p.key)}''s default value must be a literal`);
-			tsType ??= checker.typeOf(p.default, libGlobal);
+			tsType ??= checkerTypeOf(p.default, libGlobal);
 		}
 		if (!tsType)
 			throw new Error(`towasm: 'param '${describeBinding(p.key)}' needs an explicit type`);
@@ -3332,7 +3385,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			args.forEach((a, i) => {
 				const p = params[i];
 				if (p?.typeAnnotation && a.type !== 'spread')
-					T.inferTypeArgs(p.typeAnnotation as Type, checker.typeOf(a, ctx.scope), names, map, libGlobal);
+					T.inferTypeArgs(p.typeAnnotation as Type, checkerTypeOf(a, ctx.scope), names, map, libGlobal);
 			});
 			typeParams.forEach(p => {
 				if (!map.has(p.name))
@@ -3377,7 +3430,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		funcs.set(name, info);
 		worklist.push(() => {
 			const ctx	= new FuncCtx(new Scope(libGlobal), result, undefined);
-			ctx.widenedTypes = collectRangeWidenings(decl.body!, checker, ctx.scope);
+			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 			ctx.declareParams(decl.rest ? [...decl.params, decl.rest] : decl.params, params, tsTypes).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
@@ -3402,7 +3455,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			return decls[0];
 		if (args.some(a => a.type === 'spread'))
 			throw new Error(`towasm: spread arguments are not supported in a call to overloaded '${label}'`);
-		const argTs = args.map(a => checker.typeOf(a, ctx.scope));
+		const argTs = args.map(a => checkerTypeOf(a, ctx.scope));
 		const found = decls.find(d => d.body && T.argsFit(T.FixSig(d, T.ANY), argTs, ctx.scope));
 		if (!found)
 			throw new Error(`towasm: no overload of '${label}' matches this call`);
@@ -3469,16 +3522,41 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			const wt = typeAnnotation && typeOf(typeAnnotation);
 			if (!wt || wt === 'void')
 				throw new Error(`towasm: field '${name}.${key}' needs an explicit number/boolean/object type`);
+			// A field sharing a name already seeded from the superclass (below) would silently clobber its
+			// index in `fieldIndex` while leaving the physical struct slot untouched -- the base class's own
+			// (already-compiled-against-that-slot) methods would then read/write the wrong logical field.
+			// Real TS allows re-declaring an inherited field (with a compatible type); this compiler doesn't
+			// model that, so it throws rather than silently miscompiling it.
+			if (info.fieldIndex.has(key))
+				throw new Error(`towasm: field '${name}.${key}' redeclares an inherited field -- not supported`);
 			info.fieldIndex.set(key, info.fields.length);
 			info.fields.push({ name: key, wtype: wt });
 		};
 
 		try {
 			const decl = info.decl;
-			if (decl.superClass)
-				throw new Error(`towasm: inheritance ('${name} extends ...') is not supported`);
 			if (decl.abstract)
 				throw new Error(`towasm: abstract class '${name}' is not supported`);
+
+			// Resolved *before* this class's own members, so `addField`'s redeclaration guard (above) sees
+			// every inherited field already seeded, and `info.fields`/`fieldIndex` end up in the order
+			// wasm-GC struct subtyping requires: the supertype's own fields first, as an exact prefix, this
+			// class's own appended after.
+			if (decl.superClass) {
+				const superName = decl.superClass.type === 'identifier' ? decl.superClass.name
+					: decl.superClass.type === 'instantiation' && decl.superClass.expression.type === 'identifier' ? decl.superClass.expression.name
+					: undefined;
+				if (!superName)
+					throw new Error(`towasm: only a plain named superclass ('class ${name} extends Base' or 'extends Base<T>') is supported`);
+				const superInfo = ensureClass(superName, decl.superClass.type === 'instantiation' ? decl.superClass.typeArgs as Type[] : undefined);
+				if (!superInfo)
+					throw new Error(`towasm: unknown superclass '${superName}' for class '${name}'`);
+				if (typeof superInfo.thisWtype !== 'string' && superInfo.thisWtype && 'arr' in superInfo.thisWtype || superInfo.typeIndex === -1)
+					throw new Error(`towasm: '${name}' can't extend '${superName}' -- extending an array/scalar-backed class (a constructor with its own explicit 'return') is not supported`);
+				info.superClass = superInfo;
+				info.fields.push(...superInfo.fields);
+				superInfo.fieldIndex.forEach((idx, fname) => info.fieldIndex.set(fname, idx));
+			}
 
 			let returnType;
 
@@ -3489,7 +3567,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 					if (typeof m.key !== 'string')
 						throw new Error(`towasm: computed field names in '${name}' are not supported`);
-					addField(m.key, m.typeAnnotation ?? (m.value ? checker.typeOf(m.value, libGlobal) : undefined));
+					addField(m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, libGlobal) : undefined));
 
 				} else if (m.type === 'method') {
 					// A computed name can't be stored as a decl key -- and can never be called via `.name()` syntax either, so it's simply never reachable, no need to throw.
@@ -3501,14 +3579,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
 								if (typeof p.key !== 'string')
 									throw new Error(`towasm: computed field names in '${name}' are not supported`);
-								addField(p.key, p.typeAnnotation ?? (p.default ? checker.typeOf(p.default, libGlobal) : undefined));
+								addField(p.key, p.typeAnnotation ?? (p.default ? checkerTypeOf(p.default, libGlobal) : undefined));
 							}
 						}
 
 						if (!returnType && m.body) {
 							const last = m.body[m.body.length - 1];
 							if (last?.type === 'return' && last.argument)
-								returnType = checker.typeOf(unwrapAs(last.argument), m.scope as Scope);
+								returnType = checkerTypeOf(unwrapAs(last.argument), m.scope as Scope);
 						}
 					}
 
@@ -3530,6 +3608,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			// `thisWtype` is determined by a constructor that explicitly returns a value
 			// Every other class keeps the ordinary struct path. Any one overload's explicit-return shape already tells us `thisWtype`/`typeIndex` -- no need to check they all agree.
 			if (returnType) {
+				if (decl.superClass)
+					throw new Error(`towasm: '${name}' can't both extend '${(decl.superClass as any).name}' and have a constructor with its own explicit 'return' -- not supported`);
 				const result	= typeOf(returnType);
 				if (!result || (typeof result !== 'string' && !('arr' in result)))
 					throw new Error(`towasm: '${name}'s constructor returns a value of an unsupported shape for 'this' -- only a scalar or array-shaped result is supported`);
@@ -3537,7 +3617,17 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				info.typeIndex = typeof result === 'string' ? -1 : ensureArrayType(result.arr);
 			} else {
 				info.thisWtype = { ref: key };
-				info.typeIndex = addType({ final: true, supertypes: [], type: {
+				// `final: !everExtended.has(name)` -- wasm-GC requires a struct type be declared extensible
+				// (`final: false`) *at the point it's registered* to ever be usable as another's
+				// `supertypes` entry later; `everExtended` (computed once, from the whole program's own
+				// `class ... extends X` references, before any class's struct type is actually registered)
+				// is what makes that decision knowable up front instead of needing to patch it in after the
+				// fact. `supertypes: [info.superClass.typeIndex]` is exactly what makes `(ref Derived)` a
+				// real subtype of `(ref Base)` in the wasm type section -- a subclass instance can be passed
+				// anywhere a `(ref Base)` is expected with zero cast/conversion, which is the whole reason a
+				// non-overridden inherited method can stay a single, ordinary, statically-resolved `call`
+				// straight to `Base`'s own compiled function (see `ensureMethod`'s own delegation).
+				info.typeIndex = addType({ final: !everExtended.has(name), supertypes: info.superClass ? [info.superClass.typeIndex] : [], type: {
 					kind: 'struct',
 					fields: info.fields.map(f => ({ type: toValType(f.wtype), mut: true }))
 				} });
@@ -3573,6 +3663,49 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			e.type === 'binary' && e.operator === '=' && e.left.type === 'this' ? true : process(e));
 	}
 
+	// Emits a constructor body statement-by-statement, same as an ordinary `stmts.forEach(st => emitStmt(st,
+	// ctx))` -- except a `super(...)` call is recognized and *inlined*: the superclass's own constructor
+	// body runs right there, writing into the exact same `this` (there's only ever one physical allocation
+	// for the whole hierarchy -- see `ensureClass`'s field-layout comment -- so "calling super" here means
+	// "run its init logic", not "allocate a separate base object"). Recurses naturally for a multi-level
+	// chain (the superclass's own body may contain its own `super(...)`, resolved against *its* own
+	// `cls.superClass` in the recursive call).
+	function emitCtorStatements(stmts: Statement[], cls: ClassInfo, ctx: FuncCtx): void {
+		for (const st of stmts) {
+			if (st.type === 'expression' && st.expression.type === 'call' && st.expression.callee.type === 'super') {
+				const call = st.expression;
+				const superClass = cls.superClass;
+				if (!superClass)
+					throw new Error(`towasm: '${cls.name}' has no superclass -- 'super(...)' is not supported here`);
+				if (call.arguments.some(a => a.type === 'spread'))
+					throw new Error(`towasm: 'super(...)': a spread argument is not supported`);
+				const superDecls = superClass.methodDecls.get('constructor');
+				if (!superDecls)
+					throw new Error(`towasm: superclass '${superClass.name}' needs an explicit constructor for 'super(...)' to call`);
+				const superCtor = resolveOverload(`${superClass.name}'s constructor`, superDecls, call.arguments, ctx);
+				if (!superCtor.body)
+					throw new Error(`towasm: '${superClass.name}'s constructor needs a body (overload signatures are not supported)`);
+
+				// Binds the base ctor's own param names to this call's own argument expressions -- a plain
+				// `var_decl` per param, reusing the ordinary local-declaration path (including its own
+				// destructuring-pattern desugaring, for a destructured base param) unchanged. A nested scope
+				// closes once the base's own body has run, matching real TS scoping: the base ctor's own
+				// params aren't visible to the rest of *this* ctor's body.
+				ctx.openScope();
+				superCtor.params.forEach((p, i) => {
+					const argExpr = call.arguments[i] ?? p.default;
+					if (!argExpr)
+						throw new Error(`towasm: 'super(...)': missing argument for '${superClass.name}'s constructor parameter '${describeBinding(p.key)}'`);
+					emitStmt(JS.VarDecl('const', JS.Var(p.key, argExpr, p.typeAnnotation)), ctx);
+				});
+				emitCtorStatements(superCtor.body, superClass, ctx);
+				ctx.closeScope();
+				continue;
+			}
+			emitStmt(st, ctx);
+		}
+	}
+
 	function ensureCtor(cls: ClassInfo, args: Expr[], callerCtx: FuncCtx): FuncInfo {
 		const decls = cls.methodDecls.get('constructor');
 		if (!decls)
@@ -3602,7 +3735,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 		worklist.push(() => {
 			const ctx		= new FuncCtx(new Scope(libGlobal), thisWtype, cls);
-			ctx.widenedTypes = collectRangeWidenings(ctor.body!, checker, ctx.scope);
+			ctx.widenedTypes = collectRangeWidenings(ctor.body!, ctx.scope);
 			ctx.declareParams(ctor.rest ? [...ctor.params, ctor.rest] : ctor.params, params, tsTypes).forEach(st => emitStmt(st, ctx));
 			// This constructor supplies `this` directly via its own return value (`ctorReturnsValue`)
 			// `cls`'s own `thisWtype`/`typeIndex` already say so; ordinary statement compilation does the right thing once `ctx.ctorThis` is unset.
@@ -3612,10 +3745,18 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			// Defaultability is a whole-struct-type property, not per-field -- one object-typed field forces the collect-then-`struct.new` path for the whole class.
 			} else if (cls.fields.some(f => typeof f.wtype !== 'string')) {
+				// Scope limit, not a fundamental one: this path collects every field's real value up front
+				// (`struct.new`, not `struct.new_default`) by scanning `cls.decl.body`'s own field
+				// initializers and `this.field =` statements directly -- neither of those account for
+				// inherited fields/initializers or a spliced-in `super(...)` body the way
+				// `emitCtorStatements`/the plain `struct.new_default` path below do. Combining the two
+				// would need this whole path taught the same inheritance-awareness; not attempted here.
+				if (cls.superClass)
+					throw new Error(`towasm: '${cls.name}' extends '${cls.superClass.name}' and also has at least one object-typed field of its own -- combining inheritance with a field that needs 'struct.new' (real values up front, instead of 'struct.new_default') is not supported`);
 				const remaining	= new Set(cls.fields.map(f => f.name));
 				const values	= new Map<string, Local>();
 				ctx.ctorFields	= values;
-				// No real local for `this` yet, but `checker.typeOf` still needs its static type to resolve a
+				// No real local for `this` yet, but `checkerTypeOf` still needs its static type to resolve a
 				// chained read like `this.p.x` (`p` already collected) down to `p`'s own class -- same no-real-
 				// local, scope-only registration `declareCaptured` uses for closure captures.
 				ctx.scope.addValue('this', cls.thisTsType);
@@ -3682,7 +3823,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					I.struct.new_default(cls.typeIndex),
 					I.local.set(thisLocal.index),
 				);
-				ctor.body!.forEach(st => emitStmt(st, ctx));
+				emitCtorStatements(ctor.body!, cls, ctx);
 				ctx.emit(I.local.get(ctx.ctorThis!.index), I.return);
 			}
 
@@ -3698,8 +3839,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// params, which are already fully concrete by the time `owner` (a real `ClassInfo`) exists at all.
 	function ensureMethod(owner: ClassInfo, name: string, args: Expr[], callerCtx: FuncCtx, typeArgs?: Type[]): FuncInfo | undefined {
 		const decls = owner.methodDecls.get(name);
+		// Not overridden by `owner` itself -- delegate straight to the ancestor's own compiled function
+		// (cached under *its* own key, e.g. `A.greet`, not `owner.name`'s) rather than recompiling a
+		// duplicate copy under `owner`'s name. Sound and free: wasm-GC struct subtyping (`ensureClass`'s own
+		// `supertypes`) makes a `(ref Derived)` value directly callable wherever `(ref A)` is declared, no
+		// cast needed -- this is the whole reason a non-overridden inherited method stays a single, plain,
+		// statically-resolved `call`, exactly as if there were no inheritance involved at all.
 		if (!decls)
-			return undefined;
+			return owner.superClass && ensureMethod(owner.superClass, name, args, callerCtx, typeArgs);
 		let decl = resolveOverload(`${owner.name}.${name}`, decls, args, callerCtx);
 		// Qualified so it can share `funcs` with plain top-level functions (bare identifiers can't contain
 		// '.') without colliding; only suffixed when there's a real overload set to disambiguate.
@@ -3765,7 +3912,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				ctx.declareValue('this', thisWtype, owner.thisTsType);
 			if (reassignsThis)
 				ctx.appendThisOnReturn = true;
-			ctx.widenedTypes = collectRangeWidenings(decl.body!, checker, ctx.scope);
+			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 			ctx.declareParams(decl.rest ? [...decl.params, decl.rest] : decl.params, params, tsTypes).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
@@ -3842,6 +3989,91 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return info;
 	}
 
+	// Every *reachable* (already `ensureClass`'d, unlike `directSubclasses`' whole-source-text set) class
+	// transitively extending `owner` that overrides `name` with a real body, deepest-first -- `ref.test`
+	// recognizes a value as a subtype of *every* ancestor's own struct type too (a grandchild instance
+	// passes `ref.test $Child` as well as `ref.test $GrandChild`), so testing shallower candidates first
+	// would wrongly stop at an ancestor's override even when the receiver's real, more-derived class has
+	// its own. Depth is measured by walking each candidate's own `superClass` chain back up to `owner`.
+	function collectOverridingCandidates(owner: ClassInfo, name: string): { depth: number; cls: ClassInfo }[] {
+		const found: { depth: number; cls: ClassInfo }[] = [];
+		for (const cls of classes.values()) {
+			if (cls === owner || cls.typeIndex === -1 || !cls.methodDecls.get(name)?.some(d => d.body))
+				continue;
+			let depth = 0;
+			for (let p: ClassInfo | undefined = cls; p; p = p.superClass, depth++) {
+				if (p === owner) {
+					found.push({ depth, cls });
+					break;
+				}
+			}
+		}
+		return found.sort((a, b) => b.depth - a.depth);
+	}
+
+	// A real dynamic-dispatch cascade for `recv.name(...args)` where `recv`'s *static* type (`owner`) has
+	// at least one reachable subclass overriding `name` (`emitMethodCall` only ever routes here when
+	// `hasDeclaredOverride` says so -- every other call, the overwhelming majority even in a program that
+	// uses inheritance at all, stays a plain direct `call`, exactly as without inheritance). Same shape as
+	// `ensureAnyDispatch` (reserve a funcIndex immediately so call sites can `call` it right away; build the
+	// real cascade body once `lateWorklist` guarantees every reachable class has been discovered) --
+	// generalized to a real receiver type (not just `any`) and real method arguments (not just zero-arg).
+	// One assumption this doesn't verify: every override shares `owner`'s own resolved param/result
+	// `WasmType`s (real TS requires override signatures to stay compatible with the base's, which this
+	// narrow subset takes to mean "the same shape", same trust-the-checker stance as everywhere else here).
+	function ensureVirtualDispatch(owner: ClassInfo, name: string, ctx: FuncCtx): FuncInfo {
+		const key = `${owner.name}.${name}<virtual>`;
+		const existing = anyDispatchFuncs.get(key);
+		if (existing)
+			return existing;
+		// `[]`: safe even for a real-arg method, not just zero-arg like `ensureAnyDispatch`'s own use of this
+		// same call -- `resolveOverload` only actually consults `args` to disambiguate a genuine overload
+		// set (`decls.length > 1`); a plain, non-overloaded method (the only kind this function supports --
+		// see the header comment) returns its one real declaration unconditionally, args ignored.
+		const base = ensureMethod(owner, name, [], ctx);
+		if (!base)
+			throw new Error(`towasm: internal: virtual dispatch requested for unknown method '${owner.name}.${name}'`);
+
+		const { funcIndex, typeIndex } = registerFunc([{ type: toValType(owner.thisWtype!), id: 'this' }, ...toParams(base.params)], toResults(base.result));
+		const info: FuncInfo = { params: base.params, result: base.result, funcIndex, typeIndex, defaults: base.defaults, hasRest: base.hasRest };
+		anyDispatchFuncs.set(key, info);
+		funcs.set(`<virtual dispatch>.${key}`, info);
+		lateWorklist.push(() => {
+			const candidates = collectOverridingCandidates(owner, name).map(({ cls }) => ({ cls, funcInfo: ensureMethod(cls, name, [], ctx)! }));
+			const dctx = new FuncCtx(new Scope(libGlobal), base.result, undefined);
+			const recv = dctx.declareLocal('$recv', owner.thisWtype!);
+			// Already-evaluated argument values (the caller pushed these against `owner`'s own signature,
+			// not knowing yet which concrete override will run) -- forwarded as-is to whichever `call`
+			// actually fires, never re-evaluated.
+			const argLocals = base.params.map((p, i) => dctx.declareLocal(`$arg$${i}`, p));
+
+			const buildArm = (i: number): wasm.Instr[] => {
+				if (i >= candidates.length) {
+					// No override matched -- the receiver really is (an instance of, or a non-overriding
+					// subclass of) `owner` itself. `ensureMethod(owner, ...)` already resolved `base` by
+					// walking up to whichever ancestor actually defines `name`; call it directly.
+					dctx.emit(I.local.get(recv.index));
+					argLocals.forEach(l => dctx.emit(I.local.get(l.index)));
+					dctx.emit(I.call(base.funcIndex));
+					return dctx.swapOut();
+				}
+				const c = candidates[i];
+				dctx.emit(I.local.get(recv.index), I.ref.test(c.cls.typeIndex));
+				const _cond = dctx.swapOut();
+				dctx.emit(I.local.get(recv.index), I.ref.cast(c.cls.typeIndex));
+				argLocals.forEach(l => dctx.emit(I.local.get(l.index)));
+				dctx.emit(I.call(c.funcInfo.funcIndex));
+				coerceTop(c.funcInfo.result, dctx, base.result);
+				return [..._cond, I.if(base.result === 'void' ? undefined : toValType(base.result), dctx.swapOut(), buildArm(i + 1))];
+			};
+
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(1 + argLocals.length, toValType);
+			info.body.id = key.replace(/[^a-zA-Z0-9_]/g, '_');
+		});
+		return info;
+	}
+
 
 	// ===================================================================
 	//  Program lowering
@@ -3910,7 +4142,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					// stops mattering once it's a global: every function sees the same slot regardless
 					// of compile order. `mut: false` for `const` -- a genuine wasm-level compile-time
 					// constant, not just a same-value-never-checked mutable slot.
-					const tsType = d.typeAnnotation ?? checker.typeOf(d.init, libGlobal);
+					const tsType = d.typeAnnotation ?? checkerTypeOf(d.init, libGlobal);
 					const wtype = typeOf(tsType);
 					if (wtype && wtype !== 'void') {
 						ensureGlobal(d.name, wtype, d.init, s.kind !== 'const');
@@ -3921,6 +4153,58 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		}
 	}
 
+	// Every class declaration in the whole program (lib + user, generic + not), scanned once for a plain
+	// named `superClass` reference -- shared by two things that each need "the whole program's inheritance
+	// graph" known up front, before any lazy per-class resolution begins: `ensureClass`'s `final` flag
+	// (wasm-GC requires a struct type be declared `final: false` to ever be usable as another's
+	// `supertypes` entry -- can't be decided lazily/after the fact once a class's own type is registered)
+	// and a virtual-dispatch cascade's own candidate set (does ANY class anywhere in the program actually
+	// override a given method -- if not, a plain direct call stays correct and optimal, exactly as without
+	// inheritance at all). Keyed by the bare declared name (never a generic instantiation's composite key)
+	// -- `extends Box`/`extends Box<T>` both reference the same bare name a subclass search needs.
+	const directSubclasses = new Map<string, TS.Class[]>();
+	const everExtended = new Set<string>();
+	for (const d of [
+		...[...LIB_DECL_MAP.values()].filter((d): d is Extract<typeof d, { type: 'class_decl' }> => d.type === 'class_decl'),
+		...[...userGenericClassDecls.values()].map(d => d as unknown as TS.Class & { name: string }),
+		...[...classes.values()].map(c => c.decl),
+	]) {
+		const superName = d.superClass?.type === 'identifier' ? d.superClass.name
+			: d.superClass?.type === 'instantiation' && d.superClass.expression.type === 'identifier' ? d.superClass.expression.name
+			: undefined;
+		if (superName) {
+			everExtended.add(superName);
+			const list = directSubclasses.get(superName);
+			if (list)
+				list.push(d);
+			else
+				directSubclasses.set(superName, [d]);
+		}
+	}
+
+	// Whether *any* class textually declared anywhere in the program, transitively extending `className`,
+	// declares its own (non-static) `methodName` member -- decided purely from `directSubclasses` (whole-
+	// program source text, known complete up front), not from `classes`'s own lazily/incrementally
+	// populated instantiation set. This is what a method-call site checks (`emitMethodCall`) to decide
+	// whether it needs `ensureVirtualDispatch`'s cascade at all: if nothing overrides `methodName` anywhere
+	// reachable from `className`, a plain direct call (`ensureMethod`, walking up to whichever ancestor
+	// actually defines it) is already correct and optimal, exactly as without inheritance -- the common
+	// case, meant to stay just as cheap as it always was. Memoized: a call site re-asks this for the same
+	// `(className, methodName)` pair often (every call to that method, anywhere in the program).
+	const declaredOverrideCache = new Map<string, boolean>();
+	function hasDeclaredOverride(className: string, methodName: string): boolean {
+		const key = `${className}.${methodName}`;
+		let cached = declaredOverrideCache.get(key);
+		if (cached === undefined) {
+			cached = (directSubclasses.get(className) ?? []).some(sub =>
+				sub.body.some(m => m.type === 'method' && m.key === methodName && !hasMod(m, 'static'))
+				|| hasDeclaredOverride(sub.name!, methodName)
+			);
+			declaredOverrideCache.set(key, cached);
+		}
+		return cached;
+	}
+
 	//top level
 	const {funcIndex, typeIndex} = registerFunc([], []);
 	const info: FuncInfo = {params: [], result: 'void', funcIndex, typeIndex};
@@ -3928,7 +4212,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	mod.start	= funcIndex;
 	worklist.push(() => {
 		const ctx	= new FuncCtx(new Scope(libGlobal), 'void', undefined);
-		ctx.widenedTypes = collectRangeWidenings(ast.body!, checker, ctx.scope);
+		ctx.widenedTypes = collectRangeWidenings(ast.body!, ctx.scope);
 		ast.body!.forEach(st => {
 			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl')
 				return;
@@ -4009,7 +4293,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	for (const info of closureLiterals)
 		place(info);
 
-	mod.types			= { types, groupSizes: types.map(() => 1) };
+	// One shared rec group for every type this module ever registered, not a singleton group each --
+	// wasm-GC type equivalence is structural *within* a group's own shape only up to each member's
+	// position in it, but fully structural *across* separate groups (confirmed empirically, not assumed:
+	// two singleton groups with identical shape -- e.g. two sibling classes adding no fields of their own
+	// beyond a shared base -- canonicalize into one runtime type, which `ref.test` then can't tell apart).
+	// One group sidesteps that for every type at once, with zero cost: `types[]`'s own registration order
+	// already satisfies a rec group's one real requirement (a contiguous run), so this needs no reordering
+	// and no index remapping, and it's monotonic -- grouping never makes two *already*-distinct types
+	// collide, only ever adds distinguishing power for ones that would otherwise coincide. Func/array/
+	// closure types that are *deliberately* meant to share one physical type (identical signature, see
+	// `registerType`'s and `ensureClosureType`'s own dedup) are unaffected either way: that merge already
+	// happened before either one ever reached `types[]`, long before grouping is decided here.
+	mod.types			= { types, groupSizes: types.length ? [types.length] : [] };
 	if (globals.has('heap')) {
 		mod.memories	= [{ min: 1 }];
 		// So a host can actually read back what got written to it (e.g. console.log's fd_write buffer) --

@@ -2093,6 +2093,108 @@ async function main() {
 	}
 
 	{
+		// Struct-layout inheritance + `super(...)` constructor chaining -- one physical struct for the
+		// whole hierarchy (wasm-GC `supertypes`), base fields as an exact prefix, `super(...)` inlines the
+		// base ctor's own init logic into the same allocation rather than a separate one.
+		const { basic, threeLevel } = await compile(`
+			class A { x: number; constructor(x: number) { this.x = x; } }
+			class B extends A { y: number; constructor(x: number, y: number) { super(x); this.y = y; } }
+			class C extends B { z: number; constructor(x: number, y: number, z: number) { super(x, y); this.z = z; } }
+			export function basic(): number {
+				const b = new B(3, 4);
+				return b.x + b.y;
+			}
+			export function threeLevel(): number {
+				const c = new C(1, 2, 3);
+				return c.x * 100 + c.y * 10 + c.z;
+			}
+		`);
+		check('inheritance: struct-layout + super(...) (base fields)', basic(), 7);
+		check('inheritance: 3-level super(...) chain', threeLevel(), 123);
+	}
+
+	{
+		// A non-overridden method resolves via a single plain `call` straight to the ancestor's own
+		// compiled function (no cast, no dispatch) -- and `super.method()` always means exactly that
+		// ancestor's own implementation, never virtual, even when the method IS overridden elsewhere.
+		const { inherited, viaSuper } = await compile(`
+			class A {
+				x: number;
+				constructor(x: number) { this.x = x; }
+				greet(): number { return this.x + 1; }
+			}
+			class B extends A {
+				constructor(x: number) { super(x); }
+				greet(): number { return super.greet() * 10; }
+			}
+			export function inherited(): number {
+				const b = new B(3);
+				return b.x;
+			}
+			export function viaSuper(): number {
+				const b = new B(3);
+				return b.greet();
+			}
+		`);
+		check('inheritance: field access through a derived instance', inherited(), 3);
+		check("inheritance: super.method() calls the ancestor's own implementation", viaSuper(), 40);
+	}
+
+	{
+		// Virtual dispatch: a base-typed reference holding a derived instance must call the *override*,
+		// including through `this.method()` inside the base's own body, an array of mixed concrete
+		// instances, and a non-overriding grandchild correctly inheriting its nearest ancestor's override.
+		// `Dog`/`Cat` deliberately declare no fields of their own beyond what `Animal` gives them -- their
+		// wasm-GC struct types are otherwise identical, which wasm-GC canonicalizes into one *same* runtime
+		// type (confirmed empirically): a virtual-dispatch cascade can't reliably tell them apart via
+		// `ref.test` alone, which is why it compares a real stored per-instance type id instead. This is a
+		// real regression test for that, not just a normal-case check.
+		const { overrideWins, baseStays, siblingsDistinct, thisDispatchesVirtually, grandchildInherits } = await compile(`
+			class Animal {
+				constructor() {}
+				sound(): number { return 1; }
+				describe(): number { return this.sound() * 100; }
+			}
+			class Dog extends Animal {
+				constructor() { super(); }
+				sound(): number { return 2; }
+			}
+			class Cat extends Animal {
+				constructor() { super(); }
+				sound(): number { return 3; }
+			}
+			class Puppy extends Dog {
+				constructor() { super(); }
+			}
+			export function overrideWins(): number {
+				const a: Animal = new Dog();
+				return a.sound();
+			}
+			export function baseStays(): number {
+				const a: Animal = new Animal();
+				return a.sound();
+			}
+			export function siblingsDistinct(): number {
+				const animals: Animal[] = [new Animal(), new Dog(), new Cat()];
+				return animals[0].sound() * 100 + animals[1].sound() * 10 + animals[2].sound();
+			}
+			export function thisDispatchesVirtually(): number {
+				const a: Animal = new Dog();
+				return a.describe();
+			}
+			export function grandchildInherits(): number {
+				const a: Animal = new Puppy();
+				return a.sound();
+			}
+		`);
+		check('virtual dispatch: base-typed reference calls the override', overrideWins(), 2);
+		check("virtual dispatch: base instance still calls the base's own implementation", baseStays(), 1);
+		check('virtual dispatch: structurally-identical sibling subclasses stay distinct', siblingsDistinct(), 123);
+		check('virtual dispatch: this.method() inside a base method body dispatches virtually', thisDispatchesVirtually(), 200);
+		check("virtual dispatch: non-overriding grandchild inherits its nearest ancestor's override", grandchildInherits(), 2);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

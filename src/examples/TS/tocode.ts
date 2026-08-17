@@ -614,6 +614,9 @@ export class Output {
 			case 'this':
 				return 'this';
 
+			case 'super':
+				return 'super';
+
 			case 'array':
 				// Elements use `assignment_expression` in the grammar (array_literal's `element_list`),
 				// so minPrec=2 keeps a literal comma/sequence element from being misread as two elements.

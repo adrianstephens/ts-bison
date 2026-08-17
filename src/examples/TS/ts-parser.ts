@@ -49,7 +49,8 @@ export interface ConstructorType extends CallSig { type: 'constructor'; abstract
 // Not writable in source syntax -- only ever produced internally by narrowing (see `type-utils.ts`'s `toRange`/`rangeToType`).
 // A `bigint` has no `Literal` node of its own (see `Type` below), so an exact bigint value is represented as a
 // degenerate range (`min === max`); `tocode.ts` prints that case back out as a real bigint literal (e.g. `10n`).
-export interface RangeType { type: 'range'; base: 'number' | 'bigint'; min?: number | bigint; max?: number | bigint; integer?: boolean }
+// `frozen`: see `common.ts`'s `Literal.frozen` -- same purpose, for a `bigint`'s degenerate-range literal form.
+export interface RangeType { type: 'range'; base: 'number' | 'bigint'; min?: number | bigint; max?: number | bigint; integer?: boolean; frozen?: boolean }
 export function  RangeType(base: 'number' | 'bigint', min?: number | bigint, max?: number | bigint, integer?: boolean): RangeType { return { type: 'range', base, min, max, integer }; }
 
 export type TypeMember =
