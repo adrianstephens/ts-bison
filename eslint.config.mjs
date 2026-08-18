@@ -11,7 +11,7 @@ export default tslint.config(
 		// Real TS syntax, but deliberately not standalone-valid TypeScript (see its header comment) --
 		// towasm.ts reads it as text and reparses it with its own `TS.parse`, never as a normal module.
 		// Excluded the same way it's excluded from test/tsconfig.json.
-		ignores: ["examples/TS/lib/**/*.ts"],
+		ignores: ["src/examples/TS/lib/**/*.ts"],
 	},
 	eslint.configs.recommended,
 	...tslint.configs.recommended,
@@ -47,6 +47,17 @@ export default tslint.config(
 		languageOptions: {
 			parserOptions: {
 				project: './tsconfig.json',
+				tsconfigRootDir: dirname(fileURLToPath(import.meta.url))
+			}
+		}
+	},
+	{
+		// examples/ has its own tsconfig (own outDir, includes the whole subtree) rather than
+		// being part of the root tsconfig.json's `src/*.ts` (non-recursive) include.
+		files: ["src/examples/**/*.ts"],
+		languageOptions: {
+			parserOptions: {
+				project: './src/examples/tsconfig.json',
 				tsconfigRootDir: dirname(fileURLToPath(import.meta.url))
 			}
 		}

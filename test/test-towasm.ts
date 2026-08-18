@@ -2679,6 +2679,58 @@ async function main() {
 			}
 		`);
 		check("calling a closure read directly off an array element ('arr[i](x)')", indexCall(), 31);
+
+		// `(a / 0) | 0` -- an `f64`->`i32` coercion of a non-finite value must never trap (real division
+		// by zero is `+-Infinity`/`NaN`, not an error) -- confirms the saturating conversion itself, not
+		// any particular value it saturates to (real JS's own `ToInt32` gives `0` for every non-finite
+		// input, which this doesn't replicate -- a documented, accepted gap, see the file's own top comment).
+		const { divByZero, divByZeroNeg, divNaN } = await compile(`
+			export function divByZero(a: number): number { return (a / 0) | 0; }
+			export function divByZeroNeg(a: number): number { return (a / -0) | 0; }
+			export function divNaN(): number { return (0 / 0) | 0; }
+		`);
+		check("'f64'->'i32' coercion of '+Infinity' never traps", divByZero(5), 2147483647);
+		check("'f64'->'i32' coercion of '-Infinity' never traps", divByZeroNeg(5), -2147483648);
+		check("'f64'->'i32' coercion of 'NaN' never traps", divNaN(), 0);
+	}
+
+	{
+		// A `func` type must never share a multi-member rec group with anything else -- `ref.test`/
+		// `ref.cast` (the reason struct/array types *do* need a shared group, so two structurally-
+		// identical sibling classes stay distinguishable) is never applied to a bare func type here, so
+		// there's no such need for one -- and per the wasm-GC spec, a type sharing a multi-member group
+		// canonicalizes differently than an equivalently-shaped standalone/singleton one, which breaks
+		// matching a real host import (e.g. WASI's `fd_write`) against this module's own func type of the
+		// same signature. Confirmed the hard way via `wasmtime` (a real standalone runtime, not just
+		// Node's own lenient `WebAssembly` engine) rejecting a `console.log`-using module outright before
+		// this was fixed -- checked here structurally, without needing `wasmtime` itself as a test
+		// dependency.
+		const program = parser.parse(`
+			class Point { x: number; constructor(x: number) { this.x = x; } }
+			export function f(p: Point): number {
+				const g = (n: number) => n + 1;
+				console.log(p.x);
+				return g(p.x);
+			}
+		`);
+		const diagnostics = TStypeCheck(program, libScope);
+		assert(!diagnostics.some(d => d.severity === SEVERITY.ERROR), 'unexpected type errors');
+		const mod = TStoWasm(program);
+		const { types, groupSizes } = mod.types!;
+		let i = 0;
+		let anyFuncInMultiMemberGroup = false;
+		for (const size of groupSizes) {
+			if (size > 1) {
+				for (let j = i; j < i + size; j++) {
+					const t = types[j];
+					const kind = ('type' in t ? t.type : t).kind;
+					if (kind === 'func')
+						anyFuncInMultiMemberGroup = true;
+				}
+			}
+			i += size;
+		}
+		check("no 'func' type shares a multi-member rec group", anyFuncInMultiMemberGroup, false);
 	}
 
 	{
