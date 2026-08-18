@@ -656,13 +656,15 @@ const NUMERIC_TYPES = ['f64', 'f32', 'i64', 'i32'] as const;
 type NumericType = typeof NUMERIC_TYPES[number];
 function isNumericType(t: WasmType | undefined): t is NumericType { return NUMERIC_TYPES.includes(t as NumericType); }
 
-// WatInstr and wasm.Instr differ on block/loop/if (unsupported in flat inline asm) and on `__local`
-// (a `(local ...)` declaration) -- WAT.parseAsmBody/instantiateAsmBody already hoist every local out
-// into their own `.locals` before returning `.body`, so a `__local` reaching here means one leaked
-// through that hoisting somewhere, a real bug worth failing fast on rather than silently encoding.
+// WatInstr and wasm.Instr differ on block/loop/if/try_table (unsupported in flat inline asm -- these
+// carry a pre-resolution `ValType[]` blockType that only `WAT.toWasm`'s module-level pass can turn into
+// a real `BlockType`, see WatInstr's own comment) and on `__local` (a `(local ...)` declaration) --
+// WAT.parseAsmBody/instantiateAsmBody already hoist every local out into their own `.locals` before
+// returning `.body`, so a `__local` reaching here means one leaked through that hoisting somewhere, a
+// real bug worth failing fast on rather than silently encoding.
 function assertFlatInstrs(instrs: WAT.WatInstr[], asm: string): wasm.Instr[] {
 	return instrs.map(i => {
-		if (i.op === 'block' || i.op === 'loop' || i.op === 'if')
+		if (i.op === 'block' || i.op === 'loop' || i.op === 'if' || i.op === 'try_table')
 			throw new Error(`inline asm '${asm}': '${i.op}' (control flow) is not supported in inline asm`);
 		if (i.op === '__switch')
 			throw new Error(`inline asm '${asm}': switch '${i.key}' is unresolved -- not a ctx.defines entry, and inline asm has no enclosing macro call to bind it to a $tag argument`);
