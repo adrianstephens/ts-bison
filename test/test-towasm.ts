@@ -1506,20 +1506,34 @@ async function main() {
 		check("ctorEarlyReturn() (bare 'return;' nested in an 'if' inside a constructor)", ctorEarlyReturn(), 5);
 	}
 
-	await checkThrows('void param is rejected', () => compile(`
-		export function f(x: void): number { return 1; }
-	`), /void/);
-
-	await checkThrows('void field is rejected', () => compile(`
-		class C {
-			x: void;
-			constructor() {}
-		}
-		export function f(): number {
-			const c = new C();
-			return 1;
-		}
-	`), /number\/boolean/);
+	{
+		// `void` is real, valid TS in a param/field position (if a fairly useless thing to write) --
+		// there's just no wasm value it can itself represent, so it's boxed as `any` (the same
+		// "no meaningful value" treatment every other such position gets) rather than rejected. Real
+		// TS's only value assignable to `void` is `undefined`, so that has to actually work too, not
+		// just the bare declaration -- `emitAs`'s own null-literal handling now boxes a placeholder for
+		// a non-nullable `any` target instead of only ever accepting a nullable one.
+		const { callF, fieldTest } = await compile(`
+			export function f(x: void): number { return 1; }
+			export function callF(): number {
+				return f(undefined);
+			}
+			class C {
+				x: void;
+				y: number;
+				constructor(y: number) {
+					this.x = undefined;
+					this.y = y;
+				}
+			}
+			export function fieldTest(): number {
+				const c = new C(42);
+				return c.y;
+			}
+		`);
+		check("a 'void' param compiles and is callable with 'undefined'", callF(), 1);
+		check("a 'void' field compiles, assignable from 'undefined', rest of the class still works", fieldTest(), 42);
+	}
 
 	await checkThrows('void local is rejected', () => compile(`
 		export function noop(): void {}
@@ -2553,6 +2567,33 @@ async function main() {
 			}
 		`);
 		check("generator: 'const v = yield x;' binds the next .next(v)'s sent value", sentGen(), 110021);
+
+		// `Generator<Y, void, N>` -- a real, common instantiation (a generator that yields values but
+		// has no meaningful final return value) -- `IteratorResult<Y,R>.value: Y | R`'s own type
+		// resolves this via the ordinary nullable-union path (same mechanism `number | null` already
+		// uses) once `R` is `void`, so `yield`'s own payload and a bare `return;`'s implicit "done"
+		// value must both agree on that *same* boxed representation, not each independently derive
+		// their own from `Y`/`R` alone (a real bug found and fixed this session: `yield`'s own value
+		// used to derive its wasm shape from bare `Y`, diverging from what the shared IteratorResult
+		// constructor actually expects whenever `Y` and `R` differ).
+		const { driveVoidGen } = await compile(`
+			function* voidGen(): Generator<number, void, number> {
+				yield 1;
+				yield 2;
+				return;
+			}
+			export function driveVoidGen(): number {
+				const g = voidGen();
+				const a = g.next(0);
+				const b = g.next(0);
+				const c = g.next(0);
+				let result = a.value + b.value * 10;
+				if (a.done || b.done) result += 1000;
+				if (!c.done) result += 2000;
+				return result;
+			}
+		`);
+		check("generator: 'Generator<Y, void, N>' -- yield/yield/bare 'return;'", driveVoidGen(), 21);
 	}
 
 	{
@@ -2662,6 +2703,32 @@ async function main() {
 			}
 		`);
 		check("async: 'Promise.all' resolves only once every input has, order-independent", promiseAll(), 999);
+
+		// `Promise<void>` -- a real, common instantiation -- unlike `Generator`'s own `Y | R` union,
+		// `Promise<T>.value: T` is a *bare* field with no union to fall back on, so `T=void` needed a
+		// real fix (not something the existing machinery already handled): `compileAsyncFunc` now
+		// substitutes `any` for `T` right where `Promise<T>` gets instantiated, once, whenever the
+		// async function's own declared return is `void` -- both natural completion (no explicit
+		// `return` at all, here) and every `resolve()`/await site downstream then agree on that same
+		// substituted shape. Also exercises awaiting an existing `Promise<void>` value (`observe`
+		// below), which must reference the *same* substituted instantiation its producer built.
+		const { asyncVoidTest } = await compile(`
+			let output: number = 0;
+			async function addOneVoid(p: Promise<number>): Promise<void> {
+				const v = await p;
+				output = v + 1;
+			}
+			async function observe(p: Promise<number>): Promise<void> {
+				await addOneVoid(p);
+			}
+			export function asyncVoidTest(): number {
+				const p = new Promise<number>(0);
+				p.resolve(41);
+				observe(p);
+				return output;
+			}
+		`);
+		check("async: 'Promise<void>' -- natural completion (no explicit 'return') resolves fine", asyncVoidTest(), 42);
 	}
 
 	{

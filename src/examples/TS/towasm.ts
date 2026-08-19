@@ -6,7 +6,7 @@ import * as T from './type-utils';
 import { Literal, Binary } from '../common';
 import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink } from './checker';
 import { walk, walkB, hasMod } from './walker';
-import { foldConstants, flattenStateMachine, collectHoistedLocals, StateMachine, SegmentNext } from './transform';
+import { foldConstants, flattenStateMachine, collectHoistedLocals, StateMachine, SegmentNext, SuspendBoundary } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
 import * as WAT from '../wat-parser';
 
@@ -178,9 +178,9 @@ const ARR_WTYPE: Record<WasmElement, WasmType> = {
 	f64: { arr: 'f64' },
 	ref: { arr: 'ref' },
 };
-const REF_ANY: WasmType = { ref: 'any' };
+const REF_ANY:			WasmType = { ref: 'any' };
 const REF_ANY_NULLABLE: WasmType = { ref: 'any', nullable: true };
-const REF_EXN: WasmType = { ref: 'exn', nullable: true };
+const REF_EXN:			WasmType = { ref: 'exn', nullable: true };
 
 // The plain scalar kind a value acts as for arithmetic/comparison dispatch -- unwraps a boxed
 // nullable primitive the same way `coerceTop` does, or passes a bare scalar through unchanged.
@@ -188,9 +188,15 @@ const REF_EXN: WasmType = { ref: 'exn', nullable: true };
 function scalarKind(wtype: WasmType | undefined): WasmScalar | undefined {
 	return typeof wtype === 'string' ? (wtype !== 'void' ? wtype : undefined) : wtype && unboxedPrimitive(wtype)?.kind;
 }
-function notUnsigned(wtype: WasmScalar | undefined): WasmScalarI  | undefined {
+function notUnsigned(wtype: WasmScalar): WasmScalarI;
+function notUnsigned(wtype: WasmScalar | undefined): WasmScalarI  | undefined;
+function notUnsigned(wtype: string | undefined) {
 	return wtype === 'u32' ?  'i32' : wtype === 'u64' ? 'i64' : wtype;
 }
+function elementKind(wtype: WasmType | undefined): WasmElement {
+	return typeof wtype === 'string' && wtype !== 'void' ? notUnsigned(wtype) : 'ref';
+}
+
 // If `wtype` is a boxed nullable primitive (see `nullableWtype`/`ensureBoxType`), its underlying
 // scalar kind and box type index; otherwise `undefined` (a real class/array/closure-env-struct, or
 // already a bare scalar). Structural (checks `primKind` on the object itself), not a lookup table --
@@ -228,15 +234,9 @@ function intWasmType(min: number, max: number): WasmType {
 	return 'f64';
 }
 
-// The wasmElement kind for a T[]/Array<T>/ReadonlyArray<T> element type.
-// `i8`/`u8` checked by name before `wasmTypeOf` (which would otherwise resolve either straight through to
-// plain `number`/`f64`, same as `builtinTypes`'s own before-`T.resolve` pseudo-type checks) -- the one place
-// this project needs a genuine packed-byte GC array (`ArrayBuffer`'s backing store, see `lib/typedarray.ts`).
-function arrayElemKind(elemType: Type, global: Scope): 'f64' | 'i32' | 'i8' | 'ref' | undefined {
-	if (elemType.type === 'ref' && !elemType.typeArgs && (elemType.name === 'i8' || elemType.name === 'u8'))
-		return 'i8';
-	const we = wasmTypeOf(elemType, global);
-	return we === 'i32' || we === 'f64' ? we : we === 'u32' ? 'i32' : 'ref';
+// null parses as a literal; undefined is a real identifier -- both need ref.null with a heap type.
+function isNullLiteral(e: Expr): boolean {
+	return (e.type === 'literal' && e.value === null) || (e.type === 'identifier' && e.name === 'undefined');
 }
 
 // Checks builtinTypes before T.resolve to avoid expanding a hoisted class name and losing it.
@@ -251,21 +251,15 @@ function wasmTypeOf(t: Type, global: Scope): WasmType | undefined {
 
 	// Resolve each union member first so alias duplicates collapse before arrayElemKind.
 	const w = T.widenLiterals(t.type === 'union' ? T.combineTypes(t.types.map(m => T.resolve(global, m))) : T.resolve(global, t));
-	if (w.type === 'array') {
-		const we = arrayElemKind(w.element, global);
+	if (w.type === 'array' || (w.type === 'ref' && (w.name === 'Array' || w.name === 'ReadonlyArray'))) {
+		const elemType = w.type === 'array' ? w.element : w.typeArgs![0];
+		const we = elemType.type === 'ref' && !elemType.typeArgs && (elemType.name === 'i8' || elemType.name === 'u8') ? 'i8'
+			: elementKind(wasmTypeOf(elemType, global));
 		return we ? ARR_WTYPE[we] : undefined;
 	}
 
-	if (w.type === 'ref') {
-		switch (w.name) {
-			case 'Array':
-			case 'ReadonlyArray': {
-				const we = arrayElemKind(w.typeArgs![0], global);
-				return we ? ARR_WTYPE[we] : undefined;
-			}
-		}
+	if (w.type === 'ref')
 		return builtinTypes[w.name]?.wtype;
-	}
 
 	return undefined;
 }
@@ -305,7 +299,13 @@ interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number }
 
 // Per-operand info for builtin dispatch -- wtype for kind-polymorphic dispatch, owner for identity dispatch.
 interface OperandInfo { wtype: WasmType | undefined; owner?: ClassInfo }
-type Builtin<T = Inline | MethodDelegate | FunctionDecl> = (args: OperandInfo[], ctx: FuncCtx) => T
+type Builtin<T = Inline | MethodDelegate | FunctionDecl> = (args: OperandInfo[], ctx: FunctionContext) => T
+
+// A `get`/`set` accessor's `methodDecls`/`inlineMethods`/`funcs` key, mangled apart from a plain same-named
+// method so a getter and a setter for one property can coexist as two entries instead of overwriting each other.
+function accessorKey(kind: 'get' | 'set', name: string): string {
+	return `${kind}:${name}`;
+}
 
 interface MethodOwner {
 	decl:			TS.Class;
@@ -337,7 +337,42 @@ interface Local			{ wtype: WasmType, index: number; }
 type Global				= Local & {init: Expr, mut: boolean}
 interface ResolvedParam { key: BindingTarget; wtype: WasmType; tsType: Type }
 
-class FuncCtx {
+interface ClosureEnv {
+	envLocal:		Local;
+	envTypeIndex:	number;
+	fields:			Map<string, { index: number; wtype: WasmType }>
+};
+
+// Pushed by `case 'try'` while compiling a `try`/`catch` that has a `finally` -- `emitBreak`/
+// `emitContinue` check this first (innermost guard): real JS semantics require `finally` to run
+// before either actually completes, so one whose real target lies outside this specific
+// `try`/`finally`'s own span stashes an action code and branches to the shared landing point
+// instead of exiting directly. Popped before that landing point's own re-dispatch code is built, so
+// a `br` built there targets the next-outer guard (or ordinary behavior once none remain) --
+// composes for nested `try`/`finally` without any extra bookkeeping. `return`'s own equivalent
+// redirect is a temporary `ctx.onReturn` swap instead (see `case 'try'`), not part of this guard --
+// unlike a loop/switch target, there's only ever one "current" return meaning at a time, no stack needed.
+interface FinallyGuard {
+	actionLocal:				Local;
+	breakTargetsLenAtEntry:		number;
+	continueTargetsLenAtEntry:	number;
+	landingDepth:				number
+};
+
+// What a plain `return expr;` actually means here -- ordinarily just "coerce `expr` to `ctx.result`
+// and emit a wasm `return`" (`plainReturn`, below), but a generator/async function's own resumable
+// step function, a constructor, or a `reassignsThis` method each redefine it (IteratorResult
+// protocol, Promise resolution, implicit/appended `this`, ...). Set once by whichever compiler
+// routine gives 'return' that meaning (`compileGeneratorFunc`, `compileAsyncFunc`, `ensureCtor`,
+// `ensureMethod`), checked by `case 'return'` -- and temporarily swapped out by a `case 'try'` guard
+// with a `finally`, which needs the *outer* meaning to reconstruct a real return once `finally` has
+// run (see `case 'try'`), not a fresh mechanism of its own.
+interface ReturnHandler {
+	wtype(ctx: FunctionContext): WasmType | undefined;
+	emit(ctx: FunctionContext, argument: Expr | undefined): void;
+};
+
+class FunctionContext {
 	// Declarations (`declareLocal`/`declareValue`, and `local`'s scratch temps), in declaration order. A name may appear
 	// more than once (a closed sibling scope's declaration, or a live nested shadow) -- `lookup` scans
 	// from the end and skips closed entries, so a still-open outer binding resurfaces once an inner one closes.
@@ -348,53 +383,32 @@ class FuncCtx {
 	// so `freeSlots` (keyed by `wasmTypeKey`) only ever offers back a same-typed index for reuse.
 	slotTypes:	WasmType[] = [];
 	freeSlots	= new Map<string, number[]>();
-	out:	wasm.Instr[]	= [];
-	ctorThis?: Local;
+	out:		wasm.Instr[]	= [];
+	ctorThis?:	Local;
+
 	// Set only while a struct-collecting constructor (see `ensureCtor`) gathers field values into scratch
 	// locals ahead of `struct.new` -- lets `this.field` resolve to the field's own local, for a field already
 	// collected, before a real `this` exists. Cleared the moment `ctorThis` is set.
 	ctorFields?: Map<string, Local>;
-	// depth counts open block/loop/if labels; breakTargets/continueTargets record depth at each label
-	// so `br(depth - target)` gives the correct relative index from any nesting depth. Only ever touched
-	// via the enter*/exit* pairs below, which mirror `openScope`/`closeScope`'s own pairing but for WAT's
-	// structural nesting rather than JS lexical scope -- a related, not identical, kind of "currently open".
+
 	depth = 0;
 	breakTargets:		number[] = [];
 	continueTargets:	number[] = [];
 
 	// Set when this FuncCtx is a closure body -- captured names have no real local, reads/writes go through struct.get/set on envLocal.
-	closureEnv?: { envLocal: Local; envTypeIndex: number; fields: Map<string, { index: number; wtype: WasmType }> };
-	// Set when this FuncCtx is a nested `function_decl`'s own body that's allowed to call itself by
-	// name -- a call to `name` resolves to a direct, statically-known `call funcIndex` (reusing the
-	// same env) instead of going through a closure struct, since the struct being constructed can't
-	// reference itself while it's still being built. See `emitClosureLiteral`'s `allowSelfCall`.
-	selfCall?: { name: string; funcIndex: number; params: WasmType[]; result: WasmType; hasRest?: boolean };
-	// Populated once, right after construction, by `collectRangeWidenings` -- a `let`/`var` declarator
-	// whose reassignments push its numeric range wider than its own initializer alone gives.
-	widenedTypes?: Map<JS.Var<Type>, Type>;
-	// Set while compiling a reassignsThis method -- every return also pushes the current `this`.
-	appendThisOnReturn = false;
-	// Set while compiling a generator's own resumable step function -- `case 'return'` in `emitStmt`
-	// checks this first: a plain `return expr;` inside a generator body means "done", not an ordinary
-	// wasm return of `expr` (the step function's real wasm result is always an `IteratorResult`, never
-	// the bare yield/return type) -- see `compileGeneratorFunc`.
-	generatorFrame?: { frameLocal: Local; frameTypeIndex: number; stateField: number; doneStateId: number; resultCtor: FuncInfo; rWtype: WasmType };
-	// Set while compiling an async function's own resumable step function -- `case 'return'` checks
-	// this first, same reasoning as `generatorFrame`: a plain `return expr;` means "resolve the
-	// function's own result Promise with `expr`, then a bare wasm `return`", not an ordinary return of
-	// `expr` (the step function's own real wasm result type is always `void` -- see `compileAsyncFunc`).
-	asyncFrame?: { frameLocal: Local; frameTypeIndex: number; resultPromiseField: number; promiseClass: ClassInfo; rWtype: WasmType };
-	// Pushed by `case 'try'` while compiling a `try`/`catch` that has a `finally` -- `case 'return'`/
-	// `case 'break'`/`case 'continue'` check this first (innermost guard, same convention as
-	// `generatorFrame`/`asyncFrame`): real JS semantics require `finally` to run before any of them
-	// actually completes, so one whose real target lies outside this specific `try`/`finally`'s own span
-	// stashes its payload and branches to the shared landing point instead of exiting directly. Popped
-	// before that landing point's own re-dispatch code is built, so a statement synthesized there
-	// naturally falls through to the next-outer guard (or ordinary behavior once none remain) --
-	// composes for nested `try`/`finally` without any extra bookkeeping.
-	finallyGuards: { actionLocal: Local; returnValueLocal?: Local; exnLocal: Local; breakTargetsLenAtEntry: number; continueTargetsLenAtEntry: number; landingDepth: number }[] = [];
+	closureEnv?:		ClosureEnv;
+	// Set when this FuncCtx is a nested `function_decl`'s own body that's allowed to call itself by name
+	// -- a call to `name` resolves to a direct, statically-known `call funcIndex` (reusing the same env) instead of going through a closure struct,
+	// since the struct being constructed can't/ reference itself while it's still being built. See `emitClosureLiteral`'s `allowSelfCall`.
+	selfCall?:			FuncInfo;
+	
+	// Populated once, right after construction, by `collectRangeWidenings` -- a `let`/`var` declarator whose reassignments push its numeric range wider than its own initializer alone gives
+	widenedTypes?:		Map<JS.Var<Type>, Type>;
+	// Unset for an ordinary function/method/arrow -- `case 'return'` falls back to `plainReturn` in
+	// that case. See `ReturnHandler`'s own comment for who sets this and why.
+	finallyGuards:		FinallyGuard[] = [];
 
-	constructor(public scope: Scope, public result: WasmType, public owner: ClassInfo | undefined) {}
+	constructor(public name: string, public scope: Scope, public onReturn: ReturnHandler, public owner: ClassInfo | undefined) {}
 
 	lookup(name: string): Local | undefined {
 		for (let i = this.declared.length - 1; i >= 0; i--) {
@@ -452,6 +466,26 @@ class FuncCtx {
 		return this;
 	}
 
+	inScope(fn: (ctx: FunctionContext)=>void) {
+		this.openScope();
+		fn(this);
+		this.closeScope();
+	}
+
+	emitBreak() {
+		const guard = this.finallyGuards.at(-1);
+		if (guard && this.breakTargets.length <= guard.breakTargetsLenAtEntry)
+			this.emit(I.i32.const(2), I.local.set(guard.actionLocal.index), I.br(this.depth - guard.landingDepth));
+		else
+			this.emit(I.br(this.depth - this.breakTargets.at(-1)!));
+	}
+	emitContinue() {
+		const guard = this.finallyGuards.at(-1);
+		if (guard && this.continueTargets.length <= guard.continueTargetsLenAtEntry)
+			this.emit(I.i32.const(3), I.local.set(guard.actionLocal.index), I.br(this.depth - guard.landingDepth));
+		else
+			this.emit(I.br(this.depth - this.continueTargets.at(-1)!));
+	}
 	// a still-visible same-name entry is reused rather than rejected
 	temp(name: string, wtype: WasmType): number {
 		const prev = this.lookup(name);
@@ -495,7 +529,6 @@ class FuncCtx {
 	resolvedWtype(name: string): WasmType | undefined {
 		return this.closureEnv?.fields.get(name)?.wtype ?? this.lookup(name)?.wtype;
 	}
-
 	// Destructured params get a hidden #param$<i> local; returns var_decl stmts to bind the real names.
 	// `tsTypes` -- the caller already resolved each param's effective `Type` (annotation, or inferred
 	// from a default) via `paramType`, to pick `wtypes` in the first place; reused here rather than
@@ -526,14 +559,35 @@ class FuncCtx {
 	}
 
 	toFuncBody(numParams: number, toValType: (t: WasmType) => wasm.ValType): wasm.FuncBody {
-		return { locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
+		return { id: this.name, locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
 	}
 }
 
-// null parses as a literal; undefined is a real identifier -- both need ref.null with a heap type.
-function isNullLiteral(e: Expr): boolean {
-	return (e.type === 'literal' && e.value === null) || (e.type === 'identifier' && e.name === 'undefined');
+
+// Qualifies a scratch local's name by its own wtype -- a bare fixed name would collide (`FuncCtx.local`
+// throws on a same-name-different-type redeclare) once one function writes to two differently-typed targets.
+function scratchName(prefix: string, wtype: WasmType): string {
+	return `${prefix}$${wasmTypeKey(wtype)}`;
 }
+
+// `as` is a pure pass-through in codegen (`case 'as'` just compiles `e.expression`), but `checkerTypeOf`
+// still honors the asserted type -- any codegen-facing type/owner lookup must unwrap it first or it sees a fictional type, wrongly losing method/owner dispatch on the real underlying value.
+function unwrapAs(e: Expr): Expr {
+	while (e.type === 'as')
+		e = e.expression;
+	return e;
+}
+
+// Whether expression tree `e` references identifier `name` anywhere, not descending into a nested
+// arrow/function's own body (closure boundary) -- same idiom as the named-function self-reference
+// check a few hundred lines down (`e.type === 'identifier' && e.name === selfName`).
+function exprMentionsName(name: string, e: Expr): boolean {
+	return walkB(e, undefined, (ex, process) =>
+		ex.type === 'identifier' && ex.name === name ? true
+		: (ex.type === 'arrow' || ex.type === 'function') ? false
+		: process(ex));
+}
+
 
 // For error messages only.
 function describeBinding(t: BindingTarget): string {
@@ -647,37 +701,9 @@ function collectFreeVars(bound: Set<string>, body: Statement[] | Expr, free: Set
 	);
 }
 
-
-// `as` is a pure pass-through in codegen (`case 'as'` just compiles `e.expression`), but `checkerTypeOf`
-// still honors the asserted type -- any codegen-facing type/owner lookup must unwrap it first or it sees a fictional type, wrongly losing method/owner dispatch on the real underlying value.
-function unwrapAs(e: Expr): Expr {
-	while (e.type === 'as')
-		e = e.expression;
-	return e;
-}
-
-// Whether expression tree `e` references identifier `name` anywhere, not descending into a nested
-// arrow/function's own body (closure boundary) -- same idiom as the named-function self-reference
-// check a few hundred lines down (`e.type === 'identifier' && e.name === selfName`).
-function exprMentionsName(name: string, e: Expr): boolean {
-	return walkB(e, undefined, (ex, process) =>
-		ex.type === 'identifier' && ex.name === name ? true
-		: (ex.type === 'arrow' || ex.type === 'function') ? false
-		: process(ex));
-}
-
-
-// Qualifies a scratch local's name by its own wtype -- a bare fixed name would collide (`FuncCtx.local`
-// throws on a same-name-different-type redeclare) once one function writes to two differently-typed targets.
-function scratchName(prefix: string, wtype: WasmType): string {
-	return `${prefix}$${wasmTypeKey(wtype)}`;
-}
-
-// All four numeric wasm types, in "widen to me first" preference order when an operand's own type has no
-// real instruction -- f64 first, since widening i32/i64/f32 up to it is exact or an already-accepted tradeoff.
-const NUMERIC_TYPES = ['f64', 'f32', 'i64', 'i32'] as const;
-type NumericType = typeof NUMERIC_TYPES[number];
-function isNumericType(t: WasmType | undefined): t is NumericType { return NUMERIC_TYPES.includes(t as NumericType); }
+// ===================================================================
+//  Assembly
+// ===================================================================
 
 // WatInstr and wasm.Instr differ on block/loop/if/try_table (unsupported in flat inline asm -- these
 // carry a pre-resolution `ValType[]` blockType that only `WAT.toWasm`'s module-level pass can turn into
@@ -792,7 +818,7 @@ function makeAsm(key: string, value: Expr | undefined, builtin: string, index: n
 		};
 
 		// Resolves named scratch locals to real local indices via ctx.local
-		const resolveAsmLocals = (instrs: wasm.Instr[], locals: WAT.WatLocal[], ctx: FuncCtx, asm: string): wasm.Instr[] => {
+		const resolveAsmLocals = (instrs: wasm.Instr[], locals: WAT.WatLocal[], ctx: FunctionContext, asm: string): wasm.Instr[] => {
 			const indices = new Map(locals.map(l => {
 				if (!l.id)
 					throw new Error(`inline asm '${asm}': an anonymous local can't be referenced by name`);
@@ -813,6 +839,12 @@ function makeAsm(key: string, value: Expr | undefined, builtin: string, index: n
 
 		const sw = parsed.body.find((i): i is WAT.SwitchPlaceholder => i.op === '__switch' && i.key === '$T');
 		if (sw) {
+			// All four numeric wasm types, in "widen to me first" preference order when an operand's own type has no
+			// real instruction -- f64 first, since widening i32/i64/f32 up to it is exact or an already-accepted tradeoff.
+			const NUMERIC_TYPES = ['f64', 'f32', 'i64', 'i32'] as const;
+			type NumericType = typeof NUMERIC_TYPES[number];
+			function isNumericType(t: WasmType | undefined): t is NumericType { return NUMERIC_TYPES.includes(t as NumericType); }
+
 			//generic case
 			const variants: Partial<Record<NumericType, { locals: WAT.WatLocal[]; body: wasm.Instr[] }>> = {};
 
@@ -863,40 +895,6 @@ function makeAsm(key: string, value: Expr | undefined, builtin: string, index: n
 		console.warn(`towasm: skipping inline asm '${builtin}.${key}': ${(e as Error).message}`);
 		return undefined;
 	}
-}
-
-// A `get`/`set` accessor's `methodDecls`/`inlineMethods`/`funcs` key, mangled apart from a plain same-named
-// method so a getter and a setter for one property can coexist as two entries instead of overwriting each other.
-function accessorKey(kind: 'get' | 'set', name: string): string {
-	return `${kind}:${name}`;
-}
-
-// wasm requires every import at the lowest, contiguous function indices, assigned before any local
-// function claims one -- so "is this host import needed" must be decided up front, before the worklist
-// first reaches its caller. Deliberately a conservative, name-matching over-approximation, not a precise call-graph simulation -- an unused import is harmless, so this only needs to never *under*-approximate.
-function reachedNames(program: TS.Program): Set<string> {
-	const functionDeclByName	= new Map(program.body.filter(s => s.type === 'function_decl').map(s => [s.name, s]));
-
-	const reached	= new Set<string>();
-	const pending: string[] = [];
-
-	const collectNames = (node: TS.Statement | TS.Statement[]) => walk(node, undefined, (e, process) => {
-		if (e.type === 'identifier')
-			pending.push(e.name);
-		return process(e);
-	});
-
-	collectNames(program.body);
-	while (pending.length) {
-		const name = pending.shift()!;
-		if (!reached.has(name)) {
-			reached.add(name);
-			const decl = functionDeclByName.get(name) ?? LIB_DECL_MAP.get(name);
-			if (decl && (decl.type === 'function_decl' || decl.type === 'class_decl'))
-				collectNames(decl);
-		}
-	}
-	return reached;
 }
 
 function scanInlineMethods(decl: TS.Class, builtin: string, index: number, elemKind?: WasmElement, elemType?: Type, elemDefine?: TypedArrayTag) {
@@ -1330,6 +1328,37 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return offset;
 	}
 
+	// Every class declaration in the whole program (lib + user, generic + not), scanned once for a plain
+	// named `superClass` reference -- shared by two things that each need "the whole program's inheritance
+	// graph" known up front, before any lazy per-class resolution begins: `ensureClass`'s `final` flag
+	// (wasm-GC requires a struct type be declared `final: false` to ever be usable as another's
+	// `supertypes` entry -- can't be decided lazily/after the fact once a class's own type is registered)
+	// and a virtual-dispatch cascade's own candidate set (does ANY class anywhere in the program actually
+	// override a given method -- if not, a plain direct call stays correct and optimal, exactly as without
+	// inheritance at all). Keyed by the bare declared name (never a generic instantiation's composite key)
+	// -- `extends Box`/`extends Box<T>` both reference the same bare name a subclass search needs.
+	const directSubclasses	= new Map<string, TS.Class[]>();
+	const everExtended		= new Set<string>();
+
+	// Whether *any* class textually declared anywhere in the program, transitively extending `className`,
+	// declares its own (non-static) `methodName` member -- decided purely from `directSubclasses` (whole-
+	// program source text, known complete up front), not from `classes`'s own lazily/incrementally
+	// populated instantiation set. This is what a method-call site checks (`emitMethodCall`) to decide
+	// whether it needs `ensureVirtualDispatch`'s cascade at all: if nothing overrides `methodName` anywhere
+	// reachable from `className`, a plain direct call (`ensureMethod`, walking up to whichever ancestor
+	// actually defines it) is already correct and optimal, exactly as without inheritance -- the common
+	// case, meant to stay just as cheap as it always was. Memoized: a call site re-asks this for the same
+	// `(className, methodName)` pair often (every call to that method, anywhere in the program).
+	const declaredOverrideCache = new Map<string, boolean>();
+	function hasDeclaredOverride(className: string, methodName: string): boolean {
+		const key = `${className}.${methodName}`;
+		let cached = declaredOverrideCache.get(key);
+		if (cached === undefined) {
+			cached = (directSubclasses.get(className) ?? []).some(sub => sub.body.some(m => m.type === 'method' && m.key === methodName && !hasMod(m, 'static')) || hasDeclaredOverride(sub.name!, methodName));
+			declaredOverrideCache.set(key, cached);
+		}
+		return cached;
+	}
 
 	// Resolves a possibly-generic class `ref` (`Foo<X>`, `Array<X>`, ...) to its monomorphized `ClassInfo`,
 	// shared by `typeOf`/`ownerFor`. `t` must be the original unresolved `ref` node -- `T.resolve`'s expanded form discards the class name entirely.
@@ -1376,10 +1405,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				throw new Error(`towasm: function type parameter '${describeBinding(p.key)}' cannot have a default value`);
 			if (p.modifiers?.includes('optional'))
 				throw new Error(`towasm: function type parameter '${describeBinding(p.key)}' cannot be optional`);
+			// `void` is real, valid TS here (real TS lets a param/field declare `void`, if uselessly) --
+			// there's just no wasm value it can itself represent, so box it as `any` like any other
+			// "no meaningful value" position instead of rejecting otherwise-valid source.
 			const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
-			if (!wt || wt === 'void')
+			const boxed = wt === 'void' ? REF_ANY : wt;
+			if (!boxed)
 				throw new Error(`towasm: function type parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`);
-			return wt;
+			return boxed;
 		});
 		if (t.rest?.typeAnnotation) {
 			const wt = typeOf(t.rest.typeAnnotation);
@@ -1410,19 +1443,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	// The `WasmType` a value expression resolves to -- `classOf`/`arrayKindOf` below are thin discriminating views over this one (previously identical) checker walk.
 	// `unwrapAs`: see that function's own comment -- the checker's `typeOf` must see the real (post-`as`) expression, not the asserted one.
-	function wtypeOf(e: Expr, ctx: FuncCtx): WasmType | undefined {
+	function wtypeOf(e: Expr, ctx: FunctionContext): WasmType | undefined {
 		return typeOf(checkerTypeOf(unwrapAs(e), ctx.scope));
 	}
 
 	// The class a value expression resolves to, or `undefined`. Goes through `ownerOf` (the checker type,
 	// not `wtypeOf`'s collapsed `WasmType`) since an array-backed class's `WasmType` is `{arr:kind}`, not `{ref:name}` -- reverse-mapping a `WasmType` back to "which class" is the anti-pattern `ownerFor` avoids.
-	function classOf(e: Expr, ctx: FuncCtx): ClassInfo | undefined {
+	function classOf(e: Expr, ctx: FunctionContext): ClassInfo | undefined {
 		return ownerOf(e, ctx);
 	}
 
 	// `cls.name`'s own `get(i)`/`set(i,v)` -- real index syntax dispatched generically to any class using
 	// this convention (typed-array views are just one user of it), whether inline-asm or a plain declared method.
-	function methodSig(cls: ClassInfo, name: string, ctx: FuncCtx): { params: WasmType[]; result: WasmType } | undefined {
+	function methodSig(cls: ClassInfo, name: string, ctx: FunctionContext): { params: WasmType[]; result: WasmType } | undefined {
 		const inline = cls.inlineMethods?.get(name);
 		if (inline) {
 			const b = inline([], ctx);
@@ -1432,13 +1465,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	}
 
 	// The array-kind (`{arr}`) a value expression resolves to, or `undefined` if it isn't one.
-	function arrayKindOf(e: Expr, ctx: FuncCtx): WasmElement | undefined {
+	function arrayKindOf(e: Expr, ctx: FunctionContext): WasmElement | undefined {
 		const wt = wtypeOf(e, ctx);
 		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : undefined;
 	}
 
 	// The `WasmType`/`MethodOwner` a builtin-operator operand resolves to -- `wtypeOf`/`ownerOf` alone can't see an indexed read's element kind, so `numericPairWtype`/etc would silently fall back to `f64`.
-	function operandInfo(e: Expr, ctx: FuncCtx): OperandInfo {
+	function operandInfo(e: Expr, ctx: FunctionContext): OperandInfo {
 		if (e.type === 'index') {
 			// `owner` (for owner-based operator dispatch -- '+' on a string/bigint element, etc) is a
 			// TS-level identity question, so it's resolved through the checker same as any other expression
@@ -1538,7 +1571,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	// The owner for a *namespace-style* reference (`Math.sqrt`, `Array.alloc`) -- not a value expression, so
 	// `ownerFor` (needs a checker `Type`) doesn't apply; `builtinTypeOwner` covers it directly.
-	function namespaceOwner(name: string, ctx: FuncCtx) {
+	function namespaceOwner(name: string, ctx: FunctionContext) {
 		// A self-referential call site (`X.method()`) can match either name a class goes by: a generic
 		// instantiation's `name` is the composite cache key while `decl.name` stays plain `Array`; a typed-array alias's `decl.name` stays canonical `Uint8Array` while `name` is the real alias, e.g. `Int32Array`.
 		return builtinTypeOwner(name) ?? (ctx.owner && (ctx.owner.decl.name === name || ctx.owner.name === name) ? ctx.owner : undefined)
@@ -1547,7 +1580,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	// Field access stays `classOf`-only (arrays/scalars have no fields), but method-call dispatch is
 	// otherwise identical across real classes, array kinds, and scalar box kinds -- all handled by `ownerFor` above.
-	function ownerOf(e: Expr, ctx: FuncCtx) {
+	function ownerOf(e: Expr, ctx: FunctionContext) {
 		return ownerFor(checkerTypeOf(unwrapAs(e), ctx.scope));
 	}
 
@@ -1592,7 +1625,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	//  Expression lowering -- every case leaves exactly one value on the stack
 	// ===================================================================
 
-	function emitStringConst(s: string, ctx: FuncCtx): void {
+	function emitStringConst(s: string, ctx: FunctionContext): void {
 		// `array.new_data`'s two `i32` operands are a byte offset and an *element* count into the module's
 		// one shared passive data segment -- `internString`'s return value and `s.length` already match both, no conversion needed.
 		ctx.emit(I.i32.const(internString(s)), I.i32.const(s.length), I.array.new_data(ensureArrayType('i16'), 0));
@@ -1612,7 +1645,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return false;
 	}
 
-	function coerceTop(got: WasmType, ctx: FuncCtx, want: WasmType): void {
+	function coerceTop(got: WasmType, ctx: FunctionContext, want: WasmType): void {
 		if (wasmTypeEq(got, want))
 			return;
 
@@ -1781,12 +1814,20 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		throw new Error(`towasm: internal: cannot convert ${JSON.stringify(got)} to ${JSON.stringify(want)}`);
 	}
 
-	function emitAs(e: Expr, ctx: FuncCtx, want: WasmType): WasmType {
-		// `null`/`undefined` alone (`emitExpr` has no target type to pick a heap type from) -- only legal into a nullable slot, same restriction `typeOf`'s union handling already enforces.
+	function emitAs(e: Expr, ctx: FunctionContext, want: WasmType): WasmType {
+		// `null`/`undefined` alone (`emitExpr` has no target type to pick a heap type from) -- only legal
+		// into a nullable slot, same restriction `typeOf`'s union handling already enforces -- except a
+		// non-nullable `any` target (see `emitDefaultValue`'s own identical case): that's specifically
+		// what a real `void`-typed param/field/local gets boxed to (`void` only ever holds `undefined`
+		// in real TS), so `undefined` assigned there is valid, ordinary source, not a `null` misuse --
+		// box the same placeholder `emitDefaultValue` would, rather than reject it.
 		if (isNullLiteral(e)) {
-			if (typeof want === 'string' || !want.nullable)
+			if (typeof want !== 'string' && 'ref' in want && want.ref === 'any' && !want.nullable)
+				ctx.emit(I.f64.const(0), I.struct.new(ensureBoxType('f64')));
+			else if (typeof want === 'string' || !want.nullable)
 				throw new Error("towasm: 'null'/'undefined' is only supported where a nullable object type (class/array/string) is expected");
-			ctx.emit(I.ref.null(heapTypeIndexOf(want)));
+			else
+				ctx.emit(I.ref.null(heapTypeIndexOf(want)));
 
 		} else {
 			let got = emitExpr(e, ctx, want);
@@ -1801,7 +1842,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return want;
 	}
 
-	function emitTruthy(e: Expr, ctx: FuncCtx): void {
+	function emitTruthy(e: Expr, ctx: FunctionContext): void {
 		let got = emitExpr(e, ctx);
 		// A boxed nullable primitive (`number | null`/`boolean | null`) has no truthiness of its own --
 		// unbox it first (same unconditional-narrowing contract `coerceTop` uses everywhere else), then
@@ -1826,7 +1867,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	// Shared by every optional (`?.`) lowering -- `objectExpr` must only ever be evaluated once, so this
 	// materializes it into a scratch local up front and hands that off to `emitOptionalGuard`.
-	function emitOptionalAccess(ctx: FuncCtx, objWtype: WasmType, resultWtype: WasmType, readCore: (objLocal: number) => void): WasmType {
+	function emitOptionalAccess(ctx: FunctionContext, objWtype: WasmType, resultWtype: WasmType, readCore: (objLocal: number) => void): WasmType {
 		const objLocal = ctx.temp(`$opt$obj$${optionalTempCounter++}`, objWtype);
 		ctx.emit(I.local.set(objLocal), I.local.get(objLocal), I.ref.is_null);
 		const _old = ctx.swapOut();
@@ -1842,7 +1883,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// way to represent a genuinely distinct "empty" slot here). A non-nullable ref/array/closure element
 	// has no such value at all -- same "no defaultable zero for a non-null ref" restriction an object-typed
 	// class field already has (`ensureCtor`'s own `struct.new` vs. `struct.new_default` split).
-	function emitDefaultValue(want: WasmType, ctx: FuncCtx): void {
+	function emitDefaultValue(want: WasmType, ctx: FunctionContext): void {
 		if (typeof want === 'string') {
 			switch (want) {
 				case 'f64': ctx.emit(I.f64.const(0)); return;
@@ -1853,6 +1894,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		} else if (want.nullable) {
 			ctx.emit(I.ref.null(heapTypeIndexOf(want)));
 			return;
+		} else if ('ref' in want && want.ref === 'any') {
+			// A non-nullable `any` slot has no `null` to fall back on -- box an arbitrary placeholder
+			// instead (a real boxed value is already a valid `anyref`, no further coercion needed).
+			// Reached by a generic type parameter substituted with `any` in place of an otherwise-
+			// unrepresentable `void` (see `compileAsyncFunc`'s own comment) -- nothing ever reads this
+			// placeholder back meaningfully, only that a real value fills the slot.
+			ctx.emit(I.f64.const(0), I.struct.new(ensureBoxType('f64')));
+			return;
 		}
 		throw new Error("towasm: an array literal hole needs a nullable or scalar element type");
 	}
@@ -1860,7 +1909,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Shared by array literals and `new Uint8Array([...])` -- both coerce every plain element to `want`,
 	// a hole (`emitDefaultValue`, above) included. A spread element forces the slower
 	// `emitArrayElementsWithSpread` path (runtime length, not `array.new_fixed`'s compile-time count).
-	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FuncCtx, want: WasmType, kind: WasmElement, typeIndex: number): void {
+	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElement, typeIndex: number): void {
 		if (elements.some(el => el?.type === 'spread')) {
 			// A `[...]` array literal with at least one spread element. Every element is evaluated exactly once, in
 			// source order, into a scratch local before anything is allocated (side effects must not run twice). The real array is then `array.new_default`-allocated to the true runtime total and filled in a second pass.
@@ -1930,7 +1979,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		}
 	}
 
-	function emitInline(name: string, inline: Inline, args: Expr[], ctx: FuncCtx): WasmType {
+	function emitInline(name: string, inline: Inline, args: Expr[], ctx: FunctionContext): WasmType {
 		if (args.length !== inline.params.length)
 			throw new Error(`towasm: '${name}' takes exactly ${inline.params.length} argument(s)`);
 		args.forEach((a, i) => emitAs(a, ctx, inline.params[i]));
@@ -1947,7 +1996,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// its length isn't known until runtime, so there's no way to know how many of the fixed params it
 	// fills. Every caller used to duplicate (inconsistently, some not at all) an "any spread anywhere is
 	// rejected" check of its own; centralized here instead, precisely scoped to what's actually unsupported.
-	function emitCallArgs(label: string, params: WasmType[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FuncCtx): void {
+	function emitCallArgs(label: string, params: WasmType[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FunctionContext): void {
 		if (!hasRest) {
 			if (args.some(a => a.type === 'spread'))
 				throw new Error(`towasm: '${label}' takes no rest parameter -- a spread argument has nowhere to expand into`);
@@ -1976,14 +2025,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			if (kind === 'i16' || kind === 'i8')
 				throw new Error(`towasm: '${label}' rest param: a 'string[]'/packed-byte-array element is not supported`);
 			emitArrayElements(args.slice(fixedCount), ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind));
-	}
+		}
 	}
 
 	// Dispatches every `builtins` entry, coercing args via `emitAs`; falls back to `ensureFunc` for a plain user-declared function not in `builtins` at all.
 	// `typeArgs`: only ever meaningful for a plain user-declared generic function (`builtins` entries and
 	// host imports are never generic) -- an explicit `identity<number>(5)` call-site type argument list, or
 	// `undefined` when left implicit (the common case, inferred by `ensureGenericFunc`).
-	function emitCall(name: string, args: Expr[], ctx: FuncCtx, typeArgs?: Type[]): WasmType {
+	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[]): WasmType {
 		let decl;
 		const builtin = builtins[name];
 		if (builtin) {
@@ -2018,7 +2067,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// a real user method call (an inline/accessor/index/operator dispatch is never independently generic).
 	// `bypassVirtual`: set only by `super.method(...)`'s own call site -- by definition never virtual (see
 	// that call site's own comment), regardless of whether `owner` has overriding subclasses elsewhere.
-	function emitMethodCall(owner: ClassInfo, name: string, args: Expr[], ctx: FuncCtx, typeArgs?: Type[], bypassVirtual?: boolean): WasmType {
+	function emitMethodCall(owner: ClassInfo, name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], bypassVirtual?: boolean): WasmType {
 		const inline = owner.inlineMethods?.get(name);
 		if (inline) {
 			if (args.some(a => a.type === 'spread'))
@@ -2056,31 +2105,33 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return method.result;
 	}
 
-	function captureOld(ctx: FuncCtx, wtype: WasmType, old: 'none' | 'discard' | 'keep', readCore: () => void): number | undefined {
-		let savedOld: number | undefined;
-		if (old !== 'none') {
-			readCore();
-			if (old === 'keep') {
-				savedOld = ctx.temp(scratchName('$old', wtype), wtype);
-				ctx.emit(I.local.tee(savedOld));
-			}
-		}
-		return savedOld;
-	}
-	function makeWrite(ctx: FuncCtx, wtype: WasmType, storeCore: (val: number) => void): (tee: boolean) => number {
-		return tee => {
-			const val = ctx.temp(scratchName('$new', wtype), wtype);
-			ctx.emit(I.local.set(val));
-			storeCore(val);
-			if (tee)
-				ctx.emit(I.local.get(val));
-			return val;
-		};
-	}
-
 	// Two questions: whether the current value needs reading at all (`'none'`, only a plain `=` skips it),
 	// and whether it needs preserving for `.old` (`'keep'`, only postfix `++`/`--`) or just combining once (`'discard'`, every compound op and prefix `++`/`--`) -- `'discard'` skips the extra scratch `'keep'` needs.
-	function emitAssignTarget(target: Expr, ctx: FuncCtx, old: 'none' | 'discard' | 'keep'): AssignTarget {
+	function emitAssignTarget(target: Expr, ctx: FunctionContext, old: 'none' | 'discard' | 'keep'): AssignTarget {
+
+		function captureOld(wtype: WasmType, readCore: () => void): number | undefined {
+			let savedOld: number | undefined;
+			if (old !== 'none') {
+				readCore();
+				if (old === 'keep') {
+					savedOld = ctx.temp(scratchName('$old', wtype), wtype);
+					ctx.emit(I.local.tee(savedOld));
+				}
+			}
+			return savedOld;
+		}
+		function makeWrite(wtype: WasmType, storeCore: (val: number) => void): (tee: boolean) => number {
+			return tee => {
+				const val = ctx.temp(scratchName('$new', wtype), wtype);
+				ctx.emit(I.local.set(val));
+				storeCore(val);
+				if (tee)
+					ctx.emit(I.local.get(val));
+				return val;
+			};
+		}
+
+
 		// `this = expr` (only meaningful inside a `reassignsThis` method) is just one more named binding --
 		// `this` parses as its own `{type:'this'}` node, not an `identifier`, so it needs its own name derivation, same as `case 'this'`'s read side.
 		if (target.type === 'identifier' || target.type === 'this') {
@@ -2093,8 +2144,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				const envTypeIndex	= ctx.closureEnv!.envTypeIndex;
 				return {
 					wtype,
-					old: captureOld(ctx, wtype, old, () => ctx.emit(I.local.get(envLocal.index), I.struct.get(envTypeIndex, index))),
-					write: makeWrite(ctx, wtype, val => ctx.emit(I.local.get(envLocal.index), I.local.get(val), I.struct.set(envTypeIndex, index))),
+					old: captureOld(wtype, () => ctx.emit(I.local.get(envLocal.index), I.struct.get(envTypeIndex, index))),
+					write: makeWrite(wtype, val => ctx.emit(I.local.get(envLocal.index), I.local.get(val), I.struct.set(envTypeIndex, index))),
 				};
 			}
 
@@ -2105,7 +2156,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			const { wtype, index } = loc!;
 			return {
 				wtype,
-				old: captureOld(ctx, wtype, old, () => ctx.emit(isGlobal ? I.global.get(index) : I.local.get(index))),
+				old: captureOld(wtype, () => ctx.emit(isGlobal ? I.global.get(index) : I.local.get(index))),
 				write(tee) {
 					// Wasm has no `global.tee` (`global.set` is void) -- re-`global.get` right after when the
 					// caller needs the newly-written value left on the stack too.
@@ -2138,13 +2189,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				ctx.emit(I.local.set(obj));
 				return {
 					wtype,
-					old: captureOld(ctx, wtype, old, () => {
+					old: captureOld(wtype, () => {
 						if (!cls.getterNames?.has(target.property))
 							throw new Error(`towasm: '${target.property}' has no getter -- its old value can't be read for a compound assignment/'++'/'--'`);
 						ctx.emit(I.local.get(obj));
 						emitMethodCall(cls, accessorKey('get', target.property), [], ctx);
 					}),
-					write: makeWrite(ctx, wtype, () => {
+					write: makeWrite(wtype, () => {
 						ctx.emit(I.local.get(obj));
 						emitMethodCall(cls, accessorKey('set', target.property), [valExpr], ctx);
 					}),
@@ -2164,8 +2215,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			ctx.emit(I.local.set(obj));
 			return {
 				wtype,
-				old:	captureOld(ctx, wtype, old, () => ctx.emit(I.local.get(obj), I.struct.get(cls.typeIndex, fieldIdx))),
-				write:	makeWrite(ctx, wtype, val => ctx.emit(I.local.get(obj), I.local.get(val), I.struct.set(cls.typeIndex, fieldIdx))),
+				old:	captureOld(wtype, () => ctx.emit(I.local.get(obj), I.struct.get(cls.typeIndex, fieldIdx))),
+				write:	makeWrite(wtype, val => ctx.emit(I.local.get(obj), I.local.get(val), I.struct.set(cls.typeIndex, fieldIdx))),
 			};
 			
 		} else if (target.type == 'index') {
@@ -2188,11 +2239,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 				return {
 					wtype,
-					old: captureOld(ctx, wtype, old, () => {
+					old: captureOld(wtype, () => {
 						ctx.emit(I.local.get(obj));
 						emitMethodCall(cls, 'get', [idxExpr], ctx);
 					}),
-					write: makeWrite(ctx, wtype, () => {
+					write: makeWrite(wtype, () => {
 						ctx.emit(I.local.get(obj));
 						emitMethodCall(cls, 'set', [idxExpr, valExpr], ctx);
 					}),
@@ -2217,9 +2268,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			return {
 				wtype,
-				old: captureOld(ctx, wtype, old, () => ctx.emit(I.local.get(obj), I.local.get(idx), I.array.get(typeIndex))),
+				old: captureOld(wtype, () => ctx.emit(I.local.get(obj), I.local.get(idx), I.array.get(typeIndex))),
 				// `wtype` -- the value on the stack was already coerced to it by the caller (`emitAssign`'s `emitAs(right, ctx, target.wtype)` or its compound-op equivalent), so no extra conversion belongs here.
-				write: makeWrite(ctx, wtype, val => ctx.emit(I.local.get(obj), I.local.get(idx), I.local.get(val), I.array.set(typeIndex))),
+				write: makeWrite(wtype, val => ctx.emit(I.local.get(obj), I.local.get(idx), I.local.get(val), I.array.set(typeIndex))),
 			};
 		} else {
 			throw new Error(`towasm: cannot assign to ${target.type}`);
@@ -2234,7 +2285,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// self-*capture* is impossible -- the struct can't be a field of itself before it exists.
 	function emitClosureLiteral(
 		e: TS.CallSig & {type: string, name?: string, modifiers?: string[], body?: Statement[] | Expr },
-		ctx: FuncCtx,
+		ctx: FunctionContext,
 		allowSelfCall: boolean,
 	): WasmType {
 		if (hasMod(e, 'async'))
@@ -2257,10 +2308,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				throw new Error(`towasm: closure parameter '${describeBinding(p.key)}' cannot have a default value`);
 			if (hasMod(p, 'optional'))
 				throw new Error(`towasm: closure parameter '${describeBinding(p.key)}' cannot be optional`);
+			// See `closureFuncSigType`'s own identical comment -- box a real but wasm-unrepresentable
+			// `void` as `any` rather than reject otherwise-valid source.
 			const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
-			if (!wt || wt === 'void')
+			const boxed = wt === 'void' ? REF_ANY : wt;
+			if (!boxed)
 				throw new Error(`towasm: closure parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`);
-			return {key: p.key, wtype: wt, tsType: p.typeAnnotation! };
+			return {key: p.key, wtype: boxed, tsType: p.typeAnnotation! };
 		});
 		if (e.rest?.typeAnnotation) {
 			const wt = typeOf(e.rest.typeAnnotation);
@@ -2301,7 +2355,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		closureLiterals.push(info);
 
 		worklist.push(() => {
-			const fnCtx		= new FuncCtx(new Scope(libGlobal), result, undefined);
+			const fnCtx		= new FunctionContext(e.name ?? '<anonymous>', new Scope(libGlobal), plainReturn(result), undefined);
 			// Env param first (real wasm param index 0), then this literal's own params -- `toFuncBody`'s `numParams` assumes the first `1 + params.length` declared locals are the real wasm params, in order.
 			const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
 			const pending	= fnCtx.declareParams(params);
@@ -2313,7 +2367,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 			fnCtx.closureEnv = { envLocal, envTypeIndex, fields: fields ?? new Map() };
 			if (allowSelfCall && e.name)
-				fnCtx.selfCall = { name: e.name, ...info };
+				fnCtx.selfCall = info;
 			for (const name of capturedNames) {
 				const tsType = ctx.scope.value(name);
 				if (tsType)
@@ -2342,7 +2396,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	}
 
 	// A numeric/bitwise binary op's instructions as data (`Inline`), keyed by `BINARY_OP_NAMES`'s method name
-	function numericOpInline(method: string, a: WasmType | undefined, b: WasmType | undefined, ctx: FuncCtx): Inline {
+	function numericOpInline(method: string, a: WasmType | undefined, b: WasmType | undefined, ctx: FunctionContext): Inline {
 		const at = scalarKind(a), bt = scalarKind(b);
 		const t	=	at === 'i64' || bt === 'i64' ? 'i64'
 			:		(at === 'i32' || at === 'u32') && (bt === 'i32' || bt === 'u32') ? 'i32'
@@ -2377,7 +2431,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	// `want`, when passed, is a hint only -- lets a literal pick its physical representation directly instead
 	// of `coerceTop` immediately converting it back. The returned `WasmType` is always the actual physical type left on the stack.
-	function emitExpr(e: Expr, ctx: FuncCtx, want?: WasmType): WasmType {
+	function emitExpr(e: Expr, ctx: FunctionContext, want?: WasmType): WasmType {
 		switch (e.type) {
 			case 'literal':
 				if (Array.isArray(e.value)) {
@@ -3068,7 +3122,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				// A recursive call to the nested `function_decl` currently being compiled, from inside its
 				// own body -- resolved to a direct, statically-known `call` (reusing the same env), not a
 				// `call_ref` through a closure struct (see `FuncCtx.selfCall`'s own comment for why).
-				if (e.callee.type === 'identifier' && ctx.selfCall?.name === e.callee.name) {
+				if (e.callee.type === 'identifier' && ctx.selfCall && ctx.name === e.callee.name) {
 					const { funcIndex, params, result, hasRest } = ctx.selfCall;
 					ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index));
 					emitCallArgs(e.callee.name, params, undefined, !!hasRest, e.arguments, ctx);
@@ -3135,42 +3189,36 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	//  Statement lowering
 	// ===================================================================
 
-	// A `break`/`continue`'s own real target lies *inside* the innermost active `finallyGuards` entry
-	// (not crossing it) when a loop/switch was opened after entering that guard's own `try` -- one
-	// nested entirely within the `try` isn't escaping anything, so it must compile as an ordinary
-	// `break`/`continue`, not redirect through `finally`. Returns the guard to redirect through, or
-	// `undefined` if this exit should compile normally.
-	function finallyGuardFor(ctx: FuncCtx, kind: 'break' | 'continue'): FuncCtx['finallyGuards'][number] | undefined {
-		const guard = ctx.finallyGuards.at(-1);
-		if (!guard)
-			return undefined;
-		const lenAtEntry	= kind === 'break' ? guard.breakTargetsLenAtEntry : guard.continueTargetsLenAtEntry;
-		const targets		= kind === 'break' ? ctx.breakTargets : ctx.continueTargets;
-		return targets.length <= lenAtEntry ? guard : undefined;
+	// The ordinary meaning of `return` -- an unremarkable function/method/arrow with no
+	// generator/async/constructor/reassignsThis-specific behavior overriding `ctx.onReturn`. Shared
+	// (not stashed as a `FunctionContext` field default) since the class itself, defined before this
+	// closure, can't reach `emitAs` -- see `ReturnHandler`'s own comment for who overrides this and why.
+	// `result` has two equivalent "no value" spellings floating around this file -- the plain
+	// `WasmType` string `'void'` (what a real `: void`-annotated/inferred function's own `result`
+	// holds) and a bare omitted argument (what a caller with no meaningful `WasmType` at all, e.g. a
+	// resumable step function, passes) -- normalized to `undefined` right here, once, rather than
+	// trusting every caller to already agree on which spelling they're using.
+	function plainReturn(result?: WasmType): ReturnHandler {
+		if (result === 'void')
+			result = undefined;
+		return {
+			wtype: () => result,
+			emit(ctx, argument) {
+				if (result === undefined) {
+					if (argument)
+						throw new Error("towasm: a 'void' function cannot return a value");
+				} else if (argument) {
+					emitAs(argument, ctx, result);
+				}
+				ctx.emit(I.return);
+			},
+		};
 	}
 
-	// The real wasm type a `return`'s own argument needs, in whatever context `ctx` is currently
-	// compiling -- exactly mirrors `case 'return'`'s own dispatch (generatorFrame/asyncFrame's own
-	// `rWtype`, never `ctorThis`'s -- a constructor's return never carries a value -- and `ctx.result`
-	// otherwise, or `undefined` for a 'void' function). A `case 'try'` guard's own stashed-return local
-	// uses this, so the redispatch that later re-invokes `case 'return'` for real reconstructs whichever
-	// of those shapes actually applies, correctly, regardless of what triggered the intercepted return.
-	function returnValueWtype(ctx: FuncCtx): WasmType | undefined {
-		if (ctx.generatorFrame)
-			return ctx.generatorFrame.rWtype;
-		if (ctx.asyncFrame)
-			return ctx.asyncFrame.rWtype;
-		if (ctx.ctorThis || ctx.result === 'void')
-			return undefined;
-		return ctx.result;
-	}
-
-	function emitStmt(s: Statement, ctx: FuncCtx): void {
+	function emitStmt(s: Statement, ctx: FunctionContext): void {
 		switch (s.type) {
 			case 'block':
-				ctx.openScope();
-				s.body.forEach(st => emitStmt(st, ctx));
-				ctx.closeScope();
+				ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
 				return;
 
 			case 'var_decl':
@@ -3327,11 +3375,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					throw new Error("towasm: labeled 'continue' is not supported");
 				if (!ctx.continueTargets.length)
 					throw new Error("towasm: 'continue' outside of a loop");
-				const guard = finallyGuardFor(ctx, 'continue');
-				if (guard)
-					ctx.emit(I.i32.const(3), I.local.set(guard.actionLocal.index), I.br(ctx.depth - guard.landingDepth));
-				else
-					ctx.emit(I.br(ctx.depth - ctx.continueTargets.at(-1)!));
+				ctx.emitContinue();
 				return;
 			}
 
@@ -3340,109 +3384,51 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					throw new Error("towasm: labeled 'break' is not supported");
 				if (!ctx.breakTargets.length)
 					throw new Error("towasm: 'break' outside of a loop or switch");
-				const guard = finallyGuardFor(ctx, 'break');
-				if (guard)
-					ctx.emit(I.i32.const(2), I.local.set(guard.actionLocal.index), I.br(ctx.depth - guard.landingDepth));
-				else
-					ctx.emit(I.br(ctx.depth - ctx.breakTargets.at(-1)!));
+				ctx.emitBreak();
 				return;
 			}
 
-			case 'return': {
-				const guard = ctx.finallyGuards.at(-1);
-				if (guard) {
-					// `guard.returnValueLocal`'s type already accounts for `generatorFrame`/`asyncFrame`/
-					// `ctorThis` (see `returnValueWtype`) -- stash now, in the *original* scope this
-					// 'return' was written in; the redispatch below re-invokes this same 'case' (guard
-					// already popped by then), which reconstructs the real generator/async/ctor-specific
-					// return shape (IteratorResult, Promise resolution, appended 'this', ...) itself, from
-					// a plain synthetic identifier read of whatever got stashed here.
-					if (guard.returnValueLocal) {
-						if (s.argument)
-							emitAs(s.argument, ctx, guard.returnValueLocal.wtype);
-						else
-							emitDefaultValue(guard.returnValueLocal.wtype, ctx);
-						ctx.emit(I.local.set(guard.returnValueLocal.index));
-					} else if (s.argument) {
-						throw new Error(ctx.ctorThis ? 'towasm: a constructor cannot return a value' : "towasm: a 'void' function cannot return a value");
-					}
-					ctx.emit(I.i32.const(1), I.local.set(guard.actionLocal.index), I.br(ctx.depth - guard.landingDepth));
-					return;
-				}
-				if (ctx.generatorFrame) {
-					const { frameLocal, frameTypeIndex, stateField, doneStateId, resultCtor, rWtype } = ctx.generatorFrame;
-					ctx.emit(I.local.get(frameLocal.index), I.i32.const(doneStateId), I.struct.set(frameTypeIndex, stateField));
-					if (s.argument)
-						emitAs(s.argument, ctx, rWtype);
-					else
-						emitDefaultValue(rWtype, ctx);
-					ctx.emit(I.i32.const(1), I.call(resultCtor.funcIndex), I.return);
-					return;
-				}
-				if (ctx.asyncFrame) {
-					const { frameLocal, frameTypeIndex, resultPromiseField, promiseClass, rWtype } = ctx.asyncFrame;
-					ctx.emit(I.local.get(frameLocal.index), I.struct.get(frameTypeIndex, resultPromiseField));
-					if (s.argument)
-						emitAs(s.argument, ctx, rWtype);
-					else
-						emitDefaultValue(rWtype, ctx);
-					ctx.emit(I.call(ensureMethod(promiseClass, 'resolve', [], ctx)!.funcIndex), I.return);
-					return;
-				}
-				if (ctx.ctorThis) {
-					if (s.argument)
-						throw new Error('towasm: a constructor cannot return a value');
-					ctx.emit(I.local.get(ctx.ctorThis.index));
-				} else {
-					if (ctx.result === 'void' && s.argument)
-						throw new Error("towasm: a 'void' function cannot return a value");
-					if (s.argument)
-						emitAs(s.argument, ctx, ctx.result);
-				}
-				// A `reassignsThis` method's own (possibly just-updated) `this` rides along as one more wasm-level result on every return
-				if (ctx.appendThisOnReturn)
-					ctx.emit(I.local.get(ctx.lookup('this')!.index));
-				ctx.emit(I.return);
+			case 'return':
+				ctx.onReturn.emit(ctx, s.argument);
 				return;
-			}
 
 			// `for...of` desugars into a synthetic `block`/`var_decl`/`for` (normal-kind) and recurses into
 			// `emitStmt` itself, rather than adding a second instruction-emission path -- `kind: 'normal'`
 			// below is the one real implementation both share.
 			case 'for':
 				switch (s.kind) {
-					case 'normal': {
-						// `s.init`'s own declaration (`for (let t = ...; ...)`) is scoped to the loop itself,
-						// same as real JS -- opened here rather than relying on `s.body`'s own block scope
-						// (which may not exist at all if the body is a single bare statement).
-						ctx.openScope();
-						if (s.init)
-							emitStmt(s.init.type === 'var_decl' ? s.init : { type: 'expression', expression: s.init }, ctx);
+					case 'normal':
+						ctx.inScope(() => {
+							// `s.init`'s own declaration (`for (let t = ...; ...)`) is scoped to the loop itself,
+							// same as real JS -- opened here rather than relying on `s.body`'s own block scope
+							// (which may not exist at all if the body is a single bare statement).
+							if (s.init)
+								emitStmt(s.init.type === 'var_decl' ? s.init : { type: 'expression', expression: s.init }, ctx);
 
-						// A `block` wrapping a `loop`, same idiom as `while`, except the body gets its own *inner*
-						// block as the real `continue` target -- a plain `while` can reuse its restart label since it has no separate update step, but this desugared `for` has one (`s.update`) that must still run first.
-						const old = ctx.swapOut();
-						emitTruthy(s.test ?? Literal(true), ctx);
-						ctx.emit(I.i32.eqz);
-						ctx.enterBreakTarget();
-						ctx.enterLabel();	// the bare "loop" level, between the break-block and the continue-block
-						ctx.emit(I.br_if(1));
+							// A `block` wrapping a `loop`, same idiom as `while`, except the body gets its own *inner*
+							// block as the real `continue` target -- a plain `while` can reuse its restart label since it has no separate update step, but this desugared `for` has one (`s.update`) that must still run first.
+							const old = ctx.swapOut();
+							emitTruthy(s.test ?? Literal(true), ctx);
+							ctx.emit(I.i32.eqz);
+							ctx.enterBreakTarget();
+							ctx.enterLabel();	// the bare "loop" level, between the break-block and the continue-block
+							ctx.emit(I.br_if(1));
 
-						const bodyOld = ctx.swapOut();
-						ctx.enterContinueTarget();
-						emitStmt(s.body, ctx);
-						ctx.exitContinueTarget();
-						ctx.emit(I.block(undefined, ctx.swapOut(bodyOld)));
+							const bodyOld = ctx.swapOut();
+							ctx.enterContinueTarget();
+							emitStmt(s.body, ctx);
+							ctx.exitContinueTarget();
+							ctx.emit(I.block(undefined, ctx.swapOut(bodyOld)));
 
-						if (s.update)
-							emitStmt({ type: 'expression', expression: s.update }, ctx);
-						ctx.emit(I.br(0));
-						ctx.exitLabel();
-						ctx.exitBreakTarget();
-						ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(old))]));
-						ctx.closeScope();
+							if (s.update)
+								emitStmt({ type: 'expression', expression: s.update }, ctx);
+							ctx.emit(I.br(0));
+							ctx.exitLabel();
+							ctx.exitBreakTarget();
+							ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(old))]));
+						});
 						return;
-					}
+
 					case  'of': {
 						if (s.init.type !== 'var_decl' || s.init.declarations.length !== 1 || typeof s.init.declarations[0].name !== 'string')
 							throw new Error("towasm: 'for...of' loop variable must be a single plain identifier declaration");
@@ -3546,41 +3532,41 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				// One shared scope for the whole switch -- real JS gives every case a single common lexical
 				// scope (not one per case) unless a case wraps its own body in `{}`, which nests its own
 				// block scope inside this one via `case 'block'` as usual.
-				ctx.openScope();
-				const discName = `#switch$${switchTempCounter++}`;
-				emitStmt(JS.VarDecl('const', JS.Var(discName, s.discriminant)), ctx);
-				const discId: Expr = { type: 'identifier', name: discName };
+				ctx.inScope(() => {
+					const discName = `#switch$${switchTempCounter++}`;
+					emitStmt(JS.VarDecl('const', JS.Var(discName, s.discriminant)), ctx);
+					const discId: Expr = { type: 'identifier', name: discName };
 
-				const old = ctx.swapOut();
+					const old = ctx.swapOut();
 
-				ctx.enterBreakTarget();
-				ctx.enterLabel(n);
+					ctx.enterBreakTarget();
+					ctx.enterLabel(n);
 
-				// `br`/`br_if` labels are already relative to the branch point -- case `i`'s own block is
-				// the `i`-th one opened above (case 0 innermost), and "no default" falls through all `n`
-				// case-blocks to the enclosing break-target block at relative depth `n`.
-				for (let i = 0; i < n; i++) {
-					const c = s.cases[i];
-					if (c.test) {
-						emitAs(JS.JSBinary('===', discId, c.test), ctx, 'i32');
-						ctx.emit(I.br_if(i));
+					// `br`/`br_if` labels are already relative to the branch point -- case `i`'s own block is
+					// the `i`-th one opened above (case 0 innermost), and "no default" falls through all `n`
+					// case-blocks to the enclosing break-target block at relative depth `n`.
+					for (let i = 0; i < n; i++) {
+						const c = s.cases[i];
+						if (c.test) {
+							emitAs(JS.JSBinary('===', discId, c.test), ctx, 'i32');
+							ctx.emit(I.br_if(i));
+						}
 					}
-				}
 
-				const defaultIndex = s.cases.findIndex(c => !c.test);
-				ctx.emit(I.br(defaultIndex >= 0 ? defaultIndex : n));
+					const defaultIndex = s.cases.findIndex(c => !c.test);
+					ctx.emit(I.br(defaultIndex >= 0 ? defaultIndex : n));
 
-				let content = ctx.out;
-				for (let k = 0; k < n; k++) {
-					ctx.exitLabel();
-					ctx.out = [I.block(undefined, content)];
-					s.cases[k].consequent.forEach(st => emitStmt(st, ctx));
-					content = ctx.out;
-				}
-				ctx.exitBreakTarget();
-				ctx.out = old;
-				ctx.emit(I.block(undefined, content));
-				ctx.closeScope();
+					let content = ctx.out;
+					for (let k = 0; k < n; k++) {
+						ctx.exitLabel();
+						ctx.out = [I.block(undefined, content)];
+						s.cases[k].consequent.forEach(st => emitStmt(st, ctx));
+						content = ctx.out;
+					}
+					ctx.exitBreakTarget();
+					ctx.out = old;
+					ctx.emit(I.block(undefined, content));
+				});
 				return;
 			}
 
@@ -3607,31 +3593,23 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 				if (!s.finalizer) {
 					const saved			= ctx.swapOut();
-					const afterDepth	= ctx.enterLabel();	// $after
-					const catchSaved	= ctx.swapOut();
-					ctx.enterLabel();						// $catchLand
-					const tryBodySaved	= ctx.swapOut();
-					ctx.enterLabel();						// try_table's own implicit level
-
-					ctx.openScope();
-					s.block.forEach(st => emitStmt(st, ctx));
-					ctx.closeScope();
+					ctx.enterLabel(3);
+					ctx.inScope(() => s.block.forEach(st => emitStmt(st, ctx)));
 					
-					ctx.emit(I.br(ctx.depth - afterDepth));
+					ctx.emit(I.br(2));	//ctx.depth - $after
 					ctx.exitLabel();
-					const tryBody = ctx.swapOut(tryBodySaved);
-					ctx.emit(I.try_table(undefined, [wasm.Catch.tag(ensureExceptionTag(), 0)], tryBody));
+					ctx.emit(I.try_table(undefined, [wasm.Catch.tag(ensureExceptionTag(), 0)], ctx.swapOut()));
 					ctx.emit(I.unreachable);
 					ctx.exitLabel();
-					ctx.emit(I.block(toValType(REF_ANY), ctx.swapOut(catchSaved)));
+					ctx.emit(I.block(toValType(REF_ANY), ctx.swapOut()));
 
-					ctx.openScope();
-					if (s.handlerParam)
-						ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
-					else
-						ctx.emit(I.drop);
-					s.handlerBody!.forEach(st => emitStmt(st, ctx));
-					ctx.closeScope();
+					ctx.inScope(() => {
+						if (s.handlerParam)
+							ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
+						else
+							ctx.emit(I.drop);
+						s.handlerBody!.forEach(st => emitStmt(st, ctx));
+					});
 
 					ctx.exitLabel();
 					ctx.emit(I.block(undefined, ctx.swapOut(saved)));
@@ -3648,98 +3626,114 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					// landing code, exactly like a fresh `throw` would.
 					//
 					// A `return`/`throw`/`break`/`continue` written directly inside 'finally' itself also
-					// needs no special handling: `ctx.finallyGuards` is already popped by the time 'finally'
-					// compiles (below), so it either executes as a real exit (overriding whatever action was
-					// pending -- correct JS semantics) or redirects through the next-*outer* guard if this
-					// 'try' is itself nested inside another 'try'/'finally' -- right either way, for free.
-					// Works inside a generator/async function, a constructor, or a `reassignsThis` method too
-					// -- `returnValueWtype` picks the real per-context return representation to stash, and the
-					// redispatch's recursive `case 'return'` call reconstructs the rest (IteratorResult/Promise
+					// needs no special handling: `ctx.finallyGuards`/`ctx.onReturn` are already restored to
+					// their outer values by the time 'finally' compiles (below), so it either executes as a
+					// real exit (overriding whatever action was pending -- correct JS semantics) or
+					// redirects through the next-*outer* guard/`onReturn` if this 'try' is itself nested
+					// inside another 'try'/'finally' -- right either way, for free.
+					// Works inside a generator/async function, a constructor, or a `reassignsThis` method
+					// too -- `ctx.onReturn` (or `plainReturn`) already knows the real per-context return
+					// representation, so the redispatch below reconstructs the rest (IteratorResult/Promise
 					// resolution/appended `this`) itself, exactly as if compiling that shape fresh.
 					const actionLocal		= { wtype: 'i32' as const, index: ctx.temp('#finally$action', 'i32') };
 					const exnLocal			= { wtype: REF_EXN, index: ctx.temp('#finally$exn', REF_EXN) };
-					const returnWtype		= returnValueWtype(ctx);
-					const returnValueLocal	= returnWtype !== undefined ? { wtype: returnWtype, index: ctx.temp('#finally$retval', returnWtype) } : undefined;
+					const savedOnReturn		= ctx.onReturn;
+					const outerOnReturn		= savedOnReturn;
+					const outerWtype		= outerOnReturn.wtype(ctx);
+					const returnValueLocal	= outerWtype !== undefined ? { wtype: outerWtype, index: ctx.temp('#finally$retval', outerWtype) } : undefined;
 
 					const saved				= ctx.swapOut();
 					const landDepth			= ctx.enterLabel();			// $land
-					const catchAllSaved 	= ctx.swapOut();
 					const catchAllDepth 	= ctx.enterLabel();			// $catchAllLand
-					const afterSaved		= ctx.swapOut();
 					const afterDepth		= ctx.enterLabel();			// $after
 
 					const guard = {
-						actionLocal, returnValueLocal, exnLocal,
-						breakTargetsLenAtEntry: ctx.breakTargets.length,
-						continueTargetsLenAtEntry: ctx.continueTargets.length,
-						landingDepth: landDepth,
+						actionLocal,
+						breakTargetsLenAtEntry:		ctx.breakTargets.length,
+						continueTargetsLenAtEntry:	ctx.continueTargets.length,
+						landingDepth:				landDepth,
 					};
 					ctx.finallyGuards.push(guard);
+					// A `return` inside the protected region below must stash its value and redirect here
+					// too, same reasoning as `break`/`continue` -- but there's only ever one "current"
+					// return meaning at a time (no stack needed the way nested loops need one for `break`),
+					// so a plain swap-and-restore suffices, mirroring `ctx.swapOut()`'s own idiom.
+					ctx.onReturn = {
+						wtype: () => outerWtype,
+						emit(ctx, argument) {
+							if (returnValueLocal) {
+								if (argument)
+									emitAs(argument, ctx, returnValueLocal.wtype);
+								else
+									emitDefaultValue(returnValueLocal.wtype, ctx);
+								ctx.emit(I.local.set(returnValueLocal.index));
+							} else if (argument) {
+								// Same rejection the real (outer) 'return' would give -- delegate to it for
+								// that message (a 'void' function vs. a constructor say this differently)
+								// rather than inventing a second copy of the same decision here.
+								outerOnReturn.emit(ctx, argument);
+							}
+							ctx.emit(I.i32.const(1), I.local.set(actionLocal.index), I.br(ctx.depth - landDepth));
+						},
+					};
 
 					if (s.handlerBody) {
 						// A's own exceptions: our single project-wide tag is the only thing this compiler ever throws, so the ordinary tag-catch below already covers 'try' exhaustively --
 						// no 'catch_all_ref' needed on *this* try_table (unlike the one below, for B).
-						const catchLandSaved = ctx.swapOut();
 						ctx.enterLabel();			// $catchLand
-						const tryTableSaved = ctx.swapOut();
 						ctx.enterLabel();			// try_table (A)'s own implicit level
-						ctx.openScope();
-						s.block.forEach(st => emitStmt(st, ctx));
-						ctx.closeScope();
+						ctx.inScope(() => s.block.forEach(st => emitStmt(st, ctx)));
 						ctx.emit(I.br(ctx.depth - afterDepth));
 						ctx.exitLabel();
-						ctx.emit(I.try_table(undefined, [wasm.Catch.tag(ensureExceptionTag(), 0)], ctx.swapOut(tryTableSaved)));
+						ctx.emit(I.try_table(undefined, [wasm.Catch.tag(ensureExceptionTag(), 0)], ctx.swapOut()));
 						ctx.emit(I.unreachable);
 						ctx.exitLabel();
-						ctx.emit(I.block(toValType(REF_ANY), ctx.swapOut(catchLandSaved)));
+						ctx.emit(I.block(toValType(REF_ANY), ctx.swapOut()));
 
 						// The catch param binds $catchLand's own delivered value -- outside and *before*
 						// try_table (B) starts: a block's body doesn't inherit values left on the outer stack
 						// unless declared as real params (none of these are), so try_table (B) itself must
 						// start from a clean slate, not reach back for a value produced before it began.
 						ctx.openScope();
-						if (s.handlerParam)
-							ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
-						else
-							ctx.emit(I.drop);
+							if (s.handlerParam)
+								ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
+							else
+								ctx.emit(I.drop);
 
-						// B (the catch handler) gets its *own* safety net -- unlike A, nothing else already
-						// guarantees every exception B might throw is caught before 'finally' needs to run.
-						const catchHandlerSaved = ctx.swapOut();
-						ctx.enterLabel();			// try_table (B)'s own implicit level
-						s.handlerBody.forEach(st => emitStmt(st, ctx));
+							// B (the catch handler) gets its *own* safety net -- unlike A, nothing else already
+							// guarantees every exception B might throw is caught before 'finally' needs to run.
+							const catchHandlerSaved = ctx.swapOut();
+							ctx.enterLabel();			// try_table (B)'s own implicit level
+							s.handlerBody.forEach(st => emitStmt(st, ctx));
 						ctx.closeScope();
+
 						ctx.emit(I.br(ctx.depth - afterDepth));
 						ctx.exitLabel();
 						ctx.emit(I.try_table(undefined, [wasm.Catch.allRef(ctx.depth - catchAllDepth)], ctx.swapOut(catchHandlerSaved)));
 						ctx.emit(I.unreachable);
 					} else {
 						// No 'catch' clause -- 'finally' alone needs only the safety net around A itself.
-						const tryTableSaved = ctx.swapOut();
 						ctx.enterLabel();			// try_table's own implicit level
-						ctx.openScope();
-						s.block.forEach(st => emitStmt(st, ctx));
-						ctx.closeScope();
+						ctx.inScope(() => s.block.forEach(st => emitStmt(st, ctx)));
 						ctx.emit(I.br(ctx.depth - afterDepth));
 						ctx.exitLabel();
-						ctx.emit(I.try_table(undefined, [wasm.Catch.allRef(ctx.depth - catchAllDepth)], ctx.swapOut(tryTableSaved)));
+						ctx.emit(I.try_table(undefined, [wasm.Catch.allRef(ctx.depth - catchAllDepth)], ctx.swapOut()));
 						ctx.emit(I.unreachable);
 					}
 
 					ctx.finallyGuards.pop();
+					ctx.onReturn = savedOnReturn;
 
 					ctx.exitLabel();				// exit $after
-					ctx.emit(I.block(undefined, ctx.swapOut(afterSaved)));
+					ctx.emit(I.block(undefined, ctx.swapOut()));
 					ctx.emit(I.i32.const(0), I.local.set(actionLocal.index), I.br(ctx.depth - landDepth));
 					ctx.exitLabel();				// exit $catchAllLand
-					ctx.emit(I.block(toValType(REF_EXN), ctx.swapOut(catchAllSaved)));
+					ctx.emit(I.block(toValType(REF_EXN), ctx.swapOut()));
 					ctx.emit(I.local.set(exnLocal.index), I.i32.const(4), I.local.set(actionLocal.index));
 					ctx.exitLabel();				// exit $land
 					ctx.emit(I.block(undefined, ctx.swapOut(saved)));
 
-					ctx.openScope();
-					s.finalizer.forEach(st => emitStmt(st, ctx));
-					ctx.closeScope();
+					ctx.inScope(() => s.finalizer!.forEach(st => emitStmt(st, ctx)));
 
 					// Re-dispatch: exactly one of these ever actually fires per call (the action codes above
 					// are mutually exclusive), each gated by its own 'if' so the validator only ever checks
@@ -3752,15 +3746,15 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						ctx.exitLabel();
 						ctx.emit(I.if(undefined, ctx.swapOut(old)));
 					};
-					dispatch(1, () => emitStmt({ type: 'return', argument: returnValueLocal ? { type: 'identifier', name: '#finally$retval' } : undefined }, ctx));
+					dispatch(1, () => outerOnReturn.emit(ctx, returnValueLocal ? { type: 'identifier', name: '#finally$retval' } : undefined));
 					// A synthesized 'break'/'continue' only ever compiles to a real target this construct
 					// could actually reach at runtime -- skip building the arm at all when there wasn't one
 					// enclosing it in the first place (action can then never actually be 2/3), or 'case break'/
 					// 'case continue' rejects it outright even though it would never really execute.
 					if (guard.breakTargetsLenAtEntry > 0)
-						dispatch(2, () => emitStmt({ type: 'break' }, ctx));
+						dispatch(2, () => ctx.emitBreak());
 					if (guard.continueTargetsLenAtEntry > 0)
-						dispatch(3, () => emitStmt({ type: 'continue' }, ctx));
+						dispatch(3, () => ctx.emitContinue());
 					dispatch(4, () => ctx.emit(I.local.get(exnLocal.index), I.throw_ref));
 				}
 				return;
@@ -3776,7 +3770,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	// A non-`void` body doesn't necessarily end in a top-level `return` -- `if`/`while`/`switch` compile to a `void`-typed block wrapping their branches, leaving wasm's trailing-fallthrough check unsatisfied.
 	// No full "does every path return" analysis to avoid it -- a trailing `unreachable` is always safe (dead code whenever a real return already covers every path).
-	function emitTrailingUnreachable(ctx: FuncCtx, result: WasmType): void {
+	function emitTrailingUnreachable(ctx: FunctionContext, result: WasmType): void {
 		if (result !== 'void')
 			ctx.emit(I.unreachable);
 	}
@@ -3812,11 +3806,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		}
 		if (!tsType)
 			throw new Error(`towasm: 'param '${describeBinding(p.key)}' needs an explicit type`);
-		const wtype = typeOf(tsType);
-		if (!wtype)
+		const rawWtype = typeOf(tsType);
+		if (!rawWtype)
 			throw new Error(`towasm: 'param '${describeBinding(p.key)}' needs an explicit type`);
-		if (wtype === 'void')
-			throw new Error(`towasm: 'param '${describeBinding(p.key)}' cannot be 'void'`);
+		// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as `any`
+		// rather than reject otherwise-valid source.
+		const wtype = rawWtype === 'void' ? REF_ANY : rawWtype;
 		return { key: p.key, wtype, tsType };
 	}
 
@@ -3834,7 +3829,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// time `ensureMethod` reaches here) is declared relative to the one module scope this file ever has,
 	// same as `paramType`/`compileFunc` already assume elsewhere -- no separate "declaring module" to track
 	// the way `T.declScopeOf` exists for (a cross-module signature, which nothing here ever is).
-	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, ctx: FuncCtx): Map<string, Type> {
+	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, ctx: FunctionContext): Map<string, Type> {
 		const map = new Map<string, Type>();
 		if (typeArgs) {
 			typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
@@ -3858,7 +3853,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// difference from a class reference: a function's type arguments are usually left implicit at the call
 	// site, inferred from the arguments (`inferTypeArgMap`, above). Explicit call-site type args
 	// (`identity<number>(5)`) are honored too, same as a class's are.
-	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, ctx: FuncCtx): FuncInfo {
+	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, ctx: FunctionContext): FuncInfo {
 		const typeParams = decl.typeParams!;
 		const map = inferTypeArgMap(typeParams, decl.params, args, typeArgs, ctx);
 		const key = `${name}<${typeParams.map(p => T.typeKey(T.resolve(global, map.get(p.name)!))).join(',')}>`;
@@ -3886,13 +3881,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: decl.params.map(p => p.default), hasRest: !!decl.rest?.typeAnnotation};
 		funcs.set(name, info);
 		worklist.push(() => {
-			const ctx	= new FuncCtx(new Scope(libGlobal), result, undefined);
+			const ctx	= new FunctionContext(name, new Scope(libGlobal), plainReturn(result), undefined);
 			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
 			info.body		= ctx.toFuncBody(params.length, toValType);
-			info.body.id	= name;
 		});
 		return info;
 	}
@@ -3936,8 +3930,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// yield x;` (see `compileGeneratorFunc`'s own comment on why `checkerTypeOf` can't be trusted
 	// there); an async `await` needs no such override, so `compileAsyncFunc` never passes one.
 	function buildFrameFields(kind: 'generator' | 'async', decl: FunctionDecl, params: ResolvedParam[], widenedTypes: Map<JS.Var<Type>, Type>, resumeValueType?: Type) {
-		const hoisted = collectHoistedLocals(decl.body!);
-		const localFields = new Map<string, { index: number; wtype: WasmType; tsType: Type }>();
+		const hoisted		= collectHoistedLocals(decl.body!);
+		const localFields	= new Map<string, { index: number; wtype: WasmType; tsType: Type }>();
 		const frameFields: wasm.FieldType[] = [{ type: 'i32', mut: true }];
 		for (const p of params) {
 			localFields.set(p.key as string, { index: frameFields.length, wtype: p.wtype, tsType: p.tsType });
@@ -3958,139 +3952,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return { localFields, frameFields };
 	}
 
-	function compileGeneratorFunc(name: string, decl: FunctionDecl): FuncInfo {
-		if (decl.typeParams?.length)
-			throw new Error(`towasm: generic generator function '${name}' is not supported`);
-		const params = resolveResumableParams('generator', decl);
-
-		// Read off `libGlobal`'s own hoisted function type, not `decl.returnType` directly: `checkStmt`'s
-		// own per-statement check (`case 'function_decl'`) re-derives and overwrites `decl.returnType`
-		// in place with `N` forced to `T.ANY` regardless of what's declared (`checkFunctionBody`'s
-		// `skipReturn` is unconditionally true for a generator) -- but that mutation happens *after*
-		// `hoist()` already snapshotted the real declared type into the scope value every call site
-		// (`countUp()`) actually resolves through, so the two disagree. Going through the same scope
-		// lookup a call site uses keeps this in sync with what callers see, sidestepping the mismatch
-		// rather than fighting it.
-		const rt = (global.value(name) as TS.FunctionType | undefined)?.returnType;
-		if (rt?.type !== 'ref' || rt.name !== 'Generator' || (rt.typeArgs?.length ?? 0) !== 3)
-			throw new Error(`towasm: generator function '${name}' has an unexpected inferred return type`);
-		const [Y, R, N] = rt.typeArgs!;
-		const yWtype = typeOf(Y), rWtype = typeOf(R), nWtype = typeOf(N);
-		if (!yWtype || yWtype === 'void')
-			throw new Error(`towasm: generator function '${name}' has an unsupported yielded type`);
-		if (!rWtype)
-			throw new Error(`towasm: generator function '${name}' has an unsupported return type`);
-		if (!nWtype || nWtype === 'void')
-			throw new Error(`towasm: generator function '${name}' has an unsupported '.next()' argument type`);
-
-		const resultClass = ensureClass('IteratorResult', [Y, R]);
-		const genClass = ensureClass('Generator', [Y, R, N]);
-		if (!resultClass || !genClass)
-			throw new Error(`towasm: internal: the generator lib classes were not found`);
-		const resultWtype = ownerThisType(resultClass);
-
-		const sig: FuncSig = { params: [nWtype], result: resultWtype, hasRest: false };
-		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
-
-		// The frame holds the resume state plus every local the body declares (conservative: hoists
-		// every one of them, not just the ones actually live across a yield -- see
-		// `collectHoistedLocals`'s own comment). `supertypes: [envBase]`, matching an ordinary closure
-		// literal's own env struct -- the step function's real wasm param is declared `(ref $envBase)`
-		// (`ensureClosureType`), so whatever concrete frame struct gets stored into the closure at the
-		// creation site below must be a real subtype of it.
-		const envBase = ensureEnvBase();
-		const STATE_FIELD = 0;
-		// Same fallback chain `case 'var_decl'` itself uses to pick a hoisted local's *actual* write type
-		// (typeAnnotation, then a widened-reassignment-range override, then the initializer's own narrow
-		// literal type, e.g. a small integer literal defaults to 'i32' not 'f64') -- the frame field's
-		// declared type must agree with what the real write emits, or the field type mismatches its own
-		// initializer (confirmed the hard way: computing this independently via `checkerTypeOf` alone
-		// picked the checker's un-narrowed 'number' -> f64 while the actual `let i = 0` write picked the
-		// narrower i32, corrupting the very first assignment). Consistency matters here, not which of the
-		// two representations wins -- `emitAs`/`coerceTop` widen i32 -> f64 at every *use* site regardless
-		// (`yield i` against a 'number'-typed generator, `i < 3`, ...), so 'i32' is a completely valid,
-		// even cheaper choice for the field as long as the declaration and every write agree on it.
-		// `resumeValueType: N` -- 'const v = yield x;''s own checker type is always `T.ANY` (the same
-		// forced-any inference behind the `N`-in-`decl.returnType` workaround above, `checkFunctionBody`'s
-		// `skipReturn`), not the real declared/resolved `N` -- `buildFrameFields` reads `N` directly for
-		// that one case instead of trusting `checkerTypeOf`, or the field ends up `anyref`-typed against
-		// an `N`-typed write.
-		const widenedTypes = collectRangeWidenings(decl.body!, libGlobal);
-		const { localFields, frameFields } = buildFrameFields('generator', decl, params, widenedTypes, N);
-		const frameTypeIndex = addType({ final: true, supertypes: [envBase], type: { kind: 'struct', fields: frameFields } });
-
-		const machine = flattenStateMachine(decl.body!);
-
-		const { funcIndex: stepFuncIndex } = registerFuncAtType(funcTypeIndex);
-		const stepInfo: FuncInfo = { params: sig.params, result: sig.result, hasRest: false, funcIndex: stepFuncIndex, typeIndex: funcTypeIndex };
-		closureLiterals.push(stepInfo);
-
-		worklist.push(() => {
-			const fnCtx		= new FuncCtx(new Scope(libGlobal), resultWtype, undefined);
-			// Param order must match `ensureClosureType`'s real wasm signature exactly (env, then
-			// `sig.params`) -- the cast-down frame local is declared *after* both real params, as one
-			// more genuine local, same as an ordinary closure literal's own `#env` (`emitClosureLiteral`).
-			const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
-			const sentParam	= fnCtx.declareLocal('#sent', nWtype);
-			const frameLocal	= fnCtx.declareLocal('#frame', { typeIndex: frameTypeIndex, nullable: false });
-			fnCtx.emit(I.local.get(envParam.index), I.ref.cast(frameTypeIndex), I.local.set(frameLocal.index));
-			// Every hoisted local reads/writes through the frame automatically from here on --
-			// `case 'identifier'`/`emitAssignTarget` already check `closureEnv.fields` first, same as a
-			// real closure capture; `case 'var_decl'` gained the one new branch that *writes* one instead
-			// of declaring a real wasm local, when its own name is already a frame field.
-			fnCtx.closureEnv = { envLocal: frameLocal, envTypeIndex: frameTypeIndex, fields: localFields };
-			for (const [localName, { tsType }] of localFields)
-				fnCtx.declareCaptured(localName, tsType);
-			// The same map already consulted above, building the frame's own field types -- reused (not
-			// recomputed) so `case 'var_decl'`'s actual write agrees with what the field was declared as.
-			fnCtx.widenedTypes = widenedTypes;
-			const resultCtor = ensureCtor(resultClass, [], fnCtx);
-			emitGeneratorDispatch(machine, fnCtx, frameLocal, frameTypeIndex, STATE_FIELD, resultCtor, yWtype, rWtype, sentParam);
-			emitTrailingUnreachable(fnCtx, resultWtype);
-			stepInfo.body = fnCtx.toFuncBody(2, toValType);
-		});
-
-		const outerResult = ownerThisType(genClass);
-		const { funcIndex: outerFuncIndex, typeIndex: outerTypeIndex } = registerFunc(toParams2(params), toResults(outerResult));
-		const info: FuncInfo = { params: params.map(p => p.wtype), result: outerResult, funcIndex: outerFuncIndex, typeIndex: outerTypeIndex, hasRest: false };
-		funcs.set(name, info);
-		worklist.push(() => {
-			const ctx = new FuncCtx(new Scope(libGlobal), outerResult, undefined);
-			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
-			const genCtor = ensureCtor(genClass, [], ctx);
-			// Build the step closure exactly like an ordinary closure literal's own creation site
-			// (`I.ref.func`, then the env/frame value, then the 2-field `{code,env}` struct), then
-			// construct `new Generator(step)` -- calling `name(...)` never runs the body, matching a real
-			// JS generator's own "nothing runs before the first `.next()`" semantics. `state` is set to
-			// the state machine's own real entry segment explicitly (`machine.entryId`) -- NOT left at
-			// some implicit default, which is only the entry point by coincidence when nothing else
-			// claimed id 0 first (e.g. `completeId` reserves it whenever the body's very first statement
-			// is itself a suspend point).
-			//
-			// The frame is built via a real `struct.new` (every field's actual value, not
-			// `struct.new_default` + later `struct.set`s) -- a real object-typed field (a ref-typed
-			// param, e.g. a `Promise<T>` argument to an async function sharing this same construction
-			// shape) isn't *defaultable*, so `struct.new_default` would reject the whole struct type the
-			// moment even one field needs one. A param already has a real value ready (the wrapper's own
-			// local); a hoisted (non-param) local doesn't yet -- `emitDefaultValue` covers a scalar or
-			// nullable-ref one, and throws its own clear error for a still-unsupported non-nullable-ref
-			// hoisted local (deliberately not attempted this round).
-			const paramNames = new Set(params.map(p => p.key as string));
-			ctx.emit(I.ref.func(stepFuncIndex), I.i32.const(machine.entryId));
-			for (const [localName, field] of localFields) {
-				if (paramNames.has(localName))
-					ctx.emit(I.local.get(ctx.lookup(localName)!.index));
-				else
-					emitDefaultValue(field.wtype, ctx);
-			}
-			ctx.emit(I.struct.new(frameTypeIndex), I.struct.new(structTypeIndex));
-			ctx.emit(I.call(genCtor.funcIndex), I.return);
-			info.body = ctx.toFuncBody(params.length, toValType);
-			info.body.id = name;
-		});
-		return info;
-	}
-
 	// Shared by emitGeneratorDispatch/emitAsyncDispatch -- the whole "one dispatch + N nested blocks
 	// (innermost = segment 0), wrapped in one outer `loop`" skeleton, exactly the shape `case 'switch'`
 	// already lowers a real switch statement to, generalized from "jump to case i" to "jump to resume
@@ -4103,10 +3964,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// (a generator's is unconditional; an async function's is gated to a real Promise suspension only,
 	// and needs unboxing `#sent` first) that it isn't shared here either.
 	function emitResumableDispatch(
-		machine: StateMachine, fnCtx: FuncCtx, frameLocal: Local, frameTypeIndex: number, stateField: number,
+		machine: StateMachine, fnCtx: FunctionContext, frameLocal: Local, frameTypeIndex: number, stateField: number,
 		onSegmentStart: (segmentId: number) => void,
-		onSuspend: (next: Extract<SegmentNext, { type: 'suspend' }>, loopMark: number) => void,
-		onComplete: () => void,
+		onSuspend:		(next: SuspendBoundary, resumeId: number, loopMark: number) => void,
+		onComplete:		() => void,
 	): void {
 		const segs = machine.segments;
 		const n = segs.length;
@@ -4134,8 +3995,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					return;
 				}
 				case 'suspend':
-					onSuspend(next, loopMark);
+					onSuspend(next, next.resumeId, loopMark);
 					return;
+
 				case 'complete':
 					onComplete();
 					return;
@@ -4167,48 +4029,182 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		fnCtx.emit(I.loop(undefined, content));
 	}
 
-	// `emitResumableDispatch`'s 'suspend'/'complete' arms, specialized for a generator: a suspend
-	// always evaluates+yields a real value and returns a fresh `IteratorResult`; completion (natural or
-	// a repeat call once already pinned there) does too, idempotently.
-	function emitGeneratorDispatch(machine: StateMachine, fnCtx: FuncCtx, frameLocal: Local, frameTypeIndex: number, stateField: number, resultCtor: FuncInfo, yWtype: WasmType, rWtype: WasmType, sentParam: Local): void {
-		fnCtx.generatorFrame = { frameLocal, frameTypeIndex, stateField, doneStateId: machine.completeId, resultCtor, rWtype };
+	function compileGeneratorFunc(name: string, decl: FunctionDecl): FuncInfo {
+		if (decl.typeParams?.length)
+			throw new Error(`towasm: generic generator function '${name}' is not supported`);
+		const params = resolveResumableParams('generator', decl);
 
-		// 'const v = yield x;' -- `v`'s own resume-side binding lives on the *suspending* segment's own
-		// `next` (the only place the flattener has it), not the segment it resumes into, so build the
-		// reverse lookup once: which segment (by id) needs to write the sent value into which frame field,
-		// right before running its own statements.
-		const sentBindings = new Map<number, number>();
-		for (const seg of machine.segments) {
-			if (seg.next.type === 'suspend' && seg.next.resultVar)
-				sentBindings.set(seg.next.resumeId, fnCtx.closureEnv!.fields.get(seg.next.resultVar)!.index);
-		}
+		// Read off `libGlobal`'s own hoisted function type, not `decl.returnType` directly: `checkStmt`'s
+		// own per-statement check (`case 'function_decl'`) re-derives and overwrites `decl.returnType`
+		// in place with `N` forced to `T.ANY` regardless of what's declared (`checkFunctionBody`'s
+		// `skipReturn` is unconditionally true for a generator) -- but that mutation happens *after*
+		// `hoist()` already snapshotted the real declared type into the scope value every call site
+		// (`countUp()`) actually resolves through, so the two disagree. Going through the same scope
+		// lookup a call site uses keeps this in sync with what callers see, sidestepping the mismatch
+		// rather than fighting it.
+		const rt = (global.value(name) as TS.FunctionType | undefined)?.returnType;
+		if (rt?.type !== 'ref' || rt.name !== 'Generator' || (rt.typeArgs?.length ?? 0) !== 3)
+			throw new Error(`towasm: generator function '${name}' has an unexpected inferred return type`);
+		const [Y, R, N] = rt.typeArgs!;
+		const yWtype = typeOf(Y), rWtype = typeOf(R), nWtype = typeOf(N);
+		if (!yWtype || yWtype === 'void')
+			throw new Error(`towasm: generator function '${name}' has an unsupported yielded type`);
+		if (!rWtype)
+			throw new Error(`towasm: generator function '${name}' has an unsupported return type`);
+		if (!nWtype || nWtype === 'void')
+			throw new Error(`towasm: generator function '${name}' has an unsupported '.next()' argument type`);
 
-		emitResumableDispatch(machine, fnCtx, frameLocal, frameTypeIndex, stateField,
-			id => {
-				const sentField = sentBindings.get(id);
-				if (sentField !== undefined)
-					fnCtx.emit(I.local.get(frameLocal.index), I.local.get(sentParam.index), I.struct.set(frameTypeIndex, sentField));
-			},
-			next => {
-				if (next.kind !== 'yield')
-					throw new Error("towasm: 'await' is not supported yet (generators only, for now)");
-				if (next.delegate)
-					throw new Error("towasm: 'yield*' delegation is not supported");
-				if (next.operand)
-					emitAs(next.operand, fnCtx, yWtype);
+		const resultClass	= ensureClass('IteratorResult', [Y, R]);
+		const genClass		= ensureClass('Generator', [Y, R, N]);
+		if (!resultClass || !genClass)
+			throw new Error(`towasm: internal: the generator lib classes were not found`);
+		const resultWtype	= ownerThisType(resultClass);
+
+		const sig: FuncSig = { params: [nWtype], result: resultWtype, hasRest: false };
+		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
+
+		// The frame holds the resume state plus every local the body declares (conservative: hoists
+		// every one of them, not just the ones actually live across a yield -- see
+		// `collectHoistedLocals`'s own comment). `supertypes: [envBase]`, matching an ordinary closure
+		// literal's own env struct -- the step function's real wasm param is declared `(ref $envBase)`
+		// (`ensureClosureType`), so whatever concrete frame struct gets stored into the closure at the
+		// creation site below must be a real subtype of it.
+		const envBase = ensureEnvBase();
+		const STATE_FIELD = 0;
+		// Same fallback chain `case 'var_decl'` itself uses to pick a hoisted local's *actual* write type
+		// (typeAnnotation, then a widened-reassignment-range override, then the initializer's own narrow
+		// literal type, e.g. a small integer literal defaults to 'i32' not 'f64') -- the frame field's
+		// declared type must agree with what the real write emits, or the field type mismatches its own
+		// initializer (confirmed the hard way: computing this independently via `checkerTypeOf` alone
+		// picked the checker's un-narrowed 'number' -> f64 while the actual `let i = 0` write picked the
+		// narrower i32, corrupting the very first assignment). Consistency matters here, not which of the
+		// two representations wins -- `emitAs`/`coerceTop` widen i32 -> f64 at every *use* site regardless
+		// (`yield i` against a 'number'-typed generator, `i < 3`, ...), so 'i32' is a completely valid,
+		// even cheaper choice for the field as long as the declaration and every write agree on it.
+		// `resumeValueType: N` -- 'const v = yield x;''s own checker type is always `T.ANY` (the same
+		// forced-any inference behind the `N`-in-`decl.returnType` workaround above, `checkFunctionBody`'s
+		// `skipReturn`), not the real declared/resolved `N` -- `buildFrameFields` reads `N` directly for
+		// that one case instead of trusting `checkerTypeOf`, or the field ends up `anyref`-typed against
+		// an `N`-typed write.
+		const widenedTypes	= collectRangeWidenings(decl.body!, libGlobal);
+		const { localFields, frameFields } = buildFrameFields('generator', decl, params, widenedTypes, N);
+		const frameTypeIndex = addType({ final: true, supertypes: [envBase], type: { kind: 'struct', fields: frameFields } });
+		const machine		= flattenStateMachine(decl.body!);
+
+		const { funcIndex: stepFuncIndex } = registerFuncAtType(funcTypeIndex);
+		const stepInfo: FuncInfo = { params: sig.params, result: sig.result, hasRest: false, funcIndex: stepFuncIndex, typeIndex: funcTypeIndex };
+		closureLiterals.push(stepInfo);
+
+		worklist.push(() => {
+			const fnCtx		= new FunctionContext(name, new Scope(libGlobal), plainReturn(resultWtype), undefined);
+			// Param order must match `ensureClosureType`'s real wasm signature exactly (env, then `sig.params`)
+			// -- the cast-down frame local is declared *after* both real params, as one more genuine local, same as an ordinary closure literal's own `#env` (`emitClosureLiteral`).
+			const envParam		= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
+			const sentParam		= fnCtx.declareLocal('#sent', nWtype);
+			const frameLocal	= fnCtx.declareLocal('#frame', { typeIndex: frameTypeIndex, nullable: false });
+			fnCtx.emit(I.local.get(envParam.index), I.ref.cast(frameTypeIndex), I.local.set(frameLocal.index));
+			// Every hoisted local reads/writes through the frame automatically from here on --
+			// `case 'identifier'`/`emitAssignTarget` already check `closureEnv.fields` first, same as a
+			// real closure capture; `case 'var_decl'` gained the one new branch that *writes* one instead
+			// of declaring a real wasm local, when its own name is already a frame field.
+			fnCtx.closureEnv = { envLocal: frameLocal, envTypeIndex: frameTypeIndex, fields: localFields };
+			for (const [localName, { tsType }] of localFields)
+				fnCtx.declareCaptured(localName, tsType);
+			// The same map already consulted above, building the frame's own field types -- reused (not
+			// recomputed) so `case 'var_decl'`'s actual write agrees with what the field was declared as.
+			fnCtx.widenedTypes	= widenedTypes;
+
+			const resultCtor = ensureCtor(resultClass, [], fnCtx);
+			const stateField = STATE_FIELD;
+			// `resultCtor.params[0]` -- not the bare `rWtype` -- is `IteratorResult<Y,R>.value`'s own real,
+			// already-resolved wasm representation: identical to `rWtype` whenever `R` is an ordinary type,
+			// but when `R` is `void` (a real, common case -- `Generator<Y, void, N>`), `ensureClass` already
+			// boxed that instantiation's `value: Y | R` field to `any` (`void` is never valid as a field's
+			// own type -- see `addField`'s guard), and this must push a value matching what the field/
+			// constructor was actually built to accept, not the un-substituted bare type.
+			const valueWtype = resultCtor.params[0];
+			// A plain `return expr;` inside a generator body means "done", not an ordinary wasm return of
+			// `expr` (the step function's real wasm result is always an `IteratorResult`, never the bare
+			// yield/return type).
+			fnCtx.onReturn = {
+				wtype: () => valueWtype,
+				emit(ctx, argument) {
+					ctx.emit(I.local.get(frameLocal.index), I.i32.const(machine.completeId), I.struct.set(frameTypeIndex, stateField));
+					if (argument)
+						emitAs(argument, ctx, valueWtype);
+					else
+						emitDefaultValue(valueWtype, ctx);
+					ctx.emit(I.i32.const(1), I.call(resultCtor.funcIndex), I.return);
+				},
+			};
+
+			// 'const v = yield x;' -- `v`'s own resume-side binding lives on the *suspending* segment's own
+			// `next` (the only place the flattener has it), not the segment it resumes into, so build the
+			// reverse lookup once: which segment (by id) needs to write the sent value into which frame field,
+			// right before running its own statements.
+			const sentBindings = new Map<number, number>();
+			for (const seg of machine.segments) {
+				if (seg.next.type === 'suspend' && seg.next.resultVar)
+					sentBindings.set(seg.next.resumeId, fnCtx.closureEnv!.fields.get(seg.next.resultVar)!.index);
+			}
+
+			emitResumableDispatch(machine, fnCtx, frameLocal, frameTypeIndex, stateField,
+				id => {
+					const sentField = sentBindings.get(id);
+					if (sentField !== undefined)
+						fnCtx.emit(I.local.get(frameLocal.index), I.local.get(sentParam.index), I.struct.set(frameTypeIndex, sentField));
+				},
+				(next, resumeId) => {
+					if (next.kind !== 'yield')
+						throw new Error("towasm: 'await' is not supported yet (generators only, for now)");
+					if (next.delegate)
+						throw new Error("towasm: 'yield*' delegation is not supported");
+					// `valueWtype` (`IteratorResult<Y,R>.value`'s own real, already-resolved type -- see its
+					// own comment above), not the bare `yWtype`: identical whenever `Y` and `R` happen to be
+					// the same type (every existing test, until now), but a real, different representation
+					// once they're not (this constructor's own single `value` param always expects exactly
+					// one physical shape, whichever path -- yield or return -- is calling it).
+					if (next.operand)
+						emitAs(next.operand, fnCtx, valueWtype);
+					else
+						emitDefaultValue(valueWtype, fnCtx);
+					fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(resumeId), I.struct.set(frameTypeIndex, stateField));
+					fnCtx.emit(I.i32.const(0), I.call(resultCtor.funcIndex), I.return);
+				},
+				() => {
+					// Natural completion, or a repeat call once already pinned here -- either way,
+					// idempotent: re-pin `state` to this same segment's own id, done forever after.
+					fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(machine.completeId), I.struct.set(frameTypeIndex, stateField));
+					emitDefaultValue(valueWtype, fnCtx);
+					fnCtx.emit(I.i32.const(1), I.call(resultCtor.funcIndex), I.return);
+				},
+			);
+
+			emitTrailingUnreachable(fnCtx, resultWtype);
+			stepInfo.body		= fnCtx.toFuncBody(2, toValType);
+		});
+
+		const outerResult = ownerThisType(genClass);
+		const { funcIndex: outerFuncIndex, typeIndex: outerTypeIndex } = registerFunc(toParams2(params), toResults(outerResult));
+		const info: FuncInfo = { params: params.map(p => p.wtype), result: outerResult, funcIndex: outerFuncIndex, typeIndex: outerTypeIndex, hasRest: false };
+		funcs.set(name, info);
+
+		worklist.push(() => {
+			const ctx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(outerResult), undefined);
+			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
+			const genCtor		= ensureCtor(genClass, [], ctx);
+			const paramNames	= new Set(params.map(p => p.key as string));
+			ctx.emit(I.ref.func(stepFuncIndex), I.i32.const(machine.entryId));
+			for (const [localName, field] of localFields) {
+				if (paramNames.has(localName))
+					ctx.emit(I.local.get(ctx.lookup(localName)!.index));
 				else
-					emitDefaultValue(yWtype, fnCtx);
-				fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(next.resumeId), I.struct.set(frameTypeIndex, stateField));
-				fnCtx.emit(I.i32.const(0), I.call(resultCtor.funcIndex), I.return);
-			},
-			() => {
-				// Natural completion, or a repeat call once already pinned here -- either way,
-				// idempotent: re-pin `state` to this same segment's own id, done forever after.
-				fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(machine.completeId), I.struct.set(frameTypeIndex, stateField));
-				emitDefaultValue(rWtype, fnCtx);
-				fnCtx.emit(I.i32.const(1), I.call(resultCtor.funcIndex), I.return);
-			},
-		);
+					emitDefaultValue(field.wtype, ctx);
+			}
+			ctx.emit(I.struct.new(frameTypeIndex), I.struct.new(structTypeIndex), I.call(genCtor.funcIndex), I.return);
+			info.body = ctx.toFuncBody(params.length, toValType);
+		});
+		return info;
 	}
 
 	// An `async function` reuses the exact same resumable-function machinery a generator does (frame,
@@ -4255,8 +4251,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const widenedTypes = collectRangeWidenings(decl.body!, libGlobal);
 		const { localFields, frameFields } = buildFrameFields('async', decl, params, widenedTypes);
 		// One more hidden field -- this function's own result Promise, resolved directly (a real public
-		// method call, not routed through the executor-callback pattern) by every `return` and by
-		// natural completion (`ctx.asyncFrame`, `emitAsyncDispatch`'s own 'complete' handling).
+		// method call, not routed through the executor-callback pattern) by every `return` (`ctx.onReturn`,
+		// set below) and by natural completion (`emitAsyncDispatch`'s own 'complete' handling).
 		const resultPromiseField = frameFields.length;
 		frameFields.push({ type: toValType(promiseWtype), mut: true });
 		const frameTypeIndex = addType({ final: true, supertypes: [envBase], type: { kind: 'struct', fields: frameFields } });
@@ -4277,15 +4273,157 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		closureLiterals.push(stepInfo);
 
 		worklist.push(() => {
-			const fnCtx		= new FuncCtx(new Scope(libGlobal), 'void', undefined);
+			const fnCtx		= new FunctionContext(name, new Scope(libGlobal), plainReturn(), undefined);
 			const frameLocal	= fnCtx.declareLocal('#frame', { typeIndex: frameTypeIndex, nullable: false });
 			const sentParam		= fnCtx.declareLocal('#sent', REF_ANY);
 			fnCtx.closureEnv = { envLocal: frameLocal, envTypeIndex: frameTypeIndex, fields: localFields };
 			for (const [localName, { tsType }] of localFields)
 				fnCtx.declareCaptured(localName, tsType);
 			fnCtx.widenedTypes = widenedTypes;
-			fnCtx.asyncFrame = { frameLocal, frameTypeIndex, resultPromiseField, promiseClass, rWtype };
-			emitAsyncDispatch(machine, fnCtx, frameLocal, frameTypeIndex, STATE_FIELD, sentParam, envBase, stepFuncIndex);
+			const resolveMethod = ensureMethod(promiseClass, 'resolve', [], fnCtx)!;
+			// `resolveMethod.params[0]` -- not the bare `rWtype` -- is `Promise<T>.resolve`'s own real,
+			// already-resolved wasm parameter type: identical to `rWtype` whenever `T` is an ordinary
+			// type, but when `T` is `void` (a real, common case -- `Promise<void>`), `ensureClass` already
+			// boxed that instantiation's `value: T` field (and `resolve`'s own param) to `any` (`void` is
+			// never valid as a field/param's own type -- see `addField`'s guard), and this must push a
+			// value matching what `resolve` was actually built to accept, not the un-substituted bare type.
+			const valueWtype = resolveMethod.params[0];
+			// A plain `return expr;` means "resolve the function's own result Promise with `expr`, then
+			// a bare wasm `return`", not an ordinary return of `expr` (the step function's own real wasm
+			// result type is always `void` -- nothing ever reads it directly).
+			fnCtx.onReturn = {
+				wtype: () => valueWtype,
+				emit(ctx, argument) {
+					ctx.emit(I.local.get(frameLocal.index), I.struct.get(frameTypeIndex, resultPromiseField));
+					if (argument)
+						emitAs(argument, ctx, valueWtype);
+					else
+						emitDefaultValue(valueWtype, ctx);
+					ctx.emit(I.call(resolveMethod.funcIndex), I.return);
+				},
+			};
+			// `emitResumableDispatch`'s 'suspend'/'complete' arms, specialized for async: a suspend either
+			// unwraps immediately (a non-Promise operand -- the synchronous fast path) or registers a
+			// trampoline via `Promise.then()` and returns; completion resolves the function's own result
+			// Promise directly instead of constructing anything.
+			const stateField = STATE_FIELD;
+
+			// One trampoline per distinct awaited element type, shared across every await site in this same
+			// function that awaits that type -- a trampoline only ever needs to unbox its own received value
+			// and forward it (plus the frame, as its own closure env -- a real subtype of `$envBase`, exactly
+			// like any other closure literal's own env) into `stepFuncIndex` directly; it has no need to know
+			// *which* resume state that call will land on (the frame's own state field, set before `.then()`
+			// was ever called, already says so).
+			const trampolines = new Map<string, { funcIndex: number; structTypeIndex: number }>();
+			const ensureTrampoline = (tWtype: WasmType) => {
+				const key = wasmTypeKey(tWtype);
+				let info = trampolines.get(key);
+				if (!info) {
+					const { funcTypeIndex, structTypeIndex } = ensureClosureType({ params: [tWtype], result: 'void' });
+					const { funcIndex } = registerFuncAtType(funcTypeIndex);
+					const tInfo: FuncInfo = { params: [tWtype], result: 'void', hasRest: false, funcIndex, typeIndex: funcTypeIndex };
+					closureLiterals.push(tInfo);
+					worklist.push(() => {
+						const tCtx = new FunctionContext(fnCtx.name, new Scope(libGlobal), plainReturn(), undefined);
+						const envParam = tCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
+						const valueParam = tCtx.declareLocal('#value', tWtype);
+						tCtx.emit(I.local.get(envParam.index), I.ref.cast(frameTypeIndex));
+						tCtx.emit(I.local.get(valueParam.index));
+						coerceTop(tWtype, tCtx, REF_ANY);
+						tCtx.emit(I.call(stepFuncIndex), I.return);
+						tInfo.body = tCtx.toFuncBody(2, toValType);
+					});
+					info = { funcIndex, structTypeIndex };
+					trampolines.set(key, info);
+				}
+				return info;
+			};
+
+			let awaitTemp = 0;
+
+			// Same reverse-lookup idea as `emitGeneratorDispatch`'s own `sentBindings` -- a suspending
+			// segment's own `resultVar` lives on *its* `next`, not the segment it resumes into. Only a
+			// *real* Promise suspension resumes via `#sent` (a trampoline's own delivered value) -- the
+			// synchronous fast path (`onSuspend`, below) already writes `resultVar` directly, inline, before
+			// ever transitioning; re-writing it here from `#sent` too would clobber that with whatever
+			// `#sent` happened to hold from a *previous, unrelated* resume (confirmed the hard way -- a
+			// non-Promise `await x; output = v;` silently read back the wrong value).
+			const sentBindings = new Map<number, { index: number; wtype: WasmType }>();
+			for (const seg of machine.segments) {
+				if (seg.next.type === 'suspend' && seg.next.resultVar && T.asPromiseRef(checkerTypeOf(seg.next.operand!, fnCtx.scope), fnCtx.scope))
+					sentBindings.set(seg.next.resumeId, fnCtx.closureEnv!.fields.get(seg.next.resultVar)!);
+			}
+
+			emitResumableDispatch(machine, fnCtx, frameLocal, frameTypeIndex, stateField,
+				id => {
+					const sentField = sentBindings.get(id);
+					if (sentField) {
+						fnCtx.emit(I.local.get(frameLocal.index), I.local.get(sentParam.index));
+						coerceTop(REF_ANY, fnCtx, sentField.wtype);
+						fnCtx.emit(I.struct.set(frameTypeIndex, sentField.index));
+					}
+				},
+				(next, resumeId, loopMark) => {
+					if (next.kind !== 'await')
+						throw new Error("towasm: 'yield' is not supported inside an async function");
+					if (next.delegate)
+						throw new Error("towasm: 'yield*' is not supported inside an async function");
+					const operand = next.operand!;
+					const promiseRef = T.asPromiseRef(checkerTypeOf(operand, fnCtx.scope), fnCtx.scope);
+					if (!promiseRef) {
+						// The synchronous fast path: `operand` isn't Promise-shaped, so there's nothing to
+						// suspend on -- real JS unwraps a non-thenable `await` immediately. Still a real state
+						// transition (simpler and no less correct than trying to fall through directly; the
+						// wasm-level cost is one extra dispatch-loop iteration).
+						if (next.resultVar) {
+							const field = fnCtx.closureEnv!.fields.get(next.resultVar)!;
+							fnCtx.emit(I.local.get(frameLocal.index));
+							emitAs(operand, fnCtx, field.wtype);
+							fnCtx.emit(I.struct.set(frameTypeIndex, field.index));
+						} else if (emitExpr(operand, fnCtx, 'void') !== 'void') {
+							fnCtx.emit(I.drop);
+						}
+						fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(resumeId), I.struct.set(frameTypeIndex, stateField));
+						fnCtx.emit(I.br(fnCtx.depth - loopMark));
+						return;
+					}
+
+					const tType = promiseRef.typeArgs![0];
+					const tWtype = typeOf(tType);
+					if (!tWtype)
+						throw new Error("towasm: 'await' on a Promise of an unsupported element type");
+					// `addField`/`resolveParam` already box a bare `void` reaching a field/param position as
+					// `any` (see their own comments), so `ensureClass` needs no help here -- but the
+					// trampoline closure below is built from an already-resolved `WasmType`, bypassing that
+					// same-path fallback entirely, and needs its own matching substitution.
+					const substitutedTWtype = tWtype === 'void' ? REF_ANY : tWtype;
+					const awaitedClass = ensureClass('Promise', [tType]);
+					if (!awaitedClass)
+						throw new Error(`towasm: internal: the 'Promise' lib class was not found`);
+
+					emitAs(operand, fnCtx, ownerThisType(awaitedClass));
+					const promiseLocal = fnCtx.declareLocal(`$await$${awaitTemp++}`, ownerThisType(awaitedClass));
+					fnCtx.emit(I.local.set(promiseLocal.index));
+
+					// `state` must already say where to resume *before* calling `.then()` -- a promise
+					// that's already settled invokes the trampoline synchronously, reentrantly calling
+					// `stepFuncIndex` before this `.then()` call itself returns (safe: this arm's own code
+					// ends in `return` immediately after, so the reentrant call's own work is never redone).
+					fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(resumeId), I.struct.set(frameTypeIndex, stateField));
+
+					const { funcIndex: trampolineFuncIndex, structTypeIndex: trampolineStructTypeIndex } = ensureTrampoline(substitutedTWtype);
+					const thenMethod = ensureMethod(awaitedClass, 'then', [], fnCtx)!;
+					fnCtx.emit(I.local.get(promiseLocal.index));
+					fnCtx.emit(I.ref.func(trampolineFuncIndex), I.local.get(frameLocal.index), I.struct.new(trampolineStructTypeIndex));
+					fnCtx.emit(I.call(thenMethod.funcIndex), I.return);
+				},
+				() => {
+					fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(machine.completeId), I.struct.set(frameTypeIndex, stateField));
+					fnCtx.emit(I.local.get(frameLocal.index), I.struct.get(frameTypeIndex, resultPromiseField));
+					emitDefaultValue(valueWtype, fnCtx);
+					fnCtx.emit(I.call(resolveMethod.funcIndex), I.return);
+				},
+			);
 			stepInfo.body = fnCtx.toFuncBody(2, toValType);
 		});
 
@@ -4293,12 +4431,16 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const info: FuncInfo = { params: params.map(p => p.wtype), result: promiseWtype, funcIndex: outerFuncIndex, typeIndex: outerTypeIndex, hasRest: false };
 		funcs.set(name, info);
 		worklist.push(() => {
-			const ctx = new FuncCtx(new Scope(libGlobal), promiseWtype, undefined);
+			const ctx = new FunctionContext(name, new Scope(libGlobal), plainReturn(promiseWtype), undefined);
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 
 			const promiseCtor = ensureCtor(promiseClass, [], ctx);
 			const resultPromiseLocal = ctx.declareLocal('#resultPromise', promiseWtype);
-			emitDefaultValue(rWtype, ctx);
+			// `promiseCtor.params[0]` -- not the bare `rWtype` -- matches its own real, already-resolved
+			// `initial: T` parameter (see the step function's own `valueWtype` comment for why these can
+			// diverge when `T` is `void`); its value never actually matters (`resolve()` always overwrites
+			// it for real before anything reads it), just that it's a real type the constructor can accept.
+			emitDefaultValue(promiseCtor.params[0], ctx);
 			ctx.emit(I.call(promiseCtor.funcIndex), I.local.set(resultPromiseLocal.index));
 
 			// Built via a real `struct.new` (every field's actual value), not `struct.new_default` +
@@ -4328,134 +4470,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			ctx.emit(I.local.get(resultPromiseLocal.index), I.return);
 			info.body = ctx.toFuncBody(params.length, toValType);
-			info.body.id = name;
 		});
 		return info;
 	}
 
-	// `emitResumableDispatch`'s 'suspend'/'complete' arms, specialized for async: a suspend either
-	// unwraps immediately (a non-Promise operand -- the synchronous fast path) or registers a
-	// trampoline via `Promise.then()` and returns; completion resolves the function's own result
-	// Promise directly instead of constructing anything.
-	function emitAsyncDispatch(machine: StateMachine, fnCtx: FuncCtx, frameLocal: Local, frameTypeIndex: number, stateField: number, sentParam: Local, envBase: number, stepFuncIndex: number): void {
-		const { resultPromiseField, promiseClass, rWtype } = fnCtx.asyncFrame!;
-
-		// One trampoline per distinct awaited element type, shared across every await site in this same
-		// function that awaits that type -- a trampoline only ever needs to unbox its own received value
-		// and forward it (plus the frame, as its own closure env -- a real subtype of `$envBase`, exactly
-		// like any other closure literal's own env) into `stepFuncIndex` directly; it has no need to know
-		// *which* resume state that call will land on (the frame's own state field, set before `.then()`
-		// was ever called, already says so).
-		const trampolines = new Map<string, { funcIndex: number; structTypeIndex: number }>();
-		const ensureTrampoline = (tWtype: WasmType) => {
-			const key = wasmTypeKey(tWtype);
-			let info = trampolines.get(key);
-			if (!info) {
-				const { funcTypeIndex, structTypeIndex } = ensureClosureType({ params: [tWtype], result: 'void' });
-				const { funcIndex } = registerFuncAtType(funcTypeIndex);
-				const tInfo: FuncInfo = { params: [tWtype], result: 'void', hasRest: false, funcIndex, typeIndex: funcTypeIndex };
-				closureLiterals.push(tInfo);
-				worklist.push(() => {
-					const tCtx = new FuncCtx(new Scope(libGlobal), 'void', undefined);
-					const envParam = tCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
-					const valueParam = tCtx.declareLocal('#value', tWtype);
-					tCtx.emit(I.local.get(envParam.index), I.ref.cast(frameTypeIndex));
-					tCtx.emit(I.local.get(valueParam.index));
-					coerceTop(tWtype, tCtx, REF_ANY);
-					tCtx.emit(I.call(stepFuncIndex), I.return);
-					tInfo.body = tCtx.toFuncBody(2, toValType);
-				});
-				info = { funcIndex, structTypeIndex };
-				trampolines.set(key, info);
-			}
-			return info;
-		};
-
-		let awaitTemp = 0;
-
-		// Same reverse-lookup idea as `emitGeneratorDispatch`'s own `sentBindings` -- a suspending
-		// segment's own `resultVar` lives on *its* `next`, not the segment it resumes into. Only a
-		// *real* Promise suspension resumes via `#sent` (a trampoline's own delivered value) -- the
-		// synchronous fast path (`onSuspend`, below) already writes `resultVar` directly, inline, before
-		// ever transitioning; re-writing it here from `#sent` too would clobber that with whatever
-		// `#sent` happened to hold from a *previous, unrelated* resume (confirmed the hard way -- a
-		// non-Promise `await x; output = v;` silently read back the wrong value).
-		const sentBindings = new Map<number, { index: number; wtype: WasmType }>();
-		for (const seg of machine.segments) {
-			if (seg.next.type === 'suspend' && seg.next.resultVar && T.asPromiseRef(checkerTypeOf(seg.next.operand!, fnCtx.scope), fnCtx.scope))
-				sentBindings.set(seg.next.resumeId, fnCtx.closureEnv!.fields.get(seg.next.resultVar)!);
-		}
-
-		emitResumableDispatch(machine, fnCtx, frameLocal, frameTypeIndex, stateField,
-			id => {
-				const sentField = sentBindings.get(id);
-				if (sentField) {
-					fnCtx.emit(I.local.get(frameLocal.index), I.local.get(sentParam.index));
-					coerceTop(REF_ANY, fnCtx, sentField.wtype);
-					fnCtx.emit(I.struct.set(frameTypeIndex, sentField.index));
-				}
-			},
-			(next, loopMark) => {
-				if (next.kind !== 'await')
-					throw new Error("towasm: 'yield' is not supported inside an async function");
-				if (next.delegate)
-					throw new Error("towasm: 'yield*' is not supported inside an async function");
-				const operand = next.operand!;
-				const promiseRef = T.asPromiseRef(checkerTypeOf(operand, fnCtx.scope), fnCtx.scope);
-				if (!promiseRef) {
-					// The synchronous fast path: `operand` isn't Promise-shaped, so there's nothing to
-					// suspend on -- real JS unwraps a non-thenable `await` immediately. Still a real state
-					// transition (simpler and no less correct than trying to fall through directly; the
-					// wasm-level cost is one extra dispatch-loop iteration).
-					if (next.resultVar) {
-						const field = fnCtx.closureEnv!.fields.get(next.resultVar)!;
-						fnCtx.emit(I.local.get(frameLocal.index));
-						emitAs(operand, fnCtx, field.wtype);
-						fnCtx.emit(I.struct.set(frameTypeIndex, field.index));
-					} else if (emitExpr(operand, fnCtx, 'void') !== 'void') {
-						fnCtx.emit(I.drop);
-					}
-					fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(next.resumeId), I.struct.set(frameTypeIndex, stateField));
-					fnCtx.emit(I.br(fnCtx.depth - loopMark));
-					return;
-				}
-
-				const tType = promiseRef.typeArgs![0];
-				const tWtype = typeOf(tType);
-				if (!tWtype)
-					throw new Error("towasm: 'await' on a Promise of an unsupported element type");
-				const awaitedClass = ensureClass('Promise', [tType]);
-				if (!awaitedClass)
-					throw new Error(`towasm: internal: the 'Promise' lib class was not found`);
-
-				emitAs(operand, fnCtx, ownerThisType(awaitedClass));
-				const promiseLocal = fnCtx.declareLocal(`$await$${awaitTemp++}`, ownerThisType(awaitedClass));
-				fnCtx.emit(I.local.set(promiseLocal.index));
-
-				// `state` must already say where to resume *before* calling `.then()` -- a promise
-				// that's already settled invokes the trampoline synchronously, reentrantly calling
-				// `stepFuncIndex` before this `.then()` call itself returns (safe: this arm's own code
-				// ends in `return` immediately after, so the reentrant call's own work is never redone).
-				fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(next.resumeId), I.struct.set(frameTypeIndex, stateField));
-
-				const { funcIndex: trampolineFuncIndex, structTypeIndex: trampolineStructTypeIndex } = ensureTrampoline(tWtype);
-				const thenMethod = ensureMethod(awaitedClass, 'then', [], fnCtx)!;
-				fnCtx.emit(I.local.get(promiseLocal.index));
-				fnCtx.emit(I.ref.func(trampolineFuncIndex), I.local.get(frameLocal.index), I.struct.new(trampolineStructTypeIndex));
-				fnCtx.emit(I.call(thenMethod.funcIndex), I.return);
-			},
-			() => {
-				fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(machine.completeId), I.struct.set(frameTypeIndex, stateField));
-				fnCtx.emit(I.local.get(frameLocal.index), I.struct.get(frameTypeIndex, resultPromiseField));
-				emitDefaultValue(rWtype, fnCtx);
-				fnCtx.emit(I.call(ensureMethod(promiseClass, 'resolve', [], fnCtx)!.funcIndex), I.return);
-			},
-		);
-	}
-
 	// Picks the declaration (from possibly several real bodies sharing a name, a genuine overload set) whose
 	// declared params fit `args`' actual types, mirroring the checker's own `T.argsFit`-based resolution -- resolves to the exact same overload the checker already validated the call against.
-	function resolveOverload(label: string, decls: MethodMember[], args: Expr[], ctx: FuncCtx): MethodMember {
+	function resolveOverload(label: string, decls: MethodMember[], args: Expr[], ctx: FunctionContext): MethodMember {
 		if (decls.length === 1)
 			return decls[0];
 		if (args.some(a => a.type === 'spread'))
@@ -4505,8 +4526,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				throw new Error(`towasm: object-shape type '${name}' can only have plain properties (no methods/index/call signatures) to be an object literal's target type`);
 			if (typeof m.key !== 'string')
 				throw new Error(`towasm: object-shape type '${name}' has a computed property name -- not supported`);
-			const wt = typeOf(m.typeAnnotation);
-			if (!wt || wt === 'void')
+			// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as
+			// `any` rather than reject otherwise-valid source.
+			const rawWt = typeOf(m.typeAnnotation);
+			const wt = rawWt === 'void' ? REF_ANY : rawWt;
+			if (!wt)
 				throw new Error(`towasm: object-shape type '${name}.${m.key}' needs an explicit number/boolean/object type`);
 			fieldIndex.set(m.key, fields.length);
 			fields.push({ name: m.key, wtype: wt });
@@ -4574,8 +4598,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		resolving.add(key);
 		
 		const addField = (key: string, typeAnnotation?: Type) => {
-			const wt = typeAnnotation && typeOf(typeAnnotation);
-			if (!wt || wt === 'void')
+			// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as
+			// `any` rather than reject otherwise-valid source.
+			const rawWt = typeAnnotation && typeOf(typeAnnotation);
+			const wt = rawWt === 'void' ? REF_ANY : rawWt;
+			if (!wt)
 				throw new Error(`towasm: field '${name}.${key}' needs an explicit number/boolean/object type`);
 			// A field sharing a name already seeded from the superclass (below) would silently clobber its
 			// index in `fieldIndex` while leaving the physical struct slot untouched -- the base class's own
@@ -4733,7 +4760,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// "run its init logic", not "allocate a separate base object"). Recurses naturally for a multi-level
 	// chain (the superclass's own body may contain its own `super(...)`, resolved against *its* own
 	// `cls.superClass` in the recursive call).
-	function emitCtorStatements(stmts: Statement[], cls: ClassInfo, ctx: FuncCtx): void {
+	function emitCtorStatements(stmts: Statement[], cls: ClassInfo, ctx: FunctionContext): void {
 		for (const st of stmts) {
 			if (st.type === 'expression' && st.expression.type === 'call' && st.expression.callee.type === 'super') {
 				const call = st.expression;
@@ -4754,22 +4781,22 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				// destructuring-pattern desugaring, for a destructured base param) unchanged. A nested scope
 				// closes once the base's own body has run, matching real TS scoping: the base ctor's own
 				// params aren't visible to the rest of *this* ctor's body.
-				ctx.openScope();
-				superCtor.params.forEach((p, i) => {
-					const argExpr = call.arguments[i] ?? p.default;
-					if (!argExpr)
-						throw new Error(`towasm: 'super(...)': missing argument for '${superClass.name}'s constructor parameter '${describeBinding(p.key)}'`);
-					emitStmt(JS.VarDecl('const', JS.Var(p.key, argExpr, p.typeAnnotation)), ctx);
+				ctx.inScope(() => {
+					superCtor.params.forEach((p, i) => {
+						const argExpr = call.arguments[i] ?? p.default;
+						if (!argExpr)
+							throw new Error(`towasm: 'super(...)': missing argument for '${superClass.name}'s constructor parameter '${describeBinding(p.key)}'`);
+						emitStmt(JS.VarDecl('const', JS.Var(p.key, argExpr, p.typeAnnotation)), ctx);
+					});
+					emitCtorStatements(superCtor.body!, superClass, ctx);
 				});
-				emitCtorStatements(superCtor.body, superClass, ctx);
-				ctx.closeScope();
 				continue;
 			}
 			emitStmt(st, ctx);
 		}
 	}
 
-	function ensureCtor(cls: ClassInfo, args: Expr[], callerCtx: FuncCtx): FuncInfo {
+	function ensureCtor(cls: ClassInfo, args: Expr[], callerCtx: FunctionContext): FuncInfo {
 		const decls = cls.methodDecls.get('constructor');
 		if (!decls)
 			throw new Error(`towasm: class '${cls.name}' needs an explicit constructor`);
@@ -4791,8 +4818,20 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const info: FuncInfo = { params: params.map(r => r.wtype), result: thisWtype, funcIndex, typeIndex, defaults: ctor.params.map(p => p.default), hasRest: !!ctor.rest?.typeAnnotation };
 		funcs.set(key, info);
 
+		// A constructor's own `return;` never carries a value (real TS syntax already enforces this at
+		// the checker level) -- it just means "stop early, `this` is the result," same value every real
+		// exit already emits via `ctx.ctorThis`.
+		const ctorOnReturn: ReturnHandler = {
+			wtype: () => undefined,
+			emit(ctx, argument) {
+				if (argument)
+					throw new Error('towasm: a constructor cannot return a value');
+				ctx.emit(I.local.get(ctx.ctorThis!.index), I.return);
+			},
+		};
+
 		worklist.push(() => {
-			const ctx		= new FuncCtx(new Scope(libGlobal), thisWtype, cls);
+			const ctx		= new FunctionContext(key, new Scope(libGlobal), plainReturn(thisWtype), cls);
 			ctx.widenedTypes = collectRangeWidenings(ctor.body!, ctx.scope);
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 			// This constructor supplies `this` directly via its own return value (`ctorReturnsValue`)
@@ -4830,6 +4869,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						ctx.emit(I.struct.new(cls.typeIndex));
 						const thisLocal = ctx.declareValue('this', thisWtype, cls.thisTsType);
 						ctx.ctorThis = thisLocal;
+						ctx.onReturn = ctorOnReturn;
 						ctx.ctorFields = undefined;
 						ctx.emit(I.local.set(thisLocal.index));
 					}
@@ -4877,6 +4917,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			} else {
 				const thisLocal = ctx.declareValue('this', thisWtype, cls.thisTsType);
 				ctx.ctorThis = thisLocal;
+				ctx.onReturn = ctorOnReturn;
 				ctx.emit(
 					I.struct.new_default(cls.typeIndex),
 					I.local.set(thisLocal.index),
@@ -4886,7 +4927,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 
 			info.body = ctx.toFuncBody(ctor.params.length + (ctor.rest ? 1 : 0), toValType);
-			info.body.id = key;
 		});
 		return info;
 	}
@@ -4895,8 +4935,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// `typeArgs`: an explicit call-site type argument list for a generic *method*'s own type params
 	// (`obj.map<number>(f)`) -- distinct from, and layered on top of, `owner`'s own class-level type
 	// params, which are already fully concrete by the time `owner` (a real `ClassInfo`) exists at all.
-	function ensureMethod(owner: ClassInfo, name: string, args: Expr[], callerCtx: FuncCtx, typeArgs?: Type[]): FuncInfo | undefined {
-		const decls = owner.methodDecls.get(name);
+	function ensureMethod(owner: ClassInfo, name: string, args: Expr[], callerCtx: FunctionContext, typeArgs?: Type[]): FuncInfo | undefined {
+		const decls		= owner.methodDecls.get(name);
+		const fullName	= `${owner.name}.${name}`;
 		// Not overridden by `owner` itself -- delegate straight to the ancestor's own compiled function
 		// (cached under *its* own key, e.g. `A.greet`, not `owner.name`'s) rather than recompiling a
 		// duplicate copy under `owner`'s name. Sound and free: wasm-GC struct subtyping (`ensureClass`'s own
@@ -4905,10 +4946,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		// statically-resolved `call`, exactly as if there were no inheritance involved at all.
 		if (!decls)
 			return owner.superClass && ensureMethod(owner.superClass, name, args, callerCtx, typeArgs);
-		let decl = resolveOverload(`${owner.name}.${name}`, decls, args, callerCtx);
+		let decl = resolveOverload(fullName, decls, args, callerCtx);
 		// Qualified so it can share `funcs` with plain top-level functions (bare identifiers can't contain
 		// '.') without colliding; only suffixed when there's a real overload set to disambiguate.
-		let key = decls.length > 1 ? `${owner.name}.${name}#${decls.indexOf(decl)}` : `${owner.name}.${name}`;
+		let key = decls.length > 1 ? `${fullName}#${decls.indexOf(decl)}` : fullName;
 
 		// A generic method's own type params (beyond whatever `owner`'s class-level ones already resolved
 		// to, e.g. `class Box<T> { map<U>(f: (t: T) => U): Box<U> {...} }`) -- same composite-key/substitution
@@ -4938,11 +4979,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (existing)
 			return existing;
 		if (!decl.body)
-			throw new Error(`towasm: '${owner.name}.${name}' needs a body (overload signatures are not supported)`);
+			throw new Error(`towasm: '${fullName}' needs a body (overload signatures are not supported)`);
 
 		const result = decl.returnType ? typeOf(decl.returnType) : 'void';
 		if (!result)
-			throw new Error(`towasm: '${owner.name}.${name}' has an unsupported return type`);
+			throw new Error(`towasm: '${fullName}' has an unsupported return type`);
 
 		const params = decl.params.map(p => resolveParam(p));
 		if (decl.rest?.typeAnnotation)
@@ -4959,17 +5000,32 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: decl.params.map(p => p.default), hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
 		funcs.set(key, info);
 		worklist.push(() => {
-			const ctx	= new FuncCtx(new Scope(libGlobal), result, owner);
+			const ctx	= new FunctionContext(key.replace('.', '_').replace('#', '_'), new Scope(libGlobal), plainReturn(result), owner);
 			if (!isStatic)
 				ctx.declareValue('this', thisWtype, owner.thisTsType);
-			if (reassignsThis)
-				ctx.appendThisOnReturn = true;
+			if (reassignsThis) {
+				// A `reassignsThis` method's own (possibly just-updated) `this` rides along as one more
+				// wasm-level result on every return, on top of its ordinary declared result -- see
+				// `assignsToThis`'s own comment for why a method's body doing this at all is this
+				// compiler's own signal to compile it this way.
+				ctx.onReturn = {
+					wtype: () => result === 'void' ? undefined : result,
+					emit(ctx, argument) {
+						if (result === 'void') {
+							if (argument)
+								throw new Error("towasm: a 'void' function cannot return a value");
+						} else if (argument) {
+							emitAs(argument, ctx, result);
+						}
+						ctx.emit(I.local.get(ctx.lookup('this')!.index), I.return);
+					},
+				};
+			}
 			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
 			info.body = ctx.toFuncBody((isStatic ? 0 : 1) + params.length, toValType);
-			info.body.id = key.replace('.', '_').replace('#', '_');
 		});
 		return info;
 	}
@@ -4978,7 +5034,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// reassigning, zero-argument `name` -- the candidate set a dynamic (`any`-typed) dispatch of `name()`
 	// cascades over. Deduped by physical `heapType` (several owners sharing one physical type need only one
 	// `ref.test` arm). `!assignsToThis` excludes a method with no sensible write-back target through a boxed `any` value (`Array<T>.push`/etc).
-	function findAnyDispatchCandidates(name: string, ctx: FuncCtx): { heapType: number; isBoxedScalar: boolean; funcInfo: FuncInfo }[] {
+	function findAnyDispatchCandidates(name: string, ctx: FunctionContext): { heapType: number; isBoxedScalar: boolean; funcInfo: FuncInfo }[] {
 		const found = new Map<number, { heapType: number; isBoxedScalar: boolean; funcInfo: FuncInfo }>();
 		const probe = (owner: ClassInfo | undefined, heapType: number, isBoxedScalar: boolean) => {
 			if (owner && !found.has(heapType) && owner.methodDecls.get(name)?.find(d => d.body && !assignsToThis(d.body) && T.argsFit(T.FixSig(d, T.ANY), [], ctx.scope))) {
@@ -5001,7 +5057,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// A real dynamic-dispatch cascade for `recv.name()` where `recv`'s static type is genuinely `any`.
 	// One shared function per `(name, want)` pair, reserved immediately so call sites can `call` it right away -- but its body can only be built
 	// once the full, final candidate set is known, needing every class ever discovered. `lateWorklist`, drained only once `worklist` has fully emptied, is what guarantees that.
-	function ensureAnyDispatch(name: string, want: WasmType, ctx: FuncCtx): FuncInfo {
+	function ensureAnyDispatch(name: string, want: WasmType, ctx: FunctionContext): FuncInfo {
 		const key = `${name}=>${wasmTypeKey(want)}`;
 		const existing = anyDispatchFuncs.get(key);
 		if (existing)
@@ -5014,7 +5070,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			const candidates = findAnyDispatchCandidates(name, ctx);
 			if (!candidates.length)
 				throw new Error(`towasm: no reachable class (or 'number'/'boolean') declares a matching zero-argument '${name}' -- a dynamic dispatch on 'any' needs at least one real candidate`);
-			const dctx = new FuncCtx(new Scope(libGlobal), want, undefined);
+			const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(want), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY);
 
 			function buildArm(i: number): wasm.Instr[] {
@@ -5036,7 +5092,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			dctx.emit(...buildArm(0));
 			info.body = dctx.toFuncBody(1, toValType);
-			info.body.id = key.replace(/[^a-zA-Z0-9_]/g, '_');
 		});
 		return info;
 	}
@@ -5073,7 +5128,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// One assumption this doesn't verify: every override shares `owner`'s own resolved param/result
 	// `WasmType`s (real TS requires override signatures to stay compatible with the base's, which this
 	// narrow subset takes to mean "the same shape", same trust-the-checker stance as everywhere else here).
-	function ensureVirtualDispatch(owner: ClassInfo, name: string, ctx: FuncCtx): FuncInfo {
+	function ensureVirtualDispatch(owner: ClassInfo, name: string, ctx: FunctionContext): FuncInfo {
 		const key = `${owner.name}.${name}<virtual>`;
 		const existing = anyDispatchFuncs.get(key);
 		if (existing)
@@ -5092,7 +5147,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		funcs.set(`<virtual dispatch>.${key}`, info);
 		lateWorklist.push(() => {
 			const candidates = collectOverridingCandidates(owner, name).map(({ cls }) => ({ cls, funcInfo: ensureMethod(cls, name, [], ctx)! }));
-			const dctx = new FuncCtx(new Scope(libGlobal), base.result, undefined);
+			const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(base.result), undefined);
 			const recv = dctx.declareLocal('$recv', owner.thisWtype!);
 			// Already-evaluated argument values (the caller pushed these against `owner`'s own signature,
 			// not knowing yet which concrete override will run) -- forwarded as-is to whichever `call`
@@ -5121,7 +5176,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			dctx.emit(...buildArm(0));
 			info.body = dctx.toFuncBody(1 + argLocals.length, toValType);
-			info.body.id = key.replace(/[^a-zA-Z0-9_]/g, '_');
 		});
 		return info;
 	}
@@ -5132,15 +5186,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// ===================================================================
 
 	const mod		= new wasm.WasmModule();
-
-	const reached	= reachedNames(ast);
-	mod.imports = LIB_HOST_IMPORTS.filter(hi => reached.has(hi.name)).map(hi => {
-		const params = hi.params.map(p => resolveParam({ key: '', typeAnnotation: p }).wtype);
-		const result = hi.returnType ? typeOf(hi.returnType) ?? 'void' : 'void';
-		const { funcIndex, typeIndex } = registerFunc(toParams(params), toResults(result));
-		funcs.set(hi.name, { params, result, funcIndex, typeIndex });
-		return { module: hi.source, name: hi.name, desc: { kind: 'func', typeIndex, id: undefined } };
-	});
 
 	// A `const name = (...) => ...` (or `= function(...) {...}`) at the top level is, for this
 	// compiler's purposes, exactly as callable-by-name as a real `function` declaration -- it can
@@ -5215,20 +5260,40 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		}
 	}
 
-	// Every class declaration in the whole program (lib + user, generic + not), scanned once for a plain
-	// named `superClass` reference -- shared by two things that each need "the whole program's inheritance
-	// graph" known up front, before any lazy per-class resolution begins: `ensureClass`'s `final` flag
-	// (wasm-GC requires a struct type be declared `final: false` to ever be usable as another's
-	// `supertypes` entry -- can't be decided lazily/after the fact once a class's own type is registered)
-	// and a virtual-dispatch cascade's own candidate set (does ANY class anywhere in the program actually
-	// override a given method -- if not, a plain direct call stays correct and optimal, exactly as without
-	// inheritance at all). Keyed by the bare declared name (never a generic instantiation's composite key)
-	// -- `extends Box`/`extends Box<T>` both reference the same bare name a subclass search needs.
-	const directSubclasses = new Map<string, TS.Class[]>();
-	const everExtended = new Set<string>();
+	// wasm requires every import at the lowest, contiguous function indices, assigned before any local
+	// function claims one -- so "is this host import needed" must be decided up front, before the worklist
+	// first reaches its caller. Deliberately a conservative, name-matching over-approximation, not a precise call-graph simulation -- an unused import is harmless, so this only needs to never *under*-approximate.
+	const reached	= new Set<string>();
+	const pending: string[] = [];
+
+	const collectNames = (node: TS.Statement | TS.Statement[]) => walk(node, undefined, (e, process) => {
+		if (e.type === 'identifier')
+			pending.push(e.name);
+		return process(e);
+	});
+
+	collectNames(ast.body);
+	while (pending.length) {
+		const name = pending.shift()!;
+		if (!reached.has(name)) {
+			reached.add(name);
+			const decl = functionDeclByName.get(name) ?? LIB_DECL_MAP.get(name);
+			if (decl && (decl.type === 'function_decl' || decl.type === 'class_decl'))
+				collectNames(decl);
+		}
+	}
+
+	mod.imports = LIB_HOST_IMPORTS.filter(hi => reached.has(hi.name)).map(hi => {
+		const params = hi.params.map(p => resolveParam({ key: '', typeAnnotation: p }).wtype);
+		const result = hi.returnType ? typeOf(hi.returnType) ?? 'void' : 'void';
+		const { funcIndex, typeIndex } = registerFunc(toParams(params), toResults(result));
+		funcs.set(hi.name, { params, result, funcIndex, typeIndex });
+		return { module: hi.source, name: hi.name, desc: { kind: 'func', typeIndex, id: undefined } };
+	});
+
 	for (const d of [
-		...[...LIB_DECL_MAP.values()].filter((d): d is Extract<typeof d, { type: 'class_decl' }> => d.type === 'class_decl'),
-		...[...userGenericClassDecls.values()].map(d => d as unknown as TS.Class & { name: string }),
+		...[...LIB_DECL_MAP.values()].filter(d => d.type === 'class_decl'),
+		...userGenericClassDecls.values(),
 		...[...classes.values()].map(c => c.decl),
 	]) {
 		const superName = d.superClass?.type === 'identifier' ? d.superClass.name
@@ -5244,36 +5309,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		}
 	}
 
-	// Whether *any* class textually declared anywhere in the program, transitively extending `className`,
-	// declares its own (non-static) `methodName` member -- decided purely from `directSubclasses` (whole-
-	// program source text, known complete up front), not from `classes`'s own lazily/incrementally
-	// populated instantiation set. This is what a method-call site checks (`emitMethodCall`) to decide
-	// whether it needs `ensureVirtualDispatch`'s cascade at all: if nothing overrides `methodName` anywhere
-	// reachable from `className`, a plain direct call (`ensureMethod`, walking up to whichever ancestor
-	// actually defines it) is already correct and optimal, exactly as without inheritance -- the common
-	// case, meant to stay just as cheap as it always was. Memoized: a call site re-asks this for the same
-	// `(className, methodName)` pair often (every call to that method, anywhere in the program).
-	const declaredOverrideCache = new Map<string, boolean>();
-	function hasDeclaredOverride(className: string, methodName: string): boolean {
-		const key = `${className}.${methodName}`;
-		let cached = declaredOverrideCache.get(key);
-		if (cached === undefined) {
-			cached = (directSubclasses.get(className) ?? []).some(sub =>
-				sub.body.some(m => m.type === 'method' && m.key === methodName && !hasMod(m, 'static'))
-				|| hasDeclaredOverride(sub.name!, methodName)
-			);
-			declaredOverrideCache.set(key, cached);
-		}
-		return cached;
-	}
-
 	//top level
 	const {funcIndex, typeIndex} = registerFunc([], []);
 	const info: FuncInfo = {params: [], result: 'void', funcIndex, typeIndex};
 	funcs.set('__toplevel', info);
 	mod.start	= funcIndex;
 	worklist.push(() => {
-		const ctx	= new FuncCtx(new Scope(libGlobal), 'void', undefined);
+		const ctx	= new FunctionContext('__toplevel', new Scope(libGlobal), plainReturn('void'), undefined);
 		ctx.widenedTypes = collectRangeWidenings(ast.body!, ctx.scope);
 		ast.body!.forEach(st => {
 			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl')
@@ -5289,7 +5331,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		});
 		//emitTrailingUnreachable(ctx, result);
 		info.body = ctx.toFuncBody(0, toValType);
-		info.body.id = '__toplevel';
 	});
 
 
@@ -5316,12 +5357,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// top-level class, kept out of the eagerly-seeded `classes` map for the same reason) -- only a real call
 	// site (`ensureGenericFunc`) can ever produce a concrete instantiation, so an *exported* generic function
 	// (no fixed signature to give the export) is a real error, not silently skipped.
-	for (const f of functionDeclByName) {
-		if (!exportedNames.has(f[0]))
+	for (const [name, decl] of functionDeclByName) {
+		if (!exportedNames.has(name))
 			continue;
-		if (f[1].typeParams?.length)
-			throw new Error(`towasm: exported function '${f[0]}' is generic -- a generic function has no single fixed signature to export`);
-		compileFunc(f[0], f[1]);
+		if (decl.typeParams?.length)
+			throw new Error(`towasm: exported function '${name}' is generic -- a generic function has no single fixed signature to export`);
+		const info = compileFunc(name, decl);
+		if (info)
+			(mod.exports??=[]).push({ name, kind: 'func', index: info.funcIndex });
 	}
 
 	while (worklist.length)
@@ -5397,33 +5440,25 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		(mod.exports ??= []).push({ name: 'memory', kind: 'memory', index: 0 });
 	}
 	
-	
-	function constGlobalInit(name: string, init: Expr | undefined, wtype: WasmType): wasm.Instr[] {
-		if (init && isNullLiteral(init)) {
-			if (typeof wtype === 'string' || !wtype.nullable)
-				throw new Error(`towasm: global '${name}' can't be initialized to 'null'/'undefined' -- its type isn't nullable`);
-			return [I.ref.null(heapTypeIndexOf(wtype))];
-		}
-		if (init?.type === 'literal') {
-			if (typeof init.value === 'number') {
-				switch (wtype) {
-					case 'i32': case 'u32': return [I.i32.const(init.value)];
-					case 'i64': return [I.i64.const(BigInt(init.value))];
-					case 'f32': return [I.f32.const(init.value)];
-					case 'f64': return [I.f64.const(init.value)];
-				}
-			} else if (typeof init.value === 'boolean' && wtype === 'i32') {
-				return [I.i32.const(init.value ? 1 : 0)];
-			} else if (typeof init.value === 'bigint' && wtype === 'i64') {
-				return [I.i64.const(init.value)];
+	mod.globals			= Array.from(globals.entries()).map(([name, {init, wtype, mut}]) => {
+		if (init) {
+			const type = { mut, type: toValType(wtype) };
+			if (isNullLiteral(init)) {
+				if (typeof wtype === 'string' || !wtype.nullable)
+					throw new Error(`towasm: global '${name}' can't be initialized to 'null'/'undefined' -- its type isn't nullable`);
+				return {type, init: [I.ref.null(heapTypeIndexOf(wtype))]};
+			}
+			const wtype2 = notUnsigned(scalarKind(wtype));
+			if (wtype2 && init?.type === 'literal') {
+				if (typeof init.value === 'number' || typeof init.value === 'boolean')
+					return {type, init: [I[wtype2](+init.value)]};
+				if (typeof init.value === 'bigint' && wtype2 === 'i64')
+					return {type, init: [I[wtype2](init.value)]};
 			}
 		}
 		throw new Error(`towasm: global '${name}' needs a compile-time-constant initializer`);
-	}
-	mod.globals			= Array.from(globals.entries()).map(([name, g]) => ({
-		type: { mut: g.mut, type: toValType(g.wtype) },
-		init: constGlobalInit(name, g.init, g.wtype),
-	}));
+	});
+
 	mod.datas			= [{ mode: 'passive', bytes: data }];
 	if (tags.length)
 		mod.tags		= tags;
@@ -5431,13 +5466,6 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Every closure literal's `funcIndex` is taken by `ref.func` at its creation site -- wasm requires any function referenced that way to be "declared" first, which a declarative element segment satisfies.
 	if (closureLiterals.length)
 		mod.elements = [{ mode: 'declarative', reftype: { ref: 'func', nullable: true }, funcIndices: closureLiterals.map(info => info.funcIndex) }];
-
-	for (const outer of ast.body) {
-		if (outer.type !== 'export_decl')
-			continue;
-		for (const name of exportedFuncNames(outer.declaration))
-			(mod.exports??=[]).push({ name, kind: 'func', index: funcs.get(name)!.funcIndex });
-	}
 
 	return mod;
 }
