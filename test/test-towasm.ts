@@ -1,10 +1,16 @@
 import assert from 'assert';
 import fs from 'fs/promises';
 import path from 'path';
+import v8 from 'v8';
 import * as TS from '../src/examples/TS/ts-parser';
 import { TStoWasm, makeLibScope } from '../src/examples/TS/towasm';
 import { TStypeCheck } from '../src/examples/TS/transform';
 import { SEVERITY } from '../src/examples/TS/checker';
+
+// `try`/`catch` compiles to the exnref/try_table exception-handling proposal (Wasm 3.0), which
+// this Node's V8 doesn't enable by default -- must be set before the first `WebAssembly.Module`
+// compile below. See the towasm exceptions design memory for how this was confirmed necessary.
+v8.setFlagsFromString('--experimental-wasm-exnref');
 
 const parser = TS.make();
 // Built once, reused across every `compile()` call below -- same lib declarations either way.
@@ -2692,6 +2698,312 @@ async function main() {
 		check("'f64'->'i32' coercion of '+Infinity' never traps", divByZero(5), 2147483647);
 		check("'f64'->'i32' coercion of '-Infinity' never traps", divByZeroNeg(5), -2147483648);
 		check("'f64'->'i32' coercion of 'NaN' never traps", divNaN(), 0);
+	}
+
+	{
+		const { noThrow, caught, uncaughtValue, noBinding, nested, returnsFromTry, breaksFromTry } = await compile(`
+			export function noThrow(): number {
+				let r = 0;
+				try {
+					r = 1;
+				} catch (e) {
+					r = 2;
+				}
+				return r;
+			}
+			export function caught(): number {
+				try {
+					throw 42;
+				} catch (e) {
+					return e;
+				}
+			}
+			export function uncaughtValue(): number {
+				throw 99;
+			}
+			export function noBinding(): number {
+				try {
+					throw 1;
+				} catch {
+					return 2;
+				}
+			}
+			export function nested(): number {
+				try {
+					try {
+						throw 5;
+					} catch (e) {
+						throw 6;
+					}
+				} catch (e) {
+					return e;
+				}
+			}
+			export function returnsFromTry(): number {
+				try {
+					return 7;
+				} catch (e) {
+					return -1;
+				}
+			}
+			export function breaksFromTry(): number {
+				let i = 0;
+				while (i < 10) {
+					try {
+						if (i === 3)
+							break;
+					} catch (e) {}
+					i = i + 1;
+				}
+				return i;
+			}
+		`);
+		check("try/catch: no throw -- catch doesn't run", noThrow(), 1);
+		check('try/catch: caught value round-trips', caught(), 42);
+		check("try/catch: 'catch' with no binding", noBinding(), 2);
+		check('try/catch: nested -- inner rethrow reaches outer catch', nested(), 6);
+		check("try/catch: 'return' inside 'try' exits the function", returnsFromTry(), 7);
+		check("try/catch: 'break' inside 'try' crosses it to the enclosing loop", breaksFromTry(), 3);
+		try {
+			uncaughtValue();
+			++failures;
+			console.error('FAIL - try/catch: an uncaught throw propagates out: expected a throw, got none');
+		} catch (e) {
+			check('try/catch: an uncaught throw propagates out as a real WebAssembly.Exception', e instanceof WebAssembly.Exception, true);
+		}
+	}
+
+	{
+		const {
+			finallyOnly, finallyUncaught, catchFinallyNormal, catchFinallyCaught,
+			returnThroughFinally, finallyOverridesReturn, breakThroughFinally, continueThroughFinally,
+			nestedFinally, catchThrowsFinallyRuns, __consoleOutput,
+		} = await compile(`
+			export function finallyOnly(): number {
+				let r = 0;
+				try {
+					r = 1;
+				} finally {
+					r = r + 10;
+				}
+				return r;
+			}
+			export function finallyUncaught(): number {
+				try {
+					throw 1;
+				} finally {
+					console.log(777);
+				}
+				return 0;
+			}
+			export function catchFinallyNormal(): number {
+				let r = 0;
+				try {
+					r = 1;
+				} catch (e) {
+					r = 2;
+				} finally {
+					r = r + 100;
+				}
+				return r;
+			}
+			export function catchFinallyCaught(): number {
+				let r = 0;
+				try {
+					throw 5;
+				} catch (e) {
+					r = e;
+				} finally {
+					r = r + 100;
+				}
+				return r;
+			}
+			export function returnThroughFinally(): number {
+				try {
+					return 7;
+				} finally {
+					console.log(888);
+				}
+			}
+			export function finallyOverridesReturn(): number {
+				try {
+					return 7;
+				} finally {
+					return 9;
+				}
+			}
+			export function breakThroughFinally(): number {
+				let i = 0;
+				while (i < 10) {
+					try {
+						if (i === 3)
+							break;
+					} finally {
+						console.log(i);
+					}
+					i = i + 1;
+				}
+				return i;
+			}
+			export function continueThroughFinally(): number {
+				let i = 0;
+				let sum = 0;
+				while (i < 5) {
+					i = i + 1;
+					try {
+						if (i % 2 === 0)
+							continue;
+					} finally {
+						sum = sum + 1;
+					}
+					sum = sum + 100;
+				}
+				return sum;
+			}
+			export function nestedFinally(): number {
+				try {
+					try {
+						throw 1;
+					} finally {
+						console.log(1);
+					}
+				} catch (e) {
+					console.log(2);
+				} finally {
+					console.log(3);
+				}
+				return 0;
+			}
+			export function catchThrowsFinallyRuns(): number {
+				try {
+					try {
+						throw 1;
+					} catch (e) {
+						throw 2;
+					} finally {
+						console.log(9);
+					}
+				} catch (e) {
+					return e;
+				}
+			}
+		`);
+		check("finally: no 'catch' -- runs on the normal path", finallyOnly(), 11);
+		check("finally: 'catch'+'finally' -- normal path runs 'finally' too", catchFinallyNormal(), 101);
+		check("finally: 'catch'+'finally' -- caught path runs 'finally' too", catchFinallyCaught(), 105);
+		check("finally: 'return' inside 'try' keeps its own value through 'finally'", returnThroughFinally(), 7);
+		check('finally: console output ran before the deferred return', __consoleOutput.includes('888\n'), true);
+		check("finally: a 'return' inside 'finally' overrides 'try's own pending return", finallyOverridesReturn(), 9);
+		check("finally: 'break' inside 'try' still runs 'finally' on every iteration, including the break", breakThroughFinally(), 3);
+		check("finally: 'continue' inside 'try' still runs 'finally' every time", continueThroughFinally(), 305);
+		check('nested try/finally: inner finally, then outer catch, then outer finally, in order',
+			__consoleOutput.filter(s => s === '1\n' || s === '2\n' || s === '3\n').join(''), '1\n2\n3\n');
+		check("finally: 'finally' still runs even when the 'catch' handler itself throws", catchThrowsFinallyRuns(), 2);
+		check("finally: 'finally' body itself ran despite 'catch' rethrowing", __consoleOutput.includes('9\n'), true);
+		try {
+			finallyUncaught();
+			++failures;
+			console.error("FAIL - finally: an uncaught throw still runs 'finally' first: expected a throw, got none");
+		} catch (e) {
+			check("finally: an uncaught throw still runs 'finally' first", __consoleOutput.includes('777\n') && e instanceof WebAssembly.Exception, true);
+		}
+	}
+
+	{
+		// 'try'/'finally' inside a generator/async function, a constructor, or a `reassignsThis` method --
+		// each of those redefines what a plain `return` actually means (IteratorResult/Promise
+		// resolution/appended `this`, see `returnValueWtype`), so the redirect-through-'finally' mechanism
+		// needs to reconstruct the *right* one once 'finally' has run, not just a generic wasm return.
+		const { driveGenFinally, __consoleOutput: genOutput } = await compile(`
+			function* genWithFinally(): Generator<number, number, number> {
+				yield 1;
+				try {
+					return 42;
+				} finally {
+					console.log(555);
+				}
+			}
+			export function driveGenFinally(): number {
+				const g = genWithFinally();
+				const a = g.next(0);
+				const b = g.next(0);
+				return a.value + b.value * 1000 + (b.done ? 1000000 : 0);
+			}
+		`);
+		check("finally: inside a generator -- 'return' still yields the try's own value via the IteratorResult protocol", driveGenFinally(), 1042001);
+		check("finally: inside a generator -- 'finally' itself still ran", genOutput.includes('555\n'), true);
+
+		const { asyncFinallyTest } = await compile(`
+			let output: number = 0;
+			let finallyRan: number = 0;
+			async function addOneFinally(p: Promise<number>): Promise<number> {
+				const v = await p;
+				try {
+					return v + 1;
+				} finally {
+					finallyRan = 1;
+				}
+			}
+			async function observe(p: Promise<number>): Promise<number> {
+				const v = await addOneFinally(p);
+				output = v;
+				return v;
+			}
+			export function asyncFinallyTest(): number {
+				const p = new Promise<number>(0);
+				p.resolve(41);
+				const result = observe(p);
+				return output * 10 + finallyRan;
+			}
+		`);
+		check("finally: inside an async function -- 'return' still resolves the try's own value through 'finally'", asyncFinallyTest(), 421);
+
+		const { testCtorFinally } = await compile(`
+			class Widget {
+				v: number;
+				constructor(v: number) {
+					try {
+						this.v = v;
+						if (v < 0) {
+							this.v = 0;
+							return;
+						}
+					} finally {
+						this.v = this.v + 1000;
+					}
+				}
+			}
+			export function testCtorFinally(): number {
+				const w1 = new Widget(5);
+				const w2 = new Widget(-5);
+				return w1.v * 1000000 + w2.v;
+			}
+		`);
+		check("finally: inside a constructor -- an early 'return' still runs 'finally' before implicitly returning 'this'", testCtorFinally(), 1005001000);
+
+		const { testReassignThisFinally } = await compile(`
+			class Counter {
+				n: number;
+				constructor(n: number) { this.n = n; }
+				bump(): number {
+					const result = new Counter(this.n + 1);
+					try {
+						// @ts-expect-error - tison extension: reassigning 'this' swaps the receiver
+						this = result;
+						return this.n;
+					} finally {
+						this.n = this.n + 100;
+					}
+				}
+			}
+			export function testReassignThisFinally(): number {
+				let c = new Counter(5);
+				const r = c.bump();
+				return r * 1000 + c.n;
+			}
+		`);
+		check("finally: inside a 'reassignsThis' method -- the return value is fixed early, but the appended (caller-visible) 'this' still reflects 'finally's later mutation",
+			testReassignThisFinally(), 6106);
 	}
 
 	{

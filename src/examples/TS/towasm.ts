@@ -16,7 +16,10 @@ import * as WAT from '../wat-parser';
 // an item under a category is either a whole missing construct or the one unsupported edge of an
 // otherwise-working one -- never a description of what does work.
 //  - Control flow:
-//    - exceptions (try/catch/throw/finally)
+//    - a suspend point ('yield'/'await') directly inside a 'try' -- a separate, permanent scope
+//      boundary (see the Async section below), unrelated to try/catch/throw/finally themselves,
+//      which are fully supported everywhere else, including inside a generator/async function, a
+//      constructor, or a 'reassignsThis' method
 //    - labeled break/continue
 //    - for-in
 //    - for-of over a string or a general iterable
@@ -31,7 +34,10 @@ import * as WAT from '../wat-parser';
 //    - 'Promise.race'/'Promise.any'/'Promise.allSettled' (only 'Promise.all' exists)
 //    - the standard 'new Promise((resolve, reject) => ...)' executor form ('resolve' is a plain
 //      public method on this compiler's 'Promise<T>' instead)
-//    - rejection/'.catch' (no try/catch exists yet either, a separate pre-existing gap)
+//    - Promise rejection/'.catch' -- this compiler's 'Promise<T>' has no rejected state at all, so
+//      there's nothing yet for a real 'try'/'catch' to observe even where one could otherwise wrap
+//      an 'await' (which it still can't -- a suspend point directly inside a 'try' is its own,
+//      separate, permanent boundary, listed under Control flow above)
 //    - a generic async or generator function
 //    - an async function or generator nested inside another closure, capturing that enclosing
 //      function's own free variables (its own params/locals are captured into its frame fine --
@@ -77,6 +83,11 @@ import * as WAT from '../wat-parser';
 //      during generic instantiation stays stuck with it) leaves the alias unresolved at the call site
 //      even though the same alias resolves fine as a plain variable's declared type; bind the element
 //      to a local first ('const f = arr[i]; f(x);', which 'for...of' already does for you) instead
+//    - narrowing an 'any'-typed value (e.g. a caught 'catch(e)') down to a concrete class via 'as'
+//      for a subsequent field/method access -- 'unwrapAs' deliberately discards an 'as' cast's
+//      asserted type for every codegen-facing owner/field lookup (real narrowing only ever comes
+//      from the checker's own control-flow narrowing), and this compiler has no 'instanceof' at all
+//      to drive that; there is currently no way to narrow a caught 'any' down to a concrete class
 //  - Numbers:
 //    - an i32/u32-targeted float-to-int coercion (bitwise ops, an explicit i32/u32-typed local, etc.)
 //      of a non-finite (NaN/+-Infinity) or huge finite f64 value doesn't replicate real JS's exact
@@ -142,12 +153,13 @@ const LIB_HOST_IMPORTS: HostImport[] = (() => {
 
 // `void` is only valid as a function result, never a param/local/field.
 // `u32` is not a real wasm type -- tracks "unsigned i32" so coerceTop picks convert_i32_u vs _s.
-type WasmScalar0	= 'i32' | 'i64' | 'f32' | 'f64'
-type WasmScalar		= WasmScalar0 | 'u32' | 'u64'
-type wasmElement	= WasmScalar | 'i16' | 'i8' | 'ref';
+type WasmScalarI	= 'i32' | 'i64' | 'f32' | 'f64'
+type WasmScalar		= WasmScalarI | 'u32' | 'u64'
+type WasmElement	= WasmScalarI | 'i8' | 'i16' | 'ref';
+//type WasmElement	= WasmElementI | 'u8' | 'u16' | 'u32' | 'u64' | 'ref';
 type WasmType		= WasmScalar | 'void'
 	| { ref: string; nullable?: boolean }
-	| { arr: wasmElement; nullable?: boolean }
+	| { arr: WasmElement; nullable?: boolean }
 	| { closure: FuncSig; nullable?: boolean }
 	| { typeIndex: number; nullable?: boolean }
 	// A boxed nullable primitive ('number | null'/'boolean | null'): a real class/closure env struct
@@ -157,19 +169,18 @@ type WasmType		= WasmScalar | 'void'
 	| { typeIndex: number; nullable?: boolean; primKind: 'f64' | 'i32' };
 
 // Shared singletons -- ctx.local compares WasmType by object identity
-const ARR_WTYPE: Record<wasmElement, WasmType> = {
+const ARR_WTYPE: Record<WasmElement, WasmType> = {
 	i8: { arr: 'i8' },
 	i16: { arr: 'i16' },
 	i32: { arr: 'i32' },
 	i64: { arr: 'i64' },
-	u32: { arr: 'u32' },
-	u64: { arr: 'u64' },
 	f32: { arr: 'f32' },
 	f64: { arr: 'f64' },
 	ref: { arr: 'ref' },
 };
 const REF_ANY: WasmType = { ref: 'any' };
 const REF_ANY_NULLABLE: WasmType = { ref: 'any', nullable: true };
+const REF_EXN: WasmType = { ref: 'exn', nullable: true };
 
 // The plain scalar kind a value acts as for arithmetic/comparison dispatch -- unwraps a boxed
 // nullable primitive the same way `coerceTop` does, or passes a bare scalar through unchanged.
@@ -177,8 +188,8 @@ const REF_ANY_NULLABLE: WasmType = { ref: 'any', nullable: true };
 function scalarKind(wtype: WasmType | undefined): WasmScalar | undefined {
 	return typeof wtype === 'string' ? (wtype !== 'void' ? wtype : undefined) : wtype && unboxedPrimitive(wtype)?.kind;
 }
-function notUnsigned(wtype: WasmScalar | undefined): WasmScalar0  | undefined {
-	return wtype === 'u32' ? 'i32' : wtype === 'u64' ? 'i64' : wtype;
+function notUnsigned(wtype: WasmScalar | undefined): WasmScalarI  | undefined {
+	return wtype === 'u32' ?  'i32' : wtype === 'u64' ? 'i64' : wtype;
 }
 // If `wtype` is a boxed nullable primitive (see `nullableWtype`/`ensureBoxType`), its underlying
 // scalar kind and box type index; otherwise `undefined` (a real class/array/closure-env-struct, or
@@ -221,11 +232,11 @@ function intWasmType(min: number, max: number): WasmType {
 // `i8`/`u8` checked by name before `wasmTypeOf` (which would otherwise resolve either straight through to
 // plain `number`/`f64`, same as `builtinTypes`'s own before-`T.resolve` pseudo-type checks) -- the one place
 // this project needs a genuine packed-byte GC array (`ArrayBuffer`'s backing store, see `lib/typedarray.ts`).
-function arrayElemKind(elemType: Type, global: Scope): 'f64' | 'i32' | 'u32' | 'i8' | 'ref' | undefined {
+function arrayElemKind(elemType: Type, global: Scope): 'f64' | 'i32' | 'i8' | 'ref' | undefined {
 	if (elemType.type === 'ref' && !elemType.typeArgs && (elemType.name === 'i8' || elemType.name === 'u8'))
 		return 'i8';
 	const we = wasmTypeOf(elemType, global);
-	return we === 'i32' || we === 'f64' || we === 'u32' ? we : 'ref';
+	return we === 'i32' || we === 'f64' ? we : we === 'u32' ? 'i32' : 'ref';
 }
 
 // Checks builtinTypes before T.resolve to avoid expanding a hoisted class name and losing it.
@@ -323,6 +334,7 @@ interface ClassInfo extends MethodOwner {
 }
 
 interface Local			{ wtype: WasmType, index: number; }
+type Global				= Local & {init: Expr, mut: boolean}
 interface ResolvedParam { key: BindingTarget; wtype: WasmType; tsType: Type }
 
 class FuncCtx {
@@ -372,6 +384,15 @@ class FuncCtx {
 	// function's own result Promise with `expr`, then a bare wasm `return`", not an ordinary return of
 	// `expr` (the step function's own real wasm result type is always `void` -- see `compileAsyncFunc`).
 	asyncFrame?: { frameLocal: Local; frameTypeIndex: number; resultPromiseField: number; promiseClass: ClassInfo; rWtype: WasmType };
+	// Pushed by `case 'try'` while compiling a `try`/`catch` that has a `finally` -- `case 'return'`/
+	// `case 'break'`/`case 'continue'` check this first (innermost guard, same convention as
+	// `generatorFrame`/`asyncFrame`): real JS semantics require `finally` to run before any of them
+	// actually completes, so one whose real target lies outside this specific `try`/`finally`'s own span
+	// stashes its payload and branches to the shared landing point instead of exiting directly. Popped
+	// before that landing point's own re-dispatch code is built, so a statement synthesized there
+	// naturally falls through to the next-outer guard (or ordinary behavior once none remain) --
+	// composes for nested `try`/`finally` without any extra bookkeeping.
+	finallyGuards: { actionLocal: Local; returnValueLocal?: Local; exnLocal: Local; breakTargetsLenAtEntry: number; continueTargetsLenAtEntry: number; landingDepth: number }[] = [];
 
 	constructor(public scope: Scope, public result: WasmType, public owner: ClassInfo | undefined) {}
 
@@ -393,7 +414,7 @@ class FuncCtx {
 	}
 
 	// more WAT labels with no `break`/`continue` targets of their own
-	enterLabel(n = 1)		{ this.depth += n; }
+	enterLabel(n = 1)		{ return this.depth += n; }
 	exitLabel(n = 1)		{ this.depth -= n; }
 
 	// A loop or switch's enclosing block -- what `break` (with no label) branches to.
@@ -407,6 +428,7 @@ class FuncCtx {
 	// Opens a new lexical scope
 	openScope() {
 		this.scopeStack.push(this.declared.length);
+		return this;
 	}
 
 	// Closes the innermost open scope: every declaration made since its `openScope` becomes invisible to
@@ -427,6 +449,7 @@ class FuncCtx {
 					this.freeSlots.set(key, [d.local.index]);
 			}
 		}
+		return this;
 	}
 
 	// a still-visible same-name entry is reused rather than rejected
@@ -725,7 +748,7 @@ function instantiateAsmBody(generic: WAT.ParsedAsmBody, type: 'i32' | 'i64' | 'f
 	return process(generic.body) ? { locals, body } : undefined;
 }
 
-function makeAsm(key: string, value: Expr | undefined, builtin: string, index: number, elemKind?: wasmElement, elemType?: Type, elemDefine?: TypedArrayTag): Builtin<Inline> | undefined {
+function makeAsm(key: string, value: Expr | undefined, builtin: string, index: number, elemKind?: WasmElement, elemType?: Type, elemDefine?: TypedArrayTag): Builtin<Inline> | undefined {
 	try {
 		const	call	= value as JS.Call<Type>;
 		let		asm		= (call.arguments[0] as Literal<string | JS.TemplatePart<Expr>[]>).value;
@@ -876,7 +899,7 @@ function reachedNames(program: TS.Program): Set<string> {
 	return reached;
 }
 
-function scanInlineMethods(decl: TS.Class, builtin: string, index: number, elemKind?: wasmElement, elemType?: Type, elemDefine?: TypedArrayTag) {
+function scanInlineMethods(decl: TS.Class, builtin: string, index: number, elemKind?: WasmElement, elemType?: Type, elemDefine?: TypedArrayTag) {
 	const inlineDecls: { key: string; value: Expr }[] = [];
 	const asmMethodKeys = new Set<string>();
 
@@ -947,7 +970,7 @@ const builtinTypes: Record<string, { wtype: WasmType; class?: string }> = {
 	Number:		{ wtype: 'f64', 			class: 'Number' },
 	string:		{ wtype: ARR_WTYPE.i16,		class: 'String' },
 	String:		{ wtype: ARR_WTYPE.i16,		class: 'String' },
-	bigint:		{ wtype: ARR_WTYPE.u32,		class: 'BigInt' },
+	bigint:		{ wtype: ARR_WTYPE.i32,		class: 'BigInt' },
 	// Pseudo-types from `lib.d.ts` (`declare type i32 = number`, etc) -- real wasm value types, for a field/method whose storage isn't the usual `number`->`f64` mapping (see `lib/typedarray.ts`'s `Uint8Array`).
 	i32:		{ wtype: 'i32' },
 	i64:		{ wtype: 'i64' },
@@ -1195,25 +1218,15 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	let data				= new Uint8Array(0);
 	const strings			= new Map<string, number>;
-
-	type Global = Local & {init: Expr, mut: boolean}
 	const globals			= new Map<string, Global>;
-	// Real declared initializer, and whether it's a `const` (vs `let`), per global (by name), consumed
-	// once at the very end to build `mod.globals`'s own `init`/`mut` -- see `constGlobalInit`. Keyed
-	// separately from `globals` since `Local` (locals and globals share that shape) has no notion of
-	// an initializer or of `const`-ness at all.
-	//const globalInits		= new Map<string, Expr>();
-	//const globalMut			= new Map<string, boolean>();
 
 	let forTempCounter			= 0;
 	let destructureTempCounter	= 0;
 	let optionalTempCounter 	= 0;
 	let switchTempCounter		= 0;
 
-	// `func`/`array` are structurally deduped 
-	// `struct` needs to maintain distinctness for `ref.test`-based dispatch
 	const types: wasm.SubType[] = [];
-	const typeMap = new Map<string, number>();
+	const typeMap			= new Map<string, number>();
 	function addType(type: wasm.SubType): number {
 		return types.push(type) - 1;
 	}
@@ -1228,12 +1241,22 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return typeIndex;
 	}
 
-	function ensureArrayType(kind: wasmElement): number {
-		return registerType({ final: true, supertypes: [], type: { kind: 'array', field: { type: kind === 'ref' ? { ref: 'any', nullable: true } : kind === 'i8' ? 'i8' : kind === 'u32' ? 'i32' : kind as NumericType, mut: true } } });
+	function ensureArrayType(kind: WasmElement): number {
+		return registerType({ final: true, supertypes: [], type: { kind: 'array', field: { type: kind === 'ref' ? { ref: 'any', nullable: true } : kind, mut: true } } });
 	}
 	function ensureBoxType(kind: 'f64' | 'i32'): number {
 		return registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } });
 	}
+
+	// One project-wide exception tag, `(anyref) -> ()` -- JS/TS `catch(e)` is untyped and catches any thrown value regardless of its real TS type, so there's no reason for more than one tag
+	const tags: wasm.TagType[] = [];
+	let exceptionTagIndex: number | undefined;
+	function ensureExceptionTag(): number {
+		if (exceptionTagIndex === undefined)
+			exceptionTagIndex = tags.push({ attribute: 0, typeIndex: registerFuncType(toParams([REF_ANY]), []) }) - 1;
+		return exceptionTagIndex;
+	}
+
 	function nullableWtype(base: WasmType): WasmType {
 		if (typeof base !== 'string')
 			return { ...base, nullable: true };
@@ -1335,8 +1358,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		}
 		if (resolved.type === 'function')
 			return closureFuncSigType(resolved);
-		// An already-cached class (any ref resolves here once seen, generic or not -- `String` is non-generic
-		// so it only ever goes through this path). Same `ownerThisType` delegation as the generic branch above -- an array-backed class's real `WasmType` is `{arr:kind}`, not the generic `{ref:name}`.
+
 		if (t.type === 'ref') {
 			const cls = ensureClass(t.name);
 			if (cls)
@@ -1410,7 +1432,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	}
 
 	// The array-kind (`{arr}`) a value expression resolves to, or `undefined` if it isn't one.
-	function arrayKindOf(e: Expr, ctx: FuncCtx): wasmElement | undefined {
+	function arrayKindOf(e: Expr, ctx: FuncCtx): WasmElement | undefined {
 		const wt = wtypeOf(e, ctx);
 		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : undefined;
 	}
@@ -1437,7 +1459,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				return { wtype: sig.result, owner };
 
 			const kind = arrayKindOf(e.object, ctx);
-			if (kind === 'f64' || kind === 'i32' || kind === 'u32')
+			if (kind === 'f64' || kind === 'i32'/* || kind === 'u32'*/)
 				return { wtype: kind, owner };
 			if (!T.isAny(t))
 				return { wtype: typeOf(t), owner };
@@ -1541,10 +1563,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (typeof w === 'string')
 			return w;
 		if ('ref' in w) {
-			// `any` is wasm's own abstract heap type (a real string, not a type-section index) -- a real
-			// local declared `{ref:'any'}` needs this to resolve directly, not have `ensureClass` treat "any" as an unknown user class name.
-			if (w.ref === 'any')
-				return { ref: 'any', nullable: !!w.nullable };
+			// `any`/`exn` are wasm's own abstract heap types (real strings, not type-section indices) --
+			// resolve directly, not have `ensureClass` treat either as an unknown user class name.
+			if (w.ref === 'any' || w.ref === 'exn')
+				return { ref: w.ref, nullable: !!w.nullable };
 			// Lazy like every other class use -- a not-yet-reached class still needs a real `typeIndex` now, not the stale `-1` `classes` seeded it with.
 			const cls = ensureClass(w.ref);
 			if (!cls)
@@ -1717,8 +1739,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 		}
 		// generate bigint -- must track `bigint`'s own physical representation (`builtinTypes.bigint.wtype`, currently `{arr:'u32'}`, see `lib/bigint.ts`), not assume a fixed `{arr:'i32'}`.
-		if (wasmTypeEq(want, ARR_WTYPE.u32)) {
-			const array = I.array(ensureArrayType('u32'));
+		if (wasmTypeEq(want, ARR_WTYPE.i32)) {
+			const array = I.array(ensureArrayType('i32'));
 
 			switch (got) {
 				case 'i32': case 'u32':
@@ -1743,9 +1765,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					ctx.emit(I.f64.promote_f32);
 					//fall through
 				case 'f64': {
-					const tmp64 = ctx.temp('$tmp64', 'i64');
-					const exp = ctx.temp('$exp', 'i32');
-					const arr = ctx.temp('$exp', {arr: 'u32'});
+					const tmp64	= ctx.temp('$tmp64', 'i64');
+					const exp	= ctx.temp('$exp', 'i32');
+					const arr	= ctx.temp('$exp', ARR_WTYPE.i32);
 					ctx.emit(I.local.tee(tmp64));
 					// get exponent
 					ctx.emit(I.i64.reinterpret_f64, I.i64(53), I.i64.shr_u, I.i32.wrap_i64, I.i32(0x7ff), I.i32.and, I.i32(1023), I.i32.add, I.local.tee(exp));
@@ -1838,7 +1860,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Shared by array literals and `new Uint8Array([...])` -- both coerce every plain element to `want`,
 	// a hole (`emitDefaultValue`, above) included. A spread element forces the slower
 	// `emitArrayElementsWithSpread` path (runtime length, not `array.new_fixed`'s compile-time count).
-	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FuncCtx, want: WasmType, kind: wasmElement, typeIndex: number): void {
+	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FuncCtx, want: WasmType, kind: WasmElement, typeIndex: number): void {
 		if (elements.some(el => el?.type === 'spread')) {
 			// A `[...]` array literal with at least one spread element. Every element is evaluated exactly once, in
 			// source order, into a scratch local before anything is allocated (side effects must not run twice). The real array is then `array.new_default`-allocated to the true runtime total and filled in a second pass.
@@ -3113,6 +3135,36 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	//  Statement lowering
 	// ===================================================================
 
+	// A `break`/`continue`'s own real target lies *inside* the innermost active `finallyGuards` entry
+	// (not crossing it) when a loop/switch was opened after entering that guard's own `try` -- one
+	// nested entirely within the `try` isn't escaping anything, so it must compile as an ordinary
+	// `break`/`continue`, not redirect through `finally`. Returns the guard to redirect through, or
+	// `undefined` if this exit should compile normally.
+	function finallyGuardFor(ctx: FuncCtx, kind: 'break' | 'continue'): FuncCtx['finallyGuards'][number] | undefined {
+		const guard = ctx.finallyGuards.at(-1);
+		if (!guard)
+			return undefined;
+		const lenAtEntry	= kind === 'break' ? guard.breakTargetsLenAtEntry : guard.continueTargetsLenAtEntry;
+		const targets		= kind === 'break' ? ctx.breakTargets : ctx.continueTargets;
+		return targets.length <= lenAtEntry ? guard : undefined;
+	}
+
+	// The real wasm type a `return`'s own argument needs, in whatever context `ctx` is currently
+	// compiling -- exactly mirrors `case 'return'`'s own dispatch (generatorFrame/asyncFrame's own
+	// `rWtype`, never `ctorThis`'s -- a constructor's return never carries a value -- and `ctx.result`
+	// otherwise, or `undefined` for a 'void' function). A `case 'try'` guard's own stashed-return local
+	// uses this, so the redispatch that later re-invokes `case 'return'` for real reconstructs whichever
+	// of those shapes actually applies, correctly, regardless of what triggered the intercepted return.
+	function returnValueWtype(ctx: FuncCtx): WasmType | undefined {
+		if (ctx.generatorFrame)
+			return ctx.generatorFrame.rWtype;
+		if (ctx.asyncFrame)
+			return ctx.asyncFrame.rWtype;
+		if (ctx.ctorThis || ctx.result === 'void')
+			return undefined;
+		return ctx.result;
+	}
+
 	function emitStmt(s: Statement, ctx: FuncCtx): void {
 		switch (s.type) {
 			case 'block':
@@ -3270,23 +3322,53 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(_old))]));
 				return;
 			}
-			case 'continue':
+			case 'continue': {
 				if (s.label)
 					throw new Error("towasm: labeled 'continue' is not supported");
 				if (!ctx.continueTargets.length)
 					throw new Error("towasm: 'continue' outside of a loop");
-				ctx.emit(I.br(ctx.depth - ctx.continueTargets.at(-1)!));
+				const guard = finallyGuardFor(ctx, 'continue');
+				if (guard)
+					ctx.emit(I.i32.const(3), I.local.set(guard.actionLocal.index), I.br(ctx.depth - guard.landingDepth));
+				else
+					ctx.emit(I.br(ctx.depth - ctx.continueTargets.at(-1)!));
 				return;
+			}
 
-			case 'break':
+			case 'break': {
 				if (s.label)
 					throw new Error("towasm: labeled 'break' is not supported");
 				if (!ctx.breakTargets.length)
 					throw new Error("towasm: 'break' outside of a loop or switch");
-				ctx.emit(I.br(ctx.depth - ctx.breakTargets.at(-1)!));
+				const guard = finallyGuardFor(ctx, 'break');
+				if (guard)
+					ctx.emit(I.i32.const(2), I.local.set(guard.actionLocal.index), I.br(ctx.depth - guard.landingDepth));
+				else
+					ctx.emit(I.br(ctx.depth - ctx.breakTargets.at(-1)!));
 				return;
+			}
 
-			case 'return':
+			case 'return': {
+				const guard = ctx.finallyGuards.at(-1);
+				if (guard) {
+					// `guard.returnValueLocal`'s type already accounts for `generatorFrame`/`asyncFrame`/
+					// `ctorThis` (see `returnValueWtype`) -- stash now, in the *original* scope this
+					// 'return' was written in; the redispatch below re-invokes this same 'case' (guard
+					// already popped by then), which reconstructs the real generator/async/ctor-specific
+					// return shape (IteratorResult, Promise resolution, appended 'this', ...) itself, from
+					// a plain synthetic identifier read of whatever got stashed here.
+					if (guard.returnValueLocal) {
+						if (s.argument)
+							emitAs(s.argument, ctx, guard.returnValueLocal.wtype);
+						else
+							emitDefaultValue(guard.returnValueLocal.wtype, ctx);
+						ctx.emit(I.local.set(guard.returnValueLocal.index));
+					} else if (s.argument) {
+						throw new Error(ctx.ctorThis ? 'towasm: a constructor cannot return a value' : "towasm: a 'void' function cannot return a value");
+					}
+					ctx.emit(I.i32.const(1), I.local.set(guard.actionLocal.index), I.br(ctx.depth - guard.landingDepth));
+					return;
+				}
 				if (ctx.generatorFrame) {
 					const { frameLocal, frameTypeIndex, stateField, doneStateId, resultCtor, rWtype } = ctx.generatorFrame;
 					ctx.emit(I.local.get(frameLocal.index), I.i32.const(doneStateId), I.struct.set(frameTypeIndex, stateField));
@@ -3322,6 +3404,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					ctx.emit(I.local.get(ctx.lookup('this')!.index));
 				ctx.emit(I.return);
 				return;
+			}
 
 			// `for...of` desugars into a synthetic `block`/`var_decl`/`for` (normal-kind) and recurses into
 			// `emitStmt` itself, rather than adding a second instruction-emission path -- `kind: 'normal'`
@@ -3503,6 +3586,183 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			case 'function_decl':
 				ctx.emit(I.local.set(ctx.declareLocal(s.name, emitClosureLiteral(s, ctx, true)).index));
+				return;
+
+			case 'throw':
+				emitAs(s.argument, ctx, REF_ANY);
+				ctx.emit(I.throw(ensureExceptionTag()));
+				return;
+
+			// `try_table`'s catch dispatch is branch-based, not legacy EH's inline-handler style: two
+			// nested blocks -- `$after` (the shared landing point once either the try body or the catch
+			// handler completes) wraps `$catchLand` (the catch clause's own branch target, delivering the
+			// caught `anyref` payload as that block's result). The try body's own success path explicitly
+			// `br`s past the handler to `$after`, so `$catchLand`'s wrapped `try_table` never actually
+			// falls through to its own end -- `unreachable` closes that dead edge; without it the
+			// validator still checks `$catchLand`'s declared (anyref) result against what `try_table`'s
+			// own fallthrough would produce there (nothing) and rejects the module.
+			case 'try':
+				if (!s.handlerBody && !s.finalizer)
+					throw new Error("towasm: 'try' needs a 'catch' or 'finally'");
+
+				if (!s.finalizer) {
+					const saved			= ctx.swapOut();
+					const afterDepth	= ctx.enterLabel();	// $after
+					const catchSaved	= ctx.swapOut();
+					ctx.enterLabel();						// $catchLand
+					const tryBodySaved	= ctx.swapOut();
+					ctx.enterLabel();						// try_table's own implicit level
+
+					ctx.openScope();
+					s.block.forEach(st => emitStmt(st, ctx));
+					ctx.closeScope();
+					
+					ctx.emit(I.br(ctx.depth - afterDepth));
+					ctx.exitLabel();
+					const tryBody = ctx.swapOut(tryBodySaved);
+					ctx.emit(I.try_table(undefined, [wasm.Catch.tag(ensureExceptionTag(), 0)], tryBody));
+					ctx.emit(I.unreachable);
+					ctx.exitLabel();
+					ctx.emit(I.block(toValType(REF_ANY), ctx.swapOut(catchSaved)));
+
+					ctx.openScope();
+					if (s.handlerParam)
+						ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
+					else
+						ctx.emit(I.drop);
+					s.handlerBody!.forEach(st => emitStmt(st, ctx));
+					ctx.closeScope();
+
+					ctx.exitLabel();
+					ctx.emit(I.block(undefined, ctx.swapOut(saved)));
+
+				} else {
+
+					// A 'finally' is present: every exit -- normal completion, a caught exception, an
+					// escaping break/continue/return, or an uncaught exception -- funnels through one shared
+					// landing point ($land) that runs 'finally' exactly once, then re-dispatches on a
+					// recorded action code. `break`/`continue`/`return` inside the protected region redirect
+					// here via `ctx.finallyGuards` (see those `case`s above); the exception path needs no
+					// such interception -- `throw_ref` below is an ordinary instruction that propagates
+					// outward on its own, caught by whatever real `try_table` happens to enclose *this*
+					// landing code, exactly like a fresh `throw` would.
+					//
+					// A `return`/`throw`/`break`/`continue` written directly inside 'finally' itself also
+					// needs no special handling: `ctx.finallyGuards` is already popped by the time 'finally'
+					// compiles (below), so it either executes as a real exit (overriding whatever action was
+					// pending -- correct JS semantics) or redirects through the next-*outer* guard if this
+					// 'try' is itself nested inside another 'try'/'finally' -- right either way, for free.
+					// Works inside a generator/async function, a constructor, or a `reassignsThis` method too
+					// -- `returnValueWtype` picks the real per-context return representation to stash, and the
+					// redispatch's recursive `case 'return'` call reconstructs the rest (IteratorResult/Promise
+					// resolution/appended `this`) itself, exactly as if compiling that shape fresh.
+					const actionLocal		= { wtype: 'i32' as const, index: ctx.temp('#finally$action', 'i32') };
+					const exnLocal			= { wtype: REF_EXN, index: ctx.temp('#finally$exn', REF_EXN) };
+					const returnWtype		= returnValueWtype(ctx);
+					const returnValueLocal	= returnWtype !== undefined ? { wtype: returnWtype, index: ctx.temp('#finally$retval', returnWtype) } : undefined;
+
+					const saved				= ctx.swapOut();
+					const landDepth			= ctx.enterLabel();			// $land
+					const catchAllSaved 	= ctx.swapOut();
+					const catchAllDepth 	= ctx.enterLabel();			// $catchAllLand
+					const afterSaved		= ctx.swapOut();
+					const afterDepth		= ctx.enterLabel();			// $after
+
+					const guard = {
+						actionLocal, returnValueLocal, exnLocal,
+						breakTargetsLenAtEntry: ctx.breakTargets.length,
+						continueTargetsLenAtEntry: ctx.continueTargets.length,
+						landingDepth: landDepth,
+					};
+					ctx.finallyGuards.push(guard);
+
+					if (s.handlerBody) {
+						// A's own exceptions: our single project-wide tag is the only thing this compiler ever throws, so the ordinary tag-catch below already covers 'try' exhaustively --
+						// no 'catch_all_ref' needed on *this* try_table (unlike the one below, for B).
+						const catchLandSaved = ctx.swapOut();
+						ctx.enterLabel();			// $catchLand
+						const tryTableSaved = ctx.swapOut();
+						ctx.enterLabel();			// try_table (A)'s own implicit level
+						ctx.openScope();
+						s.block.forEach(st => emitStmt(st, ctx));
+						ctx.closeScope();
+						ctx.emit(I.br(ctx.depth - afterDepth));
+						ctx.exitLabel();
+						ctx.emit(I.try_table(undefined, [wasm.Catch.tag(ensureExceptionTag(), 0)], ctx.swapOut(tryTableSaved)));
+						ctx.emit(I.unreachable);
+						ctx.exitLabel();
+						ctx.emit(I.block(toValType(REF_ANY), ctx.swapOut(catchLandSaved)));
+
+						// The catch param binds $catchLand's own delivered value -- outside and *before*
+						// try_table (B) starts: a block's body doesn't inherit values left on the outer stack
+						// unless declared as real params (none of these are), so try_table (B) itself must
+						// start from a clean slate, not reach back for a value produced before it began.
+						ctx.openScope();
+						if (s.handlerParam)
+							ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
+						else
+							ctx.emit(I.drop);
+
+						// B (the catch handler) gets its *own* safety net -- unlike A, nothing else already
+						// guarantees every exception B might throw is caught before 'finally' needs to run.
+						const catchHandlerSaved = ctx.swapOut();
+						ctx.enterLabel();			// try_table (B)'s own implicit level
+						s.handlerBody.forEach(st => emitStmt(st, ctx));
+						ctx.closeScope();
+						ctx.emit(I.br(ctx.depth - afterDepth));
+						ctx.exitLabel();
+						ctx.emit(I.try_table(undefined, [wasm.Catch.allRef(ctx.depth - catchAllDepth)], ctx.swapOut(catchHandlerSaved)));
+						ctx.emit(I.unreachable);
+					} else {
+						// No 'catch' clause -- 'finally' alone needs only the safety net around A itself.
+						const tryTableSaved = ctx.swapOut();
+						ctx.enterLabel();			// try_table's own implicit level
+						ctx.openScope();
+						s.block.forEach(st => emitStmt(st, ctx));
+						ctx.closeScope();
+						ctx.emit(I.br(ctx.depth - afterDepth));
+						ctx.exitLabel();
+						ctx.emit(I.try_table(undefined, [wasm.Catch.allRef(ctx.depth - catchAllDepth)], ctx.swapOut(tryTableSaved)));
+						ctx.emit(I.unreachable);
+					}
+
+					ctx.finallyGuards.pop();
+
+					ctx.exitLabel();				// exit $after
+					ctx.emit(I.block(undefined, ctx.swapOut(afterSaved)));
+					ctx.emit(I.i32.const(0), I.local.set(actionLocal.index), I.br(ctx.depth - landDepth));
+					ctx.exitLabel();				// exit $catchAllLand
+					ctx.emit(I.block(toValType(REF_EXN), ctx.swapOut(catchAllSaved)));
+					ctx.emit(I.local.set(exnLocal.index), I.i32.const(4), I.local.set(actionLocal.index));
+					ctx.exitLabel();				// exit $land
+					ctx.emit(I.block(undefined, ctx.swapOut(saved)));
+
+					ctx.openScope();
+					s.finalizer.forEach(st => emitStmt(st, ctx));
+					ctx.closeScope();
+
+					// Re-dispatch: exactly one of these ever actually fires per call (the action codes above
+					// are mutually exclusive), each gated by its own 'if' so the validator only ever checks
+					// one small, simple branch at a time.
+					const dispatch = (code: number, build: () => void) => {
+						ctx.emit(I.local.get(actionLocal.index), I.i32.const(code), I.i32.eq);
+						const old = ctx.swapOut();
+						ctx.enterLabel();			// this 'if''s own implicit level -- a depth-relative 'br' built by `build()` (e.g. a nested try/finally's own redispatch) needs it counted
+						build();
+						ctx.exitLabel();
+						ctx.emit(I.if(undefined, ctx.swapOut(old)));
+					};
+					dispatch(1, () => emitStmt({ type: 'return', argument: returnValueLocal ? { type: 'identifier', name: '#finally$retval' } : undefined }, ctx));
+					// A synthesized 'break'/'continue' only ever compiles to a real target this construct
+					// could actually reach at runtime -- skip building the arm at all when there wasn't one
+					// enclosing it in the first place (action can then never actually be 2/3), or 'case break'/
+					// 'case continue' rejects it outright even though it would never really execute.
+					if (guard.breakTargetsLenAtEntry > 0)
+						dispatch(2, () => emitStmt({ type: 'break' }, ctx));
+					if (guard.continueTargetsLenAtEntry > 0)
+						dispatch(3, () => emitStmt({ type: 'continue' }, ctx));
+					dispatch(4, () => ctx.emit(I.local.get(exnLocal.index), I.throw_ref));
+				}
 				return;
 
 			default:
@@ -3883,8 +4143,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		};
 
 		const oldOuter = fnCtx.swapOut();
-		fnCtx.enterLabel();
-		const loopMark = fnCtx.depth;
+		const loopMark = fnCtx.enterLabel();
 		fnCtx.enterLabel(n);
 
 		// Every valid state (0..n-1) has its own explicit table entry -- the required 'default' arm is
@@ -5166,6 +5425,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		init: constGlobalInit(name, g.init, g.wtype),
 	}));
 	mod.datas			= [{ mode: 'passive', bytes: data }];
+	if (tags.length)
+		mod.tags		= tags;
 
 	// Every closure literal's `funcIndex` is taken by `ref.func` at its creation site -- wasm requires any function referenced that way to be "declared" first, which a declarative element segment satisfies.
 	if (closureLiterals.length)
