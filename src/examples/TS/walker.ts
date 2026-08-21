@@ -17,7 +17,11 @@ export function guard<R>(types: string[]) {
 const stmts = ['block', 'var_decl', 'expression', 'empty', 'if', 'do_while', 'while', 'for', 'for_in', 'continue', 'break', 'return', 'with', 'labeled', 'switch', 'throw', 'try', 'debugger', 'function_decl', 'import', 'export', 'export_decl', 'class_decl'];
 
 export const isProgram			= guard<TS.Program|JS.Program<any>>(['program']);
-export const isType				= guard<Type>(['ref', 'literal', 'range', 'template_literal', 'this', 'array', 'tuple', 'union', 'intersection', 'function', 'constructor', 'object', 'keyof', 'typeof', 'indexed_access', 'conditional', 'infer', 'mapped', 'predicate']);
+const typeTags = guard<Type>(['ref', 'literal', 'range', 'template_literal', 'this', 'array', 'tuple', 'union', 'intersection', 'function', 'constructor', 'object', 'keyof', 'typeof', 'indexed_access', 'conditional', 'infer', 'mapped', 'predicate']);
+// 'object'/'array'/'function' are real tags shared with JS.Expr's object/array-literal and function-expression
+// nodes (same string, different shape: Type has members/element/no body, Expr has properties/elements/body), so
+// the tag alone can't tell an object-type literal from an object-literal expression -- a field-level tiebreak can.
+export const isType = (node: any): node is Type => typeTags(node) && !('properties' in node || 'elements' in node || 'body' in node);
 export const isTsDeclaration	= guard<TS.Declaration>(['type_alias_decl', 'interface_decl', 'enum_decl', 'namespace_decl']);
 export const isJsStatement		= guard<JS.Statement<any>>(stmts);
 

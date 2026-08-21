@@ -254,6 +254,19 @@ declare type BigUint64Array = TypedArray<u64>;
 //}
 
 //-----------------------------------------------------------------------------
+//	Object
+//-----------------------------------------------------------------------------
+
+// `entries` only, for now -- a compiler intrinsic (see `emitObjectEntries` in towasm.ts), not real TS
+// source: what fields exist depends on the argument's own concrete type at each call site, which only
+// the compiler itself can see. Currently supports a `Map`-backed dynamic object (forwards to its own
+// real `entries()`) and a *sealed* (never-subclassed) struct-backed class/object-shape; an extended
+// class isn't supported yet (would need the receiver's real runtime type, not just its static one).
+declare var Object: {
+	entries<T>(x: T): [string, any][];
+};
+
+//-----------------------------------------------------------------------------
 //	Math
 //-----------------------------------------------------------------------------
 
@@ -315,4 +328,10 @@ declare function __towasm_alloc(size: i32, align: i32): i32;
 
 type Partial<T> = { [P in keyof T]?: T[P]; };
 type Record<K extends keyof any, T> = { [P in K]: T; };
+type Exclude<T, U> = T extends U ? never : T;
+type Extract<T, U> = T extends U ? T : never;
+type NonNullable<T> = T & {};
+type Pick<T, K extends keyof T> = { [P in K]: T[P]; };
+type Omit<T, K extends keyof any> = Pick<T, Exclude<keyof T, K>>;
+type Readonly<T> = { readonly [P in keyof T]: T[P]; };
 

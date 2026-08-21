@@ -123,6 +123,10 @@ export class Output {
 	newline = '\n';
 	colon	= ': ';
 	comma	= ', ';
+	// A function inferred to (directly or indirectly) return its own type -- e.g. `function f() { return f; }` --
+	// is a real, uncaught checker gap (no cycle detection during inference yet), so a genuinely cyclic Type object
+	// can reach here. Printing it is diagnostic-only, so a placeholder beats an unbounded recursive stack overflow.
+	private printing = new Set<Type>();
 
 	constructor(opts: Options = {}) {
 		this.opts		= {...DefaultOptions, ...opts};
@@ -273,7 +277,14 @@ export class Output {
 	// `minPrec`: the precedence tier required of `type` here -- if lower, it gets parens. Defaults to 0 (never wraps),
 	// right for the many call sites that sit in an unrestricted `type` position (annotations, generic args, delimited lists, ...).
 	type(type: Type, minPrec = 0): string {
-		return withParens(this.typeBody(type), typePrecedence(type) < minPrec);
+		if (this.printing.has(type))
+			return '<circular>';
+		this.printing.add(type);
+		try {
+			return withParens(this.typeBody(type), typePrecedence(type) < minPrec);
+		} finally {
+			this.printing.delete(type);
+		}
 	}
 
 	tupleElement(t: TS.TupleElement) {

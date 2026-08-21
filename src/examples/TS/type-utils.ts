@@ -19,7 +19,7 @@ const ALL_PRIMITIVES	= new Set(['any', 'unknown', 'never', 'void', 'number', 'st
 // folded into `resolve`'s general unwrapping or into `ALL_PRIMITIVES` itself: doing either globally breaks
 // every *other* place a resolved `number` was relied on to unify structurally with an `i32` (e.g. a
 // ternary's two branches, one `i32` one `number`, need to combine into one type same as before).
-export const WASM_PSEUDO_TYPES	= new Set(['i32', 'i64', 'f32', 'f64', 'u32']);
+export const WASM_PSEUDO_TYPES	= new Set(['i8', 'u8', 'i16', 'u16', 'i32', 'i64', 'f32', 'f64', 'u32', 'u64']);
 const OPAQUE		= new Set(['keyof', 'indexed_access', 'conditional', 'infer', 'mapped', 'this', 'predicate']);
 
 // The subset of `OPAQUE` that's a genuinely unevaluated computation, as opposed to `this`/`predicate` (opaque by design, not a gap).
@@ -292,8 +292,11 @@ export function rangeClamp(a: NumRange, bound: number|bigint, isUpper: boolean, 
 
 // A spread (`...T`) contributes no single element value; an optional element (`T?`)'s contributed value type is just `T`, consistent with this
 // file not modeling "possibly absent" via `| undefined` for optional members elsewhere either.
-export function tupleElementType(te: TS.TupleElement): Type | undefined {
-	return te.type === 'spread' ? undefined : te.type === 'optional' || te.type === 'labeled' ? te.element : te;
+// `te` is undefined when a literal has more elements than the tuple type it's contextually checked
+// against (e.g. `[1, 2, 3]` against an expected `[number, number]`) -- those extra positions just get
+// no contextual type, same as an untyped array literal's elements would.
+export function tupleElementType(te: TS.TupleElement | undefined): Type | undefined {
+	return !te || te.type === 'spread' ? undefined : te.type === 'optional' || te.type === 'labeled' ? te.element : te;
 }
 
 export function bindingNames(t: BindingTarget): string[] {
@@ -1605,6 +1608,31 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 		return ANY;
 	}
 	switch (t.type) {
+		// An array's own element never got resolved recursively at all before this case existed -- e.g. `Record<string,
+		// number>['string']`-shaped indexed access (a mapped type's homomorphic value collapsing down to a plain
+		// index-signature's own value type, per `case 'indexed_access'` above) stayed opaque forever once tucked
+		// inside a `V[]` field, even though resolving it *directly* already worked -- towasm.ts's own generic-array-
+		// element-kind lookup (`ownerFor`'s `w.type === 'array'` case) never got a chance to see the real, concrete
+		// element type as a result, silently defaulting a scalar array field to boxed/`any` storage instead.
+		case 'array': {
+			// A wasm pseudo-type element (`i8[]`/etc, see `WASM_PSEUDO_TYPES`'s own comment) must survive resolution
+			// intact, same reason `hoistVar`'s own `stopAtPseudoType` guard exists -- towasm.ts's `wasmTypeOf` matches
+			// `TYPED_ARRAY_TAGS` names directly off `t.element`, never through `resolve`'s own alias-unwrapping;
+			// resolving `i8` down to its declared `number` alias here would silently pick the wrong physical element
+			// kind for a typed-array-backed field/local (a real, observed regression -- `Uint8Array`'s own literal-
+			// argument constructor picked `f64` storage for what should stay `i8`).
+			if (t.element.type === 'ref' && !t.element.typeArgs && WASM_PSEUDO_TYPES.has(t.element.name))
+				return t;
+			// Always `stopAtRef` here, regardless of the outer call's own value -- the element is a nested part of
+			// the *array* type, not the value resolution ultimately returns, so a named class/interface/alias element
+			// (`Animal[]`) must stay that clean ref, not get fully expanded into its own structural member list: many
+			// callers (`ownerFor`'s own class-dispatch lookup, chief among them) need the element's real *name* to
+			// resolve a method call on an array element (`animals[0].sound()`) -- an expanded structural shape has no
+			// name left to dispatch by at all. Only `indexed_access`/`mapped`/`keyof`/etc *composition* need real
+			// resolution through to a concrete shape; a plain named element type never does.
+			const element = resolve(scope, t.element, depth - 1, true);
+			return element === t.element ? t : TS.ArrayType(element, t.readonly);
+		}
 		case 'mapped': {
 			// Members are only knowable once the key constraint resolves to a literal (or union of literals); anything else stays opaque.
 			// `keyof T & U`-shaped constraints (restricting a homomorphic key set further, e.g. to `string | number`)
@@ -1683,9 +1711,17 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 			// mapped type (e.g. `Partial<{[K in keyof N]: V}>`, walker.ts's own `NodeMap<N>` idiom) --
 			// without it, `T[P]` stays opaque and the whole homomorphic-mapped-type-over-another-
 			// mapped-type shape never resolves to anything codegen (or further checking) can use.
+			// Peels through `ref` aliases only (`expandRefOnce`, looped) rather than a full `resolve()` --
+			// a keyable-constraint mapped type (`Record<string,T>`-shaped) reduces itself into a plain
+			// index-signature object one case up in this same switch, so a full resolve here would
+			// already have collapsed it before this check ever saw `'mapped'`, permanently missing this
+			// composition for exactly the common case (`Partial<Record<string,T>>` and the like).
+			let peeled = t.object;
+			for (let i = 0; i < depth && peeled.type === 'ref' && !ALL_PRIMITIVES.has(peeled.name); i++)
+				peeled = expandRefOnce(scope, peeled);
+			if (peeled.type === 'mapped')
+				return resolve(scope, substituteType(peeled.valueType, new Map([[peeled.keyName, t.index]])), depth - 1, stopAtRef);
 			const object = resolve(scope, t.object, depth - 1);
-			if (object.type === 'mapped')
-				return resolve(scope, substituteType(object.valueType, new Map([[object.keyName, t.index]])), depth - 1, stopAtRef);
 			const keys = isLiteral(index, 'string') ? [index.value]
 				: index.type === 'union' && index.types.every(m => isLiteral(m, 'string')) ? index.types.map(m => (m as { value: string }).value)
 				: undefined;
@@ -1693,6 +1729,16 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				const parts = keys.map(key => lookupMember(object, key, scope));
 				if (parts.every(p => !!p))
 					return resolve(scope, combineTypes(parts), depth - 1, stopAtRef);
+			}
+			// `T[K]` where `T` has an index signature and `K` isn't a literal but matches the signature's own
+			// key type (e.g. `Record<string,V>[string]`, the shape a mapped type's own homomorphic `T[P]`
+			// value reduces to once `P`'s constraint is a bare `keyof N`-derived `string`, not a specific
+			// property name) -- real TS gives the index signature's own value type here, same as a literal
+			// key lookup would if a matching property actually existed.
+			if (object.type === 'object') {
+				const idx = object.members.find((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index' && isAssignable(index, m.paramType, scope));
+				if (idx)
+					return resolve(scope, idx.typeAnnotation, depth - 1, stopAtRef);
 			}
 			break;
 		}
@@ -1826,7 +1872,16 @@ export class Scope {
 	private aliases?:		Map<string, Expr>;	// const initializers -- narrowing a const also narrows through its initializer (TS 4.4 aliased conditions)
 	private namespaces?:	Map<string, Scope>;	// nested namespace/module scopes, keyed by their bound name -- consulted by `resolve` for a dotted type ref (`NS.Foo`)
 
-	constructor(public parent?: Scope) {}
+	// Set only on a generic class's own instance scope (`checkClassMembers`, when the class declares type
+	// params) -- marks every scope descending from it (an instance method's own body scope, any nested
+	// block scope inside it) as belonging to a shared, per-instantiation-reused method template rather than
+	// a single concrete check. `checkFunctionBody`/`checkStmt` consult `isGenericTemplate()` to skip their
+	// own `fn.scope ??=`/`(stmt as any).scope ??=` stamps there -- see `makeLibScope`'s comment in towasm.ts
+	// for why a stamp reflecting the template's own unresolved type param would otherwise permanently block
+	// (`??=` first-wins) a later, per-instantiation-correct scope from ever being recorded instead.
+	constructor(public parent?: Scope, private genericTemplate?: boolean) {}
+
+	isGenericTemplate(): boolean					{ return !!this.genericTemplate || !!this.parent?.isGenericTemplate(); }
 
 	value(name: string): Type | undefined			{ return this.narrowings?.get(name) ?? this.values.get(name) ?? this.parent?.value(name); }
 	type(name: string): TypeEntry | undefined		{ return this.types.get(name) ?? this.parent?.type(name); }

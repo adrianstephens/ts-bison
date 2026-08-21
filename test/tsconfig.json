@@ -19,6 +19,6 @@
 		// declarations are meant only for `towasm.ts`'s own lib-parsing and the editor (via each lib
 		// file's own `/// <reference>`), not to leak globally into this project. Matches
 		// `examples/tsconfig.json`'s own exclusion; see towasm-lib.ts's header comment.
-		"../examples/TS/lib/**/*.ts"
+		"../src/examples/TS/lib/**/*.ts"
 	]
 }

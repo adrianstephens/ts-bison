@@ -22,10 +22,10 @@ import * as WAT from '../wat-parser';
 //      which are fully supported everywhere else, including inside a generator/async function, a
 //      constructor, or a 'reassignsThis' method
 //    - labeled break/continue
-//    - for-in over anything but a dynamic object (a structural '{[k: string]: V}'-typed value,
-//      routed to 'Map<string, V>' -- see 'indexSignatureValueType') -- a plain object/class instance
-//      or a mapped-type-shaped generic (e.g. walker.ts's own 'NodeMap<N>') has no live key set to
-//      iterate this way
+//    - for-in over anything but a dynamic object (a structural '{[k: string]: V}'-typed value, or a
+//      mapped type that resolves down to that same shape, e.g. walker.ts's own 'NodeMap<N>' --
+//      'Partial<{[K in keyof N]: F}>' -- routed to 'Map<string, V>', see 'indexSignatureValueType') --
+//      a plain object/class instance has no live key set to iterate this way
 //    - for-of over a string or a general iterable
 //  - Async (real suspend/resume generators and async/await exist -- see 'flattenStateMachine' in
 //    transform.ts and 'compileGeneratorFunc'/'compileAsyncFunc' here; this compiler has no
@@ -860,7 +860,7 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 				throw new Error(`inline asm '${asm}': an anonymous local can't be referenced by name`);
 			if (l.type === 'i32' || l.type === 'i64' || l.type === 'f32' || l.type === 'f64')
 				return [l.id, ctx.temp(l.id, l.type)];
-			throw new Error(`inline asm '${asm}': unsupported local type '${JSON.stringify(l.type)}'`);
+			throw new Error(`inline asm '${asm}': unsupported local type '${typeof l.type === 'string' ? l.type : 'ref'}'`);
 		}));
 		return instrs.map(i => {
 			if ('localIndex' in i && typeof i.localIndex === 'string') {
@@ -1247,18 +1247,20 @@ function collectRangeWidenings(body: Statement[], scope: Scope): Map<JS.Var<Type
 // it directly too, e.g. to compile a lib method's own body in isolation from user-declared names).
 // A throwaway `makeChecker` instance here is fine -- `Scope` is plain data, not tied to whichever
 // checker instance populated it, so this result is equally usable by any later, separate instance.
-// Muted, deliberately -- tried unmuted once (its diag sink is already a no-op, so muting itself buys
-// nothing directly): that DOES fix `checker.scopeOfStmt` for a declared-return-type lib method's body
-// (`checkFunctionBody`'s `if (expected && muted) return;` otherwise skips the walk that would stamp it,
-// found via `String.split`'s `m.groupStart(0)` resolving to `any` post-narrowing instead of `number`) --
-// but it simultaneously breaks every GENERIC lib class method (`Array<T>.reverse`/`.fill`/...): the stamp
-// it leaves is the template's own, with `T` still unresolved, and `??=` first-wins then blocks the real,
-// per-instantiation substituted scope from ever overriding it (`ctx.scope`, built fresh per monomorphized
-// instantiation, used to be the *only* thing var_decl's codegen ever saw here, precisely because muted
-// left the template unstamped). No fix found yet that satisfies both narrowing-dependent AND
-// generic-instantiation-dependent lib bodies through the same stamp -- reverted to muted, keeping
-// `ctx.scope` as the sole (unnarrowed but instantiation-correct) fallback var_decl's codegen relies on
-// for lib method bodies. `methodOwner`'s special-case in `var_decl` (below) still needed for this reason.
+// Muted, deliberately (its diag sink is a no-op either way) -- but no longer skips walking a declared-
+// return-type lib method's body outright the way it once did. That used to be an all-or-nothing choice:
+// walking+stamping fixed narrowing-dependent bodies (`String.split`'s `m.groupStart(0)`) but broke every
+// GENERIC lib class method (`Array<T>.reverse`/`.fill`/...), since the stamp left behind was the template's
+// own, with `T` still unresolved, and `??=` first-wins then blocked the real, per-instantiation substituted
+// scope from ever overriding it. Resolved at the source instead (`Scope.isGenericTemplate`, checker.ts):
+// a generic class's own instance scope is flagged, and `checkFunctionBody`/`checkStmt` skip *just* their
+// `fn.scope`/`(stmt as any).scope` stamps under that flag while still performing the walk -- so
+// `applyContextualParams`'s param-typing side effect (needed for e.g. `lib/map.ts`'s `entries()`, whose
+// `.map()` callback params previously never got typed at all) now runs for every lib method, generic or
+// not, while a generic method's body still falls back to `ctx.scope` at codegen time, same as before.
+// `methodOwner`'s special-case in `var_decl` (below) is still worth keeping regardless -- it reads a
+// method's return type directly off the class decl without needing `checkerTypeOf` at all, which remains
+// the cheaper path for that one, common shape.
 export function makeLibScope(): Scope {
 	const libScope = new Scope;
 	checkBlock(LIB_AST, libScope);
@@ -1298,6 +1300,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// like an ordinary closure value (passed as a callback, assigned, returned, ...). One shared
 	// zero-capture wrapper per function name, not one per use site.
 	const functionValueWrappers = new Map<string, FuncInfo>();
+	// A closure *value* whose own concrete signature has a narrower/nullable-mismatched result than
+	// some slot it's being coerced into (real TS covariant-return assignability, e.g. `(x: number) =>
+	// number` fitting `(x: number) => number | undefined`) -- one shared coercing trampoline per
+	// (source signature, wanted result) pair, not one per use site. See `ensureClosureCoercionWrapper`.
+	const closureCoercionWrappers = new Map<string, { info: FuncInfo; wantStructTypeIndex: number; envTypeIndex: number }>();
 
 	const closureLiterals: FuncInfo[] = [];
 	const closureWasmTypes	= new Map<string, WasmType>();	// The `{closure: FuncSig}` wrapper object itself, memoized per signature
@@ -1771,6 +1778,24 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (wasmTypeEq(got, want))
 			return;
 
+		// A closure value whose own concrete signature differs from `want` only in its *result*, or in
+		// having *fewer* params than `want` declares (real JS/TS callback convention -- `arr.map(x =>
+		// x*2)` ignoring `index`/`array` is entirely ordinary, not a narrower type) -- wrap rather than
+		// reject; a real incompatibility in a *shared* param position (or `got` wanting *more* params
+		// than `want` offers) still falls through to the "cannot convert" throw below, same as any other
+		// genuinely incompatible shape. See `ensureClosureCoercionWrapper`'s own comment.
+		if (typeof got !== 'string' && typeof want !== 'string' && 'closure' in got && 'closure' in want) {
+			const gotSig = got.closure, wantSig = want.closure;
+			if (gotSig.params.length <= wantSig.params.length && !!gotSig.hasRest === !!wantSig.hasRest
+				&& gotSig.params.every((p, i) => wasmTypeEq(p, wantSig.params[i]))) {
+				const orig = ctx.temp(`$origClosure$${closureCallTempCounter++}`, got);
+				ctx.emit(I.local.set(orig));
+				const { info, wantStructTypeIndex, envTypeIndex } = ensureClosureCoercionWrapper(gotSig, wantSig);
+				ctx.emit(I.ref.func(info.funcIndex), I.local.get(orig), I.struct.new(envTypeIndex), I.struct.new(wantStructTypeIndex));
+				return;
+			}
+		}
+
 		// `u32`/`i32` are the same physical wasm value -- `u32` only exists so `coerceTop` always knows which
 		// conversion direction (`_s` vs `_u`) a value needs, instead of every producer converting eagerly itself.
 		if ((got === 'u32' && want === 'i32') || (got === 'i32' && want === 'u32'))
@@ -2240,6 +2265,50 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return method.result;
 	}
 
+	// `Object.entries(x)` -- a known, fixed-identity global intrinsic (`declare var Object: {...}` in
+	// lib.d.ts, same category as `Math`, not a name to special-case the way a *user* method name would
+	// be), not expressible as ordinary generic TS source at all: what fields exist depends on `x`'s own
+	// concrete type at each call site, which only the compiler itself can see. For a `Map`-backed
+	// dynamic object, real `entries()` already exists and is already the efficient, correct answer, so
+	// this just forwards to it. For a real struct (class or plain object-shape), only the *sealed*
+	// case (never subclassed elsewhere, `!everExtended`) is handled for now -- an extended class's own
+	// instances may carry more fields at runtime than its static type declares, which would need the
+	// same `ref.test` cascade `ensureVirtualDispatch` already uses for virtual method calls; deferred,
+	// not attempted here. The sealed case needs no runtime reflection at all: `owner.fields` is a real,
+	// compile-time-known list, so this synthesizes a real `[string, any][]` array literal -- one
+	// `[fieldName, obj.field]` tuple per declared field -- and hands it to the ordinary array-literal
+	// codegen, the same "synthesize AST, reuse existing codegen" idiom already used for spread/for-in.
+	function emitObjectEntries(args: Expr[], ctx: FunctionContext): WasmType {
+		if (args.length !== 1)
+			throw new Error("towasm: 'Object.entries' takes exactly one argument");
+		const arg = args[0];
+		const owner = ownerOf(arg, ctx);
+		if (!owner)
+			throw new Error("towasm: 'Object.entries' needs a known object/class type");
+
+		if (owner.decl.name === 'Map') {
+			emitAs(arg, ctx, owner.thisWtype!);
+			return emitMethodCall(owner, 'entries', [], ctx);
+		}
+		if (owner.decl.name && everExtended.has(owner.decl.name))
+			throw new Error(`towasm: 'Object.entries' on '${owner.name}' isn't supported yet -- '${owner.decl.name}' may be subclassed elsewhere, and a correct result needs the receiver's real runtime type, not just its declared one`);
+
+		const n			= closureCallTempCounter++;
+		const objName	= `#objEntries$${n}`;
+		const objLocal	= ctx.declareValue(objName, owner.thisWtype!, owner.thisTsType!);
+		emitAs(arg, ctx, owner.thisWtype!);
+		ctx.emit(I.local.set(objLocal.index));
+
+		const entries: Expr = {
+			type: 'array',
+			elements: owner.fields.map((f): Expr => ({
+				type: 'array',
+				elements: [Literal(f.name), { type: 'member', object: { type: 'identifier', name: objName }, property: f.name }],
+			})),
+		};
+		return emitAs(entries, ctx, ARR_WTYPE.ref);
+	}
+
 	// Two questions: whether the current value needs reading at all (`'none'`, only a plain `=` skips it),
 	// and whether it needs preserving for `.old` (`'keep'`, only postfix `++`/`--`) or just combining once (`'discard'`, every compound op and prefix `++`/`--`) -- `'discard'` skips the extra scratch `'keep'` needs.
 	function emitAssignTarget(target: Expr, ctx: FunctionContext, old: 'none' | 'discard' | 'keep'): AssignTarget {
@@ -2592,6 +2661,63 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return { info, structTypeIndex };
 	}
 
+	// A closure *value* whose own concrete signature doesn't match some slot it's being coerced into, but
+	// real TS/JS would still allow it -- either a covariant return (`(x: number) => number` fitting
+	// `(x: number) => number | undefined`, the common shape a mapped-type's own homomorphic value type
+	// produces: `Partial<{...}>`'s `?`-optional value widens every property's own type with `| undefined`,
+	// but a real property/callback value written against one specific key rarely bothers writing that
+	// itself), or fewer declared params than `wantSig` offers (the ordinary JS callback convention --
+	// `arr.map(x => x*2)` never declares `index`/`array` at all, found via `lib/map.ts`'s own `entries()`
+	// calling `Array<K>.map((k, i) => ...)`, itself two short of the real 3-param `callbackfn`). Unlike a
+	// scalar (`coerceTop` alone can convert one already-on-the-stack value in place), a closure's own
+	// compiled function signature is fixed forever at its own `funcTypeIndex` -- there's no in-place
+	// conversion, only wrapping: one small, shared trampoline per (source signature, wanted signature)
+	// pair, not one per use site, that declares `wantSig`'s full param list, forwards only the leading
+	// `gotSig.params.length` of them through to the original closure (silently dropping the rest, same as
+	// real JS ignoring the trailing call arguments a shorter callback never bound), and coerces just the
+	// return value. A mismatch in a *shared* leading param's own type (contravariant widening) isn't
+	// attempted here -- narrower in scope than full function-type variance, but covers the shape that's
+	// actually shown up so far.
+	function ensureClosureCoercionWrapper(gotSig: FuncSig, wantSig: FuncSig): { info: FuncInfo; wantStructTypeIndex: number; envTypeIndex: number } {
+		const key = `(${gotSig.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(gotSig.result)}=>(${wantSig.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(wantSig.result)}`;
+		const existing = closureCoercionWrappers.get(key);
+		if (existing)
+			return existing;
+
+		const { funcTypeIndex: gotFuncTypeIndex, structTypeIndex: gotStructTypeIndex } = ensureClosureType(gotSig);
+		const { funcTypeIndex: wantFuncTypeIndex, structTypeIndex: wantStructTypeIndex } = ensureClosureType(wantSig);
+		const { funcIndex, typeIndex } = registerFuncAtType(wantFuncTypeIndex);
+		const info: FuncInfo = { ...wantSig, funcIndex, typeIndex };
+		closureLiterals.push(info);
+		// A dedicated one-field env struct (real subtype of `envBase`, like any other closure's own capture
+		// struct) holding just the original closure value -- the {code,env} pair itself is *not* a subtype of
+		// `envBase` (it has no supertypes at all, see `ensureClosureType`), so it can't be used as this
+		// wrapper's own env directly the way `emitClosureLiteral`'s zero-capture case reuses `envBase` as-is.
+		const envTypeIndex = addType({ final: true, supertypes: [ensureEnvBase()], type: { kind: 'struct', fields: [
+			{ type: toValType({ typeIndex: gotStructTypeIndex, nullable: false }), mut: false },
+		] } });
+		const result = { info, wantStructTypeIndex, envTypeIndex };
+		closureCoercionWrappers.set(key, result);
+
+		worklist.push(() => {
+			const wctx		= new FunctionContext(`<coerce>.${key}`.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(wantSig.result), undefined);
+			const envParam	= wctx.declareLocal('#envParam', { typeIndex: ensureEnvBase(), nullable: false });
+			// Declares `wantSig`'s *full* param list (matching the wrapper's own real arity, since a caller
+			// invoking through `wantFuncTypeIndex` always passes all of them) -- only the leading
+			// `gotSig.params.length` are ever read, the rest just go unused, same as a real JS callback
+			// simply never binding its own trailing, never-declared params.
+			const argLocals	= wantSig.params.map((p, i) => wctx.declareLocal(`$arg$${i}`, p));
+			const env		= wctx.declareLocal('#env', { typeIndex: envTypeIndex, nullable: false });
+			wctx.emit(I.local.get(envParam.index), I.ref.cast(envTypeIndex), I.local.set(env.index));
+			wctx.emit(I.local.get(env.index), I.struct.get(envTypeIndex, 0), I.struct.get(gotStructTypeIndex, 1));
+			argLocals.slice(0, gotSig.params.length).forEach(l => wctx.emit(I.local.get(l.index)));
+			wctx.emit(I.local.get(env.index), I.struct.get(envTypeIndex, 0), I.struct.get(gotStructTypeIndex, 0), I.call_ref(gotFuncTypeIndex));
+			coerceTop(gotSig.result, wctx, wantSig.result);
+			info.body = wctx.toFuncBody(1 + argLocals.length, toValType);
+		});
+		return result;
+	}
+
 	// A numeric/bitwise binary op's instructions as data (`Inline`), keyed by `BINARY_OP_NAMES`'s method name
 	function numericOpInline(method: string, a: WasmType | undefined, b: WasmType | undefined, ctx: FunctionContext): Inline {
 		const at = scalarKind(a), bt = scalarKind(b);
@@ -2897,11 +3023,60 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					const ctor = ensureCtor(owner, [], ctx);
 					emitCallArgs(`${owner.name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, [], ctx);
 					ctx.emit(I.call(ctor.funcIndex));
-					for (const p of e.properties) {
-						if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
-							throw new Error(`towasm: object literal for '${owner.name}' can only have plain 'key: value' properties (no methods, spreads, or computed keys)`);
-						emitMethodCall(owner, 'set', [{ type: 'literal', value: p.key }, p.value], ctx);
+					if (!e.properties.some(p => p.type === 'spread')) {
+						// `set` returns `this`, so each call's result is already the next one's receiver -- no scratch local needed.
+						for (const p of e.properties) {
+							if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
+								throw new Error(`towasm: object literal for '${owner.name}' can only have plain 'key: value' properties (no methods or computed keys)`);
+							emitMethodCall(owner, 'set', [{ type: 'literal', value: p.key }, p.value], ctx);
+						}
+						return owner.thisWtype!;
 					}
+					// `{...other, k: v}` -- spreading one dynamic object's own live entries into another needs a
+					// real loop (copy every key `other` currently holds via `.keys()`/`.get()`), unlike a plain
+					// `key: value` property, so the map instance needs a real local to reference repeatedly across
+					// iterations (the stack-chaining trick above, `set`'s own `this` return feeding the next call,
+					// only works for a fixed, statically-known sequence of calls). Every spread argument is its
+					// own dynamic object too (the only shape `{...x}` can mean once the whole literal's own target
+					// is one) -- evaluated once each into its own local, matching real JS's one-evaluation-per-
+					// spread semantics, then copied via the same `for...in`-over-a-dynamic-object desugaring
+					// `case 'for'`'s own `'in'` kind already uses.
+					const n			= closureCallTempCounter++;
+					const mapName	= `#dynobj$${n}`;
+					const mapLocal	= ctx.declareValue(mapName, owner.thisWtype!, owner.thisTsType!);
+					ctx.emit(I.local.set(mapLocal.index));
+					let spreadIndex = 0;
+					for (const p of e.properties) {
+						if (p.type === 'spread') {
+							const spreadName	= `#spread$${n}$${spreadIndex}`;
+							const kName			= `#spreadkey$${n}$${spreadIndex++}`;
+							const spreadLocal	= ctx.declareValue(spreadName, owner.thisWtype!, owner.thisTsType!);
+							emitAs(p.operand, ctx, owner.thisWtype!);
+							ctx.emit(I.local.set(spreadLocal.index));
+							// Same `for (const k of x.keys()) ...` desugaring `case 'for'`'s own `'in'` kind uses --
+							// synthesized directly (not a real `for...in` node) since there's no user-written loop
+							// variable/body here, just this one copy step per spread argument.
+							emitStmt({
+								type: 'for', kind: 'of',
+								init: JS.VarDecl('const', JS.Var(kName)),
+								right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: spreadName }, property: 'keys' }, arguments: [] },
+								body: JS.Block({
+									type: 'expression', expression: {
+										type: 'call',
+										callee: { type: 'member', object: { type: 'identifier', name: mapName }, property: 'set' },
+										arguments: [{ type: 'identifier', name: kName }, { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: spreadName }, property: 'get' }, arguments: [{ type: 'identifier', name: kName }] }],
+									},
+								}),
+							} as Statement, ctx);
+							continue;
+						}
+						if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
+							throw new Error(`towasm: object literal for '${owner.name}' can only have plain 'key: value' properties (no methods or computed keys)`);
+						ctx.emit(I.local.get(mapLocal.index));
+						emitMethodCall(owner, 'set', [{ type: 'literal', value: p.key }, p.value], ctx);
+						ctx.emit(I.drop);
+					}
+					ctx.emit(I.local.get(mapLocal.index));
 					return owner.thisWtype!;
 				}
 
@@ -3388,6 +3563,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					const obj = e.callee.object;
 					const typeArgs = e.typeArgs;
 					if (obj.type === 'identifier') {
+						// `Object.entries` -- a known global intrinsic (see `emitObjectEntries`'s own comment for
+						// why this can't just be `namespaceOwner`/`ensureClass`-dispatched like an ordinary static
+						// method), checked before the generic paths below.
+						if (obj.name === 'Object' && e.callee.property === 'entries')
+							return emitObjectEntries(e.arguments, ctx);
 						const owner = namespaceOwner(obj.name, ctx);
 						if (owner)
 							return emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
@@ -3735,8 +3915,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						return;
 
 					case  'of': {
-						if (s.init.type !== 'var_decl' || s.init.declarations.length !== 1 || typeof s.init.declarations[0].name !== 'string')
-							throw new Error("towasm: 'for...of' loop variable must be a single plain identifier declaration");
+						// The loop variable's own `name` (`v.name` below) may be a plain identifier or a real
+						// destructuring pattern (`for (const [k, v] of pairs)`) -- `JS.Var`'s own `name: BindingTarget`
+						// already carries either through unchanged, and the synthesized `var_decl` this desugars into
+						// (`JS.VarDecl(s.init.kind, JS.Var(v.name, ...))` below) is handled the same generic way any
+						// other pattern-typed `var_decl` already is (`hoistVar`/`patternBindings`) -- nothing here
+						// needs to know or care which shape `v.name` is.
+						if (s.init.type !== 'var_decl' || s.init.declarations.length !== 1)
+							throw new Error("towasm: 'for...of' loop variable must be a single declaration");
 
 						const v			= s.init.declarations[0];
 						const n			= forTempCounter++;
@@ -4130,6 +4316,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return e.type === 'literal' || (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el)));
 	}
 
+	// A bare `p?: T` (optional, no `= value`) is real, valid TS distinct from `p: T = value` (a real
+	// default expression) -- `emitCallArgs`'s own omitted-argument handling only ever consulted a real
+	// default expression, so an optional-but-defaultless trailing param could never actually be omitted
+	// at a call site (found via `lib/map.ts`'s own `entries()` calling `.map()` with `thisArg` omitted,
+	// `lib/array.ts`'s own real method -- `thisArg?: any` has no explicit default, same as every other
+	// optional trailing param `arrayMethod`'s hand-built checker signatures declare). Synthesizes a real
+	// `undefined` identifier expression as the default whenever one is otherwise missing -- `emitAs`'s
+	// own `isNullLiteral` handling already treats a bare `undefined` as a real, valid value wherever a
+	// nullable (or plain `any`) target is expected, so this needs no further codegen support at all.
+	function defaultsWithImplicitUndefined(params: readonly { default?: Expr; modifiers?: string[] }[]): (Expr | undefined)[] {
+		return params.map(p => p.default ?? (hasMod(p, 'optional') ? { type: 'identifier', name: 'undefined' } : undefined));
+	}
+
 	function resolveParam(p: JS.Param<Type>): ResolvedParam {
 		let tsType = p.typeAnnotation;
 		if (p.default) {
@@ -4225,7 +4424,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			params.push({key: decl.rest.key, wtype: typeOf(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
 		
 		const {funcIndex, typeIndex} = registerFunc(toParams2(params), toResults(result));
-		const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: decl.params.map(p => p.default), hasRest: !!decl.rest?.typeAnnotation};
+		const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), hasRest: !!decl.rest?.typeAnnotation};
 		funcs.set(name, info);
 		worklist.push(() => {
 			const ctx	= new FunctionContext(name, new Scope(libGlobal), plainReturn(result), undefined);
@@ -5131,7 +5330,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const thisWtype		= cls.thisWtype!;
 
 		const {funcIndex, typeIndex} = registerFunc(toParams2(params), toResults(thisWtype));
-		const info: FuncInfo = { params: params.map(r => r.wtype), result: thisWtype, funcIndex, typeIndex, defaults: ctor.params.map(p => p.default), hasRest: !!ctor.rest?.typeAnnotation };
+		const info: FuncInfo = { params: params.map(r => r.wtype), result: thisWtype, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(ctor.params), hasRest: !!ctor.rest?.typeAnnotation };
 		funcs.set(key, info);
 
 		// A constructor's own `return;` never carries a value (real TS syntax already enforces this at
@@ -5324,7 +5523,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			reassignsThis	? [...toResults(result), toValType(thisWtype)] : toResults(result)
 		);
 
-		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: decl.params.map(p => p.default), hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
+		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
 		funcs.set(key, info);
 		worklist.push(() => {
 			const ctx	= new FunctionContext(key.replace('.', '_').replace('#', '_'), new Scope(libGlobal), plainReturn(result), owner);

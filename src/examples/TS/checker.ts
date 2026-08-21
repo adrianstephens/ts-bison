@@ -1450,7 +1450,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				if (e.operator.endsWith('=')) {
 					// Assignments are judged against the declaration-site type, not any active narrowing -- a dotted target goes through
 					// `lookupMember` on the object's own type, not `typeOf` (which would consult the narrowings map instead).
-					if (err) {
+					// A destructuring target (`e.left.type` 'object'/'array', reusing the literal AST shape) has no dedicated pattern
+					// checker yet -- `recurse(e.left)` above just runs it as a value expression, so `lt` isn't a real declared type to
+					// check `rt` against here. Matches `hoistVar`'s same gap for declaration-site patterns (widens to `any`, no check).
+					if (err && (e.left.type === 'identifier' || e.left.type === 'member' || e.left.type === 'index')) {
 						if (e.left.type === 'identifier') {
 							lt = scope.declared(e.left.name) || lt;
 						} else if (e.left.type === 'member') {
@@ -1569,7 +1572,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			case 'class': {
 				const e2 = e as TS.Class;
 				const { instance, value } = classShapes(e2, scope);
-				checkClassMembers(e.name, e2.body, instance, value, scope, err);
+				checkClassMembers(e.name, e2.body, instance, value, scope, e2.typeParams, err);
 				return value;
 			}
 			case 'as': {
@@ -1623,16 +1626,35 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 	if (skipReturn || (expected && T.isAny(expected)) || isPredicate)
 		expected = undefined;
 
-	// Already fully known and this walk is only an unrelated call's speculative (muted) side effect -- this declaration
-	// gets a real, unmuted pass whenever it's directly checked, so nothing here needs to backstop that.
-	if (expected && !err)
+	// A muted re-walk of a declared-return-type function is skipped ONLY once it's already been stamped
+	// (`fn.scope` set) -- `narrow`'s speculative re-walks always run under `muted` and only ever reach a
+	// given node *after* the real pass already checked it, so this is the common case this guard exists
+	// for. But a lib method's *one and only* check (`makeLibScope`'s single muted `checkBlock`) would
+	// otherwise never walk the body at all, silently skipping `applyContextualParams`'s side effect on an
+	// unannotated callback param below (found via `lib/map.ts`'s `entries()`, whose `.map()` callback
+	// params never got typed) -- so the very first walk still has to run, even muted.
+	if (expected && !err && fn.scope)
 		return;
 
 	const inner = new Scope(scope);
-	// First (real, unmuted) check wins: `narrow`'s speculative re-walks always run under `muted` and only ever
-	// reach this same node *after* the real pass already checked it (e.g. `case 'if'` checks `stmt.test` before
-	// narrowing it), so `??=` can never let a narrowed/speculative scope clobber the real one.
-	fn.scope ??= inner;
+	// `noStamp`: true only for the exact case the early-return above used to swallow entirely -- a muted
+	// (no `err`), declared-return-type, first-ever-walked (`fn.scope` unset, or this line wouldn't be
+	// reached at all) method belonging to a generic class's own instance scope
+	// (`scope.isGenericTemplate()`). Everything else -- a constructor (`skipReturn` always forces
+	// `expected` false, so it never qualifies), a real `err`-set check, a non-generic lib method (`String`)
+	// -- stamps exactly as it always has.
+	//
+	// The reason this specific case must NOT stamp: this method body is a shared template, reused across
+	// every concrete instantiation via structural substitution rather than re-checked per instantiation --
+	// a stamp here would freeze the template's own unresolved type param forever (`??=` first-wins),
+	// permanently blocking a later, per-instantiation-correct scope (`ctx.scope` in towasm.ts) from ever
+	// being used instead. Leaving it unstamped is safe: every consumer of `fn.scope`/`(stmt as any).scope`
+	// already falls back to something instantiation-correct when unset (see `makeLibScope`'s own comment
+	// in towasm.ts). The walk itself still has to run either way, muted or not -- `applyContextualParams`'s
+	// side effect on an unannotated callback param below doesn't depend on the scope stamp at all.
+	const noStamp = !!expected && !err && scope.isGenericTemplate();
+	if (!noStamp)
+		fn.scope ??= inner;
 	// Each of this function's own type params gets registered into its body's scope (`addTypeParam`,
 	// not `addType` -- see its own comment on why the distinction matters for conditional-type
 	// deferral), using its declared constraint (or `any` when unconstrained) as a real, resolvable
@@ -1675,7 +1697,7 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 							checkExcessProps(argument, expected, scope, (argument as any).pos, scope, err);
 					}
 				}
-			}, undefined, err);
+			}, undefined, err, noStamp);
 		} else {
 			const	returns: Type[] = [];
 			let		yields: Type[] | undefined;
@@ -1683,7 +1705,7 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 			try {
 				checkBlock(body, inner, (argument: Expr|undefined, scope: Scope): void => {
 					returns.push(argument ? typeOf(argument, scope, true, undefined, undefined, err) : T.VOID);
-				}, yieldCollector, err);
+				}, yieldCollector, err, noStamp);
 			} finally {
 				yields = yieldCollector;
 			}
@@ -1716,10 +1738,24 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 	}
 }
 
-function checkClassMembers(name: string | undefined, body: TS.ClassMember[], instance: Type, classValue: Type, scope: Scope, err?: Err): Scope {
-	const instScope = new Scope(scope);
+function checkClassMembers(name: string | undefined, body: TS.ClassMember[], instance: Type, classValue: Type, scope: Scope, typeParams: TS.TypeParam[] | undefined, err?: Err): Scope {
+	// Flagged (`Scope.isGenericTemplate`) whenever this class itself declares type params: an instance
+	// method's body here is one shared template reused (via structural substitution, not a fresh check)
+	// across every later `K`/`V`-concrete instantiation -- see `checkFunctionBody`'s own use of the flag.
+	const instScope = new Scope(scope, !!typeParams?.length);
 	// prefer the named entry: declaration merging can extend it beyond this declaration's shape
 	instScope.addValue('this', name && scope.type(name) ? { type: 'ref', name } : instance);
+	// Each of this class's own type params gets registered into its instance-method scope, same
+	// reasoning and mechanism as `checkFunctionBody`'s own registration (`addTypeParam`, not `addType`)
+	// -- a bare, unregistered class type param (e.g. `K`/`V` of `Map<K,V>`) stays fully opaque for every
+	// reference inside an instance method body, including needing to *resolve* a field's own type
+	// (`this.keys_: K[]`) to look up a real member on it (`Array<K>.map`, needed to contextually type
+	// `this.keys_.map(...)`'s own callback params) -- silently tolerated, not actually verified, until
+	// now (found via `lib/map.ts`'s own `entries()`, whose `.map()` callback params never resolved at
+	// all). Not registered into `statScope`: a static member can never reference its own class's
+	// instance type params, matching real TS.
+	for (const p of typeParams ?? [])
+		instScope.addTypeParam(p.name, p.constraint ?? T.ANY);
 	const statScope = new Scope(scope);
 	statScope.addValue('this', classValue);
 	for (const m of body) {
@@ -1776,10 +1812,15 @@ function assignRights(st: TS.Statement, name?: string): { name: string; rights: 
 	return undefined;
 }
 
-export function checkBlock(stmts: TS.Statement[], scope: Scope, onReturn?: (argument: Expr|undefined, scope: Scope)=>void, yieldCollector?: Type[], err?: Err) {
+// `noStamp`: threaded down from `checkFunctionBody`'s own `noStamp` (see its own long comment) --
+// only ever `true` for the muted, first-ever walk of a generic class's shared method-body template.
+// Every other caller (real user-program checks, `static_block`, the top-level `makeLibScope`/
+// `transform.ts` calls) leaves it `undefined`, so `checkStmt`'s `(stmt as any).scope ??=` stamp fires
+// exactly as it always has for them.
+export function checkBlock(stmts: TS.Statement[], scope: Scope, onReturn?: (argument: Expr|undefined, scope: Scope)=>void, yieldCollector?: Type[], err?: Err, noStamp?: boolean) {
 	hoist(stmts, scope);
 	for (const s of stmts) {
-		checkStmt(s, scope, onReturn, yieldCollector, err);
+		checkStmt(s, scope, onReturn, yieldCollector, err, noStamp);
 
 		if (s.type === 'if') {
 			if (!s.alternate && alwaysExits(s.consequent)) {
@@ -1805,7 +1846,7 @@ export function checkBlock(stmts: TS.Statement[], scope: Scope, onReturn?: (argu
 }
 
 
-function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|undefined, scope: Scope)=>void, yieldCollector?: Type[], err?: Err): void {
+function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|undefined, scope: Scope)=>void, yieldCollector?: Type[], err?: Err, noStamp?: boolean): void {
 	// The real (post-narrowing, where applicable) `Scope` this statement was type-checked under --
 	// stamped directly on the node (like `pos`, `CallSig.scope`), not tracked as checker state, so a
 	// consumer with no narrowing-aware scope of its own (towasm.ts's codegen, whose own scope tracking
@@ -1814,12 +1855,17 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 	// field on `Statement` -- that union is large enough that a shared field added via an intersection
 	// broke unrelated generic AST-mapping code elsewhere (`walker.ts`'s `keyof`-based `NodeMap`).
 	// `??=`: first (real, unmuted) check wins, same reasoning as `fn.scope ??=` above -- a speculative
-	// (muted) re-walk always reaches a given statement only after the real pass already has.
-	(stmt as any).scope ??= scope;
+	// (muted) re-walk always reaches a given statement only after the real pass already has. `noStamp`
+	// (see `checkFunctionBody`'s own comment) skips it entirely for the one case where even a first
+	// stamp would be wrong -- deliberately *not* re-derived here from `scope.isGenericTemplate()`
+	// directly: that would also catch a constructor (always walked in full regardless of genericity,
+	// via `skipReturn`, and never itself at risk), which must keep stamping as before.
+	if (!noStamp)
+		(stmt as any).scope ??= scope;
 	const typeOf1 = (e: Expr, scope: Scope, expected?: Type) => typeOf(e, scope, true, expected, yieldCollector, err);
-	const checkBlock1 = (stmts: TS.Statement[], scope: Scope) => checkBlock(stmts, scope, onReturn, yieldCollector, err);
+	const checkBlock1 = (stmts: TS.Statement[], scope: Scope) => checkBlock(stmts, scope, onReturn, yieldCollector, err, noStamp);
 
-	const recurse = (stmt: TS.Statement, scope: Scope) => checkStmt(stmt, scope, onReturn, yieldCollector, err);
+	const recurse = (stmt: TS.Statement, scope: Scope) => checkStmt(stmt, scope, onReturn, yieldCollector, err, noStamp);
 
 	switch (stmt.type) {
 		case 'var_decl': {
@@ -1951,7 +1997,7 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 		case 'class_decl': {
 			const c = stmt as TS.Class;
 			const { instance, value } = classShapes(c, scope);
-			checkClassMembers(stmt.name, c.body, instance, value, scope, err);
+			checkClassMembers(stmt.name, c.body, instance, value, scope, c.typeParams, err);
 			break;
 		}
 		case 'export_decl':

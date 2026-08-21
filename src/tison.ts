@@ -827,20 +827,17 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Intern
 	while (true) {
 		const row			= tables.action[stack[stack.length - 1].state];
 		const direct		= row.get(realTok.type);
-		const usingRecovery	= !direct || direct.kind === 'error';
+		let usingRecovery	= !direct || direct.kind === 'error';
 		if (usingRecovery) {
 			// Not reset on non-recovery steps: a stuck cycle alternates recovery with shift/reduce of the
 			// synthesized token itself, so consecutive recovery steps are rare even when truly stuck --
 			// compare against `stream.offset` (real progress) instead.
 			recoveryStuckCount = recoveryStuckAt === stream.offset ? recoveryStuckCount + 1 : 1;
 			recoveryStuckAt = stream.offset;
-			if (recoveryStuckCount > MAX_RECOVERY_AT_SAME_OFFSET) {
-				const pos = getTextPos(stream);
-				throw new SyntaxError(
-					`Parser stuck in error recovery at line ${pos.line}, col ${pos.col} `
-					+ `(recovery keeps re-inserting a token without consuming '${realTok.type.name}') -- this is a parser/grammar bug, not just invalid input.`
-				);
-			}
+			// Recovery keeps synthesizing tokens without ever consuming real input: give up on it so this
+			// falls through to the ordinary Unexpected-token/character report below, instead of spinning.
+			if (recoveryStuckCount > MAX_RECOVERY_AT_SAME_OFFSET)
+				usingRecovery = false;
 		}
 		const tok			= usingRecovery ? recover(stream, row) : realTok;
 		const entry			= tok && row.get(tok.type);
@@ -1001,13 +998,12 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 
 			const row			= tables.action[path.state];
 			const direct		= row.get(tok.type);
-			const usingRecovery	= !direct || direct.kind === 'error';
-			if (usingRecovery && ++recoveryUsedCount > MAX_RECOVERY_PER_POSITION) {
-				throw new SyntaxError(
-					`GLR fork stuck in error recovery at line ${stream.line}, col ${stream.col} `
-					+ `(recovery keeps re-inserting a token without consuming '${tok.type.name}') -- this is a parser/grammar bug, not just invalid input.`
-				);
-			}
+			let usingRecovery	= !direct || direct.kind === 'error';
+			// Same non-progress hazard as runParser (see there): once recovery has churned without this
+			// position ever advancing, stop trying it so the path just dies out normally below instead
+			// of every worklist entry re-triggering this same throw.
+			if (usingRecovery && ++recoveryUsedCount > MAX_RECOVERY_PER_POSITION)
+				usingRecovery = false;
 			const actionTok		= usingRecovery ? recover(stream, row) : tok;
 			const entry			= actionTok && row.get(actionTok.type);
 			if (entry && entry.kind !== 'error') {
@@ -1032,8 +1028,11 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 			stream.prev = tok;
 
 		// Merge converging paths landing on i + 1 (same derivation reached by separate shifts).
-		if (!shifted.length)
+		if (!shifted.length) {
+			if (tok.type === ERROR)
+				throw new SyntaxError(`Unexpected character '${stream.peekText()[0] ?? ''}' at line ${stream.line}, col ${stream.col}.`);
 			throw new SyntaxError(`No active GLR fork paths survived to token ${i + 1} (at line ${stream.line}, col ${stream.col}, near '${tok.type.name}') -- every forked derivation died out; this is a parser/grammar bug, not just invalid input.`);
+		}
 
 		active = new Map<string, StackFrame>();
 		for (const path of shifted) {

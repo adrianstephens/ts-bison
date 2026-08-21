@@ -2482,6 +2482,52 @@ async function main() {
 	}
 
 	{
+		// `for...in` over a *mapped-type-shaped* generic (`Partial<Record<string,V>>`, walker.ts's own
+		// `NodeMap<N>` idiom: `Partial<{[K in keyof N]: F}>`) -- previously unsupported (only a plain
+		// index-signature `{[k:string]:V}` routed to `Map`-backed dynamic-object codegen); a real
+		// composition gap in `resolve()`'s own `indexed_access`/`keyof`/`array` handling, not a codegen
+		// one -- once the mapped type genuinely resolves down to the same index-signature shape, the
+		// existing dynamic-object machinery reaches it with no further codegen changes needed.
+		const { forInMappedType, spreadDynamicObject } = await compile(`
+			export function forInMappedType(): number {
+				const fields: Partial<Record<string, number>> = { a: 1, b: 2, c: 3 };
+				let total = 0;
+				for (const f in fields)
+					total = total + (fields[f] as number);
+				return total;
+			}
+			export function spreadDynamicObject(): number {
+				const a: Partial<Record<string, number>> = { x: 1, y: 2 };
+				const b: Partial<Record<string, number>> = { ...a, z: 3 };
+				let total = 0;
+				for (const k in b)
+					total = total + (b[k] as number);
+				return total;
+			}
+		`);
+		check("dynamic object: for...in over a mapped-type-shaped generic (walker.ts's own NodeMap<N> idiom)", forInMappedType(), 6);
+		check('dynamic object: spread (`{...other, k: v}`) copies the spread argument\'s own live entries', spreadDynamicObject(), 6);
+	}
+
+	{
+		// A closure literal's own concrete result narrower than the slot it's assigned into -- real TS
+		// covariant-return assignability (`(x: number) => number` fitting `(x: number) => number |
+		// undefined`), the common shape a `Partial<...>`'s own optional mapped-type value produces for a
+		// literal written against one specific, always-present key. Unlike a scalar (`coerceTop` alone
+		// converts one already-on-the-stack value), a closure's own compiled signature is fixed forever,
+		// so this needs a real wrapping trampoline (`ensureClosureCoercionWrapper`), not an in-place
+		// instruction sequence.
+		const { closureCovariantReturn } = await compile(`
+			export function closureCovariantReturn(): number {
+				const f: (x: number) => number | undefined = (x: number) => x + 100;
+				const r = f(1);
+				return r === undefined ? -1 : r;
+			}
+		`);
+		check("closure covariant-return coercion: a narrower-returning literal fits a wider ('| undefined') slot", closureCovariantReturn(), 101);
+	}
+
+	{
 		// Set<T> -- same linear-scan implementation as Map (lib/set.ts), sharing the shift-down-on-
 		// delete/reference-identity behavior.
 		const { basic, dedupe, del } = await compile(`
