@@ -37,7 +37,7 @@
 declare type i8 = number;
 
 export class ArrayBuffer {
-	get byteLength(): number { return __asm<[], u32>('array.len')(); }
+	get byteLength(): number	{ return __asm<[], u32>('array.len')(); }
 	[i: number]: u8;
 	get(i: i32): u8				{ return __asm<[i32], i32>('array.get_u $this')(i); }
 	set(i: i32, v: i32): void	{ return __asm<[i32, i32], void>('array.set $this')(i, v); }
@@ -60,7 +60,7 @@ export class TypedArray<T> {
 	// which of Uint8Array/Int32Array/Uint32Array they actually are (towasm.ts substitutes the class's own
 	// name into this call site too, same as everywhere else in this file -- see its header comment).
 	private static elemSize(): i32 { return __asm<[], i32>(`
-		(switch $elem
+		(switch $T
 			(($u8 $i8)			i32.const 1)
 			(($u16 $i16)		i32.const 2)
 			(($i32 $u32 $f32)	i32.const 4)

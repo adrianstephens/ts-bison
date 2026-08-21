@@ -567,6 +567,7 @@ export class RegExp {
 	global: 	boolean;
 	ignoreCase: boolean;
 	multiline: 	boolean;
+	sticky:		boolean;
 	lastIndex	= 0;
 
 	private compiled: 	RegExpCompiler;
@@ -580,8 +581,19 @@ export class RegExp {
 		this.global		= hasFlag(flags, 103);	// 'g'
 		this.ignoreCase = hasFlag(flags, 105);	// 'i'
 		this.multiline	= hasFlag(flags, 109);	// 'm'
+		this.sticky		= hasFlag(flags, 121);	// 'y'
 		this.compiled	= compilePattern(source);
 		this.groups		= new Array<i32>((this.compiled.groupCount + 1) * 2);
+	}
+
+	// Canonical relative order matches real JS's full 'dgimsuvy' -- just the subset this class tracks.
+	get flags(): string {
+		let f = '';
+		if (this.global) f = f.concat('g');
+		if (this.ignoreCase) f = f.concat('i');
+		if (this.multiline) f = f.concat('m');
+		if (this.sticky) f = f.concat('y');
+		return f;
 	}
 
 	private charEq(a: number, b: number): boolean {
@@ -755,14 +767,19 @@ export class RegExp {
 		return null;
 	}
 	exec(s: string): RegExpMatch | null {
-		const start = this.global ? this.lastIndex : 0;
+		const tracks = this.global || this.sticky;
+		const start = tracks ? this.lastIndex : 0;
 		if (start > s.length) {
-			if (this.global)
+			if (tracks)
 				this.lastIndex = 0;
 			return null;
 		}
-		const result = this.execFrom(s, start);
-		if (this.global) {
+		// Sticky matches only exactly at `lastIndex` (`runVM` directly, no `execFrom` scan) -- unlike
+		// `global`, which scans forward from it. Real JS: a regex can be both 'g' and 'y' together, in
+		// which case sticky's exact-position rule wins (this compiler's own callers only ever combine
+		// 'y' with 'i'/'m', but the check is written to match real semantics regardless).
+		const result = this.sticky ? (this.runVM(s, start) ? this.buildMatch(s) : null) : this.execFrom(s, start);
+		if (tracks) {
 			if (result === null) {
 				this.lastIndex = 0;
 			} else {

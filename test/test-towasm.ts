@@ -1118,6 +1118,191 @@ async function main() {
 	}
 
 	{
+		// An empty array literal `[]` has no elements for `arrayKindOf` to infer a kind from -- it used
+		// to fall back to 'ref' unconditionally, ignoring the declared target type entirely, and fail
+		// for any non-ref target ("cannot convert {arr:ref} to {arr:f64}"). Found while building Map/Set
+		// (lib/map.ts's own `keys_: K[] = []`/`values_: V[] = []` fields), but general -- covers a local,
+		// a field, and a generic field where the type parameter substitutes to a scalar kind.
+		const { emptyLocal, emptyField, emptyGenericField } = await compile(`
+			export function emptyLocal(): number {
+				const a: number[] = [];
+				return a.length;
+			}
+			class Holder { xs: number[] = []; constructor() {} }
+			export function emptyField(): number {
+				const h = new Holder();
+				return h.xs.length;
+			}
+			class GenericHolder<T> { xs: T[] = []; constructor() {} }
+			export function emptyGenericField(): number {
+				const h = new GenericHolder<number>();
+				return h.xs.length;
+			}
+		`);
+		check('empty array literal: local number[]', emptyLocal(), 0);
+		check('empty array literal: number[] class field', emptyField(), 0);
+		check('empty array literal: generic field substituted to number[]', emptyGenericField(), 0);
+	}
+
+	{
+		// A parameter default value is re-emitted verbatim at each real omitted-argument call site
+		// (`emitCallArgs`), not evaluated once and shared -- safe for any expression that references
+		// nothing outside its own literal value. Used to only allow a bare `'literal'` node; an array
+		// literal (the empty-array case in particular, `items: T[] = []`) has exactly the same
+		// no-external-reference safety property but was rejected outright. Found while adding
+		// `lib/map.ts`.
+		const { emptyDefault, nonEmptyDefault, calledWithArg, freshEachCall } = await compile(`
+			function f(items: number[] = []): number {
+				return items.length;
+			}
+			export function emptyDefault(): number {
+				return f();
+			}
+			function g(items: number[] = [1, 2, 3]): number {
+				return items.length + items[0] + items[1] + items[2];
+			}
+			export function nonEmptyDefault(): number {
+				return g();
+			}
+			export function calledWithArg(): number {
+				return f([9, 9]);
+			}
+			function h(items: number[] = []): number {
+				items.push(1);
+				return items.length;
+			}
+			export function freshEachCall(): number {
+				// Each omitted-arg call must get its own fresh [] -- not one shared/mutated across calls.
+				return h() * 10 + h();
+			}
+		`);
+		check('default value: empty array literal', emptyDefault(), 0);
+		check('default value: non-empty array literal of literals', nonEmptyDefault(), 9);
+		check('default value: an explicit argument still overrides it', calledWithArg(), 2);
+		check('default value: a fresh array is re-emitted per omitted call, not shared', freshEachCall(), 11);
+	}
+
+	{
+		// A plain named function read as a *value* (passed as a callback, assigned to a local,
+		// stored in an array, ...) rather than called directly by name -- previously threw a bare,
+		// message-less `"unknown"` unconditionally (identifier resolution only knew locals/closure-
+		// captures/globals, never `functionDeclByName`). An ordinary top-level function has no `env`
+		// param at all (it captures nothing), so it can't just be read as a closure value directly --
+		// needs a small, shared, zero-capture trampoline (`ensureFunctionValueWrapper`) forwarding to
+		// the real compiled function. A *nested* function referenced as a value by a sibling
+		// expression already worked before this fix (it's an ordinary local holding a real closure
+		// value); this is specifically about a top-level one.
+		const { direct, twoUsesShareOneWrapper, assignedToLocal, viaArrayElement, forwardsRestParams } = await compile(`
+			function helper(x: number): number { return x + 1; }
+			function useCallback(cb: (x: number) => number): number { return cb(10); }
+			export function direct(): number {
+				return useCallback(helper);
+			}
+			export function twoUsesShareOneWrapper(): number {
+				return useCallback(helper) + useCallback(helper);
+			}
+			export function assignedToLocal(): number {
+				const f = helper;
+				return f(5);
+			}
+			function double(x: number): number { return x * 2; }
+			export function viaArrayElement(): number {
+				const fns: ((x: number) => number)[] = [helper, double];
+				return fns[0](3) + fns[1](3);
+			}
+			function sum(...nums: number[]): number {
+				let total = 0;
+				for (let i = 0; i < nums.length; i = i + 1)
+					total = total + nums[i];
+				return total;
+			}
+			function callWithRest(cb: (...n: number[]) => number): number { return cb(1, 2, 3); }
+			export function forwardsRestParams(): number {
+				return callWithRest(sum);
+			}
+		`);
+		check('function-as-value: passed directly as a callback', direct(), 11);
+		check('function-as-value: two uses of the same function share one wrapper', twoUsesShareOneWrapper(), 22);
+		check('function-as-value: assigned to a local, then called through it', assignedToLocal(), 6);
+		check('function-as-value: stored as array elements, called through indexing', viaArrayElement(), 10);
+		check("function-as-value: the wrapper forwards a rest param correctly", forwardsRestParams(), 6);
+	}
+
+	{
+		// A generic closure *value* (as opposed to calling a generic function/method directly, already
+		// monomorphized per call site) is one physical closure that has to work across every call-site
+		// instantiation. Bound-substitution, not universal `anyref`-boxing: each type param becomes its
+		// own upper bound (defaulting to boxed `any` only when unconstrained) throughout params/return
+		// type/body -- free when bounded (a real wasm-GC upcast, zero instructions), since the
+		// overwhelmingly common shape (walker.ts's own motivating case) only ever narrows an
+		// already-concrete bound for the *caller's* own type precision, never consumes the param in a
+		// genuinely type-specific way.
+		const { returnedFromGenericFn, fromConditional, unconstrainedBoxedAny, boundedClassNarrowing } = await compile(`
+			function makeProcess<U>(parts: (x: U) => U) {
+				const redo = <T extends U>(t: T): T => parts(t as unknown as U) as unknown as T;
+				return redo;
+			}
+			export function returnedFromGenericFn(): number {
+				const inc = makeProcess<number>((x: number) => x + 1);
+				return inc(5);
+			}
+			function makeProcess2<U>(always: boolean, parts: (x: U) => U) {
+				return always
+					? (<T extends U>(t: T): T => parts(t as unknown as U) as unknown as T)
+					: (<T extends U>(t: T): T => t);
+			}
+			export function fromConditional(): number {
+				const g = makeProcess2<number>(true, (x: number) => x * 2);
+				return g(5);
+			}
+			export function unconstrainedBoxedAny(): number {
+				// No bound at all -- falls back to boxed 'any'. One physical closure, called with two
+				// genuinely different concrete types.
+				const identity = <T,>(x: T): T => x;
+				const n = identity(42);
+				const s = identity("hello");
+				return n + s.length;
+			}
+			class Animal { constructor() {} sound(): number { return 1; } }
+			class Dog extends Animal { constructor() { super(); } sound(): number { return 2; } }
+			export function boundedClassNarrowing(): number {
+				const redo = <T extends Animal>(t: T): T => t;
+				const d = redo(new Dog());
+				return d.sound();
+			}
+		`);
+		check('generic closure: returned from a generic function, called at its own instantiation', returnedFromGenericFn(), 6);
+		check('generic closure: selected via a conditional expression, still generic', fromConditional(), 10);
+		check('generic closure: unconstrained type param falls back to boxed any, works for two real types', unconstrainedBoxedAny(), 47);
+		check('generic closure: bounded by a class, a subclass instance still dispatches virtually afterward', boundedClassNarrowing(), 2);
+	}
+
+	{
+		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
+		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
+		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed
+		// operands and rejects a bare `anyref` even though every real value here is eq-comparable.
+		// Found the same way as the empty-array-literal fix above -- `Array<T>.indexOf` (lib/array.ts,
+		// already-shipped) silently only ever worked for scalar `T`, never a class-typed one, because
+		// nothing exercised it that way before.
+		const { classIndexOf, classIncludes } = await compile(`
+			class Node { constructor(public id: number) {} }
+			export function classIndexOf(): number {
+				const a: Node[] = [new Node(1), new Node(2), new Node(3)];
+				return a.indexOf(a[1]);
+			}
+			export function classIncludes(): number {
+				const a: Node[] = [new Node(1), new Node(2)];
+				const notIn = new Node(1);
+				// Same 'id' as a[0], but a distinct instance -- must NOT be found (reference identity).
+				return a.includes(notIn) ? 1 : 0;
+			}
+		`);
+		check('Array<T>.indexOf() with class-typed T (ref.eq on boxed-any elements)', classIndexOf(), 1);
+		check('Array<T>.includes() with class-typed T uses reference identity, not structural equality', classIncludes(), 0);
+	}
+
+	{
 		// number[] non-callback methods
 		const { numIndexOf, numLastIndexOf, numIncludes, numSlice, numReverse, numConcat, numFill } = await compile(`
 			export function numIndexOf(): number {
@@ -2017,6 +2202,7 @@ async function main() {
 			starGreedyLength, starLazyLength, plusMatch, optionalBoth, braceExactTooShort, braceExactOk,
 			braceRangeLength, groupBackrefMatch, groupBackrefNoMatch, groupCaptureLength, alternation,
 			anchors, ignoreCaseFlag, globalExecCount, wordBoundary,
+			flagsContent, stickyFailsAtWrongOffset, stickyMatchesAtOffset, globalStillScansPastOffset,
 		} = await compile(`
 			export function literalMatch(): number { const re = new RegExp("abc"); return re.test("xxabcyy") ? 1 : 0; }
 			export function literalNoMatch(): number { const re = new RegExp("abc"); return re.test("xyz") ? 1 : 0; }
@@ -2081,6 +2267,32 @@ async function main() {
 				const re = new RegExp("\\\\bcat\\\\b");
 				return (re.test("a cat sat") ? 1 : 0) * 10 + (re.test("category") ? 1 : 0);
 			}
+			// '.flags'/sticky ('y') support -- added for tison.ts's own lexer (nextToken sets 'lastIndex'
+			// and expects an exact-position match, never a forward scan), part of the towasm.ts
+			// self-hosting groundwork.
+			export function flagsContent(): number {
+				const re = new RegExp("a", "yim");
+				const f = re.flags;
+				let h = f.length * 1000;
+				for (let i = 0; i < f.length; i = i + 1)
+					h = h + f.charCodeAt(i) * (i + 1);
+				return h;
+			}
+			export function stickyFailsAtWrongOffset(): number {
+				const re = new RegExp("b", "y");
+				re.lastIndex = 0;
+				return re.exec("ab") === null ? 1 : 0;
+			}
+			export function stickyMatchesAtOffset(): number {
+				const re = new RegExp("b", "y");
+				re.lastIndex = 1;
+				return re.exec("ab") !== null ? 1 : 0;
+			}
+			export function globalStillScansPastOffset(): number {
+				const re = new RegExp("b", "g");
+				re.lastIndex = 0;
+				return re.exec("ab") !== null ? 1 : 0;
+			}
 		`);
 		check('RegExp: literal match', literalMatch(), 1);
 		check('RegExp: literal no-match', literalNoMatch(), 0);
@@ -2103,6 +2315,200 @@ async function main() {
 		check('RegExp: "i" flag case-insensitive', ignoreCaseFlag(), 1);
 		check('RegExp: "g" flag exec() steps lastIndex (3 "a"s in "banana")', globalExecCount(), 3);
 		check('RegExp: \\bcat\\b word boundary', wordBoundary(), 10);
+		check('RegExp: .flags canonicalizes to "imy" regardless of input order "yim"', flagsContent(), 3686);
+		check('RegExp: "y" (sticky) fails when the match is past lastIndex, not scanned to', stickyFailsAtWrongOffset(), 1);
+		check('RegExp: "y" (sticky) matches exactly at lastIndex', stickyMatchesAtOffset(), 1);
+		check('RegExp: "g" (non-sticky) still scans forward past lastIndex', globalStillScansPastOffset(), 1);
+	}
+
+	{
+		// Map<K,V> -- linear-scan implementation (lib/map.ts), part of the towasm.ts self-hosting
+		// groundwork (checker.ts/type-utils.ts/walker.ts/transform.ts/towasm.ts/tison.ts itself all use
+		// Map pervasively). `set`/`get`/`has`/`delete`/`size`/`clear`/`keys` over string keys, plus
+		// reference-identity semantics for class-typed keys (a structurally-identical-but-distinct
+		// instance must NOT collide).
+		const { basic, overwrite, del, sizeAndClear, keysOrderAfterDelete, classKeysUseIdentity } = await compile(`
+			export function basic(): number {
+				const m = new Map<string, number>();
+				m.set('a', 1);
+				m.set('b', 2);
+				return (m.get('a') ?? -1) * 100 + (m.get('b') ?? -1) * 10 + (m.has('c') ? 1 : 0);
+			}
+			export function overwrite(): number {
+				const m = new Map<string, number>();
+				m.set('a', 1);
+				m.set('a', 10);
+				return m.size * 100 + (m.get('a') ?? -1);
+			}
+			export function del(): number {
+				const m = new Map<string, number>();
+				m.set('a', 1);
+				m.set('b', 2);
+				const removed = m.delete('a') ? 1 : 0;
+				return removed * 100 + m.size * 10 + (m.has('a') ? 1 : 0);
+			}
+			export function sizeAndClear(): number {
+				const m = new Map<string, number>();
+				m.set('a', 1);
+				m.set('b', 2);
+				m.set('c', 3);
+				const before = m.size;
+				m.clear();
+				return before * 10 + m.size;
+			}
+			export function keysOrderAfterDelete(): number {
+				const m = new Map<string, number>();
+				m.set('a', 1);
+				m.set('b', 2);
+				m.set('c', 3);
+				m.delete('b');
+				const ks = m.keys();
+				return ks.length * 10000 + ks[0].charCodeAt(0) * 100 + ks[1].charCodeAt(0);
+			}
+			class Node { constructor(public id: number) {} }
+			export function classKeysUseIdentity(): number {
+				const m = new Map<Node, number>();
+				const a = new Node(1);
+				const b = new Node(2);
+				m.set(a, 100);
+				m.set(b, 200);
+				const c = new Node(1);
+				return (m.get(a) ?? -1) * 10000 + (m.get(b) ?? -1) * 100 + (m.has(c) ? 1 : 0);
+			}
+		`);
+		check('Map: get/set/has', basic(), 120);
+		check('Map: set() on an existing key overwrites, size unchanged', overwrite(), 110);
+		check('Map: delete() removes and reports size/has correctly', del(), 110);
+		check('Map: size tracks entries, clear() empties it', sizeAndClear(), 30);
+		check('Map: keys() after delete() preserves remaining relative order', keysOrderAfterDelete(),
+			2 * 10000 + 'a'.charCodeAt(0) * 100 + 'c'.charCodeAt(0));
+		check('Map: class-typed keys use reference identity, not structural equality', classKeysUseIdentity(), 1020000);
+	}
+
+	{
+		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
+		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
+		// arrays; the checker already fully tracks each element's own precise type, codegen only
+		// needed the one physical-representation mapping (`wasmTypeOf`'s tuple case). A nested tuple
+		// literal (as opposed to one directly target-typed itself) needed a second, real, separate fix:
+		// array-literal contextual typing didn't thread the expected type to its own elements at all
+		// (unlike object literals, which already did) -- `[1,2]` inside a `[number,number][]`-typed
+		// outer literal used to infer as a plain `number[]` regardless of position, which is wrong for
+		// both real assignability checking and (via the wrong physical array kind) for codegen. Found
+		// while restoring `lib/map.ts`'s `entries`-array convenience constructor.
+		const { standaloneTuple, homogeneousArrayOfTuples, mixedTypeArrayOfTuples, mapFromEntries } = await compile(`
+			export function standaloneTuple(): number {
+				const t: [number, number] = [1, 2];
+				return t[0] + t[1];
+			}
+			export function homogeneousArrayOfTuples(): number {
+				const pairs: [number, number][] = [[1, 2], [3, 4]];
+				return pairs[0][0] + pairs[0][1] + pairs[1][0] + pairs[1][1];
+			}
+			export function mixedTypeArrayOfTuples(): number {
+				const pairs: [string, number][] = [["ab", 10], ["xyz", 20]];
+				return pairs[0][0].length + pairs[0][1] + pairs[1][0].length + pairs[1][1];
+			}
+			export function mapFromEntries(): number {
+				const m = new Map<string, number>([["a", 1], ["b", 2]]);
+				return (m.get("a") ?? -1) * 10 + (m.get("b") ?? -1);
+			}
+		`);
+		check('tuple array: a directly target-typed tuple literal indexes correctly', standaloneTuple(), 3);
+		check('tuple array: a homogeneous array of tuple literals', homogeneousArrayOfTuples(), 10);
+		check('tuple array: a mixed-type (string,number) array of tuple literals', mixedTypeArrayOfTuples(), 35);
+		check("tuple array: Map's entries-array convenience constructor", mapFromEntries(), 12);
+	}
+
+	{
+		// Dynamic objects (`{[k: string]: V}`) -- a real, genuine user-facing idiom (`{}`/bracket
+		// syntax, `delete`/`in`/`for...in`), not routed through Map/Set syntax even though it shares
+		// their same underlying hash-table implementation (`indexSignatureValueType` routes the
+		// structural type to `Map<string,V>`'s own physical representation) -- see the plan/gap
+		// comment's own reasoning on why. Bracket read/write is free (the same generic `get`/`set`
+		// index-syntax dispatch `Array`/`Uint8Array` already use); `delete`/`in`/`for...in` are new,
+		// narrow, structurally-general dispatches to `Map`'s own `delete`/`has`/`keys` methods.
+		// `insertFactoryShaped` mirrors `binary-libs/wasm.ts`'s actual `insertFactory` pattern
+		// (nested dynamic objects built up incrementally via bracket assignment) -- the whole reason
+		// this feature exists.
+		const { emptyLiteral, withProps, bracketWrite, deleteTest, inTest, forInTest, insertFactoryShaped } = await compile(`
+			export function emptyLiteral(): number {
+				const obj: { [k: string]: number } = {};
+				obj["a"] = 1;
+				return obj["a"];
+			}
+			export function withProps(): number {
+				const obj: { [k: string]: number } = { a: 10, b: 20 };
+				return obj["a"] + obj["b"];
+			}
+			export function bracketWrite(): number {
+				const obj: { [k: string]: number } = {};
+				obj["x"] = 5;
+				obj["x"] = obj["x"] + 1;
+				return obj["x"];
+			}
+			export function deleteTest(): number {
+				const obj: { [k: string]: number } = { a: 1, b: 2 };
+				const removed = delete obj["a"] ? 1 : 0;
+				return removed * 100 + (("a" in obj) ? 1 : 0) * 10 + (("b" in obj) ? 1 : 0);
+			}
+			export function inTest(): number {
+				const obj: { [k: string]: number } = { x: 1 };
+				return (("x" in obj) ? 1 : 0) * 10 + (("y" in obj) ? 1 : 0);
+			}
+			export function forInTest(): number {
+				const obj: { [k: string]: number } = { a: 1, b: 2, c: 3 };
+				let total = 0;
+				for (const k in obj)
+					total = total + obj[k];
+				return total;
+			}
+			export function insertFactoryShaped(): number {
+				const root: { [k: string]: { [k: string]: number } } = {};
+				if (!("local" in root))
+					root["local"] = {};
+				root["local"]["get"] = 32;
+				root["local"]["set"] = 33;
+				return root["local"]["get"] + root["local"]["set"];
+			}
+		`);
+		check('dynamic object: empty literal, bracket write, bracket read', emptyLiteral(), 1);
+		check('dynamic object: literal with properties', withProps(), 30);
+		check('dynamic object: bracket write, read-modify-write', bracketWrite(), 6);
+		check('dynamic object: delete obj[k], then in reflects it', deleteTest(), 101);
+		check('dynamic object: k in obj', inTest(), 10);
+		check('dynamic object: for (const k in obj) iterates the live key set', forInTest(), 6);
+		check("dynamic object: nested, built incrementally (binary-libs/wasm.ts's insertFactory shape)", insertFactoryShaped(), 65);
+	}
+
+	{
+		// Set<T> -- same linear-scan implementation as Map (lib/set.ts), sharing the shift-down-on-
+		// delete/reference-identity behavior.
+		const { basic, dedupe, del } = await compile(`
+			export function basic(): number {
+				const s = new Set<number>();
+				s.add(1);
+				s.add(2);
+				return s.size * 100 + (s.has(1) ? 1 : 0) * 10 + (s.has(3) ? 1 : 0);
+			}
+			export function dedupe(): number {
+				const s = new Set<string>();
+				s.add('x');
+				s.add('x');
+				s.add('y');
+				return s.size;
+			}
+			export function del(): number {
+				const s = new Set<number>();
+				s.add(1);
+				s.add(2);
+				const removed = s.delete(1) ? 1 : 0;
+				return removed * 100 + s.size * 10 + (s.has(1) ? 1 : 0);
+			}
+		`);
+		check('Set: add/has/size', basic(), 210);
+		check('Set: add() de-duplicates', dedupe(), 2);
+		check('Set: delete() removes and reports size/has correctly', del(), 110);
 	}
 
 	{
@@ -2264,6 +2670,158 @@ async function main() {
 		check('virtual dispatch: structurally-identical sibling subclasses stay distinct', siblingsDistinct(), 123);
 		check('virtual dispatch: this.method() inside a base method body dispatches virtually', thisDispatchesVirtually(), 200);
 		check("virtual dispatch: non-overriding grandchild inherits its nearest ancestor's override", grandchildInherits(), 2);
+	}
+
+	{
+		// A scalar-only class (every field number/boolean, no object-typed field) takes `ensureCtor`'s
+		// `struct.new_default` shortcut path -- which used to skip class-level field initializers
+		// entirely (only `this.field = ...` statements actually written in the constructor body ever
+		// ran), silently leaving any field with a non-zero/non-false initializer at its wasm-default
+		// value. An object-typed field takes a different, already-correct path (`initField`), which is
+		// why this went unnoticed. Found while adding general `this`-typed-return support below.
+		const { plainNonZero, private_, unrelatedCtorBody, readInCtor, subclassOwnInit, subclassInheritedInit } = await compile(`
+			class Plain {
+				tag: number = 99;
+				constructor() {}
+			}
+			export function plainNonZero(): number {
+				return new Plain().tag;
+			}
+			class WithPrivate {
+				private secret: number = 7;
+				constructor() {}
+				reveal(): number { return this.secret; }
+			}
+			export function private_(): number {
+				return new WithPrivate().reveal();
+			}
+			class Unrelated {
+				tag: number = 99;
+				other: number = 0;
+				constructor() { this.other = 1; }
+			}
+			export function unrelatedCtorBody(): number {
+				const u = new Unrelated();
+				return u.tag * 10 + u.other;
+			}
+			class ReadsOwnInit {
+				tag: number = 99;
+				constructor(x: number) { this.tag = this.tag + x; }
+			}
+			export function readInCtor(): number {
+				return new ReadsOwnInit(1).tag;
+			}
+			class Base { total: number = 7; constructor() {} }
+			class Derived extends Base {
+				tag: number = 99;
+				constructor() { super(); }
+			}
+			export function subclassOwnInit(): number {
+				return new Derived().tag;
+			}
+			export function subclassInheritedInit(): number {
+				return new Derived().total;
+			}
+		`);
+		check('field init: scalar-only class field initializer runs (not just wasm-default 0)', plainNonZero(), 99);
+		check('field init: applies to a private field too', private_(), 7);
+		check('field init: still applies when the constructor body touches an unrelated field', unrelatedCtorBody(), 991);
+		check("field init: runs before the constructor body, so 'this.field = this.field + x' sees the real initial value", readInCtor(), 100);
+		check("field init: a subclass's own field initializer runs after super()", subclassOwnInit(), 99);
+		check("field init: an inherited (superclass) field initializer still runs too", subclassInheritedInit(), 7);
+	}
+
+	{
+		// A `this`-typed return (`add(): this`) means "whatever the receiver's own type is." The checker
+		// itself never eagerly resolves `this` as a type (it's opaque, resolved lazily/contextually at
+		// each assignability check) -- codegen needs one concrete type up front, so `this` gets
+		// substituted with the declaring class's own type in the method's own signature (`ensureMethod`),
+		// in the raw-decl bypass `case 'var_decl'` uses for a method-call init, and (via a real,
+		// checker-level fix, not just a codegen one) at every call site, using the receiver expression's
+		// own resolved type -- covariant through a subclass, not just the declaring class.
+		const { direct, viaLocal, chained, subclassDirect, subclassAfterInherited } = await compile(`
+			class Builder {
+				total: number = 0;
+				constructor() {}
+				add(n: number): this {
+					this.total = this.total + n;
+					return this;
+				}
+			}
+			export function direct(): number {
+				return new Builder().add(5).total;
+			}
+			export function viaLocal(): number {
+				const b = new Builder();
+				const c = b.add(5);
+				return c.total;
+			}
+			export function chained(): number {
+				return new Builder().add(1).add(2).add(3).total;
+			}
+			class SpecialBuilder extends Builder {
+				tag: number = 42;
+				constructor() { super(); }
+			}
+			export function subclassDirect(): number {
+				// 'this' from an *inherited* (non-overridden) method call, used through a subclass-typed
+				// local -- '.tag' (SpecialBuilder-only) must still resolve, proving the physical value
+				// really is the subclass instance, not just something Builder-shaped.
+				const s = new SpecialBuilder();
+				const c = s.add(10);
+				return c.tag;
+			}
+			export function subclassAfterInherited(): number {
+				return new SpecialBuilder().add(1).add(2).tag;
+			}
+		`);
+		check("this-return: direct chain reads a field afterward", direct(), 5);
+		check("this-return: assigned to an intermediate local first", viaLocal(), 5);
+		check("this-return: chains through multiple calls", chained(), 6);
+		check("this-return: covariant through a subclass, inherited method, via a local", subclassDirect(), 42);
+		check("this-return: covariant through a subclass, chained inherited-method calls", subclassAfterInherited(), 42);
+	}
+
+	{
+		// `instanceof` lowers to `ref.test` against the named class's own struct type. `dogNotCat` is
+		// the same structurally-identical-siblings scenario as `siblingsDistinct` above -- Dog/Cat add
+		// no fields of their own beyond Animal, so this only passes if the shared-rec-group fix that
+		// makes `ref.test` reliable there also holds for `instanceof`'s own lowering.
+		const { derivedIsBase, derivedIsSelf, baseIsNotDerived, dogNotCat, viaBaseTypedRef, negated } = await compile(`
+			class Animal { constructor() {} }
+			class Dog extends Animal { constructor() { super(); } }
+			class Cat extends Animal { constructor() { super(); } }
+			export function derivedIsBase(): boolean {
+				const d = new Dog();
+				return d instanceof Animal;
+			}
+			export function derivedIsSelf(): boolean {
+				const d = new Dog();
+				return d instanceof Dog;
+			}
+			export function baseIsNotDerived(): boolean {
+				const a = new Animal();
+				return a instanceof Dog;
+			}
+			export function dogNotCat(): boolean {
+				const d = new Dog();
+				return d instanceof Cat;
+			}
+			export function viaBaseTypedRef(): boolean {
+				const a: Animal = new Dog();
+				return a instanceof Dog;
+			}
+			export function negated(): boolean {
+				const d = new Dog();
+				return !(d instanceof Cat);
+			}
+		`);
+		check('instanceof: a derived instance is an instance of its base', derivedIsBase(), 1);
+		check('instanceof: a derived instance is an instance of its own class', derivedIsSelf(), 1);
+		check('instanceof: a base instance is not an instance of a derived class', baseIsNotDerived(), 0);
+		check('instanceof: structurally-identical siblings stay distinct', dogNotCat(), 0);
+		check('instanceof: works through a base-typed reference holding a derived instance', viaBaseTypedRef(), 1);
+		check('instanceof: negation composes normally', negated(), 1);
 	}
 
 	{

@@ -533,9 +533,74 @@ export function freeze(t: Type): Type {
 }
 
 // Replaces type-parameter references with their instantiating arguments (`Foo<string>` -> Foo's body with T := string)
+// Monotonically-increasing suffix for a synthetic type-parameter name -- an apostrophe keeps it guaranteed-distinct
+// from any real user identifier (never valid in one), so a fresh/renamed name can never collide with a real type
+// actually in scope. Shared by `avoidCapture` (renaming a colliding *existing* type param) and `arrayMethod` (naming
+// a hand-built signature's own type param fresh from the start, rather than colliding in the first place).
+let freshTypeParamId = 0;
+function freshTypeParamName(base: string) { return `${base}'${freshTypeParamId++}`; }
+
+// A nested signature's own type parameter (`Array<T>.map<U>`'s own `U`) is bound within it, shadowing whatever
+// `substituteType` is replacing elsewhere -- but if one of `map`'s *values* being substituted in also happens to
+// mention that same bound name (e.g. substituting `T := U[]`, where `U` is the *caller's* own, unrelated ambient
+// type parameter, into `map`'s declared `(value: T, ...) => U`), the substituted-in value's `U` gets silently
+// captured by `map`'s own bound `U` -- both are the same literal name afterward, and `inferTypeArgs`'s purely
+// name-based matching can no longer tell "map's own, still-to-infer U" apart from "the caller's already-resolved
+// U[] that got substituted in". Alpha-renames the colliding bound parameter (and every occurrence of it within
+// just this one nested signature, including its own constraint/default) to a fresh, guaranteed-unique name first,
+// so the outer substitution proceeds capture-free. A real, general hygiene gap in generic substitution -- exposed
+// once type parameters started resolving to their real constraints instead of staying permanently opaque.
+function avoidCapture(sig: TS.CallSig, map: Map<string, Type>): TS.CallSig {
+	if (!sig.typeParams?.length)
+		return sig;
+	const values = [...map.values()];
+	const rename = new Map(sig.typeParams.filter(p => values.some(v => mentionsTypeParam(v, p.name))).map(p => [p.name, freshTypeParamName(p.name)] as const));
+	if (!rename.size)
+		return sig;
+	const renameRefs = new Map([...rename].map(([from, to]) => [from, TS.RefType(to)] as const));
+	return {
+		...sig,
+		params: sig.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: substituteType(p.typeAnnotation, renameRefs) } : p),
+		rest: sig.rest?.typeAnnotation ? { ...sig.rest, typeAnnotation: substituteType(sig.rest.typeAnnotation, renameRefs) } : sig.rest,
+		returnType: sig.returnType && substituteType(sig.returnType, renameRefs),
+		typeParams: sig.typeParams.map(p => ({
+			...p,
+			name: rename.get(p.name) ?? p.name,
+			constraint: p.constraint && substituteType(p.constraint, renameRefs),
+			default: p.default && substituteType(p.default, renameRefs),
+		})),
+	};
+}
+
 export function substituteType(t: Type, map: Map<string, Type>): Type {
+	return walk(t, undefined, undefined,
+		(x, process) => {
+			if (x.type === 'ref' && !x.typeArgs && map.has(x.name))
+				return map.get(x.name);
+			if (x.type === 'function' || x.type === 'constructor')
+				x = { ...x, ...avoidCapture(x, map) };
+			return process(x);
+		},
+		// An interface/class method's own generic signature (`Array<T>.map<U>`) is a `TypeMember` node
+		// (`method`/`call`/`construct`), not a `Type` one -- `avoidCapture` needs the same treatment here,
+		// or a method's own type parameter only gets capture-avoidance when it's reachable through a bare
+		// `function`/`constructor` type, missing every interface/class member signature (the common case).
+		(m, process) => {
+			if (m.type === 'method' || m.type === 'call' || m.type === 'construct')
+				m = { ...m, ...avoidCapture(m, map) };
+			return process(m);
+		}
+	) ?? t;
+}
+
+// Replaces a `this` type node with `thisType` (the concrete class ref for whichever class is
+// currently being compiled/checked) -- the checker itself never needs this (`this` as a type is
+// resolved lazily, contextually, at each individual assignability check against `scope.value('this')`
+// -- see `OPAQUE`'s own inclusion of `'this'`), but a consumer needing one concrete, materialized
+// type up front (codegen) does.
+export function substituteThisType(t: Type, thisType: Type): Type {
 	return walk(t, undefined, undefined, (x, process) =>
-		x.type === 'ref' && !x.typeArgs && map.has(x.name) ? map.get(x.name) : process(x)
+		x.type === 'this' ? thisType : process(x)
 	) ?? t;
 }
 
@@ -736,18 +801,25 @@ export function FixSig(params: JS.CallSig<any>, defaultRet?: Type, declaredRetur
 function arrayMethod(elem: Type, prop: string): Type | undefined {
 	// `map`'s result depends on the callback's own return type, not a fixed formula of `elem` -- needs a real generic signature, or it silently
 	// falls back to `ANY`, which can then poison a *constrained* generic elsewhere with a confusing error nowhere near the real cause.
-	if (prop === 'map')
+	// The type param's own name is freshly generated per call (not the literal `'U'`) -- `elem` may itself already mention an ambient `U`
+	// (e.g. calling `.map()` on `U[][]` inside a method whose own type parameter happens to be named `U` too), and a hand-built signature
+	// like this one is constructed directly rather than through `substituteType`, so `avoidCapture`'s own collision handling never sees it;
+	// a hardcoded name here would let that unrelated ambient `U` silently capture this signature's own, genuinely different `U`, corrupting
+	// per-call generic inference (`inferTypeArgs`'s purely name-based matching can't tell them apart once both are spelled the same).
+	if (prop === 'map') {
+		const U = TS.RefType(freshTypeParamName('U'));
 		return TS.FunctionType([
 				JS.Param('callback', TS.FunctionType([
 					JS.Param('v', elem),
 					JS.Param('i', NUMBER),
 					JS.Param('arr', TS.ArrayType(elem))
-				], TS.RefType('U'))),
+				], U)),
 				JS.Param('thisArg', ANY, ['optional']),
 			],
-			TS.ArrayType(TS.RefType('U')),
-			[{ name: 'U' }]
+			TS.ArrayType(U),
+			[{ name: U.name }]
 		);
+	}
 
 	// Real `.flat()` is a recursive conditional type keyed off an explicit depth argument; only the common argument-less (depth-1) case is
 	// modeled -- unwrap one level of nesting when `elem` is itself an array. An unmodeled explicit depth falls back to the methods below.
@@ -756,8 +828,9 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 
 	// Real overloads (bare 1-arg form defaults the accumulator to `elem`, seeded 2-arg form to `initialValue`'s own type) collapse
 	// into one signature with `initialValue` optional and `U` defaulting to `elem` -- an approximation, not exact for every case.
+	// Freshly-named per call, same reasoning as `map`'s own `U` above.
 	if (prop === 'reduce' || prop === 'reduceRight') {
-		const U = TS.RefType('U');
+		const U = TS.RefType(freshTypeParamName('U'));
 		return TS.FunctionType(
 			[
 				JS.Param('callback', TS.FunctionType([
@@ -769,7 +842,7 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 				JS.Param('initialValue', U, ['optional']),
 			],
 			U,
-			[{ name: 'U', default: elem }]
+			[{ name: U.name, default: elem }]
 		);
 	}
 
@@ -781,8 +854,9 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 			TS.ArrayType(elem)
 		);
 
+	// Freshly-named per call, same reasoning as `map`'s own `U` above.
 	if (prop === 'every' || prop === 'filter' || prop === 'find' || prop === 'findLast') {
-		const S = TS.RefType('S');
+		const S = TS.RefType(freshTypeParamName('S'));
 		return TS.FunctionType(
 			[
 				JS.Param('predicate', TS.FunctionType(
@@ -792,7 +866,7 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 				JS.Param('thisArg', ANY, ['optional']),
 			],
 			prop === 'every' ? TS.Predicate('this', TS.ArrayType(S)) : prop === 'filter' ? TS.ArrayType(S) : combineTypes([S, UNDEFINED]),
-			[{ name: 'S', constraint: elem, default: elem }],
+			[{ name: S.name, constraint: elem, default: elem }],
 		);
 	}
 	const ret =	prop === 'pop' || prop === 'shift' ? combineTypes([elem, UNDEFINED])
@@ -1415,12 +1489,15 @@ function memberOptionalState(t: Type, prop: string, scope: Scope, depth: number)
 
 // Tags every `ref`/signature reachable from `t` with `scope`, mutating in place (`mapObjectVoid`, freshly-built nodes only).
 // Skips one that already carries a scope, so re-stamping an already-tagged structure is a no-op. Delegates traversal to `walk`.
-export function stampScope<T extends Type>(t: T, scope: Scope): T {
+// `exclude`: names that must NOT be stamped even though otherwise eligible -- see `stampSig`'s own use, where a nested
+// function's own type-parameter names are bound (not free) and must stay resolvable in whatever scope later actually
+// registers them, not permanently baked to the hoisting pass's outer scope.
+export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<string>): T {
 	walkB(t, undefined, undefined,
 		(x, process) => {
 			// Primitives resolve the same everywhere -- stamping them would only add dead weight and dedup-key noise for no gain.
 			if (x.type === 'ref') {
-				if (!x.declScope && !ALL_PRIMITIVES.has(x.name))
+				if (!x.declScope && !ALL_PRIMITIVES.has(x.name) && !exclude?.has(x.name))
 					x.declScope = scope;
 			} else if (x.type === 'function' || x.type === 'constructor') {
 				x.declScope ??= scope;
@@ -1442,19 +1519,29 @@ export function stampSig<T extends TS.CallSig>(sig: T, scope: Scope): T {
 	// Also tags the signature itself (see `withScope`) -- a bare interface/type-literal method has no other declScope
 	// source (unlike a hoisted free function/class method, which already gets one before `stampSig` ever sees it).
 	sig.declScope ??= scope;
-	sig.params.forEach(p => p.typeAnnotation && stampScope(p.typeAnnotation as Type, scope));
+	// This signature's own type parameters are excluded from stamping below -- they're bound within the signature, not
+	// free names resolved against the hoisting pass's outer scope. A hoisted *nested* function (one whose own body-check
+	// scope, which registers these names via `addTypeParam`, doesn't exist yet at hoist time) would otherwise have every
+	// reference to its own `T` permanently stamped with the *enclosing* function's scope -- `declScope`'s "first stamp
+	// wins, skip if already tagged" semantics then shadow the nested function's own registration forever, so its own `T`
+	// silently resolves as the *outer* function's `T` throughout its whole body. A real, previously-latent scope-leakage
+	// bug, invisible before type parameters were ever registered at all (either name was equally unresolvable, so which
+	// scope you asked never mattered) -- exposed once `checkFunctionBody` started registering them for real.
+	const ownTypeParams = sig.typeParams?.length ? new Set(sig.typeParams.map(p => p.name)) : undefined;
+	sig.params.forEach(p => p.typeAnnotation && stampScope(p.typeAnnotation as Type, scope, ownTypeParams));
 	if (sig.rest?.typeAnnotation)
-		stampScope(sig.rest.typeAnnotation as Type, scope);
+		stampScope(sig.rest.typeAnnotation as Type, scope, ownTypeParams);
 	if (sig.returnType)
-		stampScope(sig.returnType, scope);
+		stampScope(sig.returnType, scope, ownTypeParams);
 	// A type param's own `constraint`/`default` need it too -- otherwise `inferTypeArgs`'s `isLiteralOnly(tp.constraint, ...)`
 	// check (does this constraint restrict to a union of literals?) can't resolve a constraint declared in this module but
 	// invisible from the caller's own scope, and silently widens a literal argument that should have stayed narrow.
+	// Still excludes `ownTypeParams`: an F-bounded constraint (`T extends hasop<'x', T>`) refers to its own bound `T`.
 	sig.typeParams?.forEach(p => {
 		if (p.constraint)
-			stampScope(p.constraint as Type, scope);
+			stampScope(p.constraint as Type, scope, ownTypeParams);
 		if (p.default)
-			stampScope(p.default as Type, scope);
+			stampScope(p.default as Type, scope, ownTypeParams);
 	});
 	return sig;
 }
@@ -1490,7 +1577,7 @@ function objectKeyNames(t: Type, scope: Scope, depth: number): string[] | undefi
 // structurally complex. `indexed_access` passes the question through to its inner position.
 function isAbstract(t: Type, scope: Scope): boolean {
 	switch (t.type) {
-		case 'ref':				return !t.typeArgs && !ALL_PRIMITIVES.has(t.name) && !scope.type(t.name);
+		case 'ref':				return !t.typeArgs && !ALL_PRIMITIVES.has(t.name) && (!scope.type(t.name) || !!scope.type(t.name)?.isTypeParam);
 		case 'indexed_access':	return isAbstract(t.object, scope) || isAbstract(t.index, scope);
 		default:				return false;
 	}
@@ -1589,11 +1676,20 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				if (object.type === 'array')
 					return resolve(scope, object.element, undefined, stopAtRef);
 			}
+			// A mapped type's own value, for *any* index expression (not just a resolvable literal) --
+			// `{[K in C]: V}[X]` is just `V` with `K := X` substituted throughout, by construction,
+			// regardless of whether `X` itself ever resolves to something concrete. This is what lets
+			// `Partial<T>` (`{[P in keyof T]?: T[P]}`) compose correctly when `T` is *itself* another
+			// mapped type (e.g. `Partial<{[K in keyof N]: V}>`, walker.ts's own `NodeMap<N>` idiom) --
+			// without it, `T[P]` stays opaque and the whole homomorphic-mapped-type-over-another-
+			// mapped-type shape never resolves to anything codegen (or further checking) can use.
+			const object = resolve(scope, t.object, depth - 1);
+			if (object.type === 'mapped')
+				return resolve(scope, substituteType(object.valueType, new Map([[object.keyName, t.index]])), depth - 1, stopAtRef);
 			const keys = isLiteral(index, 'string') ? [index.value]
 				: index.type === 'union' && index.types.every(m => isLiteral(m, 'string')) ? index.types.map(m => (m as { value: string }).value)
 				: undefined;
 			if (keys) {
-				const object = resolve(scope, t.object, depth - 1);
 				const parts = keys.map(key => lookupMember(object, key, scope));
 				if (parts.every(p => !!p))
 					return resolve(scope, combineTypes(parts), depth - 1, stopAtRef);
@@ -1606,6 +1702,12 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 			if (isAny(t.argument))
 				return TS.UnionType([TS.RefType('string'), TS.RefType('number'), TS.RefType('symbol')]);
 			const arg = resolve(scope, t.argument, depth - 1);
+			// A mapped type's own keys ARE its constraint, by construction -- `keyof {[K in C]: V}` is
+			// just `C` itself (the same "homomorphic mapped type" collapse real TS performs), composing
+			// with `indexed_access`'s own mapped-type case above so `Partial<{[K in C]: V}>` (itself a
+			// mapped type wrapping another one) still resolves correctly rather than staying opaque.
+			if (arg.type === 'mapped')
+				return resolve(scope, arg.constraint, depth - 1, stopAtRef);
 			// An object made purely of an index signature has no enumerable literal keys -- `keyof` of it is just the index's own
 			// key type (real TS: `keyof Record<string,T>` is `string`, not `never`), distinct from the finite-keys case below.
 			if (arg.type === 'object' && arg.members.length && arg.members.every(m => m.type === 'index'))
@@ -1696,7 +1798,13 @@ export function expandRefOnce(scope: Scope, t: Type): Type {
 		: entry.type;
 }
 
-export interface TypeEntry { typeParams?: TS.TypeParam[]; type: Type; defaultSubstitution?: Type }
+// `isTypeParam`: registered via `Scope.addTypeParam`, not a real, resolvable type alias -- `isAbstract`'s
+// own `'ref'` case treats a flagged entry as still abstract despite having a real `scope.type()` entry
+// now (its `type` is only an upper-bound *approximation*, the constraint, not the real, possibly-narrower
+// type an actual call site instantiates it with) -- keeps conditional-type deferral (`N extends X ? A :
+// B` staying unresolved until `N` is genuinely concrete) working correctly for a bounded, still-abstract
+// type parameter, while still letting `keyof`/member-access/etc. resolve *something* useful for it.
+export interface TypeEntry { typeParams?: TS.TypeParam[]; type: Type; defaultSubstitution?: Type; isTypeParam?: boolean }
 
 // A stable key for narrowing simple property chains (`a.b.c`), sharing the Scope narrowings map with plain identifiers (dotted keys can never collide with real bindings)
 export function pathKey(e: Expr): string | undefined {
@@ -1766,6 +1874,9 @@ export class Scope {
 
 	addValue(name: string, type: Type)				{ this.values.set(name, type); }
 	addType(name: string, type: Type, typeParams?: TS.TypeParam[])	{ this.types.set(name, {type, typeParams}); }
+	// See `TypeEntry.isTypeParam`'s own comment -- `constraint` is only an upper-bound approximation, not
+	// a real resolvable alias; `isAbstract` treats a flagged entry as still abstract accordingly.
+	addTypeParam(name: string, constraint: Type)						{ this.types.set(name, {type: constraint, isTypeParam: true}); }
 	addNarrowing(name: string, t: Type)				{ (this.narrowings ??= new Map()).set(name, t); }
 	addAlias(d: JS.Var<any>)						{ (this.aliases ??= new Map()).set(d.name, d.init); }
 	addNamespace(name: string, s: Scope)			{ (this.namespaces ??= new Map()).set(name, s); }

@@ -309,3 +309,10 @@ declare function UnsignedToString(n: number, radix?: number, digits?: number): s
 declare function strIsSpace(code: number): boolean;
 declare function __towasm_alloc(size: i32, align: i32): i32;
 
+//-----------------------------------------------------------------------------
+//	Utility types
+//-----------------------------------------------------------------------------
+
+type Partial<T> = { [P in keyof T]?: T[P]; };
+type Record<K extends keyof any, T> = { [P in K]: T; };
+

@@ -297,15 +297,20 @@ function narrowValue(scope: Scope, name: string, keep: (m: Type) => boolean | Ty
 		}
 		return scope;
 	}
-	// A union member may resolve to a further nested union -- flatten before filtering, so a discriminant matching only part
-	// of a compound member filters at the right granularity. Each candidate keeps its own *original* (unresolved) form
-	// alongside the resolved one used only to evaluate `keep` -- a member kept as-is (`k === true`) is pushed by its
-	// original ref, not the fully-expanded structural shape, so e.g. a generic `PolynomialN<number>` union member survives
-	// narrowing as that clean ref instead of losing the identity later generic inference (`complexBound<T>`) needs.
-	const candidates = r.types.flatMap(m => {
+	// A union member may resolve to a further nested union, possibly several aliases deep (e.g. a registered type
+	// parameter's own constraint, `builtinNumber | Pick<ops<T,S>,'mag'>`, where `builtinNumber` itself is `number |
+	// bigint`) -- flatten recursively before filtering, not just one level, so a discriminant matching only part of
+	// a compound, multiply-aliased member still filters at the right granularity instead of `typeofName` seeing an
+	// still-unresolved ref (ambiguous, so trivially "kept") and never actually narrowing at all. Each candidate keeps
+	// its own *original* (unresolved) form alongside the resolved one used only to evaluate `keep` -- a member kept
+	// as-is (`k === true`) is pushed by its original ref, not the fully-expanded structural shape, so e.g. a generic
+	// `PolynomialN<number>` union member survives narrowing as that clean ref instead of losing the identity later
+	// generic inference (`complexBound<T>`) needs.
+	const flatten = (m: Type): { resolved: Type; orig: Type }[] => {
 		const resolved = T.resolveOwn(m, scope);
-		return resolved.type === 'union' ? resolved.types.map(rt => ({ resolved: rt, orig: rt })) : [{ resolved, orig: m }];
-	});
+		return resolved.type === 'union' ? resolved.types.flatMap(flatten) : [{ resolved, orig: m }];
+	};
+	const candidates = r.types.flatMap(flatten);
 	const parts: Type[] = [];
 	let changed = false;
 	for (const { resolved, orig } of candidates) {
@@ -969,18 +974,31 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			case 'identifier':	return scope.value(e.name) ?? T.ANY;
 
 			case 'array': {
+				// Contextual typing, same idea `case 'object'`'s own `expectedMember`/`T.lookupMember`
+				// already applies per property -- a tuple-typed `expected` (`[number,number][]`'s own
+				// element type, for instance) threads each position's own expected type into that
+				// element, and shapes this literal's own inferred type as a tuple too (not just widened
+				// to a plain array afterward) -- otherwise a nested tuple literal infers as a plain
+				// array regardless of context (real TS: `[1, 2]` alone is `number[]`; contextually
+				// tuple-typed, it's `[number, number]`), which is wrong both for later assignability
+				// and (via `wasmTypeOf`) for codegen's own physical representation of it.
+				const resolvedExpected = expected && T.resolveOwn(expected, scope);
+				const wantTuple = resolvedExpected?.type === 'tuple';
 				const elems: Type[] = [];
+				let i = 0;
 				for (const el of e.elements) {
 					if (el) {
 						if (el.type === 'spread') {
 							const t = T.resolveOwn(recurse(el.operand), scope);
 							elems.push(t.type === 'array' ? t.element : T.ANY);
 						} else {
-							elems.push(recurse(el));
+							elems.push(recurse(el, wantTuple ? T.tupleElementType(resolvedExpected.elements[i])
+								: resolvedExpected?.type === 'array' ? resolvedExpected.element : undefined));
 						}
 					}
+					i++;
 				}
-				return TS.ArrayType(elems.length ? T.combineTypes(elems) : T.ANY);
+				return wantTuple ? { type: 'tuple', elements: elems } : TS.ArrayType(elems.length ? T.combineTypes(elems) : T.ANY);
 			}
 			case 'object': {
 				const members: TS.TypeMember[] = [];
@@ -1148,8 +1166,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// searches every part of a merged intersection), but left as a harmless, explicit fallback.
 				// Checked by name on the *unresolved* type -- same reason `TYPED_ARRAY_RANGES`'s other checks
 				// above are: `T.resolve` would expand the alias into an intersection this never matches.
+				// Hoisted out of the `if` below (was `const objT`, block-scoped) so the `this`-typed-return
+				// substitution further down can reuse it instead of calling `recurse(e.callee.object)` a
+				// second time -- re-evaluating the same receiver expression twice caused a real, observed
+				// regression (a duplicate diagnostic on one real corpus file, a genuine wrong-type result on
+				// another), root-caused via a real whole-workspace sweep, not assumed.
+				let calleeObjT: Type | undefined;
 				if (e.type === 'call' && e.callee.type === 'member') {
-					const objT = recurse(e.callee.object);
+					const objT = calleeObjT = recurse(e.callee.object);
 					if (objT.type === 'ref' && !objT.typeArgs && objT.name in TYPED_ARRAY_RANGES) {
 						switch (e.callee.property) {
 							case 'indexOf': case 'lastIndexOf':	return TS.RangeType('number', -1, 0x7fffffff, true);
@@ -1241,7 +1265,19 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 
 					// First pass, non-callback arguments only (reused below in `argTs`, so nothing gets double-typed/reported): infers a type
 					// param from a sibling argument (`arr.reduce((acc, x) => ..., seed)`'s `U` from `seed`) before typing the callback itself.
-					const preArgTs = e.arguments.map(a => a.type === 'function' || a.type === 'arrow' || a.type === 'spread' ? undefined : recurse(a));
+					// Also threads the matching declared param type through as `expected` -- a literal argument (`heap.push([1, ...])`
+					// against `push(item: [number, number[]])`) needs real contextual typing the same way an object/array literal
+					// var-decl initializer already gets, or a tuple-typed param silently infers as a plain, wider array instead and
+					// fails assignability for real (this was long masked by an unrelated opaque-`this` leniency bug elsewhere, not a
+					// coincidence this stayed invisible). Skipped when the declared type still mentions one of *this* signature's own
+					// (not yet inferred) type params -- `preMap`, which resolves those, is itself built FROM this very pass below, so
+					// it isn't available yet, and threading a still-generic shape as `expected` risks a wrong contextual guess.
+					const preArgTs = e.arguments.map((a, i) => {
+						if (a.type === 'function' || a.type === 'arrow' || a.type === 'spread')
+							return undefined;
+						const declared = sig!.params[i]?.typeAnnotation;
+						return recurse(a, declared && !sig!.typeParams?.some(p => T.mentionsTypeParam(declared, p.name)) ? declared : undefined);
+					});
 					let preMap: Map<string, Type> | undefined;
 					if (sig.typeParams?.length) {
 						const names		= new Map(sig.typeParams.map(p => [p.name, p] as const));
@@ -1310,7 +1346,12 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// A predicate return is only special to `narrow()`'s dedicated `case 'call'`; as a plain value it's `boolean` (or `void`
 					// if asserting) -- without this, the raw predicate type would leak into whatever consumes this expression next.
 					const result = returnType && returnType.type === 'predicate' ? (returnType.asserts ? T.VOID : T.BOOLEAN) : returnType!;
-					return calleeOptional ? T.combineTypes([result, T.UNDEFINED]) : result;
+					// A `this`-typed return (`sort(): this`) means "whatever the receiver's own type is" at a
+					// real call site -- `this` as a type is never eagerly resolved elsewhere (see
+					// `T.substituteThisType`'s own comment, `OPAQUE`'s inclusion of `'this'`), so a method
+					// call's return needs it substituted in here, using the receiver expression's own type.
+					const withThis = e.callee.type === 'member' ? T.substituteThisType(result, calleeObjT ?? recurse(e.callee.object)) : result;
+					return calleeOptional ? T.combineTypes([withThis, T.UNDEFINED]) : withThis;
 				}
 				return e.type === 'new' && e.callee.type === 'identifier' ? TS.RefType(e.callee.name, typeArgs) : T.ANY;
 			}
@@ -1592,6 +1633,16 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 	// reach this same node *after* the real pass already checked it (e.g. `case 'if'` checks `stmt.test` before
 	// narrowing it), so `??=` can never let a narrowed/speculative scope clobber the real one.
 	fn.scope ??= inner;
+	// Each of this function's own type params gets registered into its body's scope (`addTypeParam`,
+	// not `addType` -- see its own comment on why the distinction matters for conditional-type
+	// deferral), using its declared constraint (or `any` when unconstrained) as a real, resolvable
+	// upper-bound approximation -- `resolve()`'s own `ref` case only ever looks up a real
+	// `scope.type()` entry, and a bare, unregistered type-parameter name (e.g. `N` in `function
+	// f<N extends X>(...)`) has none, so it stays fully opaque for every reference inside the body
+	// (member access, `keyof`, assignability, ...) -- silently *tolerated*, not actually verified,
+	// until now.
+	for (const p of fn.typeParams ?? [])
+		inner.addTypeParam(p.name, p.constraint ?? T.ANY);
 	for (const p of fn.params) {
 		const anno = p.typeAnnotation;
 		// Computed unconditionally (not just `!muted`) so it's available below for a defaulted,

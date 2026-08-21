@@ -276,6 +276,13 @@ export class Output {
 		return withParens(this.typeBody(type), typePrecedence(type) < minPrec);
 	}
 
+	tupleElement(t: TS.TupleElement) {
+		return t.type === 'spread'	? '...' + maybe(t.label, label => label + this.colon) + this.type(t.argument)
+			: t.type === 'optional' ? this.type(t.element) + '?'
+			: t.type === 'labeled'	? t.label + optional(t.optional) + this.typeAnnotation(t.element)
+			: this.type(t);
+	}
+
 	private typeBody(type: Type): string {
 		switch (type.type) {
 			case 'ref':
@@ -299,11 +306,7 @@ export class Output {
 				return readonly(type.readonly) + this.type(type.element, 4) + '[]';
 
 			case 'tuple':
-				return readonly(type.readonly) + '[' + type.elements.map(t => 
-					  t.type === 'spread'	? '...' + maybe(t.label, label => label + this.colon) + this.type(t.argument)
-					: t.type === 'optional' ? this.type(t.element) + '?'
-					: t.type === 'labeled'	? t.label + optional(t.optional) + this.typeAnnotation(t.element)
-					: this.type(t)).join(this.comma) + ']';
+				return readonly(type.readonly) + '[' + type.elements.map(t => this.tupleElement(t)).join(this.comma) + ']';
 
 			case 'union':
 				return type.types.map(t => this.type(t, 2)).join(' | ');
