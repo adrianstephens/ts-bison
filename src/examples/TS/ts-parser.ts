@@ -312,7 +312,10 @@ const type_member = Rules(
 	// first-match doesn't see; `JS.GET`/`JS.SET`, not bare string literals, for their `startsPropertyName` disambiguation (see the
 	// bareword-keyword-vs-identifier pattern in tison_project memory).
 	Rule([JS.GET, type_member_id, '(', ')', ':', type],				$ => TypeProperty($[1], $[5])),
-	Rule([JS.SET, type_member_id, '(', IDENT, ':', type, ')'],		$ => TypeProperty($[1], $[5])),
+	Rule([JS.SET, type_member_id, '(', IDENT, ':', type, ')'],				$ => TypeProperty($[1], $[5])),
+	// `set`'s parameter position (unambiguous, same reasoning as class_member_body's own set rules above).
+	Rule([JS.SET, type_member_id, '(', JS.object_pattern, ':', type, ')'],		$ => TypeProperty($[1], $[5])),
+	Rule([JS.SET, type_member_id, '(', JS.array_pattern, ':', type, ')'],		$ => TypeProperty($[1], $[5])),
 	Rule(['[', dotted_path, ':', type, ']', ':', type],				$ => TypeIndex($[1], $[3], $[6])),
 	Rule([READONLY, '[', dotted_path, ':', type, ']', ':', type],	$ => TypeIndex($[2], $[4], $[7], ['readonly'])),
 	Rule([type_member_params],										$ => TypeCall($[0])),
@@ -639,7 +642,12 @@ class_member_body.push(
 	// Return types on get/generator/async-generator methods (`set`'s is always `void`, so it's skipped, mirroring js-parser.ts's own get/set asymmetry).
 	Rule([JS.GET, JS.property_name_computed, '(', ')', ':', return_type, '{', JS.function_body, '}'],	$ => JS.Method('get', $[1], {params: [], returnType: $[5]}, $[7])),
 	// `set`'s *parameter* type: js-parser.ts's own `set` rule only accepts a bare untyped `IDENT` parameter.
-	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', '{', JS.function_body, '}'],	$ => JS.Method('set', $[1], {params: [{ key: $[3], typeAnnotation: $[5] }]}, $[8])),
+	// `set`'s parameter position is unambiguous (never reachable as a plain expression, unlike an arrow's `(`), so
+	// `object_pattern`/`array_pattern` need no `forceFork` here -- same reasoning `parameter`'s own typed-destructured
+	// alternatives rely on for those, just without the ambiguity this position never has in the first place.
+	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', '{', JS.function_body, '}'],					$ => JS.Method('set', $[1], {params: [{ key: $[3], typeAnnotation: $[5] }]}, $[8])),
+	Rule([JS.SET, JS.property_name_computed, '(', JS.object_pattern, ':', type, ')', '{', JS.function_body, '}'],		$ => JS.Method('set', $[1], {params: [{ key: $[3], typeAnnotation: $[5] }]}, $[8])),
+	Rule([JS.SET, JS.property_name_computed, '(', JS.array_pattern, ':', type, ')', '{', JS.function_body, '}'],		$ => JS.Method('set', $[1], {params: [{ key: $[3], typeAnnotation: $[5] }]}, $[8])),
 	Rule([JS.class_member_name, ':', type, ';'],														$ => JS.Field($[0].key, undefined, $[2], $[0].modifiers)),
 	Rule([JS.class_member_name, ':', type, '=', assignment_expression, ';'],							$ => JS.Field($[0].key, $[4], $[2], $[0].modifiers)),
 );
@@ -650,7 +658,9 @@ const class_member_overloads = Rules<JS.Method<Type>>(
 	// Bodyless accessor signatures (`abstract get length(): number;`). `JS.GET`/`JS.SET`, not bare string literals, to keep their `startsPropertyName`
 	// disambiguation (see the bareword-keyword-vs-identifier pattern in tison_project memory).
 	Rule([JS.GET, JS.property_name_computed, '(', ')', ':', type, ';'],			$ => ({ type: 'get', key: $[1], params: [], returnType: $[5] } as const)),
-	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', ';'],	$ => ({ type: 'set', key: $[1], params: [{ key: $[3], typeAnnotation: $[5] }] } as const)),
+	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', ';'],					$ => ({ type: 'set', key: $[1], params: [{ key: $[3], typeAnnotation: $[5] }] } as const)),
+	Rule([JS.SET, JS.property_name_computed, '(', JS.object_pattern, ':', type, ')', ';'],		$ => ({ type: 'set', key: $[1], params: [{ key: $[3], typeAnnotation: $[5] }] } as const)),
+	Rule([JS.SET, JS.property_name_computed, '(', JS.array_pattern, ':', type, ')', ';'],		$ => ({ type: 'set', key: $[1], params: [{ key: $[3], typeAnnotation: $[5] }] } as const)),
 );
 
 // Any number of member modifiers in any order (`static readonly`, `public static`, etc), pushed onto `class_member` so every member shape gets it.

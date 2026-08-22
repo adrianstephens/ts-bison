@@ -47,7 +47,6 @@ declare type u64 = number;
 declare var NaN: number;
 declare var Infinity: number;
 
-interface Object {}
 interface Function {}
 interface CallableFunction {}
 interface NewableFunction {}
@@ -55,6 +54,24 @@ interface IArguments {}
 interface Symbol {}
 interface Boolean {}
 interface BigInt {}
+
+//-----------------------------------------------------------------------------
+//	Object
+//-----------------------------------------------------------------------------
+
+// `entries` only, for now -- a compiler intrinsic (see `emitObjectEntries` in towasm.ts), not real TS
+// source: what fields exist depends on the argument's own concrete type at each call site, which only
+// the compiler itself can see. Currently supports a `Map`-backed dynamic object (forwards to its own
+// real `entries()`) and a *sealed* (never-subclassed) struct-backed class/object-shape; an extended
+// class isn't supported yet (would need the receiver's real runtime type, not just its static one).
+interface Object {}
+declare var Object: {
+	entries<T>(x: T): [string, any][];
+};
+
+//-----------------------------------------------------------------------------
+//	Number
+//-----------------------------------------------------------------------------
 
 interface Number {}
 declare var Number: {
@@ -252,19 +269,6 @@ declare type BigUint64Array = TypedArray<u64>;
 //	from<T>(arrayLike: ArrayLike<T>): TypedArray<T>;
 //	from<T, U>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => U, thisArg?: any): TypedArray<U>;
 //}
-
-//-----------------------------------------------------------------------------
-//	Object
-//-----------------------------------------------------------------------------
-
-// `entries` only, for now -- a compiler intrinsic (see `emitObjectEntries` in towasm.ts), not real TS
-// source: what fields exist depends on the argument's own concrete type at each call site, which only
-// the compiler itself can see. Currently supports a `Map`-backed dynamic object (forwards to its own
-// real `entries()`) and a *sealed* (never-subclassed) struct-backed class/object-shape; an extended
-// class isn't supported yet (would need the receiver's real runtime type, not just its static one).
-declare var Object: {
-	entries<T>(x: T): [string, any][];
-};
 
 //-----------------------------------------------------------------------------
 //	Math

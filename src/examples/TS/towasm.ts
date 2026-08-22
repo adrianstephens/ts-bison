@@ -22,10 +22,11 @@ import * as WAT from '../wat-parser';
 //      which are fully supported everywhere else, including inside a generator/async function, a
 //      constructor, or a 'reassignsThis' method
 //    - labeled break/continue
-//    - for-in over anything but a dynamic object (a structural '{[k: string]: V}'-typed value, or a
-//      mapped type that resolves down to that same shape, e.g. walker.ts's own 'NodeMap<N>' --
-//      'Partial<{[K in keyof N]: F}>' -- routed to 'Map<string, V>', see 'indexSignatureValueType') --
-//      a plain object/class instance has no live key set to iterate this way
+//    - for-in over an extended (possibly-subclassed) class instance -- a dynamic object (a structural
+//      '{[k: string]: V}'-typed value, or a mapped type resolving to that shape, e.g. walker.ts's own
+//      'NodeMap<N>') takes the efficient '.keys()' path; any other, *sealed* (never-subclassed) class/
+//      object-shape falls back to 'Object.entries', same restriction that has -- the receiver's real
+//      runtime type isn't visible here, only its declared one, so a correct key set can't be produced
 //    - for-of over a string or a general iterable
 //  - Async (real suspend/resume generators and async/await exist -- see 'flattenStateMachine' in
 //    transform.ts and 'compileGeneratorFunc'/'compileAsyncFunc' here; this compiler has no
@@ -415,6 +416,18 @@ class FunctionContext {
 	depth = 0;
 	breakTargets:		number[] = [];
 	continueTargets:	number[] = [];
+
+	// A one-shot hint for the *very next* expression about to be compiled: the enclosing declaration's
+	// own real TS type (e.g. a var_decl's `Expr[]`, or one array literal element's own `Expr`), used
+	// only to contextually infer a generic call's own type param when its declared signature has no
+	// other way to determine it (`case 'call'`, `ensureGenericFunc`/`inferTypeArgMap` -- mirrors
+	// checker.ts's own `expected` vs `sig.returnType` contextual step, which this file's own, separate
+	// generic-instantiation codegen doesn't otherwise have access to). Set by the few producers that
+	// have a real TS type on hand (`case 'var_decl'`, `case 'array'`'s own per-element loop) and always
+	// consumed-then-cleared immediately by whoever reads it (`case 'call'`), so it never leaks into an
+	// unrelated sub-expression (a call's own arguments, a nested literal, ...) -- not a general
+	// "expected type" channel threaded through every expression, deliberately narrow.
+	contextualReturn?:	Type;
 
 	// Set when this FuncCtx is a closure body -- captured names have no real local, reads/writes go through struct.get/set on envLocal.
 	closureEnv?:		ClosureEnv;
@@ -2068,7 +2081,20 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Shared by array literals and `new Uint8Array([...])` -- both coerce every plain element to `want`,
 	// a hole (`emitDefaultValue`, above) included. A spread element forces the slower
 	// `emitArrayElementsWithSpread` path (runtime length, not `array.new_fixed`'s compile-time count).
-	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElementI, typeIndex: number): void {
+	// `elementTsType`: the array's own real TS element type (e.g. `Expr`, from `case 'array'`'s own
+	// `ctx.contextualReturn`), when known -- reset as `ctx.contextualReturn` around each individual
+	// element's own compilation (see that field's own comment), so a generic call used as an element
+	// (`[makeRule(() => ({...}))]`) can contextually infer its own type param from it. `undefined` for
+	// anything without a known one (a tuple's own per-position type doesn't come through this path at
+	// all, and `new Uint8Array([...])` never has one either) -- every existing call site keeps working
+	// unchanged.
+	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElementI, typeIndex: number, elementTsType?: Type): void {
+		const emitElement = (el: Expr) => {
+			const saved = ctx.contextualReturn;
+			ctx.contextualReturn = elementTsType;
+			emitAs(el, ctx, want);
+			ctx.contextualReturn = saved;
+		};
 		if (elements.some(el => el?.type === 'spread')) {
 			// A `[...]` array literal with at least one spread element. Every element is evaluated exactly once, in
 			// source order, into a scratch local before anything is allocated (side effects must not run twice). The real array is then `array.new_default`-allocated to the true runtime total and filled in a second pass.
@@ -2093,7 +2119,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					ctx.emit(I.local.set(src), I.local.get(src), I.array.len, I.local.set(len));
 					parts.push({ spread: true, src, len });
 				} else {
-					emitAs(el, ctx, want);
+					emitElement(el);
 					const value = ctx.temp(`$spread$elem$${i}`, want);
 					ctx.emit(I.local.set(value));
 					parts.push({ spread: false, value });
@@ -2130,7 +2156,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		} else {
 			for (const el of elements) {
 				if (el)
-					emitAs(el, ctx, want);
+					emitElement(el);
 				else
 					emitDefaultValue(want, ctx);
 			}
@@ -2191,7 +2217,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// `typeArgs`: only ever meaningful for a plain user-declared generic function (`builtins` entries and
 	// host imports are never generic) -- an explicit `identity<number>(5)` call-site type argument list, or
 	// `undefined` when left implicit (the common case, inferred by `ensureGenericFunc`).
-	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[]): WasmType {
+	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Type): WasmType {
 		let decl;
 		const builtin = builtins[name];
 		if (builtin) {
@@ -2212,7 +2238,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		}
 
 		const info = decl?.typeParams?.length
-			? ensureGenericFunc(name, decl, args, typeArgs, ctx.scope)
+			? ensureGenericFunc(name, decl, args, typeArgs, ctx.scope, expected)
 			: ensureFunc(name, decl!);
 		if (!info)
 			throw new Error(`towasm: call to unknown function '${name}'`);
@@ -2281,7 +2307,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	function emitObjectEntries(args: Expr[], ctx: FunctionContext): WasmType {
 		if (args.length !== 1)
 			throw new Error("towasm: 'Object.entries' takes exactly one argument");
-		const arg = args[0];
+		const arg	= args[0];
 		const owner = ownerOf(arg, ctx);
 		if (!owner)
 			throw new Error("towasm: 'Object.entries' needs a known object/class type");
@@ -2299,14 +2325,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		emitAs(arg, ctx, owner.thisWtype!);
 		ctx.emit(I.local.set(objLocal.index));
 
-		const entries: Expr = {
+		// The outer array's own kind is always `ref` (a `[string, T]` tuple per field, boxed regardless
+		// of `T`) -- known outright, not inferred, so this calls `emitArrayElements` directly rather than
+		// wrapping in an `Expr` and routing through `emitAs`/`case 'array'`'s own `arrayKindOf`/`want`
+		// inference, which exists for exactly the cases where the kind *isn't* already known. Each tuple
+		// element still stays a real `Expr` (`{type:'array', ...}`) rather than a second direct
+		// `emitArrayElements` call: that lets the ordinary per-element `emitAs` this already goes through
+		// (inside `emitArrayElements`'s own loop) delegate back to `case 'array'` for it, reusing the same
+		// coercion logic every other array literal already relies on instead of duplicating it here.
+		emitArrayElements(owner.fields.map((f): Expr => ({
 			type: 'array',
-			elements: owner.fields.map((f): Expr => ({
-				type: 'array',
-				elements: [Literal(f.name), { type: 'member', object: { type: 'identifier', name: objName }, property: f.name }],
-			})),
-		};
-		return emitAs(entries, ctx, ARR_WTYPE.ref);
+			elements: [Literal(f.name), { type: 'member', object: { type: 'identifier', name: objName }, property: f.name }],
+		})), ctx, REF_ANY_NULLABLE, 'ref', ensureArrayType('ref'));
+		return ARR_WTYPE.ref;
 	}
 
 	// Two questions: whether the current value needs reading at all (`'none'`, only a plain `=` skips it),
@@ -2497,6 +2528,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		e: TS.CallSig & {type: string, name?: string, modifiers?: string[], body?: Statement[] | Expr },
 		ctx: FunctionContext,
 		allowSelfCall: boolean,
+		want?: WasmType,
 	): WasmType {
 		if (hasMod(e, 'async'))
 			throw new Error('towasm: an async arrow/function expression is not supported');
@@ -2529,7 +2561,22 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (e.name && !allowSelfCall && walkB(body, undefined, (e, process) => e.type === 'identifier' ? true : process(e)))
 			throw new Error(`towasm: a named function expression referencing its own name ('${e.name}') is not supported`);
 
-		const result = e.returnType ? typeOf(e.returnType) : 'void';
+		// The call site's own expected closure signature (`want`, when this literal is being compiled
+		// directly as a call argument -- `case 'arrow'`/`case 'function'` forward whatever `want` they
+		// were given) wins over this literal's own `e.returnType`-derived guess, when it's available:
+		// found via `Rule([...], $ => ({type: 'spread', ...}))`-shaped calls (ts-parser.ts/js-parser.ts/
+		// binary-libs/wasm.ts, hundreds of real sites) -- an arrow with no explicit return-type annotation
+		// still gets *a* `e.returnType` (the checker's own structural/anonymous inference back-filled
+		// into the same field real TS itself would have inferred, `checkFunctionBody`'s inference branch),
+		// but an anonymous structural object type has no nominal identity for `typeOf` to turn into a real
+		// wasm struct -- it degrades to boxed `any`, and `case 'object'` then rejects the body outright
+		// ("needs a known target type") even though the caller's own declared callback signature already
+		// names the exact concrete shape wanted. Safe even when the arrow *did* have a real, explicit
+		// annotation: the checker already verified that's assignable to whatever the caller expects, so
+		// the two physical wtypes are equivalent here anyway (this compiler's whole "upcast is free"
+		// contract) -- and if a *later*, different use of the same closure value ever wants a genuinely
+		// different (but still compatible) signature, `coerceTop`'s own wrapper mechanism still applies.
+		const result = (want && typeof want !== 'string' && 'closure' in want ? want.closure.result : undefined) ?? (e.returnType ? typeOf(e.returnType) : 'void');
 		if (!result)
 			throw new Error('towasm: closure has an unsupported return type');
 
@@ -2829,6 +2876,16 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			//fall through
 			case 'this': {
 				const name = e.type === 'this' ? 'this' : e.name;
+				// `this` isn't a real value at all yet during `ensureCtor`'s collect-then-`struct.new` path
+				// (`ctx.ctorFields` stays set for exactly as long as that's true, cleared the instant the
+				// last field's value is collected) -- reading an *already-collected* field straight off
+				// `this` has its own dedicated shortcut (`case 'member'`, below) that never reaches here at
+				// all, so anything that does reach this point genuinely has no value to produce: a field
+				// that hasn't been assigned yet, a method call, or `this` passed/returned/captured as a bare
+				// value. All would otherwise fall through to the generic "unresolved identifier" throw below
+				// -- caught here first for a clear, specific message instead.
+				if (e.type === 'this' && ctx.ctorFields)
+					throw new Error(`towasm: 'this' can't be used yet in '${ctx.owner?.name}'s constructor -- it has at least one object-typed field, which needs every field's real value collected up front (for 'struct.new') before 'this' exists at all; assign every field via a plain 'this.field = value' statement before using 'this' any other way`);
 				// A captured free variable has no real local of its own -- read via `struct.get` off the
 				// cast env local instead. Checked before `ctx.lookup`, since it's never also in `ctx.locals`.
 				const captured = ctx.closureEnv?.fields.get(name);
@@ -3116,7 +3173,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					: (e.elements.length === 0 && wantArr) ? wantArr : arrayKindOf(e, ctx);
 				if (!kind || kind === 'i16' || kind === 'i8')
 					throw new Error('towasm: array literals are only supported for number[]/boolean[]/T[]');
-				emitArrayElements(e.elements, ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind));
+				// This literal's own real declared element type, when known (`ctx.contextualReturn`, set
+				// by whichever enclosing declaration had one, e.g. a var_decl's `Expr[]`) -- threaded to
+				// each element via `emitArrayElements`'s own `elementTsType` param, see its comment.
+				const contextualArr = ctx.contextualReturn && T.resolve(ctx.scope, ctx.contextualReturn);
+				const elementTsType = contextualArr?.type === 'array' ? contextualArr.element : undefined;
+				emitArrayElements(e.elements, ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind), elementTsType);
 				return ARR_WTYPE[kind];
 			}
 
@@ -3653,14 +3715,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				if (e.callee.type !== 'identifier')
 					throw new Error('towasm: only direct calls to named functions, methods, or Math intrinsics are supported');
 
-				return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs);
+				// One-shot: consumed here (for this call's own generic type-param inference, if it applies)
+				// and cleared immediately, so it can't leak into this same call's own arguments below (see
+				// `contextualReturn`'s own comment on why that would be wrong).
+				const contextualReturn = ctx.contextualReturn;
+				ctx.contextualReturn = undefined;
+				return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn);
 			}
 
 			// Closures: a captured arrow/function-expression literal compiles to a 2-field `{code, env}`
 			// wasm-GC struct -- building it here is "closure creation"; `case 'call'` handles *using* the result. v1 restrictions are all explicit throws, never silent misbehavior.
 			case 'arrow':
 			case 'function':
-				return emitClosureLiteral(e, ctx, false);
+				return emitClosureLiteral(e, ctx, false, want);
 
 			default:
 				throw new Error(`towasm: unsupported expression '${e.type}'`);
@@ -3800,6 +3867,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					// field, not a real wasm local, same as a real closure capture would be (`declareCaptured`
 					// already registered its scope type upfront, so only the write itself is new here).
 					const hoisted = ctx.closureEnv?.fields.get(d.name);
+					// `tsType` is the one real TS type this declaration has on hand -- seeds `ctx.contextualReturn`
+					// (see its own comment) for `d.init`'s own top-level compilation, e.g. an array literal whose
+					// element is itself a generic call (`const rules: Expr[] = [makeRule(() => ({...}))]`).
+					const savedContextualReturn = ctx.contextualReturn;
+					ctx.contextualReturn = tsType;
 					if (hoisted) {
 						ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index));
 						emitAs(d.init, ctx, wtype);
@@ -3808,6 +3880,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						emitAs(d.init, ctx, wtype);
 						ctx.emit(I.local.set(ctx.declareValue(d.name, wtype, tsType).index));
 					}
+					ctx.contextualReturn = savedContextualReturn;
 				}
 				return;
 
@@ -3877,6 +3950,16 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			}
 
 			case 'return':
+				// Same reasoning as `case 'this'`'s own guard -- a `return` inside a constructor implicitly
+				// needs `this` to exist too (that's the whole value being returned), even a bare one with
+				// no argument at all: `ctx.onReturn` is still the generic `plainReturn(thisWtype)` handler
+				// at this point (not yet swapped to the constructor-specific one, which only happens once
+				// every field is collected), so it would either emit invalid wasm (a bare 'return' with
+				// nothing of the declared result type on the stack) or, for `return <value>`, try to coerce
+				// an arbitrary expression into the class's own struct type -- neither is a real, checkable
+				// program error worth a confusing low-level failure instead of a clear one.
+				if (ctx.ctorFields)
+					throw new Error(`towasm: 'return' can't be used yet in '${ctx.owner?.name}'s constructor -- not every field has been assigned yet (this class has at least one object-typed field, needing 'struct.new' with every field's real value up front, before 'this' -- and so a valid return -- exists at all)`);
 				ctx.onReturn.emit(ctx, s.argument);
 				return;
 
@@ -3943,22 +4026,40 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						), ctx);
 						return;
 					}
-					// `for (const k in obj)` -- only over a dynamic object (structural `{[k: string]: V}`,
-					// routed to `Map<string, V>`; see `indexSignatureValueType`), the one case this
-					// compiler can give real, live-key-set semantics to. Desugars to `for (const k of
-					// obj.keys())`, already-supported syntax, same "synthesize and hand back to
-					// `emitStmt`" idiom `case 'of'` itself uses one level down -- `keys()` is a real
-					// snapshot array (see `lib/map.ts`'s own comment on why), so this iterates the live
-					// key set at the moment the loop starts, matching real `for...in` closely enough for
-					// every real use this project has (none mutate the object mid-loop).
+					// `for (const k in obj)` -- most efficiently over a dynamic object (structural
+					// `{[k: string]: V}`, routed to `Map<string, V>`; see `indexSignatureValueType`),
+					// which has a real, live key set: desugars to `for (const k of obj.keys())`,
+					// already-supported syntax, same "synthesize and hand back to `emitStmt`" idiom
+					// `case 'of'` itself uses one level down -- `keys()` is a real snapshot array (see
+					// `lib/map.ts`'s own comment on why), so this iterates the live key set at the moment
+					// the loop starts, matching real `for...in` closely enough for every real use this
+					// project has (none mutate the object mid-loop).
+					//
+					// Anything else falls back to `Object.entries`, pulling just the key out of each
+					// `[k, v]` pair via ordinary array-destructuring in the loop variable (this session's
+					// own for-of-destructuring fix) -- covers a *sealed* struct/class instance the same
+					// way `Object.entries` itself does, and throws the same "not supported yet" error for
+					// an extended class, for free, by just deferring to `emitObjectEntries`'s own dispatch
+					// rather than re-deriving its sealed/extended check here.
 					case 'in': {
-						if (!classOf(s.right, ctx)?.methodDecls.get('keys'))
-							throw new Error("towasm: 'for...in' is only supported over a dynamic object (a structural '{[k: string]: V}'-typed value)");
+						if (s.init.type !== 'var_decl' || s.init.declarations.length !== 1)
+							throw new Error("towasm: 'for...in' loop variable must be a single declaration");
 
+						if (classOf(s.right, ctx)?.methodDecls.get('keys')) {
+							emitStmt({
+								type: 'for', kind: 'of',
+								init: s.init,
+								right: { type: 'call', callee: { type: 'member', object: s.right, property: 'keys' }, arguments: [] },
+								body: s.body,
+							}, ctx);
+							return;
+						}
+
+						const v = s.init.declarations[0];
 						emitStmt({
 							type: 'for', kind: 'of',
-							init: s.init,
-							right: { type: 'call', callee: { type: 'member', object: s.right, property: 'keys' }, arguments: [] },
+							init: { type: 'var_decl', kind: s.init.kind, declarations: [{ ...v, name: JS.ArrayPattern([{ target: v.name }]) }] },
+							right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Object' }, property: 'entries' }, arguments: [s.right] },
 							body: s.body,
 						}, ctx);
 						return;
@@ -4352,25 +4453,39 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// via the exact inference the checker itself uses (`T.inferTypeArgs`), matching checker.ts's own
 	// `instantiate`, not a reimplementation. Falls back to each remaining type param's own `default`/
 	// `constraint`/`any` in turn when nothing inferred it, same as the checker's own final fallback.
-	// No contextual/expected-return-type inference (`instantiate` also tries that, via its own `expected`
-	// param) -- towasm's codegen has no comparable "expected type" threaded through a call expression today.
-	// `libGlobal` doubles as both `scope` (resolving each argument's own type) and `declScope` (resolving
-	// the declared param types a type param is matched against) -- every declaration this is ever called
-	// for (a top-level function, or a class method -- its class's own type params already concrete by the
-	// time `ensureMethod` reaches here) is declared relative to the one module scope this file ever has,
-	// same as `paramType`/`compileFunc` already assume elsewhere -- no separate "declaring module" to track
-	// the way `T.declScopeOf` exists for (a cross-module signature, which nothing here ever is).
-	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, scope: Scope): Map<string, Type> {
+	// Contextual/expected-return-type inference (`instantiate`'s own `expected` param, checker.ts): `want`
+	// -- towasm's codegen equivalent, `ctx.contextualReturn` (see its own comment) -- reaches here as
+	// `expected`/`returnType` when the call site had a real one on hand (currently only `case 'array'`'s
+	// own per-element loop and `case 'var_decl'` seed it). Matched with the *same* priority checker.ts's
+	// own `instantiate` uses: an ordinary direct param (`x: T`) still resolves first and wins outright
+	// (`T.inferTypeArgs`'s own `out`-already-has-it guard) -- only a generic callback argument's own
+	// *return*-position inference is deferred until after this contextual step gets a chance, since an
+	// unannotated callback's own inferred return is otherwise whatever anonymous, non-nominal structural
+	// shape its body happened to produce (found via `Rule([...], $ => ({type:'spread', ...}))`-shaped
+	// calls, `Rule<T>`'s `T` only ever knowable from the surrounding array literal's own declared element
+	// type). `libGlobal` doubles as both `scope` (resolving each argument's own type) and `declScope`
+	// (resolving the declared param types a type param is matched against) -- every declaration this is
+	// ever called for (a top-level function, or a class method -- its class's own type params already
+	// concrete by the time `ensureMethod` reaches here) is declared relative to the one module scope this
+	// file ever has, same as `paramType`/`compileFunc` already assume elsewhere -- no separate "declaring
+	// module" to track the way `T.declScopeOf` exists for (a cross-module signature, which nothing here
+	// ever is).
+	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Type, returnType?: Type): Map<string, Type> {
 		const map = new Map<string, Type>();
 		if (typeArgs) {
 			typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
 		} else {
 			const names = new Map(typeParams.map(p => [p.name, p] as const));
+			const deferred: { paramT: Type; argT: Type }[] = [];
 			args.forEach((a, i) => {
 				const p = params[i];
 				if (p?.typeAnnotation && a.type !== 'spread')
-					T.inferTypeArgs(p.typeAnnotation, checkerTypeOf(a, scope), names, map, libGlobal);
+					T.inferTypeArgs(p.typeAnnotation, checkerTypeOf(a, scope), names, map, libGlobal, 0, libGlobal, deferred);
 			});
+			if (expected && returnType)
+				T.inferTypeArgs(returnType, expected, names, map, libGlobal);
+			for (const { paramT, argT } of deferred)
+				T.inferTypeArgs(paramT, argT, names, map, libGlobal);
 			typeParams.forEach(p => {
 				if (!map.has(p.name))
 					map.set(p.name, p.default ?? p.constraint ?? T.ANY);
@@ -4388,9 +4503,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// difference from a class reference: a function's type arguments are usually left implicit at the call
 	// site, inferred from the arguments (`inferTypeArgMap`, above). Explicit call-site type args
 	// (`identity<number>(5)`) are honored too, same as a class's are.
-	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope): FuncInfo {
+	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Type): FuncInfo {
 		const typeParams	= decl.typeParams!;
-		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, scope);
+		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, scope, expected, decl.returnType as Type | undefined);
 		const key			= genericKey(name, typeParams, map, global);
 		return funcs.get(key) ?? compileFunc(key, { ...substituteTypeParams(decl, map), typeParams: undefined })!;
 	}
@@ -5256,7 +5371,24 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// "run its init logic", not "allocate a separate base object"). Recurses naturally for a multi-level
 	// chain (the superclass's own body may contain its own `super(...)`, resolved against *its* own
 	// `cls.superClass` in the recursive call).
-	function emitCtorStatements(stmts: Statement[], cls: ClassInfo, ctx: FunctionContext): void {
+	function emitCtorStatements(ctor: MethodMember, cls: ClassInfo, ctx: FunctionContext, setField: (field: string, value: Expr) => void): void {
+		const params = ctor.params;
+		const stmts	= ctor.body!;
+
+		// A parameter property (`constructor(public x: number)`) has no `this.x = x` statement anywhere
+		// in `stmts` at all -- real TS synthesizes that assignment itself, and (verified against real TS
+		// output) runs it *before* any class-level field initializer, not after, even though a field's own
+		// `= value` is textually declared above the constructor -- e.g. `y = this.x + 1; constructor(public
+		// x: number) {}` needs `x` assigned first for `y`'s own initializer to see it. Only reached for a
+		// scalar-only class (`ensureCtor`'s `struct.new_default` path); an object-typed field forces the
+		// other, explicit-collection path, which already assigns parameter properties itself (`ensureCtor`'s
+		// own `setField` loop over `params`).
+		const emitParamPropertyInits = () => {
+			for (const p of params) {
+				if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected'))
+					setField(p.key as string, { type: 'identifier', name: p.key as string });
+			}
+		};
 		// A class-level field initializer (`tag: number = 99`) isn't part of the constructor's own
 		// `body` at all -- it has to be synthesized as a real `this.field = value` assignment and run
 		// at the right point: after `super(...)` returns (if there is one) but before the rest of this
@@ -5265,16 +5397,15 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		// forces the other, explicit-collection path, whose own `initField` already does this correctly.
 		const emitOwnFieldInits = () => {
 			for (const m of cls.decl.body) {
-				if (m.type === 'field' && !m.modifiers?.includes('static') && m.value) {
-					emitStmt({
-						type: 'expression',
-						expression: { type: 'binary', operator: '=', left: { type: 'member', object: { type: 'this' }, property: m.key as string }, right: m.value },
-					}, ctx);
-				}
+				if (m.type === 'field' && !m.modifiers?.includes('static') && m.value)
+					setField(m.key as string, m.value);
 			}
 		};
-		if (!stmts.some(st => st.type === 'expression' && st.expression.type === 'call' && st.expression.callee.type === 'super'))
+
+		if (!stmts.some(st => st.type === 'expression' && st.expression.type === 'call' && st.expression.callee.type === 'super')) {
+			emitParamPropertyInits();
 			emitOwnFieldInits();
+		}
 		for (const st of stmts) {
 			if (st.type === 'expression' && st.expression.type === 'call' && st.expression.callee.type === 'super') {
 				const call = st.expression;
@@ -5302,9 +5433,25 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 							throw new Error(`towasm: 'super(...)': missing argument for '${superClass.name}'s constructor parameter '${describeBinding(p.key)}'`);
 						emitStmt(JS.VarDecl('const', JS.Var(p.key, argExpr, p.typeAnnotation)), ctx);
 					});
-					emitCtorStatements(superCtor.body!, superClass, ctx);
+					emitCtorStatements(superCtor, superClass, ctx, setField);
 				});
+				emitParamPropertyInits();
 				emitOwnFieldInits();
+				continue;
+			}
+			// An ordinary `this.field = value` statement, written directly in the constructor body (not a
+			// param property, not a class-level field initializer) -- the historically-supported way to
+			// assign an object-typed field (`this.inner = new Other(...)`, needs a real value collected
+			// before `struct.new`, so it can't go through plain assignment codegen at all until `setField`
+			// decides it's safe to). Routed through `setField` too, same as the other two synthesized
+			// sources above -- `setField` itself (see `ensureCtor`) knows whether this is still mid-
+			// collection or `this` already exists. Gated on `cls.fieldIndex` (this constructor's own
+			// level's real data fields only, not an inherited one from a *further* subclass, matching real
+			// TS scoping) so an accessor write (`this.someSetter = x`) still falls through to ordinary
+			// `emitStmt` -- calling a setter needs a real `this` receiver, so it's correctly caught by
+			// `case 'this'`'s own guard if attempted too early.
+			if (st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '=' && st.expression.left.type === 'member' && st.expression.left.object.type === 'this' && cls.fieldIndex.has(st.expression.left.property)) {
+				setField(st.expression.left.property, st.expression.right);
 				continue;
 			}
 			emitStmt(st, ctx);
@@ -5357,14 +5504,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			// Defaultability is a whole-struct-type property, not per-field -- one object-typed field forces the collect-then-`struct.new` path for the whole class.
 			} else if (cls.fields.some(f => typeof f.wtype !== 'string')) {
-				// Scope limit, not a fundamental one: this path collects every field's real value up front
-				// (`struct.new`, not `struct.new_default`) by scanning `cls.decl.body`'s own field
-				// initializers and `this.field =` statements directly -- neither of those account for
-				// inherited fields/initializers or a spliced-in `super(...)` body the way
-				// `emitCtorStatements`/the plain `struct.new_default` path below do. Combining the two
-				// would need this whole path taught the same inheritance-awareness; not attempted here.
-				if (cls.superClass)
-					throw new Error(`towasm: '${cls.name}' extends '${cls.superClass.name}' and also has at least one object-typed field of its own -- combining inheritance with a field that needs 'struct.new' (real values up front, instead of 'struct.new_default') is not supported`);
+
 				const remaining	= new Set(cls.fields.map(f => f.name));
 				const values	= new Map<string, Local>();
 				ctx.ctorFields	= values;
@@ -5373,8 +5513,22 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				// local, scope-only registration `declareCaptured` uses for closure captures.
 				ctx.scope.addValue('this', cls.thisTsType);
 
-				const setField = (field: string, wtype: WasmType) => {
+				emitCtorStatements(ctor, cls, ctx, (field: string, value: Expr) => {
+					// Once `this` genuinely exists (either every field was collected earlier in this same
+					// constructor, or this is a *reassignment* after that point) -- an ordinary field write,
+					// same as the scalar-only path's own `setField` always does. Only reachable via
+					// `emitCtorStatements`'s own explicit-`this.field=value`-statement interception (a
+					// param property/field initializer is always emitted before `remaining` can be empty).
+					if (!ctx.ctorFields) {
+						emitStmt({
+							type: 'expression',
+							expression: { type: 'binary', operator: '=', left: { type: 'member', object: { type: 'this' }, property: field }, right: value },
+						}, ctx);
+						return;
+					}
+					const wtype = cls.fields[cls.fieldIndex.get(field)!].wtype;
 					const local = ctx.declareLocal(`$field$${field}`, wtype);
+					emitAs(value, ctx, wtype);
 					ctx.emit(I.local.set(local.index));
 					values.set(field, local);
 					remaining.delete(field);
@@ -5388,43 +5542,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						ctx.ctorFields = undefined;
 						ctx.emit(I.local.set(thisLocal.index));
 					}
-				};
-
-				const initField = (field: string, value: Expr) => {
-					const wtype = cls.fields[cls.fieldIndex.get(field)!].wtype;
-					emitAs(value, ctx, wtype);
-					setField(field, wtype);
-				};
-
-				for (const m of cls.decl.body) {
-					if (m.type === 'field' && !m.modifiers?.includes('static') && m.value)
-						initField(m.key as string, m.value);
-				}
-				for (const p of ctor.params) {
-					if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
-						const loc = ctx.lookup(p.key as string)!;
-						ctx.emit(I.local.get(loc.index));
-						setField(p.key as string, loc.wtype);
-					}
-				}
-
-				for (const st of ctor.body!) {
-					if (!remaining.size || st.type === 'var_decl') {
-						emitStmt(st, ctx);
-						continue;
-					}
-
-					if (st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '=' && st.expression.left.type === 'member' && st.expression.left.object.type === 'this') {
-						const field	 = st.expression.left.property;
-						if (remaining.has(field)) {
-							initField(field, st.expression.right);
-							continue;
-						}
-					}
-
-					throw new Error(`towasm: '${cls.name}'s constructor must assign every field via a plain 'this.field = value' statement, before any other statement -- it has at least one object-typed field, which needs 'struct.new' (real values up front) instead of 'struct.new_default'`);
-				}
-
+				});
 				if (remaining.size)
 					throw new Error(`towasm: '${cls.name}'s constructor never assigns field(s) ${[...remaining].join(', ')}`);
 				ctx.emit(I.local.get(ctx.ctorThis!.index), I.return);
@@ -5437,7 +5555,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					I.struct.new_default(cls.typeIndex),
 					I.local.set(thisLocal.index),
 				);
-				emitCtorStatements(ctor.body!, cls, ctx);
+				emitCtorStatements(ctor, cls, ctx, (field: string, value: Expr) => emitStmt({
+					type: 'expression',
+					expression: { type: 'binary', operator: '=', left: { type: 'member', object: { type: 'this' }, property: field }, right: value },
+				}, ctx));
 				ctx.emit(I.local.get(ctx.ctorThis!.index), I.return);
 			}
 

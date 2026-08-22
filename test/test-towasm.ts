@@ -718,6 +718,62 @@ async function main() {
 		export function f(): number { return new Outer(1).n; }
 	`), /towasm/);
 
+	await checkThrows("calling a method on 'this' before every object-typed field is assigned is rejected", () => compile(`
+		class Inner { v: number; constructor() { this.v = 0; } }
+		class Outer {
+			p: Inner; n: number;
+			constructor(x: number) {
+				this.log();
+				this.n = x;
+				this.p = new Inner();
+			}
+			log(): void {}
+		}
+		export function f(): number { return new Outer(1).n; }
+	`), /can't be used yet/);
+
+	{
+		// `setField`'s own "already constructed" fallback (`ensureCtor`): once every field has been
+		// collected and `struct.new` has run, an ordinary `this.field = value` statement -- including a
+		// genuine reassignment, not just the first-ever assignment -- goes through plain field-write
+		// codegen exactly like the scalar-only path always has, not the collect-into-a-scratch-local path.
+		const { reassign } = await compile(`
+			class Inner { v: number; constructor(v: number) { this.v = v; } }
+			class Outer {
+				p: Inner; n: number;
+				constructor(x: number) {
+					this.p = new Inner(x);
+					this.n = x;
+					this.n = x + 100;
+				}
+			}
+			export function reassign(): number { return new Outer(5).n; }
+		`);
+		check("object-typed ctor: a field reassigned after every field is already collected still works", reassign(), 105);
+	}
+
+	{
+		// A field initializer that reads an already-collected *sibling* field (here, a parameter property
+		// assigned before any field initializer runs, per `emitCtorStatements`'s own real-TS-matching
+		// order) -- exercises `case 'member'`'s own `ctx.ctorFields`-aware shortcut, which reads the
+		// sibling's scratch local directly rather than needing a real `this` to exist at all yet.
+		const { test } = await compile(`
+			class Inner { v: number; constructor(v: number) { this.v = v; } }
+			class Foo {
+				p: Inner;
+				y = this.x + 1;
+				constructor(public x: number) {
+					this.p = new Inner(x);
+				}
+			}
+			export function test(): number {
+				const f = new Foo(5);
+				return f.y * 10 + f.p.v;
+			}
+		`);
+		check("object-typed ctor: a field initializer reading an already-collected sibling field works", test(), 65);
+	}
+
 	await checkThrows('never assigning an object-typed field is rejected', () => compile(`
 		class Inner { v: number; constructor() { this.v = 0; } }
 		class Outer {
@@ -1275,6 +1331,84 @@ async function main() {
 		check('generic closure: selected via a conditional expression, still generic', fromConditional(), 10);
 		check('generic closure: unconstrained type param falls back to boxed any, works for two real types', unconstrainedBoxedAny(), 47);
 		check('generic closure: bounded by a class, a subclass instance still dispatches virtually afterward', boundedClassNarrowing(), 2);
+	}
+
+	{
+		// towasm.ts's own generic-function-call codegen (`ensureGenericFunc`/`inferTypeArgMap`) is a
+		// separate, parallel mechanism from checker.ts's own `instantiate` -- it reuses the same shared
+		// `T.inferTypeArgs`, but previously had no contextual/expected-type step at all (documented gap,
+		// `inferTypeArgMap`'s own old comment). A generic callback argument with no other source for its
+		// own type param (`makeRule<T>(action: () => T): T` called as `makeRule(() => ({...}))`) always
+		// inferred `T` purely from the callback's own structurally-inferred return -- an anonymous,
+		// non-nominal shape with no wasm struct representation, even when the surrounding context (here,
+		// an array literal's own declared element type) already names the real, concrete target type.
+		// Fixed via `ctx.contextualReturn`, a one-shot hint threaded from the few producers that have a
+		// real TS type on hand (`case 'var_decl'`, `case 'array'`'s own per-element loop) through to
+		// `case 'call'`, mirroring checker.ts's own `expected`-vs-`sig.returnType` contextual step (itself
+		// also strengthened this session: a generic callback argument's own return-type inference is now
+		// *deferred* until after that contextual step gets a chance, rather than racing it first and
+		// winning on `out`'s own first-bound-wins guard).
+		const { arrayElementContext, ordinaryArgumentWins, multipleElements } = await compile(`
+			type SpreadExpr = { kind: string; value: number };
+			function makeRule<T>(action: () => T): T { return action(); }
+			export function arrayElementContext(): number {
+				const rules: SpreadExpr[] = [
+					makeRule(() => ({ kind: 'spread', value: 42 })),
+				];
+				return rules[0].value;
+			}
+			function identity<T>(x: T): T { return x; }
+			export function ordinaryArgumentWins(): number {
+				const y: number = identity(5);
+				return y;
+			}
+			export function multipleElements(): number {
+				const rules: SpreadExpr[] = [
+					makeRule(() => ({ kind: 'a', value: 1 })),
+					makeRule(() => ({ kind: 'b', value: 2 })),
+				];
+				return rules[0].value * 10 + rules[1].value;
+			}
+		`);
+		check("contextual generic inference: an unannotated callback's own return type comes from the array literal's own declared element type", arrayElementContext(), 42);
+		check('contextual generic inference: an ordinary direct param still infers from the argument itself, unaffected', ordinaryArgumentWins(), 5);
+		check("contextual generic inference: ctx.contextualReturn resets correctly per array element, not just once", multipleElements(), 12);
+	}
+
+	{
+		// `emitClosureLiteral` used to compute its own return wtype purely from `e.returnType` -- for an
+		// unannotated arrow/function expression, that's whatever *structural* type the checker's own
+		// inference back-fills (real, but anonymous -- no nominal identity for `typeOf` to turn into a
+		// wasm struct), so an unannotated closure returning a bare object literal always failed ("needs a
+		// known target type"), even where the *caller's* own declared callback signature already names
+		// the exact concrete shape wanted. Fixed by threading the call site's own expected closure
+		// signature (`want`) into `emitClosureLiteral`, preferring its `result` over the closure's own
+		// guess when available -- found via `Rule([...], $ => ({...}))`-shaped calls in ts-parser.ts/
+		// js-parser.ts/binary-libs/wasm.ts (hundreds of real sites), though most of those specifically
+		// still don't resolve: `T` there is pinned only by an *outer* array literal's own declared element
+		// type (`Rule<Expr>[]`), which needs real bidirectional/contextual generic inference this checker
+		// doesn't have (its own documented limitation: "structural-argument-matching only") -- confirmed
+		// via a direct, minimal repro of that exact shape, deliberately NOT attempted here. What this DOES
+		// fix: any case where a nominal target type reaches the call site without needing that -- a
+		// non-generic callback parameter, or an explicit type argument pinning a generic one directly.
+		const { nonGenericParam, explicitTypeArg } = await compile(`
+			type Spread = { kind: 'spread'; value: number };
+			function buildPlain(make: () => Spread): number {
+				return make().value;
+			}
+			export function nonGenericParam(): number {
+				return buildPlain(() => ({ kind: 'spread', value: 42 }));
+			}
+			function buildGeneric<T>(make: () => T): T {
+				return make();
+			}
+			export function explicitTypeArg(): number {
+				const s = buildGeneric<Spread>(() => ({ kind: 'spread', value: 42 }));
+				return s.value;
+			}
+		`);
+		check("unannotated closure returning an object literal: non-generic callback param supplies the target type", nonGenericParam(), 42);
+		check("unannotated closure returning an object literal: an explicit type argument supplies the target type", explicitTypeArg(), 42);
 	}
 
 	{
@@ -2510,6 +2644,68 @@ async function main() {
 	}
 
 	{
+		// `Object.entries(x)`: a compiler intrinsic (`emitObjectEntries`, dispatched via `declare var
+		// Object` in lib.d.ts, not real TS source -- what fields exist depends on `x`'s own concrete type
+		// at each call site, which only the compiler itself can see). Forwards to a `Map`-backed value's
+		// own real `.entries()`; for a *sealed* (never-subclassed) struct, synthesizes a `[string,any][]`
+		// array literal directly from the class's own fields; throws a clear "not supported yet" for an
+		// extended class (the receiver's real runtime type isn't known here, only its declared one).
+		const { sealedClass, dynamicObject, forInSealed, forInDynamicUnchanged } = await compile(`
+			class Point {
+				x: number;
+				y: number;
+				constructor(x: number, y: number) { this.x = x; this.y = y; }
+			}
+			export function sealedClass(): number {
+				const p = new Point(3, 4);
+				const entries = Object.entries(p);
+				const first = entries[0];
+				const second = entries[1];
+				return (first[1] as number) * 1000 + (second[1] as number) * 10 + entries.length;
+			}
+			export function dynamicObject(): number {
+				const obj: Partial<Record<string, number>> = { a: 1, b: 2, c: 3 };
+				const entries = Object.entries(obj);
+				let total = 0;
+				for (const [k, v] of entries)
+					total = total + (v as number);
+				return total;
+			}
+			export function forInSealed(): number {
+				const p = new Point(3, 4);
+				let total = 0;
+				for (const k in p)
+					total = total + 1;
+				return total;
+			}
+			export function forInDynamicUnchanged(): number {
+				const obj: Partial<Record<string, number>> = { a: 1, b: 2, c: 3 };
+				let total = 0;
+				for (const k in obj)
+					total = total + 1;
+				return total;
+			}
+		`);
+		check('Object.entries: sealed struct synthesizes its own [string,any][] literal', sealedClass(), 3042);
+		check('Object.entries: Map-backed dynamic object forwards to its own real entries()', dynamicObject(), 6);
+		check("for...in: falls back to Object.entries for a sealed struct (no 'keys()' method)", forInSealed(), 2);
+		check("for...in: a dynamic object still takes the efficient .keys() path, unchanged", forInDynamicUnchanged(), 3);
+
+		// A genuine, permanent safety net (like arg-count validation elsewhere in this file), not a bare
+		// "unimplemented feature throws": a subclassed receiver's real runtime type isn't visible here,
+		// only its declared one, so refusing outright is deliberately safer than silently producing the
+		// wrong field set.
+		await checkThrows('Object.entries: an extended class is rejected, not silently mis-handled', () => compile(`
+			class Animal { constructor() {} }
+			class Dog extends Animal { constructor() { super(); } }
+			export function test(): number {
+				const a: Animal = new Animal();
+				return Object.entries(a).length;
+			}
+		`), /isn't supported yet/);
+	}
+
+	{
 		// A closure literal's own concrete result narrower than the slot it's assigned into -- real TS
 		// covariant-return assignability (`(x: number) => number` fitting `(x: number) => number |
 		// undefined`), the common shape a `Partial<...>`'s own optional mapped-type value produces for a
@@ -2775,6 +2971,42 @@ async function main() {
 		check("field init: runs before the constructor body, so 'this.field = this.field + x' sees the real initial value", readInCtor(), 100);
 		check("field init: a subclass's own field initializer runs after super()", subclassOwnInit(), 99);
 		check("field init: an inherited (superclass) field initializer still runs too", subclassInheritedInit(), 7);
+	}
+
+	{
+		// Same `struct.new_default` shortcut, same silent-skip failure mode, but for a parameter
+		// property (`constructor(public x: number) {}`) instead of a class-level field initializer --
+		// there's no `this.x = x` statement anywhere in the constructor's own body at all (real TS
+		// synthesizes that assignment itself), so the scalar-only fast path never assigned it either,
+		// silently leaving the field at wasm's zero default regardless of the argument passed in.
+		const { plain, mixed, subclass } = await compile(`
+			class Point {
+				constructor(public x: number, public y: number) {}
+			}
+			export function plain(): number {
+				const p = new Point(3, 4);
+				return p.x * 10 + p.y;
+			}
+			class Mixed {
+				z: number = 5;
+				constructor(public x: number) {}
+			}
+			export function mixed(): number {
+				const m = new Mixed(2);
+				return m.x * 10 + m.z;
+			}
+			class Base { a: number; constructor(a: number) { this.a = a; } }
+			class Derived extends Base {
+				constructor(a: number, public b: number) { super(a); }
+			}
+			export function subclass(): number {
+				const d = new Derived(1, 2);
+				return d.a * 10 + d.b;
+			}
+		`);
+		check('param property: scalar-only class assigns it, not just wasm-default 0', plain(), 34);
+		check('param property: coexists correctly with an ordinary field initializer', mixed(), 25);
+		check("param property: a derived class's own param property is assigned after super()", subclass(), 12);
 	}
 
 	{

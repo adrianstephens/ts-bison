@@ -1265,7 +1265,14 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 
 // Infers a generic call's type args by structurally matching each param's declared type against the argument's (first binding wins).
 // `declScope` resolves `paramT`'s own names (the signature's declaring module); `scope` resolves `argT`'s (the call site's).
-export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<string, TS.TypeParam>, out: Map<string, Type>, scope: Scope, depth = 0, declScope: Scope = scope): void {
+// `deferred`: when given, a callback-shaped param's own *return*-position inference (the one case that
+// depends on the argument's own already-inferred type rather than its declared one -- see the
+// `function`/`constructor` case below) is queued here instead of running immediately, so a caller
+// (`instantiate()`) can replay it after a more reliable source (the call's own contextual `expected`
+// type) has had first crack at the same type param. Every other case (a plain, non-callback param
+// position) is unaffected and keeps today's immediate, first-wins behavior regardless -- omitting
+// `deferred` (every caller except `instantiate()`) reproduces the exact old behavior throughout.
+export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<string, TS.TypeParam>, out: Map<string, Type>, scope: Scope, depth = 0, declScope: Scope = scope, deferred?: { paramT: Type; argT: Type }[]): void {
 	if (depth > 6)
 		return;
 	if (paramT.type === 'ref' && !paramT.typeArgs && tparams.has(paramT.name)) {
@@ -1280,27 +1287,27 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 	const a = resolveOwn(argT, scope);
 	if (paramT.type === 'array') {
 		if (a.type === 'array') {
-			inferTypeArgs(paramT.element, a.element, tparams, out, scope, depth + 1, declScope);
+			inferTypeArgs(paramT.element, a.element, tparams, out, scope, depth + 1, declScope, deferred);
 		} else if (a.type === 'tuple') {
 			a.elements.forEach(el => {
 				const t = tupleElementType(el);
 				if (t)
-					inferTypeArgs(paramT.type === 'array' ? paramT.element : ANY, t, tparams, out, scope, depth + 1, declScope);
+					inferTypeArgs(paramT.type === 'array' ? paramT.element : ANY, t, tparams, out, scope, depth + 1, declScope, deferred);
 			});
 		// e.g. an argument built from `x ?? y` where both branches independently resolve to compatible-but-not-deduplicated array types
 		// (`number[] | number[]`) -- distribute over the union rather than giving up (the first member to actually match wins, per `out`'s guard).
 		} else if (a.type === 'union') {
-			a.types.forEach(m => inferTypeArgs(paramT, m, tparams, out, scope, depth + 1, declScope));
+			a.types.forEach(m => inferTypeArgs(paramT, m, tparams, out, scope, depth + 1, declScope, deferred));
 		}
 	} else if (paramT.type === 'ref' && paramT.typeArgs) {
 		if (paramT.name === 'Array' && paramT.typeArgs.length === 1 && a.type === 'array') {
-			inferTypeArgs(paramT.typeArgs[0], a.element, tparams, out, scope, depth + 1, declScope);
+			inferTypeArgs(paramT.typeArgs[0], a.element, tparams, out, scope, depth + 1, declScope, deferred);
 		} else if (paramT.name === 'PromiseLike' && paramT.typeArgs.length === 1 && (argT.type === 'union' ? argT.types : [argT]).some(m => asPromiseRef(m, scope))) {
 			// `.then`'s 2nd alternative: the callback's return may be a union with only *some* members Promise-shaped (e.g.
 			// `Font | FontGroup | Promise<Font> | undefined`) -- `awaitType` distributes over the union, unwrapping just those.
 			// Checked on `argT`, not the resolved `a`: `resolveOwn` would expand a bare `Promise<X>` into its structural
 			// body, losing the ref identity `asPromiseRef` needs.
-			inferTypeArgs(paramT.typeArgs[0], awaitType(argT, scope), tparams, out, scope, depth + 1, declScope);
+			inferTypeArgs(paramT.typeArgs[0], awaitType(argT, scope), tparams, out, scope, depth + 1, declScope, deferred);
 		} else {
 			// Prefer the argument's own (unresolved) named type over its fully-expanded structural shape -- `resolve()` eagerly substitutes a
 			// generic ref's type params into its body, losing the "this was Polynomial<number>" name/typeArgs identity `paramT` needs to match.
@@ -1311,25 +1318,25 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				paramT.typeArgs.forEach((p, i) => {
 					const t = named.typeArgs![i];
 					if (t)
-						inferTypeArgs(p, t, tparams, out, scope, depth + 1, declScope);
+						inferTypeArgs(p, t, tparams, out, scope, depth + 1, declScope, deferred);
 				});
 			} else {
 				// A generic alias wrapping `T` (e.g. `Testable<T> = T extends primitive ? T : T & Equal<T>`) -- unfold one level and recurse,
 				// so whichever case below actually contains `T` gets a chance to match. `paramT.name` is declared in `declScope`, not `scope`.
 				const entry = declScope.type(paramT.name);
 				if (entry?.typeParams?.length)
-					inferTypeArgs(substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, paramT.typeArgs![i] ?? p.default ?? ANY]))), argT, tparams, out, scope, depth + 1, declScope);
+					inferTypeArgs(substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, paramT.typeArgs![i] ?? p.default ?? ANY]))), argT, tparams, out, scope, depth + 1, declScope, deferred);
 			}
 		}
 	} else if (paramT.type === 'intersection') {
 		// Same reasoning as `union` below: `T` may be embedded in just one part -- trying every part is safe, only the matching one infers anything.
 		for (const p of paramT.types)
-			inferTypeArgs(p, argT, tparams, out, scope, depth + 1, declScope);
+			inferTypeArgs(p, argT, tparams, out, scope, depth + 1, declScope, deferred);
 
 	} else if (paramT.type === 'conditional') {
 		// Which branch `T` is in depends on `checkType extends extendsType`, not knowable here since `T` may itself be `checkType` -- try both.
-		inferTypeArgs(paramT.trueType, argT, tparams, out, scope, depth + 1, declScope);
-		inferTypeArgs(paramT.falseType, argT, tparams, out, scope, depth + 1, declScope);
+		inferTypeArgs(paramT.trueType, argT, tparams, out, scope, depth + 1, declScope, deferred);
+		inferTypeArgs(paramT.falseType, argT, tparams, out, scope, depth + 1, declScope, deferred);
 
 	} else if (paramT.type === 'function' || paramT.type === 'constructor') {
 		// A callable value built via `Object.assign(fn, {...})` (e.g. `rational`) comes out as an intersection, not a bare
@@ -1339,10 +1346,22 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 			paramT.params.forEach((p, i) => {
 				const q = fn.params[i];
 				if (p.typeAnnotation && q?.typeAnnotation)
-					inferTypeArgs(p.typeAnnotation, q.typeAnnotation, tparams, out, scope, depth + 1, declScope);
+					inferTypeArgs(p.typeAnnotation, q.typeAnnotation, tparams, out, scope, depth + 1, declScope, deferred);
 			});
-			if (paramT.returnType && fn.returnType)
-				inferTypeArgs(paramT.returnType, fn.returnType, tparams, out, scope, depth + 1, declScope);
+			// The one case `deferred` exists for: `fn.returnType` is the *argument's own*, independently
+			// inferred return type -- for a generic callback literal (`() => ({...})`) with no declared
+			// return-type annotation, that's whatever anonymous, non-nominal structural shape the checker's
+			// own inference happened to produce from its body, not necessarily what the call actually wants.
+			// Queuing it lets a more reliable source (the whole call's own contextual `expected` type,
+			// matched against the outer signature's `returnType` in `instantiate()`) bind the type param
+			// first when it can; `out`'s own first-wins guard (`ref` case, above) then makes replaying this
+			// afterward a safe no-op wherever contextual typing already succeeded.
+			if (paramT.returnType && fn.returnType) {
+				if (deferred)
+					deferred.push({ paramT: paramT.returnType, argT: fn.returnType });
+				else
+					inferTypeArgs(paramT.returnType, fn.returnType, tparams, out, scope, depth + 1, declScope);
+			}
 		}
 	} else if (paramT.type === 'object') {
 		for (const m of paramT.members) {
@@ -1351,7 +1370,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 			if (m.type === 'property') {
 				const t = lookupMember(a, m.key, scope);
 				if (t)
-					inferTypeArgs(m.typeAnnotation, t, tparams, out, scope, depth + 1, declScope);
+					inferTypeArgs(m.typeAnnotation, t, tparams, out, scope, depth + 1, declScope, deferred);
 			} else if (m.type === 'method') {
 				// Same shape as `function`/`constructor` above -- `adapter0<T,D>`-style interfaces often carry `T`/`D` only in a method's own signature.
 				const t = lookupMember(a, m.key, scope);
@@ -1359,10 +1378,14 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 					m.params.forEach((p, i) => {
 						const q = t.params[i];
 						if (p.typeAnnotation && q?.typeAnnotation)
-							inferTypeArgs(p.typeAnnotation, q.typeAnnotation, tparams, out, scope, depth + 1, declScope);
+							inferTypeArgs(p.typeAnnotation, q.typeAnnotation, tparams, out, scope, depth + 1, declScope, deferred);
 					});
-					if (m.returnType)
-						inferTypeArgs(m.returnType, t.returnType ?? ANY, tparams, out, scope, depth + 1, declScope);
+					if (m.returnType) {
+						if (deferred)
+							deferred.push({ paramT: m.returnType, argT: t.returnType ?? ANY });
+						else
+							inferTypeArgs(m.returnType, t.returnType ?? ANY, tparams, out, scope, depth + 1, declScope);
+					}
 				}
 			}
 		}
@@ -1370,7 +1393,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 		// Only an argument that's *itself* an inferred/declared predicate carries a usable asserted type (e.g. `.filter`'s `(v) => v is S`
 		// matched against a callback whose own inferred return came out `v is <narrowed>`) -- a plain `boolean` callback leaves `S` uninferred.
 		if (a.type === 'predicate' && paramT.assertedType && a.assertedType)
-			inferTypeArgs(paramT.assertedType, a.assertedType, tparams, out, scope, depth + 1, declScope);
+			inferTypeArgs(paramT.assertedType, a.assertedType, tparams, out, scope, depth + 1, declScope, deferred);
 
 	} else if (paramT.type === 'union') {
 		// A bare `T` alternative matches the whole argument too coarsely when a more structural alternative (`TypeT<K>`) could
@@ -1378,10 +1401,10 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 		const isBare = (t: Type) => t.type === 'ref' && !t.typeArgs && tparams.has(t.name);
 		for (const t of paramT.types)
 			if (!isBare(t))
-				inferTypeArgs(t, argT, tparams, out, scope, depth + 1, declScope);
+				inferTypeArgs(t, argT, tparams, out, scope, depth + 1, declScope, deferred);
 		for (const t of paramT.types)
 			if (isBare(t))
-				inferTypeArgs(t, argT, tparams, out, scope, depth + 1, declScope);
+				inferTypeArgs(t, argT, tparams, out, scope, depth + 1, declScope, deferred);
 	}
 }
 

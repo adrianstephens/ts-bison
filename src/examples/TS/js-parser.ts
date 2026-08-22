@@ -285,12 +285,19 @@ function binaryChainLeft(lowerLeft: Rules<Expr>, lowerRight: Rules<Expr>, ops: b
 	]);
 }
 
+// `\u{...}` takes an unbounded run of hex digits, so its value can exceed the max code point (0x10FFFF)
+// -- real source for this (deliberately invalid, testing tsc's own diagnostic) exists in the wild, and
+// `String.fromCodePoint` throws a native RangeError rather than returning anything for it. This is called
+// from plain grammar-action code with no error-reporting path available, so the replacement character
+// stands in, same as a real decoder falls back to for any other unrepresentable input.
+const codePoint = (n: number) => n >= 0 && n <= 0x10FFFF ? String.fromCodePoint(n) : '�';
+
 // Hand-decoded rather than round-tripped through `JSON.parse`: JSON's escape set is a strict subset of JS's, so valid JS strings like `'\0'` threw there.
 export const unescapeString = (s: string) => s.replace(
 	/\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|\r\n|\n|(.))/g,
 	(_, hex, ubrace, u4, ch) =>
 		hex !== undefined ? String.fromCharCode(parseInt(hex, 16))
-		: ubrace !== undefined || u4 !== undefined ? String.fromCodePoint(parseInt(ubrace ?? u4, 16))
+		: ubrace !== undefined || u4 !== undefined ? codePoint(parseInt(ubrace ?? u4, 16))
 		: ch === undefined ? ''
 		: ch === 'n' ? '\n' : ch === 't' ? '\t' : ch === 'r' ? '\r' : ch === 'b' ? '\b' : ch === 'f' ? '\f' : ch === 'v' ? '\v' : ch === '0' ? '\0'
 		: ch
@@ -332,7 +339,14 @@ export const binding_target = Rules<BindingTarget>(
 );
 
 const object_pattern_property = Rules(
-	Rule([IDENT], 														$ => ({ key: $[0], value: $[0] } as const)),
+	// `forceFork`: a bare `identifier` here is a genuine reduce-reduce tie with `property_assignment`'s own
+	// bare-`identifier` shorthand (an arrow's `(` is also reachable as a plain expression, so `{a}` is
+	// ambiguous between a destructuring shorthand and an object-literal shorthand until something past this
+	// single token disambiguates) -- same shape as `binding_target`'s own `ForceFork(Rule([IDENT], ...))`
+	// just above. Recorded as `kind:'reduce-reduce', resolution:'earlier rule wins'` when unfixed (verified
+	// via a direct, uncached `makeParser` build -- `tables.conflicts` is NOT populated on a table loaded
+	// from `.tables-cache/*.json.gz`, so checking a cached parser's `conflicts` always looks empty).
+	ForceFork(Rule([IDENT], 											$ => ({ key: $[0], value: $[0] } as const))),
 	Rule([IDENT, '=', fwd_assignment_expression], 						$ => ({ key: $[0], value: $[0], default: $[2] } as const)),
 	Rule([IDENT, ':', binding_target], 									$ => ({ key: $[0], value: $[2] } as const)),
 	Rule([IDENT, ':', binding_target, '=', fwd_assignment_expression], 	$ => ({ key: $[0], value: $[2], default: $[4] } as const)),
@@ -1006,8 +1020,12 @@ export const program = Rules<Program<any>>(
 export const skip = [WS, /\/\/[^\n]*\n?/, /\/\*[^]*?\*\//, /^#![^\n]*\n?/];
 
 // Error-driven insertion: only when the real token would otherwise fail, and is preceded by a line terminator, or is `}`, or EOF.
+// `lex.token` (the failing token itself), not `lex.remaining` (already past it -- a real token always
+// advances the lexer before any caller sees it, so by the time recovery runs, `remaining` describes what
+// comes AFTER the failing token, never the token's own text; checking it for "is `}`" never matched the
+// failing token actually being `}`, only a `}` immediately following it, e.g. doubly-nested `}}`).
 export const recover: RecoveryCallback = (lex, row) => {
-	if (!((lex.prev && lex.prev.pos && lex.line > lex.prev.pos.line) || lex.remaining.startsWith('}') || !lex.remaining))
+	if (!((lex.prev && lex.prev.pos && lex.line > lex.prev.pos.line) || lex.token.name === '}' || !lex.remaining))
 		return undefined;
 	return [...row.keys()].find(t => t.name === ';');
 };

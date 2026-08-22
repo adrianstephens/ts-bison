@@ -58,8 +58,15 @@ export interface LexContext extends LexPosition {
 	next(): 	Token | undefined;
 }
 
+// The token recovery is being asked to substitute for -- NOT reflected in `remaining`, since a real
+// (already-lexed) token has already advanced the lexer's position past its own text by the time recovery
+// runs. A callback checking "is the failing token itself `}`" needs this, not `remaining`.
+export interface RecoveryLexPosition extends LexPosition {
+	token: Terminal;
+}
+
 export type TerminalCallback<C = any> = (lexctx: LexContext, ctx: C) => Token | Terminal | string | RegExp | undefined;
-export type RecoveryCallback = (lex: LexPosition, row: Map<Terminal, ActionEntry>) => Token | Terminal | string | RegExp | undefined;
+export type RecoveryCallback = (lex: RecoveryLexPosition, row: Map<Terminal, ActionEntry>) => Token | Terminal | string | RegExp | undefined;
 
 export class Terminal<T = any> {
 	_ignore = false;
@@ -814,7 +821,7 @@ function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: Te
 }
 
 interface StackEntry { state: number; value: unknown; }
-type InternalRecoveryCallback = (stream: Lexer, row: Map<Terminal, ActionEntry>) => Token | undefined;
+type InternalRecoveryCallback = (stream: Lexer, row: Map<Terminal, ActionEntry>, failing: Terminal) => Token | undefined;
 
 function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any) {
 	const stack: StackEntry[] = [{ state: 0, value: undefined }];
@@ -839,7 +846,7 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Intern
 			if (recoveryStuckCount > MAX_RECOVERY_AT_SAME_OFFSET)
 				usingRecovery = false;
 		}
-		const tok			= usingRecovery ? recover(stream, row) : realTok;
+		const tok			= usingRecovery ? recover(stream, row, realTok.type) : realTok;
 		const entry			= tok && row.get(tok.type);
 
 		if (!entry || entry.kind === 'error') {
@@ -928,8 +935,13 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 	let active = new Map([[convergeKey(frame), frame]]);
 
 	// Bounds all work across this call (any cause of runaway path explosion), on top of the more specific recovery-stuck check below.
+	// 5,000 (the original bound) turned out too tight for legitimate, real-world-complex code -- not a bug, just under-provisioned:
+	// two real files (msbuild/src/MsBuild.ts, this repo's own transform.ts) genuinely need >5,000 but <10,000 steps to resolve a
+	// single big function's worth of ordinary ambiguity (switch/case + optional chaining + generic types, each contributing a
+	// small amount that adds up), and take single-digit milliseconds even at 50,000 -- a true runaway explosion multiplies per
+	// token and would blow past this by orders of magnitude almost immediately, so the higher bound still catches those.
 	let totalWork = 0;
-	const MAX_TOTAL_WORK = 5_000;
+	const MAX_TOTAL_WORK = 50_000;
 
 	for (let i = 0; ; i++) {
 		const worklist	= [...active.values()];
@@ -1004,7 +1016,7 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 			// of every worklist entry re-triggering this same throw.
 			if (usingRecovery && ++recoveryUsedCount > MAX_RECOVERY_PER_POSITION)
 				usingRecovery = false;
-			const actionTok		= usingRecovery ? recover(stream, row) : tok;
+			const actionTok		= usingRecovery ? recover(stream, row, tok.type) : tok;
 			const entry			= actionTok && row.get(actionTok.type);
 			if (entry && entry.kind !== 'error') {
 				if (entry.kind === 'conflict') {
@@ -1341,8 +1353,8 @@ export function makeParser<T>(spec: GrammarSpec<T>, prebuilt?: { g: GrammarBuild
 	});
 
 	const recover: InternalRecoveryCallback = spec.recover
-		? (stream, row) => {
-			const result = resolveSym(spec.recover!({...getTextPos(stream), remaining: stream.peekText(), prev: stream.prev}, row));
+		? (stream, row, failing) => {
+			const result = resolveSym(spec.recover!({...getTextPos(stream), remaining: stream.peekText(), prev: stream.prev, token: failing}, row));
 			if (result)
 				return result instanceof Terminal ? {type: result, value: '', pos: getTextPos(stream)} : result;
 			return undefined;

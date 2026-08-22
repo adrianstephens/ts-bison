@@ -913,20 +913,32 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 		} else {
 			const names		= new Map(sig.typeParams.map(p => [p.name, p] as const));
 			const declScope	= T.declScopeOf(sig, scope);
+			// Collects a generic callback argument's own return-type inference (`T.inferTypeArgs`'s
+			// `function`/`constructor` case) instead of running it immediately -- an unannotated callback
+			// literal's own inferred return type is whatever anonymous, non-nominal structural shape its
+			// body happened to produce, not necessarily what the call actually wants (e.g. `Rule([...], $ =>
+			// ({type:'spread', ...}))`, where the real intent is only knowable from the surrounding array
+			// literal's own declared element type). Replayed below, after the contextual `expected` pass has
+			// had first crack at the same type params -- `out`'s own first-wins guard then makes replaying a
+			// safe no-op wherever contextual typing already succeeded, and an ordinary direct param (`x: T`,
+			// never queued at all) keeps resolving immediately, unaffected.
+			const deferred: { paramT: Type; argT: Type }[] = [];
 			argTs.forEach((t, i) => {
 				const p = params[i];
 				if (t && p?.typeAnnotation)
-					T.inferTypeArgs(p.typeAnnotation, t, names, map, scope, 0, declScope);
+					T.inferTypeArgs(p.typeAnnotation, t, names, map, scope, 0, declScope, deferred);
 			});
 			if (sig.rest?.typeAnnotation && restElementTs?.length) {
 				const t		= sig.rest.typeAnnotation;
 				const elem	= t.type === 'array' ? t.element : t;
-				restElementTs.forEach(t => T.inferTypeArgs(elem, t, names, map, scope, 0, declScope));
+				restElementTs.forEach(t => T.inferTypeArgs(elem, t, names, map, scope, 0, declScope, deferred));
 			}
 			// Same reasoning as the `preMap` pass above: whatever's still unbound after arguments, try the call's own contextual
 			// expected type before falling back to a default/constraint/`any` guess below.
 			if (expected && sig.returnType)
 				T.inferTypeArgs(sig.returnType, expected, names, map, scope, 0, declScope);
+			for (const { paramT, argT } of deferred)
+				T.inferTypeArgs(paramT, argT, names, map, scope, 0, declScope);
 			sig.typeParams.forEach(p => {
 				if (!map.has(p.name)) {
 					map.set(p.name, p.default ?? p.constraint ?? T.ANY);
