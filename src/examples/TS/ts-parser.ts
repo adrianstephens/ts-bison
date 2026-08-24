@@ -2,7 +2,7 @@ import * as path from 'path';
 import { Rules, Forward, Maybe, List, MaybeList, OneOf, terminal, ForceFork } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import * as JS from './js-parser';
-import { IDENT, NUM, STR, unquoteString, Rule } from './js-parser';
+import { IDENT, NUM, STR, EXPORT_KW, unquoteString, Rule } from './js-parser';
 import { Literal, UnaryPost, mergeMods } from '../common';
 
 // ===================================================================
@@ -142,6 +142,12 @@ export interface Program { type: 'program'; body: Statement[]; scope?: unknown }
 // `readonly` as a modifier is always followed by another name or `[`; a property literally *named* `readonly` has `?`/`:` directly next instead --
 // the one shape a real modifier can never produce, so checking for just that disambiguates without allow-listing every legal follow-token.
 const READONLY = terminal('readonly', /readonly(?!\w)/, lex => /^\s*[?:]/.test(lex.remaining) ? IDENT : READONLY);
+// `declare`/`const` as class-member modifiers need the same READONLY-style fallback -- a real member literally named
+// `declare`/`const` (e.g. `@isopodlabs/registry`'s `export(file: string): Promise<void>` surfaced this for `export`,
+// fixed via js-parser.ts's own `EXPORT_KW`, imported above) has one of these punctuation marks directly next, which
+// neither keyword's modifier usage ever produces.
+const DECLARE_MOD	= terminal('declare', /declare(?!\w)/, lex => /^\s*[(<:?=;}!]/.test(lex.remaining) ? IDENT : DECLARE_MOD);
+const CONST_MOD	= terminal('const', /const(?!\w)/, lex => /^\s*[(<:?=;}!]/.test(lex.remaining) ? IDENT : CONST_MOD);
 
 // `global` is only a keyword directly followed by `{`. Unlike `READONLY`, a bare `Rule(['global', ...])` has no fallback, so SLR's whole-grammar FOLLOW
 // set lets that item leak into unrelated states, silently swallowing any identifier actually named `global` elsewhere in the file (a real case hit this).
@@ -235,10 +241,10 @@ const type_parameter = Rules<TypeParam>(
 	Rule([IDENT, '=', type],										$ => ({ name: $[0], default: $[2] } as const)),
 	Rule([IDENT, 'extends', type, '=', type],						$ => ({ name: $[0], constraint: $[2], default: $[4] } as const)),
 	// TS 5.0 `const` type parameter modifier -- infers the narrowest (literal) type for T instead of widening.
-	Rule(['const', IDENT],											$ => ({ name: $[1], const: true } as const)),
-	Rule(['const', IDENT, 'extends', type],							$ => ({ name: $[1], constraint: $[3], const: true } as const)),
-	Rule(['const', IDENT, '=', type],								$ => ({ name: $[1], default: $[3], const: true } as const)),
-	Rule(['const', IDENT, 'extends', type, '=', type],				$ => ({ name: $[1], constraint: $[3], default: $[5], const: true } as const)),
+	Rule([CONST_MOD, IDENT],											$ => ({ name: $[1], const: true } as const)),
+	Rule([CONST_MOD, IDENT, 'extends', type],							$ => ({ name: $[1], constraint: $[3], const: true } as const)),
+	Rule([CONST_MOD, IDENT, '=', type],								$ => ({ name: $[1], default: $[3], const: true } as const)),
+	Rule([CONST_MOD, IDENT, 'extends', type, '=', type],				$ => ({ name: $[1], constraint: $[3], default: $[5], const: true } as const)),
 );
 const type_parameters = Rules(
 	Rule(['<', List(type_parameter, ',', true), '>'],				$ => $[1]),
@@ -491,7 +497,7 @@ const enum_body = Rules<EnumMember[]>(
 );
 const enum_declaration = Rules<EnumDecl>(
 	Rule(['enum', IDENT, enum_body],				$ => ({ type: 'enum_decl', name: $[1], members: $[2] } as const)),
-	Rule(['const', 'enum', IDENT, enum_body],		$ => ({ type: 'enum_decl', name: $[2], const: true, members: $[3] })),
+	Rule([CONST_MOD, 'enum', IDENT, enum_body],		$ => ({ type: 'enum_decl', name: $[2], const: true, members: $[3] })),
 );
 
 const bodyless_function = Rules(
@@ -552,17 +558,17 @@ const declared_body_item = Rules<Declaration>(
 	maybe_ambient,
 	fake_ambient,
 	Rule(['import', JS.import_declaration],				$ => $[1] as Declaration),
-	Rule(['export', 'import', JS.import_declaration],	$ => $[2] as Declaration),
-	Rule(['export', '=', dotted_path, ';'],				$ => ({ type: 'export_assignment', expr: $[2] } as const)),
+	Rule([EXPORT_KW, 'import', JS.import_declaration],	$ => $[2] as Declaration),
+	Rule([EXPORT_KW, '=', dotted_path, ';'],				$ => ({ type: 'export_assignment', expr: $[2] } as const)),
 	// A plain re-export list (`export { x as y };`, no accompanying declaration) inside an ambient
 	// module/namespace body -- `JS.export_declaration` already has this shape for real top-level `export`,
 	// this body-level sibling just never got it.
-	Rule(['export', JS.named_exports, ';'],				$ => ({ type: 'export', specifiers: $[1] } as const)),
+	Rule([EXPORT_KW, JS.named_exports, ';'],				$ => ({ type: 'export', specifiers: $[1] } as const)),
 	// A member exported out of an already-ambient namespace/module stays ambient itself -- reuses
 	// `maybe_ambient`/`fake_ambient` directly rather than `JS.export_declaration`, which also carries the
 	// *real*-bodied `exportable_item`, only valid for a plain `export` at actual module top level.
-	Rule(['export', maybe_ambient],						$ => $[1] as Declaration),
-	Rule(['export', fake_ambient],							$ => $[1] as Declaration),
+	Rule([EXPORT_KW, maybe_ambient],						$ => $[1] as Declaration),
+	Rule([EXPORT_KW, fake_ambient],							$ => $[1] as Declaration),
 	Rule(['module', dotted_path, '{', declared_body, '}'],	$ => NamespaceDecl($[1], $[3])),
 	Rule(['module', STR, ';'],							$ => ModuleDecl(unquoteString($[2]), [])),
 	Rule([GLOBAL, '{', declared_body, '}'],				$ => ModuleDecl('global', $[2])),
@@ -570,13 +576,13 @@ const declared_body_item = Rules<Declaration>(
 
 module_item.push(
 	real_namespace,
-	Rule(['declare', maybe_ambient],						$ => Declare($[1])),
-	Rule(['declare', fake_ambient],							$ => $[1]),
+	Rule([DECLARE_MOD, maybe_ambient],						$ => Declare($[1])),
+	Rule([DECLARE_MOD, fake_ambient],							$ => $[1]),
 	// `export = X;` at the top level of a whole file, not just nested in a `declare module`/`namespace` body (`declared_body_item` covers that).
-	Rule(['export', '=', dotted_path, ';'],					$ => ({ type: 'export_assignment', expr: $[2] } as const)),
+	Rule([EXPORT_KW, '=', dotted_path, ';'],					$ => ({ type: 'export_assignment', expr: $[2] } as const)),
 	// `export import X = N;` (an import-alias re-export) -- same rule `declared_body_item` already has for
 	// ambient bodies, needed again here for a plain (non-`declare`) `module`/`namespace` body or top-level file.
-	Rule(['export', 'import', JS.import_declaration],		$ => $[2] as Declaration),
+	Rule([EXPORT_KW, 'import', JS.import_declaration],		$ => $[2] as Declaration),
 );
 
 JS.binding_name.push(
@@ -619,9 +625,9 @@ JS.import_declaration.push(
 	Rule([TYPE, '*', 'as', IDENT, 'from', STR, ';'],	$ => ({ type: 'export', namespace: $[3], source: unquoteString($[5]), typeOnly: true } as const)),
 
 	Rule([exportable_item],								$ => JS.ExportDecl($[0] as JS.Declaration<any>)),
-	Rule(['declare', maybe_ambient],					$ => JS.ExportDecl(Declare($[1]))),
+	Rule([DECLARE_MOD, maybe_ambient],					$ => JS.ExportDecl(Declare($[1]))),
 	Rule([fake_ambient],								$ => JS.ExportDecl($[0] as JS.Declaration<any>)),
-	Rule(['declare', fake_ambient],						$ => JS.ExportDecl($[1] as JS.Declaration<any>)),
+	Rule([DECLARE_MOD, fake_ambient],						$ => JS.ExportDecl($[1] as JS.Declaration<any>)),
 	// `export default interface A {}` -- real TS (an interface has a name that can also serve as the
 	// default export's binding). Reuses `fake_ambient` the same way the plain-`export` rule just above
 	// does; permissively also accepts `export default type T = ...`, which real TS disallows, matching
@@ -711,7 +717,10 @@ const class_member_overloads = Rules<JS.Method<Type>>(
 );
 
 // Any number of member modifiers in any order (`static readonly`, `public static`, etc), pushed onto `class_member` so every member shape gets it.
-const class_member_modifier_list = List(OneOf(['public', 'private', 'protected', 'readonly', 'abstract', 'static', 'override', 'accessor']));
+// `declare`/`export`/`const` are syntactically valid here too (real TS's parser accepts them on any class element and leaves
+// "this modifier isn't legal on this kind of member" -- TS1031/TS1039/TS1248 -- to the checker); confirmed against the official
+// corpus's own baselines (`illegalModifiersOnClassElements.ts`, `constInClassExpression.ts`), each a single soft diagnostic.
+const class_member_modifier_list = List(OneOf(['public', 'private', 'protected', 'readonly', 'abstract', 'static', 'override', 'accessor', 'declare', 'export', 'const']));
 
 (JS.class_member as unknown as Rules<ClassMember>).push(
 	Rule(['[', IDENT, ':', type, ']', ':', type, ';'],				$ => ({ type: 'index_signature', paramName: $[1], paramType: $[3], typeAnnotation: $[6] } as const)),

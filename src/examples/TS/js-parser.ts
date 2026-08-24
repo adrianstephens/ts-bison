@@ -232,6 +232,13 @@ export const ASYNC		= terminal('async',	/async(?!\w)/,	lex => {
 	const next = lex.next();
 	return (next && (next.type.name === 'function' || next.type.name === '*' || next.type.name === '(' || next.type.name === '<')) || startsPropertyName(next) ? ASYNC : IDENT;
 });
+// A class member literally *named* `export` (e.g. `@isopodlabs/registry`'s `export(file: string): Promise<void>`)
+// has `(`/`<`/`:`/`?`/`;`/`}`/`!` directly next -- a shape `export`-the-keyword never produces in any of its own
+// uses (`export class`, `export { ... }`, `export = expr`, ts-parser.ts's class-member-modifier use, etc). `=` is
+// deliberately excluded: `export = expr;` (export-assignment) legitimately has `=` right after `export` too.
+// Exported (not local to this file) so ts-parser.ts's class-member-modifier list reuses the exact same terminal
+// object instead of letting its own bare `'export'` string auto-intern a second, non-contextual one.
+export const EXPORT_KW	= terminal('export', /export(?!\w)/, lex => /^\s*[(<:?;}!]/.test(lex.remaining) ? IDENT : EXPORT_KW);
 
 // Automatic Semicolon Insertion: reclassify a line-terminator-containing run of whitespace into a `;`
 // right after return/throw/break/continue/yield, or right before postfix ++/--.
@@ -1110,7 +1117,7 @@ export const export_declaration = Rules<Statement<any>>(
 
 export const module_item = Rules(
 	Rule(['import', import_declaration],		$ => $[1]),
-	Rule(['export', export_declaration],		$ => $[1]),
+	Rule([EXPORT_KW, export_declaration],		$ => $[1]),
 	statement,
 	// A bare `import(...)` *statement* (no assignment/await/chaining) specifically at module top level --
 	// a real LALR "missing transition" (confirmed via `tables.conflicts` being empty for the state reached
@@ -1121,7 +1128,7 @@ export const module_item = Rules(
 	// those items. Narrow fix, narrow gap: no further chaining support for a *bare* top-level `import(...)`
 	// statement specifically (real code overwhelmingly assigns/awaits/chains it, all of which already work).
 	Rule(['import', ()=>arguments_, ';'],		$ => ({ type: 'expression', expression: Call(Identifier('import'), $[1]) } as const)),
-	Rule([decorator_list, 'export', export_declaration], $ => {
+	Rule([decorator_list, EXPORT_KW, export_declaration], $ => {
 		const decl = $[2] as Export<any> | ExportDecl<any>;
 		if (decl.type === 'export_decl' && decl.declaration.type === 'class_decl')
 			return { ...decl, declaration: { ...decl.declaration, decorators: $[0] } };
