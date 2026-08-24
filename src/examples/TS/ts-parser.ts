@@ -156,6 +156,10 @@ const GLOBAL = terminal('global', /global(?!\w)/, lex => /^\s*\{/.test(lex.remai
 // `type` is only a keyword right before `type X = ...`, or a `{`/`*` (`import type {...}`/`import type * as ns`) -- checked against `lex.remaining`
 // directly, not `lex.next()`, since `next()` re-lexes using the current position's candidate-restricted terminal set (see js-parser.ts's `WS`).
 const TYPE = terminal('type', /type(?!\w)/, lex => /^\s*([$_\p{ID_Start}]|[{*])/u.test(lex.remaining) ? TYPE : IDENT);
+// `module` as a keyword is always followed by its name (a dotted path or a string), never anything else -- `module.exports`
+// (the real, extremely common Node/CommonJS global) needs the fallback or it collides the moment `module` is reachable
+// anywhere a statement is, not just at the top level (`if (!module.exports) ...` broke this way, real corpus regression).
+const MODULE = terminal('module', /module(?!\w)/, lex => /^\s*([$_\p{ID_Start}]|["'])/u.test(lex.remaining) ? MODULE : IDENT);
 
 
 // --- Generic calls: `foo<T>(...)` ---
@@ -516,8 +520,8 @@ const declared_body		= MaybeList(Forward<Declaration>(()=>declared_body_item));
 function namespaceOrModule(body: Rules<Declaration[]>) {
 	return Rules<MaybeAmbient>(
 		Rule(['namespace', dotted_path, '{', body, '}'],	$ => NamespaceDecl($[1], $[3])),
-		Rule(['module', dotted_path, '{', body, '}'],		$ => NamespaceDecl($[1], $[3])),
-		Rule(['module', STR, '{', body, '}'],		$ => ModuleDecl(unquoteString($[1]), $[3])),
+		Rule([MODULE, dotted_path, '{', body, '}'],		$ => NamespaceDecl($[1], $[3])),
+		Rule([MODULE, STR, '{', body, '}'],		$ => ModuleDecl(unquoteString($[1]), $[3])),
 	);
 }
 const real_namespace	= namespaceOrModule(namespace_body);
@@ -569,8 +573,8 @@ const declared_body_item = Rules<Declaration>(
 	// *real*-bodied `exportable_item`, only valid for a plain `export` at actual module top level.
 	Rule([EXPORT_KW, maybe_ambient],						$ => $[1] as Declaration),
 	Rule([EXPORT_KW, fake_ambient],							$ => $[1] as Declaration),
-	Rule(['module', dotted_path, '{', declared_body, '}'],	$ => NamespaceDecl($[1], $[3])),
-	Rule(['module', STR, ';'],							$ => ModuleDecl(unquoteString($[2]), [])),
+	Rule([MODULE, dotted_path, '{', declared_body, '}'],	$ => NamespaceDecl($[1], $[3])),
+	Rule([MODULE, STR, ';'],							$ => ModuleDecl(unquoteString($[2]), [])),
 	Rule([GLOBAL, '{', declared_body, '}'],				$ => ModuleDecl('global', $[2])),
 );
 
@@ -640,6 +644,11 @@ JS.import_declaration.push(
 	type_alias_declaration,
 	enum_declaration,
 	bodyless_function,
+	// `namespace`/`module` are syntactically legal anywhere a statement is (nested in a function, labeled, etc) --
+	// real TS only restricts them semantically (TS1235 "only allowed at the top level"), same permissive-parser/
+	// checker-flags-it split as item 49's class modifiers. Confirmed via the official corpus: `label: namespace N
+	// {}` compiles with zero diagnostics at the top level, and a function-nested one is a single soft TS1235.
+	real_namespace,
 );
 
 // ===================================================================
