@@ -36,13 +36,13 @@ async function compile(filein: string, fileout: string, wat = false) {
 		throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
 
 	// Real multi-file codegen: seed `TStoWasm` from every module the loader actually resolved (not just
-	// the entry file's own body), plus each module's own namespace-import bindings, so a real cross-file
-	// call (`NS.foo(...)`) resolves to the declaring file's own AST, not just its checked type. Only a
-	// plain top-level *function* declared in another module is supported this way today -- a cross-module
-	// class/scalar global, or a plain (non-namespace) `import { foo } from '...'`, still isn't; either
-	// throws a clear, specific error from `TStoWasm` rather than miscompiling.
-	const { modules, namespaceImports } = await collectModules(program.body, loader);
-	const mod		= TStoWasm(program, modules, namespaceImports);
+	// the entry file's own body), plus each module's own namespace-import and named-import bindings, so a
+	// real cross-file call (`NS.foo(...)` or a plain `foo(...)` imported via `import { foo } from '...'`)
+	// resolves to the declaring file's own AST, not just its checked type. Only a plain top-level
+	// *function* declared in another module is supported this way today -- a cross-module class/scalar
+	// global still isn't; that throws a clear, specific error from `TStoWasm` rather than miscompiling.
+	const { modules, namespaceImports, namedImports } = await collectModules(program.body, loader);
+	const mod		= TStoWasm(program, modules, namespaceImports, namedImports);
 	if (wat)
 		console.log(mod.toWAT({expandTypes: true, hexFloats: false}));
 

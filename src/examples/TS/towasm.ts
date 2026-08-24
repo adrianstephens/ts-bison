@@ -1292,16 +1292,18 @@ export function makeLibScope(): Scope {
 }
 
 // `modules`: every other loaded module (canonical path -> its own top-level statements) reachable from
-// `ast` -- built by the caller (see `tsw.ts`'s `collectModules`) via the same `ModuleLoader` the checking
-// pass already resolved against, since `TStoWasm` has no loader of its own and no async boundary to load
-// one lazily. `namespaceImports`: for each module (by canonical path, keyed the same way), its own
+// `ast` -- built by the caller (see `module-loader.ts`'s `collectModules`) via the same `ModuleLoader` the
+// checking pass already resolved against, since `TStoWasm` has no loader of its own and no async boundary
+// to load one lazily. `namespaceImports`: for each module (by canonical path, keyed the same way), its own
 // `import * as X from '...'` local bindings, each mapped to the target module's canonical path -- lets a
 // namespace-qualified call (`X.foo(...)`) resolve `foo` against the right module's own declarations
-// instead of the calling module's. Only top-level *functions* are seeded across modules this way today --
-// a cross-module class/global reference is still unsupported (throws a clear, unrelated error), and a
-// plain (non-namespace) `import { foo } from '...'` is resolved by the checker for type purposes but not
-// by codegen at all yet -- both real, separate, not-yet-attempted follow-on work.
-export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>, namespaceImports?: Map<string, Map<string, string>>): wasm.WasmModule {
+// instead of the calling module's. `namedImports`: the same, for a plain `import { foo } from '...'` (or
+// `import { foo as bar } from '...'`) -- the *local* name maps to `{module, name}`, the target module's own
+// canonical path plus the name it's actually declared under there (which may differ from the local alias).
+// Only top-level *functions* are seeded/resolved across modules this way today -- a cross-module class or
+// scalar global reference is still unsupported (throws a clear, unrelated error), a real, separate,
+// not-yet-attempted follow-on.
+export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>, namespaceImports?: Map<string, Map<string, string>>, namedImports?: Map<string, Map<string, { module: string; name: string }>>): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new Error('towasm: ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
@@ -1332,6 +1334,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// different files never collides in this (or `funcs`') shared cache.
 	const moduleBodies			= new Map<string, TS.Statement[]>([['.', ast.body], ...(modules ?? [])]);
 	const namespaceImportsByModule = namespaceImports ?? new Map<string, Map<string, string>>();
+	const namedImportsByModule = namedImports ?? new Map<string, Map<string, { module: string; name: string }>>();
 
 	function homeKey(homeModule: string, name: string) {
 		return homeModule === '.' ? name : homeModule + '\0' + name;
@@ -1345,7 +1348,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// function or a real wasm global, both always reachable from anywhere via the same ordinary
 	// `case 'identifier'` fallback chain, regardless of lexical nesting.
 	function resolvesGlobally(homeModule: string, name: string): boolean {
-		return globals.has(name) || LIB_DECL_MAP.get(name)?.type === 'var_decl' || !!resolveDecl(homeModule, name);
+		return globals.has(name) || LIB_DECL_MAP.get(name)?.type === 'var_decl' || !!resolveDecl(homeModule, name)
+			|| !!namedImportsByModule.get(homeModule)?.has(name);
 	}
 
 	const worklist:			(()=>void)[] = [];
@@ -2379,8 +2383,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		} else {
 			decl = functionDeclByName.get(homeKey(homeModule, name));
 			// A pre-seeded host import (`LIB_HOST_IMPORTS`) has no `FunctionDecl` to compile a body from -- a missing `decl` is only a real error when `funcs` doesn't already know the name either.
-			if (!decl && !funcs.has(name))
+			if (!decl && !funcs.has(name)) {
+				// `name` may be a plain (non-namespace) `import { foo } from '...'` binding local to
+				// `homeModule` -- resolve it to the declaring module and retry there, same idea as a
+				// namespace-qualified call site's own `nsTarget` redirect (`case 'call'`'s member-callee
+				// branch), just reached via a bare identifier instead of `NS.foo(...)`.
+				const imported = namedImportsByModule.get(homeModule)?.get(name);
+				if (imported && functionDeclByName.has(homeKey(imported.module, imported.name)))
+					return emitCall(imported.name, args, ctx, typeArgs, expected, imported.module);
 				throw new Error(`towasm: call to unknown function '${name}'`);
+			}
 		}
 
 		const info = decl?.typeParams?.length
@@ -3062,9 +3074,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 				// A plain named function read as a value (passed as a callback, assigned, returned, ...)
 				// rather than called directly by name -- see `ensureFunctionValueWrapper`'s own comment.
-				const fnDecl = resolveDecl(ctx.homeModule, name);
+				// `imported`: same idea as `emitCall`'s own named-import redirect -- `name` may be a plain
+				// `import { foo } from '...'` binding local to `ctx.homeModule` rather than a real
+				// declaration of its own.
+				let fnDecl = resolveDecl(ctx.homeModule, name);
+				let fnName = name, fnModule = ctx.homeModule;
+				if (!fnDecl) {
+					const imported = namedImportsByModule.get(ctx.homeModule)?.get(name);
+					if (imported) {
+						fnDecl = functionDeclByName.get(homeKey(imported.module, imported.name));
+						fnName = imported.name;
+						fnModule = imported.module;
+					}
+				}
 				if (fnDecl && fnDecl.type === 'function_decl' && fnDecl.body) {
-					const { info, structTypeIndex } = ensureFunctionValueWrapper(name, fnDecl, ctx.homeModule);
+					const { info, structTypeIndex } = ensureFunctionValueWrapper(fnName, fnDecl, fnModule);
 					ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
 					return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
 				}

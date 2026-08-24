@@ -73,8 +73,8 @@ async function compileMulti(files: Record<string, string>, entry: string) {
 		if (errors.length)
 			throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
 
-		const { modules, namespaceImports } = await collectModules(program.body, loader);
-		const mod = TStoWasm(program, modules, namespaceImports);
+		const { modules, namespaceImports, namedImports } = await collectModules(program.body, loader);
+		const mod = TStoWasm(program, modules, namespaceImports, namedImports);
 		console.log(mod.toWAT({expandTypes: true, hexFloats: false}));
 		return instantiate(mod.toBytes());
 	} finally {
@@ -4268,6 +4268,51 @@ async function main() {
 			`,
 		}, 'mainFile');
 		check('multi-file: a closure nested inside a cross-module function resolves its own module\'s names', main(), 15);
+	}
+
+	{
+		// A plain (non-namespace) `import { helper } from './helperFile'; helper(...)` -- the same
+		// underlying problem `import * as H` had before real multi-file codegen landed (a local binding
+		// with no AST body of its own to compile against), just reached via `s.specifiers` instead of
+		// `s.namespace`.
+		const { main } = await compileMulti({
+			helperFile: `
+				export function helper(a: number, b: number): number {
+					return a + b * 2;
+				}
+			`,
+			mainFile: `
+				import { helper } from './helperFile';
+				export function main(): number {
+					return helper(3, 4);
+				}
+			`,
+		}, 'mainFile');
+		check('multi-file: a plain named import resolves a direct call to the declaring module', main(), 11);
+	}
+
+	{
+		// An aliased named import (`import { helper as h }`) used as a *value* (passed to a higher-order
+		// function), not called directly -- exercises the identifier-fallback path (`ensureFunctionValueWrapper`)
+		// separately from `emitCall`'s own direct-call path above; the local alias `h` must resolve to the
+		// declaring module's real `helper`, under its real (not aliased) name.
+		const { main } = await compileMulti({
+			helperFile: `
+				export function helper(a: number, b: number): number {
+					return a + b * 2;
+				}
+			`,
+			mainFile: `
+				import { helper as h } from './helperFile';
+				function applyIt(f: (a: number, b: number) => number): number {
+					return f(3, 4);
+				}
+				export function main(): number {
+					return applyIt(h);
+				}
+			`,
+		}, 'mainFile');
+		check('multi-file: an aliased named import used as a value resolves to the declaring module', main(), 11);
 	}
 
 	{
