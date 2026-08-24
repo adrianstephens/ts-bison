@@ -5304,7 +5304,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		if (resolved.members.some(m => m.type === 'index'))
 			return undefined;
 
-		const fields: { name: string; wtype: WasmType }[] = [];
+		const fields: { name: string; wtype: WasmType; optional?: boolean }[] = [];
 		const fieldIndex = new Map<string, number>();
 		for (const m of resolved.members) {
 			if (m.type !== 'property')
