@@ -1,10 +1,12 @@
 import assert from 'assert';
 import fs from 'fs/promises';
+import os from 'os';
 import path from 'path';
 import v8 from 'v8';
 import * as TS from '../src/examples/TS/ts-parser';
 import { TStoWasm, makeLibScope } from '../src/examples/TS/towasm';
-import { TStypeCheck } from '../src/examples/TS/transform';
+import { TStypeCheck, TStypeCheckAsync, FixOptions } from '../src/examples/TS/transform';
+import { ModuleLoader, collectModules } from '../src/examples/TS/module-loader';
 import { SEVERITY } from '../src/examples/TS/checker';
 
 // `try`/`catch` compiles to the exnref/try_table exception-handling proposal (Wasm 3.0), which
@@ -41,6 +43,35 @@ async function compile(src: string) {
 	const mod		= TStoWasm(program);
 	console.log(mod.toWAT({expandTypes: true, hexFloats: false}));
 	return instantiate(mod.toBytes());
+}
+
+// Real multi-file codegen (`TStoWasm`'s `modules`/`namespaceImports` params) needs a real `ModuleLoader`
+// resolving real files -- an in-memory `parser.parse(src)` string, unlike `compile()` above, has no file
+// system location for a relative `import` to resolve against. `files`: every module's own source, keyed
+// by its filename (no `.ts` extension) relative to a fresh temp directory; `entry` names which one is the
+// program entry point.
+async function compileMulti(files: Record<string, string>, entry: string) {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'towasm-multi-'));
+	try {
+		for (const [name, src] of Object.entries(files))
+			await fs.writeFile(path.join(dir, name + '.ts'), src);
+
+		const options		= FixOptions({ target: 'es2022' });
+		const loader		= new ModuleLoader(dir, options);
+		const entrySrc		= await fs.readFile(path.join(dir, entry + '.ts'), 'utf8');
+		const program		= parser.parse(entrySrc);
+		const diagnostics	= await TStypeCheckAsync(program, loader, options, libScope);
+		const errors		= diagnostics.filter(d => d.severity === SEVERITY.ERROR);
+		if (errors.length)
+			throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
+
+		const { modules, namespaceImports } = await collectModules(program.body, loader);
+		const mod = TStoWasm(program, modules, namespaceImports);
+		console.log(mod.toWAT({expandTypes: true, hexFloats: false}));
+		return instantiate(mod.toBytes());
+	} finally {
+		await fs.rm(dir, {recursive: true, force: true});
+	}
 }
 
 async function instantiate(bytes: Uint8Array) {
@@ -4111,6 +4142,79 @@ async function main() {
 			i += size;
 		}
 		check("no 'func' type shares a multi-member rec group", anyFuncInMultiMemberGroup, false);
+	}
+
+	{
+		// Real multi-file codegen: `import * as H from './helperFile'; H.helper(...)` -- `TStoWasm`'s own
+		// `collectNames` used to only ever walk the single entry `Program`'s own top-level statements, so
+		// a namespace-import-qualified call to another module's function had no AST body to compile against
+		// (the checker resolves its *type* fine via `ModuleLoader`, but codegen needs the callee's real
+		// declaration). `modules`/`namespaceImports` (built by `collectModules`, the same loader-driven walk
+		// `tsw.ts`'s own CLI uses) close that gap for a plain top-level function.
+		const { main } = await compileMulti({
+			helperFile: `
+				export function helper(a: number, b: number): number {
+					return a + b * 2;
+				}
+			`,
+			mainFile: `
+				import * as H from './helperFile';
+				export function main(): number {
+					return H.helper(3, 4);
+				}
+			`,
+		}, 'mainFile');
+		check('multi-file: a namespace-import-qualified call resolves to the declaring module', main(), 11);
+	}
+
+	{
+		// A function in a non-entry module calling a *sibling* function declared in the same module by its
+		// own bare (unqualified) name -- must resolve within that module's own top level, not the entry's,
+		// even though both modules happen to declare a function under the same name (`helper`).
+		const { main } = await compileMulti({
+			helperFile: `
+				function helper(a: number, b: number): number {
+					return a * 10 + b;
+				}
+				export function callHelper(x: number): number {
+					return helper(x, 1);
+				}
+			`,
+			mainFile: `
+				import * as H from './helperFile';
+				function helper(): number {
+					return -1;
+				}
+				export function main(): number {
+					return H.callHelper(5) + helper();
+				}
+			`,
+		}, 'mainFile');
+		check('multi-file: a same-named sibling function resolves within its own declaring module', main(), 50);
+	}
+
+	{
+		// A closure declared *inside* a cross-module function inherits that function's own module context
+		// -- a free variable that's really a same-module top-level function must still resolve correctly
+		// from inside the nested closure, not just the enclosing function's own body.
+		const { main } = await compileMulti({
+			helperFile: `
+				function double(n: number): number {
+					return n * 2;
+				}
+				export function applyTwice(x: number): number {
+					const step = (n: number) => double(n) + 1;
+					return step(step(x));
+				}
+			`,
+			mainFile: `
+				import * as H from './helperFile';
+				export function main(): number {
+					return H.applyTwice(3);
+				}
+			`,
+		}, 'mainFile');
+		check('multi-file: a closure nested inside a cross-module function resolves its own module\'s names', main(), 15);
 	}
 
 	{

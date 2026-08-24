@@ -291,3 +291,41 @@ export class ModuleLoader {
 		return await this.imported.get(resolved);
 	}
 }
+
+// Walks every `import` statement reachable from `entryBody` (via the given, already-warm `loader` --
+// typically the very same instance a preceding `TStypeCheckAsync` call resolved against), collecting
+// every other module's own body (keyed by its `LoadedModule.canonical`, entry excluded -- callers
+// conventionally treat `'.'` as the entry itself) plus, per module, its own `import * as X from '...'`
+// local bindings mapped to the target module's canonical path. `TStoWasm` (towasm.ts) needs both to seed/
+// resolve a real cross-file call for codegen -- the checker's own `Scope` only ever carries *types*,
+// never a callee's actual AST body to compile. Only plain `import` is walked (matching every real import
+// in this monorepo's own self-hosting target files) -- a re-exporting `export ... from` isn't resolved
+// here, a real, narrower, separate gap if one is ever found in practice.
+export async function collectModules(entryBody: TS.Statement[], loader: ModuleLoader) {
+	const modules = new Map<string, TS.Statement[]>();
+	const namespaceImports = new Map<string, Map<string, string>>();
+	const seen = new Set<string>(['.']);
+
+	async function walk(canonical: string, body: TS.Statement[]) {
+		for (const s of body) {
+			if (s.type !== 'import')
+				continue;
+			const target = await loader.get(s.source, canonical);
+			if (!target)
+				continue;
+			if (s.namespace) {
+				let bindings = namespaceImports.get(canonical);
+				if (!bindings)
+					namespaceImports.set(canonical, bindings = new Map());
+				bindings.set(s.namespace, target.canonical);
+			}
+			if (!seen.has(target.canonical)) {
+				seen.add(target.canonical);
+				modules.set(target.canonical, target.body);
+				await walk(target.canonical, target.body);
+			}
+		}
+	}
+	await walk('.', entryBody);
+	return { modules, namespaceImports };
+}

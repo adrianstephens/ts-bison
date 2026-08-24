@@ -342,7 +342,10 @@ interface MethodOwner {
 }
 
 interface ClassInfo extends MethodOwner {
-	fields:			{ name: string; wtype: WasmType }[];
+	// `optional`: only ever set for an object-shape's own `key?: T` member (`ensureObjectShape`) -- a real
+	// class field is never itself optional (TS requires either a declared initializer or assignment in
+	// every constructor path), so every other `fields` producer leaves this `undefined`/falsy.
+	fields:			{ name: string; wtype: WasmType; optional?: boolean }[];
 	fieldIndex:		Map<string, number>;
 	// This class's own real physical `this`-type -- `{ref: name}` for an ordinary struct, or whatever its constructor's own `return` compiles to (`ensureCtor`) -- never guessed from the name.
 	// `undefined` only while that constructor is still being compiled (`ownerThisType` falls back to `{ref: name}` then, safe since only a static method's own unused this-type can be in flight).
@@ -442,7 +445,10 @@ class FunctionContext {
 	// that case. See `ReturnHandler`'s own comment for who sets this and why.
 	finallyGuards:		FinallyGuard[] = [];
 
-	constructor(public name: string, public scope: Scope, public onReturn: ReturnHandler, public owner?: ClassInfo) {}
+	// Which loaded module (canonical path, `'.'` for the entry program) this function's own top-level
+	// declarations live in -- an unqualified identifier inside its body resolves against *that* module's
+	// own declarations, never another module's, even a same-named one. See `homeKey`/`resolveDecl`.
+	constructor(public name: string, public scope: Scope, public onReturn: ReturnHandler, public owner?: ClassInfo, public homeModule = '.') {}
 
 	lookup(name: string): Local | undefined {
 		for (let i = this.declared.length - 1; i >= 0; i--) {
@@ -1047,6 +1053,10 @@ const builtinTypes: Record<string, { wtype: WasmType; class?: string }> = {
 	// No `class` -- `any` has no single owner to dispatch a method call against (`ensureAnyDispatch` handles
 	// that dynamically); this entry only gives a genuinely `any`-typed local/param/field a real `WasmType` (`REF_ANY`) so it doesn't fail to compile the moment it's declared.
 	any:		{ wtype: REF_ANY },
+	// `unknown` has no dedicated physical representation of its own -- same boxed storage as `any` (the
+	// checker's own `T.isAny` already treats the two alike), just without `any`'s implicit-assignability
+	// laxness on the *checking* side, which doesn't affect codegen at all.
+	unknown:	{ wtype: REF_ANY },
 	boolean:	{ wtype: 'i32', 			class: 'Boolean' },
 	Boolean:	{ wtype: 'i32', 			class: 'Boolean' },
 	number:		{ wtype: 'f64', 			class: 'Number' },
@@ -1281,7 +1291,17 @@ export function makeLibScope(): Scope {
 	return libScope;
 }
 
-export function TStoWasm(ast: TS.Program): wasm.WasmModule {
+// `modules`: every other loaded module (canonical path -> its own top-level statements) reachable from
+// `ast` -- built by the caller (see `tsw.ts`'s `collectModules`) via the same `ModuleLoader` the checking
+// pass already resolved against, since `TStoWasm` has no loader of its own and no async boundary to load
+// one lazily. `namespaceImports`: for each module (by canonical path, keyed the same way), its own
+// `import * as X from '...'` local bindings, each mapped to the target module's canonical path -- lets a
+// namespace-qualified call (`X.foo(...)`) resolve `foo` against the right module's own declarations
+// instead of the calling module's. Only top-level *functions* are seeded across modules this way today --
+// a cross-module class/global reference is still unsupported (throws a clear, unrelated error), and a
+// plain (non-namespace) `import { foo } from '...'` is resolved by the checker for type purposes but not
+// by codegen at all yet -- both real, separate, not-yet-attempted follow-on work.
+export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>, namespaceImports?: Map<string, Map<string, string>>): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new Error('towasm: ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
@@ -1304,6 +1324,29 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	const funcs				= new Map<string, FuncInfo>();
 	const functionDeclByName = new Map<string, FunctionDecl>();
 	let nextFunc			= 0;
+
+	// Every module reachable from `ast`, entry included under the same `'.'` canonical `TStypeCheckAsync`'s
+	// own `entrySrc` uses -- `functionDeclByName`'s own keys stay bare (unmangled) for the entry module
+	// (zero behavior change from before multi-file support existed); a non-entry module's top-level
+	// functions are stored under `homeKey(canonical, name)` instead, so a same-named function in two
+	// different files never collides in this (or `funcs`') shared cache.
+	const moduleBodies			= new Map<string, TS.Statement[]>([['.', ast.body], ...(modules ?? [])]);
+	const namespaceImportsByModule = namespaceImports ?? new Map<string, Map<string, string>>();
+
+	function homeKey(homeModule: string, name: string) {
+		return homeModule === '.' ? name : homeModule + '\0' + name;
+	}
+	// The one place an unqualified (or namespace-resolved) name turns into a `FunctionDecl` -- a lib
+	// declaration is always homeModule-independent, checked only after the calling module's own.
+	function resolveDecl(homeModule: string, name: string) {
+		return functionDeclByName.get(homeKey(homeModule, name)) ?? LIB_DECL_MAP.get(name);
+	}
+	// True for a name that resolves without ever needing a closure capture slot -- a plain top-level
+	// function or a real wasm global, both always reachable from anywhere via the same ordinary
+	// `case 'identifier'` fallback chain, regardless of lexical nesting.
+	function resolvesGlobally(homeModule: string, name: string): boolean {
+		return globals.has(name) || LIB_DECL_MAP.get(name)?.type === 'var_decl' || !!resolveDecl(homeModule, name);
+	}
 
 	const worklist:			(()=>void)[] = [];
 	const lateWorklist: 	(()=>void)[] = [];
@@ -2316,7 +2359,11 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// `typeArgs`: only ever meaningful for a plain user-declared generic function (`builtins` entries and
 	// host imports are never generic) -- an explicit `identity<number>(5)` call-site type argument list, or
 	// `undefined` when left implicit (the common case, inferred by `ensureGenericFunc`).
-	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Type): WasmType {
+	// `homeModule`: which module's own `functionDeclByName` bucket an unqualified `name` resolves against
+	// -- defaults to the calling function's own (`ctx.homeModule`); a namespace-qualified call site
+	// (`NS.foo(...)`) passes the *target* module explicitly instead, so `foo` resolves against the
+	// declaring file's own top level, not the caller's.
+	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Type, homeModule: string = ctx.homeModule): WasmType {
 		let decl;
 		const builtin = builtins[name];
 		if (builtin) {
@@ -2330,15 +2377,15 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 			decl = result;
 		} else {
-			decl = functionDeclByName.get(name);
+			decl = functionDeclByName.get(homeKey(homeModule, name));
 			// A pre-seeded host import (`LIB_HOST_IMPORTS`) has no `FunctionDecl` to compile a body from -- a missing `decl` is only a real error when `funcs` doesn't already know the name either.
 			if (!decl && !funcs.has(name))
 				throw new Error(`towasm: call to unknown function '${name}'`);
 		}
 
 		const info = decl?.typeParams?.length
-			? ensureGenericFunc(name, decl, args, typeArgs, ctx.scope, expected)
-			: ensureFunc(name, decl!);
+			? ensureGenericFunc(name, decl, args, typeArgs, ctx.scope, expected, homeModule)
+			: ensureFunc(name, decl!, homeModule);
 		if (!info)
 			throw new Error(`towasm: call to unknown function '${name}'`);
 		emitCallArgs(name, info.params, info.defaults, !!info.hasRest, args, ctx);
@@ -2706,14 +2753,17 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			throw new Error("towasm: 'this' inside a function expression is not supported -- only an arrow function's lexical 'this' is");
 
 		for (const name of free) {
-			if (!ctx.resolvesName(name))
+			if (!ctx.resolvesName(name) && !resolvesGlobally(ctx.homeModule, name))
 				throw new Error(`towasm: unresolved identifier '${name}'`);
 		}
 
 		// This literal's own concrete env struct type -- zero captures just reuses `$envBase`
-		// directly (no distinct type, no cast needed in the compiled body either).
+		// directly (no distinct type, no cast needed in the compiled body either). A free name that's
+		// globally resolvable (a top-level function, or a real wasm global) needs no capture slot at all
+		// -- the compiled body's own ordinary `case 'identifier'` fallback reaches it directly, same as
+		// from any other function's body, regardless of this closure's own lexical nesting.
 		const envBase		= ensureEnvBase();
-		const capturedNames = [...free];
+		const capturedNames = [...free].filter(name => ctx.resolvesName(name));
 		const fields		= capturedNames.length ? new Map<string, { index: number; wtype: WasmType }>() : undefined;
 		let envTypeIndex	= envBase;
 		if (fields) {
@@ -2731,7 +2781,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		closureLiterals.push(info);
 
 		worklist.push(() => {
-			const fnCtx		= new FunctionContext(e.name ?? '<anonymous>', new Scope(libGlobal), plainReturn(result), undefined);
+			const fnCtx		= new FunctionContext(e.name ?? '<anonymous>', new Scope(libGlobal), plainReturn(result), undefined, ctx.homeModule);
 			// Env param first (real wasm param index 0), then this literal's own params -- `toFuncBody`'s `numParams` assumes the first `1 + params.length` declared locals are the real wasm params, in order.
 			const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
 			const pending	= fnCtx.declareParams(params);
@@ -2779,13 +2829,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// zero-capture trampoline per function name instead: same shape `emitClosureLiteral`'s own
 	// zero-capture case builds (`env` ignored, `envBase` reused directly, no distinct env type), just
 	// forwarding straight through to the real, already-compiled (or newly compiled here) function.
-	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl): { info: FuncInfo; structTypeIndex: number } {
-		const existing = functionValueWrappers.get(name);
+	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl, homeModule = '.'): { info: FuncInfo; structTypeIndex: number } {
+		const key = homeKey(homeModule, name);
+		const existing = functionValueWrappers.get(key);
 		if (existing) {
 			const { structTypeIndex } = ensureClosureType({ params: existing.params, result: existing.result, hasRest: existing.hasRest });
 			return { info: existing, structTypeIndex };
 		}
-		const target = funcs.get(name) ?? compileFunc(name, decl);
+		const target = funcs.get(key) ?? compileFunc(name, decl, homeModule);
 		if (!target)
 			throw new Error(`towasm: '${name}' can't be used as a value`);
 
@@ -2794,7 +2845,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const { funcIndex, typeIndex } = registerFuncAtType(funcTypeIndex);
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex, defaults: target.defaults };
 		closureLiterals.push(info);
-		functionValueWrappers.set(name, info);
+		functionValueWrappers.set(key, info);
 
 		worklist.push(() => {
 			const wctx		= new FunctionContext(`<fnvalue>.${name}`.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(target.result), undefined);
@@ -3011,9 +3062,9 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 				// A plain named function read as a value (passed as a callback, assigned, returned, ...)
 				// rather than called directly by name -- see `ensureFunctionValueWrapper`'s own comment.
-				const fnDecl = functionDeclByName.get(name) ?? LIB_DECL_MAP.get(name);
+				const fnDecl = resolveDecl(ctx.homeModule, name);
 				if (fnDecl && fnDecl.type === 'function_decl' && fnDecl.body) {
-					const { info, structTypeIndex } = ensureFunctionValueWrapper(name, fnDecl);
+					const { info, structTypeIndex } = ensureFunctionValueWrapper(name, fnDecl, ctx.homeModule);
 					ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
 					return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
 				}
@@ -3258,10 +3309,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				}
 				for (const f of owner.fields) {
 					const propValue = byKey.get(f.name);
-					if (!propValue)
-						throw new Error(`towasm: object literal for '${owner.name}' is missing property '${f.name}'`);
-					emitAs(propValue, ctx, f.wtype);
-					byKey.delete(f.name);
+					if (!propValue) {
+						if (!f.optional)
+							throw new Error(`towasm: object literal for '${owner.name}' is missing property '${f.name}'`);
+						emitDefaultValue(f.wtype, ctx);
+					} else {
+						emitAs(propValue, ctx, f.wtype);
+						byKey.delete(f.name);
+					}
 				}
 				if (byKey.size)
 					throw new Error(`towasm: object literal for '${owner.name}' has unknown propert${byKey.size > 1 ? 'ies' : 'y'} '${[...byKey.keys()].join("', '")}'`);
@@ -3743,6 +3798,18 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						// method), checked before the generic paths below.
 						if (obj.name === 'Object' && e.callee.property === 'entries')
 							return emitObjectEntries(e.arguments, ctx);
+						// A namespace-import-qualified call (`NS.foo(...)`, `import * as NS from '...'`) into
+						// another module -- checked before `namespaceOwner`, which only knows about real classes/
+						// lib namespaces (`Math`, `Array`), never an actual cross-file import; only takes this
+						// path when the target module really does declare `foo` as a plain function, so an
+						// unsupported cross-module reference (a class, a scalar global, a host-module member like
+						// `path.join`) still falls through to the ordinary paths below and their own clear errors.
+						// `functionDeclByName` directly, not `resolveDecl` -- a namespace-qualified reference must
+						// only ever match what the *target module itself* actually declares, never spuriously
+						// fall back to an unrelated same-named `LIB_DECL_MAP` global.
+						const nsTarget = namespaceImportsByModule.get(ctx.homeModule)?.get(obj.name);
+						if (nsTarget !== undefined && functionDeclByName.has(homeKey(nsTarget, e.callee.property)))
+							return emitCall(e.callee.property, e.arguments, ctx, typeArgs, undefined, nsTarget);
 						const owner = namespaceOwner(obj.name, ctx);
 						if (owner)
 							return emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
@@ -4613,8 +4680,8 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return map;
 	}
 
-	function ensureFunc(name: string, decl: FunctionDecl): FuncInfo {
-		return funcs.get(name) ?? compileFunc(name, decl)!;
+	function ensureFunc(name: string, decl: FunctionDecl, homeModule = '.'): FuncInfo {
+		return funcs.get(homeKey(homeModule, name)) ?? compileFunc(name, decl, homeModule)!;
 	}
 
 	// Resolves a generic top-level function call to its monomorphized `FuncInfo`, cached under the same
@@ -4622,24 +4689,26 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// difference from a class reference: a function's type arguments are usually left implicit at the call
 	// site, inferred from the arguments (`inferTypeArgMap`, above). Explicit call-site type args
 	// (`identity<number>(5)`) are honored too, same as a class's are.
-	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Type): FuncInfo {
+	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Type, homeModule = '.'): FuncInfo {
 		const typeParams	= decl.typeParams!;
 		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, scope, expected, decl.returnType as Type | undefined);
+		// Bare (unmangled) composite key -- `compileFunc` applies `homeKey` itself when it caches, so this
+		// must match without a second wrapping here.
 		const key			= genericKey(name, typeParams, map, global);
-		return funcs.get(key) ?? compileFunc(key, { ...substituteTypeParams(decl, map), typeParams: undefined })!;
+		return funcs.get(homeKey(homeModule, key)) ?? compileFunc(key, { ...substituteTypeParams(decl, map), typeParams: undefined }, homeModule)!;
 	}
 
-	function compileFunc(name: string, decl: FunctionDecl): FuncInfo | undefined {
+	function compileFunc(name: string, decl: FunctionDecl, homeModule = '.'): FuncInfo | undefined {
 		if (hasMod(decl, 'async')) {
 			try {
-				return compileAsyncFunc(name, decl);
+				return compileAsyncFunc(name, decl, homeModule);
 			} catch (e) {
 				throw new Error(`towasm: async ${e}`);
 			}
 		}
 		if (hasMod(decl, 'generator')) {
 			try {
-				return compileGeneratorFunc(name, decl);
+				return compileGeneratorFunc(name, decl, homeModule);
 			} catch (e) {
 				throw new Error(`towasm: generator ${e}`);
 			}
@@ -4656,12 +4725,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const params	= decl.params.map(p => resolveParam(p));
 		if (decl.rest?.typeAnnotation)
 			params.push({key: decl.rest.key, wtype: typeOf(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
-		
+
 		const {funcIndex, typeIndex} = registerFunc(toParams2(params), toResults(result));
 		const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), hasRest: !!decl.rest?.typeAnnotation};
-		funcs.set(name, info);
+		funcs.set(homeKey(homeModule, name), info);
 		worklist.push(() => {
-			const ctx	= new FunctionContext(name, new Scope(libGlobal), plainReturn(result), undefined);
+			const ctx	= new FunctionContext(name, new Scope(libGlobal), plainReturn(result), undefined, homeModule);
 			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
@@ -4727,7 +4796,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// <Y,R>` (`lib/generator.ts`) are ordinary generic lib classes -- `.next()` calling the closure-
 	// typed `step` field is `emitMethodCall`'s new closure-through-a-field path, not anything generator-
 	// specific.
-	function compileGeneratorFunc(name: string, decl: FunctionDecl): FuncInfo {
+	function compileGeneratorFunc(name: string, decl: FunctionDecl, homeModule = '.'): FuncInfo {
 		if (decl.typeParams?.length)
 			throw new Error(`towasm: generic generator function '${name}' is not supported`);
 		const params = resolveResumableParams(decl);
@@ -4795,7 +4864,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			closureLiterals.push(stepInfo);
 
 			worklist.push(() => {
-				const fnCtx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(resultWtype), undefined);
+				const fnCtx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(resultWtype), undefined, homeModule);
 				// Param order must match `ensureClosureType`'s real wasm signature exactly (env, then `sig.params`)
 				// -- the cast-down frame local is declared *after* both real params, as one more genuine local, same as an ordinary closure literal's own `#env` (`emitClosureLiteral`).
 				const envParam		= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
@@ -4929,7 +4998,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// `await`-site trampoline below -- always call its own real `funcIndex` directly), so the frame is
 	// simply its first real param, no `envBase`/`ref.cast` indirection needed the way a generator's own
 	// step function requires (matching `ensureClosureType`'s generic env-first convention).
-	function compileAsyncFunc(name: string, decl: FunctionDecl): FuncInfo {
+	function compileAsyncFunc(name: string, decl: FunctionDecl, homeModule = '.'): FuncInfo {
 		if (decl.typeParams?.length)
 			throw new Error(`generic function '${name}' is not supported`);
 		const params = resolveResumableParams(decl);
@@ -4971,7 +5040,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		closureLiterals.push(stepInfo);
 
 		worklist.push(() => {
-			const fnCtx			= new FunctionContext(name, new Scope(libGlobal), plainReturn());
+			const fnCtx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(), undefined, homeModule);
 			const frameLocal	= fnCtx.declareLocal('#frame', { typeIndex: frameTypeIndex, nullable: false });
 			const sentParam		= fnCtx.declareLocal('#sent', REF_ANY);
 			fnCtx.closureEnv	= { envLocal: frameLocal, envTypeIndex: frameTypeIndex, fields: localFields };
@@ -5249,7 +5318,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			if (!wt)
 				throw new Error(`towasm: object-shape type '${name}.${m.key}' needs an explicit number/boolean/object type`);
 			fieldIndex.set(m.key, fields.length);
-			fields.push({ name: m.key, wtype: wt });
+			fields.push({ name: m.key, wtype: wt, optional: hasMod(m, 'optional') });
 		}
 
 		const info: ClassInfo = {
@@ -6027,54 +6096,61 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 
 	const promotedConsts = new Set<string>();
 
-	// Seed with every exported (real, user-level top-level) function and reserve every class name eagerly
-	for (let s of ast.body) {
-		if (s.type === 'export_decl')
-			s = s.declaration;
-		if (s.type === 'function_decl' && s.body) {
-			functionDeclByName.set(s.name, s);
-		} else if (s.type === 'class_decl') {
-			if (s.typeParams?.length) {
-				userGenericClassDecls.set(s.name, s);
-			} else {
-				classes.set(s.name, {
-					name: 		s.name,
-					typeIndex:	-1,
-					thisTsType:	TS.RefType(s.name),
-					decl:		s,
-					fields: 	[],
-					fieldIndex: new Map(),
-					methodDecls: new Map(),
-				});
-			}
-		} else if (s.type === 'var_decl' && s.kind !== 'var') {
-			for (const d of s.declarations) {
-				if (typeof d.name !== 'string' || !d.init)
-					continue;
-				if (s.kind === 'const' && (d.init.type === 'arrow' || d.init.type === 'function')) {
-					functionDeclByName.set(d.name, arrowOrFunctionToDecl(d.name, d.init));
-					promotedConsts.add(d.name);
+	// Seed with every exported (real, user-level top-level) function and reserve every class name eagerly.
+	// Only *functions* are seeded across every module this way -- a non-entry module's own classes/scalar
+	// globals aren't yet given the module-scoped treatment `ensureClass`/`ensureGlobal` would need (see
+	// `TStoWasm`'s own header comment), so `class_decl`/scalar `var_decl` promotion below stays entry-only,
+	// exactly as before multi-file support existed.
+	for (const [moduleId, body] of moduleBodies) {
+		for (let s of body) {
+			if (s.type === 'export_decl')
+				s = s.declaration;
+			if (s.type === 'function_decl' && s.body) {
+				functionDeclByName.set(homeKey(moduleId, s.name), s);
+			} else if (moduleId === '.' && s.type === 'class_decl') {
+				if (s.typeParams?.length) {
+					userGenericClassDecls.set(s.name, s);
 				} else {
-					// `foldConstants` first -- `-1`/`!true`/etc. parse as a real `unary`/`binary` node, not
-					// a bare `literal` one, so checking `d.init.type === 'literal'` directly missed every
-					// negative-literal (or other foldable) initializer, silently leaving that global
-					// unregistered (confirmed the hard way: any function referencing it then threw
-					// "unresolved identifier", unrelated to whatever else that function was doing). Reusing
-					// `foldConstants` here matches `case 'switch'`'s own linear-jump-table detection, the
-					// file's existing "is this expression actually a compile-time constant" idiom.
-					const folded = foldConstants(d.init) as Expr;
-					if (folded.type === 'literal') {
-						// A top-level `let`/`const` primitive with a compile-time-constant initializer
-						// becomes a real wasm global -- the same mechanism a library declaration (e.g.
-						// `lib/console.ts`'s `heap`) already uses, just registered *eagerly* here rather than
-						// lazily on first reference, since a user declaration's own position in `ast.body`
-						// stops mattering once it's a global: every function sees the same slot regardless
-						// of compile order. `mut: false` for `const` -- a genuine wasm-level compile-time
-						// constant, not just a same-value-never-checked mutable slot.
-						const wtype = typeOf(d.typeAnnotation ?? checkerTypeOf(d.init, libGlobal));
-						if (wtype && wtype !== 'void') {
-							ensureGlobal(d.name, wtype, folded, s.kind !== 'const');
+					classes.set(s.name, {
+						name: 		s.name,
+						typeIndex:	-1,
+						thisTsType:	TS.RefType(s.name),
+						decl:		s,
+						fields: 	[],
+						fieldIndex: new Map(),
+						methodDecls: new Map(),
+					});
+				}
+			} else if (s.type === 'var_decl' && s.kind !== 'var') {
+				for (const d of s.declarations) {
+					if (typeof d.name !== 'string' || !d.init)
+						continue;
+					if (s.kind === 'const' && (d.init.type === 'arrow' || d.init.type === 'function')) {
+						functionDeclByName.set(homeKey(moduleId, d.name), arrowOrFunctionToDecl(d.name, d.init));
+						if (moduleId === '.')
 							promotedConsts.add(d.name);
+					} else if (moduleId === '.') {
+						// `foldConstants` first -- `-1`/`!true`/etc. parse as a real `unary`/`binary` node, not
+						// a bare `literal` one, so checking `d.init.type === 'literal'` directly missed every
+						// negative-literal (or other foldable) initializer, silently leaving that global
+						// unregistered (confirmed the hard way: any function referencing it then threw
+						// "unresolved identifier", unrelated to whatever else that function was doing). Reusing
+						// `foldConstants` here matches `case 'switch'`'s own linear-jump-table detection, the
+						// file's existing "is this expression actually a compile-time constant" idiom.
+						const folded = foldConstants(d.init) as Expr;
+						if (folded.type === 'literal') {
+							// A top-level `let`/`const` primitive with a compile-time-constant initializer
+							// becomes a real wasm global -- the same mechanism a library declaration (e.g.
+							// `lib/console.ts`'s `heap`) already uses, just registered *eagerly* here rather than
+							// lazily on first reference, since a user declaration's own position in `ast.body`
+							// stops mattering once it's a global: every function sees the same slot regardless
+							// of compile order. `mut: false` for `const` -- a genuine wasm-level compile-time
+							// constant, not just a same-value-never-checked mutable slot.
+							const wtype = typeOf(d.typeAnnotation ?? checkerTypeOf(d.init, libGlobal));
+							if (wtype && wtype !== 'void') {
+								ensureGlobal(d.name, wtype, folded, s.kind !== 'const');
+								promotedConsts.add(d.name);
+							}
 						}
 					}
 				}
@@ -6094,7 +6170,14 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		return process(e);
 	});
 
-	collectNames(ast.body);
+	// Every module's own top-level statements, not just the entry's -- `walk` already descends into every
+	// nested function/class body it finds, so this alone covers everything reachable *syntactically*; the
+	// `pending` loop below only adds the (separate) `LIB_AST` declarations on top. Deliberately
+	// unconditional (not gated by cross-module call-graph reachability) -- see this pass's own "never
+	// under-approximate" comment above; walking a module that turns out unreached just adds a few
+	// harmless extra names to `reached`.
+	for (const body of moduleBodies.values())
+		collectNames(body);
 	while (pending.length) {
 		const name = pending.shift()!;
 		if (!reached.has(name)) {
@@ -6140,7 +6223,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const ctx	= new FunctionContext('__toplevel', new Scope(libGlobal), plainReturn('void'), undefined);
 		ctx.widenedTypes = collectRangeWidenings(ast.body!, ctx.scope);
 		ast.body!.forEach(st => {
-			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl' || st.type === 'interface_decl')
+			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl' || st.type === 'interface_decl' || st.type === 'import')
 				return;
 			if (st.type === 'var_decl' && promotedConsts.size) {
 				const declarations = st.declarations.filter(d => typeof d.name !== 'string' || !promotedConsts.has(d.name));
