@@ -97,6 +97,7 @@ class NodeModules {
 	// resolves -- otherwise a directory with no `node_modules` anywhere above it (a common case for a
 	// scratch/leaf directory) redoes the whole failed walk, uncached, on every single call.
 	static async get(root: string, restrictTypes?: string[]): Promise<NodeModules|undefined> {
+		root = path.resolve(root);
 		const visited: string[] = [];
 		let result: NodeModules | undefined;
 		while (root !== '/') {
