@@ -182,7 +182,7 @@ export class Output {
 			return target;
 		if (target.type === 'object_pattern') {
 			const parts = target.properties.map(p =>
-				p.key + ':' + this.bindingTarget(p.value) + maybe(p.default, def => ' = ' + this.expr(def, 2))
+				this.memberKey(p.key) + ':' + this.bindingTarget(p.value) + maybe(p.default, def => ' = ' + this.expr(def, 2))
 			);
 			if (target.rest)
 				parts.push('...' + target.rest);
@@ -476,7 +476,7 @@ export class Output {
 
 			case 'switch':
 				return 'switch (' + this.expr(stmt.discriminant) + ') ' + this.curlyIndented(() => stmt.cases.map(c =>
-					(c.test ? 'case ' + this.expr(c.test) : 'default') + ':' + this.opts.newline + this.indented(()=> c.consequent.map(s => this.statement(s)).join(this.newline))
+					(c.test ? 'case ' + this.expr(c.test) : 'default') + ':' + this.indented(()=> this.newline + c.consequent.map(s => this.statement(s)).join(this.newline))
 				).join(this.newline));
 
 			case 'throw':
@@ -484,7 +484,7 @@ export class Output {
 
 			case 'try':
 				return 'try ' + this.indentBlock(stmt.block)
-					+ maybe(stmt.handlerBody, body => ' catch' + maybe(stmt.handlerParam, param => ' (' + param + ')') + ' ' + this.indentBlock(body))
+					+ maybe(stmt.handlerBody, body => ' catch' + maybe(stmt.handlerParam, param => ' (' + this.bindingTarget(param) + ')') + ' ' + this.indentBlock(body))
 					+ maybe(stmt.finalizer, final => ' finally ' + this.indentBlock(final));
 
 			case 'debugger':

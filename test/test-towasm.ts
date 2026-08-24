@@ -1376,6 +1376,105 @@ async function main() {
 	}
 
 	{
+		// A real union of >=2 different object shapes had no wasm representation at all before this --
+		// `typeOf`'s own union case now boxes it as `any`, same physical representation this compiler
+		// already gives an unconstrained generic or a caught exception, and `case 'member'`'s own new
+		// `ensureUnionFieldDispatch` fallback (when `classOf` can't resolve one single owner) reads the
+		// right field via a `ref.test`/`ref.cast` cascade scoped to the union's own exact, bounded member
+		// set -- not `ensureAnyDispatch`'s "every class ever reached" scan, which would be both broader
+		// than the real static type says and unable to tell two same-named-but-different-typed fields
+		// apart.
+		const { directUnion } = await compile(`
+			class A { value: number = 1; constructor(v: number) { this.value = v; } }
+			class B { value: number = 2; constructor(v: number) { this.value = v; } }
+			function pick(useA: boolean): A | B {
+				return useA ? new A(10) : new B(20);
+			}
+			export function directUnion(): number {
+				const x: A | B = pick(true);
+				const y: A | B = pick(false);
+				return x.value * 10 + y.value;
+			}
+		`);
+		check('union field dispatch: a direct (non-generic) union-typed value reads the right field', directUnion(), 120);
+
+		// Found and fixed while landing the above: a union whose members all happen to be `ownerFor`-
+		// resolvable but NOT struct-backed (`number`/`boolean`'s own synthetic `builtinTypeOwner`, which
+		// has no real heap type -- `typeIndex === -1`) must NOT box as `any` -- `IteratorResult<Y,R>.value:
+		// Y | R`, monomorphized with `Y`/`R` both `number`, degenerates to a plain `number | number` union
+		// that has to stay `f64`. Regressed this exact case once already (a generator using `try`/`finally`
+		// failed wasm validation, "uninitialized non-defaultable local") before `unionStructOwners` was
+		// narrowed to require a real heap type, not just any `ownerFor` hit.
+		const { driveGenFinallyUnionRegression } = await compile(`
+			function* gen(): Generator<number, number, number> {
+				yield 1;
+				try {
+					return 42;
+				} finally {
+					console.log(555);
+				}
+			}
+			export function driveGenFinallyUnionRegression(): number {
+				const g = gen();
+				const a = g.next(0);
+				const b = g.next(0);
+				return a.value + b.value * 1000 + (b.done ? 1000000 : 0);
+			}
+		`);
+		check("union field dispatch: doesn't wrongly box a degenerate scalar union (IteratorResult<number,number>.value)", driveGenFinallyUnionRegression(), 1042001);
+	}
+
+	{
+		// Discriminated-union object literal construction: `case 'object'`'s own `want` (a plain WasmType)
+		// can't say which union member a bare `{...}` literal is meant to build as when the target is a
+		// real union (boxed `any`, `typeOf`'s own union case) rather than one single class -- fixed via
+		// `matchObjectShape`, a last-resort structural match against every reachable, struct-backed class
+		// (same "every class ever discovered" scan `findAnyDispatchCandidates` already uses for method
+		// dispatch): exact field-set matching, then a literal-value discriminant check when more than one
+		// candidate's field set matches (the real, common shape here). This is THE full real-world pattern
+		// this session's contextual-inference work was chasing (`Rule([...], $ => ({...}))`-shaped calls
+		// in ts-parser.ts/js-parser.ts/binary-libs/wasm.ts): an unannotated generic callback resolving its
+		// own type param to a real union via the surrounding array literal's own declared element type,
+		// then building one member's own object literal as its own return value -- now works end to end.
+		const { fullPattern, directLiteral } = await compile(`
+			type SpreadExpr = { kind: 'spread'; value: number };
+			type OtherExpr = { kind: 'other'; value: number };
+			type Expr = SpreadExpr | OtherExpr;
+			function makeRule<T>(action: () => T): T { return action(); }
+			export function fullPattern(): number {
+				const rules: Expr[] = [
+					makeRule(() => ({ kind: 'spread', value: 42 })),
+					makeRule(() => ({ kind: 'other', value: 7 })),
+				];
+				return rules[0].value * 10 + rules[1].value;
+			}
+			type A = { kind: 'a'; value: number };
+			type B = { kind: 'b'; value: number };
+			function pick(useA: boolean): A | B {
+				return useA ? { kind: 'a', value: 10 } : { kind: 'b', value: 20 };
+			}
+			export function directLiteral(): number {
+				const x = pick(true);
+				const y = pick(false);
+				return x.value * 10 + y.value;
+			}
+		`);
+		check("discriminated union object literal: the full Rule([...], $ => ({...})) pattern works end to end", fullPattern(), 427);
+		check('discriminated union object literal: a direct (non-generic) discriminated literal picks the right member', directLiteral(), 120);
+
+		// A genuinely ambiguous literal (same field set, no literal discriminant at all) must be rejected,
+		// not silently guessed at.
+		await checkThrows('discriminated union object literal: genuine ambiguity (no discriminant) is rejected', () => compile(`
+			type A = { value: number };
+			type B = { value: number };
+			function pick(useA: boolean): A | B {
+				return { value: 5 };
+			}
+			export function test(): number { return pick(true).value; }
+		`), /needs a known target type/);
+	}
+
+	{
 		// `emitClosureLiteral` used to compute its own return wtype purely from `e.returnType` -- for an
 		// unannotated arrow/function expression, that's whatever *structural* type the checker's own
 		// inference back-fills (real, but anonymous -- no nominal identity for `typeOf` to turn into a

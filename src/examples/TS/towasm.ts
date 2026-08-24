@@ -589,14 +589,13 @@ class FunctionContext {
 		return _old;
 	}
 
-	emit(...instr: wasm.Instr[]) {
-		this.out.push(...instr);
+	emit(...instr: (wasm.Instr|wasm.Instr[])[]) {
+		this.out.push(...instr.flat());
 	}
 
-	toFuncBody(numParams: number, toValType: (t: WasmType) => wasm.ValType): wasm.FuncBody {
+	toFuncBody(numParams: number, toValType: (t: WasmType) => wasm.ValType): wasm.FuncBody & {id: string} {
 		return { id: this.name, locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
 	}
-
 
 	// Shared by emitGeneratorDispatch/emitAsyncDispatch -- the whole "one dispatch + N nested blocks
 	// (innermost = segment 0), wrapped in one outer `loop`" skeleton, exactly the shape `case 'switch'`
@@ -730,6 +729,8 @@ function patternBindings(target: BindingTarget, valueExpr: Expr): JS.Statement<T
 	if (target.rest)
 		throw new Error("towasm: a rest property ('...') in an object destructuring pattern is not supported -- unlike array rest (a plain '.slice()'), this needs a genuinely new object type holding an arbitrary 'all fields except these' shape, which isn't modeled yet");
 	return target.properties.flatMap(prop => {
+		if (typeof prop.key !== 'string')
+			throw new Error("towasm: a computed key ('[expr]') in an object destructuring pattern is not supported");
 		const propExpr: Expr = JS.Member(valueExpr, prop.key);
 		return patternBindings(prop.value, prop.default ? Binary('??', propExpr, prop.default) : propExpr);
 	});
@@ -1307,6 +1308,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	const worklist:			(()=>void)[] = [];
 	const lateWorklist: 	(()=>void)[] = [];
 	const anyDispatchFuncs	= new Map<string, FuncInfo>();
+	// `ensureUnionFieldDispatch`'s own cache -- keyed by field name + the exact, bounded member set (not
+	// "every class ever reached" like `anyDispatchFuncs`), so a real union type's own field access never
+	// silently succeeds via some unrelated third class that happens to share the same field name.
+	const unionFieldDispatchFuncs = new Map<string, FuncInfo>();
 	// A plain named function used as a *value* (not a direct call) -- `case 'call'` already resolves
 	// `name(...)` straight to `funcs.get(name)`/`compileFunc`, no closure struct involved at all, so
 	// this is only ever populated the first time some *other* expression shape needs `name` to behave
@@ -1515,6 +1520,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					return undefined;
 				return nullableWtype(base);
 			}
+			// A real union of >=2 genuinely different object shapes (not the nullable-collapse case just
+			// above) -- boxed `any`, the same physical representation this compiler already gives every
+			// other "could be one of several different shapes" value (an unconstrained generic, a caught
+			// exception). `unionStructOwners`, not `typeOf`, on the whole set: only meaningful when every
+			// member is itself a real, *struct-backed* class/object-shape (`case 'member'`'s own
+			// `ensureUnionFieldDispatch` fallback needs a real `ref.test` target for each) -- excludes a
+			// scalar (`number`/`boolean`, whose own synthetic `builtinTypeOwner` has no heap type at all,
+			// `typeIndex === -1`) just as much as a member that isn't representable at all. Found via
+			// `IteratorResult<Y,R>.value: Y | R` monomorphized with `Y`/`R` both `number` -- a degenerate
+			// `number | number` union that must stay a plain `f64`, not become boxed `any` just because
+			// `ownerFor('number')` alone happens to succeed (a real owner, just not a struct-backed one).
+			if (nonNullish.length > 1 && unionStructOwners(nonNullish))
+				return REF_ANY;
 		}
 		if (resolved.type === 'function')
 			return closureFuncSigType(resolved);
@@ -1588,6 +1606,73 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// not `wtypeOf`'s collapsed `WasmType`) since an array-backed class's `WasmType` is `{arr:kind}`, not `{ref:name}` -- reverse-mapping a `WasmType` back to "which class" is the anti-pattern `ownerFor` avoids.
 	function classOf(e: Expr, ctx: FunctionContext): ClassInfo | undefined {
 		return ownerOf(e, ctx);
+	}
+
+	// `e`'s own checker type, when it's a genuine union of >=2 different object shapes (`typeOf`'s own
+	// union case boxes exactly this shape as `any` -- see its own comment) -- the union's real, bounded
+	// member set, for `case 'member'`'s own `ensureUnionFieldDispatch` fallback when `classOf` can't
+	// resolve a single owner. `undefined` for anything else (not a union at all, a nullable one already
+	// handled elsewhere, or a union with a member that isn't itself a real nameable class/object-shape).
+	function unionClassMembers(e: Expr, ctx: FunctionContext): ClassInfo[] | undefined {
+		const t = T.resolve(ctx.scope, checkerTypeOf(unwrapAs(e), ctx.scope));
+		if (t.type !== 'union')
+			return undefined;
+		const nonNullish = t.types.filter(m => !T.isNullish(m, ctx.scope));
+		return nonNullish.length > 1 ? unionStructOwners(nonNullish) : undefined;
+	}
+
+	// A bare object literal with no single resolvable target type at all (`case 'object'`'s own `want`
+	// doesn't name one class) -- a last-resort structural match against every reachable, struct-backed
+	// class/object-shape (same "every class ever discovered" scan `findAnyDispatchCandidates` already
+	// uses for method dispatch, just picking which *shape* a literal is meant to build as instead of
+	// which method to call). A candidate qualifies only when its own field set exactly matches the
+	// literal's own property names (no missing, no extra); when more than one candidate's field set
+	// matches (the real, common "discriminated union" shape -- e.g. `SpreadExpr`/`OtherExpr` both
+	// `{kind, value}`), a further check narrows by discriminant: a property whose own literal value
+	// matches exactly one candidate's own literal-typed field declaration, but not another's. Found via
+	// a generic callback correctly resolving its own type param to a real union (contextual generic
+	// inference, this session) and then needing to build one member's own object literal -- deliberately
+	// narrow (exact-field-set matching plus literal-value discrimination, not general structural
+	// subtyping): covers the real, common discriminated-union shape this is for, nothing broader.
+	// `cls`'s own declared type for field `key`, for `matchObjectShape`'s own discriminant check -- a real
+	// `class`'s own member lives on `cls.decl.body` directly (`JS.Field`'s `typeAnnotation`), but an
+	// object-shape type alias (`type X = {...}`, not a real class) never populates that at all
+	// (`ensureObjectShape`'s own comment: `decl: { name, body: [] }`, deliberately empty) -- its own
+	// field types live only on the original structural type, re-resolved here the same way
+	// `ensureObjectShape` itself already derived them once when building `cls` in the first place.
+	function fieldDeclaredType(cls: ClassInfo, key: string): Type | undefined {
+		const m = cls.decl.body.find((m): m is JS.Field<Type> => m.type === 'field' && m.key === key);
+		if (m)
+			return m.typeAnnotation;
+		const resolved = T.resolve(global, global.type(cls.name)?.type ?? T.ANY);
+		if (resolved.type === 'object') {
+			const p = resolved.members.find(p => p.type === 'property' && p.key === key);
+			if (p?.type === 'property')
+				return p.typeAnnotation;
+		}
+		return undefined;
+	}
+
+	function matchObjectShape(e: JS.ObjectExpr<Type>): ClassInfo | undefined {
+		const props = new Map<string, Expr>();
+		for (const p of e.properties) {
+			if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
+				return undefined;
+			props.set(p.key, p.value);
+		}
+		const candidates = [...classes.values()].filter(cls =>
+			cls.typeIndex !== -1 && cls.fields.length === props.size && cls.fields.every(f => props.has(f.name))
+		);
+		if (candidates.length <= 1)
+			return candidates[0];
+
+		const matches = candidates.filter(cls => [...props].every(([key, value]) => {
+			if (value.type !== 'literal')
+				return true;
+			const declType = fieldDeclaredType(cls, key);
+			return !declType || declType.type !== 'literal' || declType.value === value.value;
+		}));
+		return matches.length === 1 ? matches[0] : undefined;
 	}
 
 	// `cls.name`'s own `get(i)`/`set(i,v)` -- real index syntax dispatched generically to any class using
@@ -1694,6 +1779,22 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				return ensureClass('Map', [TS.RefType('string'), vt]);
 		}
 		return undefined;
+	}
+
+	// A union's own member types, each resolved to a real, *struct-backed* `ClassInfo` (a genuine wasm
+	// heap type, `typeIndex !== -1`) -- `undefined` unless every member qualifies. Deliberately narrower
+	// than `ownerFor` alone: a scalar (`number`/`boolean`) has its own synthetic owner too
+	// (`builtinTypeOwner`), but with no real heap type to `ref.test` against, so it can't participate in
+	// the same "boxed `any`, dispatch by `ref.test`" representation a real union of object shapes uses
+	// (`typeOf`'s own union case, `case 'member'`'s `ensureUnionFieldDispatch` fallback). Without this
+	// distinction, a degenerate union like `IteratorResult<Y,R>.value: Y | R` monomorphized with `Y`/`R`
+	// both `number` would wrongly box a plain `number | number` as `any` instead of staying `f64`.
+	function unionStructOwners(types: readonly Type[]): ClassInfo[] | undefined {
+		const owners = types.map(m => {
+			const o = ownerFor(m);
+			return o && o.typeIndex !== -1 ? o : undefined;
+		});
+		return owners.every(o => !!o) ? owners as ClassInfo[] : undefined;
 	}
 
 	// A namespace-style reference (`Box.describe()`) never carries real type arguments the way a genuine
@@ -2107,9 +2208,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					const value = ctx.temp(`$spread$elem$${i}`, want);
 					ctx.emit(I.local.set(value));
 					parts.push({ spread: false, value });
-					return;
-				}
-				if (el.type === 'spread') {
+				} else if (el.type === 'spread') {
 					const srcKind = arrayKindOf(el.operand, ctx);
 					if (srcKind !== kind)
 						throw new Error('towasm: a spread element in an array literal must be an array of the same element type');
@@ -2948,8 +3047,19 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				}
 
 				const fieldIdx	= cls?.fieldIndex.get(e.property);
-				if (!cls || fieldIdx === undefined)
+				if (!cls || fieldIdx === undefined) {
+					// `classOf` couldn't resolve a single owner -- one real reason (besides a genuinely
+					// unknown field) is a receiver whose static type is a real union of different object
+					// shapes (`unionClassMembers`), physically boxed as `any` by `typeOf`'s own union case.
+					const unionMembers = unionClassMembers(e.object, ctx);
+					if (unionMembers) {
+						emitAs(e.object, ctx, REF_ANY);
+						const info = ensureUnionFieldDispatch(unionMembers, e.property);
+						ctx.emit(I.call(info.funcIndex));
+						return info.result;
+					}
 					throw new Error(`towasm: unknown field '${e.property}'`);
+				}
 				const fieldWtype = cls.fields[fieldIdx].wtype;
 
 				// Mid-construction, before a real `this` exists (see `ensureCtor`'s struct-collecting path) --
@@ -3066,7 +3176,10 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			// (`struct.new` needs every field value up front, in that fixed order), not the literal's own
 			// written order -- looked up from the literal's properties by name instead.
 			case 'object': {
-				const owner = typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined;
+				// `want` naming one class wins outright when it does; otherwise (most commonly `REF_ANY`,
+				// e.g. this literal is a generic callback's own return value, boxed as `any` per `typeOf`'s
+				// own union case) fall back to `matchObjectShape`'s own structural/discriminant match.
+				const owner = (typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined) ?? matchObjectShape(e);
 				if (!owner)
 					throw new Error("towasm: an object literal needs a known target type (e.g. a 'const x: Point = {...}' with a plain 'type Point = {...}' alias) -- not supported here");
 
@@ -4216,10 +4329,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 					ctx.emit(I.block(toValType(REF_ANY), ctx.swapOut()));
 
 					ctx.inScope(() => {
-						if (s.handlerParam)
+						if (s.handlerParam) {
+							if (typeof s.handlerParam !== 'string')
+								throw new Error("towasm: a destructured catch parameter ('catch ({...})'/'catch ([...])') is not supported");
 							ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
-						else
+						} else {
 							ctx.emit(I.drop);
+						}
 						s.handlerBody!.forEach(st => emitStmt(st, ctx));
 					});
 
@@ -4306,10 +4422,13 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 						// unless declared as real params (none of these are), so try_table (B) itself must
 						// start from a clean slate, not reach back for a value produced before it began.
 						ctx.openScope();
-							if (s.handlerParam)
+							if (s.handlerParam) {
+								if (typeof s.handlerParam !== 'string')
+									throw new Error("towasm: a destructured catch parameter ('catch ({...})'/'catch ([...])') is not supported");
 								ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
-							else
+							} else {
 								ctx.emit(I.drop);
+							}
 
 							// B (the catch handler) gets its *own* safety net -- unlike A, nothing else already
 							// guarantees every exception B might throw is caught before 'finally' needs to run.
@@ -5737,6 +5856,63 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 				dctx.emit(I.call(c.funcInfo.funcIndex));
 				coerceTop(c.funcInfo.result, dctx, want);
 				return [..._cond, I.if(want === 'void' ? undefined : toValType(want), dctx.swapOut(), buildArm(i + 1))];
+			}
+
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(1, toValType);
+		});
+		return info;
+	}
+
+	// A real dynamic-dispatch cascade for `recv.name` (a plain field read, not a call) where `recv`'s
+	// static type is a genuine union of >=2 different object shapes (`typeOf`'s own union case boxes
+	// this as `any`, same physical representation `ensureAnyDispatch` already uses for a truly untyped
+	// receiver) -- found via a generic callback resolving its own type param to a real union, contextually
+	// (`Rule([...], $ => ({...}))`-shaped calls, once their own `T` correctly resolves to a union like
+	// `SpreadExpr | OtherExpr` rather than an anonymous shape). Unlike `ensureAnyDispatch`, `members` is
+	// the union's own exact, bounded set (not "every class ever reached") -- the checker already verified
+	// every member declares this field before allowing the access at all, so this never needs a fallback
+	// "no candidate matched" arm the way `ensureAnyDispatch` does; a receiver failing every `ref.test` here
+	// would mean the checker was wrong, an internal inconsistency, not a real program to guard against.
+	function ensureUnionFieldDispatch(members: readonly ClassInfo[], name: string): FuncInfo {
+		const key = `${name}=>[${members.map(m => m.typeIndex).join(',')}]`;
+		const existing = unionFieldDispatchFuncs.get(key);
+		if (existing)
+			return existing;
+
+		// Each member's own field, looked up once up front -- an internal inconsistency (not a real
+		// program error) if any member turns out not to declare it, since the checker already required
+		// every member of a union to have a given property before allowing `.property` on it at all.
+		const memberFields = members.map(m => {
+			const idx = m.fieldIndex.get(name);
+			if (idx === undefined)
+				throw new Error(`towasm: internal: '${m.name}' (a member of a union type) has no field '${name}'`);
+			return { cls: m, fieldIdx: idx, wtype: m.fields[idx].wtype };
+		});
+		// The dispatch's own result type: every member's field shares one identical physical type in the
+		// overwhelmingly common case (as real TS itself would usually require anyway, absent a `never`-
+		// narrowed exception) -- boxed `any` otherwise, same "differently-shaped values through one slot"
+		// fallback this file already uses everywhere else a value's own shape isn't uniform.
+		const result = memberFields.every(f => wasmTypeEq(f.wtype, memberFields[0].wtype)) ? memberFields[0].wtype : REF_ANY;
+
+		const { funcIndex, typeIndex } = registerFunc(toParams2([{ key: 'recv', wtype: REF_ANY, tsType: T.ANY }]), toResults(result));
+		const info: FuncInfo = { params: [REF_ANY], result, funcIndex, typeIndex };
+		unionFieldDispatchFuncs.set(key, info);
+		funcs.set(`<union field dispatch>.${key}`, info);
+
+		worklist.push(() => {
+			const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(result), undefined);
+			const recv = dctx.declareLocal('$recv', REF_ANY);
+
+			function buildArm(i: number): wasm.Instr[] {
+				if (i >= memberFields.length)
+					return [I.unreachable];
+				const f = memberFields[i];
+				dctx.emit(I.local.get(recv.index), I.ref.test(f.cls.typeIndex));
+				const _cond = dctx.swapOut();
+				dctx.emit(I.local.get(recv.index), I.ref.cast(f.cls.typeIndex), I.struct.get(f.cls.typeIndex, f.fieldIdx));
+				coerceTop(f.wtype, dctx, result);
+				return [..._cond, I.if(result === 'void' ? undefined : toValType(result), dctx.swapOut(), buildArm(i + 1))];
 			}
 
 			dctx.emit(...buildArm(0));

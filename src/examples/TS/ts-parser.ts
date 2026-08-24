@@ -122,6 +122,7 @@ export type Declaration = MaybeAmbient
 	| { type: 'interface_decl'; name: string; typeParams?: TypeParam[]; extendsClause?: Type[]; body: TypeMember[] }
 	| { type: 'type_alias_decl'; name: string; typeParams?: TypeParam[]; value: Type }
 	| { type: 'export_assignment'; expr: string }
+	| JS.Export<Type>
 
 function Declare<T extends {ambient?: boolean}>(d: T) { d.ambient = true; return d as unknown as JS.Declaration<any>; }
 
@@ -221,8 +222,8 @@ const tuple_element = Rules<Type | { type: 'spread'; argument: Type; label?: str
 // Reuses js-parser.ts's own two `template_literal_part` regex terminals verbatim (anonymous regexes are interned by pattern text, so writing the same
 // pattern here resolves to the same shared terminal) -- only the interpolated part differs (`type` here instead of an expression).
 const type_template_literal_part = Rules(
-	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=\$\{)/, '${', type, '}'],	$ => ({ str: $[0], exp: $[2] } as const)),
-	Rule([/(?:[^`$\\]|\\.|\$(?!\{))*(?=`)/], 						$ => ({ str: $[0] } as const)),
+	Rule([/(?:[^`$\\]|\\[\s\S]|\$(?!\{))*(?=\$\{)/, '${', type, '}'],	$ => ({ str: $[0], exp: $[2] } as const)),
+	Rule([/(?:[^`$\\]|\\[\s\S]|\$(?!\{))*(?=`)/], 						$ => ({ str: $[0] } as const)),
 );
 const type_parameter = Rules<TypeParam>(
 	Rule([IDENT],													$ => ({ name: $[0] } as const)),
@@ -252,7 +253,13 @@ const type_member_id = Rules<Key>(
 	Rule([IDENT]),
 	Rule([STR],								$ => unquoteString($[0])),
 	Rule([NUM]),
-	Rule(['[', dotted_path, ']'],			$ => ({ computed: JS.dottedNameToExpr($[1]) } as const)),
+	// A real expression, not just a dotted name -- `["" + ""]()` etc. are syntactically valid computed
+	// interface/type-member keys even though TSC's type checker rejects any that aren't literal/`unique
+	// symbol`-typed; that's a semantic check, not a parse-time restriction.
+	Rule(['[', assignment_expression, ']'],	$ => ({ computed: $[1] } as const)),
+	// A bracketed string literal (`["a_b_c"]: T`) isn't a real runtime-computed key, just syntax sugar for
+	// the same plain quoted name `Rule([STR], ...)` above already handles bare -- treated identically.
+	Rule(['[', STR, ']'],					$ => unquoteString($[1])),
 );
 
 const return_type = Rules(
@@ -300,6 +307,11 @@ const function_type = Rules(
 );
 
 const type_member = Rules(
+	// A bare name with no `:` type at all (`interface A { a }`) -- real TS lets an interface property omit
+	// its type entirely, defaulting to `any`. Unambiguous: the next token after `type_member_id` (`:`, `?`,
+	// `(`, or a separator/`}`) already picks the right alternative with one token of lookahead, this is just
+	// the one continuation none of the existing rules covered.
+	Rule([type_member_id],											$ => TypeProperty($[0], RefType('any'))),
 	Rule([type_member_id, ':', type],								$ => TypeProperty($[0], $[2])),
 	Rule([type_member_id, '?', ':', type],							$ => TypeProperty($[0], $[3], ['optional'])),
 	Rule([READONLY, type_member_id, ':', type],						$ => TypeProperty($[1], $[3], ['readonly'])),
@@ -493,8 +505,8 @@ const declared_body		= MaybeList(Forward<Declaration>(()=>declared_body_item));
 // accepting real function/class bodies while a plain `export namespace` still can.
 function namespaceOrModule(body: Rules<Declaration[]>) {
 	return Rules<MaybeAmbient>(
-		Rule(['namespace', IDENT, '{', body, '}'],	$ => NamespaceDecl($[1], $[3])),
-		Rule(['module', IDENT, '{', body, '}'],		$ => NamespaceDecl($[1], $[3])),
+		Rule(['namespace', dotted_path, '{', body, '}'],	$ => NamespaceDecl($[1], $[3])),
+		Rule(['module', dotted_path, '{', body, '}'],		$ => NamespaceDecl($[1], $[3])),
 		Rule(['module', STR, '{', body, '}'],		$ => ModuleDecl(unquoteString($[1]), $[3])),
 	);
 }
@@ -512,7 +524,14 @@ const ambientable_item = Rules<MaybeAmbient>(
 // Reached via `declare` (top-level `declare namespace X {...}`, or any item nested inside one -- nesting stays
 // ambient without repeating `declare`, matching real TypeScript). Its own namespace/module alternative recurses
 // into `declared_body`, so a real function implementation can never sneak in this way.
-const maybe_ambient = Rules<MaybeAmbient>(ambientable_item, ambient_namespace);
+const maybe_ambient = Rules<MaybeAmbient>(
+	ambientable_item,
+	ambient_namespace,
+	// `declare global { ... }` at top level -- `declared_body_item` already has the identical rule for the
+	// case where `global` is nested inside an already-ambient module/namespace (no `declare` needed again
+	// there); this is the same construct's own top-level entry point, which still needs its own `declare`.
+	Rule([GLOBAL, '{', declared_body, '}'],	$ => ModuleDecl('global', $[2])),
+);
 
 // Reached via a plain `export namespace X {...}` / `export module X {...}` (no `declare`). Unlike `maybe_ambient`,
 // its namespace/module alternative recurses into `namespace_body`, so ordinary, non-exported helper functions
@@ -531,12 +550,16 @@ const declared_body_item = Rules<Declaration>(
 	Rule(['import', JS.import_declaration],				$ => $[1] as Declaration),
 	Rule(['export', 'import', JS.import_declaration],	$ => $[2] as Declaration),
 	Rule(['export', '=', dotted_path, ';'],				$ => ({ type: 'export_assignment', expr: $[2] } as const)),
+	// A plain re-export list (`export { x as y };`, no accompanying declaration) inside an ambient
+	// module/namespace body -- `JS.export_declaration` already has this shape for real top-level `export`,
+	// this body-level sibling just never got it.
+	Rule(['export', JS.named_exports, ';'],				$ => ({ type: 'export', specifiers: $[1] } as const)),
 	// A member exported out of an already-ambient namespace/module stays ambient itself -- reuses
 	// `maybe_ambient`/`fake_ambient` directly rather than `JS.export_declaration`, which also carries the
 	// *real*-bodied `exportable_item`, only valid for a plain `export` at actual module top level.
 	Rule(['export', maybe_ambient],						$ => $[1] as Declaration),
 	Rule(['export', fake_ambient],							$ => $[1] as Declaration),
-	Rule(['module', IDENT, '{', declared_body, '}'],	$ => NamespaceDecl($[1], $[3])),
+	Rule(['module', dotted_path, '{', declared_body, '}'],	$ => NamespaceDecl($[1], $[3])),
 	Rule(['module', STR, ';'],							$ => ModuleDecl(unquoteString($[2]), [])),
 	Rule([GLOBAL, '{', declared_body, '}'],				$ => ModuleDecl('global', $[2])),
 );
@@ -547,10 +570,18 @@ module_item.push(
 	Rule(['declare', fake_ambient],							$ => $[1]),
 	// `export = X;` at the top level of a whole file, not just nested in a `declare module`/`namespace` body (`declared_body_item` covers that).
 	Rule(['export', '=', dotted_path, ';'],					$ => ({ type: 'export_assignment', expr: $[2] } as const)),
+	// `export import X = N;` (an import-alias re-export) -- same rule `declared_body_item` already has for
+	// ambient bodies, needed again here for a plain (non-`declare`) `module`/`namespace` body or top-level file.
+	Rule(['export', 'import', JS.import_declaration],		$ => $[2] as Declaration),
 );
 
 JS.binding_name.push(
     Rule([IDENT, ':', type], $ => ({ key: $[0], typeAnnotation: $[2] } as const)),
+    // A destructured rest binding can carry a type too (`function f(...[a, b]: [string, number]) {}`,
+    // `Iterator.next`'s own real `lib.d.ts`-shaped signature) -- `binding_name`'s array/object-pattern
+    // alternatives were missing the typed form the bare-IDENT one just above already has.
+    ForceFork(Rule([JS.array_pattern, ':', type], $ => ({ key: $[0], typeAnnotation: $[2] } as const))),
+    ForceFork(Rule([JS.object_pattern, ':', type], $ => ({ key: $[0], typeAnnotation: $[2] } as const))),
 );
 // Folding an optional `type_parameters` prefix directly into `parameter_clause` (rather than every call site spelling out its own sibling pair) means
 // every place that spreads `parameter_clause`'s result picks up generics for free, including js-parser.ts's own base method/function rules.
@@ -587,6 +618,11 @@ JS.import_declaration.push(
 	Rule(['declare', maybe_ambient],					$ => JS.ExportDecl(Declare($[1]))),
 	Rule([fake_ambient],								$ => JS.ExportDecl($[0] as JS.Declaration<any>)),
 	Rule(['declare', fake_ambient],						$ => JS.ExportDecl($[1] as JS.Declaration<any>)),
+	// `export default interface A {}` -- real TS (an interface has a name that can also serve as the
+	// default export's binding). Reuses `fake_ambient` the same way the plain-`export` rule just above
+	// does; permissively also accepts `export default type T = ...`, which real TS disallows, matching
+	// this grammar's usual stance of erring permissive where the exactness isn't load-bearing for parsing.
+	Rule(['default', fake_ambient],						$ => ({ type: 'export', default: $[1] as JS.Declaration<any> } as const)),
 );
 
 (JS.statement as unknown as Rules<Statement>).push(
@@ -629,6 +665,13 @@ JS.parameter.push(
 JS.property_assignment.push(
 	// Return-type-annotated `get` shorthand method; other method shapes fall out of `parameter_clause`'s optional `type_parameters` prefix for free.
 	Rule([JS.GET, JS.property_name_computed, '(', ')', ':', return_type, '{', JS.function_body, '}'],	$ => JS.Method('get',$[1], {params: [], returnType: $[5]}, $[7])),
+	// `set`'s *parameter* type -- js-parser.ts's own object-literal `set` rule only accepts a bare untyped
+	// `IDENT` parameter, same gap `class_member_body`'s own `set` rules above already needed fixing for
+	// class members (item 8); `object_pattern`/`array_pattern` need no `forceFork` here for the same reason
+	// as there -- a setter's parameter position is never also reachable as a plain expression.
+	Rule([JS.SET, JS.property_name_computed, '(', IDENT, ':', type, ')', '{', JS.function_body, '}'],					$ => JS.Method('set', $[1], {params: [{ key: $[3], typeAnnotation: $[5] }]}, $[8])),
+	Rule([JS.SET, JS.property_name_computed, '(', JS.object_pattern, ':', type, ')', '{', JS.function_body, '}'],		$ => JS.Method('set', $[1], {params: [{ key: $[3], typeAnnotation: $[5] }]}, $[8])),
+	Rule([JS.SET, JS.property_name_computed, '(', JS.array_pattern, ':', type, ')', '{', JS.function_body, '}'],		$ => JS.Method('set', $[1], {params: [{ key: $[3], typeAnnotation: $[5] }]}, $[8])),
 );
 
 // `class_member_name` itself now carries `?`/`!` (see its own comment in js-parser.ts), so plain/generator/async method rules already match `foo?(...) {...}` for free.
@@ -664,10 +707,18 @@ const class_member_overloads = Rules<JS.Method<Type>>(
 );
 
 // Any number of member modifiers in any order (`static readonly`, `public static`, etc), pushed onto `class_member` so every member shape gets it.
-const class_member_modifier_list = List(OneOf(['public', 'private', 'protected', 'readonly', 'abstract', 'static', 'override']));
+const class_member_modifier_list = List(OneOf(['public', 'private', 'protected', 'readonly', 'abstract', 'static', 'override', 'accessor']));
 
 (JS.class_member as unknown as Rules<ClassMember>).push(
 	Rule(['[', IDENT, ':', type, ']', ':', type, ';'],				$ => ({ type: 'index_signature', paramName: $[1], paramType: $[3], typeAnnotation: $[6] } as const)),
+	// A modifier-prefixed class index signature (`readonly`/`static`/`public`/...) -- every OTHER
+	// `class_member` shape already gets `class_member_modifier_list` for free (see the `class_member_body`/
+	// `class_member_overloads` rules just below), but the bare index-signature rule above never did.
+	// Deliberately permissive rather than restricting to just `readonly` (the only modifier real TS actually
+	// allows semantically here) -- matches this grammar's usual stance of parsing first, leaving semantic
+	// restrictions like "public indexers not allowed" to a real type checker, not the parser.
+	Rule([class_member_modifier_list, '[', IDENT, ':', type, ']', ':', type, ';'],
+		$ => ({ type: 'index_signature', paramName: $[2], paramType: $[4], typeAnnotation: $[7], modifiers: $[0] } as const)),
 	Rule([class_member_modifier_list, class_member_body],			$ => {
 		const modifiers = $[1].modifiers ? [...$[1].modifiers, ...$[0]] : $[0];
 		return {...$[1], ...(modifiers.length ? { modifiers } : {}) };
@@ -676,6 +727,9 @@ const class_member_modifier_list = List(OneOf(['public', 'private', 'protected',
 	// A sole `static` modifier has no LR(0) state retaining the `class_member_overloads` completion (a missing transition from state-merging, not
 	// a resolvable conflict -- `forceFork` can't fix this class of bug), so it needs its own direct rule.
 	Rule(['static', class_member_overloads],						$ => ({...$[1], modifiers: [...($[1].modifiers ?? []), 'static']} as const)),
+	// Same "sole `static`" missing-transition, this time for the index-signature shape above.
+	Rule(['static', '[', IDENT, ':', type, ']', ':', type, ';'],
+		$ => ({ type: 'index_signature', paramName: $[2], paramType: $[4], typeAnnotation: $[7], modifiers: ['static'] } as const)),
 	class_member_overloads,
 );
 
@@ -685,6 +739,16 @@ const class_member_modifier_list = List(OneOf(['public', 'private', 'protected',
 
 JS.variable_declaration.push(
 	Rule([IDENT, '!', ':', type],							$ => ({ name: $[0], typeAnnotation: $[3], definite: true } as const)),
+	// A type annotation on a destructured declarator (`let [c0]: [I?] = ...;`, `let {a, b}: T = ...;`) --
+	// `JS.parameter`'s own `object_pattern ':' type`/`array_pattern ':' type` alternatives cover *function*
+	// parameters, but `variable_declaration`'s own pattern alternative (`binding_pattern '=' assignment_expression`,
+	// used for `let`/`const`/`var` declarators) never got the same treatment. No `forceFork` needed here
+	// unlike the parameter case: a `var`/`let`/`const` declarator's `{`/`[` is never *also* reachable as a
+	// plain expression the way an arrow's `(` is, so there's no ambiguity to resolve.
+	Rule([JS.binding_pattern, ':', type, '=', assignment_expression],	$ => ({ name: $[0], typeAnnotation: $[2], init: $[4] } as const)),
+);
+JS.variable_declaration_noin.push(
+	Rule([JS.binding_pattern, ':', type, '=', JS.assignment_expression_noin],	$ => ({ name: $[0], typeAnnotation: $[2], init: $[4] } as const)),
 );
 
 // ===================================================================
@@ -711,6 +775,14 @@ JS.class_heritage.push(
 JS.class_declaration.push(
 	Rule(['abstract', 'class', IDENT, JS.class_heritage, JS.class_body],	$ => ({ type: 'class_decl', name: $[2], ...$[3], body: $[4], abstract: true } as const)),
 );
+// An `export default abstract class {}` (anonymous) equivalent was tried here on `class_expression` too,
+// mirroring the named form above -- reverted (2026-08-23): it broke `class abstract { ... }` (`abstract`
+// used as an ordinary class *name*, previously working) via LALR state-sharing between "just shifted
+// `class`, expecting a name" and wherever the new rule's own leading `abstract` candidate landed -- the
+// classic "sixth class" fragility (tison_debugging_technique memory), confirmed by the corpus catching a
+// real regression (`classAbstractAsIdentifier.ts`) for a 2-file gain (`export default abstract class {}`
+// is a narrow, rare combination). Left unsupported rather than risk it; see tison_official_ts_test_suite
+// memory item 34 for the full story if revisiting.
 
 // ===================================================================
 //  `expr as Type` / `expr satisfies Type` / `expr!` (non-null assertion)

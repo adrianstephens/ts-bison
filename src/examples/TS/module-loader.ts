@@ -89,25 +89,45 @@ function joinSpecifier(from: string, rel: string): string {
 // ===================================================================
 
 class NodeModules {
-	static found = new Map<string, NodeModules>;
+	static found		= new Map<string, NodeModules>;
+	static notFound		= new Set<string>;
 
+	// Walks up from `root` looking for the nearest ancestor with a `node_modules` dir. Every directory
+	// visited along the way gets cached either way (`found`/`notFound`), not just the one where the walk
+	// resolves -- otherwise a directory with no `node_modules` anywhere above it (a common case for a
+	// scratch/leaf directory) redoes the whole failed walk, uncached, on every single call.
 	static async get(root: string, restrictTypes?: string[]): Promise<NodeModules|undefined> {
+		const visited: string[] = [];
+		let result: NodeModules | undefined;
 		while (root !== '/') {
+			let nm = this.found.get(root);
+			if (nm) {
+				result = nm;
+				break;
+			}
+			if (this.notFound.has(root))
+				break;
+			visited.push(root);
 			try {
-				let nm = this.found.get(root);
+				await fs.access(path.join(root, 'node_modules'));
+				nm = this.found.get(root);	// a concurrent call may have created it while this one awaited
 				if (!nm) {
-					await fs.access(path.join(root, 'node_modules'));
-					nm = this.found.get(root);
-					if (!nm) {
-						nm = new NodeModules(root, restrictTypes);
-						this.found.set(root, nm);
-					}
+					nm = new NodeModules(root, restrictTypes);
+					this.found.set(root, nm);
 				}
-				return nm;
+				result = nm;
+				break;
 			} catch {
 				root = path.dirname(root);
 			}
 		}
+		for (const r of visited) {
+			if (result)
+				this.found.set(r, result);
+			else
+				this.notFound.add(r);
+		}
+		return result;
 	}
 
 	imported	= new Map<string, LoadedModule | undefined>;

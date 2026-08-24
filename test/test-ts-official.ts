@@ -32,12 +32,24 @@ function splitTestFile(source: string, defaultName: string) {
 
 	return markers.map((m, i) => ({
 		name:		m[1],
-		content:	source.slice(m.index + m[0].length, markers[i + 1]?.index ?? source.length),
+		// Strip the one newline right after the marker line -- a real standalone file never has a
+		// leading blank line, and leaving it in breaks a leading shebang (`^#!` only matches col 0).
+		content:	source.slice(m.index + m[0].length, markers[i + 1]?.index ?? source.length).replace(/^\r?\n/, ''),
 	}));
 }
 
+// A handful of corpus files are UTF-16 (BOM-prefixed), not UTF-8 -- reading those as 'utf8' decodes
+// every 2-byte char as two garbage/replacement-char bytes, so the BOM itself picks the real encoding.
+function readSource(buf: Buffer): string {
+	if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe)
+		return buf.toString('utf16le', 2);
+	if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff)
+		return buf.swap16().toString('utf16le', 2);
+	return buf.toString('utf8');
+}
+
 async function testFile(filename: string) {
-	const source = await fs.readFile(filename, 'utf8');
+	const source = readSource(await fs.readFile(filename));
 
 	for (const virtual of splitTestFile(source, filename)) {
 		if (!/\.tsx?$/.test(virtual.name) || virtual.name.endsWith('.d.ts'))

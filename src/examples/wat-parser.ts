@@ -1,8 +1,12 @@
 import * as path from 'path';
 import { Rules, makeRule, List, MaybeList, Maybe, OneOf, Forward, termOneOf } from '../tison';
 import { makeCachedParser } from '../tableCache';
-import { Instr, ValType, Local, GlobalType, TableType, SubType, WasmModule, Limits, Import as WasmImport, CatchClause } from '@isopodlabs/binary_libs/wasm';
-import { ROOT_OPS, FB_OPS, FC_OPS, SIMD_OPS, THREAD_OPS, equalFuncSig } from '@isopodlabs/binary_libs/wasm';
+import {
+	Instr, HeapType, ValType, Local, GlobalType, TableType, SubType, FuncSig, CompType, FieldType, StorageType, ParamType,
+	WasmModule, Limits, Import as WasmImport, CatchClause,
+	ROOT_OPS, FB_OPS, FC_OPS, SIMD_OPS, THREAD_OPS
+} from '@isopodlabs/binary_libs/wasm';
+import { AnyMxRecord } from 'dns';
 
 // ===================================================================
 //  WAT (WebAssembly Text Format) Parser
@@ -25,33 +29,22 @@ export { ROOT_OPS };
 
 type index = string | number
 
-// wasm.ts Limits is inlined into MemType/TableType; expose a plain shape for WAT
-//interface Limits	{ min: number; max?: number }
-//interface MemType	{ min: number; max?: number }
+// The abstract heap type names `heap_type` accepts alongside a `$name`/number index (see `ref_type`
+// below) -- a raw `$name` isn't a real `HeapType`/`SubType.supertypes` entry until `WasmModule.resolve()`
+// looks it up once the whole module is assembled, same as any other named reference in this file (a
+// local/global/func/etc id). No parallel "pending" type for it here -- see the `as X` casts below,
+// same escape hatch already used for `WatInstr` (this file doesn't own resolution any more; wasm.ts does).
+const ABSTRACT_HEAP_NAMES = new Set(['func', 'extern', 'any', 'eq', 'i31', 'struct', 'array', 'none', 'noextern', 'nofunc', 'exn', 'noexn']);
+
 type MemType	= Limits;
-interface FuncType	{ params: {id?: string; type: ValType}[]; results: ValType[] }
-interface TypeUse	{ typeIndex?: index; params: {id?: string; type: ValType}[]; results: ValType[] };
+type FuncType	= FuncSig & { typeIndex?: index};
 interface Imp		{ module: string, name: string };
 
-// A type-parametric local's declared type, before `instantiateAsmBody` substitutes it for a real numeric type
-// -- `$T` is the one recognized placeholder name (a fixed, documented convention, the same `$T` a typed-op reference elsewhere uses; not a general named-type-parameter system,
-// nothing in this codebase needs more than one).
+// A type-parametric local's declared type, before `instantiateAsmBody` substitutes it for a real numeric type.
 // Every switch arm can declare locals so `WatLocal.type` has to admit this alongside a real `ValType`
-// -- a func/macro's own locals only ever construct the real-`ValType` half; this placeholder only ever originates from a switch arm, and only ever survives to `toWasm` if that arm's `$T` is never instantiated (a real authoring error
-// `toWasm` itself catches, see its own comment).
 export interface AsmTypeParam { typeParam: string }
 export type WatLocal = Omit<Local, 'type'> & { type: ValType | AsmTypeParam };
-
-// block/loop/if/try_table's `blockType` is widened here to a pre-resolution `ValType[]` (the 0, 1, or
-// several `(result t)` clauses accumulated while parsing) -- `toWasm`'s `resolveBlockType` turns it into
-// the real binary-level `BlockType` (a single valtype, void, or a synthesized multi-result func-type
-// index) once the module's type section is known, so these 4 ops replace (not extend) their `Instr` shape.
-type WatBlockInstr =
-	| { op: 'block'; blockType: ValType[]; body: WatInstr[]; label?: string }
-	| { op: 'loop'; blockType: ValType[]; body: WatInstr[]; label?: string }
-	| { op: 'if'; blockType: ValType[]; then: WatInstr[]; else?: WatInstr[]; label?: string }
-	| { op: 'try_table'; blockType: ValType[]; catches: CatchClause[]; body: WatInstr[]; label?: string };
-export type WatInstr = Exclude<Instr, { op: 'block' | 'loop' | 'if' | 'try_table' }> | WatBlockInstr | SwitchPlaceholder | ({ op: '__local'} & WatLocal);
+export type WatInstr = Instr | SwitchPlaceholder | ({ op: '__local'} & WatLocal);
 
 // A `switch` whose key names a macro parameter can't be resolved at parse time (the macro body is fully reduced before it's ever stored in ctx.macros, long before any call site picks an argument)
 // -- it's left as this placeholder for expandCall's substInstr to resolve per call, once the parameter is actually bound to a caller-supplied $tag. See the `switch` rule below.
@@ -65,25 +58,19 @@ interface Field<T extends string, V> {
 	import?:	Imp;
 	value:		V;
 }
-type Func	= Field<'func', TypeUse> & { locals: WatLocal[]; body: WatInstr[] }
-type Table	= Field<'table', TableType>
-type Memory	= Field<'memory', MemType>
-// `init`/`offset` below are `WatInstr[]`, not `Instr[]`: still pre-resolution (index names, and for
-// block/loop/if/try_table the pre-resolution `ValType[]` blockType -- see `WatInstr`'s own comment)
-// until `toWasm`'s `resolveInstrs` runs, even though `assertResolved` has already ruled out locals/switches.
-type Global	= Field<'global', GlobalType> & { init: WatInstr[] }
-// A tag's type is its exception payload, expressed the same way a func's signature is (params = payload, results always empty).
-type Tag	= Field<'tag', TypeUse>
+type Func		= Field<'func', FuncType> & { locals: WatLocal[]; body: WatInstr[] }
+type Table		= Field<'table', TableType>
+type Memory		= Field<'memory', MemType>
+type Global		= Field<'global', GlobalType> & { init: Instr[] }
+type Tag		= Field<'tag', FuncType>
 
 interface Export	{ type: 'export'; name: string; kind: 'func' | 'table' | 'memory' | 'global' | 'tag'; index: index }
 interface Import	{ type: 'import'; module: string; name: string; desc: Func | Table | Memory | Global | Tag }
-interface Elem		{ type: 'elem'; id?: string; table?: index; offset?: WatInstr[]; init: index[] }
-interface Data		{ type: 'data'; id?: string; memory?: index; offset?: WatInstr[]; init: Uint8Array }
+interface Elem		{ type: 'elem'; id?: string; table?: index; offset?: Instr[]; init: index[] }
+interface Data		{ type: 'data'; id?: string; memory?: index; offset?: Instr[]; init: Uint8Array }
+interface Type		{ type: 'type'; id?: string; desc: SubType }
 
-type ModuleField =
-	| { type: 'type'; id?: string; functype: FuncType }
-	| Func | Table | Memory | Global | Tag | Export | Import | Elem | Data
-	| { type: 'start'; func: index };
+type ModuleField =	{ type: 'start'; func: index } | Func | Table | Memory | Global | Tag | Export | Import | Elem | Data | Type;
 interface Module	{ id?: string; fields: ModuleField[] }
 
 // ===================================================================
@@ -92,15 +79,63 @@ interface Module	{ id?: string; fields: ModuleField[] }
 
 interface MacroDef { params: string[]; body: WatInstr[] }
 
+function expandMacro(ctx: ParseCtx, macro: MacroDef, args: WatInstr[][]): WatInstr[] {
+	if (args.length !== macro.params.length)
+		throw new Error(`expects ${macro.params.length} argument(s), got ${args.length}`);
+
+	const paramSubst	= new Map(macro.params.map((p, i) => [p, args[i]]));
+	const renames		= new Map<string, string>;
+
+	const substInstr = (i: any): WatInstr[] => {
+		if (i.op === '__local' && i.id) {
+			const newid = `${i.id}__${++ctx.macroUid}`;
+			renames.set(i.id, newid);
+			return {...i, id: newid };
+		}
+
+		if (typeof i.localIndex === 'string') {
+			if (paramSubst.has(i.localIndex)) {
+				if (i.op !== 'local.get')
+					throw new Error(`can't ${i.op} parameter '${i.localIndex}' -- parameters are read-only expressions`);
+				return paramSubst.get(i.localIndex)!;
+			}
+			if (renames.has(i.localIndex))
+				return [{ ...i, localIndex: renames.get(i.localIndex) }];
+		}
+		switch (i.op) {
+			case 'block': case 'loop':
+				return [{ ...i, body: i.body.flatMap(substInstr) }];
+			case 'if':
+				return [{ ...i, then: i.then.flatMap(substInstr), else: i.else && i.else.flatMap(substInstr) }];
+			case '__switch': {
+				// A switch key names one of *this* macro's own parameters: resolve it against the
+				// argument bound at this call site. That argument must itself be a bare `$tag` (the
+				// same shorthand `local.get $x` uses for "read local $x") -- a computed expression
+				// has no tag to switch on.
+				const arg = paramSubst.get(i.key);
+				if (!arg || arg.length !== 1 || arg[0].op !== 'local.get' || typeof arg[0].localIndex !== 'string')
+					throw new Error(`switch key '${i.key}' isn't a parameter bound to a bare $tag argument at this call site`);
+				const tag = arg[0].localIndex;
+				for (const arm of i.arms) {
+					if (arm.values.includes(tag))
+						return arm.body.flatMap(substInstr);
+				}
+				throw new Error(`switch '${i.key}' -- no arm matches '${tag}'`);
+			}
+			default:
+				return [i];
+		}
+	};
+	return macro.body.flatMap(substInstr);
+}
+
+
 class ParseCtx {
 	macros			= new Map<string, MacroDef>;
 	literalText		= new WeakMap<object, string>;
 	macroUid		= 0;
 	data			= new Uint8Array(0);
 	dataStrings		= new Map<string, number>;
-	// External, caller-supplied conditional-assembly symbols for `switch` (e.g. target/feature
-	// flags) -- keyed and valued the same $-prefixed way a `switch` key and its arm tags are
-	// written in source, so a resolved define slots into arm.values.includes(...) unchanged.
 	defines			= new Map<string, string|number>();
 
 	constructor(defines?: Record<string, string|number>) {
@@ -137,64 +172,8 @@ class ParseCtx {
 		this.dataStrings.set(value, offset);
 		return offset;
 	}
-
-	expandCall(name: string, args: WatInstr[][]): WatInstr[] {
-		const macro = this.macros.get(name);
-		if (!macro)
-			return [...args.flat(), { op: 'call', funcIndex: name }];
-
-		if (args.length !== macro.params.length)
-			throw new Error(`macro '${name}' expects ${macro.params.length} argument(s), got ${args.length}`);
-
-		const paramSubst	= new Map(macro.params.map((p, i) => [p, args[i]]));
-		// Only named locals need renaming -- an anonymous `(local i32)` has no name a body reference
-		// could collide with, and is left as-is in the locals list below either way.
-		const renames		= new Map<string, string>;
-
-		const substInstr = (i: any): WatInstr[] => {
-			if (i.op === '__local' && i.id) {
-				const newid = `${i.id}__${++this.macroUid}`;
-				renames.set(i.id, newid);
-				return {...i, id: newid };
-			}
-
-			if (typeof i.localIndex === 'string') {
-				if (paramSubst.has(i.localIndex)) {
-					if (i.op !== 'local.get')
-						throw new Error(`macro '${name}': can't ${i.op} parameter '${i.localIndex}' -- parameters are read-only expressions`);
-					return paramSubst.get(i.localIndex)!;
-				}
-				if (renames.has(i.localIndex))
-					return [{ ...i, localIndex: renames.get(i.localIndex) }];
-			}
-			switch (i.op) {
-				case 'block': case 'loop':
-					return [{ ...i, body: i.body.flatMap(substInstr) }];
-				case 'if':
-					return [{ ...i, then: i.then.flatMap(substInstr), else: i.else && i.else.flatMap(substInstr) }];
-				case '__switch': {
-					// A switch key names one of *this* macro's own parameters: resolve it against the
-					// argument bound at this call site. That argument must itself be a bare `$tag` (the
-					// same shorthand `local.get $x` uses for "read local $x") -- a computed expression
-					// has no tag to switch on.
-					const arg = paramSubst.get(i.key);
-					if (!arg || arg.length !== 1 || arg[0].op !== 'local.get' || typeof arg[0].localIndex !== 'string')
-						throw new Error(`macro '${name}': switch key '${i.key}' isn't a parameter bound to a bare $tag argument at this call site`);
-					const tag = arg[0].localIndex;
-					for (const arm of i.arms) {
-						if (arm.values.includes(tag))
-							return arm.body.flatMap(substInstr);
-					}
-					throw new Error(`macro '${name}': switch '${i.key}' -- no arm matches '${tag}'`);
-				}
-				default:
-					return [i];
-			}
-		};
-		return macro.body.flatMap(substInstr);
-	}
-
 }
+
 const Rule = makeRule<ParseCtx>();
 
 // --- Terminals ---
@@ -220,36 +199,42 @@ const idx		= Rules<index>(
 	nat
 );
 
-// funcref/externref aren't ValType values on their own -- ValType's reference-type case is the
-// object shape { ref: HeapType, nullable: boolean } (see wasm.ts's VALTYPE_SWITCH); a bare string
-// here would fall through the binary encoder's discriminator (which only special-cases
-// i32/i64/f32/f64 for the string branch) and silently encode as v128.
-const reftype	= Rules<ValType>(
-	Rule(['funcref'],	(): ValType => ({ ref: 'func', nullable: true })),
-	Rule(['externref'],	(): ValType => ({ ref: 'extern', nullable: true })),
-	// exnref: the type a `catch_ref`/`catch_all_ref` clause's re-pushed exception reference has.
-	Rule(['exnref'],		(): ValType => ({ ref: 'exn', nullable: true })),
+const heap_type = Rules<HeapType>(
+	Rule([OneOf([...ABSTRACT_HEAP_NAMES])], $ => $[0] as HeapType),
+	Rule([idx], $ => $[0] as HeapType),
 );
-const valtype	= Rules<ValType>(
+
+const ref_type	= Rules<ValType>(
+	Rule(['(', 'ref', heap_type, ')'],			$ => ({ ref: $[2], nullable: false })),
+	Rule(['(', 'ref', 'null', heap_type, ')'],	$ => ({ ref: $[3], nullable: true })),
+	Rule(['exnref'],		() => ({ ref: 'exn',		nullable: true })),
+	Rule(['anyref'],		() => ({ ref: 'any',		nullable: true })),
+	Rule(['eqref'],			() => ({ ref: 'eq',			nullable: true })),
+//	Rule(['dataref'],		() => ({ ref: 'data',		nullable: true })),
+	Rule(['arrayref'],		() => ({ ref: 'array',		nullable: true })),
+	Rule(['funcref'],		() => ({ ref: 'func',		nullable: true })),
+	Rule(['externref'],		() => ({ ref: 'extern',		nullable: true })),
+	Rule(['nullref'],		() => ({ ref: 'none',		nullable: true })),
+	Rule(['nullfuncref'],	() => ({ ref: 'nofunc',		nullable: true })),
+	Rule(['nullexternref'],	() => ({ ref: 'noextern',	nullable: true })),
+	Rule(['i31ref'],		() => ({ ref: 'i31',		nullable: false }))
+);
+const val_type	= Rules<ValType>(
 	OneOf(['i32', 'i64', 'f32', 'f64', 'v128']),
-	reftype,
+	ref_type,
 );
 
-const heaptype = Rules(
-	Rule([OneOf(['func', 'extern', 'any', 'eq', 'i31', 'struct', 'array', 'none', 'noextern', 'nofunc', 'exn', 'noexn'])], $ => $[0]),
-	Rule([idx], $ => $[0]),
-);
 
-const param = Rules<{id?: string; type: ValType}>(
-	Rule(['(', 'param', valtype, ')'],		$ => ({ type: $[2] })),
-	Rule(['(', 'param', id, valtype, ')'],	$ => ({ id: $[2], type: $[3] })),
+const param = Rules<ParamType>(
+	Rule(['(', 'param', val_type, ')'],		$ => ({ type: $[2], id: undefined })),
+	Rule(['(', 'param', id, val_type, ')'],	$ => ({ id: $[2], type: $[3] })),
 );
 const result = Rules<ValType>(
-	Rule(['(', 'result', valtype, ')'],		$ => $[2])
+	Rule(['(', 'result', val_type, ')'],		$ => $[2])
 );
 
-const functype = Rules<FuncType>(
-	Rule(['(', 'func', MaybeList(param), MaybeList(result), ')'],	$ => ({ params: $[2], results: $[3] })),
+const func_type = Rules<FuncType>(
+	Rule([Maybe(Rules(Rule(['(', 'type', idx, ')'], $ => $[2]))), MaybeList(param), MaybeList(result)],	$ => ({ typeIdx: $[0], params: $[1], results: $[2] })),
 );
 
 const limits = Rules<Limits>(
@@ -257,20 +242,15 @@ const limits = Rules<Limits>(
 	Rule([nat, nat],	$ => ({ min: $[0], max: $[1] })),
 );
 
-// wasm.ts GlobalType = { type: ValType, mut: boolean }
-const globaltype = Rules<GlobalType>(
-	Rule([valtype],						$ => ({ type: $[0], mut: false })),
-	Rule(['(', 'mut', valtype, ')'],	$ => ({ type: $[2], mut: true })),
+const global_type = Rules<GlobalType>(
+	Rule([val_type],						$ => ({ type: $[0], mut: false })),
+	Rule(['(', 'mut', val_type, ')'],	$ => ({ type: $[2], mut: true })),
 );
 
-// wasm.ts TableType = { reftype: ValType, limits: { min, max? } }
-const tabletype = Rules<TableType>(
-	Rule([limits, reftype],				$ => ({ reftype: $[1], limits: $[0] })),
+const table_type = Rules<TableType>(
+	Rule([limits, ref_type],				$ => ({ reftype: $[1], limits: $[0] } as TableType)),
 );
 
-const typeuse = Rules<TypeUse>(
-	Rule([Maybe(Rules(Rule(['(', 'type', idx, ')'], $ => $[2]))), MaybeList(param), MaybeList(result)],	$ => ({ typeIdx: $[0], params: $[1], results: $[2] })),
-);
 
 // --- Instructions ---
 
@@ -296,9 +276,9 @@ const instrs	= Rules<WatInstr[]>(Rule([MaybeList(Forward<WatInstr[]>(() => instr
 // itself folded (confirmed by direct testing) -- so `(result t)` clauses are folded into the same
 // merged item list as the body instrs instead, same trick `func_body_item` uses to merge header
 // items and instrs, and (for `try_table`) catch clauses too.
-type BlockItem = { blockType: ValType } | { instrs: WatInstr[] };
+type BlockItem = { blockType: ValType[] } | { instrs: WatInstr[] };
 const block_item = Rules<BlockItem>(
-	Rule(['(', 'result', valtype, ')'],				$ => ({ blockType: $[2] })),
+	Rule(['(', 'result', List(val_type), ')'],			$ => ({ blockType: $[2] })),
 	Rule([Forward<WatInstr[]>(() => instr)],			$ => ({ instrs: $[0] })),
 );
 const block_body = Rules<{ blockType: ValType[]; body: WatInstr[] }>(
@@ -307,7 +287,7 @@ const block_body = Rules<{ blockType: ValType[]; body: WatInstr[] }>(
 		const body: WatInstr[] = [];
 		for (const item of $[0]) {
 			if ('blockType' in item)
-				blockType.push(item.blockType);
+				blockType.push(...item.blockType);
 			else
 				body.push(...item.instrs);
 		}
@@ -318,8 +298,8 @@ const block_body = Rules<{ blockType: ValType[]; body: WatInstr[] }>(
 // `try_table`'s catch clauses (exception-handling proposal): each names a branch target (`idx`, resolved the
 // same way a `br`'s label is), tag-typed ones also name the tag whose payload they deliver.
 const catch_clause = Rules<CatchClause>(
-	Rule(['(', 'catch', idx, idx, ')'],		$ => ({ op: 'catch', tagIndex: $[2], label: $[3] })),
-	Rule(['(', 'catch_ref', idx, idx, ')'],	$ => ({ op: 'catch_ref', tagIndex: $[2], label: $[3] })),
+	Rule(['(', 'catch', idx, idx, ')'],			$ => ({ op: 'catch', tagIndex: $[2], label: $[3] })),
+	Rule(['(', 'catch_ref', idx, idx, ')'],		$ => ({ op: 'catch_ref', tagIndex: $[2], label: $[3] })),
 	Rule(['(', 'catch_all', idx, ')'],			$ => ({ op: 'catch_all', label: $[2] })),
 	Rule(['(', 'catch_all_ref', idx, ')'],		$ => ({ op: 'catch_all_ref', label: $[2] })),
 );
@@ -336,7 +316,7 @@ const try_table_body = Rules<{ blockType: ValType[]; catches: CatchClause[]; bod
 		const body: WatInstr[] = [];
 		for (const item of $[0]) {
 			if ('blockType' in item)
-				blockType.push(item.blockType);
+				blockType.push(...item.blockType);
 			else if ('catch' in item)
 				catches.push(item.catch);
 			else
@@ -357,10 +337,10 @@ const plain_instr = Rules<WatInstr>(
 	Rule(['try_table', maybe_id, try_table_body, 'end', maybe_id],
 		$ => ({ op: 'try_table', blockType: $[2].blockType, catches: $[2].catches, body: $[2].body, label: checkLabel($[1], $[4]) })),
 	Rule(['throw', idx],											$ => ({ op: 'throw', tagIndex: $[1] })),
-	Rule(['throw_ref'],											_ => ({ op: 'throw_ref' })),
+	Rule(['throw_ref'],												_ => ({ op: 'throw_ref' })),
 
 	Rule(['br_table', List(idx)],									$ => ({ op: 'br_table', labels: $[1].slice(0, -1), default: $[1].at(-1)! })),
-	Rule(['call_indirect', typeuse],								$ => ({ op: 'call_indirect', typeIndex: $[1].typeIndex ?? 0, tableIndex: 0 })),
+	Rule(['call_indirect', func_type],								$ => ({ op: 'call_indirect', typeIndex: $[1].typeIndex ?? 0, tableIndex: 0 })),
 
 	Rule(['memory.size'],											_ => ({ op: 'memory.size', imm: 0 })),
 	Rule(['memory.grow'],											_ => ({ op: 'memory.grow', imm: 0 })),
@@ -396,10 +376,17 @@ const plain_instr = Rules<WatInstr>(
 	Rule([termOneOf(Object.values(FB_OPS.TYPE_SEG.DATA)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], dataIndex: $[2] })),
 	Rule([termOneOf(Object.values(FB_OPS.TYPE_SEG.ELEM)), idx, idx], $ => ({ op: $[0], typeIndex: $[1], elemIndex: $[2] })),
 	Rule([termOneOf(Object.values(FB_OPS.TYPE2)), idx, idx],		$ => ({ op: $[0], dst: $[1], src: $[2] })),
-	Rule(['ref.test', '(', 'ref', 'null', heaptype, ')'],			$ => ({ op: 'ref.test', typeIndex: $[4], nullable: true } as WatInstr)),
-	Rule(['ref.test', '(', 'ref', heaptype, ')'],					$ => ({ op: 'ref.test', typeIndex: $[3] } as WatInstr)),
-	Rule(['ref.cast', '(', 'ref', 'null', heaptype, ')'],			$ => ({ op: 'ref.cast', typeIndex: $[4], nullable: true } as WatInstr)),
-	Rule(['ref.cast', '(', 'ref', heaptype, ')'],					$ => ({ op: 'ref.cast', typeIndex: $[3] } as WatInstr)),
+	Rule(['ref.null', heap_type],									$ => ({ op: 'ref.null', typeIndex: $[1] } as WatInstr)),
+	Rule(['ref.test', '(', 'ref', 'null', heap_type, ')'],			$ => ({ op: 'ref.test', typeIndex: $[4], nullable: true } as WatInstr)),
+	Rule(['ref.test', '(', 'ref', heap_type, ')'],					$ => ({ op: 'ref.test', typeIndex: $[3] } as WatInstr)),
+	Rule(['ref.cast', '(', 'ref', 'null', heap_type, ')'],			$ => ({ op: 'ref.cast', typeIndex: $[4], nullable: true } as WatInstr)),
+	Rule(['ref.cast', '(', 'ref', heap_type, ')'],					$ => ({ op: 'ref.cast', typeIndex: $[3] } as WatInstr)),
+	// `flags` packs both operand types' nullability into one byte (bit 0 = `from`, bit 1 = `to`) --
+	// see wasm.ts's own `toWAT` serializer for `br_on_cast(_fail)`, which decodes it the same way.
+	// `ref_type`'s grammar only ever produces the `{ref,nullable}` shape (never a bare num/vec type) --
+	// this narrows what its broader `ValType` return type admits, same escape hatch as `as WatInstr`.
+	Rule(['br_on_cast', idx, ref_type, ref_type],					$ => { const [from, to] = [$[2], $[3]] as { ref: HeapType; nullable: boolean }[]; return { op: 'br_on_cast', label: $[1], flags: (from.nullable ? 1 : 0) | (to.nullable ? 2 : 0), from: from.ref, to: to.ref } as WatInstr; }),
+	Rule(['br_on_cast_fail', idx, ref_type, ref_type],				$ => { const [from, to] = [$[2], $[3]] as { ref: HeapType; nullable: boolean }[]; return { op: 'br_on_cast_fail', label: $[1], flags: (from.nullable ? 1 : 0) | (to.nullable ? 2 : 0), from: from.ref, to: to.ref } as WatInstr; }),
 
 	// 0xFD-prefixed (SIMD)
 	Rule([termOneOf(Object.values(SIMD_OPS.NONE))], 				$ => ({ op: $[0] } as WatInstr)),
@@ -413,8 +400,8 @@ const plain_instr = Rules<WatInstr>(
 );
 
 const local = Rules<WatLocal>(
-	Rule(['(', 'local', valtype, ')'],			$ => ({ id: undefined, count: 1, type: $[2] })),
-	Rule(['(', 'local', id, valtype, ')'],		$ => ({ id: $[2], count: 1, type: $[3] })),
+	Rule(['(', 'local', val_type, ')'],			$ => ({ id: undefined, count: 1, type: $[2] })),
+	Rule(['(', 'local', id, val_type, ')'],		$ => ({ id: $[2], count: 1, type: $[3] })),
 	Rule(['(', 'local', id, id, ')'],			$ => ({ id: $[2], count: 1, type: { typeParam: $[3] } })),
 );
 
@@ -498,9 +485,18 @@ const instr = Rules<WatInstr[]>(self => {
 
 	// Macro call / implicit call: '(' $name arg* ')'. Any locals the macro declares for itself stay embedded as `__local` markers in the returned WatInstr[]
 	// -- expandCall's substInstr only renames them for hygiene, it doesn't strip them out -- so they flow on with the rest of the stream to whichever enclosing collectAsmItems/func_field call ends up hoisting them.
-	Rule(['(', id, MaybeList(self), ')'], ($, ctx) => ctx.expandCall($[1], $[2])),
+	Rule(['(', id, MaybeList(self), ')'], ($, ctx) => {
+		const macro = ctx.macros.get($[1]);
+		if (!macro)
+			return [...$[2].flat(), { op: 'call', funcIndex: $[1] }];
+		try {
+			return expandMacro(ctx, macro, $[2]);
+		} catch (e) {
+			throw new Error(`macro '${$[1]}': ${e}`);
+		}
+	}),
 
-	Rule(['let', id, valtype], $ => [{ op: '__local', id: $[1], count: 1, type: $[2]}, { op: 'local.set', localIndex: $[1]}]),
+	Rule(['let', id, val_type], $ => [{ op: '__local', id: $[1], count: 1, type: $[2]}, { op: 'local.set', localIndex: $[1]}]),
 
 	Rule(['(', 'switch', id, MaybeList(switch_arm), ')'], ($, ctx) => {
 		const key = $[2];
@@ -534,16 +530,16 @@ const func_header_item = Rules<FuncHeaderItem>(
 	Rule([inline_export],						$ => ({ kind: 'export', name: $[0] })),
 	Rule([inline_import],						$ => ({ kind: 'import', ...$[0] })),
 	Rule(['(', 'type', idx, ')'],				$ => ({ kind: 'type', typeIdx: $[2] })),
-	Rule(['(', 'param', valtype, ')'],			$ => ({ kind: 'param', type: $[2] })),
-	Rule(['(', 'param', id, valtype, ')'],		$ => ({ kind: 'param', id: $[2], type: $[3] })),
-	Rule(['(', 'result', valtype, ')'],			$ => ({ kind: 'result', type: $[2] })),
+	Rule(['(', 'param', val_type, ')'],			$ => ({ kind: 'param', type: $[2] })),
+	Rule(['(', 'param', id, val_type, ')'],		$ => ({ kind: 'param', id: $[2], type: $[3] })),
+	Rule(['(', 'result', val_type, ')'],			$ => ({ kind: 'result', type: $[2] })),
 );
 
 function collectFuncItems(items: FuncBodyItem[]) {
 	const exp: 		string[] = [];
 	let imp:		Imp | undefined;
 	let typeIndex:	index | undefined;
-	const params:	{ id?: string; type: ValType }[] = [];
+	const params:	ParamType[] = [];
 	const results:	ValType[] = [];
 	const instr:	WatInstr[][] = [];
 
@@ -608,9 +604,9 @@ const func_field = Rules<Func>(
 );
 
 const table_field = Rules<Table>(
-	Rule(['(', 'table', maybe_id, inline_export, tabletype, ')'],	$ => ({ type: 'table', id: $[2], export: [$[3]], value: $[4] })),
-	Rule(['(', 'table', maybe_id, inline_import, tabletype, ')'],	$ => ({ type: 'table', id: $[2], import: $[3], value: $[4] })),
-	Rule(['(', 'table', maybe_id, tabletype, ')'], 					$ => ({ type: 'table', id: $[2], value: $[3] })),
+	Rule(['(', 'table', maybe_id, inline_export, table_type, ')'],	$ => ({ type: 'table', id: $[2], export: [$[3]], value: $[4] })),
+	Rule(['(', 'table', maybe_id, inline_import, table_type, ')'],	$ => ({ type: 'table', id: $[2], import: $[3], value: $[4] })),
+	Rule(['(', 'table', maybe_id, table_type, ')'], 					$ => ({ type: 'table', id: $[2], value: $[3] })),
 );
 
 const memory_field = Rules<Memory>(
@@ -638,20 +634,20 @@ const tag_field = Rules<Tag>(
 // call). Still returns `WatInstr[]`, not `Instr[]`: `toWasm`'s `resolveInstrs` (index-name resolution,
 // and for block/loop/if/try_table, the pre-resolution `ValType[]` blockType -- see `WatInstr`'s own
 // comment) still needs to run on these, same as any other body.
-function assertResolved(items: WatInstr[], where: string): WatInstr[] {
+function assertResolved(items: WatInstr[], where: string): Instr[] {
 	for (const i of items) {
 		if (i.op === '__local')
 			throw new Error(`${where}: can't use a macro or switch arm that declares its own local ('${i.id ?? '(anonymous)'}') here -- only func/macro bodies can hold locals`);
 		if (i.op === '__switch')
 			throw new Error(`${where}: switch '${i.key}' is unresolved -- not a ctx.defines entry, and a constant expression has no enclosing macro call to bind it to a $tag argument`);
 	}
-	return items;
+	return items as Instr[];
 }
 
 const global_field = Rules<Global>(
-	Rule(['(', 'global', maybe_id, inline_export, globaltype, instrs, ')'], $	=> ({ type: 'global', id: $[2], export: [$[3]], value: $[4], init: assertResolved($[5], 'global') })),
-	Rule(['(', 'global', maybe_id, inline_import, globaltype, ')'],			$	=> ({ type: 'global', id: $[2], import: $[3], value: $[4], init: [] })),
-	Rule(['(', 'global', maybe_id, globaltype, instrs, ')'],				$	=> ({ type: 'global', id: $[2], value: $[3], init: assertResolved($[4], 'global') })),
+	Rule(['(', 'global', maybe_id, inline_export, global_type, instrs, ')'], $	=> ({ type: 'global', id: $[2], export: [$[3]], value: $[4], init: assertResolved($[5], 'global') })),
+	Rule(['(', 'global', maybe_id, inline_import, global_type, ')'],			$	=> ({ type: 'global', id: $[2], import: $[3], value: $[4], init: [] })),
+	Rule(['(', 'global', maybe_id, global_type, instrs, ')'],				$	=> ({ type: 'global', id: $[2], value: $[3], init: assertResolved($[4], 'global') })),
 );
 
 const export_field = Rules<Export>(
@@ -660,9 +656,9 @@ const export_field = Rules<Export>(
 
 const import_desc = Rules<Func | Table | Memory | Global | Tag>(
 	Rule(['(', 'func',   maybe_id, func_header, ')'],				$ => ({ type: 'func',	id: $[2], value: $[3].typeuse, locals: [], body: [] })),
-	Rule(['(', 'table',  maybe_id, tabletype,  ')'],				$ => ({ type: 'table',	id: $[2], value: $[3] })),
+	Rule(['(', 'table',  maybe_id, table_type,  ')'],				$ => ({ type: 'table',	id: $[2], value: $[3] })),
 	Rule(['(', 'memory', maybe_id, limits,     ')'],				$ => ({ type: 'memory', id: $[2], value: $[3] })),
-	Rule(['(', 'global', maybe_id, globaltype, ')'],				$ => ({ type: 'global', id: $[2], value: $[3], init: [] })),
+	Rule(['(', 'global', maybe_id, global_type, ')'],				$ => ({ type: 'global', id: $[2], value: $[3], init: [] })),
 	Rule(['(', 'tag',    maybe_id, func_header, ')'],				$ => ({ type: 'tag',	id: $[2], value: $[3].typeuse })),
 );
 
@@ -675,13 +671,13 @@ const import_desc = Rules<Func | Table | Memory | Global | Tag>(
 // swallowed as elem's own index list rather than i32.add's operands -- syntactically legal,
 // semantically nonsense, and exactly the kind of position that forced NAT into the follow set of
 // every instr-ending state in the grammar (see the retyping/shortcut rules above).
-const offset_expr = Rules<WatInstr[]>(
+const offset_expr = Rules<Instr[]>(
 	Rule(['(', 'offset', instrs, ')'],	$ => assertResolved($[2], 'offset')),
 	Rule(['(', instr, ')'],				$ => assertResolved($[1], 'offset')),
 );
 
 const elem_field = Rules<Elem>(
-	Rule(['(', 'elem', maybe_id, '(', 'table', idx, ')', offset_expr, reftype, MaybeList(idx), ')'],	$ => ({ type: 'elem', id: $[2], table: $[5], offset: $[7], init: $[9] })),
+	Rule(['(', 'elem', maybe_id, '(', 'table', idx, ')', offset_expr, ref_type, MaybeList(idx), ')'],	$ => ({ type: 'elem', id: $[2], table: $[5], offset: $[7], init: $[9] })),
 	Rule(['(', 'elem', maybe_id, offset_expr, MaybeList(idx), ')'],										$ => ({ type: 'elem', id: $[2], offset: $[3], init: $[4] })),
 	Rule(['(', 'elem', maybe_id, MaybeList(idx), ')'],													$ => ({ type: 'elem', id: $[2], init: $[3] })),
 );
@@ -712,8 +708,57 @@ const macro_field = Rules<undefined>(
 	}),
 );
 
+const storage_type = Rules<StorageType>(
+	OneOf(['i8', 'i16']),
+	val_type,
+);
+
+const field_type = Rules<FieldType>(
+	Rule(['(', 'field', maybe_id, storage_type, ')'],						$ => ({ type: $[3], mut: false })),
+	Rule(['(', 'field', maybe_id, '(', 'mut', storage_type, ')', ')'],	$ => ({ type: $[5], mut: true })),
+);
+
+// A plain `MaybeList(param), MaybeList(result)` sequence -- as `func_type` uses inline -- runs into a
+// state-merging conflict once it's wrapped in its own `( func ... )`: that prefix is shared with
+// `func_field`'s and `import_desc`'s own `(func ...)` alternatives, and the merged LALR state can't
+// keep the "still matching params" vs "params done, now matching results" transition straight (an
+// empty param list followed directly by a result silently failed to parse). Folding both into one
+// per-item-tagged list, the same trick `func_header_item`/`collectFuncItems` use, sidesteps it.
+type ParamOrResult = { kind: 'param'; id?: string; type: ValType } | { kind: 'result'; type: ValType };
+
+const param_or_result = Rules<ParamOrResult>(
+	Rule(['(', 'param', val_type, ')'],		$ => ({ kind: 'param', type: $[2] })),
+	Rule(['(', 'param', id, val_type, ')'],	$ => ({ kind: 'param', id: $[2], type: $[3] })),
+	Rule(['(', 'result', val_type, ')'],		$ => ({ kind: 'result', type: $[2] })),
+);
+
+const comp_type = Rules<CompType>(
+	Rule(['(', 'func', MaybeList(param_or_result), ')'],	$ => {
+		const params: ParamType[] = [];
+		const results: ValType[] = [];
+		for (const item of $[2]) {
+			if (item.kind === 'param')
+				params.push({ id: item.id, type: item.type });
+			else
+				results.push(item.type);
+		}
+		return { kind: 'func', params, results };
+	}),
+	Rule(['(', 'struct', MaybeList(field_type), ')'],				$ => ({ kind: 'struct', fields: $[2] })),
+	Rule(['(', 'array', field_type, ')'],							$ => ({ kind: 'array', field: $[2] })),
+);
+
+// `sub`'s supertype list is left as raw `idx` (name-or-number) here, and the whole thing cast to the
+// real `SubType` -- both it and any named/self-referencing heap type nested in `comp_type` only get
+// resolved in `WasmModule.resolve()`, once every `(type ...)` in the module is assembled.
+const sub_type = Rules<SubType>(
+	Rule(['(', 'sub', 'final', MaybeList(idx), comp_type, ')'],	$ => ({ supertypes: $[3], type: $[4], final: true } as SubType)),
+	Rule(['(', 'sub', MaybeList(idx), comp_type, ')'],				$ => ({ supertypes: $[2], type: $[3], final: false } as SubType)),
+	comp_type,
+);
+
 const module_field = Rules<ModuleField | undefined>(
-	Rule(['(', 'type', maybe_id, functype, ')'],		$ => ({ type: 'type', id: $[2], functype: $[3] })),
+	Rule(['(', 'type', maybe_id, sub_type, ')'],		$ => ({ type: 'type', id: $[2], desc: $[3] })),
 	func_field,
 	table_field,
 	memory_field,
@@ -745,7 +790,6 @@ const SKIP = [/\s+/, /;;[^\n]*/, /\(;[^]*?;\)/];
 export const parser = makeCachedParser({
 	skip: SKIP,
 	start: Rules<Module>(
-
 		Rule(['(', 'module', maybe_id, MaybeList(module_field), ')'],	($, ctx) => ({ id: $[2], fields: definedFields($[3], ctx) })),
 		Rule([MaybeList(module_field)],									($, ctx) => ({ fields: definedFields($[0], ctx) })),
 	)
@@ -786,247 +830,145 @@ export function parseAsmBody(src: string, defines?: Record<string, string|number
 //	toWasm
 //-----------------------------------------------------------------------------
 
+// Nothing here resolves a single `$name` any more -- it just lowers the WAT AST into the shape
+// `WasmModule.resolve()` expects (real wasm.ts types, `$name`s left wherever an index goes), and lets
+// that one call at the end do every bit of name resolution: type-section supertypes/nested heap
+// types, table/global value types, per-function locals + bodies, and every constant expression
+// (global inits, elem/data offsets) alike -- see its own doc comment in wasm.ts.
 export function toWasm(mod: Module): WasmModule {
-	const rawExports: { name: string; kind: 'func' | 'table' | 'memory' | 'global' | 'tag'; index: any }[] = [];
-	const imports: WasmImport[] = [];
+	const rawExports:	{ name: string; kind: 'func' | 'table' | 'memory' | 'global' | 'tag'; index: index }[] = [];
+	const imports:		WasmImport[]	= [];
+	const typesList:	SubType[]		= [];
 
-	class IDTable {
-		ids:	Record<string, number> = {};
-		num	= 0;
-		add(id: string|undefined, count = 1) {
-			if (id !== undefined)
-				this.ids[id] = this.num;
-			this.num += count;
-		}
-		res(v: any, d?: number) {
-			if (v === undefined && d !== undefined)
-				return d;
-			if (typeof v === 'number')
-				return v;
-			if (v && this.ids[v] !== undefined)
-				return this.ids[v];
-			throw new Error(`no such id: ${v}`);
-		}
-	}
-	class Container<T extends Func|Table|Memory|Global|Tag> extends IDTable {
-		entries:	T[] = [];
-		addExp(item: T) {
-			item.export?.forEach(e => rawExports.push({ name: e, kind: item.type, index: this.num }));
-		}
-		addImp(imp: Import, desc: any) {
-			const item = imp.desc as T;
-			imports.push({ module: imp.module, name: imp.name, desc });
-			this.addExp(item);
-			this.add(item.id);
-		}
-		addEntry(item: T) {
-			this.entries.push(item);
-			this.addExp(item);
-			this.add(item.id);
-		}
-	}
-
-	const types		= new IDTable;
-	const elems		= new IDTable;
-	const datas		= new IDTable;
-	const funcs		= new Container<Func>;
-	const tables	= new Container<Table>;
-	const memories	= new Container<Memory>;
-	const globals	= new Container<Global>;
-	const tags		= new Container<Tag>;
-	const typesList: SubType[] = [];
-
-	const allTables = {
-		func:	funcs,
-		table:	tables,
-		memory:	memories,
-		global:	globals,
-		tag:	tags,
+	const own = {
+		func:		[] as Func[],
+		table:		[] as Table[],
+		memory:		[] as Memory[],
+		global:		[] as Global[],
+		tag:		[] as Tag[],
 	};
 
-	function getFuncTypeIdx(tu: TypeUse): number {
-		if (tu.typeIndex !== undefined)
-			return types.res(tu.typeIndex);
-		const sig = {kind: 'func', params: tu.params, results: tu.results, id: ''} as const;
-		let idx = typesList.findIndex(t => 'kind' in t && t.kind === 'func' && equalFuncSig(t, sig));
-		if (idx < 0) {
-			idx = typesList.length;
-			typesList.push(sig);
-		}
-		return idx;
+	// Only used to give an *anonymous* inline `(export ...)` a real numeric index immediately --
+	// `resolve()` handles every *named* cross-reference generically once the whole module is
+	// assembled, but an anonymous entity has no name for it to look up later. Assumes a kind's
+	// imports textually precede its own declarations here, same as every real .wat file already does
+	// (and the same assumption this file's lowering has always made).
+	const counter = { func: 0, table: 0, memory: 0, global: 0, tag: 0 };
+	function declare(kind: keyof typeof counter, item: { id?: string; export?: string[] }) {
+		const idx = counter[kind]++;
+		item.export?.forEach(e => rawExports.push({ name: e, kind, index: item.id ?? idx }));
 	}
 
-	function resolveField(i: any, name: string, table: {res: (v: any) => number}) {
-		if (name in i)
-			i[name]	= table.res(i[name]);
+	function addImport(f: Import, desc: any) {
+		declare(f.desc.type, f.desc);
+		imports.push({ module: f.module, name: f.name, desc: {kind: f.desc.type, id: f.desc.id, ...desc}});
+	}
+
+	// Explicit `(type $t)` typeuse: left as the raw name/index, resolved later. No explicit type:
+	// always push a fresh type-section entry rather than deduping via `wasmGetFuncTypeIdx` -- a
+	// function's own param names live only on its own type entry (wasm.ts has nowhere else to keep
+	// per-function param names separate from the type they reference), so merging two structurally
+	// equal but differently-named signatures would silently lose one function's names.
+	function getFuncTypeIdx(tu: FuncType): index {
+		return tu.typeIndex !== undefined ? tu.typeIndex : typesList.push({ kind: 'func', params: tu.params, results: tu.results }) - 1;
 	}
 
 	// A `$T`-typed local only ever originates from a switch arm (see `WatLocal`'s own comment) -- one
 	// still carrying it here means whatever `switch` produced it was never resolved against a concrete
 	// type (only `instantiateAsmBody`, an inline-asm-only pass, ever does that), a real authoring error
 	// rather than something to silently pass through to the binary encoder.
-	function concreteLocalType(l: WatLocal): ValType {
-		if (typeof l.type === 'object' && 'typeParam' in l.type)
-			throw new Error(`local '${l.id ?? '(anonymous)'}': uninstantiated '$${l.type.typeParam}' type -- a switch arm's own $T-typed local only resolves via instantiateAsmBody (inline asm), never in a real module`);
-		return l.type;
+	function concreteLocalType(local: WatLocal): ValType {
+		if (typeof local.type === 'object' && 'typeParam' in local.type)
+			throw new Error(`local '${local.id ?? '(anonymous)'}': uninstantiated '$${local.type.typeParam}' type -- a switch arm's own $T-typed local only resolves via instantiateAsmBody (inline asm), never in a real module`);
+		return local.type;
 	}
 
-	// 0 results -> void, 1 -> that valtype directly (both encode inline), 2+ needs a synthesized/deduped
-	// anonymous func type referenced by index -- the only way wasm's binary format expresses a
-	// multi-value blocktype (there's no direct "list of results" encoding for it).
-	function resolveBlockType(bt: ValType[]) {
-		return bt.length === 0 ? undefined : bt.length === 1 ? bt[0] : { typeIndex: getFuncTypeIdx({ params: [], results: bt }) };
-	}
-
-	function resolveInstr(i: Exclude<WatInstr, SwitchPlaceholder | { op: '__local' }>, locals: IDTable, stk: (string | undefined)[]): Instr {
-		const op		= i.op;
-		const labels	= { res: (v: any) => {
-			if (typeof v === 'number')
-				return v;
-			const i = stk.lastIndexOf(v);
-			return i >= 0 ? stk.length - 1 - i : (v ? parseInt(String(v).replace(/^\$/, '')) || 0 : 0);
-		}};
-		switch (op) {
-			case 'block': case 'loop': case 'if': {
-				const nStk = [...stk, i.label];
-				const blockType = resolveBlockType(i.blockType);
-				return op === 'if'
-					? {op, blockType, then: resolveInstrs(i.then, locals, nStk), else: i.else && resolveInstrs(i.else, locals, nStk), label: i.label}
-					: {op, blockType, body: resolveInstrs(i.body, locals, nStk), label: i.label};
-			}
-			case 'br_table':		return {...i, labels: i.labels.map(l => labels.res(l)), default: labels.res(i.default) };
-//			case 'call_indirect':	return {...i, typeIndex: types.res(i.typeIndex), tableIndex: tables.res(i.tableIndex) } as Instr;
-			case 'br_on_cast':
-			case 'br_on_cast_fail':	return {...i, label: labels.res(i.label), from: types.res(i.from), to: types.res(i.to) };
-			case 'memory.init':		return {...i, seg: datas.res(i.seg), target: memories.res(i.target)};
-			case 'memory.copy':
-			case 'memory.fill':		return {...i, seg: memories.res(i.seg), target: memories.res(i.target)};
-			case 'table.init':		return {...i, seg: elems.res(i.seg), target: tables.res(i.target)};
-			case 'table.copy':		return {...i, seg: tables.res(i.seg), target: tables.res(i.target)};
-
-			// Catch labels resolve against the *enclosing* `stk` (same as a `br` written right before
-			// `try_table`, not inside it) -- only the fallthrough `body` sees `nStk` with try_table's own label pushed.
-			case 'try_table': {
-				return {
-					op, label: i.label,
-					blockType: resolveBlockType(i.blockType),
-					catches: i.catches.map(c => c.op === 'catch_all' || c.op === 'catch_all_ref'
-						? { ...c, label: labels.res(c.label) }
-						: { ...c, tagIndex: tags.res(c.tagIndex), label: labels.res(c.label) }
-					),
-					body: resolveInstrs(i.body, locals, [...stk, i.label]),
-				};
-			}
-
-			default: {
-				const resI = { ...i };
-				resolveField(resI, 'localIndex',	locals);
-				resolveField(resI, 'globalIndex',	globals);
-				resolveField(resI, 'tableIndex',	tables);
-				resolveField(resI, 'funcIndex', 	funcs);
-				resolveField(resI, 'label',			labels);
-				resolveField(resI, 'typeIndex',		types);
-				resolveField(resI, 'dst',			types);
-				resolveField(resI, 'src',			types);
-				resolveField(resI, 'elemIndex',		elems);
-				resolveField(resI, 'dataIndex',		datas);
-				resolveField(resI, 'tagIndex',		tags);
-				return resI;
-			}
-		}
-	}
-
-	function resolveInstrs(instrs: WatInstr[], locals = new IDTable, stk: (string | undefined)[] = []): Instr[] {
-		const result: Instr[] = [];
-		instrs.forEach(i => {
-			if (i.op ===  '__switch')
-				// Reached only if `switch '${i.key}'` was never resolved: not a known ctx.defines entry
-				// at parse time, and not (or not correctly) bound via a macro call's substInstr pass.
+	// Strips the two synthetic WAT-only markers out of a func body: `__local` (a macro/switch-arm's
+	// own local declaration, discovered mid-body instead of up front, but sharing the same index
+	// space as the func's own declared locals -- hoisted into the returned `locals` list so `resolve()`
+	// sees it too) and `__switch` (only ever left behind by a truly unresolved conditional-assembly
+	// key). Doesn't recurse into block/loop/if/try_table bodies -- neither marker is expected to
+	// survive macro expansion nested that deep.
+	function stripMarkers(instrs: WatInstr[]): { body: Instr[]; locals: WatLocal[] } {
+		const locals: WatLocal[] = [];
+		const body: Instr[] = [];
+		for (const i of instrs) {
+			if (i.op === '__switch')
 				throw new Error(`switch '${i.key}': unresolved -- not a ctx.defines entry, and not inside a macro call binding it to a $tag argument`);
-			if (i.op ===  '__local')
-				locals.add(i.id, i.count);
+			if (i.op === '__local')
+				locals.push({ count: i.count, type: i.type, id: i.id });
 			else
-				result.push(resolveInstr(i, locals, stk));
-		});
-		return result;
+				body.push(i as Instr);
+		}
+		return { body, locals };
 	}
 
-	for (const f of mod.fields) {
-		if (f.type === 'type') {
-			const idx = typesList.length;
-			typesList.push({ kind: 'func', params: f.functype.params, results: f.functype.results, id: f.id });
-			if (f.id)
-				types.ids[f.id] = idx;
-		}
-	}
+	for (const f of mod.fields)
+		if (f.type === 'type')
+			typesList.push({ ...f.desc, id: f.id });
 
 	for (const f of mod.fields) {
 		switch (f.type) {
-			case 'import': {
+			case 'import':
 				switch (f.desc.type) {
-					case 'func':	funcs.addImp(f,		{ kind: 'func',		typeIndex: getFuncTypeIdx(f.desc.value) }); break;
-					case 'table':	tables.addImp(f, 	{ kind: 'table',	type: f.desc.value }); break;
-					case 'memory':	memories.addImp(f,	{ kind: 'memory',	type: f.desc.value }); break;
-					case 'global':	globals.addImp(f,	{ kind: 'global',	type: f.desc.value }); break;
-					case 'tag':		tags.addImp(f,		{ kind: 'tag', attribute: 0, typeIndex: getFuncTypeIdx(f.desc.value) }); break;
+					case 'func':	addImport(f, { typeIndex: getFuncTypeIdx(f.desc.value) }); break;
+					case 'table':	addImport(f, { type: f.desc.value }); break;
+					case 'memory':	addImport(f, { type: f.desc.value }); break;
+					case 'global':	addImport(f, { type: f.desc.value }); break;
+					case 'tag':		addImport(f, { attribute: 0, typeIndex: getFuncTypeIdx(f.desc.value) }); break;
 				}
 				break;
-			}
-			case 'func':	funcs.addEntry(f); break;
-			case 'table':	tables.addEntry(f); break;
-			case 'memory':	memories.addEntry(f); break;
-			case 'global':	globals.addEntry(f); break;
-			case 'tag':		tags.addEntry(f); break;
-
-			case 'export':	rawExports.push({ name: f.name, kind: f.kind, index: f.index }); break;
-			case 'elem':	elems.add(f.id); break;
-			case 'data':	datas.add(f.id); break;
+			case 'export':	rawExports.push(f); break; //{ name: f.name, kind: f.kind, index: f.index }); break;
+			case 'func': case 'table': case 'memory': case 'global': case 'tag':
+				declare(f.type, f);
+				own[f.type].push(f as any);
+				break;
 		}
 	}
 
 	const wmod	= new WasmModule();
-	wmod.functionTypes	= funcs.entries.map(f => getFuncTypeIdx(f.value));
-	wmod.tables			= tables.entries.map(t => t.value);
-	wmod.memories		= memories.entries.map(m => m.value);
-	wmod.globals		= globals.entries.map(g => ({ type: g.value, init: resolveInstrs(g.init), id: g.id }));
-	wmod.tags			= tags.entries.map(t => ({ attribute: 0, typeIndex: getFuncTypeIdx(t.value) }));
 	wmod.imports		= imports;
-	wmod.code			= funcs.entries.map(f => {
-		const locals = new IDTable;
-		f.value.params.forEach(p => locals.add(p.id));
-		f.locals.forEach(l => locals.add(l.id, l.count));
-		return { locals: f.locals.map(l => ({ count: l.count, type: concreteLocalType(l), id: l.id })), body: resolveInstrs(f.body, locals), id: f.id };
+	wmod.functionTypes	= own.func.map(f => getFuncTypeIdx(f.value)) as number[];
+	wmod.tables			= own.table.map(t => ({ ...t.value, id: t.id }));
+	wmod.memories		= own.memory.map(m => ({ ...m.value, id: m.id }));
+	wmod.globals		= own.global.map(g => ({ type: g.value, init: g.init, id: g.id }));
+	wmod.tags			= own.tag.map(t => ({ attribute: 0, typeIndex: getFuncTypeIdx(t.value) as number, id: t.id }));
+	wmod.code			= own.func.map(f => {
+		const { body, locals: hoisted } = stripMarkers(f.body);
+		return {
+			locals: [...f.locals, ...hoisted].map(l => ({ count: l.count, type: concreteLocalType(l), id: l.id })),
+			body,
+			id: f.id,
+		};
 	});
-
-	wmod.exports = rawExports.map(e => ({ name: e.name, kind: e.kind, index: allTables[e.kind].res(e.index) }));
+	wmod.exports = rawExports.map(e => ({ name: e.name, kind: e.kind, index: e.index }));
 
 	for (const f of mod.fields) {
 		switch (f.type) {
 			case 'start':
-				wmod.start = funcs.res(f.func);
+				wmod.start = f.func;
 				break;
-			case 'elem': {
-				const funcIndices = f.init.map(x => funcs.res(x));
+			case 'elem':
 				(wmod.elements ??= []).push(f.offset
-					? { mode: 'active', table: tables.res(f.table, 0), offset: resolveInstrs(f.offset), reftype: { ref: 'func', nullable: true }, funcIndices }
-					: { mode: 'passive', reftype: { ref: 'func', nullable: true }, funcIndices }
+					? { mode: 'active', table: f.table ?? 0, offset: f.offset, reftype: { ref: 'func', nullable: true }, funcIndices: f.init, id: f.id }
+					: { mode: 'passive', reftype: { ref: 'func', nullable: true }, funcIndices: f.init, id: f.id }
 				);
 				break;
-			}
-			case 'data': {
-				const bytes = f.init;
-				const memory = memories.res(f.memory, 0);
+			case 'data':
+				// `memory` must be omitted entirely (not just left `undefined`) when absent -- its
+				// binary encoding picks the compact "implicit memory 0" wire variant by checking
+				// `'memory' in v`, which an explicit `undefined` value would still satisfy.
 				(wmod.datas ??= []).push(f.offset
-					? { mode: 'active', ...(memory ? { memory } : {}), offset: resolveInstrs(f.offset), bytes }
-					: { mode: 'passive', bytes }
+					? { mode: 'active', ...(f.memory !== undefined ? { memory: f.memory } : {}), offset: f.offset, bytes: f.init, id: f.id }
+					: { mode: 'passive', bytes: f.init, id: f.id }
 				);
 				break;
-			}
 		}
 	}
 
 	if (typesList.length > 0)
 		wmod.types = { types: typesList, groupSizes: typesList.map(() => 1) };
 
+	wmod.resolve();
 	return wmod;
 }

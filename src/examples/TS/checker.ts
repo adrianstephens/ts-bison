@@ -965,7 +965,27 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 	// at the very bottom, to whatever this whole call ultimately produces. `expected` still defaults afresh per call
 	// (matching the old code's bare `typeOf(sub, scope)` self-calls, which never forwarded the caller's own `expected`
 	// into an unrelated sub-expression) -- only the single bootstrap call at the bottom passes the real one through.
+	// A chained call's own receiver gets independently re-derived through more than one path (e.g.
+	// `case 'new'`/`case 'call'` compute both `recurse(e.callee.object)` directly *and* `recurse(e.callee)`,
+	// which -- being a `member` expression -- internally recomputes the very same `e.object` type again from
+	// scratch) -- for a chain of N calls this compounds into 2^N total evaluations of the same nodes
+	// (confirmed: a 20-call chain produced 2^19 resolutions of one class's own type). Memoized here, per
+	// (node, expected) pair and scoped to this one `typeOf` call (a fresh `Map` each invocation, so it can't
+	// leak stale results across separate checks) -- safe because `recurse`'s own side effects (diagnostics,
+	// `yieldCollector` pushes) are themselves exact duplicates on a second visit to the identical node.
+	const recurseCache = new Map<Expr, Map<Type | undefined, Type>>();
 	const recurse = (e: Expr, expected?: Type): Type => {
+		let byExpected = recurseCache.get(e);
+		const cached = byExpected?.get(expected);
+		if (cached !== undefined)
+			return cached;
+		const result = recurseUncached(e, expected);
+		if (!byExpected)
+			recurseCache.set(e, byExpected = new Map());
+		byExpected.set(expected, result);
+		return result;
+	};
+	const recurseUncached = (e: Expr, expected?: Type): Type => {
 		const pos = (e as any).pos;
 		switch (e.type) {
 			case 'literal':
@@ -1992,8 +2012,12 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 			checkBlock1(stmt.block, new Scope(scope));
 			if (stmt.handlerBody) {
 				const inner = new Scope(scope);
-				if (stmt.handlerParam)
-					inner.addValue(stmt.handlerParam, T.ANY);
+				if (stmt.handlerParam) {
+					if (typeof stmt.handlerParam === 'string')
+						inner.addValue(stmt.handlerParam, T.ANY);
+					else
+						T.bindingNames(stmt.handlerParam).forEach(n => inner.addValue(n, T.ANY));
+				}
 				checkBlock1(stmt.handlerBody, inner);
 			}
 			if (stmt.finalizer)

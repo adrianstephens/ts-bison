@@ -552,6 +552,75 @@ export function flattenStateMachine(body: Statement[]): StateMachine {
 	};
 }
 
+// Debug/visualization only: renders a `StateMachine` back into a plain, printable JS AST -- a
+// `while (true) { switch (state) { ... } }` dispatch loop -- so `Output.toCode` can show exactly
+// which segment runs, what it does, and where it goes next. Not real codegen (towasm.ts's own
+// 'emitGeneratorDispatch' lowers the same graph straight to wasm instead); a suspend is rendered
+// as `state = resumeId; return yield/await x;` since that's the clearest way to show "control
+// leaves here and re-enters at resumeId" as source text.
+export function StateMachineToAST(machine: StateMachine) {
+	type S = JS.Statement<Type>;
+	const state			= Identifier('state');
+	const setState = (v: number): S => ({type: 'expression', expression: JS.JSBinary('=', state, Literal(v))});
+	const cont: S		= {type: 'continue'};
+
+	// a suspend's `resultVar` ('const v = yield x;') is bound only once control resumes, so it's
+	// stashed here and re-materialized as a `let` at the top of the segment it resumes into.
+	const resultVars = new Map<number, string>();
+	for (const seg of machine.segments)
+		if (seg.next.type === 'suspend' && seg.next.resultVar)
+			resultVars.set(seg.next.resumeId, seg.next.resultVar);
+	const resumeValue = Identifier('$resume');
+
+	return JS.Block(
+		JS.VarDecl('let', JS.Var('state', Literal(machine.entryId))) as S,
+		{ type: 'while', test: Literal(true), body: JS.Block(JS.Switch(state, ...machine.segments.map((seg, k) => {
+			const stmts: S[] = [];
+			const resultVar = resultVars.get(k);
+			if (resultVar)
+				stmts.push(JS.VarDecl('let', JS.Var(resultVar, resumeValue)) as S);
+			stmts.push(...seg.stmts as S[]);
+
+			const next = seg.next;
+			switch (next.type) {
+				case 'goto':
+					stmts.push(
+						setState(next.target),
+						cont
+					);
+					break;
+
+				case 'branch':
+					stmts.push(
+						JS.If(next.test, JS.Block(
+							setState(next.then)
+						) as S, JS.Block(
+							setState(next.else)
+						) as S) as S,
+						cont
+					);
+					break;
+
+				case 'suspend': {
+					if (next.delegate)
+						throw new Error("towasm: 'yield*' delegation is not supported");
+					stmts.push(setState(next.resumeId));
+					stmts.push({ type: 'return', argument: next.kind === 'yield'
+						? { type: 'yield', operand: next.operand, delegate: next.delegate } as Expr
+						: JS.JSUnary('await', next.operand!)
+					} as S);
+					break;
+				}
+
+				case 'complete':
+					stmts.push({ type: 'return' } as S);
+					break;
+			}
+			return JS.SwitchCase(Literal(k), ...stmts);
+		})) as S) } as S,
+	);
+}
+
 //-----------------------------------------------------------------------------
 // TS to JS
 //-----------------------------------------------------------------------------
