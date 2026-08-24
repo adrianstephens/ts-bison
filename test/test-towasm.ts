@@ -1509,6 +1509,51 @@ async function main() {
 	}
 
 	{
+		// The other half of the same fix: a genuinely *heterogeneous* union (scalars mixed with an
+		// object/array shape, e.g. `Literal.value: string | number | boolean | null | TemplatePart[]` in
+		// ts-parser.ts) used to have no representation at all -- `typeOf`'s old union-boxing check required
+		// every member to be *struct-backed* (`unionStructOwners`), which a scalar member never is, so this
+		// fell through to "needs an explicit number/boolean/object type". Fixed by boxing as `any` whenever
+		// the members' own physical `WasmType`s genuinely differ, regardless of *why* they differ (scalar
+		// vs. scalar, class vs. class, or scalar vs. struct/array, this case) -- not gated on every member
+		// being struct-backed. Real arguments (not compile-time constants) flow into three separate boxed
+		// constructions (`number`, `boolean`, `string` all reduce to different `WasmType`s) to actually
+		// exercise the coercion at real runtime, then an independent computation confirms the module still
+		// runs correctly afterward.
+		const { heterogeneousUnionField } = await compile(`
+			interface Box { type: 'ref'; value: number | boolean | string; }
+			function makeNum(n: number): Box { return { type: 'ref', value: n }; }
+			function makeBool(b: boolean): Box { return { type: 'ref', value: b }; }
+			function makeStr(s: string): Box { return { type: 'ref', value: s }; }
+			export function heterogeneousUnionField(n: number): number {
+				const a = makeNum(n);
+				const b = makeBool(n > 0);
+				const c = makeStr('x');
+				return n * 2;
+			}
+		`);
+		check('union boxing: a heterogeneous scalar+object union field compiles and runs', heterogeneousUnionField(21), 42);
+	}
+
+	{
+		// Found while landing the fix above: computing each union member's own `typeOf` eagerly (needed for
+		// the same-physical-type comparison) reaches a self-/mutually-referential object-shape type for the
+		// first time (previously only `ownerFor`'s shallower check ran on a union member) -- an unbounded
+		// recursion (`ensureObjectShape` had no reentrance guard at all, unlike `ensureClass`'s own matching
+		// one) rather than a clean error. Fixed by giving `ensureObjectShape` the exact same `resolving`
+		// guard `ensureClass` already has -- confirmed a *class* field cycle already threw this same shape
+		// of error before this fix (a real, pre-existing, unrelated-to-unions limitation), this just brings
+		// a plain object-shape/type-alias in line with it instead of crashing.
+		await checkThrows('a self-referential object-shape type is rejected, not an infinite recursion', () => compile(`
+			type Node = { value: number; next: Node | null };
+			function make(v: number): Node { return { value: v, next: null }; }
+			export function selfReferentialShape(): number {
+				return make(1).value;
+			}
+		`), /field cycle/);
+	}
+
+	{
 		// Discriminated-union object literal construction: `case 'object'`'s own `want` (a plain WasmType)
 		// can't say which union member a bare `{...}` literal is meant to build as when the target is a
 		// real union (boxed `any`, `typeOf`'s own union case) rather than one single class -- fixed via

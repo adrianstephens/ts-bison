@@ -1567,19 +1567,23 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					return undefined;
 				return nullableWtype(base);
 			}
-			// A real union of >=2 genuinely different object shapes (not the nullable-collapse case just
-			// above) -- boxed `any`, the same physical representation this compiler already gives every
-			// other "could be one of several different shapes" value (an unconstrained generic, a caught
-			// exception). `unionStructOwners`, not `typeOf`, on the whole set: only meaningful when every
-			// member is itself a real, *struct-backed* class/object-shape (`case 'member'`'s own
-			// `ensureUnionFieldDispatch` fallback needs a real `ref.test` target for each) -- excludes a
-			// scalar (`number`/`boolean`, whose own synthetic `builtinTypeOwner` has no heap type at all,
-			// `typeIndex === -1`) just as much as a member that isn't representable at all. Found via
-			// `IteratorResult<Y,R>.value: Y | R` monomorphized with `Y`/`R` both `number` -- a degenerate
-			// `number | number` union that must stay a plain `f64`, not become boxed `any` just because
-			// `ownerFor('number')` alone happens to succeed (a real owner, just not a struct-backed one).
-			if (nonNullish.length > 1 && unionStructOwners(nonNullish))
-				return REF_ANY;
+			// A real union of >=2 members (not the nullable-collapse case just above) -- the question isn't
+			// "is every member struct-backed" (that's `unionStructOwners`'s own, separate concern: *which
+			// classes* a union's member-*access* can dispatch to, `case 'member'`'s `ensureUnionFieldDispatch`
+			// -- still needs a real `ref.test` target per member, so it stays scoped to struct-backed unions
+			// only). Here it's simpler: do every member's own physical representations collapse to the *same*
+			// `WasmType` regardless -- a degenerate union like `IteratorResult<Y,R>.value: Y | R`
+			// monomorphized with `Y`/`R` both `number` must stay a plain `f64`, not box as `any` just because
+			// a union with >1 syntactic member showed up. Only when the members genuinely differ (class vs.
+			// class, scalar vs. scalar, or scalar vs. struct/array, e.g. `Literal.value: string | number |
+			// boolean | null | TemplatePart[]`) does this box as `any`, the same physical representation this
+			// compiler already gives every other "could be one of several different shapes" value (an
+			// unconstrained generic, a caught exception).
+			if (nonNullish.length > 1) {
+				const memberWtypes = nonNullish.map(typeOf);
+				if (memberWtypes.every(w => w !== undefined))
+					return new Set(memberWtypes.map(w => wasmTypeKey(w!))).size === 1 ? memberWtypes[0] : REF_ANY;
+			}
 		}
 		if (resolved.type === 'function')
 			return closureFuncSigType(resolved);
@@ -5328,21 +5332,35 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		if (resolved.members.some(m => m.type === 'index'))
 			return undefined;
 
+		// Same reentrance guard `ensureClass` already has (a real self-/mutually-referential shape, e.g. a
+		// union type reachable again through one of its own members' fields -- confirmed real: `Type`'s own
+		// recursive AST-node union in ts-parser.ts, reached the moment a union's own member types started
+		// being resolved eagerly for `typeOf`'s own boxing decision) -- without it this recurses without
+		// bound (a real `RangeError: Maximum call stack size exceeded`, not a clean error) instead of the
+		// same "not supported" a self-referential class already gives.
+		if (resolving.has(key))
+			throw new Error(`towasm: object-shape type '${key}' has a field cycle (directly or indirectly has a field of its own type) -- not supported`);
+		resolving.add(key);
+
 		const fields: { name: string; wtype: WasmType; optional?: boolean }[] = [];
 		const fieldIndex = new Map<string, number>();
-		for (const m of resolved.members) {
-			if (m.type !== 'property')
-				throw new Error(`towasm: object-shape type '${name}' can only have plain properties (no methods/index/call signatures) to be an object literal's target type`);
-			if (typeof m.key !== 'string')
-				throw new Error(`towasm: object-shape type '${name}' has a computed property name -- not supported`);
-			// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as
-			// `any` rather than reject otherwise-valid source.
-			const rawWt = typeOf(m.typeAnnotation);
-			const wt = rawWt === 'void' ? REF_ANY : rawWt;
-			if (!wt)
-				throw new Error(`towasm: object-shape type '${name}.${m.key}' needs an explicit number/boolean/object type`);
-			fieldIndex.set(m.key, fields.length);
-			fields.push({ name: m.key, wtype: wt, optional: hasMod(m, 'optional') });
+		try {
+			for (const m of resolved.members) {
+				if (m.type !== 'property')
+					throw new Error(`towasm: object-shape type '${name}' can only have plain properties (no methods/index/call signatures) to be an object literal's target type`);
+				if (typeof m.key !== 'string')
+					throw new Error(`towasm: object-shape type '${name}' has a computed property name -- not supported`);
+				// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as
+				// `any` rather than reject otherwise-valid source.
+				const rawWt = typeOf(m.typeAnnotation);
+				const wt = rawWt === 'void' ? REF_ANY : rawWt;
+				if (!wt)
+					throw new Error(`towasm: object-shape type '${name}.${m.key}' needs an explicit number/boolean/object type`);
+				fieldIndex.set(m.key, fields.length);
+				fields.push({ name: m.key, wtype: wt, optional: hasMod(m, 'optional') });
+			}
+		} finally {
+			resolving.delete(key);
 		}
 
 		const info: ClassInfo = {
