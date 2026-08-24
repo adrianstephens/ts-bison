@@ -154,13 +154,12 @@ export function rangeToType(r?: NumRange): Type | undefined {
 	if (!r)
 		return undefined;
 	if (r.base === 'number') {
-		if (typeof r.min === 'number' && r.min === r.max)
-			return Literal(r.min);
-		if (r.min === undefined && r.max === undefined && !r.integer)
-			return NUMBER;
-		return TS.RangeType('number', r.min, r.max, r.integer);
+		return	r.min !== undefined && r.min === r.max ?  Literal(r.min as number)
+			:	r.min !== undefined || r.max !== undefined || r.integer ?  TS.RangeType('number', r.min, r.max, r.integer)
+			:	NUMBER;
 	}
-	return r.min === undefined && r.max === undefined ? BIGINT : TS.RangeType('bigint', r.min, r.max);
+	return	r.min !== undefined || r.max !== undefined ? TS.RangeType('bigint', r.min, r.max)
+		:	BIGINT;
 }
 
 // Intersects two same-based ranges (e.g. a binding's current range with a new comparison's implied bound);
@@ -197,45 +196,6 @@ function maxOfValues(vs: (number | bigint)[]): number | bigint { return vs.reduc
 // `'binary'`/`'unary'` cases so e.g. `x + 1` for a bounded `x` stays bounded, instead of always collapsing to
 // the base `number`/`bigint`. `undefined` on either side of a range means "unbounded there", so any operation
 // touching it produces an unbounded result on that side too (a conservative, always-safe over-approximation).
-export function rangeNeg(a: NumRange): NumRange {
-	return { base: a.base, integer: a.integer,
-		min: a.max !== undefined ? negValue(a.max) : undefined,
-		max: a.min !== undefined ? negValue(a.min) : undefined };
-}
-export function rangeAdd(a: NumRange, b: NumRange): NumRange | undefined {
-	if (a.base !== b.base)
-		return undefined;
-	return { base: a.base, integer: a.integer && b.integer,
-		min: a.min !== undefined && b.min !== undefined ? addValue(a.min, b.min) : undefined,
-		max: a.max !== undefined && b.max !== undefined ? addValue(a.max, b.max) : undefined };
-}
-export function rangeSub(a: NumRange, b: NumRange): NumRange | undefined {
-	if (a.base !== b.base)
-		return undefined;
-	return { base: a.base, integer: a.integer && b.integer,
-		min: a.min !== undefined && b.max !== undefined ? subValue(a.min, b.max) : undefined,
-		max: a.max !== undefined && b.min !== undefined ? subValue(a.max, b.min) : undefined };
-}
-export function rangeMul(a: NumRange, b: NumRange): NumRange | undefined {
-	if (a.base !== b.base)
-		return undefined;
-	if (a.min === undefined || a.max === undefined || b.min === undefined || b.max === undefined)
-		return { base: a.base, integer: a.integer && b.integer };
-	const corners = [mulValue(a.min, b.min), mulValue(a.min, b.max), mulValue(a.max, b.min), mulValue(a.max, b.max)];
-	return { base: a.base, integer: a.integer && b.integer, min: minOfValues(corners), max: maxOfValues(corners) };
-}
-// Standard interval division (reciprocal-then-multiply, via the same 4-corner approach as `rangeMul`) -- only sound
-// when the divisor's sign is fixed away from zero, since a divisor interval straddling 0 can swing the result toward
-// +-Infinity on either side. `integer` is only ever claimed for `bigint` (its division always truncates to a bigint);
-// number division isn't claimed integer even for two integer operands (`5 / 2`), since that's not generally true.
-export function rangeDiv(a: NumRange, b: NumRange): NumRange | undefined {
-	if (a.base !== b.base)
-		return undefined;
-	if (a.min === undefined || a.max === undefined || b.min === undefined || b.max === undefined || (b.min <= 0 && b.max >= 0))
-		return { base: a.base, integer: a.base === 'bigint' };
-	const corners = [divValue(a.min, b.min), divValue(a.min, b.max), divValue(a.max, b.min), divValue(a.max, b.max)];
-	return { base: a.base, integer: a.base === 'bigint', min: minOfValues(corners), max: maxOfValues(corners) };
-}
 
 export function rangeMax(a: NumRange[]): NumRange | undefined {
 	if (a.length > 0) {
@@ -259,13 +219,6 @@ export function rangeMin(a: NumRange[]): NumRange | undefined {
 		};
 	}
 }
-export function rangeLogic(a: NumRange, b: NumRange): NumRange | undefined {
-	const base = a.base;
-	if (base !== b.base)
-		return undefined;
-	return base === 'number' ? { base, integer: true, min: -0x80000000, max: 0x7fffffff} : {base, integer: true};
-}
-
 // Whether `r`'s span provably includes the value `0` -- used to decide truthy/falsy/nullish-adjacent questions for
 // a narrowed numeric type the same way a plain `number`/`bigint` ref is decided (both are always presumed to include 0).
 function rangeIncludesZero(r: { min?: number | bigint; max?: number | bigint }): boolean {
@@ -285,6 +238,72 @@ export function rangeClamp(a: NumRange, bound: number|bigint, isUpper: boolean, 
 		if (a.max !== undefined && a.max < bound)
 			return undefined;
 		return {...a, min: a.min !== undefined && a.min > bound ? a.min : bound};
+	}
+}
+
+export function rangeUnOp(op: JS.unaryOps, a: NumRange): NumRange | undefined {
+	const base = a.base;
+	switch (op) {
+		case '+':	return a;
+		case '-':	return {
+			base, integer: a.integer,
+			min: a.max !== undefined ? negValue(a.max) : undefined,
+			max: a.min !== undefined ? negValue(a.min) : undefined
+		};
+		case '~':	return { base, integer: a.integer};
+		case '++':	return {
+			base, integer: a.integer,
+			min: a.min !== undefined ? addValue(a.min, 1) : undefined,
+			max: a.max !== undefined ? addValue(a.max, 1) : undefined
+		};
+		case '--':	return {
+			base, integer: a.integer,
+			min: a.min !== undefined ? subValue(a.min, 1) : undefined,
+			max: a.max !== undefined ? subValue(a.max, 1) : undefined
+		};
+	}
+}
+
+export function rangeBinOp(op: JS.binaryOps, a: NumRange, b: NumRange): NumRange | undefined {
+	const base = a.base;
+	if (b.base !== base)
+		return undefined;
+
+	function add(a: NumRange, b: NumRange): NumRange | undefined {
+		return { base, integer: a.integer && b.integer,
+			min: a.min !== undefined && b.min !== undefined ? addValue(a.min, b.min) : undefined,
+			max: a.max !== undefined && b.max !== undefined ? addValue(a.max, b.max) : undefined };
+	}
+	function sub(a: NumRange, b: NumRange): NumRange | undefined {
+		return { base, integer: a.integer && b.integer,
+			min: a.min !== undefined && b.max !== undefined ? subValue(a.min, b.max) : undefined,
+			max: a.max !== undefined && b.min !== undefined ? subValue(a.max, b.min) : undefined };
+	}
+	function mul(a: NumRange, b: NumRange): NumRange | undefined {
+		if (a.min === undefined || a.max === undefined || b.min === undefined || b.max === undefined)
+			return { base, integer: a.integer && b.integer };
+		const corners = [mulValue(a.min, b.min), mulValue(a.min, b.max), mulValue(a.max, b.min), mulValue(a.max, b.max)];
+		return { base, integer: a.integer && b.integer, min: minOfValues(corners), max: maxOfValues(corners) };
+	}
+	function div(a: NumRange, b: NumRange): NumRange | undefined {
+		if (a.min === undefined || a.max === undefined || b.min === undefined || b.max === undefined || (b.min <= 0 && b.max >= 0))
+			return { base, integer: base === 'bigint' };
+		const corners = [divValue(a.min, b.min), divValue(a.min, b.max), divValue(a.max, b.min), divValue(a.max, b.max)];
+		return { base, integer: base === 'bigint', min: minOfValues(corners), max: maxOfValues(corners) };
+	}
+
+	switch (op) {
+		case '+':	return add(a, b);
+		case '-':	return sub(a, b);
+		case '*':	return mul(a, b);
+		case '/':	return div(a, b);
+		//case '<':	case '>': case '<=': case '>=':
+		//case '==':	case '!=':	case '===': case '!==':
+		//	return { base: 'number', integer: true, min: 0, max: 1 };
+		case '&':	case '|': case '^': case '<<': case '>>':
+			return base === 'number' ? { base, integer: true, min: -0x80000000, max: 0x7fffffff} : {base, integer: true};
+		case '>>>':
+			return base === 'number' ? { base, integer: true, min: 0, max: 0xffffffff} : {base, integer: true};
 	}
 }
 
@@ -325,6 +344,8 @@ export function combineTypes(types: Type[]): Type {
 	types.forEach(add);
 	return unique.length === 1 ? unique[0] : TS.UnionType(unique);
 }
+
+export function optional(type:Type, optional?: boolean) { return optional ? combineTypes([type, UNDEFINED]) : type; }
 
 export function intersectTypes(types: Type[]): Type {
 	if (types.length === 1)
@@ -443,7 +464,9 @@ export function isNullish(t: Type, scope: Scope): boolean {
 // of a value's type -- e.g. `lookupMember`'s own union case requires *every* member to have the property
 // looked up, which a bare `null`/`undefined` member never does, so a `?.` member lookup needs this run on
 // the object type first (see `checker.ts`'s own `'member'` case) or it always misses, falling back to `any`.
-export function nonNullable(t: Type, scope: Scope): Type {
+export function nonNullable(t: Type, scope: Scope, nonNullable = true): Type {
+	if (!nonNullable)
+		return t;
 	const r = resolveOwn(t, scope);
 	if (r.type !== 'union')
 		return t;
@@ -817,7 +840,7 @@ export function FixParams(params: JS.Params<any>): TS.Params {
 	return {
 		params: params.params.filter(p => p.key !== 'this').map((p): TS.Param => ({
 			key:			typeof p.key === 'string' ? p.key : '_',
-			modifiers:		!!hasMod(p, 'optional') || !!p.default ? ['optional'] : [],
+			modifiers:		hasMod(p, 'optional') || !!p.default ? ['optional'] : [],
 			typeAnnotation: p.typeAnnotation as Type ?? literalTypeOf(p.default),
 			default:		p.default
 		})),

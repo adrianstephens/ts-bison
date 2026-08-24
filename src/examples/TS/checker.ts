@@ -5,10 +5,48 @@ import { Literal } from '../common';
 import { hasMod, isTsDeclaration, walkB } from './walker';
 import * as T from './type-utils';
 
-type Type = TS.Type;
-type Expr = JS.Expr;
-type Scope = T.Scope;
-const Scope = T.Scope;
+export const SEVERITY = {
+	GAP:		0,	// known missing functionality (see the header's own gap list) -- not a judgment call, just a reminder
+	WARNING:	1,
+	ERROR:		2,
+} as const;
+export type SEVERITY = (typeof SEVERITY)[keyof typeof SEVERITY];
+export type Err = (sev: SEVERITY, pos: JS.Location) => (strings: TemplateStringsArray, ...values: any[]) => void;
+
+type Type	= TS.Type;
+type Expr	= TS.Expr;
+type Scope	= T.Scope;
+const Scope	= T.Scope;
+
+// ===================================================================
+//  TStypeCheck -- structural type checking of a parsed TS AST
+// ===================================================================
+// Deliberately partial -- every gap errs lenient (no diagnostic, often surfaced instead as a `SEVERITY.GAP`) rather than risking a false positive.
+// Known gaps: 
+//  - generic inference is structural-argument-matching only (no bidirectional/contravariant/contextual)
+//  - narrowing covers identifiers/dotted paths only (no CFG/reassignment invalidation)
+//  - overload resolution needs exactly one arity+type fit (no best-guess)
+//  - keyof/mapped/indexed-access resolve only for literal keys
+//  - conditional types resolve only when non-distributive and concrete (no `infer`)
+
+
+const COMPARISON_OPS 	= new Set(['==', '!=', '===', '!==', '<', '>', '<=', '>=', 'in', 'instanceof']);
+const LOGICAL_OPS		= new Set(['&&', '||', '??']);
+const SINGLE_ELEMENT_ITERABLES = new Set(['Array', 'ReadonlyArray', 'Set', 'ReadonlySet', 'Generator', 'Iterable', 'IterableIterator', 'Iterator']);
+
+const TYPED_ARRAY_RANGES = new Map<string, T.NumRange>([
+	['Int8Array',			{ base: 'number', min: -0x80, 					max: 0x7f, 					integer: true }],
+	['Uint8Array',			{ base: 'number', min: 0, 						max: 0xff, 					integer: true }],
+	['Uint8ClampedArray',	{ base: 'number', min: 0, 						max: 0xff, 					integer: true }],
+	['Int16Array',			{ base: 'number', min: -0x8000, 				max: 0x7fff, 				integer: true }],
+	['Uint16Array',			{ base: 'number', min: 0, 						max: 0xffff, 				integer: true }],
+	['Int32Array',			{ base: 'number', min: -0x80000000, 			max: 0xffffffff, 			integer: true }],
+	['Uint32Array',			{ base: 'number', min: 0, 						max: 0xffffffff, 			integer: true }],
+	['Float32Array',		{ base: 'number', min: 0, 						max: 0xff, 					integer: false }],
+	['Float64Array',		{ base: 'number', min: 0, 						max: 0xff, 					integer: false }],
+	['BigInt64Array',		{ base: 'bigint', min: -0x8000000000000000n, 	max: 0x7fffffffffffffffn, 	integer: true }],
+	['BigUint64Array',		{ base: 'bigint', min: 0n, 						max: 0xffffffffffffffffn, 	integer: true }],
+]);
 
 // ===================================================================
 //  statement utils
@@ -25,6 +63,23 @@ function alwaysThrows(stmt: JS.Statement<any> | undefined): boolean {
 		case 'if':		return !!stmt.alternate && alwaysThrows(stmt.consequent) && alwaysThrows(stmt.alternate);
 		case 'try':		return (!stmt.handlerBody || alwaysThrows(stmt.handlerBody[stmt.handlerBody.length - 1])) && alwaysThrows(stmt.block[stmt.block.length - 1]);
 		default:		return false;
+	}
+}
+
+// Conservative "this statement never falls through" -- powers guard-clause narrowing
+function alwaysExits(stmt: JS.Statement<any>): boolean {
+	switch (stmt.type) {
+		case 'return':
+		case 'throw':
+		case 'continue':
+		case 'break':
+			return true;
+		case 'block':
+			return stmt.body.length > 0 && alwaysExits(stmt.body[stmt.body.length - 1]);
+		case 'if':
+			return !!stmt.alternate && alwaysExits(stmt.consequent) && alwaysExits(stmt.alternate);
+		default:
+			return false;
 	}
 }
 
@@ -75,61 +130,6 @@ export function isOptionalChainLink(e: Expr): boolean {
 	return false;
 }
 
-// Conservative "this statement never falls through" -- powers guard-clause narrowing
-function alwaysExits(stmt: JS.Statement<any>): boolean {
-	switch (stmt.type) {
-		case 'return':
-		case 'throw':
-		case 'continue':
-		case 'break':
-			return true;
-		case 'block':
-			return stmt.body.length > 0 && alwaysExits(stmt.body[stmt.body.length - 1]);
-		case 'if':
-			return !!stmt.alternate && alwaysExits(stmt.consequent) && alwaysExits(stmt.alternate);
-		default:
-			return false;
-	}
-}
-
-// ===================================================================
-//  TStypeCheck -- structural type checking of a parsed TS AST
-// ===================================================================
-// Deliberately partial -- every gap errs lenient (no diagnostic, often surfaced instead as a `SEVERITY.GAP`) rather than risking a false positive.
-// Known gaps: 
-//  - generic inference is structural-argument-matching only (no bidirectional/contravariant/contextual)
-//  - narrowing covers identifiers/dotted paths only (no CFG/reassignment invalidation)
-//  - overload resolution needs exactly one arity+type fit (no best-guess)
-//  - keyof/mapped/indexed-access resolve only for literal keys
-//  - conditional types resolve only when non-distributive and concrete (no `infer`)
-
-
-const COMPARISON_OPS 	= new Set(['==', '!=', '===', '!==', '<', '>', '<=', '>=', 'in', 'instanceof']);
-const LOGICAL_OPS		= new Set(['&&', '||', '??']);
-const SINGLE_ELEMENT_ITERABLES = new Set(['Array', 'ReadonlyArray', 'Set', 'ReadonlySet', 'Generator', 'Iterable', 'IterableIterator', 'Iterator']);
-
-const TYPED_ARRAY_RANGES: Record<string, T.NumRange> = {
-	Int8Array:			{ base: 'number', min: -0x80, 					max: 0x7f, 					integer: true },
-	Uint8Array:			{ base: 'number', min: 0, 						max: 0xff, 					integer: true },
-	Uint8ClampedArray:	{ base: 'number', min: 0, 						max: 0xff, 					integer: true },
-	Int16Array:			{ base: 'number', min: -0x8000, 				max: 0x7fff, 				integer: true },
-	Uint16Array:		{ base: 'number', min: 0, 						max: 0xffff, 				integer: true },
-	Int32Array:			{ base: 'number', min: -0x80000000, 			max: 0xffffffff, 			integer: true },
-	Uint32Array:		{ base: 'number', min: 0, 						max: 0xffffffff, 			integer: true },
-	Float32Array:		{ base: 'number', min: 0, 						max: 0xff, 					integer: false },
-	Float64Array:		{ base: 'number', min: 0, 						max: 0xff, 					integer: false },
-	BigInt64Array:		{ base: 'bigint', min: -0x8000000000000000n, 	max: 0x7fffffffffffffffn, 	integer: true },
-	BigUint64Array:		{ base: 'bigint', min: 0n, 						max: 0xffffffffffffffffn, 	integer: true },
-};
-
-export const SEVERITY = {
-	GAP:		0,	// known missing functionality (see the header's own gap list) -- not a judgment call, just a reminder
-	WARNING:	1,
-	ERROR:		2,
-} as const;
-export type SEVERITY = (typeof SEVERITY)[keyof typeof SEVERITY];
-
-type Diagnostics = (severity: SEVERITY, pos: JS.Location, strings: TemplateStringsArray, ...values: any[])=>void;
 
 
 function narrowMath(func: string, params: TS.Param[]): Type | undefined {
@@ -171,14 +171,14 @@ function narrowMath(func: string, params: TS.Param[]): Type | undefined {
 	}
 }
 
-// `instance` is `new C(...)`/`this`'s type; `value` is the class binding's type (construct sig ∩ static members).
-// `scope`: the class's declaring scope, stamped onto every result `ref` so a member resolved elsewhere still uses it.
-// Field-init inference below always calls `typeOf` muted (no `err`) -- checker.ts's only caller of this (`hoist`, `checkStmt`'s
-// `class_decl`, `typeOf`'s own `'class'` case) all want that, matching old code's `runMuted` wrap around every one of them.
+// `instance`	is `new C(...)`/`this`'s type;
+// `value`		is the class binding's type (construct sig ∩ static members).
+// `scope`:		the class's declaring scope, stamped onto every result `ref` so a member resolved elsewhere still uses it.
 function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type } {
 	const members:			TS.TypeMember[] = [];
 	const staticMembers:	TS.TypeMember[] = [];
 	const ctorMembers:		TS.ClassMethod[] = [];
+
 	// Fields needing lazy inference (below) get their getter installed only *after* this function's own `stampScope`
 	// call at the bottom -- that call already walks every member's `typeAnnotation` once, and installing the getter
 	// before it would make *that* walk the "first read", forcing inference right here (still mid-`hoist`, before
@@ -200,7 +200,7 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 				// Anything else (a call, `new`, ...) is queued into `pendingFieldInit`, resolved once the whole shape (and `hoist`'s later declarations
 				const lit = m.typeAnnotation ? undefined : T.literalTypeOf(m.value);
 				if (m.typeAnnotation || lit || !m.value) {
-					list.push(TS.TypeProperty(m.key, (m.typeAnnotation as Type) ?? (lit && T.widenLiterals(lit)) ?? T.ANY, m.modifiers));
+					list.push(TS.TypeProperty(m.key, m.typeAnnotation ?? (lit && T.widenLiterals(lit)) ?? T.ANY, m.modifiers));
 				} else {
 					const prop = TS.TypeProperty(m.key, T.ANY, m.modifiers);
 					pendingFieldInit.push({ prop, init: m.value });
@@ -233,20 +233,20 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// Own members come first: lookupMember's first match implements override precedence
 	const superType: Type | undefined =
 			c.superClass?.type === 'identifier' ? TS.RefType(c.superClass.name)
-		:	c.superClass?.type === 'instantiation' && c.superClass.expression.type === 'identifier' ? TS.RefType(c.superClass.expression.name, c.superClass.typeArgs as Type[])
+		:	c.superClass?.type === 'instantiation' && c.superClass.expression.type === 'identifier' ? TS.RefType(c.superClass.expression.name, c.superClass.typeArgs)
 		:	c.superClass ? T.ANY : undefined;
-	const instance = superType ? TS.IntersectionType([obj, superType]) : obj;
+	const instance		= superType ? TS.IntersectionType([obj, superType]) : obj;
 	// The named ref carries its own type params back as its own typeArgs (`Box<T>` -> `new(...): Box<T>`) -- without this,
 	// a bare `RefType(c.name)` never mentions `T`, so `new Box<number>(...)` produced a `Box` with no type args at all.
-	const ctorReturn = c.name ? TS.RefType(c.name, c.typeParams?.map(p => TS.RefType(p.name))) : instance;
-	const makeCtorSig = (params: TS.Params) => T.withScope(TS.CallSig(params, ctorReturn, c.typeParams), scope);
+	const ctorReturn	= c.name ? TS.RefType(c.name, c.typeParams?.map(p => TS.RefType(p.name))) : instance;
+	const makeCtorSig	= (params: TS.Params) => T.withScope(TS.CallSig(params, ctorReturn, c.typeParams), scope);
 	// >1 real constructor body: a genuine overload set, same multi-signature shape `lookupMember` builds
 	// for same-named methods and `hoist` builds for free-function overloads -- `case 'new'`'s existing
 	// arity+type-fit resolution (via `T.collectMembers`'s `'construct'`-member filter) already handles it.
 	const ctor: Type = ctorMembers.length > 1
 		? TS.ObjectType(ctorMembers.map(m => TS.TypeConstruct(makeCtorSig(T.FixParams(m)))))
 		: { type: 'constructor', ...makeCtorSig(ctorMembers.length ? T.FixParams(ctorMembers[0]) : {params: [], rest: c.superClass ? JS.Rest('args', TS.ArrayType(T.ANY)) : undefined}) };
-	const value = staticMembers.length ? TS.IntersectionType([ctor, TS.ObjectType(staticMembers)]) : ctor;
+	const value		= staticMembers.length ? TS.IntersectionType([ctor, TS.ObjectType(staticMembers)]) : ctor;
 	T.stampScope(instance, scope);
 	T.stampScope(value, scope);
 
@@ -254,8 +254,8 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	for (const { prop, init } of pendingFieldInit) {
 		let resolving = false;
 		Object.defineProperty(prop, 'typeAnnotation', {
-			configurable: true,
-			enumerable: true,
+			configurable:	true,
+			enumerable:		true,
 			get(): Type {
 				if (resolving)
 					return T.ANY;
@@ -268,16 +268,6 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	}
 	return { instance, value };
 }
-
-// ---- checker -----------------------------------------------------------------
-
-
-export function makeErr(diag: Diagnostics) {
-	return (sev: SEVERITY, pos: JS.Location) => (strings: TemplateStringsArray, ...values: any[]) => {
-		diag(sev, pos, strings, ...values);
-	};
-}
-type Err = ReturnType<typeof makeErr>;
 
 // ---- control-flow narrowing -----------------------------------------------------------------
 
@@ -368,8 +358,12 @@ function narrowTo(scope: Scope, name: string, target: Type, sense: boolean, t = 
 	const r = t && T.resolveOwn(t, scope);
 	if (!r || T.isAny(r))
 		return scope;
+	// A matching member narrows to `target` itself (same as the non-union case below), not to its own
+	// wider original shape -- the whole point of a type guard is to say more than the union member's
+	// declared type alone does (e.g. `Literal<TypeOfMap[K]>` pinning `.value` past a real AST literal
+	// node's own wide `value` union). A plain boolean `keep` would silently discard that.
 	if (r.type === 'union' && !T.isAny(target))
-		return narrowValue(scope, name, m => T.isAssignable(m, target, scope) === sense, t);
+		return narrowValue(scope, name, m => T.isAssignable(m, target, scope) === sense ? (sense ? target : true) : false, t);
 	if (!sense)
 		return scope;
 	const s = new Scope(scope);
@@ -383,9 +377,9 @@ function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 	const aliasing = new Set<string>();
 	const recurse = (test: Expr, scope: Scope, sense: boolean): Scope => {
 		const truthy: (m: Type) => boolean = sense ? m => !T.isFalsy(m, scope) : m => !T.isTruthy(m, scope);
-		const narrowKey = (target: Expr, keep: (m: Type) => boolean | Type) => {
+		const narrowKey = (target: Expr, keep: (m: Type) => boolean | Type, base = scope) => {
 			const key = T.pathKey(target);
-			return key ? narrowValue(scope, key, keep, scope.value(key) ?? typeOf(target, scope)) : undefined;
+			return key ? narrowValue(base, key, keep, base.value(key) ?? typeOf(target, base)) : undefined;
 		};
 
 		switch (test.type) {
@@ -500,7 +494,12 @@ function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 						// x.prop === literal (discriminated union): `narrowByDiscriminant` splits a compound member to its matching
 						// sub-variant(s) instead of keeping/discarding it whole; `l.object` may itself be a dotted path.
 						if (l.type === 'member' && r.type === 'literal') {
-							const s = narrowKey(l.object, m => narrowByDiscriminant(m, l.property, scope, keepMatch, r.value));
+							// `x?.prop === literal` truly holding also implies `x` itself is non-nullish -- a nullish `x` would
+							// short-circuit the whole expression to `undefined`, which a non-nullish literal can never equal.
+							// Only sound when this branch asserts the equality actually held (`keepMatch`): the excluding branch
+							// (`x?.prop !== literal`) is satisfied by a nullish `x` just as well, so no such inference there.
+							const s = narrowKey(l.object, m => narrowByDiscriminant(m, l.property, scope, keepMatch, r.value),
+								keepMatch && l.optional ? narrowKey(l.object, m => !T.isNullish(m, scope)) : scope);
 							if (s)
 								return s;
 						}
@@ -641,8 +640,6 @@ function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 				return scope;
 		}
 	};
-	// `narrow` never reports diagnostics -- it re-walks (sub)expressions `typeOf` already checked in the normal pass,
-	// purely to compute narrowed scopes; muted once here rather than at each internal `typeOf`-reaching branch.
 	return recurse(test, scope, sense);
 }
 
@@ -657,10 +654,10 @@ function inferredPredicate(fn: TS.CallSig, body: JS.Statement<any>[] | Expr, sco
 		: undefined;
 	if (!test)
 		return undefined;
-	const paramT = (p.typeAnnotation as Type | undefined) ?? T.ANY;
-	const inner = new Scope(scope);
+	const paramT	= p.typeAnnotation ?? T.ANY;
+	const inner		= new Scope(scope);
 	inner.addValue(p.key, paramT);
-	const narrowed = narrow(test, inner, true).value(p.key);
+	const narrowed	= narrow(test, inner, true).value(p.key);
 	return narrowed && narrowed !== paramT ? TS.Predicate(p.key, narrowed) : undefined;
 }
 
@@ -677,16 +674,18 @@ function checkAssignable(src: Type, dst: Type, scope: Scope, pos: JS.Location, d
 };
 
 // A fresh object literal assigned to a fully-known object type may not introduce unknown keys
-function checkExcessProps(lit: Expr, target: Type, scope: Scope, pos: JS.Location, targetScope: Scope, err: Err) {
+function checkExcessProps(lit: Expr, target: Type, pos: JS.Location, targetScope: Scope, err: Err) {
 	if (lit.type !== 'object')
 		return;
-	const r = T.resolveOwn(target, targetScope);
-	const targets = (r.type === 'intersection' ? r.types.map(t => T.resolveOwn(t, targetScope)) : [r])
-		.filter(t => t.type === 'object');
+
+	const r			= T.resolveOwn(target, targetScope);
+	const targets	= (r.type === 'intersection' ? r.types.map(t => T.resolveOwn(t, targetScope)) : [r]).filter(t => t.type === 'object');
 	if (targets.length !== (r.type === 'intersection' ? r.types.length : 1) || targets.some(t => t.members.some(m => m.type === 'index')))
 		return;		// partially-unknown target or index signature: anything goes
+
 	if (lit.properties.some(p => p.type === 'spread' || typeof p.key !== 'string'))
 		return;		// spread/computed keys: shape is open
+
 	for (const p of lit.properties)
 		if (p.type !== 'spread' && typeof p.key === 'string' && !targets.some(t => t.members.some(m => (m.type === 'property' || m.type === 'method') && m.key === p.key)))
 			err(SEVERITY.ERROR, pos)` Object literal may only specify known properties, and '${p.key}' does not exist in type '${target}'`;
@@ -717,6 +716,7 @@ function hoist(stmts: TS.Statement[], scope: Scope) {
 			case 'function_decl':
 				fnGroups.set(stmt.name, [...(fnGroups.get(stmt.name) ?? []), stmt]);
 				break;
+
 			case 'class_decl': {
 				// `stmt` reassigned twice above (unwrap `while`, then a guard `if`) -- beyond this checker's own narrowing, so the cast below is a real gap, not a type error.
 				const { instance, value } = classShapes(stmt as TS.Class, scope);
@@ -753,16 +753,17 @@ function hoist(stmts: TS.Statement[], scope: Scope) {
 					scope.addValue(stmt.namespace, scope.value(stmt.namespace) ?? T.ANY);
 				stmt.specifiers?.forEach(s => scope.addValue(s.local, scope.value(s.local) ?? T.ANY));
 				break;
+
 			case 'var_decl':
 				// Only a `declare const/let/var` reaches here -- a plain top-level one is deliberately *not* hoisted, since real `let`/`const`
 				// observe a temporal dead zone (`checkStmt`'s sequential case catches that). An ambient declaration has no such ordering.
 				if (stmt.ambient)
 					stmt.declarations.forEach(d => hoistVar(scope, d, stmt.kind !== 'const'));
 				break;
-			//'type_alias_decl' 'interface_decl':	// handled in the pass above
 		}
 	}
-	// several same-named declarations are overloads: the bodyless signatures are the public face,
+
+	// several same-named declarations are overloads: if there are any bodyless functions, their signatures are the public face,
 	// exposed as an object type with one call member each; a single declaration stays a plain function
 	for (const [name, decls] of fnGroups) {
 		const sigs		= decls.filter(d => !d.body);
@@ -962,9 +963,8 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 // determined by its arguments (`new Promise<T>(...)`) infer them from where the result is going, like TS's own contextual typing.
 export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yieldCollector?: Type[], err?: Err): Type {
 	// `recurse` always computes `e`'s *precise* type -- widening is never threaded through the walk, only applied once,
-	// at the very bottom, to whatever this whole call ultimately produces. `expected` still defaults afresh per call
-	// (matching the old code's bare `typeOf(sub, scope)` self-calls, which never forwarded the caller's own `expected`
-	// into an unrelated sub-expression) -- only the single bootstrap call at the bottom passes the real one through.
+	// at the very bottom, to whatever this whole call ultimately produces -- only the single bootstrap call at the bottom passes the real one through.
+
 	// A chained call's own receiver gets independently re-derived through more than one path (e.g.
 	// `case 'new'`/`case 'call'` compute both `recurse(e.callee.object)` directly *and* `recurse(e.callee)`,
 	// which -- being a `member` expression -- internally recomputes the very same `e.object` type again from
@@ -1014,8 +1014,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// array regardless of context (real TS: `[1, 2]` alone is `number[]`; contextually
 				// tuple-typed, it's `[number, number]`), which is wrong both for later assignability
 				// and (via `wasmTypeOf`) for codegen's own physical representation of it.
-				const resolvedExpected = expected && T.resolveOwn(expected, scope);
-				const wantTuple = resolvedExpected?.type === 'tuple';
+				const resolvedExpected	= expected && T.resolveOwn(expected, scope);
+				const wantTuple			= resolvedExpected?.type === 'tuple';
 				const elems: Type[] = [];
 				let i = 0;
 				for (const el of e.elements) {
@@ -1032,15 +1032,19 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				}
 				return wantTuple ? { type: 'tuple', elements: elems } : TS.ArrayType(elems.length ? T.combineTypes(elems) : T.ANY);
 			}
+
 			case 'object': {
 				const members: TS.TypeMember[] = [];
 				// A later property overrides an earlier one with the same key -- real JS object-literal semantics,
 				// and what lets a spread's own members participate (`{...X, key: override}` or `{key, ...X}`).
-				const byKey = new Map<string, number>();
-				const push = (m: TS.TypeMember) => {
+				const byKey	= new Map<string, number>();
+				const push	= (m: TS.TypeMember) => {
 					if ('key' in m && typeof m.key === 'string') {
 						const i = byKey.get(m.key);
-						if (i !== undefined) { members[i] = m; return; }
+						if (i !== undefined) {
+							members[i] = m;
+							return;
+						}
 						byKey.set(m.key, members.length);
 					}
 					members.push(m);
@@ -1051,31 +1055,31 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						if (t.type !== 'object')
 							return T.ANY;	// not a determinable object shape -- shape unknowable here, as before
 						t.members.forEach(push);
-						continue;
-					}
-					// A `satisfies`/annotated-`var_decl` `expected` type propagates member-by-member: an unannotated arrow/method
-					// value (`{read: (pe, data) => ...}`) otherwise types its own params as `any`, same gap `applyContextualParams`
-					// already closes for call arguments.
-					const expectedMember = expected && typeof p.key === 'string' ? T.lookupMember(expected, p.key, scope) : undefined;
-					switch (p.type) {
-						case 'method':
-							applyContextualParams(p.params, expectedMember, scope);
-							checkFunctionBody(p, p.body, scope, hasMod(p, 'async'), hasMod(p, 'generator'), hasMod(p, 'generator'), err);
-							if (typeof p.key === 'string')
-								push(TS.TypeMethod(p.key, T.FixSig(p, T.ANY)));
-							break;
-						case 'get':
-							checkFunctionBody(p, p.body, scope, false, false, false, err);
-							push(TS.TypeProperty(p.key, p.returnType as Type ?? T.ANY));
-							break;
-						case 'set':
-							checkFunctionBody(p, p.body, scope, false, false, false, err);
-							break;
-						case 'field': {
-							const _t = typeOf(p.value!, scope, true, expectedMember, yieldCollector, err);
-							if (typeof p.key === 'string')
-								push(TS.TypeProperty(p.key, _t));
-							break;
+					} else {
+						// A `satisfies`/annotated-`var_decl` `expected` type propagates member-by-member: an unannotated arrow/method
+						// value (`{read: (pe, data) => ...}`) otherwise types its own params as `any`, same gap `applyContextualParams`
+						// already closes for call arguments.
+						const expectedMember = expected && typeof p.key === 'string' ? T.lookupMember(expected, p.key, scope) : undefined;
+						switch (p.type) {
+							case 'method':
+								applyContextualParams(p.params, expectedMember, scope);
+								checkFunctionBody(p, p.body, scope, hasMod(p, 'async'), hasMod(p, 'generator'), hasMod(p, 'generator'), err);
+								if (typeof p.key === 'string')
+									push(TS.TypeMethod(p.key, T.FixSig(p, T.ANY)));
+								break;
+							case 'get':
+								checkFunctionBody(p, p.body, scope, false, false, false, err);
+								push(TS.TypeProperty(p.key, p.returnType ?? T.ANY));
+								break;
+							case 'set':
+								checkFunctionBody(p, p.body, scope, false, false, false, err);
+								break;
+							case 'field': {
+								const _t = typeOf(p.value!, scope, true, expectedMember, yieldCollector, err);
+								if (typeof p.key === 'string')
+									push(TS.TypeProperty(p.key, _t));
+								break;
+							}
 						}
 					}
 				}
@@ -1085,12 +1089,12 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			case 'function':
 				applyContextualParams(e.params, expected, scope);
 				checkFunctionBody(e, e.body, scope, hasMod(e, 'async'), hasMod(e, 'generator'), hasMod(e, 'generator'), err);
-				return TS.FunctionType(T.FixSig(e, T.ANY, e.returnType as Type | undefined));
+				return TS.FunctionType(T.FixSig(e, T.ANY, e.returnType));
 
 			case 'arrow':
 				applyContextualParams(e.params, expected, scope);
 				checkFunctionBody(e, e.body, scope, hasMod(e, 'async'), false, false, err);
-				return TS.FunctionType(T.FixSig(e, T.ANY, e.returnType as Type | undefined));
+				return TS.FunctionType(T.FixSig(e, T.ANY, e.returnType));
 
 			case 'member': {
 				const key		= T.pathKey(e);
@@ -1103,10 +1107,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// `TypedArray<T>`'s own merged (real class + ambient interface, `lib/typedarray.ts`'s own
 				// header comment) shape: `T.resolve` doesn't flatten an intersection, so a resolved check here
 				// would never match at all, same reason `i32`/`u8`/etc are checked by name before resolving.
-				if (objT.type === 'ref' && !objT.typeArgs && objT.name in TYPED_ARRAY_RANGES) {
-					// Bounded, not bare `number` -- a loop comparing against these should stay `i32` in
-					// towasm.ts rather than promoting to `f64` (see `numericPairWtype`, which requires
-					// both operands already `i32`).
+				if (T.isRefOf(objT, TYPED_ARRAY_RANGES) && !objT.typeArgs) {
+					// Bounded, not bare `number` -- a loop comparing against these should stay `i32` in towasm.ts rather than promoting to `f64`
 					if (e.property === 'length' || e.property === 'byteOffset' || e.property === 'byteLength')
 						return TS.RangeType('number', 0, 0x7fffffff, true);
 					if (e.property === 'buffer')
@@ -1118,10 +1120,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// for a chain-continuation's own lookup -- `lookupMember`'s union case requires *every*
 				// member to have the property, and `undefined` never does, so it silently fell back to `any`
 				// for the whole rest of the chain (see `isOptionalChainLink`'s own comment).
-				const chained = isOptionalChainLink(e);
-				const resolvedObjT = T.resolve(scope, chained ? T.nonNullable(objT, scope) : objT);
-				if (resolvedObjT.type === 'ref' && resolvedObjT.name === 'ArrayBuffer' && e.property === 'byteLength')
+				const chained		= isOptionalChainLink(e);
+				if (T.isRef(T.resolve(scope, T.nonNullable(objT, scope, chained)), 'ArrayBuffer') && e.property === 'byteLength')
 					return TS.RangeType('number', 0, 0x7fffffff, true);
+
 				// `?.` (direct or chained) only ever looks the property up on the non-nullish part of `objT`
 				// -- `lookupMember`'s own union case requires *every* member to have it (a bare
 				// `null`/`undefined` member never does), so an unguarded `T.lookupMember(objT, ...)` here
@@ -1130,14 +1132,15 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// that when it's already known non-nullish, so leaving it as-is is what lets the
 				// `sealed`/`err` check below still flag `x.y` on a possibly-null `x` (dropping nullish
 				// members here unconditionally would silently accept it).
-				const t		= T.lookupMember(chained ? T.nonNullable(objT, scope) : objT, e.property, scope);
-				if (err && !t && !e.optional && T.sealed(objT, scope))
-					err(SEVERITY.ERROR, pos)`Property '${e.property}' does not exist on type '${objT}'`;
-				if (!t)
+				const t		= T.lookupMember(T.nonNullable(objT, scope, chained), e.property, scope);
+				if (!t) {
+					if (err && !e.optional && T.sealed(objT, scope))
+						err(SEVERITY.ERROR, pos)`Property '${e.property}' does not exist on type '${objT}'`;
 					return T.ANY;
+				}
 				// `lookupMember` returns an optional property's type unwidened (callers needing "is this optional" use `memberOptional`);
 				// a plain read here must still see the `| undefined` a chained (direct or continued) optional access actually allows.
-				return (chained || T.memberOptional(objT, e.property, scope)) ? T.combineTypes([t, T.UNDEFINED]) : t;
+				return T.optional(t, chained || T.memberOptional(objT, e.property, scope));
 			}
 			case 'index': {
 				const rawObjT = recurse(e.object);
@@ -1148,24 +1151,23 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// check above is -- `T.resolve` below expands a typed-array alias into `TypedArray<T>`'s merged
 				// (real class + ambient interface) shape, an intersection it never flattens, so a resolved check
 				// would never match.
-				if (rawObjT.type === 'ref' && !rawObjT.typeArgs && rawObjT.name in TYPED_ARRAY_RANGES)
-					return chained ? T.combineTypes([T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]), T.UNDEFINED]) : T.rangeToType(TYPED_ARRAY_RANGES[rawObjT.name]);
+				if (T.isRefOf(rawObjT, TYPED_ARRAY_RANGES) && !rawObjT.typeArgs)
+					return T.optional(T.rangeToType(TYPED_ARRAY_RANGES.get(rawObjT.name)!), chained);
 				// Same reasoning as `case 'member'`'s own `T.nonNullable` use just above: `?.` (direct or
 				// chained) only ever indexes the non-nullish part of `objT` -- left as the full (possibly
 				// nullish) union, none of the branches below (`'array'`/`'tuple'`/index-signature/named-key)
 				// would ever match at all, since `T.resolve` never collapses a union on its own, and every
 				// one would silently fall through to the bare `T.ANY` at the end.
-				const objT = T.resolve(scope, chained ? T.nonNullable(rawObjT, scope) : rawObjT);
+				const objT = T.resolve(scope, T.nonNullable(rawObjT, scope, chained));
 				recurse(e.property);
-				const wrap = (t: Type) => chained ? T.combineTypes([t, T.UNDEFINED]) : t;
 				if (objT.type === 'array')
-					return wrap(objT.element);
+					return T.optional(objT.element, chained);
 				if (objT.type === 'tuple' && T.isLiteral(e.property, 'number')) {
 					const el = objT.elements[e.property.value];
 					if (err && !el)
 						err(SEVERITY.ERROR, pos)`Tuple type '${objT}' has no element at index ${e.property.value}`;
 					const t = el && T.tupleElementType(el);
-					return t ? wrap(t) : T.ANY;
+					return t ? T.optional(t, chained) : T.ANY;
 				}
 				// A declared `[i: number]: T` index signature (real lib.d.ts typed arrays once `TStypeCheckAsync`
 				// loads one, `Record<number, T>`-shaped types, etc) -- `indexSignatureOf` also searches every
@@ -1177,7 +1179,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				if (!T.isLiteral(e.property, 'string')) {
 					const idxT = T.indexSignatureOf(objT, scope);
 					if (idxT)
-						return wrap(idxT);
+						return T.optional(idxT, chained);
 				}
 				if (T.isLiteral(e.property, 'string')) {
 					const t = T.lookupMember(objT, e.property.value, scope);
@@ -1185,7 +1187,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						err(SEVERITY.ERROR, pos)`Property '${e.property.value}' does not exist on type '${objT}'`;
 					if (!t)
 						return T.ANY;
-					return (chained || T.memberOptional(objT, e.property.value, scope)) ? T.combineTypes([t, T.UNDEFINED]) : t;
+					return T.optional(t, chained || T.memberOptional(objT, e.property.value, scope));
 				}
 				return T.ANY;
 			}
@@ -1205,13 +1207,13 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// another), root-caused via a real whole-workspace sweep, not assumed.
 				let calleeObjT: Type | undefined;
 				if (e.type === 'call' && e.callee.type === 'member') {
-					const objT = calleeObjT = recurse(e.callee.object);
-					if (objT.type === 'ref' && !objT.typeArgs && objT.name in TYPED_ARRAY_RANGES) {
+					calleeObjT = recurse(e.callee.object);
+					if (T.isRefOf(calleeObjT, TYPED_ARRAY_RANGES) && !calleeObjT.typeArgs) {
 						switch (e.callee.property) {
 							case 'indexOf': case 'lastIndexOf':	return TS.RangeType('number', -1, 0x7fffffff, true);
-							case 'includes':						return T.BOOLEAN;
+							case 'includes':					return T.BOOLEAN;
 							case 'reverse': case 'slice': case 'concat': case 'fill': case 'subarray':
-								return TS.RefType(objT.name);
+								return TS.RefType(calleeObjT.name);
 						}
 					}
 				}
@@ -1224,10 +1226,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// fall back to `any`). The call's own short-circuit-to-`undefined` is instead reattached to
 				// the result once, right before the final `return`.
 				const calleeOptional = e.callee.type === 'member' && isOptionalChainLink(e.callee);
-				const calleeT	= T.resolveOwn(calleeOptional ? T.nonNullable(recurse(e.callee), scope) : recurse(e.callee), scope);
+				const calleeT	= T.resolveOwn(T.nonNullable(recurse(e.callee), scope, calleeOptional), scope);
 				// Explicit call-site type args (`f<Foo>(...)`) are raw AST, never stamped like a declaration's own annotations --
 				// unstamped, a ref substituted into the callee's generic body would resolve against the callee's scope, not the caller's.
-				let typeArgs	= (e.typeArgs as Type[] | undefined)?.map(t => T.stampScope(t, scope));
+				let typeArgs	= e.typeArgs?.map(t => T.stampScope(t, scope));
 				// `new Promise((resolve, reject) => {...})` with no explicit `<T>`: real TS infers `T` by finding calls to
 				// `resolve` within the executor's own body and unioning their argument types -- ordinary structural/argument
 				// inference can't do this, since `resolve`'s own declared type (`(value: T | PromiseLike<T>) => void`) is
@@ -1351,7 +1353,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// per-param inference loop -- feed them into the same rest-element inference a real spread would use.
 					e.arguments.forEach((a, i) => {
 						if (a.type !== 'spread' && i >= sig!.params.length && argTs[i])
-							restElementTs.push(argTs[i] as Type);
+							restElementTs.push(argTs[i]);
 					});
 
 					const { params, returnType } = instantiate(sig, argTs, typeArgs, scope, pos, restElementTs, expected, err);
@@ -1367,7 +1369,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 								if (!checkAssignable(t, hasMod(p, 'optional') ? TS.UnionType([p.typeAnnotation, T.UNDEFINED]) : p.typeAnnotation, scope, pos, declScope, err))
 									err(SEVERITY.ERROR, pos)`Argument of type '${t}' is not assignable to parameter '${p.key}: ${p.typeAnnotation}' in '${e}'`;
 								else
-									checkExcessProps(e.arguments[i], p.typeAnnotation, scope, pos, declScope, err);
+									checkExcessProps(e.arguments[i], p.typeAnnotation, pos, declScope, err);
 							}
 						});
 					}
@@ -1382,8 +1384,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// real call site -- `this` as a type is never eagerly resolved elsewhere (see
 					// `T.substituteThisType`'s own comment, `OPAQUE`'s inclusion of `'this'`), so a method
 					// call's return needs it substituted in here, using the receiver expression's own type.
-					const withThis = e.callee.type === 'member' ? T.substituteThisType(result, calleeObjT ?? recurse(e.callee.object)) : result;
-					return calleeOptional ? T.combineTypes([withThis, T.UNDEFINED]) : withThis;
+					return T.optional(e.callee.type === 'member' ? T.substituteThisType(result, calleeObjT ?? recurse(e.callee.object)) : result, calleeOptional);
 				}
 				return e.type === 'new' && e.callee.type === 'identifier' ? TS.RefType(e.callee.name, typeArgs) : T.ANY;
 			}
@@ -1393,9 +1394,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			case 'instantiation': {
 				const calleeT	= T.resolveOwn(recurse(e.expression), scope);
 				// Same reasoning as the 'call'/'new' case above -- these type args are raw AST, never stamped.
-				const typeArgs	= (e.typeArgs as Type[] | undefined)?.map(t => T.stampScope(t, scope));
-				const fnPart	= (calleeT.type === 'intersection' ? calleeT.types.map(p => T.resolveOwn(p, scope)) : [calleeT])
-					.find(p => p.type === 'function' || p.type === 'constructor');
+				const typeArgs	= e.typeArgs.map(t => T.stampScope(t, scope));
+				const fnPart	= (calleeT.type === 'intersection' ? calleeT.types.map(p => T.resolveOwn(p, scope)) : [calleeT]).find(p => p.type === 'function' || p.type === 'constructor');
 				if (fnPart)
 					return { type: fnPart.type, ...instantiate(fnPart, [], typeArgs, scope, pos, undefined, undefined, err) };
 				if (calleeT.type === 'object') {
@@ -1413,22 +1413,22 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					case 'typeof':	return T.STRING;
 					case 'void':	return T.UNDEFINED;
 					case 'delete':	return T.BOOLEAN;
-					case '-': {
-						const r = T.resolveOwn(argT, scope);
-						if (T.isAny(r))
-							return T.ANY;
-						const nr = T.toRange(r);
-						return nr ? T.rangeToType(T.rangeNeg(nr)) : T.isBigint(r, scope) ? T.BIGINT : T.NUMBER;
-					}
-					case '+':
-					case '~':		return T.isAny(T.resolveOwn(argT, scope)) ? T.ANY : T.isBigint(argT, scope) ? T.BIGINT : T.NUMBER;
+					case 'await':	return T.awaitType(argT, scope);
+				}
+				const r = T.resolveOwn(argT, scope);
+				if (T.isAny(r))
+					return T.ANY;
+				const nr = T.toRange(r);
+				if (nr)
+					return T.rangeToType(T.rangeUnOp(e.operator, nr)!);
+				switch (e.operator) {
 					case '++':
 					case '--':
-						if (err && !T.isNumberLike(argT, scope))
+						if (err && !T.isNumberLike(r, scope))
 							err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${argT}' in '${e}'`;
-						return T.isAny(T.resolveOwn(argT, scope)) ? T.ANY : T.isBigint(argT, scope) ? T.BIGINT : T.NUMBER;
-					case 'await':	return T.awaitType(argT, scope);
-					default:		return argT;
+						return T.isBigint(r, scope) ? T.BIGINT : T.NUMBER;
+					default:
+						return T.isBigint(r, scope) ? T.BIGINT : T.NUMBER;
 				}
 			}
 			case 'unary_post': {
@@ -1490,15 +1490,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							lt = scope.declared(e.left.name) || lt;
 						} else if (e.left.type === 'member') {
 							const objT = recurse(e.left.object);
-							lt = T.lookupMember(objT, e.left.property, scope) || lt;
-							lt = T.memberOptional(objT, e.left.property, scope) ? T.combineTypes([lt, T.UNDEFINED]) : lt;
+							lt = T.optional(T.lookupMember(objT, e.left.property, scope) || lt, T.memberOptional(objT, e.left.property, scope));
 						} else if (e.left.type === 'index') {
 							// A typed-array write accepts any real `number` (silently truncated/wrapped via the
 							// element's own real JS coercion, never a type error) -- unlike a read, so the narrow
 							// element range `typeOf`'s 'index' case gives typed-array reads doesn't apply here.
 							// Checked by name, unresolved, same reason `typeOf`'s own 'index' case checks it that way.
 							const objT = recurse(e.left.object);
-							if (objT.type === 'ref' && !objT.typeArgs && objT.name in TYPED_ARRAY_RANGES)
+							if (T.isRefOf(objT, TYPED_ARRAY_RANGES) && !objT.typeArgs)
 								lt = T.NUMBER;
 						}
 
@@ -1506,7 +1505,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							if (!checkAssignable(rt, lt, scope, pos, scope, err)) {
 								err(SEVERITY.ERROR, pos)`Type '${rt}' is not assignable to type '${lt}' in '${e.left} = ...'`;
 							} else {
-								checkExcessProps(e.right, lt, scope, pos, scope, err);
+								checkExcessProps(e.right, lt, pos, scope, err);
 								// Later statements see the assigned type, not the wider declared one. `pathKey`, not just an identifier: a
 								// dotted target narrows the same way a bare name does, via the same narrowings map.
 								const key = T.pathKey(e.left);
@@ -1552,16 +1551,12 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// collapsing back to the base `number`/`bigint` -- falls through to the old plain-type result whenever
 				// either operand isn't numeric-range-shaped, or the operator isn't one of these four.
 				const lr = T.toRange(T.resolveOwn(lt, scope)), rr = T.toRange(T.resolveOwn(rt, scope));
-				const combined = lr && rr && (
-					e.operator === '&' || e.operator === '|' || e.operator === '^' || e.operator === '<<' || e.operator === '>>' ? T.rangeLogic(lr, rr)
-					: e.operator === '>>>' ? {base: lr.base, integer: true, min: 0, max: 0xffffffff } satisfies T.NumRange
-					: e.operator === '+' ? T.rangeAdd(lr, rr)
-					: e.operator === '-' ? T.rangeSub(lr, rr)
-					: e.operator === '*' ? T.rangeMul(lr, rr)
-					: e.operator === '/' ? T.rangeDiv(lr, rr)
-					: undefined
-				);
-				return combined ? T.rangeToType(combined) : T.isBigint(lt, scope) || T.isBigint(rt, scope) ? T.BIGINT : T.NUMBER;
+				if (lr && rr ) {
+					const nr = T.rangeBinOp(e.operator, lr, rr);
+					if (nr)
+						return T.rangeToType(nr);
+				}
+				return T.isBigint(lt, scope) || T.isBigint(rt, scope) ? T.BIGINT : T.NUMBER;
 			}
 
 			case 'conditional':
@@ -1608,7 +1603,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				return value;
 			}
 			case 'as': {
-				const anno = e.typeAnnotation as Type;
+				const anno = e.typeAnnotation;
 				// `T.freeze`: any assertion's result is exempt from `widenLiterals`, permanently -- both branches (an
 				// explicit `as const`, or a plain `as T` returning `T` itself) get it, since a plain type assertion
 				// never auto-widens either, matching real TS. Survives being embedded in a later-widened container
@@ -1617,13 +1612,13 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				return T.freeze(anno.type === 'ref' && anno.name === 'const' ? recurse(e.expression) : anno);
 			}
 			case 'satisfies': {
-				const anno = e.typeAnnotation as Type;
+				const anno = e.typeAnnotation;
 				const t = recurse(e.expression, anno);
 				if (err) {
 					if (!checkAssignable(t, anno, scope, pos, scope, err))
 						err(SEVERITY.ERROR, pos)`Type '${t}' does not satisfy the expected type '${anno}'`;
 					else
-						checkExcessProps(e.expression, anno, scope, pos, scope, err);
+						checkExcessProps(e.expression, anno, pos, scope, err);
 				}
 				return t;
 			}
@@ -1642,8 +1637,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 
 // ---- functions / classes / statements -------------------------------------------------------
 
-function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Expr | undefined, scope: Scope, async: boolean, skipReturn?: boolean, generator?: boolean, err?: Err) {
-	const fn = fnj as TS.CallSig;
+function checkFunctionBody(fn: TS.CallSig, body: JS.Statement<any>[] | Expr | undefined, scope: Scope, async: boolean, skipReturn?: boolean, generator?: boolean, err?: Err) {
 	if (!body)
 		return;
 
@@ -1697,6 +1691,7 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 	// until now.
 	for (const p of fn.typeParams ?? [])
 		inner.addTypeParam(p.name, p.constraint ?? T.ANY);
+
 	for (const p of fn.params) {
 		const anno = p.typeAnnotation;
 		// Computed unconditionally (not just `!muted`) so it's available below for a defaulted,
@@ -1706,13 +1701,14 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 		if (err && dt && anno && !checkAssignable(dt, anno, inner, (p as any).pos, inner, err))
 			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
 		if (typeof p.key === 'string')
-			inner.addValue(p.key, anno ? (hasMod(p, 'optional') && !p.default ? T.combineTypes([anno, T.UNDEFINED]) : anno) : dt ?? T.ANY);
+			inner.addValue(p.key, anno ? T.optional(anno, hasMod(p, 'optional') && !p.default) : dt ?? T.ANY);
 		else
 			T.bindingNames(p.key).forEach(n => inner.addValue(n, T.ANY));
 	}
+	
 	if (fn.rest) {
 		if (typeof fn.rest.key === 'string')
-			inner.addValue(fn.rest.key, (fn.rest.typeAnnotation as Type | undefined) ?? T.ANY);
+			inner.addValue(fn.rest.key, fn.rest.typeAnnotation ?? T.ANY);
 		else
 			T.bindingNames(fn.rest.key).forEach(n => inner.addValue(n, T.ANY));
 	}
@@ -1726,21 +1722,17 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 						if (!checkAssignable(T.unwrapIfAsync(t, scope, async), expected, scope, (argument as any).pos, scope, err))
 							err(SEVERITY.ERROR, (argument as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
 						else
-							checkExcessProps(argument, expected, scope, (argument as any).pos, scope, err);
+							checkExcessProps(argument, expected, (argument as any).pos, scope, err);
 					}
 				}
 			}, undefined, err, noStamp);
 		} else {
 			const	returns: Type[] = [];
-			let		yields: Type[] | undefined;
-			const yieldCollector = generator ? [] : undefined;
-			try {
-				checkBlock(body, inner, (argument: Expr|undefined, scope: Scope): void => {
-					returns.push(argument ? typeOf(argument, scope, true, undefined, undefined, err) : T.VOID);
-				}, yieldCollector, err, noStamp);
-			} finally {
-				yields = yieldCollector;
-			}
+			const	yields = generator ? [] as Type[] : undefined;
+			checkBlock(body, inner, (argument: Expr|undefined, scope: Scope): void => {
+				returns.push(argument ? typeOf(argument, scope, true, undefined, undefined, err) : T.VOID);
+			}, yields, err, noStamp);
+
 			if (!isPredicate) {
 				if (generator) {
 					fn.returnType = TS.RefType('Generator', [
@@ -1753,7 +1745,6 @@ function checkFunctionBody(fnj: JS.CallSig<any>, body: JS.Statement<any>[] | Exp
 					fn.returnType = T.wrapReturnIfAsync((T.isBoolean(combined) && inferredPredicate(fn, body, inner)) || combined, inner, async);
 				}
 			}
-
 		}
 	} else {
 		// Precise (unwidened): `expected` may itself be a narrow/literal declared return type (rare, but real), so the
@@ -1790,31 +1781,32 @@ function checkClassMembers(name: string | undefined, body: TS.ClassMember[], ins
 		instScope.addTypeParam(p.name, p.constraint ?? T.ANY);
 	const statScope = new Scope(scope);
 	statScope.addValue('this', classValue);
+
 	for (const m of body) {
-		const inner = m.type === 'static_block' || ('modifiers' in m && hasMod(m, 'static')) ? statScope : instScope;
 		switch (m.type) {
 			case 'field':
 				if (m.value) {
-					const t = typeOf(m.value, inner, true, undefined, undefined, err);
+					const inner = hasMod(m, 'static') ? statScope : instScope;
+					const t		= typeOf(m.value, inner, true, undefined, undefined, err);
 					if (m.typeAnnotation && err) {
 						if (!checkAssignable(t, m.typeAnnotation, inner, (m as any).pos, inner, err))
 							err(SEVERITY.ERROR, (m as any).pos)`Type '${t}' is not assignable to type '${m.typeAnnotation}'`;
 						else
-							checkExcessProps(m.value, m.typeAnnotation, inner, (m as any).pos, inner, err);
+							checkExcessProps(m.value, m.typeAnnotation, (m as any).pos, inner, err);
 					}
 				}
 				break;
 			case 'method':
-				checkFunctionBody(m, m.body, inner, hasMod(m, 'async'), m.key === 'constructor' || hasMod(m, 'generator'), hasMod(m, 'generator'), err);
+				checkFunctionBody(m, m.body, hasMod(m, 'static') ? statScope : instScope, hasMod(m, 'async'), m.key === 'constructor' || hasMod(m, 'generator'), hasMod(m, 'generator'), err);
 				break;
 			case 'get':
-				checkFunctionBody(m, m.body, inner, false, false, false, err);
+				checkFunctionBody(m, m.body, instScope, false, false, false, err);
 				break;
 			case 'set':
-				checkFunctionBody(m, m.body, inner, false, true, false, err);
+				checkFunctionBody(m, m.body, instScope, false, true, false, err);
 				break;
 			case 'static_block':
-				checkBlock(m.body, new Scope(inner), undefined, undefined, err);
+				checkBlock(m.body, new Scope(statScope), undefined, undefined, err);
 				break;
 		}
 	}
@@ -1829,6 +1821,7 @@ function checkClassMembers(name: string | undefined, body: TS.ClassMember[], ins
 function assignRights(st: TS.Statement, scope: Scope, name?: string): { name: string; rights: { expr: Expr; scope: Scope }[] } | undefined {
 	if (st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '=' && st.expression.left.type === 'identifier' && (!name || st.expression.left.name === name))
 		return { name: st.expression.left.name, rights: [{ expr: st.expression.right, scope }] };
+
 	if (st.type === 'block' && st.body.length) {
 		// Not just the last statement: `if (!x) { x = e; bookkeeping(); }` assigns `x` before unrelated further work --
 		// scan backward for the last statement that actually assigns `name`, skipping over anything else.
@@ -1839,10 +1832,11 @@ function assignRights(st: TS.Statement, scope: Scope, name?: string): { name: st
 		}
 		return undefined;
 	}
+
 	if (st.type === 'if' && st.alternate) {
 		const a = assignRights(st.consequent, narrow(st.test, scope, true), name);
 		const b = a && assignRights(st.alternate, narrow(st.test, scope, false), a.name);
-		return a && b && { name: a.name, rights: [...a.rights, ...b.rights] };
+		return b && { name: a.name, rights: [...a.rights, ...b.rights] };
 	}
 	return undefined;
 }
@@ -1854,6 +1848,7 @@ function assignRights(st: TS.Statement, scope: Scope, name?: string): { name: st
 // exactly as it always has for them.
 export function checkBlock(stmts: TS.Statement[], scope: Scope, onReturn?: (argument: Expr|undefined, scope: Scope)=>void, yieldCollector?: Type[], err?: Err, noStamp?: boolean) {
 	hoist(stmts, scope);
+
 	for (const s of stmts) {
 		checkStmt(s, scope, onReturn, yieldCollector, err, noStamp);
 
@@ -1897,10 +1892,10 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 	// via `skipReturn`, and never itself at risk), which must keep stamping as before.
 	if (!noStamp)
 		(stmt as any).scope ??= scope;
-	const typeOf1 = (e: Expr, scope: Scope, expected?: Type) => typeOf(e, scope, true, expected, yieldCollector, err);
-	const checkBlock1 = (stmts: TS.Statement[], scope: Scope) => checkBlock(stmts, scope, onReturn, yieldCollector, err, noStamp);
 
-	const recurse = (stmt: TS.Statement, scope: Scope) => checkStmt(stmt, scope, onReturn, yieldCollector, err, noStamp);
+	const typeOf1		= (e: Expr, scope: Scope, expected?: Type)	=> typeOf(e, scope, true, expected, yieldCollector, err);
+	const checkBlock1	= (stmts: TS.Statement[], scope: Scope)		=> checkBlock(stmts, scope, onReturn, yieldCollector, err, noStamp);
+	const checkStmt1	= (stmt: TS.Statement, scope: Scope)		=> checkStmt(stmt, scope, onReturn, yieldCollector, err, noStamp);
 
 	switch (stmt.type) {
 		case 'var_decl': {
@@ -1925,10 +1920,10 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 			const pos = (stmt as any).pos;
 			for (const d of stmt.declarations) {
 				if (err && d.typeAnnotation && d.init) {
-					const anno = d.typeAnnotation as Type;
+					const anno = d.typeAnnotation;
 					const init = typeOf1(d.init, scope, anno);
 					if (!init)
-						checkExcessProps(d.init, anno, scope, pos, scope, err);
+						checkExcessProps(d.init, anno, pos, scope, err);
 					else if (!checkAssignable(init, anno, scope, pos, scope, err))
 						err(SEVERITY.ERROR, pos)`Type '${init}' is not assignable to type '${anno}' in declaration of '${d.name}'`;
 				}
@@ -1940,26 +1935,30 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 		case 'expression':
 			typeOf1(stmt.expression, scope);
 			break;
+
 		case 'block':
 			checkBlock1(stmt.body, new Scope(scope));
 			break;
+
 		case 'if':
 			typeOf1(stmt.test, scope);
-			recurse(stmt.consequent, new Scope(narrow(stmt.test, scope, true)));
+			checkStmt1(stmt.consequent, new Scope(narrow(stmt.test, scope, true)));
 			if (stmt.alternate)
-				recurse(stmt.alternate, new Scope(narrow(stmt.test, scope, false)));
+				checkStmt1(stmt.alternate, new Scope(narrow(stmt.test, scope, false)));
 			break;
+
 		case 'while':
 		case 'do_while':
 			typeOf1(stmt.test, scope);
-			recurse(stmt.body, new Scope(stmt.type === 'while' ? narrow(stmt.test, scope, true) : scope));
+			checkStmt1(stmt.body, new Scope(stmt.type === 'while' ? narrow(stmt.test, scope, true) : scope));
 			break;
+
 		case 'for': {
 			const inner = new Scope(scope);
 			if (stmt.kind === 'normal') {
 				if (stmt.init) {
 					if (stmt.init.type === 'var_decl')
-						recurse(stmt.init, inner);
+						checkStmt1(stmt.init, inner);
 					else
 						typeOf1(stmt.init, inner);
 				}
@@ -1967,7 +1966,7 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 					typeOf1(stmt.test, inner);
 				if (stmt.update)
 					typeOf1(stmt.update, inner);
-				recurse(stmt.body, stmt.test ? narrow(stmt.test, inner, true) : inner);
+				checkStmt1(stmt.body, stmt.test ? narrow(stmt.test, inner, true) : inner);
 			} else {
 				const rightT = T.resolveOwn(typeOf1(stmt.right, inner), inner);
 				const elemT = stmt.kind === 'in' ? T.STRING
@@ -1976,17 +1975,18 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 					: T.ANY;
 				if (stmt.init.type === 'var_decl') {
 					for (const d of stmt.init.declarations)
-						hoistVar(inner, d, true, (d.typeAnnotation as Type) ?? elemT);
+						hoistVar(inner, d, true, d.typeAnnotation ?? elemT);
 				} else {
 					typeOf1(stmt.init, inner);
 				}
-				recurse(stmt.body, inner);
+				checkStmt1(stmt.body, inner);
 			}
 			break;
 		}
 		case 'return':
 			onReturn?.(stmt.argument, scope);
 			break;
+
 		case 'switch': {
 			typeOf1(stmt.discriminant, scope);
 			// A `case` with no body falls through to the next -- reuse `if`'s discriminated-union narrowing by synthesizing that binary
@@ -2009,8 +2009,9 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 		case 'with':
 			typeOf1(stmt.argument, scope);
 			if (stmt.type === 'with')
-				recurse(stmt.body, scope);
+				checkStmt1(stmt.body, scope);
 			break;
+
 		case 'try':
 			checkBlock1(stmt.block, new Scope(scope));
 			if (stmt.handlerBody) {
@@ -2026,13 +2027,16 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 			if (stmt.finalizer)
 				checkBlock1(stmt.finalizer, new Scope(scope));
 			break;
+
 		case 'labeled':
-			recurse(stmt.body, scope);
+			checkStmt1(stmt.body, scope);
 			break;
+
 		case 'function_decl':
 			if (stmt.body)
 				checkFunctionBody(stmt, stmt.body, scope, hasMod(stmt, 'async'), hasMod(stmt, 'generator'), hasMod(stmt, 'generator'), err);
 			break;
+
 		case 'class_decl': {
 			const c = stmt as TS.Class;
 			const { instance, value } = classShapes(c, scope);
@@ -2040,16 +2044,18 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 			break;
 		}
 		case 'export_decl':
-			recurse(stmt.declaration, scope);
+			checkStmt1(stmt.declaration, scope);
 			break;
+
 		case 'export':
 			if (stmt.default) {
 				if (isTsDeclaration(stmt.default))
-					recurse(stmt.default, scope);
+					checkStmt1(stmt.default, scope);
 				else
 					typeOf1(stmt.default, scope);
 			}
 			break;
+
 		case 'namespace_decl':
 			checkBlock1(stmt.body, new Scope(scope));
 			break;

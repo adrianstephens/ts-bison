@@ -33,6 +33,14 @@ for (let i = 0; i < f.length; i++) {
 // directly, and that package's own `.toBytes()` is the assembler -- a first-party GC-capable writer
 // (wabt's published build has GC compiled out entirely; binaryen works but is ~200x this project's
 // own size for what's fundamentally a fixed, self-controlled instruction set -- see the write-up).
+// Type-checks `src` in isolation (no codegen) -- for tests that only care whether the checker
+// accepts/rejects a program, independent of whatever towasm.ts backend gaps its shape might otherwise hit.
+function typeErrors(src: string): string[] {
+	const program		= parser.parse(src);
+	const diagnostics	= TStypeCheck(program, libScope);
+	return diagnostics.filter(d => d.severity === SEVERITY.ERROR).map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`);
+}
+
 async function compile(src: string) {
 	const program		= parser.parse(src);
 	const diagnostics	= TStypeCheck(program, libScope);
@@ -116,6 +124,17 @@ async function main() {
 			console.error(`FAIL - ${name}: expected a throw, got none`);
 		} catch (e) {
 			check(name, pattern.test((e as Error).message), true);
+		}
+	};
+	// Asserts `src` type-checks with zero errors -- for narrowing/inference regressions where the bug is
+	// entirely in the checker's own verdict, independent of whether towasm.ts's backend can also compile the shape.
+	const checkTypeChecks = (name: string, src: string) => {
+		const errors = typeErrors(src);
+		if (errors.length === 0) {
+			console.log(`ok - ${name}`);
+		} else {
+			++failures;
+			console.error(`FAIL - ${name}: unexpected type errors:\n${errors.join('\n')}`);
 		}
 	};
 	// The `Math.*` transcendental functions are polynomial approximations, not exact -- a relative
@@ -998,6 +1017,40 @@ async function main() {
 		} catch {
 			console.log('ok - nullable primitive field: unnarrowed arithmetic traps at runtime');
 		}
+	}
+
+	{
+		// `x?.prop === literal` truly holding also implies `x` itself is non-nullish (a nullish `x` would
+		// short-circuit the whole comparison to `undefined`, never equal to a real literal) -- negating a
+		// further-nested `x?.prop === literal && !x.other && x.other2` conjunction used to lose this,
+		// letting `undefined` leak into the narrowed type on the branch asserting the equality actually
+		// held, and (as a consequence of the same union-combining logic) silently dropping a union member
+		// along the way. Type-check only (not `compile`/wasm execution) -- the bug is entirely in the
+		// checker's own verdict, and this receiver shape (an optional union-of-interfaces parameter) hits
+		// unrelated, pre-existing towasm.ts backend gaps that have nothing to do with the narrowing itself.
+		checkTypeChecks('optional-chain discriminant conjunction: negation keeps every union member and excludes undefined', `
+			interface RefType { kind: 'ref'; typeArgs?: unknown[]; declScope?: object }
+			interface OtherType { kind: 'other' }
+			type NodeType = RefType | OtherType;
+			function resolve(scope: unknown, t: NodeType): string { return t.kind; }
+			function f(scope: unknown, typeAnnotation?: NodeType) {
+				return typeAnnotation?.kind === 'ref' && !typeAnnotation.typeArgs && typeAnnotation.declScope
+					? resolve(typeAnnotation.declScope, typeAnnotation)
+					: typeAnnotation ? resolve(scope, typeAnnotation) : 'none';
+			}
+		`);
+		// Negative control: `x?.prop !== literal` holding does NOT imply `x` is non-nullish (a nullish `x`
+		// satisfies `!==` just as well) -- must stay rejected, not accidentally "fixed" into acceptance.
+		await checkThrows('optional-chain discriminant conjunction: negated-equality branch does not wrongly assume non-null', () => compile(`
+			interface RefType { kind: 'ref' }
+			interface OtherType { kind: 'other' }
+			function resolve(t: RefType | OtherType): string { return String(t); }
+			export function f(typeAnnotation?: RefType | OtherType): string {
+				if (typeAnnotation?.kind !== 'ref')
+					return resolve(typeAnnotation);
+				return resolve(typeAnnotation);
+			}
+		`), /not assignable/);
 	}
 
 	{
