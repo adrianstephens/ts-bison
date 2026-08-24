@@ -37,10 +37,14 @@ export interface TextPos {
 }
 export type WithTextPos<T> = T & {pos: TextPos};
 
-export interface Token {
-	type:	Terminal;
-	value:	string;	// semantic value; available as $[i] in actions
+export interface Token<T = string> {
+	type:	Terminal<T>;
+	value:	T;	// semantic value; available as $[i] in actions
 	pos:	TextPos;
+	// Extra raw characters already consumed beyond the terminal's own regex match, for a callback that hand-
+	// parses more than its trigger pattern (see `Manual()`) -- `nextToken` advances the lexer past match.length
+	// + consumed instead of just match.length once such a callback returns.
+	consumed?: number;
 }
 
 export interface LexPosition extends TextPos {
@@ -65,13 +69,13 @@ export interface RecoveryLexPosition extends LexPosition {
 	token: Terminal;
 }
 
-export type TerminalCallback<C = any> = (lexctx: LexContext, ctx: C) => Token | Terminal | string | RegExp | undefined;
+export type TerminalCallback<T = any, C = any> = (lexctx: LexContext, ctx: C) => Token<T> | Terminal<T> | string | RegExp | undefined;
 export type RecoveryCallback = (lex: RecoveryLexPosition, row: Map<Terminal, ActionEntry>) => Token | Terminal | string | RegExp | undefined;
 
 export class Terminal<T = any> {
 	_ignore = false;
 	pattern?: RegExp;
-	constructor(public name: string, pattern?: RegExp, public callback?: TerminalCallback) {
+	constructor(public name: string, pattern?: RegExp, public callback?: TerminalCallback<T>) {
 		if (pattern)
 			this.pattern = new RegExp(pattern.source, 'y' + pattern.flags.replace(/[gyd]/g, ''));
 	}
@@ -84,6 +88,22 @@ export function termOneOf<const T extends string>(names: readonly T[]) {
 
 export function terminal(name: string, pattern?: RegExp, lex?: TerminalCallback) {
 	return new Terminal<string>(name, pattern, lex);
+}
+
+// A hand-parsed "island": `trigger` only decides *whether* this terminal fires at a position (kept small and
+// unambiguous, e.g. a single sigil like `/@/`), then `fn` gets the raw remaining input from right after that
+// trigger match and does its own parsing however it likes (regex, a hand-rolled scanner, even invoking a
+// second tison `Parser` built with `start` set to some existing nonterminal) -- entirely outside the LALR
+// table, so it can never disturb states shared with unrelated grammar positions the way a new rule reaching
+// an already-overloaded nonterminal can (see tison_debugging_technique memory, "sixth"/"seventh" class).
+// `fn` returns how many characters of `remaining` it consumed; the lexer advances past trigger + that span
+// as one token, whose value is the payload `fn` already fully parsed -- not further reduced by any grammar rule.
+export function Manual<T>(name: string, trigger: RegExp, fn: (remaining: string, ctx: any) => { value: T; consumed: number } | undefined): Terminal<T> {
+	const term: Terminal<T> = new Terminal<T>(name, trigger, (lex, ctx) => {
+		const r = fn(lex.remaining, ctx);
+		return r && { type: term, value: r.value, pos: lex, consumed: r.consumed };
+	});
+	return term;
 }
 
 export type Action<T, C = any, A = any[]> = (values: WithTextPos<A>, ctx: C) => T
@@ -212,6 +232,10 @@ export interface GrammarSpec<T = any> {
 
 export interface Parser<T, C = any> {
 	parse(input: string, ctx?: C): T;
+	// Like `parse`, but succeeds on a leading prefix of `input` that forms one complete derivation of
+	// `start`, instead of requiring the rest of `input` to be consumed too -- for a sub-parser invoked from
+	// inside a `Manual()` island that only wants "the next one of these", not "the rest of the file".
+	parsePrefix(input: string, ctx?: C): { value: T; consumed: number };
 	tables: ParseTables;
 }
 
@@ -741,9 +765,9 @@ function advancePos(state: TextPos, text: string) {
 }
 
 interface Lexer extends TextPos {
-	prev?:		Token;
+	prev?:		Token<any>;
 	ctx:		any;			// reassigned when a GLR fork settles on a branch's cloned ctx
-	next(allowed: Map<Terminal, ActionEntry>): 	Token;
+	next(allowed: Map<Terminal, ActionEntry>): 	Token<any>;
 	peekText(): string;
 }
 
@@ -763,7 +787,7 @@ export function sameValue(a: unknown, b: unknown): boolean {
 	return keysA.length === Object.keys(b).length && keysA.every(k => sameValue((a as any)[k], (b as any)[k]));
 }
 
-function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: TextPos & { prev?: Token }, ctx: any, resolveSym: (sym: Token|Terminal|string|RegExp|undefined) => Token|Terminal|undefined): Token {
+function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: TextPos & { prev?: Token }, ctx: any, resolveSym: (sym: Token<any>|Terminal|string|RegExp|undefined) => Token<any>|Terminal|undefined): Token<any> {
 
 	while (state.offset < input.length) {
 		const pos = getTextPos(state);
@@ -801,7 +825,12 @@ function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: Te
 				}, ctx));
 
 				if (result) {
-					advancePos(state, match);
+					// A callback returning a `Token` with `.consumed` set has hand-parsed past its own trigger
+					// match (see `Manual()`) -- advance the real lexer position over that extra span too, not
+					// just `match`, so the next real token is lexed from where the callback actually left off.
+					const extra = !(result instanceof Terminal) && result.consumed
+						? input.slice(after.offset, after.offset + result.consumed) : '';
+					advancePos(state, match + extra);
 					// `result` is the callback's *returned* terminal (e.g. a contextual keyword like GET
 					// downgrading itself to IDENT) -- using `term` (the originally-matched terminal) here
 					// instead would silently discard that reclassification and always keep the keyword type.
@@ -823,7 +852,13 @@ function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: Te
 interface StackEntry { state: number; value: unknown; }
 type InternalRecoveryCallback = (stream: Lexer, row: Map<Terminal, ActionEntry>, failing: Terminal) => Token | undefined;
 
-function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any) {
+// Thrown by `runParser` in `prefixMode` when the stack has already fully reduced to `start` (the current
+// state would accept a real `$end` right now) but the actual lookahead is something else -- i.e. a
+// hand-parsed "island" (see `Manual()`) asked a sub-parser to consume just a bounded prefix of a larger
+// string, and it found exactly one. Caught by `runParserPrefix`, never meant to escape it.
+class PrefixAccepted { constructor(public value: unknown, public consumed: number) {} }
+
+function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any, prefixMode?: boolean) {
 	const stack: StackEntry[] = [{ state: 0, value: undefined }];
 
 	let realTok		= stream.next(tables.action[0]);
@@ -835,7 +870,15 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Intern
 		const row			= tables.action[stack[stack.length - 1].state];
 		const direct		= row.get(realTok.type);
 		let usingRecovery	= !direct || direct.kind === 'error';
-		if (usingRecovery) {
+		// In prefix mode, a real lookahead that doesn't fit here doesn't necessarily mean "done" yet -- a
+		// grammar shaped so nothing legally follows `start` gates even its *own* final reduce(s) on lookahead
+		// `$end` (that's exactly what `start`'s FOLLOW set is, with no real continuation to share it with), so
+		// reaching actual accept can take several chained reduces from here. Drive those via a synthetic `$end`
+		// token through the ordinary reduce/goto path below (not `recover()` -- this isn't error recovery,
+		// every one of these reduces was always going to happen, just deferred) until genuine accept, or a
+		// state with no `$end` entry at all (a real dead end, falls through to the ordinary error below).
+		const syntheticEnd	= prefixMode && usingRecovery && row.has(EOF);
+		if (usingRecovery && !syntheticEnd) {
 			// Not reset on non-recovery steps: a stuck cycle alternates recovery with shift/reduce of the
 			// synthesized token itself, so consecutive recovery steps are rare even when truly stuck --
 			// compare against `stream.offset` (real progress) instead.
@@ -846,7 +889,7 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Intern
 			if (recoveryStuckCount > MAX_RECOVERY_AT_SAME_OFFSET)
 				usingRecovery = false;
 		}
-		const tok			= usingRecovery ? recover(stream, row, realTok.type) : realTok;
+		const tok			= !usingRecovery ? realTok : syntheticEnd ? { type: EOF, value: '', pos: realTok.pos } : recover(stream, row, realTok.type);
 		const entry			= tok && row.get(tok.type);
 
 		if (!entry || entry.kind === 'error') {
@@ -891,6 +934,10 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Intern
 			stack.push({ state, value: rule.action(vals, ctx) });
 
 		} else if (entry.kind === 'accept') {
+			// Reached via a synthetic `$end` (the real lookahead is something else) -- report the boundary
+			// instead of pretending the rest of `stream` doesn't exist.
+			if (prefixMode && realTok.type !== EOF)
+				throw new PrefixAccepted(stack[stack.length - 1].value, realTok.pos.offset);
 			return stack[stack.length - 1].value;
 
 		} else {
@@ -900,6 +947,19 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Intern
 	}
 }
 
+// Parses as much of `stream` as forms one complete `start` derivation, then stops -- instead of requiring
+// the rest of `stream` to be consumed too. Doesn't handle a GLR fork needed at exactly the acceptance
+// boundary (a fork resolving *inside* the derivation is fine, since that returns normally either way).
+function runParserPrefix(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any): { value: any; consumed: number } {
+	try {
+		const value = runParser(tables, stream, ctx, recover, merge, forkCtx, true);
+		return { value, consumed: stream.offset };
+	} catch (e) {
+		if (e instanceof PrefixAccepted)
+			return { value: e.value, consumed: e.consumed };
+		throw e;
+	}
+}
 
 // ===================================================================
 //  GLR fork explorer
@@ -1034,7 +1094,7 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 			return { accepted: true, value: acceptedValue };
 
 		if (tok.type === EOF)
-			throw new SyntaxError('Parse completed without accept');
+			throw new SyntaxError(`Unexpected end of input at line ${stream.line}, col ${stream.col} -- input ended before any active derivation reached an accepting state (likely truncated or missing a closing token, e.g. an unclosed tag/bracket).`);
 
 		if (tok.type !== ERROR)
 			stream.prev = tok;
@@ -1043,7 +1103,11 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 		if (!shifted.length) {
 			if (tok.type === ERROR)
 				throw new SyntaxError(`Unexpected character '${stream.peekText()[0] ?? ''}' at line ${stream.line}, col ${stream.col}.`);
-			throw new SyntaxError(`No active GLR fork paths survived to token ${i + 1} (at line ${stream.line}, col ${stream.col}, near '${tok.type.name}') -- every forked derivation died out; this is a parser/grammar bug, not just invalid input.`);
+			// Genuinely ambiguous phrasing on purpose: every forked derivation dying here can mean a real grammar
+			// gap, but empirically (see tison_official_ts_test_suite memory) is at least as often just invalid
+			// input no derivation could ever have accepted (a mismatched/unclosed tag, a malformed attribute) --
+			// unlike the ERROR-token case above, there's no cheap way to tell those apart from here.
+			throw new SyntaxError(`No active GLR fork paths survived to token ${i + 1} (at line ${stream.line}, col ${stream.col}, near '${tok.type.name}') -- every forked derivation died out here, from either a parser/grammar gap or input no derivation could accept.`);
 		}
 
 		active = new Map<string, StackFrame>();
@@ -1338,7 +1402,7 @@ export function makeParser<T>(spec: GrammarSpec<T>, prebuilt?: { g: GrammarBuild
 		return tables;
 	})();
 
-	const resolveSym = (sym: Token|Terminal|string|RegExp|undefined): Token|Terminal|undefined =>
+	const resolveSym = (sym: Token<any>|Terminal|string|RegExp|undefined): Token<any>|Terminal|undefined =>
 		typeof sym === 'string'		? g.terminalsByName.get(sym)
 		: sym instanceof RegExp		? g.terminalsByName.get(sym.source)
 		: sym;
@@ -1371,6 +1435,7 @@ export function makeParser<T>(spec: GrammarSpec<T>, prebuilt?: { g: GrammarBuild
 
 	return {
 		tables,
-		parse: (input, ctx) => runParser(tables, makeLexer(input, ctx), ctx, recover, merge, forkCtx)
+		parse: (input, ctx) => runParser(tables, makeLexer(input, ctx), ctx, recover, merge, forkCtx),
+		parsePrefix: (input, ctx) => runParserPrefix(tables, makeLexer(input, ctx), ctx, recover, merge, forkCtx),
 	};
 }
