@@ -1822,23 +1822,26 @@ function checkClassMembers(name: string | undefined, body: TS.ClassMember[], ins
 }
 
 // Every leaf of an if/else chain (or a block's final statement) assigns the same variable:
-// yields the assigned expressions so the post-if type can merge the branches
-function assignRights(st: TS.Statement, name?: string): { name: string; rights: Expr[] } | undefined {
+// yields the assigned expressions (each tagged with the scope its own branch narrowed down to,
+// so a right-hand side that reads back the narrowed test subject -- `arg = new Stream(arg)` --
+// gets re-evaluated with that branch's narrowing in effect, not the pre-`if` scope) so the
+// post-if type can merge the branches.
+function assignRights(st: TS.Statement, scope: Scope, name?: string): { name: string; rights: { expr: Expr; scope: Scope }[] } | undefined {
 	if (st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '=' && st.expression.left.type === 'identifier' && (!name || st.expression.left.name === name))
-		return { name: st.expression.left.name, rights: [st.expression.right] };
+		return { name: st.expression.left.name, rights: [{ expr: st.expression.right, scope }] };
 	if (st.type === 'block' && st.body.length) {
 		// Not just the last statement: `if (!x) { x = e; bookkeeping(); }` assigns `x` before unrelated further work --
 		// scan backward for the last statement that actually assigns `name`, skipping over anything else.
 		for (let i = st.body.length - 1; i >= 0; i--) {
-			const a = assignRights(st.body[i], name);
+			const a = assignRights(st.body[i], scope, name);
 			if (a)
 				return a;
 		}
 		return undefined;
 	}
 	if (st.type === 'if' && st.alternate) {
-		const a = assignRights(st.consequent, name);
-		const b = a && assignRights(st.alternate, a.name);
+		const a = assignRights(st.consequent, narrow(st.test, scope, true), name);
+		const b = a && assignRights(st.alternate, narrow(st.test, scope, false), a.name);
 		return a && b && { name: a.name, rights: [...a.rights, ...b.rights] };
 	}
 	return undefined;
@@ -1861,9 +1864,9 @@ export function checkBlock(stmts: TS.Statement[], scope: Scope, onReturn?: (argu
 			} else {
 				// `if (x === undefined) x = e;` and full if/else chains assigning x:
 				// afterwards x holds one branch's value or another's
-				const a = assignRights(s.alternate ? s : s.consequent);
+				const a = s.alternate ? assignRights(s, scope) : assignRights(s.consequent, narrow(s.test, scope, true));
 				if (a) {
-					const parts = a.rights.map(r => typeOf(r, scope, true, undefined, undefined, err));
+					const parts = a.rights.map(({ expr, scope: rightScope }) => typeOf(expr, rightScope, true, undefined, undefined, err));
 					if (!s.alternate) {
 						const other = narrow(s.test, scope, false).value(a.name);
 						if (other)

@@ -206,8 +206,19 @@ export const IDENT		= terminal('identifier', reIDENT);
 // ambiguity with anything else in the grammar (`#` doesn't otherwise appear anywhere but `#!` shebangs,
 // already stripped by `skip` before any terminal match is attempted), so this needs no `forceFork`.
 export const PRIVATE_NAME	= terminal('private-name', new RegExp('#' + reIDENT.source, 'u'));
-// Exponent digits allow the same `_` numeric separator every other digit run here does (`1e1_0` is valid).
-export const NUM		= terminal('number', /0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*n?|0[oO][0-7](?:_?[0-7])*n?|0[bB][01](?:_?[01])*n?|[0-9](?:_?[0-9])*n|(?:[0-9](?:_?[0-9])*\.(?:[0-9](?:_?[0-9])*)?|\.[0-9](?:_?[0-9])*|[0-9](?:_?[0-9])*)(?:[eE][-+]?[0-9](?:_?[0-9])*)?/);
+// Real TS's scanner tolerates a numeric separator `_` in *any* position within a decimal literal's digit
+// runs -- doubled up, straddling the `.`/`e`/sign boundaries, even trailing with nothing after it -- and
+// only soft-diagnoses misplacement (TS6188/TS6189) rather than ever failing to tokenize; confirmed exhaustively
+// against `parser.numericSeparators.decmialNegative.ts`'s own `.errors.txt` baseline (52 single-fragment cases
+// enumerating misplaced separators), every one a single soft diagnostic with no parse-breaking follow-on error.
+// A bare trailing `.` (no real fraction digit, e.g. `3.toString()`) only gets absorbed into the number when NOT
+// immediately followed by an identifier-start char -- real TS reserves that adjacency for member access
+// (`3.toString()` parses as `3 . toString ()`, just diagnosed TS1351; `3. + 1` still eats the dot as usual) --
+// UNLESS what follows is actually a valid exponent (`3.e5` is the number `3.0e5`, not `(3.).e5`: `e` looks like
+// an identifier-start too, so the exponent shape has to be special-cased ahead of the generic identifier guard).
+// This same rule also covers `000.toString()` with no octal-specific casing: a leading-zero digit run has no
+// digit after its own trailing dot either, so it stops right at `000` the same way `3` does.
+export const NUM		= terminal('number', /0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*n?|0[oO][0-7](?:_?[0-7])*n?|0[bB][01](?:_?[01])*n?|[0-9](?:_?[0-9])*n|(?:[0-9][0-9_]*\.(?:_*[0-9][0-9_]*|_*(?:(?=[eE][-+]?_*[0-9])|(?![A-Za-z_$])))|\.[0-9][0-9_]*|[0-9][0-9_]*)(?:[eE]_*[-+]?_*[0-9][0-9_]*)?/);
 export const STR		= terminal('string', /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/);
 
 // `get`/`set`/`async` are contextual keywords, only keywords when what follows still looks like the construct.

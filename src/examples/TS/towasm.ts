@@ -1538,7 +1538,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 			return closureFuncSigType(resolved);
 
 		if (t.type === 'ref') {
-			const cls = ensureClass(t.name);
+			const cls = ensureClass(t.name, t.typeArgs);
 			if (cls)
 				return ownerThisType(cls);
 		}
@@ -5212,15 +5212,27 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 	// Cached into the same `classes` map real classes use -- a name can't be both a `class_decl` and a
 	// type alias, so no key collision risk -- which is what lets ordinary field access (`classOf`/`case
 	// 'member'`) work completely unchanged afterward, same as any other class.
-	function ensureObjectShape(name: string): ClassInfo | undefined {
-		const existing = classes.get(name);
+	function ensureObjectShape(name: string, typeArgs?: Type[]): ClassInfo | undefined {
+		// Same composite-key convention as `ensureClass` itself -- two different type arguments are two
+		// different physical shapes (e.g. `TypeParam<Type>` vs. a bare, implicitly-`any` `TypeParam`).
+		const key = typeArgs?.length ? `${name}<${typeArgs.map(t => T.typeKey(T.resolve(global, t))).join(',')}>` : name;
+		const existing = classes.get(key);
 		if (existing)
 			return existing;
-		const target = global.type(name)?.type;
-		if (!target)
+		if (!global.type(name))
 			return undefined;
-		const resolved = T.resolve(global, target);
+		// Via a `RefType` (not the entry's own raw, still-generic `.type` directly) so a reference to a
+		// generic interface/alias -- bare (`TypeParam`) or explicit (`TypeParam<X>`) -- goes through
+		// `resolve`'s own type-arg substitution (each param -> its given arg, its own default, or `any`)
+		// instead of leaving the type param itself unresolved in every member's type.
+		const resolved = T.resolve(global, TS.RefType(name, typeArgs));
 		if (resolved.type !== 'object')
+			return undefined;
+		// An index-signature-shaped object (`Partial<T>`, `Record<string,V>`, ...) isn't a fixed-field
+		// struct at all -- `ownerFor`'s own caller already has a real, more appropriate fallback for this
+		// exact shape (`indexSignatureValueType`, routing to the `Map`-backed dynamic-object path) once
+		// `ensureClass` declines here, same as it always safely declined before `typeArgs` was threaded in.
+		if (resolved.members.some(m => m.type === 'index'))
 			return undefined;
 
 		const fields: { name: string; wtype: WasmType }[] = [];
@@ -5241,12 +5253,12 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		}
 
 		const info: ClassInfo = {
-			name, typeIndex: -1, thisTsType: TS.RefType(name),
+			name: key, typeIndex: -1, thisTsType: TS.RefType(name, typeArgs),
 			decl: { name, body: [] },
 			fields, fieldIndex, methodDecls: new Map(),
 		};
-		classes.set(name, info);
-		info.thisWtype = { ref: name };
+		classes.set(key, info);
+		info.thisWtype = { ref: key };
 		info.typeIndex = addType({ final: !everExtended.has(name), supertypes: [], type: {
 			kind: 'struct',
 			fields: fields.map(f => ({ type: toValType(f.wtype), mut: true })),
@@ -5275,16 +5287,17 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		if (!info) {
 			// A plain lib-internal class -- an ordinary struct seeded into `classes` lazily on first reference.
 			let decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
-			if (decl?.type !== 'class_decl' && !typeArgs?.length) {
-				const alias = resolveClassAlias(name);
-				if (alias)
-					return ensureClass(alias.name, alias.typeArgs);
-				const shape = ensureObjectShape(name);
-				if (shape)
-					return shape;
+			if (decl?.type !== 'class_decl') {
+				// `resolveClassAlias` only covers a *lib* alias to a real class name, never generic --
+				// a generic interface/type-alias reference (with or without explicit type args, e.g.
+				// `TypeParam` bare or `TypeParam<T>`) goes straight to `ensureObjectShape` instead.
+				if (!typeArgs?.length) {
+					const alias = resolveClassAlias(name);
+					if (alias)
+						return ensureClass(alias.name, alias.typeArgs);
+				}
+				return ensureObjectShape(name, typeArgs);
 			}
-			if (decl?.type !== 'class_decl')
-				return undefined;
 			if (decl.typeParams?.length) {
 				if (!typeArgs || typeArgs.length !== decl.typeParams.length)
 					throw new Error(`towasm: class '${name}' needs ${decl.typeParams.length} explicit type argument(s)`);
@@ -6127,7 +6140,7 @@ export function TStoWasm(ast: TS.Program): wasm.WasmModule {
 		const ctx	= new FunctionContext('__toplevel', new Scope(libGlobal), plainReturn('void'), undefined);
 		ctx.widenedTypes = collectRangeWidenings(ast.body!, ctx.scope);
 		ast.body!.forEach(st => {
-			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl')
+			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl' || st.type === 'interface_decl')
 				return;
 			if (st.type === 'var_decl' && promotedConsts.size) {
 				const declarations = st.declarations.filter(d => typeof d.name !== 'string' || !promotedConsts.has(d.name));

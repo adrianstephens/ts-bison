@@ -186,8 +186,12 @@ function looksLikeBalancedGenericArgs(textAfterLt: string, followedBy: RegExp): 
 // `(` covers the ordinary `foo<T>(...)` call; the rest cover a paren-less generic `new` (`new Map<K, V>;`), which has no `(` to look for at all.
 // Matched via `\x3c` rather than plain `/</` so its pattern source sorts ahead of the plain `<` terminal's on the tokenizer's length-tie comparison,
 // letting this terminal's scan run before the plain `<` auto-accepts. `remaining` is already everything after the matched '<' -- don't `.slice(1)` it again.
+// `=` (assignment to an instantiation expression, `obj.fn<T> = ...`) only counts when whitespace separates
+// it from the closing `>` -- with none (`f<T>=x`), the real tokenizer merges them into a single `>=` token,
+// which can never satisfy `call_type_arguments`'s literal `'>'`, so TSC itself falls back to `<` as relational
+// there (confirmed against real tsc: `f<number>=3` types as `(f<number)>=3`, only `f<number> = 3` instantiates).
 const genericCallOpen = terminal('<call-generics>', /\x3c/,
-	({ remaining }) => looksLikeBalancedGenericArgs(remaining, /^\s*(\(|[;,)\]}.]|\?\.)/) ? genericCallOpen : undefined
+	({ remaining }) => looksLikeBalancedGenericArgs(remaining, /^(\s*(\(|[;,)\]}.]|\?\.)|\s+=)/) ? genericCallOpen : undefined
 );
 
 // Same idea, own terminal, for a generic superclass reference in `extends` -- reachable only from `class_heritage`'s own extends position, never

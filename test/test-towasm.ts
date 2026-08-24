@@ -3202,6 +3202,37 @@ async function main() {
 	}
 
 	{
+		// `checkBlock`'s own post-`if` narrowing merge (`x = e;` in one or both branches, used to predict
+		// what `x` holds afterward) re-evaluates each branch's own right-hand side `e` a second time, to
+		// combine the branches' results -- this used to re-evaluate it against the pre-`if` (unnarrowed)
+		// scope instead of that branch's own narrowed one, so `e` reading back the very thing the `if`
+		// just narrowed (`arg = new Stream(arg)`, `arg` narrowed to `Uint8Array` by the `if`) saw the
+		// original wide type and failed a real type check, even though the first (correct) evaluation of
+		// the same `if` -- via ordinary statement checking, not this merge -- had already narrowed it fine.
+		const { noElse, ifElseTrue, ifElseFalse } = await compile(`
+			class Stream { constructor(public buffer: Uint8Array) {} }
+			function ensureStreamNoElse(arg: Stream | Uint8Array): number {
+				if (arg instanceof Uint8Array)
+					arg = new Stream(arg);
+				return (arg as Stream).buffer.length;
+			}
+			function ensureStreamIfElse(arg: Stream | Uint8Array): number {
+				if (arg instanceof Uint8Array)
+					arg = new Stream(arg);
+				else
+					arg = arg;
+				return (arg as Stream).buffer.length;
+			}
+			export function noElse(): number { return ensureStreamNoElse(new Uint8Array(21)); }
+			export function ifElseTrue(): number { return ensureStreamIfElse(new Uint8Array(22)); }
+			export function ifElseFalse(): number { return ensureStreamIfElse(new Stream(new Uint8Array(23))); }
+		`);
+		check('post-if merge: a no-else branch reassigning from its own narrowed value compiles and runs', noElse(), 21);
+		check('post-if merge: the true branch of an if/else reassigning from its own narrowed value compiles and runs', ifElseTrue(), 22);
+		check('post-if merge: the false branch of an if/else compiles and runs', ifElseFalse(), 23);
+	}
+
+	{
 		// `(a, b, c)` -- every expression but the last runs purely for its side effects.
 		const { sideEffects, forLoopUpdate } = await compile(`
 			export function sideEffects(): number {
@@ -4006,6 +4037,41 @@ async function main() {
 		`);
 		check("finally: inside a 'reassignsThis' method -- the return value is fixed early, but the appended (caller-visible) 'this' still reflects 'finally's later mutation",
 			testReassignThisFinally(), 6106);
+	}
+
+	{
+		// A generic interface/type-alias referenced with no explicit type argument at all (`Pair`, not
+		// `Pair<X>`) previously crashed codegen outright -- `ensureObjectShape` resolved the entry's own
+		// raw (still-generic) type directly, instead of through `resolve`'s own default-type-arg
+		// substitution (`RefType` with no `typeArgs`), leaving the type param itself unresolved in every
+		// member. Found compiling `ts-parser.ts` itself (`TypeParam(...): TypeParam`, no `<X>`) while
+		// exploring the self-hosting target. `ensureClass` also dropped a ref's own `typeArgs` outright
+		// when falling through to this path -- so an *explicit* instantiation (a generic field like
+		// `Holder<T>`'s own `w: Wrap<T>`) needed a separate fix too, both covered here.
+		const { bareGeneric, explicitGeneric } = await compile(`
+			interface Pair<T> { first: T; second: number; }
+			function makePairBare(x: number): Pair { return { first: x, second: 2 }; }
+			export function bareGeneric(): number { return makePairBare(9).second; }
+
+			interface Wrap<T> { inner: T; }
+			class Holder<T> { constructor(public w: Wrap<T>) {} }
+			function makeHolder(x: number): Holder<number> { return new Holder<number>({ inner: x }); }
+			export function explicitGeneric(): number { return makeHolder(7).w.inner; }
+		`);
+		check('generic interface reference: bare (implicit type arg) compiles and runs', bareGeneric(), 2);
+		check('generic interface reference: explicit type arg (as a generic field type) compiles and runs', explicitGeneric(), 7);
+	}
+
+	{
+		// A top-level `interface` declaration (pure type-level, erased at runtime, same as `type X = ...`)
+		// wasn't in the top-level statement loop's skip list -- unlike `type_alias_decl`, right next to it
+		// -- so it fell through to `emitStmt`'s switch and threw "unsupported statement 'interface_decl'"
+		// merely for *existing* alongside real code, never mind being referenced.
+		const { interfaceCoexists } = await compile(`
+			interface Unused { x: number; }
+			export function interfaceCoexists(): number { return 5; }
+		`);
+		check('a top-level interface declaration compiles alongside real code', interfaceCoexists(), 5);
 	}
 
 	{
