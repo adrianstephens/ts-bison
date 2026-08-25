@@ -618,8 +618,17 @@ JS.export_specifier.push(
 JS.import_declaration.push(
 	Rule([TYPE, JS.named_imports, 'from', STR, ';'],	$ => ({ type: 'import', specifiers: $[1], source: unquoteString($[3]), typeOnly: true } as const)),
 	Rule([TYPE, '*', 'as', IDENT, 'from', STR, ';'],	$ => ({ type: 'import', namespace: $[3], source: unquoteString($[5]), typeOnly: true } as const)),
+	// The default-import shapes were missing their own `type`-only forms (`import type X from 'y'`, and its
+	// combos with a named/namespace clause) -- real TS 3.8+, confirmed via the official corpus's own
+	// grammarErrors.ts (zero diagnostics for all three).
+	Rule([TYPE, IDENT, 'from', STR, ';'],				$ => ({ type: 'import', default: $[1], source: unquoteString($[3]), typeOnly: true } as const)),
+	Rule([TYPE, IDENT, ',', JS.named_imports, 'from', STR, ';'],			$ => ({ type: 'import', default: $[1], specifiers: $[3], source: unquoteString($[5]), typeOnly: true } as const)),
+	Rule([TYPE, IDENT, ',', '*', 'as', IDENT, 'from', STR, ';'],			$ => ({ type: 'import', default: $[1], namespace: $[5], source: unquoteString($[7]), typeOnly: true } as const)),
 	Rule([IDENT, '=', 'require', '(', STR, ')', ';'],	$ => ({ type: 'import', default: $[0], source: unquoteString($[4]) } as const)),
 	Rule([IDENT, '=', dotted_path, ';'],				$ => ({ type: 'import', default: $[0], source: $[2] } as const)),
+	// `import type Foo = ns.Foo;` -- a type-only import-equals, referencing a namespace member as a type.
+	Rule([TYPE, IDENT, '=', 'require', '(', STR, ')', ';'],	$ => ({ type: 'import', default: $[1], source: unquoteString($[5]), typeOnly: true } as const)),
+	Rule([TYPE, IDENT, '=', dotted_path, ';'],					$ => ({ type: 'import', default: $[1], source: $[3], typeOnly: true } as const)),
 );
 
 (JS.export_declaration as unknown as Rules<Statement>).push(
