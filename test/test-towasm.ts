@@ -168,7 +168,27 @@ async function main() {
 	//}
 
 	{
-		const { factorial } = await compile(`
+		// Nested array literal (`number[][]`) construction + read-back. Root cause: a plain array literal
+		// has no dedicated "array of real unboxed inner arrays" physical representation -- an inner array
+		// literal nested inside an outer ref-kind array always gets boxed-`any` storage too (`case 'array'`'s
+		// own "want wins" construction rule), so `x[0]`'s real value is a boxed-any array, not the genuine
+		// `(array (mut f64))` its own declared `number[]` type alone would normally get. `x[0][1]`'s read-back
+		// used to resolve `x[0]`'s class via `classOf`'s *declared*-type-driven answer (`Array<number>`,
+		// standalone-correct but wrong here) instead of what it actually physically is (`Array<any>`) --
+		// calling `Array<number>.get(i)`'s own compiled body (hardcoded to `array.get` on a real f64-array
+		// type) on a boxed-any array crashed at runtime ("illegal cast"). Fixed via `classOfForIndexing`
+		// (only overrides the built-in `Array` class, detected via the same "is my own container ref-kind"
+		// propagation `objectArrayKind` uses for the plain-raw-array path).
+		const { arrayarray, arrayarrayWrite, factorial } = await compile(`
+			export function arrayarray() {
+				const x: number[][] = [[1, 2], [3, 4]];
+				return x[0][1];
+			}
+			export function arrayarrayWrite(): number {
+				const x: number[][] = [[1, 2], [3, 4]];
+				x[0][1] = 99;
+				return x[0][1] + x[1][0] + x[0].length + x[0][0];
+			}
 			export function factorial(n: number): number {
 				switch (n) {
 					case -0.5: return 1.77245385091;
@@ -182,6 +202,8 @@ async function main() {
 				}
 			}
 		`);
+		check('arrayarray', arrayarray(), 2);
+		check('arrayarray: write + .length on a nested array read back correctly', arrayarrayWrite(), 105);
 		check('factorial(0)', factorial(0), 1);
 		check('factorial(0.5)', factorial(0.5), 0);
 		check('factorial(-0.5)', factorial(-.5), 1.77245385091);
@@ -835,18 +857,29 @@ async function main() {
 		export function f(): number { return new Outer(1).n; }
 	`), /never assigns/);
 
-	await checkThrows('a self-referential class field is rejected (no rec-group support)', () => compile(`
-		class Node {
-			next: Node; v: number;
-			constructor(v: number, next: Node) {
-				this.v = v;
-				this.next = next;
+	{
+		// A self-referential class field (`next: Node | null`) now compiles and runs correctly --
+		// `ensureClass` registers a real placeholder `typeIndex` before resolving any field's own type, so a
+		// reentrant call for the same class (triggered while resolving `next`'s own type) finds a real,
+		// already-allocated forward index and short-circuits instead of recursing; the placeholder gets
+		// patched with the real struct fields once the outermost call's own field loop finishes. Previously
+		// unconditionally rejected ("field cycle... not supported", no `resolving` guard exists anymore).
+		const { linkedNode } = await compile(`
+			class Node {
+				next: Node | null; v: number;
+				constructor(v: number, next: Node | null) {
+					this.v = v;
+					this.next = next;
+				}
 			}
-		}
-		export function f(a: Node): number {
-			return new Node(1, a).v;
-		}
-	`), /cycle/);
+			export function linkedNode(): number {
+				const a = new Node(1, null);
+				const b = new Node(2, a);
+				return b.next!.v;
+			}
+		`);
+		check('a self-referential class field compiles and runs', linkedNode(), 1);
+	}
 
 	{
 		// Nullable types: `T | null`/`T | undefined` (object types only -- see `typeOf`'s own comment for
@@ -1536,21 +1569,23 @@ async function main() {
 	}
 
 	{
-		// Found while landing the fix above: computing each union member's own `typeOf` eagerly (needed for
-		// the same-physical-type comparison) reaches a self-/mutually-referential object-shape type for the
-		// first time (previously only `ownerFor`'s shallower check ran on a union member) -- an unbounded
-		// recursion (`ensureObjectShape` had no reentrance guard at all, unlike `ensureClass`'s own matching
-		// one) rather than a clean error. Fixed by giving `ensureObjectShape` the exact same `resolving`
-		// guard `ensureClass` already has -- confirmed a *class* field cycle already threw this same shape
-		// of error before this fix (a real, pre-existing, unrelated-to-unions limitation), this just brings
-		// a plain object-shape/type-alias in line with it instead of crashing.
-		await checkThrows('a self-referential object-shape type is rejected, not an infinite recursion', () => compile(`
+		// A self-referential object-shape type now compiles and runs correctly, the same placeholder-first
+		// mechanism `ensureClass` uses (`ensureObjectShape` gained the matching `typeIndex`-before-fields
+		// ordering) -- previously this reached a genuinely unbounded recursion the moment a union member's
+		// own `typeOf` started being resolved eagerly (`ensureObjectShape` had no reentrance guard at all,
+		// unlike `ensureClass`'s own matching one), fixed by giving it the same guard; that guard itself
+		// (and `ensureClass`'s) has since been superseded by the placeholder-first fix, so a self-referential
+		// shape is real, supported capability now, not just a clean rejection.
+		const { selfReferentialShape } = await compile(`
 			type Node = { value: number; next: Node | null };
-			function make(v: number): Node { return { value: v, next: null }; }
+			function make(v: number, next: Node | null): Node { return { value: v, next }; }
 			export function selfReferentialShape(): number {
-				return make(1).value;
+				const a = make(1, null);
+				const b = make(2, a);
+				return b.next!.value;
 			}
-		`), /field cycle/);
+		`);
+		check('a self-referential object-shape type compiles and runs', selfReferentialShape(), 1);
 	}
 
 	{
@@ -3044,6 +3079,14 @@ async function main() {
 		// Struct-layout inheritance + `super(...)` constructor chaining -- one physical struct for the
 		// whole hierarchy (wasm-GC `supertypes`), base fields as an exact prefix, `super(...)` inlines the
 		// base ctor's own init logic into the same allocation rather than a separate one.
+		// `threeLevel` doubles as the regression guard for a real bug the self-referential-struct fix
+		// introduced: `ensureClass` used to resolve a class's own superclass *after* allocating its own
+		// struct placeholder, so `C extends B extends A` ended up allocating typeIndexes in reverse order
+		// (C, then B, then A) -- a `supertypes` list referencing a *higher* type index than its own, which
+		// wasm rejects outright ("forward-declared supertype"), unlike an ordinary field reference (which
+		// may freely forward-reference within the same rec group). Fixed by resolving the superclass first,
+		// which doesn't reopen self-reference support -- that's about a class's own field(s) referencing
+		// its own not-yet-finished type, a structurally separate concern from resolving an *ancestor*.
 		const { basic, threeLevel } = await compile(`
 			class A { x: number; constructor(x: number) { this.x = x; } }
 			class B extends A { y: number; constructor(x: number, y: number) { super(x); this.y = y; } }
@@ -3059,6 +3102,33 @@ async function main() {
 		`);
 		check('inheritance: struct-layout + super(...) (base fields)', basic(), 7);
 		check('inheritance: 3-level super(...) chain', threeLevel(), 123);
+	}
+
+	{
+		// Both rec-group fixes together: a self-referential field (`children: TreeNode[]`, an array of its
+		// own class) *and* a real superclass (`extends Base`) on the same class -- confirms resolving the
+		// superclass before allocating this class's own placeholder (the supertype-ordering fix) doesn't
+		// interfere with the field loop afterward still being able to safely self-reference this class's
+		// own not-yet-fully-built type (the original self-reference fix).
+		const { treeWithBase } = await compile(`
+			class Base {
+				tag: number;
+				constructor(tag: number) { this.tag = tag; }
+			}
+			class TreeNode extends Base {
+				children: TreeNode[];
+				constructor(tag: number, children: TreeNode[]) {
+					super(tag);
+					this.children = children;
+				}
+			}
+			export function treeWithBase(): number {
+				const leaf = new TreeNode(1, []);
+				const root = new TreeNode(2, [leaf]);
+				return root.tag * 10 + root.children[0].tag;
+			}
+		`);
+		check('a self-referential class field combined with real inheritance compiles and runs', treeWithBase(), 21);
 	}
 
 	{
@@ -4204,16 +4274,20 @@ async function main() {
 	}
 
 	{
-		// A `func` type must never share a multi-member rec group with anything else -- `ref.test`/
-		// `ref.cast` (the reason struct/array types *do* need a shared group, so two structurally-
-		// identical sibling classes stay distinguishable) is never applied to a bare func type here, so
-		// there's no such need for one -- and per the wasm-GC spec, a type sharing a multi-member group
-		// canonicalizes differently than an equivalently-shaped standalone/singleton one, which breaks
-		// matching a real host import (e.g. WASI's `fd_write`) against this module's own func type of the
-		// same signature. Confirmed the hard way via `wasmtime` (a real standalone runtime, not just
-		// Node's own lenient `WebAssembly` engine) rejecting a `console.log`-using module outright before
-		// this was fixed -- checked here structurally, without needing `wasmtime` itself as a test
-		// dependency.
+		// Only a *host-imported* func type must never share a multi-member rec group with anything else --
+		// per the wasm-GC spec, a type sharing a multi-member group canonicalizes differently than an
+		// equivalently-shaped standalone/singleton one, which breaks matching a real host import (e.g.
+		// WASI's `fd_write`) against this module's own func type of the same signature. Confirmed the hard
+		// way via `wasmtime` (a real standalone runtime, not just Node's own lenient `WebAssembly` engine)
+		// rejecting a `console.log`-using module outright before this was fixed -- checked here
+		// structurally, without needing `wasmtime` itself as a test dependency.
+		// Narrowed from "no func type, period" after a real regression: `ref.test`/`ref.cast` (the reason
+		// struct/array types *do* need a shared group, so two structurally-identical sibling classes stay
+		// distinguishable) is never applied to a bare func type here, so an *internal* func type (a
+		// closure's own, like `g` below) is just as safe sharing the group as any struct/array -- and
+		// self-/mutually-referential struct support (a class/object-shape field forward-referencing its own
+		// not-yet-fully-built type) can genuinely need two structs to share a group *around* an ordinary
+		// internal func type registered in between them, which splitting at *every* func type broke.
 		const program = parser.parse(`
 			class Point { x: number; constructor(x: number) { this.x = x; } }
 			export function f(p: Point): number {
@@ -4226,20 +4300,28 @@ async function main() {
 		assert(!diagnostics.some(d => d.severity === SEVERITY.ERROR), 'unexpected type errors');
 		const mod = TStoWasm(program);
 		const { types, groupSizes } = mod.types!;
+		const importedFuncTypeIndices = new Set((mod.imports ?? []).flatMap(imp => imp.desc.kind === 'func' && typeof imp.desc.typeIndex === 'number' ? [imp.desc.typeIndex] : []));
+		assert(importedFuncTypeIndices.size > 0, 'expected console.log to pull in a real host import');
 		let i = 0;
-		let anyFuncInMultiMemberGroup = false;
+		let anyImportedFuncInMultiMemberGroup = false;
+		let anyOrdinaryFuncInMultiMemberGroup = false;
 		for (const size of groupSizes) {
 			if (size > 1) {
 				for (let j = i; j < i + size; j++) {
 					const t = types[j];
 					const kind = ('type' in t ? t.type : t).kind;
-					if (kind === 'func')
-						anyFuncInMultiMemberGroup = true;
+					if (kind !== 'func')
+						continue;
+					if (importedFuncTypeIndices.has(j))
+						anyImportedFuncInMultiMemberGroup = true;
+					else
+						anyOrdinaryFuncInMultiMemberGroup = true;
 				}
 			}
 			i += size;
 		}
-		check("no 'func' type shares a multi-member rec group", anyFuncInMultiMemberGroup, false);
+		check("an imported func type ('fd_write') never shares a multi-member rec group", anyImportedFuncInMultiMemberGroup, false);
+		check("an ordinary (non-imported) func type now shares the group, like any struct/array", anyOrdinaryFuncInMultiMemberGroup, true);
 	}
 
 	{

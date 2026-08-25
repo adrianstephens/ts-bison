@@ -1321,7 +1321,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// User-declared *generic* top-level classes can't be eagerly seeded into `classes` under their bare name
 	// (no single physical representation for `Box<T>` alone, only each concrete instantiation) -- `ensureClass`/`resolveGenericClassRef` look here instead, the user-class equivalent of `LIB_DECL_MAP`.
 	const userGenericClassDecls = new Map<string, JS.ClassDecl<Type>>();
-	const resolving			= new Set<string>();			// Classes currently mid-`ensureClass`
 
 	const funcs				= new Map<string, FuncInfo>();
 	const functionDeclByName = new Map<string, FunctionDecl>();
@@ -1640,8 +1639,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 	// `this`'s `WasmType`. A real `ClassInfo` carries its own already-resolved `thisWtype` directly (never
 	// guessed from its name); a builtin (non-class) owner has no such field, so it derives one from `thisTsType`.
-	function ownerThisType(owner: MethodOwner): WasmType {
-		const wt = 'fields' in owner ? (owner as ClassInfo).thisWtype ?? { ref: owner.name } : typeOf(owner.thisTsType);
+	function ownerThisType(owner: ClassInfo): WasmType {
+		const wt = owner.thisWtype ?? { ref: owner.name };
 		if (!wt)
 			throw new Error(`towasm: internal: '${owner.name}' has no representable this-type`);
 		return wt;
@@ -1743,6 +1742,45 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : undefined;
 	}
 
+	// `arrayKindOf`, but for a value that's *about to be indexed into* (`e[i]`) -- unlike `arrayKindOf`'s
+	// own checker-type-driven answer (correct for a genuinely standalone value, e.g. a plain `number[]`
+	// local), a value that was itself just read out of a ref-kind array element (`x[0]` where `x:
+	// number[][]`) is *always* physically ref-kind too, regardless of what its own declared element type
+	// says in isolation: `case 'array'`'s own "want wins" construction rule already boxes a nested array
+	// literal's elements as `any` whenever the *outer* container is ref-kind (there's no dedicated
+	// "array of real unboxed inner arrays" physical representation in this compiler at all -- 'ref' is
+	// the one shared bucket for every non-scalar element, arrays included), so `x[0]`'s real storage is a
+	// boxed-any array, never a genuine `(array (mut f64))`, even though a *standalone* `number[]` would
+	// normally get exactly that. `arrayKindOf(x[0], ctx)` alone can't see this -- it re-derives `x[0]`'s
+	// kind fresh from `number[]`'s own checker type, one level from a scalar base, disagreeing with what
+	// `x`'s own (correctly ref-collapsed) `number[][]` type already implied one level up. Recurses through
+	// a chain of index expressions (`a[i][j][k]`) so every level after the first ref-kind one stays 'ref'.
+	function objectArrayKind(e: Expr, ctx: FunctionContext): WasmElementI | undefined {
+		if (e.type === 'index' && objectArrayKind(e.object, ctx) === 'ref')
+			return 'ref';
+		return arrayKindOf(e, ctx);
+	}
+
+	// `classOf`, but for a value that's *about to be indexed into* (`e[i]`) via generic class-method
+	// dispatch (`Array<T>.get(i)`/`.set(i,v)`, the same mechanism a typed-array view uses) -- a plain
+	// array *literal* has no dedicated "array of real unboxed inner arrays" physical representation (see
+	// `objectArrayKind`'s own comment): a nested array literal embedded inside an outer ref-kind array
+	// always gets boxed-`any` storage, matching the outer container's own "want wins" construction rule,
+	// *regardless* of its own declared element type. `classOf(e, ctx)` alone doesn't see this -- it
+	// resolves `e`'s *declared* type (`number[]` = `Array<number>`) as if `e` were a genuine, standalone
+	// f64-backed array, which real-mismatches against `Array<number>.get(i)`'s own compiled body (its
+	// inline `array.get $this` is hardcoded to `Array<number>`'s own f64-array type index) when `e`'s
+	// real value is actually a boxed-any array. Only overrides the built-in `Array` class specifically --
+	// a real user class has no such dual representation (a `new Foo(...)` instance is always the same
+	// physical struct, regardless of context), so this is deliberately narrow, not a general `classOf`
+	// change.
+	function classOfForIndexing(e: Expr, ctx: FunctionContext): ClassInfo | undefined {
+		const cls = classOf(e, ctx);
+		if (cls?.decl.name === 'Array' && e.type === 'index' && objectArrayKind(e.object, ctx) === 'ref')
+			return ensureClass('Array', [T.ANY]);
+		return cls;
+	}
+
 	// The `WasmType`/`MethodOwner` a builtin-operator operand resolves to -- `wtypeOf`/`ownerOf` alone can't see an indexed read's element kind, so `numericPairWtype`/etc would silently fall back to `f64`.
 	function operandInfo(e: Expr, ctx: FunctionContext): OperandInfo {
 		if (e.type === 'index') {
@@ -1759,12 +1797,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			const t		= checkerTypeOf(unwrapAs(e), ctx.scope);
 			const owner	= T.isAny(t) ? undefined : ownerFor(t);
 
-			const cls = classOf(e.object, ctx);
+			const cls = classOfForIndexing(e.object, ctx);
 			const sig = cls && methodSig(cls, 'get', ctx);
 			if (cls && sig)
 				return { wtype: sig.result, owner };
 
-			const kind = arrayKindOf(e.object, ctx);
+			const kind = objectArrayKind(e.object, ctx);
 			if (kind === 'f64' || kind === 'i32'/* || kind === 'u32'*/)
 				return { wtype: kind, owner };
 			if (!T.isAny(t))
@@ -2260,7 +2298,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					ctx.emit(I.local.set(value));
 					parts.push({ spread: false, value });
 				} else if (el.type === 'spread') {
-					const srcKind = arrayKindOf(el.operand, ctx);
+					const srcKind = objectArrayKind(el.operand, ctx);
 					if (srcKind !== kind)
 						throw new Error('towasm: a spread element in an array literal must be an array of the same element type');
 					emitAs(el.operand, ctx, ARR_WTYPE[srcKind]);
@@ -2619,7 +2657,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		} else if (target.type == 'index') {
 			// Any class with its own `get(i)`/`set(i,v)` (typed-array views, or any other class using the
 			// same convention -- see `methodSig`) -- real index syntax dispatched generically, not by name.
-			const cls		= classOf(target.object, ctx);
+			const cls		= classOfForIndexing(target.object, ctx);
 			const getSig 	= cls && methodSig(cls, 'get', ctx);
 			if (cls && getSig && methodSig(cls, 'set', ctx)) {
 				// `emitAs`, not a raw `emitExpr` -- same reasoning as the plain struct-field write path above.
@@ -2653,7 +2691,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				};
 			}
 
-			const kind = arrayKindOf(target.object, ctx);
+			const kind = objectArrayKind(target.object, ctx);
 			// `i16`/`i8` (`string`/packed-byte storage) rejected same as `case 'index'`'s own read side.
 			if (!kind || kind === 'i16' || kind === 'i8')
 				throw new Error("towasm: this operation is not supported");
@@ -3110,7 +3148,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					}
 				}
 
-				const cls = classOf(e.object, ctx);
+				const cls = classOfForIndexing(e.object, ctx);
 
 				// A `get` accessor -- checked before both the `.length` special case and the ordinary
 				// struct-field read, so a real getter (e.g. `Array<T>.length`) takes priority over either.
@@ -3181,7 +3219,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			case 'index': {
 				// Any class with its own `get(i)` (typed-array views, or any other class using the same
 				// convention) -- real index syntax dispatched generically, not by name.
-				const cls = classOf(e.object, ctx);
+				const cls = classOfForIndexing(e.object, ctx);
 				const sig = cls && methodSig(cls, 'get', ctx);
 				if (cls && sig) {
 					// `isOptionalChainLink`, not a bare `e.optional` -- see `case 'member'`'s own comment.
@@ -3204,7 +3242,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					emitAs(e.object, ctx, cls.thisWtype!);
 					return emitMethodCall(cls, 'get', [e.property], ctx);
 				}
-				const kind = arrayKindOf(e.object, ctx);
+				const kind = objectArrayKind(e.object, ctx);
 				if (!kind || kind === 'i16' || kind === 'i8')
 					throw new Error("towasm: indexing is only supported on number[]/boolean[]/Uint8Array/Int32Array/Uint32Array ('string' is immutable and not indexable in this pass)");
 				// `nullable: true` on the 'ref' case -- `ensureArrayType`'s `'ref'`-kind field is declared
@@ -5316,6 +5354,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const existing = classes.get(key);
 		if (existing)
 			return existing;
+
 		if (!global.type(name))
 			return undefined;
 		// Via a `RefType` (not the entry's own raw, still-generic `.type` directly) so a reference to a
@@ -5332,48 +5371,45 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		if (resolved.members.some(m => m.type === 'index'))
 			return undefined;
 
-		// Same reentrance guard `ensureClass` already has (a real self-/mutually-referential shape, e.g. a
-		// union type reachable again through one of its own members' fields -- confirmed real: `Type`'s own
-		// recursive AST-node union in ts-parser.ts, reached the moment a union's own member types started
-		// being resolved eagerly for `typeOf`'s own boxing decision) -- without it this recurses without
-		// bound (a real `RangeError: Maximum call stack size exceeded`, not a clean error) instead of the
-		// same "not supported" a self-referential class already gives.
-		if (resolving.has(key))
-			throw new Error(`towasm: object-shape type '${key}' has a field cycle (directly or indirectly has a field of its own type) -- not supported`);
-		resolving.add(key);
-
-		const fields: { name: string; wtype: WasmType; optional?: boolean }[] = [];
-		const fieldIndex = new Map<string, number>();
-		try {
-			for (const m of resolved.members) {
-				if (m.type !== 'property')
-					throw new Error(`towasm: object-shape type '${name}' can only have plain properties (no methods/index/call signatures) to be an object literal's target type`);
-				if (typeof m.key !== 'string')
-					throw new Error(`towasm: object-shape type '${name}' has a computed property name -- not supported`);
-				// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as
-				// `any` rather than reject otherwise-valid source.
-				const rawWt = typeOf(m.typeAnnotation);
-				const wt = rawWt === 'void' ? REF_ANY : rawWt;
-				if (!wt)
-					throw new Error(`towasm: object-shape type '${name}.${m.key}' needs an explicit number/boolean/object type`);
-				fieldIndex.set(m.key, fields.length);
-				fields.push({ name: m.key, wtype: wt, optional: hasMod(m, 'optional') });
-			}
-		} finally {
-			resolving.delete(key);
-		}
-
 		const info: ClassInfo = {
-			name: key, typeIndex: -1, thisTsType: TS.RefType(name, typeArgs),
-			decl: { name, body: [] },
-			fields, fieldIndex, methodDecls: new Map(),
+			name:		key, thisTsType: TS.RefType(name, typeArgs),
+			decl:		{ name, body: [] },
+			fields:		[],
+			fieldIndex:	new Map(),
+			methodDecls: new Map(),
+			thisWtype: { ref: key },
+			typeIndex:	addType({kind: 'struct', fields: []}),
 		};
 		classes.set(key, info);
-		info.thisWtype = { ref: key };
-		info.typeIndex = addType({ final: !everExtended.has(name), supertypes: [], type: {
-			kind: 'struct',
-			fields: fields.map(f => ({ type: toValType(f.wtype), mut: true })),
-		} });
+
+		// Registering `info` (with a real `typeIndex` already allocated) into `classes` *before* resolving
+		// any member's own type is what makes a self-/mutually-referential shape safe -- e.g. a union type
+		// reachable again through one of its own members' fields (confirmed real: `Type`'s own recursive
+		// AST-node union in ts-parser.ts, reached the moment a union's own member types started being
+		// resolved eagerly for `typeOf`'s own boxing decision). A reentrant `ensureObjectShape`/`ensureClass`
+		// call for this same `key` finds `info` already in `classes` and returns it immediately (see each
+		// function's own top-of-function check), well before this loop ever gets a chance to run twice.
+		for (const m of resolved.members) {
+			if (m.type !== 'property')
+				throw new Error(`towasm: object-shape type '${name}' can only have plain properties (no methods/index/call signatures) to be an object literal's target type`);
+			if (typeof m.key !== 'string')
+				throw new Error(`towasm: object-shape type '${name}' has a computed property name -- not supported`);
+			// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as `any` rather than reject otherwise-valid source.
+			const rawWt = typeOf(m.typeAnnotation);
+			const wt	= rawWt === 'void' ? REF_ANY : rawWt;
+			if (!wt)
+				throw new Error(`towasm: object-shape type '${name}.${m.key}' needs an explicit number/boolean/object type`);
+			info.fieldIndex.set(m.key, info.fields.length);
+			info.fields.push({ name: m.key, wtype: wt, optional: hasMod(m, 'optional') });
+		}
+
+		types[info.typeIndex] = {
+			final: !everExtended.has(name),
+			supertypes: [], type: {
+				kind: 'struct',
+				fields: info.fields.map(f => ({ type: toValType(f.wtype), mut: true })),
+			}
+		};
 		return info;
 	}
 
@@ -5394,7 +5430,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const key = typeArgs?.length
 			? `${name}<${typeArgs.map(t => t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name as WasmElement) ? t.name : T.typeKey(T.resolve(global, t))).join(',')}>`
 			: name;
+		// A non-generic top-level class is seeded into `classes` *eagerly*, well before any `ensureClass`
+		// call ever reaches it (see `TStoWasm`'s own top-level seeding pass) -- `typeIndex` staying `-1` is
+		// what distinguishes "reserved but not yet processed" from "fully built" here, unlike
+		// `ensureObjectShape` (nothing pre-seeds an object-shape, so its own top-of-function check can be
+		// unconditional on mere presence in `classes`). A generic class is never pre-seeded this way (only
+		// its own template lives in `userGenericClassDecls`; each concrete instantiation is cached here
+		// lazily, by `ensureClass` itself, on first reference).
 		let info = classes.get(key);
+		if (info && info.typeIndex !== -1)
+			return info;
+
 		if (!info) {
 			// A plain lib-internal class -- an ordinary struct seeded into `classes` lazily on first reference.
 			let decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
@@ -5414,21 +5460,91 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					throw new Error(`towasm: class '${name}' needs ${decl.typeParams.length} explicit type argument(s)`);
 				decl.typeParams.forEach((p, i) => decl = substituteClassTypeParam(decl as JS.ClassDecl<Type>, p.name, typeArgs[i]));
 			}
-			// `thisTsType` is always a real reference to this class -- the ref itself must carry the real name
-			// and type arguments (`{name, typeArgs}`), not the mangled composite cache key as a bare name, or
-			// `this.length`/`this[i]` can't resolve (`T.lookupMember` silently falls back to `any`). How an
-			// instance is physically represented (struct vs. array) is the separate, towasm-only `thisWtype`, set below.
+			// `thisTsType` is always a real reference to this class -- the ref itself must carry the real
+			// name and type arguments (`{name, typeArgs}`), not the mangled composite cache key as a bare
+			// name, or `this.length`/`this[i]` can't resolve (`T.lookupMember` silently falls back to `any`).
 			info = { name: key, typeIndex: -1, thisTsType: TS.RefType(name, typeArgs), decl, fields: [], fieldIndex: new Map(), methodDecls: new Map() };
 			classes.set(key, info);
 		}
-		if (info.typeIndex !== -1)
-			return info;
 
-		if (resolving.has(key))
-			throw new Error(`towasm: class '${key}' has a field cycle (directly or indirectly has a field of its own type) -- not supported`);
+		const decl = info.decl;
 
-		resolving.add(key);
-		
+		// A constructor with its own explicit 'return' overrides `this` entirely (a scalar or array
+		// result, never a struct) -- such a class must never get a struct type index allocated, not even
+		// as an unused placeholder (a self-referential field would end up pointing at a struct nothing
+		// ever actually constructs). Pre-scanned here, before any field type gets resolved (no recursion
+		// risk -- `checkerTypeOf` is the checker's own inference, not this file's `typeOf`/`ensureClass`),
+		// specifically so this decision is already made before the field loop below runs -- which needs to
+		// know up front whether to allocate a struct placeholder for self-reference safety at all.
+		let returnType: Type | undefined;
+		for (const m of decl.body as TS.ClassMember[]) {
+			if (m.type === 'method' && m.key === 'constructor' && m.body) {
+				const last = m.body[m.body.length - 1];
+				if (last?.type === 'return' && last.argument)
+					returnType = checkerTypeOf(unwrapAs(last.argument), m.scope as Scope);
+				break;
+			}
+		}
+
+		// Resolved *before* this class's own `typeIndex` is ever allocated -- wasm-GC requires a `sub`
+		// type's own declared supertype to already be a *lower* type-section index than itself (unlike an
+		// ordinary field reference, which may freely forward-reference any other type in the same rec
+		// group; a supertype relationship is a validation-time, not a runtime-pointer, relationship, so it
+		// can't be circular/forward the same way). Resolving the superclass first guarantees
+		// `superInfo.typeIndex < info.typeIndex` regardless of how deep the chain goes, matching what
+		// always held before self-referential struct support existed (this ordering never risked infinite
+		// recursion before, since nothing needed a not-yet-allocated `typeIndex` of its own back then).
+		// Real regression, not hypothetical: confirmed a 3-level `super(...)` chain (`class A`, `class B
+		// extends A`, `class C extends B`) fails to load ("forward-declared supertype") the moment the
+		// superclass block ran *after* this class's own placeholder allocation, since resolving `C`'s own
+		// superclass `ensureClass('B')` would recursively resolve `B`'s own superclass `ensureClass('A')`
+		// too, giving A the *highest* index of the three -- backwards. Also still seeds `info.fields`/
+		// `fieldIndex` from the superclass before this class's own members are walked below, so
+		// `addField`'s redeclaration guard sees every inherited field already there, and `info.fields`
+		// end up in the order wasm-GC struct subtyping requires: the supertype's own fields first, as an
+		// exact prefix, this class's own appended after.
+		//
+		// Doesn't reopen the self-reference case this ordering used to guard against: a class field of its
+		// *own* type is resolved later, in the per-member loop below (after this class's own placeholder
+		// *is* allocated) -- this block only ever resolves an *ancestor* class, a structurally separate
+		// concern from "does one of my own fields reference me."
+		if (decl.superClass && !returnType) {
+			const superName = decl.superClass.type === 'identifier' ? decl.superClass.name
+				: decl.superClass.type === 'instantiation' && decl.superClass.expression.type === 'identifier' ? decl.superClass.expression.name
+				: undefined;
+			if (!superName)
+				throw new Error(`towasm: only a plain named superclass ('class ${name} extends Base' or 'extends Base<T>') is supported`);
+			const superInfo = ensureClass(superName, decl.superClass.type === 'instantiation' ? decl.superClass.typeArgs : undefined);
+			if (!superInfo)
+				throw new Error(`towasm: unknown superclass '${superName}' for class '${name}'`);
+			if (typeof superInfo.thisWtype !== 'string' && superInfo.thisWtype && 'arr' in superInfo.thisWtype || superInfo.typeIndex === -1)
+				throw new Error(`towasm: '${name}' can't extend '${superName}' -- extending an array/scalar-backed class (a constructor with its own explicit 'return') is not supported`);
+			info.superClass = superInfo;
+			info.fields.push(...superInfo.fields);
+			superInfo.fieldIndex.forEach((idx, fname) => info.fieldIndex.set(fname, idx));
+		}
+
+		if (returnType) {
+			if (decl.superClass)
+				throw new Error(`towasm: '${name}' can't both extend '${(decl.superClass as any).name}' and have a constructor with its own explicit 'return' -- not supported`);
+			const result = typeOf(returnType);
+			if (!result || (typeof result !== 'string' && !('arr' in result)))
+				throw new Error(`towasm: '${name}'s constructor returns a value of an unsupported shape for 'this' -- only a scalar or array-shaped result is supported`);
+			info.thisWtype = result;
+			info.typeIndex = typeof result === 'string' ? -1 : ensureArrayType(result.arr);
+		} else {
+			// How an instance is physically represented (struct vs. array) is the separate, towasm-only
+			// `thisWtype`. Allocated with a real `typeIndex`/`thisWtype` now, before any of *this* class's
+			// own field types resolve -- see `ensureObjectShape`'s own identical comment for why this
+			// ordering is what makes a self-/mutually-referential class field safe (a reentrant
+			// `ensureClass` call for this same `key`, triggered while resolving one of this class's own
+			// field types, finds `typeIndex` already real and short-circuits above instead of recursing
+			// into this same pass a second time). The superclass (if any) is already fully resolved by now
+			// (above), so this index is always the largest in the chain so far, never a forward reference.
+			info.thisWtype = { ref: key };
+			info.typeIndex = addType({ kind: 'struct', fields: [] });
+		}
+
 		const addField = (key: string, typeAnnotation?: Type) => {
 			// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as
 			// `any` rather than reject otherwise-valid source.
@@ -5457,153 +5573,106 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 		const inlineDecls: { key: string; value: JS.Call<Type> }[] = [];
 
-		try {
-			const decl = info.decl;
-			if (decl.abstract)
-				throw new Error(`towasm: abstract class '${name}' is not supported`);
+		if (decl.abstract)
+			throw new Error(`towasm: abstract class '${name}' is not supported`);
 
-			// Resolved *before* this class's own members, so `addField`'s redeclaration guard (above) sees
-			// every inherited field already seeded, and `info.fields`/`fieldIndex` end up in the order
-			// wasm-GC struct subtyping requires: the supertype's own fields first, as an exact prefix, this
-			// class's own appended after.
-			if (decl.superClass) {
-				const superName = decl.superClass.type === 'identifier' ? decl.superClass.name
-					: decl.superClass.type === 'instantiation' && decl.superClass.expression.type === 'identifier' ? decl.superClass.expression.name
-					: undefined;
-				if (!superName)
-					throw new Error(`towasm: only a plain named superclass ('class ${name} extends Base' or 'extends Base<T>') is supported`);
-				const superInfo = ensureClass(superName, decl.superClass.type === 'instantiation' ? decl.superClass.typeArgs : undefined);
-				if (!superInfo)
-					throw new Error(`towasm: unknown superclass '${superName}' for class '${name}'`);
-				if (typeof superInfo.thisWtype !== 'string' && superInfo.thisWtype && 'arr' in superInfo.thisWtype || superInfo.typeIndex === -1)
-					throw new Error(`towasm: '${name}' can't extend '${superName}' -- extending an array/scalar-backed class (a constructor with its own explicit 'return') is not supported`);
-				info.superClass = superInfo;
-				info.fields.push(...superInfo.fields);
-				superInfo.fieldIndex.forEach((idx, fname) => info.fieldIndex.set(fname, idx));
-			}
+		// `decl.body`'s own declared element type (`JS.ClassMember<Type>`, `Class<T>`'s default `M`) has no
+		// `index_signature` variant -- that's only ever added by `TS.ClassMember` (ts-parser.ts's own richer
+		// type). `decl` here is always parsed by ts-parser.ts though, so a real index-signature member can
+		// genuinely appear -- widened to the type that actually matches what's parsed, not narrowed by which
+		// shared interface happened to declare `body`.
+		for (const m of decl.body as TS.ClassMember[]) {
+			if (m.type === 'field'/* && !hasMod(m, 'static')*/) {
+				if (typeof m.key !== 'string')
+					throw new Error(`towasm: computed field names in '${name}' are not supported`);
+				if (isAsm(m.value))
+					inlineDecls.push({ key: m.key, value: m.value! });
+				else if (!m.modifiers?.includes('static'))
+					addField(m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, libGlobal) : undefined));
 
-			let returnType;
-
-			for (const m of decl.body) {
-				if (m.type === 'field'/* && !hasMod(m, 'static')*/) {
-					if (typeof m.key !== 'string')
-						throw new Error(`towasm: computed field names in '${name}' are not supported`);
-					if (isAsm(m.value))
-						inlineDecls.push({ key: m.key, value: m.value! });
-					else if (!m.modifiers?.includes('static'))
-						addField(m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, libGlobal) : undefined));
-
-				} else if (m.type === 'method') {
-					// A computed name can't be stored as a decl key -- and can never be called via `.name()` syntax either, so it's simply never reachable, no need to throw.
-					if (typeof m.key === 'string') {
-						const value = isAsmMethod(m);
-						if (value) {
-							inlineDecls.push({ key: m.key, value});
-						} else {
-							addMethod(m.key, m);
-						}
+			} else if (m.type === 'method') {
+				// A computed name can't be stored as a decl key -- and can never be called via `.name()` syntax either, so it's simply never reachable, no need to throw.
+				if (typeof m.key === 'string') {
+					const value = isAsmMethod(m);
+					if (value) {
+						inlineDecls.push({ key: m.key, value});
+					} else {
+						addMethod(m.key, m);
 					}
-
-					if (m.key === 'constructor') {
-						for (const p of m.params) {
-							if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
-								if (typeof p.key !== 'string')
-									throw new Error(`towasm: computed field names in '${name}' are not supported`);
-								addField(p.key, p.typeAnnotation ?? (p.default ? checkerTypeOf(p.default, libGlobal) : undefined));
-							}
-						}
-
-						if (!returnType && m.body) {
-							const last = m.body[m.body.length - 1];
-							if (last?.type === 'return' && last.argument)
-								returnType = checkerTypeOf(unwrapAs(last.argument), m.scope as Scope);
-						}
-					}
-
-				} else if (m.type === 'get' || m.type === 'set') {
-					if (typeof m.key === 'string') {
-						const key = accessorKey(m.type, m.key);
-						const value = isAsmMethod(m);
-						if (value) {
-							inlineDecls.push({ key, value});
-						} else {
-							addMethod(key, m);
-						}
-						(m.type === 'get' ? (info.getterNames ??= new Set()) : (info.setterNames ??= new Set())).add(m.key);
-					}
-
-				} else if (m.type === 'index_signature') {
-					// Type-checking-only -- real indexing goes through the generic `get`/`set`/array-kind paths (`case 'index'`), never a declared index signature itself, so there's nothing for this pass to do with it.
-					continue;
-
-				} else {
-					throw new Error(`towasm: unsupported class member kind '${m.type}' in '${name}'`);
 				}
-			}
 
-			// `thisWtype` is determined by a constructor that explicitly returns a value
-			// Every other class keeps the ordinary struct path. Any one overload's explicit-return shape already tells us `thisWtype`/`typeIndex` -- no need to check they all agree.
-			if (returnType) {
-				if (decl.superClass)
-					throw new Error(`towasm: '${name}' can't both extend '${(decl.superClass as any).name}' and have a constructor with its own explicit 'return' -- not supported`);
-				const result	= typeOf(returnType);
-				if (!result || (typeof result !== 'string' && !('arr' in result)))
-					throw new Error(`towasm: '${name}'s constructor returns a value of an unsupported shape for 'this' -- only a scalar or array-shaped result is supported`);
-				info.thisWtype = result;
-				info.typeIndex = typeof result === 'string' ? -1 : ensureArrayType(result.arr);
-			} else {
-				info.thisWtype = { ref: key };
-				// `final: !everExtended.has(name)` -- wasm-GC requires a struct type be declared extensible
-				// (`final: false`) *at the point it's registered* to ever be usable as another's
-				// `supertypes` entry later; `everExtended` (computed once, from the whole program's own
-				// `class ... extends X` references, before any class's struct type is actually registered)
-				// is what makes that decision knowable up front instead of needing to patch it in after the
-				// fact. `supertypes: [info.superClass.typeIndex]` is exactly what makes `(ref Derived)` a
-				// real subtype of `(ref Base)` in the wasm type section -- a subclass instance can be passed
-				// anywhere a `(ref Base)` is expected with zero cast/conversion, which is the whole reason a
-				// non-overridden inherited method can stay a single, ordinary, statically-resolved `call`
-				// straight to `Base`'s own compiled function (see `ensureMethod`'s own delegation).
-				info.typeIndex = addType({ final: !everExtended.has(name), supertypes: info.superClass ? [info.superClass.typeIndex] : [], type: {
+				if (m.key === 'constructor') {
+					for (const p of m.params) {
+						if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
+							if (typeof p.key !== 'string')
+								throw new Error(`towasm: computed field names in '${name}' are not supported`);
+							addField(p.key, p.typeAnnotation ?? (p.default ? checkerTypeOf(p.default, libGlobal) : undefined));
+						}
+					}
+				}
+
+			} else if (m.type === 'get' || m.type === 'set') {
+				if (typeof m.key === 'string') {
+					const key = accessorKey(m.type, m.key);
+					const value = isAsmMethod(m);
+					if (value) {
+						inlineDecls.push({ key, value});
+					} else {
+						addMethod(key, m);
+					}
+					(m.type === 'get' ? (info.getterNames ??= new Set()) : (info.setterNames ??= new Set())).add(m.key);
+				}
+
+			} else if (m.type !== 'index_signature') {
+				// Type-checking-only -- real indexing goes through the generic `get`/`set`/array-kind paths (`case 'index'`), never a declared index signature itself, so there's nothing for this pass to do with it.
+				throw new Error(`towasm: unsupported class member kind '${m.type}' in '${name}'`);
+			}
+		}
+
+		// `thisWtype`/`typeIndex` were already decided by the pre-scan above -- an explicit-return
+		// constructor's scalar/array result needs nothing more here; the ordinary struct case just needs
+		// its real field list patched into the placeholder type registered earlier.
+		if (!returnType) {
+			types[info.typeIndex] = {
+				final:		!everExtended.has(name),
+				supertypes: info.superClass ? [info.superClass.typeIndex] : [],
+				type: {
 					kind: 'struct',
 					fields: info.fields.map(f => ({ type: toValType(f.wtype), mut: true }))
-				} });
-			}
-
-			const defines: Record<string, string|number> = {this: info.typeIndex};
-			if (typeof info.thisWtype === 'object' && 'arr' in info.thisWtype)
-				defines.elem = info.thisWtype.arr;
-
-			if (decl.typeParams && typeArgs) {
-				decl.typeParams.forEach((p, i) => {
-					const t = typeArgs[i];
-					if (t.type === 'ref' && TYPED_ARRAY_TAGS.has(t.name)) {
-						defines[p.name] = t.name;
-					} else {
-						const w = typeOf(typeArgs[i]);
-						if (typeof w === 'string')
-							defines[p.name] = w;
-					}
-				});
-			}
-
-
-			const inlineMethods = new Map<string, Builtin<Inline>>();
-			for (const i of inlineDecls) {
-				try {
-					inlineMethods.set(i.key, makeAsm(i.value, defines, typeArgs));
-				} catch (e) {
-					throw new Error(`towasm: failed to compile inline method '${i.key}' of '${name}': ${(e as Error).message}`);
 				}
-			}
-
-			if (inlineMethods.size)
-				info.inlineMethods = inlineMethods;
-
-			return info;
-
-		} finally {
-			resolving.delete(key);
+			};
 		}
+
+		const defines: Record<string, string|number> = {this: info.typeIndex};
+		if (typeof info.thisWtype === 'object' && 'arr' in info.thisWtype)
+			defines.elem = info.thisWtype.arr;
+
+		if (decl.typeParams && typeArgs) {
+			decl.typeParams.forEach((p, i) => {
+				const t = typeArgs[i];
+				if (t.type === 'ref' && TYPED_ARRAY_TAGS.has(t.name)) {
+					defines[p.name] = t.name;
+				} else {
+					const w = typeOf(typeArgs[i]);
+					if (typeof w === 'string')
+						defines[p.name] = w;
+				}
+			});
+		}
+
+		const inlineMethods = new Map<string, Builtin<Inline>>();
+		for (const i of inlineDecls) {
+			try {
+				inlineMethods.set(i.key, makeAsm(i.value, defines, typeArgs));
+			} catch (e) {
+				throw new Error(`towasm: failed to compile inline method '${i.key}' of '${name}': ${(e as Error).message}`);
+			}
+		}
+
+		if (inlineMethods.size)
+			info.inlineMethods = inlineMethods;
+
+		return info;
 	}
 
 
@@ -6353,22 +6422,31 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// grouping never makes two *already*-distinct types collide, only ever adds distinguishing power for
 	// ones that would otherwise coincide.
 	//
-	// A `func` type is deliberately excluded from that shared group, each instead getting its own
+	// Only a *host-imported* func type is excluded from that shared group, each instead getting its own
 	// singleton group -- `ref.test`/`ref.cast` (the reason struct/array types need the shared-group
 	// protection) is never applied to a bare func type here (a closure wraps its func type inside a real
-	// *struct*, and it's the struct that's `ref.test`ed, never the func type itself). A singleton group's
-	// own canonical form, per the wasm-GC spec, is just its own flat shape -- so keeping a func type OUT
-	// of the big shared group is what lets it correctly canonicalize against an *externally*-declared type
-	// of the same signature, e.g. a real host import like WASI's `fd_write`. Confirmed via wasmtime, which
-	// -- correctly, per spec -- rejected `fd_write`'s import when its type was bundled into the shared
-	// group alongside every unrelated class/array/closure type, even though the flat signature printed
-	// identically either way; Node's own WASI/V8 path was lenient about this, masking the bug there.
-	// `SubType` is `CompType | {supertypes, type: CompType, final}` -- `registerType` always builds the
-	// wrapped form, but the type itself doesn't know that statically.
-	const compTypeOf = (t: wasm.SubType) => 'type' in t ? t.type : t;
+	// *struct*, and it's the struct that's `ref.test`ed, never the func type itself), so an *internal* func
+	// type (a closure's, a method's) is just as safe to share the one big group as any struct/array -- only
+	// an externally-declared type (a real host import like WASI's `fd_write`) needs to canonicalize as its
+	// own flat shape (a singleton group's canonical form, per the wasm-GC spec) to match what the host
+	// itself expects. Confirmed via wasmtime, which -- correctly, per spec -- rejected `fd_write`'s import
+	// when its type was bundled into the shared group, even though the flat signature printed identically
+	// either way; Node's own WASI/V8 path was lenient about this, masking the bug there.
+	// **Narrowed from "every func type" to "every *imported* func type" after a real regression**: the
+	// self-/mutually-referential struct fix (`ensureClass`/`ensureObjectShape` registering a placeholder
+	// `typeIndex` before resolving fields, so a reentrant call finds a real forward index instead of
+	// recursing) can legitimately need two structs to forward-reference each other *around* an ordinary
+	// internal func type registered in between (e.g. a closure's own func type, added mid-way through
+	// resolving one class's fields, ends up sitting between it and another struct it needs to reference) --
+	// splitting the run at every func-kind position (the original, over-broad rule) put the two structs in
+	// separate rec groups, which produces an invalid *forward* reference across a group boundary (only
+	// valid *within* one contiguous group) -- confirmed via wasmtime rejecting the emitted module outright
+	// ("type index N out of bounds"), not a silent miscompile. `mod.imports` (already built above) is the
+	// authoritative, narrow set of func types that actually need external-shape canonicalization.
+	const importedFuncTypeIndices = new Set((mod.imports ?? []).flatMap(imp => imp.desc.kind === 'func' && typeof imp.desc.typeIndex === 'number' ? [imp.desc.typeIndex] : []));
 	const groupSizes: number[] = [];
 	for (let i = 0, runStart = 0; i <= types.length; i++) {
-		if (i === types.length || compTypeOf(types[i]).kind === 'func') {
+		if (i === types.length || importedFuncTypeIndices.has(i)) {
 			if (i > runStart)
 				groupSizes.push(i - runStart);
 			if (i < types.length)
