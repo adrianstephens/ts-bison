@@ -3,8 +3,8 @@ import * as JS from './js-parser';
 import * as JSX from './jsx-parser';
 import * as T from './type-utils';
 import { Identifier, Literal, Binary } from '../common';
-import { walk, walkB, hasMod, dropMod } from './walker';
-import { SEVERITY, makeErr, checkBlock, exportScope, typeOf, inferReturn } from './checker';
+import { Walkable, walk, walkB, hasMod, dropMod } from './walker';
+import { SEVERITY, Err, checkBlock, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader, ModuleOptionsDefault } from './module-loader';
 import { Output } from './tocode';
 
@@ -17,6 +17,7 @@ type Scope			= T.Scope;
 const Scope			= T.Scope;
 
 type JSX = 'preserve' | 'react-jsx' | 'react-jsxdev'	| 'automatic' | 'react' | 'classic';
+const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
 
 const CompilerOptionsDefault = {
 //Type Checking
@@ -197,6 +198,80 @@ export function applyPragmas(source: string, options: CompilerOptions1) {
 // Constant folding
 //-----------------------------------------------------------------------------
 
+function calcUnary(op: JS.unaryOps, x: any) {
+	if (op === '!')
+		return !x;
+
+	switch (typeof x) {
+		case 'number':
+			switch (op) {
+				case '~':	return ~x;
+				case '-':	return -x;
+				case '+':	return +x;
+			}
+			break;
+		case 'bigint':
+			switch (op) {
+				case '~':	return ~x;
+				case '-':	return -x;
+			}
+			break;
+	}
+}
+
+function calcBinary(op: JS.binaryOps, a: any, b: any) {
+	switch (op) {
+		case '&&':	return a && b;
+		case '||':	return a || b;
+		case '??':	return a ?? b;
+		case '!=':	return a != b;
+		case '!==':	return a !== b;
+		case '==':	return a == b;
+		case '===':	return a === b;
+	}
+	const num = typeof a === 'number' && typeof b === 'number';
+	const big = typeof a === 'bigint' && typeof b === 'bigint';
+	if (num || big) {
+		switch (op) {
+			case '<':	return a < b;
+			case '<=':	return a <= b;
+			case '>':	return a > b;
+			case '>=':	return a >= b;
+		}
+		if (num) {
+			switch (op) {
+				case '+':	return a + b;
+				case '-':	return a - b;
+				case '*':	return a * b;
+				case '/':	return a / b;
+				case '%':	return a % b;
+				case '&':	return a & b;
+				case '|':	return a | b;
+				case '^':	return a ^ b;
+				case '<<':	return a << b;
+				case '>>':	return a >> b;
+				case '>>>':	return a >>> b;
+				case '**':	return a ** b;
+			}
+		} else if (big) {
+			switch (op) {
+				case '+':	return a + b;
+				case '-':	return a - b;
+				case '*':	return a * b;
+				case '/':	return a / b;
+				case '%':	return a % b;
+				case '&':	return a & b;
+				case '|':	return a | b;
+				case '^':	return a ^ b;
+				case '<<':	return a << b;
+				case '>>':	return a >> b;
+				case '**':	return a ** b;
+			}
+		}
+	}
+}
+
+
 export function foldConstants(ast: any) {
 	return walk(ast,
 		undefined,
@@ -224,81 +299,18 @@ export function foldConstants(ast: any) {
 					break;
 				}
 				case 'binary': {
-					if (expr.left.type === 'literal' && expr.right.type === 'literal') {
-						const a = expr.left.value, b = expr.right.value;
-						switch (expr.operator) {
-							case '&&':	return Literal(a && b);
-							case '||':	return Literal(a || b);
-							case '??':	return Literal(a ?? b);
-							case '!=':	return Literal(a != b);
-							case '!==':	return Literal(a !== b);
-							case '==':	return Literal(a == b);
-							case '===':	return Literal(a === b);
-						}
-						const num = typeof a === 'number' && typeof b === 'number';
-						const big = typeof a === 'bigint' && typeof b === 'bigint';
-						if (num || big) {
-							switch (expr.operator) {
-								case '<':	return Literal(a < b);
-								case '<=':	return Literal(a <= b);
-								case '>':	return Literal(a > b);
-								case '>=':	return Literal(a >= b);
-							}
-							if (num) {
-								switch (expr.operator) {
-									case '+':	return Literal(a + b);
-									case '-':	return Literal(a - b);
-									case '*':	return Literal(a * b);
-									case '/':	return Literal(a / b);
-									case '%':	return Literal(a % b);
-									case '&':	return Literal(a & b);
-									case '|':	return Literal(a | b);
-									case '^':	return Literal(a ^ b);
-									case '<<':	return Literal(a << b);
-									case '>>':	return Literal(a >> b);
-									case '>>>':	return Literal(a >>> b);
-									case '**':	return Literal(a ** b);
-								}
-							} else if (big) {
-								switch (expr.operator) {
-									case '+':	return Literal(a + b);
-									case '-':	return Literal(a - b);
-									case '*':	return Literal(a * b);
-									case '/':	return Literal(a / b);
-									case '%':	return Literal(a % b);
-									case '&':	return Literal(a & b);
-									case '|':	return Literal(a | b);
-									case '^':	return Literal(a ^ b);
-									case '<<':	return Literal(a << b);
-									case '>>':	return Literal(a >> b);
-									case '**':	return Literal(a ** b);
-								}
-							}
-						}
+					if (expr.left.type === 'literal' && expr.right.type === 'literal' && expr) {
+						const r = calcBinary(expr.operator, expr.left.value, expr.right.value);
+						if (r !== undefined)
+							return Literal(r);
 					}
 					break;
 				}
 				case 'unary':
 					if (expr.operand.type === 'literal') {
-						const x = expr.operand.value;
-						if (expr.operator === '!')
-							return Literal(!x);
-
-						switch (typeof x) {
-							case 'number':
-								switch (expr.operator) {
-									case '~':	return Literal(~x);
-									case '-':	return Literal(-x);
-									case '+':	return Literal(+x);
-								}
-								break;
-							case 'bigint':
-								switch (expr.operator) {
-									case '~':	return Literal(~x);
-									case '-':	return Literal(-x);
-								}
-								break;
-						}
+						const r = calcUnary(expr.operator, expr.operand.value);
+						if (r !== undefined)
+							return Literal(r);
 					}
 					break;
 					
@@ -560,9 +572,9 @@ export function flattenStateMachine(body: Statement[]): StateMachine {
 // leaves here and re-enters at resumeId" as source text.
 export function StateMachineToAST(machine: StateMachine) {
 	type S = JS.Statement<Type>;
-	const state			= Identifier('state');
-	const setState = (v: number): S => ({type: 'expression', expression: JS.JSBinary('=', state, Literal(v))});
-	const cont: S		= {type: 'continue'};
+	const state		= Identifier('state');
+	const setState	= (v: number): S => ({type: 'expression', expression: JS.JSBinary('=', state, Literal(v))});
+	const cont: S	= {type: 'continue'};
 
 	// a suspend's `resultVar` ('const v = yield x;') is bound only once control resumes, so it's
 	// stashed here and re-materialized as a `let` at the top of the segment it resumes into.
@@ -754,12 +766,12 @@ export interface Diagnostic {
 	message:	string;
 }
 
-function makeDiagnostic(func: (d: Diagnostic) => void) {
+function makeDiagnostic(func: (d: Diagnostic) => void): Err {
 	const renderer	= new Output;
 	const clip		= (s: string, max = 60)	=> s.length > max ? s.slice(0, max - 3) + '...' : s;
 	const toString	= (v: any) => v === undefined ? '' : typeof v === 'string' ? v : renderer.toCode(v);
 
-	return (severity: SEVERITY, pos: JS.Location, strings: TemplateStringsArray, ...values: any[]) => func({
+	return (severity: SEVERITY, pos: JS.Location) => (strings: TemplateStringsArray, ...values: any[]) => func({
 		severity,
 		message: ['GAP', 'WRN', 'ERR'][severity] + ': ' + strings.map((s, i) => s + clip(toString(values[i]))).join(''),
 		pos
@@ -790,7 +802,7 @@ export function TStypeCheck(ast: TS.Program, libScope?: Scope): Diagnostic[] {
 	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
 	const global = libScope ? new Scope(libScope) : T.makeGlobal();
-	checkBlock(ast.body, global, undefined, undefined, makeErr(makeDiagnostic(d => diagnostics.push(d))));
+	checkBlock(ast.body, global, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
 	pushDepthExhaustionGap(diagnostics);
 	ast.scope = global;
 	return diagnostics;
@@ -870,7 +882,7 @@ async function safely<T>(waiter: LoadedModule, target: LoadedModule, func: () =>
 export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, options: CompilerOptions1, libScope?: Scope) {
 	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
-	const err		= makeErr(makeDiagnostic(d => diagnostics.push(d)));
+	const err		= makeDiagnostic(d => diagnostics.push(d));
 	const global	= libScope ? new Scope(libScope) : await getLibScope(loader, options);
 
 	// Resolves one `import` into `importScope` (shared by `makeScope` and the entry program); return value feeds
@@ -1471,4 +1483,462 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		undefined,
 		resolveTypes(global, importScope)
 	)!;
+}
+
+
+// VSDG
+type Node = any;
+
+interface StateEdge {
+	from:	Node;
+	to:		Node;
+}
+interface ValueEdge extends StateEdge {
+	inputSlot:	number; // Specifies which argument (e.g., left vs right operand)
+}
+
+class VSDG {
+	valueEdges: ValueEdge[] = [];
+	stateEdges: StateEdge[] = [];
+	nodes		= new Set<Node>();
+	getEdge(node: Node, slot: number) {
+		return this.valueEdges.find(e => e.to === node && e.inputSlot === slot);
+	}
+	removeNode(node: Node) {
+		this.nodes.delete(node);
+		this.valueEdges = this.valueEdges.filter(e => e.to !== node);
+	}
+
+	optimize(): void {
+		let changed = true;
+
+		while (changed) {
+			changed = false;
+
+			for (const node of this.nodes) {
+				// 1. Try to fold constant math operations
+				if (foldConstantsVSDG(this, node))
+					changed = true;
+
+				// 2. Try to eliminate dead if/else branches
+				if (foldDeadBranches(this, node))
+					changed = true;
+			}
+		}
+	}
+
+	linearize(): Node[] {
+		const orderedNodes: Node[] = [];
+		const readyQueue: Node[] = [];
+
+		// Track how many incoming dependencies each node is waiting on
+		const inDegree = new Map<Node, number>();
+
+		// 1. Initialize in-degree counters for all nodes
+		for (const nodeId of this.nodes.keys())
+			inDegree.set(nodeId, 0);
+
+		// Count incoming Value Edges
+		for (const edge of this.valueEdges)
+			inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
+
+		// Count incoming State Edges
+		for (const edge of this.stateEdges)
+			inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
+
+		// 2. Find all root nodes that have 0 dependencies to start with
+		for (const [nodeId, count] of inDegree.entries()) {
+			if (count === 0)
+				readyQueue.push(nodeId);
+		}
+
+		// 3. Process the queue
+		while (readyQueue.length > 0) {
+			// Strategy: Prioritize state/side-effect nodes to keep code ordered cleanly,
+			// otherwise just pull the first available ready node.
+
+			// Look for a node that handles state or side-effects first
+			const stateNodeIndex = readyQueue.findIndex(node => {
+				const type = node.type;
+				return type === 'call' || type === 'gamma' || type === 'mu';
+			});
+
+			// If found, splice it out of the queue; otherwise take the first item
+			const indexToPull = stateNodeIndex !== -1 ? stateNodeIndex : 0;
+			const current = readyQueue.splice(indexToPull, 1)[0];
+
+			// Add to our final sequential execution order
+			orderedNodes.push(current);
+
+			// 4. Update downstream nodes that depended on this node
+			// Check downstream Value Consumers
+			for (const edge of this.valueEdges) {
+				if (edge.from === current) {
+					const remaining = inDegree.get(edge.to)! - 1;
+					inDegree.set(edge.to, remaining);
+					if (remaining === 0)
+						readyQueue.push(edge.to);
+				}
+			}
+
+			// Check downstream State Consumers
+			for (const edge of this.stateEdges) {
+				if (edge.from === current) {
+					const remaining = inDegree.get(edge.to)! - 1;
+					inDegree.set(edge.to, remaining);
+					if (remaining === 0)
+						readyQueue.push(edge.to);
+				}
+			}
+		}
+
+		// Safety check: If orderedNodes length doesn't match graph size, you have a cycle
+		if (orderedNodes.length !== this.nodes.size)
+			throw new Error("Cyclic dependency detected! Graph cannot be fully linearized.");
+
+		return orderedNodes;
+	}
+
+	toAST(sequentialNodes: Node[]): any[] {
+		// A map to track the name of variables assigned to temporary node values
+		const nodeVariableNames = new Map<Node, string>();
+		let tempVarCounter = 0;
+
+		function makeVar(node: Node) {
+			const varName 	= `t${tempVarCounter++}`;
+			nodeVariableNames.set(node, varName);
+			return varName;
+		}
+
+		const resolveOperand = (to: Node, slot: number) => {
+			// 1. Find the edge connecting to this specific slot
+			const edge = this.getEdge(to, slot);
+			if (!edge)
+				throw new Error(`Missing operand edge for slot ${slot} on node ${to}`);
+
+			const sourceNode = edge.from;
+
+			// 2. If the source is a pure constant, we can inline its value directly into the statement
+			if (sourceNode.type === 'literal')
+				return sourceNode;
+
+			// 3. Otherwise, look up the name of the temporary variable we assigned to that calculation
+			const varName = nodeVariableNames.get(sourceNode.id);
+			if (!varName)
+				throw new Error(`Node ${sourceNode.id} was consumed before it was assigned a variable name!`);
+
+			return Identifier(varName);
+		};
+
+		const statements: Statement[] = [];
+
+		for (const node of sequentialNodes) {
+			switch (node.type) {
+
+				case 'literal':
+					// Pure constants don't need a standalone line of code; 
+					// they will be inline-read by their consumer expressions.
+					break;
+
+				case 'unary': {
+					// This computation needs a name so downstream lines can reference it
+					// Emit an AST Variable Declaration statement: const t0 = left + right;
+					const un = node as (Expr & {type: 'unary'});
+					statements.push(JS.VarDecl('const', JS.Var(makeVar(node), {...un, 
+						operand: resolveOperand(node.id, 0),
+					})));
+					break;
+				}
+				case 'binary': {
+					// This computation needs a name so downstream lines can reference it
+					// Emit an AST Variable Declaration statement: const t0 = left + right;
+					const bin = node as (Expr & {type: 'binary'});
+					statements.push(JS.VarDecl('const', JS.Var(makeVar(node), {...bin,
+						left: resolveOperand(node.id, 0),
+						right: resolveOperand(node.id, 1)
+					})));
+					break;
+				}
+
+				case 'call': {
+					// Emit a standalone function call AST statement: console.log(arg0);
+					const call = node as (Expr & {type: 'call'});
+					statements.push(JS.Expression({...call,
+						arguments: call.arguments.map((a, i) => resolveOperand(node.id, i))
+					} as Expr));
+					break;
+				}
+			}
+		}
+
+		return statements;
+	}
+
+}
+
+export function BuildVSDG(ast: Walkable): VSDG {
+	const graph		= new VSDG();
+	let environment = new Map<string, any>();
+	let current: Node;
+
+	function copyState() {
+		return { environment: new Map(environment), end: current };
+	}
+	function connectState(from: Node, to: Node): void {
+		graph.stateEdges.push({ from, to });
+	}
+	function connectValue(from: Node, to: Node, inputSlot: number): void {
+		graph.valueEdges.push({ from, to, inputSlot });
+	}
+	walkB(ast,
+		(s, process, recurse) => {
+			switch (s.type) {
+				case 'if': {
+					// 1. Evaluate the condition expression to get a value node
+					recurse(s.test);
+
+					// 2. Snapshot the current state and environment before entering branches
+					const preIf	= copyState();
+
+					// 3. Walk the TRUE branch
+					process(s.consequent);
+					const trueBranch	= copyState();
+
+					// 4. Reset state and environment, then walk the FALSE branch
+					current		= preIf.end;
+					environment	= new Map(preIf.environment);
+
+					if (s.alternate)
+						process(s.alternate);
+
+					const falseBranch	= copyState();
+
+					// 5. Reconcile the STATE
+					// If either branch modified state, we must merge the state paths using a Gamma node
+					if (trueBranch.end !== preIf.end || falseBranch.end !== preIf.end) {
+						const stateGammaNode = {type: 'gamma'};
+
+						// Connect Condition
+						connectValue(s.test, stateGammaNode, 0); // Slot 0 = Condition
+						// Connect the two different resulting state paths as VALUE inputs to the Gamma
+						connectValue(trueBranch.end, stateGammaNode, 1);  // Slot 1 = True State
+						connectValue(falseBranch.end, stateGammaNode, 2); // Slot 2 = False State
+
+						// The current global state of the compiler is now the output of this Gamma
+						current = stateGammaNode;
+					}
+
+					// 6. Reconcile the ENVIRONMENT (Variables like 'x')
+					// Find every variable name that was modified in either branch
+					const allVariables = new Set([...trueBranch.environment.keys(), ...falseBranch.environment.keys()]);
+
+					for (const varName of allVariables) {
+						const trueVal	= trueBranch.environment.get(varName);
+						const falseVal	= falseBranch.environment.get(varName);
+
+						// If the variable diverged between branches, merge them with a Gamma node
+						if (trueVal !== falseVal) {
+							const valueGammaNode = {type: 'gamma', value: varName};
+							connectValue(s.test, valueGammaNode, 0); // Slot 0 = Condition
+							connectValue(trueVal || preIf.environment.get(varName)!, valueGammaNode, 1);
+							connectValue(falseVal || preIf.environment.get(varName)!, valueGammaNode, 2);
+
+							// Update the main environment to point to this merged Gamma result
+							environment.set(varName, valueGammaNode);
+						}
+					}
+					return false;
+				}
+
+				case 'while': {
+					// 1. Snapshot variables and state that exist before entering the loop
+					const preLoop = copyState();
+
+					// 2. Create MU (Entry) nodes for every variable and the global State
+					// We need these because the loop body reads variables that mutate across iterations.
+					const stateMuNode = { type: 'mu' };
+					connectValue(preLoop.end, stateMuNode, 0); // Slot 0 = Initial value from outside
+					current = stateMuNode;
+
+					const valueMuNodes = new Map<string, Node>();
+					for (const [varName, initialValueNodeId] of preLoop.environment) {
+						const mu = {type: 'mu', value: varName};
+						connectValue(initialValueNodeId, mu, 0); // Slot 0 = Initial value from outside
+
+						valueMuNodes.set(varName, mu);
+						environment.set(varName, mu); // Direct reads inside the loop to this Mu node
+					}
+
+					// 3. Walk the loop condition expression
+					// It evaluates using the values provided by our new Mu entry nodes.
+					recurse(s.test);
+
+					// 4. Walk the loop body statements
+					process(s.body);
+
+					// 5. Connect the loop body feedback loops back into the MU nodes (Slot 1)
+					// Connect the final side-effect state of the loop body back to the State Mu
+					connectValue(current, stateMuNode, 1); // Slot 1 = Feedback loop
+
+					// Connect updated variable values back to their respective Value Mus
+					for (const [varName, muNodeId] of valueMuNodes)
+						connectValue(environment.get(varName)!, muNodeId, 1); // Slot 1 = Feedback loop
+
+					// 6. Create THETA (Exit) nodes to export the final values outside the loop
+					// The Theta node prevents values from escaping until the condition is false.
+					const stateThetaNode = { type: 'theta' };
+					connectValue(s.test, stateThetaNode, 0); 			// Slot 0 = Loop termination condition
+					connectValue(stateMuNode, stateThetaNode, 1);		// Slot 1 = Value to pass out
+					current = stateThetaNode;							// Future global side-effects depend on this exit state
+
+					for (const [varName, muNodeId] of valueMuNodes) {
+						const theta = { type: 'theta', value: varName};
+						connectValue(s.test, theta, 0); // Slot 0 = Condition
+						connectValue(muNodeId, theta, 1);        // Slot 1 = Value to pass out
+
+						// Update global environment so downstream code reads the post-loop value
+						environment.set(varName, theta);
+					}
+
+					return false;
+				}
+
+
+			}
+			return process(s);
+		},
+		(s, process) => {
+			switch (s.type) {
+				case 'unary': {
+					connectValue(s.operand, s, 0);
+					break;
+				}
+				case 'binary': {
+					if (ASSIGN_OPS.has(s.operator)) {
+						if (s.left.type === 'identifier')
+							environment.set(s.left.name, s);
+
+					} else {
+						connectValue(s.left, s, 0);
+						connectValue(s.right, s, 1);
+					}
+					break;
+				}
+
+				case 'call': {
+					// 1. Thread the State Edge to preserve sequence
+					connectState(current, s);
+					// Update the current state pointer to this new call
+					current = s;
+
+					// 2. Thread Value Edges for the function arguments
+					s.arguments.forEach((arg, index) => connectValue(arg, s, index));
+					break;
+				}
+
+			}
+			return process(s);
+		}
+	);
+	return graph;
+}
+
+function foldConstantsVSDG(graph: VSDG, node: Node): boolean {
+	switch (node.type) {
+		case 'binary': {
+			// Find the incoming value edges for this node
+			const leftEdge = graph.getEdge(node, 0);
+			const rightEdge = graph.getEdge(node, 1);
+			if (!leftEdge || !rightEdge)
+				return false;
+
+			// Get the actual source nodes
+			const left	= leftEdge.from as Expr;
+			const right = rightEdge.from as Expr;
+
+			// If both inputs are constants, we can fold them!
+			if (left.type === 'literal' && right.type === 'literal') {
+				const r = calcBinary(node.operator, left.value, right.value);
+				if (r !== undefined) {
+					// 1. Change this node into a pure Constant node
+					node.type = 'literal';
+					node.value = r;
+
+					// 2. Remove the incoming edges since it no longer computes anything
+					graph.valueEdges = graph.valueEdges.filter(e => e.to !== node.id);
+
+					return true; // Graph was modified!
+				}
+			}
+			return false;
+		}
+		case 'unary': {
+			const edge = graph.getEdge(node, 0);
+			if (!edge)
+				return false;
+			const operand	= edge.from as Expr;
+			if (operand.type === 'literal') {
+				const r = calcUnary(node.operator, operand.value);
+				if (r !== undefined) {
+					// 1. Change this node into a pure Constant node
+					node.type = 'literal';
+					node.value = r;
+
+					// 2. Remove the incoming edges since it no longer computes anything
+					graph.valueEdges = graph.valueEdges.filter(e => e.to !== node.id);
+
+					return true; // Graph was modified!
+				}
+			}
+			return false;
+		}
+	}
+	return false;
+			
+}
+function foldDeadBranches(graph: VSDG, node: Node): boolean {
+	// We are looking for Gamma nodes (Value or State)
+	if (node.type !== 'gamma')
+		return false;
+
+	// Find the edge supplying the condition (Slot 0)
+	const condEdge = graph.getEdge(node, 0);
+	if (!condEdge)
+		return false;
+
+	const condNode = condEdge.from;
+
+	// If the condition is a known constant boolean (or truthy/falsy value)
+	if (condNode.type === 'literal') {
+		// Slot 1 is the True path, Slot 2 is the False path
+
+		// Find the edge representing the winning path
+		const winningEdge = graph.getEdge(node, condNode.value ? 1 : 2);
+		if (!winningEdge)
+			return false;
+
+		// Bypass this Gamma node entirely! 
+		// Find every downstream node that reads from this Gamma node, 
+		// and reconnect them to read directly from the winning branch source.
+		for (const edge of graph.valueEdges) {
+			if (edge.from === node)
+				edge.from = winningEdge.from;
+		}
+
+		// Do the exact same thing for state edges if this is a GammaState node
+		for (const edge of graph.stateEdges) {
+			if (edge.from === node)
+				edge.from = winningEdge.from;
+			if (edge.to === node)
+				edge.to = winningEdge.from;
+		}
+
+		// Delete the Gamma node and its incoming edges from the graph
+		//graph.nodes.delete(node.id);
+		graph.valueEdges = graph.valueEdges.filter(e => e.to !== node.id);
+
+		return true; // Graph was modified!
+	}
+
+	return false;
 }

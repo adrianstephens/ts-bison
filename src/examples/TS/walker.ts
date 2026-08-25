@@ -41,16 +41,19 @@ interface Process<U> {
 	<T extends U>(x: T, recall?: false): T;
 	<T extends U>(x?: T, recall?: boolean): T | undefined;
 }
-type OnAST<U>		= (x: U, process: Process<U>) => U | undefined;
+// Lets a hook recurse into a child of another domain (e.g. an expression from onStatement),
+// using the same shape-based dispatch `walk()` itself uses at its own entry point.
+type Recurse		= <T extends Walkable>(x: T) => T | undefined;
+type OnAST<U>		= (x: U, process: Process<U>, recurse: Recurse) => U | undefined;
 
-function makeProcess<U>(parts: (x: U) => U, on?: OnAST<U>, always = false) {
+function makeProcess<U>(parts: (x: U) => U, on: OnAST<U> | undefined, recurse: Recurse, always = false) {
 	if (on) {
 		function process<T extends U>(t: T, recall?: false): T;
 		function process<T extends U>(t?: T, recall?: boolean): T | undefined;
 		function process<T extends U>(t?: T, recall?: boolean): T | undefined {
 			return !t ? undefined : recall ? redo(t) : parts(t) as T;
 		}
-		const redo = <T extends U>(t?: T) => t ? on(t, process) as T | undefined : undefined;
+		const redo = <T extends U>(t?: T) => t ? on(t, process, recurse) as T | undefined : undefined;
 		return redo;
 	}
 	return always	? <T extends U>(t?: T) => t ? parts(t) as T : undefined
@@ -94,7 +97,9 @@ function mapObject<N extends Record<string, any>>(node: N, fields: NodeMap<N>): 
 	return r;
 }
 
-export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Statement[]>(ast: T,
+export type Walkable = TS.Program | TS.Statement | Expr | Type | TS.Statement[];
+
+export function walk<T extends Walkable>(ast: T,
 	onStatement?:	OnAST<TS.Statement>,
 	onExpression?:	OnAST<Expr>,
 	onType?:		OnAST<Type>,
@@ -418,11 +423,23 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 		}
 
 	};
-	const mapStatement		= makeProcess(statement, onStatement, true);
-	const mapExpression		= makeProcess(expression, onExpression, !!onType);
-	const mapType			= makeProcess(type, onType);
-	const mapTypeMember		= makeProcess(typeMember, onTypeMember, true);
-	const mapClassMember	= makeProcess(classMember, onClassMember, true);
+	const recurse: Recurse = x => {
+		if (Array.isArray(x))
+			return mapArray(mapStatement)(x) as typeof x;
+		if (isProgram(x))
+			return {...x, body: mapArray(mapStatement)(x.body)};
+		if (isType(x))
+			return mapType(x) as typeof x;
+		if (isJsStatement(x) || isTsDeclaration(x))
+			return mapStatement(x) as typeof x;
+		return mapExpression(x) as typeof x;
+	};
+
+	const mapStatement		= makeProcess(statement, onStatement, recurse, true);
+	const mapExpression		= makeProcess(expression, onExpression, recurse, !!onType);
+	const mapType			= makeProcess(type, onType, recurse);
+	const mapTypeMember		= makeProcess(typeMember, onTypeMember, recurse, true);
+	const mapClassMember	= makeProcess(classMember, onClassMember, recurse, true);
 
 	const mapTypeA			= mapDefined(mapType);
 	const mapExpressionA	= mapDefined(mapExpression);
@@ -456,19 +473,20 @@ export function walk<T extends TS.Program | TS.Statement | Expr | Type | TS.Stat
 // `ownBoundNames`/`collectFreeVars` in towasm.ts already do), or it will silently skip later
 // siblings it should have visited.
 type ProcessB<U>	= <T extends U>(x?: T, recall?: boolean)=>boolean;
-type OnASTB<U>		= (x: U, process: ProcessB<U>) => boolean;
+type RecurseB		= (x: Walkable) => boolean;
+type OnASTB<U>		= (x: U, process: ProcessB<U>, recurse: RecurseB) => boolean;
 
-function makeProcessB<U>(parts: (x: U) => boolean, on?: OnASTB<U>, always = false) {
+function makeProcessB<U>(parts: (x: U) => boolean, on: OnASTB<U> | undefined, recurse: RecurseB, always = false) {
 	if (on) {
 		const process	= (t?: U, recall?: boolean) => !t ? false : recall ? redo(t) : parts(t);
-		const redo		= (t?: U) => t ? on(t, process) : false;
+		const redo		= (t?: U) => t ? on(t, process, recurse) : false;
 		return redo;
 	}
 	return always	? (t?: U) => t ? parts(t) : false
 					: (_?: U) => false;
 }
 
-export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Statement[]>(ast: T,
+export function walkB<T extends Walkable>(ast: T,
 	onStatement?:	OnASTB<TS.Statement>,
 	onExpression?:	OnASTB<Expr>,
 	onType?:		OnASTB<Type>,
@@ -617,11 +635,23 @@ export function walkB<T extends TS.Program | TS.Statement | Expr | Type | TS.Sta
 		}
 	};
 
-	const walkStatement		= makeProcessB(statement, onStatement, true);
-	const walkExpression	= makeProcessB(expression, onExpression);
-	const walkTypeMember 	= makeProcessB(typeMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, true);
-	const walkClassMember 	= makeProcessB(classMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, true);
-	const walkType			= makeProcessB(type, onType);
+	const recurse: RecurseB = x => {
+		if (Array.isArray(x))
+			return x.some(walkStatement);
+		if (isProgram(x))
+			return x.body.some(walkStatement);
+		if (isType(x))
+			return walkType(x);
+		if (isJsStatement(x) || isTsDeclaration(x))
+			return walkStatement(x);
+		return walkExpression(x);
+	};
+
+	const walkStatement		= makeProcessB(statement, onStatement, recurse, true);
+	const walkExpression	= makeProcessB(expression, onExpression, recurse);
+	const walkTypeMember 	= makeProcessB(typeMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, recurse, true);
+	const walkClassMember 	= makeProcessB(classMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, recurse, true);
+	const walkType			= makeProcessB(type, onType, recurse);
 
 	const walkStatementU	= (stmt: JS.Statement<any>) => walkStatement(stmt as TS.Statement);
 

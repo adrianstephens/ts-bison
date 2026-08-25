@@ -121,8 +121,8 @@ export type Expr<T = any> =
 	| { type: 'tagged_template'; tag: Expr<T>; quasi: TemplatePart<Expr<T>>[] }
 	| { type: 'yield'; operand?: Expr<T>; delegate?: boolean }
 	| { type: 'class'; } & Class
-	| { type: 'as';				expression: Expr<T>; typeAnnotation: unknown }
-	| { type: 'satisfies';		expression: Expr<T>; typeAnnotation: unknown }
+	| { type: 'as';				expression: Expr<T>; typeAnnotation: T }
+	| { type: 'satisfies';		expression: Expr<T>; typeAnnotation: T }
 	| { type: 'instantiation';	expression: Expr<T>; typeArgs: T[] }
 
 // Rebuilds the flattened `"Symbol.iterator"`-style string back into a real `Expr` for a computed member name -- a general expression isn't an option,
@@ -161,7 +161,7 @@ export interface ExportSpecifier { local: string; exported: string; typeOnly?: b
 export interface Import { type: 'import'; specifiers?: ImportSpecifier[]; source:  string; namespace?: string; typeOnly?: boolean; default?: string; attributes?: {key: string, value: string}[] }
 export interface Export<T> { type: 'export'; specifiers?: ExportSpecifier[]; source?: string; namespace?: string; typeOnly?: boolean; default?: Expr<T>|Declaration<T> }
 
-export function Expression<T>(expression: Expr<T>) { return { type: 'expression', expression }; }
+export function Expression<T>(expression: Expr<T>) { return { type: 'expression', expression } as const; }
 
 export type ForInit<T> = Expr<T> | VarDecl<T>;
 export interface SwitchCase<T, S = Statement<T>> { test?: Expr<T>; consequent: S[]; }
