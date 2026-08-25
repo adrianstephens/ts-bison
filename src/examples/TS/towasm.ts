@@ -1580,8 +1580,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// unconstrained generic, a caught exception).
 			if (nonNullish.length > 1) {
 				const memberWtypes = nonNullish.map(typeOf);
-				if (memberWtypes.every(w => w !== undefined))
-					return new Set(memberWtypes.map(w => wasmTypeKey(w!))).size === 1 ? memberWtypes[0] : REF_ANY;
+				// A member with no representation of its own (e.g. a further-nested union hitting this same
+				// case, or a genuinely unrepresentable shape) is trivially "not the same physical type as
+				// everything else" -- still a real reason to box as `any`, not a reason to give up on the
+				// whole union. Only every member resolving to the exact same WasmType stays unboxed.
+				return memberWtypes.every(w => w !== undefined) && new Set(memberWtypes.map(w => wasmTypeKey(w!))).size === 1
+					? memberWtypes[0]
+					: REF_ANY;
 			}
 		}
 		if (resolved.type === 'function')
