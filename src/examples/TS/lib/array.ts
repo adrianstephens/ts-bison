@@ -7,8 +7,7 @@
 export class Array<T> {
 	[i: number]: T;
 
-	get length(): number { return __asm<[], u32>('array.len')(); }
-
+	get length(): number	{ return __asm<[], u32>('array.len')(); }
 	get(i: i32): T			{ return __asm<[i32], T>('array.get $this')(i); }
 	set(i: i32, v: T): void	{ return __asm<[i32, T], void>('array.set $this')(i, v); }
 

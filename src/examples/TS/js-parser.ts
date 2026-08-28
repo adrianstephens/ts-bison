@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { type RecoveryCallback, type MergeValues, type Token, type Parser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
-import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods } from '../common';
+import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods, withDefault } from '../common';
 
 // ===================================================================
 //  JavaScript Parser using tison
@@ -15,14 +15,18 @@ import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods } from '../com
 //  AST
 // ===================================================================
 
-export type unaryOps	= '++'|'--'|'delete'|'void'|'typeof'|'+'|'-'|'~'|'!'|'await';
-export type binaryOps	= '+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'|'>>>'
-						| '&&'|'||'|'??'
-						|'<'|'>'|'<='|'>='|'instanceof'|'in'|'=='|'!='|'==='|'!=='
-						|'='|'+='|'-='|'*='|'**='|'/='|'%='|'&='|'|='|'^='|'<<='|'>>='|'>>>='
-						|'&&='|'||='|'??='
-export const JSUnary = Unary<Expr, unaryOps>;
-export const JSBinary = Binary<Expr, binaryOps>;
+export type unaryOps		= '+'|'-'|'~'|'!'|'++'|'--'|'delete'|'void'|'typeof'|'await';
+
+export const CompareOps		= ['<', '>', '<=', '>=', '==', '!=', '===', '!=='] as const;
+export const AssignableOps	= ['+', '-', '*', '**', '/', '%', '&', '|', '^', '<<', '>>', '>>>', '&&', '||', '??'] as const;
+
+export type compareOps		= (typeof CompareOps)[number];
+export type assignableOps	= (typeof AssignableOps)[number];
+export type assignOps		= '='|`${assignableOps}=`;
+export type binaryOps		= assignableOps | assignOps | compareOps|'instanceof'|'in'
+
+export const JSUnary		= Unary<Expr, unaryOps>;
+export const JSBinary		= Binary<Expr, binaryOps>;
 
 export interface TemplatePart<T> { str: string; exp?: T; }
 
@@ -37,20 +41,17 @@ export interface ArrayPatternElement		{ target: BindingTarget; default?: Expr; }
 export interface ArrayPattern 				{ type: 'array_pattern'; elements: (ArrayPatternElement | undefined)[]; rest?: BindingTarget; }
 export function  ArrayPattern(elements: (ArrayPatternElement | undefined)[], rest?: BindingTarget): ArrayPattern { return { type: 'array_pattern', elements, rest }; }
 
-export interface ArrayLit<T> { type: 'array'; elements: readonly (Expr<T> | undefined)[] }
+export interface ArrayLit<T>				{ type: 'array'; elements: readonly (Expr<T> | undefined)[] }
 export function  ArrayLit<T>(elements: readonly (Expr<T> | undefined)[]): ArrayLit<T>	{ return { type: 'array', elements}; }
 
 export interface TypeParam<T> 				{ name: string; constraint?: T; default?: T; const?: boolean; }
-
 export interface Rest<T>					{ key: BindingTarget; typeAnnotation?: T; }
 export function  Rest<T>(key: BindingTarget, typeAnnotation?: T): Rest<T> { return {key, typeAnnotation}; }
 export interface Param<T>					{ key: BindingTarget; default?: Expr<T>; typeAnnotation?: T; modifiers?: string[]; decorators?: Expr[] }
 export function  Param<T>(key: BindingTarget, typeAnnotation?: T, modifiers?: string[]): Param<T> { return { key, typeAnnotation, modifiers }; }
 export interface Params<T>					{ params: Param<T>[]; rest?: Rest<T>; }
 export function  Params<T>(params: Param<T>[], rest?: Rest<T>) : Params<T> { return {params, rest }; }
-export interface CallSig<T> extends Params<T> { typeParams?: TypeParam<T>[]; returnType?: T; declScope?: unknown; scope?: unknown }
-
-export function  withDefault<T extends {default?: U}, U>(p: T, def: U) { p.default = def; return p; }
+export interface CallSig<T> extends Params<T> { typeParams?: TypeParam<T>[]; returnType?: T; declScope?: unknown; scope?: unknown; pure?: boolean }
 
 export type CallSigParams<T> =
 	|	[CallSig<T>]
@@ -60,6 +61,7 @@ export type CallSigParams<T> =
 	|	[Param<T>[]]
 	|	[Param<T>[], T|undefined]
 	|	[Param<T>[], T|undefined, TypeParam<T>[]|undefined]
+
 export function CallSig<T>(...args: CallSigParams<T>) : CallSig<T> {
 	if (Array.isArray(args[0]))
 		return { params: args[0], returnType: args[1] as T, typeParams: args[2] as TypeParam<T>[] };
@@ -68,8 +70,8 @@ export function CallSig<T>(...args: CallSigParams<T>) : CallSig<T> {
 		: args[0];
 }
 
-export interface KeyMods<T> { key: Key<T>, modifiers?: string[] };
-export interface Spread<T> { type: 'spread'; operand: Expr<T> }
+export interface KeyMods<T>	{ key: Key<T>, modifiers?: string[] };
+export interface Spread<T>	{ type: 'spread'; operand: Expr<T> }
 export function  Spread<T>(operand: Expr<T>): Spread<T> { return { type: 'spread', operand }; }
 
 export interface FunctionExpr<T> extends CallSig<T> { type: 'function'; name?: string; body?: Statement<T>[]; modifiers?: string[] }
@@ -79,9 +81,7 @@ export interface Arrow<T> extends CallSig<T> { type: 'arrow'; body: Expr | State
 export function  Arrow<T>(sig: CallSig<T>, body: Expr | Statement<T>[], more?: Partial<Arrow<T>>): Arrow<T> { return { body, ...sig, ...more, type: 'arrow'}; }
 
 export interface Method<T> extends CallSig<T> { type: 'method' | 'get' | 'set'; key: Key<T>; body?: Statement<T>[], modifiers?: string[] }
-export function  Method<T>(type: 'method' | 'get' | 'set', key: Key<T>, sig: CallSig<T>, body?: Statement<T>[], modifiers?: string[]): Method<T> {
-	return { type, key, body, modifiers, ...sig };
-}
+export function  Method<T>(type: 'method' | 'get' | 'set', key: Key<T>, sig: CallSig<T>, body?: Statement<T>[], modifiers?: string[]): Method<T> { return { type, key, body, modifiers, ...sig }; }
 export interface Field<T> { type: 'field'; key: Key<T>; value?: Expr; typeAnnotation?: T; modifiers?: string[] }
 export function  Field<T>(key: Key<T>, value?: Expr<T>, typeAnnotation?: T, modifiers?: string[]): Field<T> { return { type: 'field', key, value, typeAnnotation, modifiers }; }
 
@@ -98,6 +98,10 @@ export interface Member<T> { type: 'member'; object: Expr<T>; property: string; 
 export function  Member<T>(object: Expr<T>, property: string, optional?: boolean) : Member<T> { return { type: 'member', object, property, optional }; }
 export interface Index<T> { type: 'index';	object: Expr<T>; property: Expr<T>; optional?: boolean }
 export function  Index<T>(object: Expr<T>, property: Expr<T>, optional?: boolean): Index<T> { return { type: 'index', object, property, optional }; }
+
+// for JSX
+export interface Attribute<T>	{ name?: string; value?: Expr<T> }
+export interface Element<T>		{ type: 'jsx'; name: string; attributes: Attribute<T>[]; children: Expr<T>[] }
 
 export type Expr<T = any> =
 	| Literal<number | bigint | string | boolean | null | RegExp | TemplatePart<Expr>[]>
@@ -121,9 +125,12 @@ export type Expr<T = any> =
 	| { type: 'tagged_template'; tag: Expr<T>; quasi: TemplatePart<Expr<T>>[] }
 	| { type: 'yield'; operand?: Expr<T>; delegate?: boolean }
 	| { type: 'class'; } & Class
+	// for TS
 	| { type: 'as';				expression: Expr<T>; typeAnnotation: T }
 	| { type: 'satisfies';		expression: Expr<T>; typeAnnotation: T }
 	| { type: 'instantiation';	expression: Expr<T>; typeArgs: T[] }
+	// for JSX
+	| Element<T>
 
 // Rebuilds the flattened `"Symbol.iterator"`-style string back into a real `Expr` for a computed member name -- a general expression isn't an option,
 // since real TypeScript restricts a computed interface/type-literal key to a `unique symbol` reference anyway.
@@ -143,23 +150,22 @@ export function  FunctionDecl<T>(name: string, sig: CallSig<T>, body?: Statement
 
 export interface ClassDecl<T> extends Class<T> { type: 'class_decl'; name: string; ambient?: boolean; }
 
-export interface Var<T> { name: BindingTarget; init?: Expr<T>; typeAnnotation?: T; definite?: boolean; }
+export type DeclarationKind		= 'var' | 'let' | 'const' | 'using' | 'await using';
+export interface Var<T>			{ name: BindingTarget; init?: Expr<T>; typeAnnotation?: T; definite?: boolean; }
 export function  Var<T>(name: BindingTarget, init?: Expr<T>, typeAnnotation?: T, definite?: boolean): Var<T> { return {name, init, typeAnnotation, definite}; }
-export type DeclarationKind			= 'var' | 'let' | 'const' | 'using' | 'await using';
-export interface VarDecl<T>	{ type: 'var_decl'; kind: DeclarationKind; ambient?: boolean; declarations: Var<T>[] }
+export interface VarDecl<T>		{ type: 'var_decl'; kind: DeclarationKind; ambient?: boolean; declarations: Var<T>[] }
 export function  VarDecl<T>(kind: DeclarationKind, ...declarations: Var<T>[]): VarDecl<T> { return { type: 'var_decl', kind, declarations }; }
 export function  AmbientVarDecl<T>(kind: DeclarationKind, ...declarations: Var<T>[]): VarDecl<T> { return { type: 'var_decl', kind, declarations, ambient: true }; }
 
 export type Declaration<T> = VarDecl<T> | FunctionDecl<T> | ClassDecl<T>;
 
-export interface ExportDecl<T> { type: 'export_decl'; declaration: Declaration<T>};
+export interface ExportDecl<T>		{ type: 'export_decl'; declaration: Declaration<T>};
 export function  ExportDecl<T>(d: Declaration<T>): ExportDecl<T> { return { type: 'export_decl', declaration: d }; }
 
-export interface ImportSpecifier { imported: string; local: string; typeOnly?: boolean; }
-export interface ExportSpecifier { local: string; exported: string; typeOnly?: boolean; }
-
-export interface Import { type: 'import'; specifiers?: ImportSpecifier[]; source:  string; namespace?: string; typeOnly?: boolean; default?: string; attributes?: {key: string, value: string}[] }
-export interface Export<T> { type: 'export'; specifiers?: ExportSpecifier[]; source?: string; namespace?: string; typeOnly?: boolean; default?: Expr<T>|Declaration<T> }
+export interface ImportSpecifier	{ imported: string; local: string; typeOnly?: boolean; }
+export interface ExportSpecifier	{ local: string; exported: string; typeOnly?: boolean; }
+export interface Import				{ type: 'import'; specifiers?: ImportSpecifier[]; source:  string; namespace?: string; typeOnly?: boolean; default?: string; attributes?: {key: string, value: string}[] }
+export interface Export<T>			{ type: 'export'; specifiers?: ExportSpecifier[]; source?: string; namespace?: string; typeOnly?: boolean; default?: Expr<T>|Declaration<T> }
 
 export function Expression<T>(expression: Expr<T>) { return { type: 'expression', expression } as const; }
 
@@ -170,6 +176,7 @@ export function Switch<T>(discriminant: Expr, ...cases: SwitchCase<T>[]): Statem
 export function Block<T>(...body: Statement<T>[]): { type: 'block'; body: Statement<T>[] } { return { type: 'block', body }; }
 export function For<T>(init: ForInit<T>|undefined, test: Expr|undefined, update: Expr|undefined, body: Statement<T>): Statement<T> { return { type: 'for', kind: 'normal', init, test, update, body }; }
 export function If<T>(test: Expr, consequent: Statement<T>, alternate?: Statement<T>) { return {type: 'if', test, consequent, alternate }; }
+export function While<T>(test: Expr, body: Statement<T>) { return {type: 'while', test, body }; }
 
 export type Statement<T> = Declaration<T>
 	| { type: 'block'; body: Statement<T>[] }
@@ -287,7 +294,6 @@ export interface Location { line: number, col: number };
 
 export const Rule = makeRule<any>(<T>(t: T, $: any) =>
 	typeof t === 'object' ? Object.defineProperty(t, 'pos', {value: {line: $.pos.line, col: $.pos.col }, enumerable: false, configurable: true, writable: false }) : t
-//Object.assign(t as object, {pos: {line: $.pos.line, col: $.pos.col }}) : t
 );
 
 const ASSIGN_OP = OneOf(['+=', '-=', '*=', '**=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=', '&&=', '||=', '=']);
@@ -602,8 +608,7 @@ function exprToParams(e: Expr): Param<any>[] {
 // A bare `$` only stops the match when starting `${` -- anywhere else (a real case that broke this once)
 // it's ordinary text, same as real JS/TS.
 const template_literal_part = Rules<TemplatePart<Expr>>(
-	Rule([/(?:[^`$\\]|\\[\s\S]|\$(?!\{))*(?=\$\{)/, '${', expression, '}'],	$ =>
-		 ({ str: unescapeString($[0]), exp: $[2] })),
+	Rule([/(?:[^`$\\]|\\[\s\S]|\$(?!\{))*(?=\$\{)/, '${', expression, '}'],	$ => ({ str: unescapeString($[0]), exp: $[2] })),
 	Rule([/(?:[^`$\\]|\\[\s\S]|\$(?!\{))*(?=`)/], 							$ => ({ str: unescapeString($[0]) })),
 );
 const template_literal_parts = List(template_literal_part);
@@ -623,18 +628,18 @@ function parseNumber(text: string): Literal<number|bigint> {
 // Shared by `primary_expression` and its NoBrace mirror below; only the `{`-led object-literal alternative
 // differs, spliced in at its original position (not appended) so relative reduce-reduce rule order is preserved.
 const primaryRules = (objectLiteral?: Rules<Expr>): Rules<Expr> => [
-	Rule(['this'], 					_ => ({ type: 'this' } as const)),
-	Rule(['super'], 				_ => ({ type: 'super' } as const)),
-	Rule([IDENT],					$ => Identifier($[0])),
-	Rule([NUM], 					$ => parseNumber($[0])),
-	Rule([STR], 					$ => Literal(unquoteString($[0]))),
-	Rule([REGEX_LITERAL],			$ => { const m = /^\/(.*)\/([a-zA-Z]*)$/.exec($[0])!; return Literal(new RegExp(m[1], m[2])); }),
-	Rule(['true'], 					_ => Literal(true)),
-	Rule(['false'],					_ => Literal(false)),
-	Rule(['null'],					_ => Literal(null)),
+	Rule(['this'], 								_ => ({ type: 'this' } as const)),
+	Rule(['super'], 							_ => ({ type: 'super' } as const)),
+	Rule([IDENT],								$ => Identifier($[0])),
+	Rule([NUM], 								$ => parseNumber($[0])),
+	Rule([STR], 								$ => Literal(unquoteString($[0]))),
+	Rule([REGEX_LITERAL],						$ => { const m = /^\/(.*)\/([a-zA-Z]*)$/.exec($[0])!; return Literal(new RegExp(m[1], m[2])); }),
+	Rule(['true'], 								_ => Literal(true)),
+	Rule(['false'],								_ => Literal(false)),
+	Rule(['null'],								_ => Literal(null)),
 	array_literal,
 	...(objectLiteral ? [objectLiteral] : []),
-	Rule(['(', expression, ')'], 	$ => $[1]),
+	Rule(['(', expression, ')'], 				$ => $[1]),
 	Rule(['`', template_literal_parts, '`'],	$ => Literal($[1])),
 ];
 export const primary_expression = primaryRules(object_literal);
@@ -660,12 +665,9 @@ export const member_expression = Rules<Expr>(self => [
 	Rule([self, '.', PRIVATE_NAME], 							$ => Member($[0], $[2])),
 	Rule([self, '[', expression, ']'], 							$ => Index($[0], $[2])),
 	Rule(['new', self, ()=>arguments_], 						$ => ({ type: 'new', callee: $[1], arguments: $[2] } as const)),
-	// Dynamic `import(...)`/`import.meta` -- `import` on its own is never a valid expression (only ever
-	// followed by `(` or `.meta`), so these are direct alternatives here rather than going through
-	// `primary_expression`. Reuses the ordinary `Call`/`Member` shapes (with a synthetic `import` identifier
-	// as callee/object) instead of a dedicated AST node, so no downstream consumer (checker/walker/tocode/
-	// transform) needs a new case to avoid crashing on it -- same reasoning as elsewhere in this session for
-	// constructs where full semantic depth isn't the point, just not crashing the parser.
+	// Dynamic `import(...)`/`import.meta` -- `import` on its own is never a valid expression (only ever followed by `(` or `.meta`),
+	// so these are direct alternatives here rather than going through `primary_expression`.
+	// Reuses the ordinary `Call`/`Member` shapes (with a synthetic `import` identifier as callee/object) instead of a dedicated AST node, so no downstream consumer needs a new case to avoid crashing on it
 	Rule(['import', ()=>arguments_], 							$ => Call(Identifier('import'), $[1])),
 	Rule(['import', '.', 'meta'], 								_ => Member(Identifier('import'), 'meta')),
 ]);
@@ -770,7 +772,7 @@ const conditional_expression_noin = Rules(
 // The concise (non-block) form must not start with `{`: real JS always treats `x => { ... }` as a block, never an implicit object-literal return.
 // `_nobrace` avoids the resulting ambiguity with a bare object-literal expression body, same technique `expression_statement` uses.
 export const arrow_body = Rules<Expr | Statement<any>[]>(
-	Rule(['{', function_body, '}'], 					$ => $[1]),
+	Rule(['{', function_body, '}'], 											$ => $[1]),
 	Forward<Expr>(() => assignment_expression_nobrace),
 );
 // A plain, untyped `(a, b)` is genuinely ambiguous between this rule's own `expression`-then-reinterpret path and
@@ -808,10 +810,6 @@ export const assignment_expression_noin = Rules<Expr>(self => [
 	conditional_expression_noin,
 ]);
 
-//const expression = RRules<Expr>(self => [
-//	assignment_expression,
-//	Rule([self, ',', assignment_expression],			$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] } as const))
-//]);
 const expression_noin = Rules<Expr>(self => [
 	assignment_expression_noin,
 	Rule([self, ',', assignment_expression_noin],		$ => ({ type: 'sequence', expressions: $[0].type === 'sequence' ? [...$[0].expressions, $[2]] : [$[0], $[2]] }))
@@ -862,10 +860,10 @@ const logical_or_expression_nobrace			= binaryChainLeft(logical_and_expression_n
 const nullish_expression_nobrace			= binaryChainLeft(logical_or_expression_nobrace,		logical_or_expression,		['??'], 									'nullish');
 const conditional_expression_nobrace = Rules(
 	nullish_expression_nobrace,
-	Rule([nullish_expression_nobrace, '?', fwd_assignment_expression, ':', fwd_assignment_expression], $ => ({ type: 'conditional', test: $[0], consequent: $[2], alternate: $[4] } as const)),
+	Rule([nullish_expression_nobrace, '?', assignment_expression, ':', assignment_expression], $ => ({ type: 'conditional', test: $[0], consequent: $[2], alternate: $[4] } as const)),
 );
 const assignment_expression_nobrace = Rules(
-	Rule([left_hand_side_expression_nobrace, ASSIGN_OP, fwd_assignment_expression], $ => Binary($[1], $[0], $[2])),
+	Rule([left_hand_side_expression_nobrace, ASSIGN_OP, assignment_expression], $ => Binary($[1], $[0], $[2])),
 	conditional_expression_nobrace,
 	arrow_function,
 	yield_expression,
@@ -877,27 +875,22 @@ const expression_nobrace = Rules<Expr>(self => [
 
 // --- Classes ---
 
-// Real TS restricts a decorator's expression to a subset of LeftHandSideExpression (identifier/member/call
-// chains, no `new`/literals) -- accepting the full `left_hand_side_expression` here is deliberately
-// permissive rather than replicating that exact restriction, matching this grammar's usual stance elsewhere.
+// Real TS restricts a decorator's expression to a subset of LeftHandSideExpression (identifier/member/call chains, no `new`/literals)
+// -- accepting the full `left_hand_side_expression` here is deliberately permissive rather than replicating that exact restriction, matching this grammar's usual stance elsewhere.
 export const decorator = Rules<Expr>(
 	Rule(['@', left_hand_side_expression], $ => $[1]),
 );
-// No separator -- stacked decorators (`@a @b class C {}`) are just whitespace/newline-delimited.
-export const decorator_list = Rules<Expr[]>(self => [
-	Rule([decorator],			$ => [$[0]]),
-	Rule([self, decorator],	$ => [...$[0], $[1]]),
-]);
+export const decorator_list = List(decorator);
 
 // A class member's own name, plus optional trailing `?`/`!` -- mirrors `optional_binding_name`, wrapped (not aliased) so pushing `?`/`!` onto this
 // doesn't leak into object-literal property names too. Own extension point so every consumer (methods, get/set, fields) gets it for free.
 export const class_member_name = Rules<KeyMods<any>>(
-	Rule([property_name_computed], $ => ({ key: $[0] } as const)),
+	Rule([property_name_computed],	$ => ({ key: $[0] } as const)),
 	// Widens the existing `class_member_name` alphabet in place, rather than adding a rule that reaches
 	// `class_member_body`/`class_member` from a new position -- that shape (tried for decorators) corrupted
 	// unrelated ASI recovery via LALR state-sharing (see tison_debugging_technique memory, "sixth class").
 	// `key` just carries the `#`-prefixed text verbatim (`"#test"`), no separate AST shape needed for parsing.
-	Rule([PRIVATE_NAME], $ => ({ key: $[0] } as const)),
+	Rule([PRIVATE_NAME],			$ => ({ key: $[0] } as const)),
 );
 
 export const class_member_body = Rules<Method<any> | Field<any>>(
@@ -928,18 +921,18 @@ export const class_body = Rules(
 // The nullable alternative is safe because every class rule routes through this: nothing else can shift `{` in the `class [IDENT] ...` state, so the
 // ε-reduce is the state's only action, leaving the silent-default-shift trap no conflict to resolve. `typeParams`/`implements`: ts-parser.ts pushes `<T>`/`implements`.
 export const class_heritage = Rules<Partial<ClassDecl<any>>>(
-	Rule([],											_ => ({})),
-	Rule(['extends', left_hand_side_expression],		$ => ({ superClass: $[1] } as const)),
+	Rule([],										_ => ({})),
+	Rule(['extends', left_hand_side_expression],	$ => ({ superClass: $[1] } as const)),
 );
 export type ClassExpr<T> = Class<T> & { type: 'class' };
 export const class_expression = Rules(
-	Rule(['class', class_heritage, class_body], 		$ => ({ type: 'class', ...$[1], body: $[2] } as const)),
-	Rule(['class', IDENT, class_heritage, class_body],	$ => ({ type: 'class', name: $[1], ...$[2], body: $[3] } as const)),
-	Rule([decorator_list, Forward<ClassExpr<any>>(() => class_expression)], $ => ({ ...$[1], decorators: $[0] } as ClassExpr<any>)),
+	Rule(['class', class_heritage, class_body], 										$ => ({ type: 'class', ...$[1], body: $[2] } as const)),
+	Rule(['class', IDENT, class_heritage, class_body],									$ => ({ type: 'class', name: $[1], ...$[2], body: $[3] } as const)),
+	Rule([decorator_list, Forward<ClassExpr<any>>(() => class_expression)], 			$ => ({ ...$[1], decorators: $[0] } as ClassExpr<any>)),
 );
 export const class_declaration = Rules<ClassDecl<any>>(
-	Rule(['class', IDENT, class_heritage, class_body],	$ => ({ type: 'class_decl', name: $[1], ...$[2], body: $[3] } as const)),
-	Rule([decorator_list, Forward<ClassDecl<any>>(() => class_declaration)], $ => ({ ...$[1], decorators: $[0] })),
+	Rule(['class', IDENT, class_heritage, class_body],									$ => ({ type: 'class_decl', name: $[1], ...$[2], body: $[3] } as const)),
+	Rule([decorator_list, Forward<ClassDecl<any>>(() => class_declaration)], 			$ => ({ ...$[1], decorators: $[0] })),
 );
 
 // --- Statements ---
@@ -1009,10 +1002,9 @@ const case_clause = Rules<SwitchCase<any>>(
 
 export const catch_ = Rules<{ param?: BindingTarget; body: Statement<any>[] }>(
 	Rule(['catch', '(', optional_binding_name, ')', '{', function_body, '}'],	$ => ({ param: $[2].key, body: $[5] } as const)),
-	// A destructured catch parameter (`catch ({message}) {}`, `catch ([code]) {}`, ES2019+) -- no
-	// `forceFork` needed, same reasoning as `variable_declaration`'s own pattern alternative: `catch`'s `(`
+	// A destructured catch parameter -- no `forceFork` needed, same reasoning as `variable_declaration`'s own pattern alternative: `catch`'s `(`
 	// is never also reachable as a plain expression, so there's no ambiguity to resolve.
-	Rule(['catch', '(', binding_pattern, ')', '{', function_body, '}'],		$ => ({ param: $[2], body: $[5] } as const)),
+	Rule(['catch', '(', binding_pattern, ')', '{', function_body, '}'],			$ => ({ param: $[2], body: $[5] } as const)),
 	Rule(['catch', '{', function_body, '}'],									$ => ({ body: $[2] } as const)),
 );
 const finally_ = Rules(
@@ -1072,9 +1064,9 @@ export const named_imports = Rules(
 	Rule(['{', '}'], 										_ => []),
 	Rule(['{', List(import_specifier, ',', true), '}'], 	$ => $[1]),
 );
-// Import attributes (`import x from "y" with { type: "json" }`, ES2025 -- supersedes the older `assert
-// {...}` form, syntactically identical here so both are accepted under the same `'with'` keyword). Key is
-// `property_name` (IDENT or STR), matching real syntax allowing either `type: "json"` or `"type": "json"`.
+
+// Import attributes (`import x from "y" with { type: "json" }`, ES2025 -- supersedes the older `assert {...}` form,
+// syntactically identical here so both are accepted under the same `'with'` keyword). Key is `property_name` (IDENT or STR), matching real syntax allowing either `type: "json"` or `"type": "json"`.
 const import_attribute = Rules<{ key: string; value: string }>(
 	Rule([property_name, ':', STR], $ => ({ key: $[0], value: unquoteString($[2]) } as const)),
 );
@@ -1083,19 +1075,18 @@ const import_attributes = Rules<{ key: string; value: string }[]>(
 	Rule(['with', '{', List(import_attribute, ',', true), '}'],	$ => $[2]),
 );
 export const import_declaration = Rules<Statement<any>>(
-	Rule([STR, Maybe(import_attributes), ';'], 										$ => ({ type: 'import', source: unquoteString($[0]), attributes: $[1] } as const)),
-	Rule([IDENT, 'from', STR, Maybe(import_attributes), ';'], 						$ => ({ type: 'import', default: $[0], source: unquoteString($[2]), attributes: $[3] } as const)),
+	Rule([STR, Maybe(import_attributes), ';'], 											$ => ({ type: 'import', source: unquoteString($[0]), attributes: $[1] } as const)),
+	Rule([IDENT, 'from', STR, Maybe(import_attributes), ';'], 							$ => ({ type: 'import', default: $[0], source: unquoteString($[2]), attributes: $[3] } as const)),
 	Rule(['*', 'as', IDENT, 'from', STR, Maybe(import_attributes), ';'], 				$ => ({ type: 'import', namespace: $[2], source: unquoteString($[4]), attributes: $[5] } as const)),
-	Rule([named_imports, 'from', STR, Maybe(import_attributes), ';'], 				$ => ({ type: 'import', specifiers: $[0], source: unquoteString($[2]), attributes: $[3] } as const)),
-	Rule([IDENT, ',', named_imports, 'from', STR, Maybe(import_attributes), ';'], 	$ => ({ type: 'import', default: $[0], specifiers: $[2], source: unquoteString($[4]), attributes: $[5] } as const)),
+	Rule([named_imports, 'from', STR, Maybe(import_attributes), ';'], 					$ => ({ type: 'import', specifiers: $[0], source: unquoteString($[2]), attributes: $[3] } as const)),
+	Rule([IDENT, ',', named_imports, 'from', STR, Maybe(import_attributes), ';'], 		$ => ({ type: 'import', default: $[0], specifiers: $[2], source: unquoteString($[4]), attributes: $[5] } as const)),
 	Rule([IDENT, ',', '*', 'as', IDENT, 'from', STR, Maybe(import_attributes), ';'],	$ => ({ type: 'import', default: $[0], namespace: $[4], source: unquoteString($[6]), attributes: $[7] } as const)),
 );
 
 export const export_specifier = Rules(
 	Rule([IDENT],											$ => ({ local: $[0], exported: $[0] } as const)),
 	Rule([IDENT, 'as', IDENT],								$ => ({ local: $[0], exported: $[2] } as const)),
-	// Same arbitrary module namespace identifier names feature as `import_specifier` above, mirrored --
-	// here the string is the *external* (exported) name instead.
+	// Same arbitrary module namespace identifier names feature as `import_specifier` above, mirrored -- here the string is the *external* (exported) name instead.
 	Rule([IDENT, 'as', STR],								$ => ({ local: $[0], exported: unquoteString($[2]) } as const)),
 );
 export const named_exports = Rules(
@@ -1116,31 +1107,24 @@ export const export_declaration = Rules<Statement<any>>(
 );
 
 export const module_item = Rules(
-	Rule(['import', import_declaration],		$ => $[1]),
-	Rule([EXPORT_KW, export_declaration],		$ => $[1]),
+	Rule(['import', import_declaration],			$ => $[1]),
+	Rule([EXPORT_KW, export_declaration],			$ => $[1]),
 	statement,
-	// A bare `import(...)` *statement* (no assignment/await/chaining) specifically at module top level --
-	// a real LALR "missing transition" (confirmed via `tables.conflicts` being empty for the state reached
-	// after shifting `import` from state 0, see tison_debugging_technique memory "fourth class"), not a
-	// resolvable conflict. `import(...)` already works everywhere else (assigned, awaited, inside a block,
-	// chained with `.then()`) via `statement`'s own `expression_nobrace` path -- this state alone, sharing
-	// its position with this array's own direct `'import' import_declaration` rule above, doesn't merge in
-	// those items. Narrow fix, narrow gap: no further chaining support for a *bare* top-level `import(...)`
-	// statement specifically (real code overwhelmingly assigns/awaits/chains it, all of which already work).
-	Rule(['import', ()=>arguments_, ';'],		$ => ({ type: 'expression', expression: Call(Identifier('import'), $[1]) } as const)),
+	// A bare `import(...)` *statement* (no assignment/await/chaining) specifically at module top level -- a real LALR "missing transition" not a resolvable conflict.
+	// `import(...)` already works everywhere else -- this state alone, sharing its position with this array's own direct `'import' import_declaration` rule above, doesn't merge in those items.
+	// Narrow fix, narrow gap: no further chaining support for a *bare* top-level `import(...)` statement specifically (real code overwhelmingly assigns/awaits/chains it, all of which already work).
+	Rule(['import', ()=>arguments_, ';'],			$ => ({ type: 'expression', expression: Call(Identifier('import'), $[1]) } as const)),
 	Rule([decorator_list, EXPORT_KW, export_declaration], $ => {
-		const decl = $[2] as Export<any> | ExportDecl<any>;
-		if (decl.type === 'export_decl' && decl.declaration.type === 'class_decl')
-			return { ...decl, declaration: { ...decl.declaration, decorators: $[0] } };
-		if (decl.type === 'export' && decl.default && typeof decl.default === 'object' && decl.default.type === 'class_decl')
-			return { ...decl, default: { ...decl.default, decorators: $[0] } };
-		return decl;
+		const decl = $[2];
+		return	decl.type === 'export_decl' && decl.declaration.type === 'class_decl' ? { ...decl, declaration: { ...decl.declaration, decorators: $[0] } }
+			:	decl.type === 'export' && decl.default && typeof decl.default === 'object' && decl.default.type === 'class_decl' ? { ...decl, default: { ...decl.default, decorators: $[0] } }
+			:	decl;
 	}),
 );
 
 export const program = Rules<Program<any>>(
-	Rule([],									_ => ({ type: 'program', body: [] })),
-	Rule([List(module_item)],					$ => ({ type: 'program', body: $[0] })),
+	Rule([],										_ => ({ type: 'program', body: [] })),
+	Rule([List(module_item)],						$ => ({ type: 'program', body: $[0] })),
 );
 
 // ===================================================================
@@ -1152,14 +1136,11 @@ export const program = Rules<Program<any>>(
 export const skip = [WS, /\/\/[^\n]*\n?/, /\/\*[^]*?\*\//, /^#![^\n]*\n?/];
 
 // --- Member/parameter decorators, via Manual()+parsePrefix() ---
-// Both need a rule that reaches `class_member_body`/`parameter` from a new grammar position to attach to --
-// exactly the shape that corrupts unrelated ASI recovery via LALR state-sharing when done directly (see
-// tison_debugging_technique memory "sixth class"). `Manual()` sidesteps this: each decorated alternative below
-// is a single, brand-new terminal in the *main* grammar that nothing else references, so it can't collide
-// with anything -- its callback hand-scans the `@decorator...` prefix via a small standalone sub-parser
-// rooted at `decorator_list`, then finishes the rest via another sub-parser rooted at the relevant
-// nonterminal's own (undecorated) rules, both built once here, entirely outside the main automaton. See
-// tison_manual_terminal_primitive memory for the general mechanism and how it was verified in isolation.
+// Both need a rule that reaches `class_member_body`/`parameter` from a new grammar position to attach to -- exactly the shape that corrupts unrelated ASI recovery via LALR state-sharing when done directly.
+// `Manual()` sidesteps this: each decorated alternative below is a single, brand-new terminal in the *main* grammar that nothing else references, so it can't collide with anything
+// -- its callback hand-scans the `@decorator...` prefix via a small standalone sub-parser rooted at `decorator_list`, then finishes the rest via another sub-parser rooted at the relevant
+// nonterminal's own (undecorated) rules, both built once here, entirely outside the main automaton.
+// See tison_manual_terminal_primitive memory for the general mechanism and how it was verified in isolation.
 //
 // All three are built *lazily* (on first real parse, not at module load) -- `ts-parser.ts` extends
 // `decorator`/`class_member`/`parameter` (typed fields, typed params, `as`/`satisfies`, call-generics, ...)
@@ -1171,9 +1152,8 @@ export const skip = [WS, /\/\/[^\n]*\n?/, /\/\*[^]*?\*\//, /^#![^\n]*\n?/];
 // invisible to every earlier canary test, only surfacing once real annotated TS code hit the parser).
 function lazyParser<T>(start: () => Rules<T>, skip: TermLike[]): Parser<T> {
 	let built: Parser<T> | undefined;
-	// `recover`/`merge` are declared later in this module (line ~1200+) but only read here inside `get`,
-	// which never runs until the first real `.parse`/`.parsePrefix` call -- well after module load finishes,
-	// so the forward reference is safe. Without them, ASI silently didn't work inside e.g. a decorated class
+	// `recover`/`merge` are declared later in this module (line ~1200+) but only read here inside `get`, which never runs until the first real `.parse`/`.parsePrefix` call
+	// -- well after module load finishes, so the forward reference is safe. Without them, ASI silently didn't work inside e.g. a decorated class
 	// member (`class C { @dec y: any }`, no trailing `;`, as the class body's last member) -- this sub-parser
 	// has no recovery callback at all, so it required an explicit terminator the outer parser never needs.
 	const get = () => built ??= makeParser({ start: start(), skip, recover, merge });
@@ -1216,14 +1196,12 @@ export const recover: RecoveryCallback = (lex, row) => {
 	// (`lex.token.name === '}'`), or `}` isn't even a candidate this state's lexer tries at all, so it comes
 	// back as `$error` instead -- an ERROR token never advances the stream, so `lex.remaining` (unlike for a
 	// real, already-consumed failing token) still starts with the literal `}` in that case.
-	if (!(
-		(lex.prev && lex.prev.pos && lex.line > lex.prev.pos.line)
+	if ((lex.prev && lex.prev.pos && lex.line > lex.prev.pos.line)
 		|| lex.token.name === '}'
 		|| (lex.token.name === '$error' && lex.remaining.startsWith('}'))
 		|| !lex.remaining
-	))
-		return undefined;
-	return [...row.keys()].find(t => t.name === ';');
+	)
+		return [...row.keys()].find(t => t.name === ';');
 };
 export const merge: MergeValues = left => left;
 

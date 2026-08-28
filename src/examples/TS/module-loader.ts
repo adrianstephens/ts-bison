@@ -2,7 +2,7 @@ import * as TS from './ts-parser';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-export const ModuleOptionsDefault = {
+export const OptionsDefault = {
 	allowArbitraryExtensions:				false,
 	allowImportingTsExtensions:				false,
 	allowUmdGlobalAccess:					false,
@@ -240,9 +240,11 @@ class NodeModules {
 // ===================================================================
 
 export class ModuleLoader {
+	opts = OptionsDefault;
 	imported = new Map<string, Promise<LoadedModule|undefined>>;
 
-	constructor(public root: string, public opts: typeof ModuleOptionsDefault, restrictTypes?: string[]) {
+	constructor(public root: string, opts: Partial<typeof OptionsDefault>, restrictTypes?: string[]) {
+		this.opts = {...this.opts, ...opts};
 		NodeModules.get(root, restrictTypes);
 	}
 

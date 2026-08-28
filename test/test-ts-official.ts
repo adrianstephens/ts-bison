@@ -1,11 +1,13 @@
 import * as JSX from '../src/examples/TS/jsx-parser';
 import * as TS from '../src/examples/TS/ts-parser';
-import { TStypeCheckAsync, FixOptions, applyPragmas } from '../src/examples/TS/transform';
+import * as T from '../src/examples/TS/type-utils';
+import { SEVERITY, checkBlock } from '../src/examples/TS/checker';
+
+import { TStypeCheckAsync } from '../src/examples/TS/transform';
 import { ModuleLoader } from '../src/examples/TS/module-loader';
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { SEVERITY } from '../src/examples/TS/checker';
 
 // Official TypeScript compiler test suite, checked out separately on this machine.
 const TS_REPO = '/Volumes/DevSSD/dev/github/TypeScript';
@@ -13,6 +15,14 @@ const TS_REPO = '/Volumes/DevSSD/dev/github/TypeScript';
 const parser = TS.make();
 JSX.add();
 const parserX = TS.make();
+
+const lib = (async () => {
+	const global	= T.makeGlobal();
+	const loader	= new ModuleLoader(__dirname, {});
+	const lib		= await loader.get('typescript/lib/lib.esnext.full', '.');
+	checkBlock(lib!.body, global);
+	return global;
+})();
 
 const total_sev = [] as number[];
 let failed = 0, tested = 0;
@@ -57,13 +67,10 @@ async function testFile(filename: string) {
 
 		tested++;
 		try {
-			const options	= FixOptions({target: 'esnext'});
-			applyPragmas(virtual.content, options);
-			const loader	= new ModuleLoader(path.dirname(filename), options);
-
+			const loader	= new ModuleLoader(path.dirname(filename), {});
 			const useParser	= virtual.name.endsWith('.tsx') ? parserX : parser;
 			const program	= useParser.parse(virtual.content);
-			const diags		= await TStypeCheckAsync(program, loader, options);
+			const diags		= await TStypeCheckAsync(program, loader, await lib);
 
 			for (const d of diags) {
 				total_sev[d.severity] ??= 0;

@@ -852,11 +852,12 @@ function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: Te
 interface StackEntry { state: number; value: unknown; }
 type InternalRecoveryCallback = (stream: Lexer, row: Map<Terminal, ActionEntry>, failing: Terminal) => Token | undefined;
 
-// Thrown by `runParser` in `prefixMode` when the stack has already fully reduced to `start` (the current
-// state would accept a real `$end` right now) but the actual lookahead is something else -- i.e. a
-// hand-parsed "island" (see `Manual()`) asked a sub-parser to consume just a bounded prefix of a larger
+// Thrown by `runParser` in `prefixMode` when the stack has already fully reduced to `start` (the current state would accept a real `$end` right now)
+// but the actual lookahead is something else -- i.e. a hand-parsed "island" (see `Manual()`) asked a sub-parser to consume just a bounded prefix of a larger
 // string, and it found exactly one. Caught by `runParserPrefix`, never meant to escape it.
-class PrefixAccepted { constructor(public value: unknown, public consumed: number) {} }
+class PrefixAccepted {
+	constructor(public value: unknown, public consumed: number) {}
+}
 
 function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any, prefixMode?: boolean) {
 	const stack: StackEntry[] = [{ state: 0, value: undefined }];
@@ -944,20 +945,6 @@ function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: Intern
 			// 'error' is filtered out above; 'ignore' tokens are never returned by the lexer.
 			throw new Error(`Internal error: unexpected action kind '${entry.kind}'`);
 		}
-	}
-}
-
-// Parses as much of `stream` as forms one complete `start` derivation, then stops -- instead of requiring
-// the rest of `stream` to be consumed too. Doesn't handle a GLR fork needed at exactly the acceptance
-// boundary (a fork resolving *inside* the derivation is fine, since that returns normally either way).
-function runParserPrefix(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any): { value: any; consumed: number } {
-	try {
-		const value = runParser(tables, stream, ctx, recover, merge, forkCtx, true);
-		return { value, consumed: stream.offset };
-	} catch (e) {
-		if (e instanceof PrefixAccepted)
-			return { value: e.value, consumed: e.consumed };
-		throw e;
 	}
 }
 
@@ -1119,7 +1106,7 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 
 		// Settled back down to a single derivation -- hand it back to runParser's fast loop
 		if (active.size === 1) {
-			const winner = active.values().next().value!;
+			const [winner] = active.values();
 			const frames: StackEntry[] = [];
 			for (let frame: StackFrame | null = winner; frame; frame = frame.parent)
 				frames.push({ state: frame.state, value: frame.value });
@@ -1303,7 +1290,7 @@ export function serializeTables(g: GrammarBuilder, tables: ParseTables): Seriali
 				else
 					counts.set(key, { entry, count: 1 });
 			}
-			let best = counts.values().next().value!;
+			let [best] = counts.values();
 			for (const c of counts.values()) {
 				if (c.count > best.count)
 					best = c;
@@ -1436,6 +1423,15 @@ export function makeParser<T>(spec: GrammarSpec<T>, prebuilt?: { g: GrammarBuild
 	return {
 		tables,
 		parse: (input, ctx) => runParser(tables, makeLexer(input, ctx), ctx, recover, merge, forkCtx),
-		parsePrefix: (input, ctx) => runParserPrefix(tables, makeLexer(input, ctx), ctx, recover, merge, forkCtx),
+		parsePrefix: (input, ctx) => {
+			try {
+				const stream = makeLexer(input, ctx);
+				return { value: runParser(tables, stream, ctx, recover, merge, forkCtx, true), consumed: stream.offset };
+			} catch (e) {
+				if (e instanceof PrefixAccepted)
+					return { value: e.value, consumed: e.consumed };
+				throw e;
+			}
+		}
 	};
 }

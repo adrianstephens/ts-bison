@@ -4,8 +4,9 @@ import os from 'os';
 import path from 'path';
 import v8 from 'v8';
 import * as TS from '../src/examples/TS/ts-parser';
+import * as T from '../src/examples/TS/type-utils';
 import { TStoWasm, makeLibScope } from '../src/examples/TS/towasm';
-import { TStypeCheck, TStypeCheckAsync, FixOptions } from '../src/examples/TS/transform';
+import { TStypeCheck, TStypeCheckAsync } from '../src/examples/TS/transform';
 import { ModuleLoader, collectModules } from '../src/examples/TS/module-loader';
 import { SEVERITY } from '../src/examples/TS/checker';
 
@@ -64,11 +65,12 @@ async function compileMulti(files: Record<string, string>, entry: string) {
 		for (const [name, src] of Object.entries(files))
 			await fs.writeFile(path.join(dir, name + '.ts'), src);
 
-		const options		= FixOptions({ target: 'es2022' });
-		const loader		= new ModuleLoader(dir, options);
+		//const global	= libScope ? new Scope(libScope) : await getLibScope(loader, options);
+		
+		const loader		= new ModuleLoader(dir, {});
 		const entrySrc		= await fs.readFile(path.join(dir, entry + '.ts'), 'utf8');
 		const program		= parser.parse(entrySrc);
-		const diagnostics	= await TStypeCheckAsync(program, loader, options, libScope);
+		const diagnostics	= await TStypeCheckAsync(program, loader, new T.Scope(libScope));
 		const errors		= diagnostics.filter(d => d.severity === SEVERITY.ERROR);
 		if (errors.length)
 			throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
@@ -612,7 +614,7 @@ async function main() {
 			const b: number[] = [1, ...(a as unknown as number[])];
 			return b.length;
 		}
-	`), /towasm/);
+	`), /tsw/);
 
 	{
 		// Array destructuring (var_decl + function params): plain positional binding, a hole, and a
@@ -776,7 +778,7 @@ async function main() {
 			}
 		}
 		export function f(): number { return new Outer(1).n; }
-	`), /towasm/);
+	`), /tsw/);
 
 	await checkThrows('a compound assignment to an unset object-typed-sibling field is rejected', () => compile(`
 		class Inner { v: number; constructor() { this.v = 0; } }
@@ -788,7 +790,7 @@ async function main() {
 			}
 		}
 		export function f(): number { return new Outer(1).n; }
-	`), /towasm/);
+	`), /tsw/);
 
 	await checkThrows("calling a method on 'this' before every object-typed field is assigned is rejected", () => compile(`
 		class Inner { v: number; constructor() { this.v = 0; } }
@@ -1187,7 +1189,7 @@ async function main() {
 			const q = p ?? new Point(2);
 			return q.x;
 		}
-	`), /towasm/);
+	`), /tsw/);
 
 	{
 		// number[]: literal, indexing, .length, classic `for`
@@ -2022,14 +2024,14 @@ async function main() {
 			const b: number[] = a.slice(1, 2, 3);
 			return b.length;
 		}
-	`), /towasm/);
+	`), /tsw/);
 
 	await checkThrows("indexOf() with wrong arg count is rejected", () => compile(`
 		export function f(): number {
 			const a: number[] = [1, 2, 3];
 			return a.indexOf();
 		}
-	`), /towasm/);
+	`), /tsw/);
 
 	{
 		// `void` functions/methods: side-effecting via a param, an implicit (no-annotation) void
@@ -2131,7 +2133,7 @@ async function main() {
 
 	await checkThrows('an unresolvable explicit return type still throws (not silently void)', () => compile(`
 		export function f(): NotARealType { return 1; }
-	`), /towasm/);
+	`), /tsw/);
 
 	{
 		// a genuine TS type error should be caught by `TStypeCheck` up front, before `TStoWasm` ever runs
@@ -3556,7 +3558,7 @@ async function main() {
 				const p = { x: 1, y: 2 };
 				return 0;
 			}
-		`), /towasm/);
+		`), /tsw/);
 	}
 
 	{

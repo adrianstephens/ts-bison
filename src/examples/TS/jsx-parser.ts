@@ -1,11 +1,20 @@
 import { Rules, Forward, MaybeList, terminal, ForceFork } from '../../tison';
 import * as JS from './js-parser';
 import { Literal, Identifier } from '../common';
-import { CompilerOptions1 } from './transform';
 import { walk } from './walker';
 
 const Rule = JS.Rule;
 const IDENT = JS.IDENT;
+
+type JSX = 'preserve' | 'react-jsx' | 'react-jsxdev'	| 'automatic' | 'react' | 'classic';
+
+export const OptionsDefault = {
+	jsx:				'preserve' satisfies JSX,
+	jsxFactory:			'React.createElement',
+	jsxFragmentFactory:	'React.Fragment',
+	jsxImportSource:	'react',
+};
+
 // ===================================================================
 //  JSX Parser -- an extension of js-parser, composable with ts-parser
 // ===================================================================
@@ -27,16 +36,15 @@ const IDENT = JS.IDENT;
 //  AST
 // ===================================================================
 
-export interface Attribute<T>	{ name?: string; value?: Expr<T> }
-export function  Attribute<T>(name: string, value?: Expr<T>): Attribute<T>	{ return { name, value }; }
-export function  SpreadAttribute<T>(value?: Expr<T>): Attribute<T>			{ return { value }; }
+type Attribute<T>	= JS.Attribute<T>
+type Element<T>		= JS.Element<T>
 
-export interface Element<T>		{ type: 'jsx'; name: string; attributes: Attribute<T>[]; children: Expr<T>[] }
-export function  Element<T>(name: string, attributes: Attribute<T>[], children: Expr<T>[]): Element<T> {
+export function  Attribute<T>(name: string, value?: JS.Expr<T>): Attribute<T>	{ return { name, value }; }
+export function  SpreadAttribute<T>(value?: JS.Expr<T>): Attribute<T>			{ return { value }; }
+
+export function  Element<T>(name: string, attributes: Attribute<T>[], children: JS.Expr<T>[]): Element<T> {
 	return { type: 'jsx', name, attributes, children };
 }
-
-export type Expr<T = any> = JS.Expr<T> | Element<T>;
 
 // ===================================================================
 //  terminals
@@ -93,10 +101,10 @@ const jsx_attribute_name = Rules<string>(
 
 // Reuses js-parser.ts's own `assignment_expression` array directly (not a copy) -- if ts-parser.ts is also
 // loaded, its own pushes onto that same array (`as`/`satisfies`/generic instantiation, etc.) apply here too.
-const assignment_expression = JS.assignment_expression as Rules<Expr<any>>;
+const assignment_expression = JS.assignment_expression as Rules<JS.Expr<any>>;
 const fwd_jsx_element = Forward<Element<any>>(() => jsx);
 
-const jsx_attribute_value = Rules<Expr<any>>(
+const jsx_attribute_value = Rules<JS.Expr<any>>(
 	Rule([JSX_STR],							$ => Literal($[0].slice(1, -1))),
 	Rule(['{', assignment_expression, '}'],	$ => $[1]),
 	fwd_jsx_element,
@@ -109,7 +117,7 @@ const jsx_attribute = Rules<Attribute<any>>(
 );
 const jsx_attributes = MaybeList(jsx_attribute);
 
-const jsx_child = Rules<Expr<any>>(
+const jsx_child = Rules<JS.Expr<any>>(
 	Rule([JSX_TEXT],						$ => Literal($[0])),
 	Rule(['{', '}'],						_ => Literal(null)),
 	Rule(['{', assignment_expression, '}'],	$ => $[1]),
@@ -119,14 +127,14 @@ const jsx_child = Rules<Expr<any>>(
 // `jsx` is reachable as a nested child, an attribute value, and a bare top-level expression; LALR computes
 // lookaheads per automaton state, not per call site, so nested-child-only lookaheads leak into the top-level completion state too.
 
-function makeElement<T>(jsx_child: Rules<Expr<T>>) {
+function makeElement<T>(jsx_child: Rules<JS.Expr<T>>) {
 	const opening_element = Rules(
 		Rule(['<', jsx_element_name, jsx_attributes, '>'],		$ => ({ name: $[1], attributes: $[2] } as const)),
 	);
 	const closing_element = Rules(
 		Rule(['<', '/', jsx_element_name, '>'],					$ => $[2]),
 	);
-	const children = Rules<Expr<T>[]>(self => [
+	const children = Rules<JS.Expr<T>[]>(self => [
 		ForceFork(Rule([], 										_ => [])),
 		Rule([jsx_child],										$ => [$[0]]),
 		Rule([self, jsx_child],									$ => [...$[0], $[1]]),
@@ -190,7 +198,7 @@ function attrToFields(attr: Attribute<any>[]) {
 
 // Lowers JSX to the same calls real tsc's transform emits -- `jsx`/`jsxs` (automatic) or `factory` (classic) --
 // and, for automatic, prepends the implicit `jsx-runtime` import tsc synthesizes per file.
-export function lower(program: JS.Program, options: CompilerOptions1) {
+export function lower(program: JS.Program, options: typeof OptionsDefault) {
 	const lower: ((jsx: Element<any>)=>JS.Expr) | undefined = 
 		options.jsx === 'react-jsx' || options.jsx === 'react-jsxdev' ? jsx => {
 			const props = attrToFields(jsx.attributes);

@@ -12,11 +12,24 @@ export function  Unary<E, const O>(operator: O, operand: E): Unary<E, O> { retur
 export interface UnaryPost<E, O>	{ type: 'unary_post'; operator: O, operand: E }
 export function  UnaryPost<E, const O>(operator: O, operand: E): UnaryPost<E, O> { return { type: 'unary_post', operator, operand}; }
 
-export interface Binary<E, O> { type: 'binary'; operator: O; left: E; right: E }
+export interface Binary<E, O>       { type: 'binary'; operator: O; left: E; right: E }
 export function  Binary<E, const O>(operator: O, left: E, right: E): Binary<E, O> { return { type: 'binary', operator, left, right}; }
 
 
+export function hasMod(e: {modifiers?: string[]}, m: string) {
+    return e.modifiers?.includes(m) ?? false;
+}
+export function addMod(e: {modifiers?: string[]}, m: string) {
+    if (!e.modifiers?.includes(m))
+        (e.modifiers ??= []).push(m);
+}
+export function dropMod(e: {modifiers?: string[]}, m: string) {
+    if (e.modifiers?.includes(m))
+        e.modifiers = e.modifiers.filter(i => i != m);
+}
 export function mergeMods(a?: string[], b?: string[]): string[] | undefined {
     if (a || b)
         return [...(a ?? []), ...(b ?? [])];
 }
+
+export function  withDefault<T extends {default?: U}, U>(p: T, def: U) { p.default = def; return p; }

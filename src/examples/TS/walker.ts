@@ -1,9 +1,6 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import { Literal } from '../common';
-import { Expr } from './jsx-parser';
-import { BindingTarget, Key, Rest } from './js-parser';
-import { Type } from './ts-parser';
 
 // ===================================================================
 //  Type Guards
@@ -25,12 +22,70 @@ export const isType = (node: any): node is Type => typeTags(node) && !('properti
 export const isTsDeclaration	= guard<TS.Declaration>(['type_alias_decl', 'interface_decl', 'enum_decl', 'namespace_decl']);
 export const isJsStatement		= guard<JS.Statement<any>>(stmts);
 
-export function hasMod(e: {modifiers?: string[]}, m: string) {
-	return e.modifiers?.includes(m) ?? false;
+type Type		= TS.Type;
+type Expr		= TS.Expr;
+type Statement	= TS.Statement;
+export type Walkable = TS.Program | TS.Statement | Expr | Type | Statement[];
+
+//-----------------------------------------------------------------------------
+// Constant folding
+//-----------------------------------------------------------------------------
+
+export function calcUnary(op: JS.unaryOps, x: any) {
+	switch (op) {
+		case '!':	return !x;
+		case '+':	return +x;
+		case '~':	return ~x;
+		case '-':	return -x;
+	}
 }
-export function dropMod(e: {modifiers?: string[]}, m: string) {
-	if (e.modifiers?.includes(m))
-		e.modifiers = e.modifiers.filter(i => i != m);
+
+export function calcBinary(op: JS.binaryOps, a: any, b: any) {
+	switch (op) {
+		case '&&':	return a && b;
+		case '||':	return a || b;
+		case '??':	return a ?? b;
+		case '!=':	return a != b;
+		case '!==':	return a !== b;
+		case '==':	return a == b;
+		case '===':	return a === b;
+		case '<':	return a < b;
+		case '<=':	return a <= b;
+		case '>':	return a > b;
+		case '>=':	return a >= b;
+	}
+	if (typeof a === 'number' && typeof b === 'number') {
+		switch (op) {
+			case '+':	return a + b;
+			case '-':	return a - b;
+			case '*':	return a * b;
+			case '/':	return a / b;
+			case '%':	return a % b;
+			case '&':	return a & b;
+			case '|':	return a | b;
+			case '^':	return a ^ b;
+			case '<<':	return a << b;
+			case '>>':	return a >> b;
+			case '>>>':	return a >>> b;
+			case '**':	return a ** b;
+		}
+	} else if (typeof a === 'bigint' && typeof b === 'bigint') {
+		switch (op) {
+			case '+':	return a + b;
+			case '-':	return a - b;
+			case '*':	return a * b;
+			case '/':	return a / b;
+			case '%':	return a % b;
+			case '&':	return a & b;
+			case '|':	return a | b;
+			case '^':	return a ^ b;
+			case '<<':	return a << b;
+			case '>>':	return a >> b;
+			case '**':	return a ** b;
+		}
+	} else if (op === '+' && (typeof a === 'string' || typeof b === 'string')) {
+		return a + b;
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -94,10 +149,11 @@ function mapObject<N extends Record<string, any>>(node: N, fields: NodeMap<N>): 
 				delete r[k];
 		}
 	}
+	const pos = (node as any).pos;
+	if (pos)
+		Object.defineProperty(r, 'pos', {value: pos, enumerable: false, configurable: true, writable: false });
 	return r;
 }
-
-export type Walkable = TS.Program | TS.Statement | Expr | Type | TS.Statement[];
 
 export function walk<T extends Walkable>(ast: T,
 	onStatement?:	OnAST<TS.Statement>,
@@ -110,10 +166,10 @@ export function walk<T extends Walkable>(ast: T,
 	const mapStatementC	= (stmt: TS.Statement) => mapStatement(stmt) as JS.Statement<any> | undefined;
 	const mapTypeU		= (type: any): any => mapType(type as Type);
 
-	const mapKey = (key: Key): Key =>
+	const mapKey = (key: JS.Key): JS.Key =>
 		typeof key === 'string' ? key : { computed: mapExpressionA(key.computed) };
 
-	const mapBindingTarget = (t: BindingTarget): BindingTarget => {
+	const mapBindingTarget = (t: JS.BindingTarget): JS.BindingTarget => {
 		if (typeof t === 'string')
 			return t;
 		if (t.type === 'object_pattern')
@@ -139,7 +195,7 @@ export function walk<T extends Walkable>(ast: T,
 			default:		mapExpression,
 			typeAnnotation:	mapType
 		})),
-		rest:			(rest: Rest<Type>): Rest<Type> =>	({key: rest.key, typeAnnotation: mapType(rest.typeAnnotation)}),
+		rest:			(rest: JS.Rest<Type>): JS.Rest<Type> =>	({key: rest.key, typeAnnotation: mapType(rest.typeAnnotation)}),
 		typeParams:		mapArrayA(mapTypeParam),
 		returnType:		(t: Type) => mapType(t),
 	};
@@ -149,7 +205,7 @@ export function walk<T extends Walkable>(ast: T,
 			default:		mapExpression,
 			typeAnnotation:	mapTypeU
 		})),
-		rest:			(rest: Rest<any>): Rest<any> =>	({key: rest.key, typeAnnotation: mapTypeU(rest.typeAnnotation)}),
+		rest:			(rest: JS.Rest<any>): JS.Rest<any> =>	({key: rest.key, typeAnnotation: mapTypeU(rest.typeAnnotation)}),
 		typeParams:		mapArrayA(mapTypeParamU),
 		returnType:		mapTypeU,
 	};
@@ -256,7 +312,7 @@ export function walk<T extends Walkable>(ast: T,
 		}
 	};
 
-	const expression = (expr: Expr): Expr => {
+	const expression = (expr: JS.Expr): JS.Expr => {
 		switch (expr.type) {
 			case 'literal':		return mapObject(expr, {
 				value: v => Array.isArray(v) ? v.map(p => p.exp ? mapObject(p, {exp: mapExpression}) : p) : v
@@ -313,7 +369,7 @@ export function walk<T extends Walkable>(ast: T,
 				body:		mapArrayA(mapClassMemberU),
 				typeParams:	mapArray(mapTypeParamU),
 				implements: mapArray(mapTypeU)
-			}) as Expr;
+			}) as JS.Expr;
 			case 'instantiation':	return mapObject(expr, {
 				expression: mapExpressionA,
 				typeArgs:	mapArray(mapTypeU)
@@ -462,16 +518,6 @@ export function walk<T extends Walkable>(ast: T,
 // walkB
 //-----------------------------------------------------------------------------
 
-// A boolean-returning walk -- every list of siblings a node is composed from (a block's
-// statements, an `if`'s branches, etc) is combined with `.some()`, so a hook returning `true`
-// doesn't just stop the current subtree, it short-circuits traversal of *every remaining sibling
-// at every enclosing level too*. That's exactly right for an existence query ("does this
-// expression reference name X anywhere?" -- see e.g. `exprMentionsName`/`towasm.ts`'s named-
-// function self-reference check: found it, stop looking). It's wrong for a "visit everything,
-// accumulate side effects" walk -- a hook built for that must never intentionally return `true`
-// as a signal (only ever relay `process(x)`'s own result, or `false` to skip a subtree, same as
-// `ownBoundNames`/`collectFreeVars` in towasm.ts already do), or it will silently skip later
-// siblings it should have visited.
 type ProcessB<U>	= <T extends U>(x?: T, recall?: boolean)=>boolean;
 type RecurseB		= (x: Walkable) => boolean;
 type OnASTB<U>		= (x: U, process: ProcessB<U>, recurse: RecurseB) => boolean;
@@ -488,14 +534,14 @@ function makeProcessB<U>(parts: (x: U) => boolean, on: OnASTB<U> | undefined, re
 
 export function walkB<T extends Walkable>(ast: T,
 	onStatement?:	OnASTB<TS.Statement>,
-	onExpression?:	OnASTB<Expr>,
+	onExpression?:	OnASTB<JS.Expr>,
 	onType?:		OnASTB<Type>,
 	onTypeMember?:	OnASTB<TS.TypeMember|TS.ClassMember>,
 ): boolean {
 
-	const walkKey = (key: Key) => typeof key !== 'string' && walkExpression(key.computed);
+	const walkKey = (key: JS.Key) => typeof key !== 'string' && walkExpression(key.computed);
 
-	const walkBindingTarget = (t: BindingTarget): boolean => {
+	const walkBindingTarget = (t: JS.BindingTarget): boolean => {
 		return typeof t === 'string' ? false
 			: t.type === 'object_pattern'
 			? t.properties.some(p => walkBindingTarget(p.value) || walkExpression(p.default))
@@ -569,7 +615,7 @@ export function walkB<T extends Walkable>(ast: T,
 		}
 	};
 	
-	const expression = (e: Expr): boolean => {
+	const expression = (e: JS.Expr): boolean => {
 		switch (e.type) {
 			case 'literal':				return Array.isArray(e.value) && e.value.some(i => i.exp && walkExpression(i.exp));
 			case 'array':				return e.elements.some(walkExpression);
@@ -619,7 +665,7 @@ export function walkB<T extends Walkable>(ast: T,
 				|| stmt.cases.some(c => walkExpression(c.test) || c.consequent.some(walkStatement));
 			case 'try':					return stmt.block.some(walkStatement) || !!stmt.handlerBody?.some(walkStatement) || !!stmt.finalizer?.some(walkStatement);
 			case 'function_decl':		return walkSig(stmt) || !!stmt.body?.some(walkStatementU);
-			case 'export':				return !!stmt.default && (isJsStatement(stmt.default) ? walkStatement(stmt.default) : walkExpression(stmt.default as Expr));
+			case 'export':				return !!stmt.default && (isJsStatement(stmt.default) ? walkStatement(stmt.default) : walkExpression(stmt.default as JS.Expr));
 			case 'export_decl':			return walkStatement(stmt.declaration);
 			case 'class_decl':			return walkExpression(stmt.superClass)
 				|| (stmt.body as TS.ClassMember[]).some(walkClassMember)

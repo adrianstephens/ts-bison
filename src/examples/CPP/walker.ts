@@ -43,14 +43,6 @@ export const isClassMember		= guard<ClassMember>(classMemberTags);
 export const isDeclarator		= guard<Declarator | AbstractDeclarator>(declaratorTags);
 export const isPackParameter	= (p: ParamDecl): p is CPP.PackParameter => !!packParamTags.includes(p.type) && 'pack' in p && !!p.pack;
 
-export function hasMod(e: {modifiers?: string[]}, m: string) {
-	return e.modifiers?.includes(m) ?? false;
-}
-export function dropMod(e: {modifiers?: string[]}, m: string) {
-	if (e.modifiers?.includes(m))
-		e.modifiers = e.modifiers.filter(i => i != m);
-}
-
 //-----------------------------------------------------------------------------
 // walk
 //-----------------------------------------------------------------------------

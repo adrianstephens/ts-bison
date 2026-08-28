@@ -67,6 +67,10 @@ interface BigInt {}
 interface Object {}
 declare var Object: {
 	entries<T>(x: T): [string, any][];
+	values<T>(x: T): any[];
+	keys<T>(x: T): string[];
+	is<A, B>(a: A, b: B): boolean;
+	assign<T>(target: T, ...sources: any[]): T;
 };
 
 //-----------------------------------------------------------------------------

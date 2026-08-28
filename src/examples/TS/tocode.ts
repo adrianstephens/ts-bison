@@ -1,7 +1,7 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
-import { Literal } from '../common';
-import { isProgram, isType, isJsStatement, guard, hasMod, isTsDeclaration } from './walker';
+import { Literal, hasMod } from '../common';
+import { isProgram, isType, isJsStatement, guard, isTsDeclaration } from './walker';
 
 type Type	= TS.Type;
 type Expr	= JS.Expr;
@@ -135,7 +135,9 @@ export class Output {
 		this.comma		= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: JS.Program<unknown> | TS.Program | TS.Statement | Type | Expr) {
+	toCode(ast: JS.Program<unknown> | TS.Program | TS.Statement | Type | Expr | TS.Statement[]) {
+		if (Array.isArray(ast))
+			return ast.map(s => this.statement(s)).join(this.opts.newline);
 		if (isProgram(ast))
 			return ast.body.map(s => this.statement(s as TS.Statement)).join(this.opts.newline);
 		if (isType(ast))

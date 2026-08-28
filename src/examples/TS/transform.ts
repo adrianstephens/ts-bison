@@ -1,11 +1,10 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
-import * as JSX from './jsx-parser';
 import * as T from './type-utils';
-import { Identifier, Literal, Binary } from '../common';
-import { Walkable, walk, walkB, hasMod, dropMod } from './walker';
+import { Identifier, Literal, Binary, hasMod, dropMod } from '../common';
+import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, exportScope, typeOf, inferReturn } from './checker';
-import { LoadedModule, ModuleLoader, ModuleOptionsDefault } from './module-loader';
+import { LoadedModule, ModuleLoader } from './module-loader';
 import { Output } from './tocode';
 
 type Location		= JS.Location;
@@ -16,263 +15,23 @@ type Type			= TS.Type;
 type Scope			= T.Scope;
 const Scope			= T.Scope;
 
-type JSX = 'preserve' | 'react-jsx' | 'react-jsxdev'	| 'automatic' | 'react' | 'classic';
-const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
-
-const CompilerOptionsDefault = {
-//Type Checking
-	allowUnreachableCode:					undefined,
-	allowUnusedLabels:						undefined,
-	alwaysStrict:							false,
-	exactOptionalPropertyTypes:				undefined,
-	noFallthroughCasesInSwitch:				undefined,
-	noImplicitAny:							false,
-	noImplicitOverride:						undefined,
-	noImplicitReturns:						undefined,
-	noImplicitThis:							false,
-	noPropertyAccessFromIndexSignature:		undefined,
-	noUncheckedIndexedAccess:				undefined,
-	noUnusedLocals:							undefined,
-	noUnusedParameters:						undefined,
-	strict:									false,
-	strictBindCallApply:					false,
-	strictBuiltinIteratorReturn:			false,
-	strictFunctionTypes:					false,
-	strictNullChecks:						false,
-	strictPropertyInitialization:			false,
-	useUnknownInCatchVariables:				false,
-//Modules
-	...ModuleOptionsDefault,
-//Emit
-	declaration:							false,
-	declarationDir:							undefined,
-	declarationMap:							undefined,
-	downlevelIteration:						undefined,
-	emitBOM:								undefined,
-	emitDeclarationOnly:					undefined,
-	importHelpers:							undefined,
-	inlineSourceMap:						undefined,
-	inlineSources:							undefined,
-	mapRoot:								undefined,
-	newLine:								'\n',
-	noEmit:									undefined,
-	noEmitHelpers:							undefined,
-	noEmitOnError:							undefined,
-	outDir:									undefined,
-	outFile:								undefined,
-	preserveConstEnums:						undefined,
-	removeComments:							undefined,
-	sourceMap:								undefined,
-	sourceRoot:								undefined,
-	stripInternal:							undefined,
-//JavaScript Support
-	allowJs:								undefined,
-	checkJs:								undefined,
-	maxNodeModuleJsDepth:					0,
-//Editor Support
-	disableSizeLimit:						undefined,
-	plugins:								undefined,
-//Interop Constraints
-	allowSyntheticDefaultImports:			undefined,
-	erasableSyntaxOnly:						undefined,
-	esModuleInterop:						undefined,
-	forceConsistentCasingInFileNames:		true,
-	isolatedDeclarations:					undefined,
-	isolatedModules:						undefined,
-	preserveSymlinks:						undefined,
-	verbatimModuleSyntax:					undefined,
-//Backwards Compatibility
-	charset:								'utf8',
-	importsNotUsedAsValues:					0,
-	keyofStringsOnly:						undefined,
-	noImplicitUseStrict:					undefined,
-	noStrictGenericChecks:					undefined,
-	out:									undefined,
-	preserveValueImports:					undefined,
-	suppressExcessPropertyErrors:			undefined,
-	suppressImplicitAnyIndexErrors:			undefined,
-//Language
-	Environment:							undefined,
-	emitDecoratorMetadata:					undefined,
-	experimentalDecorators:					undefined,
-	jsx:									'preserve' satisfies JSX,
-	jsxFactory:								'React.createElement',
-	jsxFragmentFactory:						'React.Fragment',
-	jsxImportSource:						'react',
-	lib:									undefined as string[] | undefined,
-	libReplacement:							true,
-	moduleDetection:						'auto',
-	noLib:									false,
-	reactNamespace:							'React',
-	target:									'es5',
-	useDefineForClassFields:				false,
-//Compiler Diagnostics
-	diagnostics:							undefined,
-	explainFiles:							undefined,
-	extendedDiagnostics:					undefined,
-	generateCpuProfile:						'profile.cpuprofile',
-	generateTrace:							undefined,
-	listEmittedFiles:						undefined,
-	listFiles:								undefined,
-	noCheck:								undefined,
-	traceResolution:						undefined,
-//Projects
-	composite:								undefined,
-	disableReferencedProjectLoad:			undefined,
-	disableSolutionSearching:				undefined,
-	disableSourceOfProjectReferenceRedirect:undefined,
-	incremental:							false,
-	tsBuildInfoFile:						'.tsbuildinfo',
-//Output Formatting
-	noErrorTruncation:						undefined,
-	preserveWatchOutput:					undefined,
-	pretty:									true,
-//Completeness
-	skipDefaultLibCheck:					undefined,
-	skipLibCheck:							undefined,
-};
-
-export type CompilerOptions1 = typeof CompilerOptionsDefault;
-export type CompilerOptions = Partial<CompilerOptions1>;
-
-const TARGET_DEFAULT_LIB: Record<string, string> = {
-	es3: 	'lib',
-	es5: 	'lib',
-	es6: 	'lib.es6',
-	es2015: 'lib.es6',
-	es2016: 'lib.es2016.full',
-	es2017: 'lib.es2017.full',
-	es2018: 'lib.es2018.full',
-	es2019: 'lib.es2019.full',
-	es2020: 'lib.es2020.full',
-	es2021: 'lib.es2021.full',
-	es2022: 'lib.es2022.full',
-	es2023: 'lib.es2023.full',
-	es2024: 'lib.es2024.full',
-	esnext: 'lib.esnext.full',
-};
-
-export function FixOptions(options: CompilerOptions): CompilerOptions1 {
-	const target	= options.target?.toLowerCase() ?? CompilerOptionsDefault.target;
-	const lib		= options.lib ? Array.isArray(options.lib) ? options.lib : [options.lib]
-		:	options.noLib ? []
-		:	['typescript/lib/' + (TARGET_DEFAULT_LIB[target] ?? TARGET_DEFAULT_LIB.es5)];
-
-	return {
-		...CompilerOptionsDefault,
-		...options,
-		target,
-		lib
-	};
-}
-
-// Leading whitespace/comments/shebang -- matches js-parser.ts's own lexer `skip` list, so real tsc pragma scope.
-const reLeadingTrivia = /^(?:#![^\n]*\n)?(?:\s+|\/\/[^\n]*|\/\*[^]*?\*\/)*/;
-const rePragmaTag = /@(\w+)\s+(\S+)/g;
-
-// `@tag value` pragmas in the file's leading trivia -- same scope real tsc uses, no built-in tag knowledge here.
-export function scanPragmas(source: string): Record<string, string> {
-	const pragmas: Record<string, string> = {};
-	rePragmaTag.lastIndex = 0;
-	for (let m; (m = rePragmaTag.exec(source)); )
-		pragmas[m[1]] = m[2];
-	return pragmas;
-}
-
-// Tag -> compiler option for known pragmas; add an entry to support a new one.
-const pragmaOptionKey = {
-	jsx:				'jsxFactory',
-	jsxFrag:			'jsxFragmentFactory',
-	jsxImportSource:	'jsxImportSource',
-} as const satisfies Record<string, keyof CompilerOptions1>;
-
-export function applyPragmas(source: string, options: CompilerOptions1) {
-	const leading = reLeadingTrivia.exec(source)?.[0] ?? '';
-	for (const [tag, value] of Object.entries(scanPragmas(leading))) {
-		if (tag in pragmaOptionKey)
-			options[pragmaOptionKey[tag as keyof typeof pragmaOptionKey]] = value;
-	}
-}
-
 //-----------------------------------------------------------------------------
 // Constant folding
 //-----------------------------------------------------------------------------
 
-function calcUnary(op: JS.unaryOps, x: any) {
-	if (op === '!')
-		return !x;
+const typeMasks = {
+	number:		1,
+	bigint:		2,
+	string:		4,
+	boolean:	8,
+	undefined:	16,
+	symbol:		32,
+	unknown:	0,
+	object:		0,
+	function:	0,
+} as const;
 
-	switch (typeof x) {
-		case 'number':
-			switch (op) {
-				case '~':	return ~x;
-				case '-':	return -x;
-				case '+':	return +x;
-			}
-			break;
-		case 'bigint':
-			switch (op) {
-				case '~':	return ~x;
-				case '-':	return -x;
-			}
-			break;
-	}
-}
-
-function calcBinary(op: JS.binaryOps, a: any, b: any) {
-	switch (op) {
-		case '&&':	return a && b;
-		case '||':	return a || b;
-		case '??':	return a ?? b;
-		case '!=':	return a != b;
-		case '!==':	return a !== b;
-		case '==':	return a == b;
-		case '===':	return a === b;
-	}
-	const num = typeof a === 'number' && typeof b === 'number';
-	const big = typeof a === 'bigint' && typeof b === 'bigint';
-	if (num || big) {
-		switch (op) {
-			case '<':	return a < b;
-			case '<=':	return a <= b;
-			case '>':	return a > b;
-			case '>=':	return a >= b;
-		}
-		if (num) {
-			switch (op) {
-				case '+':	return a + b;
-				case '-':	return a - b;
-				case '*':	return a * b;
-				case '/':	return a / b;
-				case '%':	return a % b;
-				case '&':	return a & b;
-				case '|':	return a | b;
-				case '^':	return a ^ b;
-				case '<<':	return a << b;
-				case '>>':	return a >> b;
-				case '>>>':	return a >>> b;
-				case '**':	return a ** b;
-			}
-		} else if (big) {
-			switch (op) {
-				case '+':	return a + b;
-				case '-':	return a - b;
-				case '*':	return a * b;
-				case '/':	return a / b;
-				case '%':	return a % b;
-				case '&':	return a & b;
-				case '|':	return a | b;
-				case '^':	return a ^ b;
-				case '<<':	return a << b;
-				case '>>':	return a >> b;
-				case '**':	return a ** b;
-			}
-		}
-	}
-}
-
-
-export function foldConstants(ast: any) {
+export function foldConstants<T extends Walkable>(ast: T) {
 	return walk(ast,
 		undefined,
 		(expr, process) => {
@@ -311,6 +70,62 @@ export function foldConstants(ast: any) {
 						const r = calcUnary(expr.operator, expr.operand.value);
 						if (r !== undefined)
 							return Literal(r);
+					}
+					break;
+
+				case 'call':
+					if (expr.arguments.every(a => a.type === 'literal')) {
+						const args = expr.arguments.map(a => (a as Literal<any>).value);
+						const arg0 = args[0];
+						const mask = typeMasks[typeof arg0];
+						if (expr.callee.type === 'identifier') {
+							switch (expr.callee.name) {
+								case 'Number':		return Literal(Number(arg0));
+								case 'BigInt':		return mask & 15 ? Literal(BigInt(arg0)) : undefined;
+								case 'String':		return mask & 15 ? Literal(arg0.toString()) : undefined;
+								case 'Boolean':		return Literal(Boolean(arg0));
+								case 'parseInt':	return mask === 4 ? Literal(parseInt(arg0)) : undefined;
+								case 'parseFloat':	return mask === 4? Literal(parseFloat(arg0)) : undefined;
+							}
+						} else if (expr.callee.type === 'member' && expr.callee.object.type === 'identifier') {
+							if (expr.callee.object.name === 'Math') {
+								switch (expr.callee.property) {
+									case 'abs':		return Literal(Math.abs(arg0));
+									case 'floor':	return Literal(Math.floor(arg0));
+									case 'ceil':	return Literal(Math.ceil(arg0));
+									case 'round':	return Literal(Math.round(arg0));
+									case 'fround':	return Literal(Math.fround(arg0));
+									case 'max':		return Literal(Math.max(...args));
+									case 'min':		return Literal(Math.min(...args));
+									case 'pow':		return Literal(Math.pow(args[0], args[1]));
+									case 'sqrt':	return Literal(Math.sqrt(arg0));
+									case 'sin':		return Literal(Math.sin(arg0));
+									case 'cos':		return Literal(Math.cos(arg0));
+									case 'tan':		return Literal(Math.tan(arg0));
+									case 'asin':	return Literal(Math.asin(arg0));
+									case 'acos':	return Literal(Math.acos(arg0));
+									case 'atan':	return Literal(Math.atan(arg0));
+									case 'atan2':	return Literal(Math.atan2(args[0], args[1]));
+									case 'exp':		return Literal(Math.exp(arg0));
+									case 'log':		return Literal(Math.log(arg0));
+									case 'log10':	return Literal(Math.log10(arg0));
+									case 'log2':	return Literal(Math.log2(arg0));
+									case 'trunc':	return Literal(Math.trunc(arg0));
+									case 'sign':	return Literal(Math.sign(arg0));
+									case 'sinh':	return Literal(Math.sinh(arg0));
+									case 'cosh':	return Literal(Math.cosh(arg0));
+									case 'tanh':	return Literal(Math.tanh(arg0));
+									case 'asinh':	return Literal(Math.asinh(arg0));
+									case 'acosh':	return Literal(Math.acosh(arg0));
+									case 'atanh':	return Literal(Math.atanh(arg0));
+									case 'log1p':	return Literal(Math.log1p(arg0));
+									case 'cbrt':	return Literal(Math.cbrt(arg0));
+									case 'hypot':	return Literal(Math.hypot(...args));
+									case 'imul':	return Literal(Math.imul(args[0], args[1]));
+									case 'clz32':	return Literal(Math.clz32(arg0));
+								}
+							}
+						}
 					}
 					break;
 					
@@ -387,160 +202,6 @@ export interface StateMachine {
 	completeId:	number;
 }
 
-function suspendExpr(e: Expr): SuspendBoundary | undefined {
-	return e.type === 'yield' ? { kind: 'yield', operand: e.operand, delegate: e.delegate }
-		: e.type === 'unary' && e.operator === 'await' ? { kind: 'await', operand: e.operand }
-		: undefined;
-}
-
-// The only statement shapes v1 recognizes as a suspend boundary:
-// - a bare 'yield x;'/'await p;'
-// - expression statement, 'return await p;'
-// - a single-declarator 'const v = yield x;'/'= await p;'.
-function suspendBoundary(stmt: Statement): SuspendBoundary | undefined {
-	if (stmt.type === 'expression')
-		return suspendExpr(stmt.expression);
-	if (stmt.type === 'return' && stmt.argument) {
-		// 'return (yield x)' isn't recognized here (only 'return await p;') -- real but rare, deferred.
-		const b = suspendExpr(stmt.argument);
-		return b?.kind === 'await' ? b : undefined;
-	}
-	if (stmt.type === 'var_decl' && stmt.declarations.length === 1) {
-		const d = stmt.declarations[0];
-		if (typeof d.name === 'string' && d.init) {
-			const b = suspendExpr(d.init);
-			if (b)
-				return { ...b, resultVar: d.name };
-		}
-	}
-	return undefined;
-}
-
-// Stops at a nested closure boundary (a yield/await inside it belongs to *that* function, not this one)
-function containsSuspend(stmt: Statement): boolean {
-	return walkB(stmt,
-		undefined,
-		(e, process) => suspendExpr(e as Expr) ? true : (e.type === 'arrow' || e.type === 'function') ? false : process(e)
-	);
-}
-
-// A bare (unlabeled -- labeled break/continue is unsupported everywhere else in towasm.ts too) break
-// or continue that would target the loop/switch containing `stmts` directly, not a nested one (which
-// establishes its own break/continue scope, same reasoning `case 'switch'`'s own scoping needs).
-function containsOwnBreakOrContinue(stmts: Statement|Statement[]): boolean {
-	return walkB(stmts,
-		(s, process) => {
-			if (s.type === 'break' || s.type === 'continue')
-				return true;
-			if (s.type === 'while' || s.type === 'do_while' || s.type === 'for' || s.type === 'switch')
-				return false;
-			return process(s);
-		},
-		(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
-	);
-}
-
-function bodyStmtsOf(stmt: Statement): Statement[] {
-	return stmt.type === 'block' ? stmt.body : [stmt];
-}
-
-class Builder {
-	segments: (StateMachineSegment | undefined)[] = [];
-	reserve(): number {
-		return this.segments.push(undefined) - 1;
-	}
-	define(id: number, stmts: Statement[], next: SegmentNext) {
-		this.segments[id] = { id, stmts, next };
-	}
-
-	// Flattens `stmts`, returning the id of its own entry segment. `contId`: where control goes once `stmts` completes normally (falls off its own end)
-	// -- always a real, already-known id (the whole point of processing backward below: by the time a statement is handled, everything textually after
-	// it is already built, so its own "what happens next" is always a concrete target, never a forward reference needing a later patch-up).
-	flattenList(stmts: Statement[], contId: number): number {
-		let cont = contId;
-		let trailing: Statement[] = [];	// ordinary statements seen so far, nearest-to-`cont` first
-		const flush = (): number => {
-			if (trailing.length === 0)
-				return cont;
-			const id = this.reserve();
-			this.define(id, trailing.reverse(), { type: 'goto', target: cont });
-			trailing = [];
-			cont = id;
-			return id;
-		};
-		for (let i = stmts.length - 1; i >= 0; i--) {
-			const stmt = stmts[i];
-			const boundary = suspendBoundary(stmt);
-			if (boundary) {
-				const id = this.reserve();
-				this.define(id, [], { ...boundary, type: 'suspend', resumeId: flush() });
-				cont = id;
-
-			} else if (containsSuspend(stmt)) {
-				switch (stmt.type) {
-					case 'block':
-						cont = this.flattenList(stmt.body, flush());
-						break;
-
-					case 'if': {
-						const cont0 = flush();
-						cont = this.reserve();
-						this.define(cont, [], {
-							type: 'branch', test: stmt.test,
-							then: this.flattenList(bodyStmtsOf(stmt.consequent), cont0),
-							else: stmt.alternate ? this.flattenList(bodyStmtsOf(stmt.alternate), cont0) : cont0,
-						});
-						break;
-					}
-					case 'while': {
-						if (containsOwnBreakOrContinue(stmt.body))
-							throw new Error("towasm: 'break'/'continue' inside a yield-containing loop is not yet supported");
-						const cont0 = flush();
-						cont = this.reserve();
-						this.define(cont, [], { type: 'branch', test: stmt.test, then: this.flattenList(bodyStmtsOf(stmt.body), cont), else: cont0 });
-						break;
-					}
-					case 'do_while': {
-						if (containsOwnBreakOrContinue(stmt.body))
-							throw new Error("towasm: 'break'/'continue' inside a yield-containing loop is not yet supported");
-						const cont0		= flush();
-						const testId	= this.reserve();
-						cont = this.flattenList(bodyStmtsOf(stmt.body), testId);
-						this.define(testId, [], { type: 'branch', test: stmt.test, then: cont, else: cont0 });
-						break;
-					}
-					case 'for': {
-						if (containsOwnBreakOrContinue(stmt.body))
-							throw new Error("towasm: 'break'/'continue' inside a yield-containing loop is not yet supported");
-						const cont0		= flush();
-						cont = this.reserve();
-						const updateId	= this.reserve();
-						const bodyEntry = this.flattenList(bodyStmtsOf(stmt.body), updateId);
-						switch (stmt.kind) {
-							case 'normal':
-								this.define(updateId, stmt.update ? [{ type: 'expression', expression: stmt.update } as Statement] : [], { type: 'goto', target: cont });
-								this.define(cont, [], stmt.test ? { type: 'branch', test: stmt.test, then: bodyEntry, else: cont0 } : { type: 'goto', target: bodyEntry });
-								break;
-						}
-						if (stmt.init) {
-							const cont2 = this.reserve();
-							this.define(cont2, [stmt.init.type === 'var_decl' ? stmt.init : { type: 'expression', expression: stmt.init } as Statement], { type: 'goto', target: cont });
-							cont = cont2;
-						}
-						break;
-					}
-					default:
-						throw new Error("towasm: a yield/await here is not yet supported (only a bare 'yield x;'/'await x;' statement, 'return await x;', 'const v = yield x;', or one of those nested in a plain 'if'/'while'/'do..while'/'for' -- not embedded in a larger expression, and not inside a 'switch'/'try')");
-				}
-
-			} else {
-				trailing.push(stmt);
-			}
-		}
-		return flush();
-	}
-}
-
 // Splits a generator/async function's body into a flat, id-addressable graph of segments --
 // towasm.ts's 'emitGeneratorDispatch' turns this into one resumable step function (a dispatch + one
 // nested block per segment, the same shape 'case switch' already lowers a real switch statement to,
@@ -549,20 +210,174 @@ class Builder {
 // concepts. `containsSuspend`/`isFlattenable` reject anything not directly expressible this way (a
 // suspend point embedded in a larger expression, or nested inside a 'switch'/'try') with a clear
 // error rather than silently mishandling it.
-export function flattenStateMachine(body: Statement[]): StateMachine {
-	const b = new Builder();
-	const completeId	= b.reserve();
-	const entryId		= b.flattenList(body, completeId);
-	b.define(completeId, [], { type: 'complete' });
+
+export function BuildStateMachine(stmts: Statement[]) {
+	const segments = [] as (StateMachineSegment | undefined)[];
+
+	function reserve(): number {
+		return segments.push(undefined) - 1;
+	}
+	function define(id: number, stmts: Statement[], next: SegmentNext) {
+		segments[id] = { id, stmts, next };
+	}
+
+	function suspendExpr(e: Expr): SuspendBoundary | undefined {
+		return e.type === 'yield' ? { kind: 'yield', operand: e.operand, delegate: e.delegate }
+			: e.type === 'unary' && e.operator === 'await' ? { kind: 'await', operand: e.operand }
+			: undefined;
+	}
+
+	// The only statement shapes v1 recognizes as a suspend boundary:
+	// - a bare 'yield x;'/'await p;'
+	// - expression statement, 'return await p;'
+	// - a single-declarator 'const v = yield x;'/'= await p;'.
+	function suspendBoundary(stmt: Statement): SuspendBoundary | undefined {
+		if (stmt.type === 'expression')
+			return suspendExpr(stmt.expression);
+		if (stmt.type === 'return' && stmt.argument) {
+			// 'return (yield x)' isn't recognized here (only 'return await p;') -- real but rare, deferred.
+			const b = suspendExpr(stmt.argument);
+			return b?.kind === 'await' ? b : undefined;
+		}
+		if (stmt.type === 'var_decl' && stmt.declarations.length === 1) {
+			const d = stmt.declarations[0];
+			if (typeof d.name === 'string' && d.init) {
+				const b = suspendExpr(d.init);
+				if (b)
+					return { ...b, resultVar: d.name };
+			}
+		}
+		return undefined;
+	}
+
+	// Stops at a nested closure boundary (a yield/await inside it belongs to *that* function, not this one)
+	function containsSuspend(stmt: Statement): boolean {
+		return walkB(stmt,
+			undefined,
+			(e, process) => suspendExpr(e as Expr) ? true : (e.type === 'arrow' || e.type === 'function') ? false : process(e)
+		);
+	}
+
+	// A bare (unlabeled -- labeled break/continue is unsupported everywhere else in towasm.ts too) break
+	// or continue that would target the loop/switch containing `stmts` directly, not a nested one (which
+	// establishes its own break/continue scope, same reasoning `case 'switch'`'s own scoping needs).
+	function containsOwnBreakOrContinue(stmts: Statement|Statement[]): boolean {
+		return walkB(stmts,
+			(s, process) => {
+				if (s.type === 'break' || s.type === 'continue')
+					return true;
+				if (s.type === 'while' || s.type === 'do_while' || s.type === 'for' || s.type === 'switch')
+					return false;
+				return process(s);
+			},
+			(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
+		);
+	}
+
+	function bodyStmtsOf(stmt: Statement): Statement[] {
+		return stmt.type === 'block' ? stmt.body : [stmt];
+	}
+
+	// Flattens `stmts`, returning the id of its own entry segment. `contId`: where control goes once `stmts` completes normally (falls off its own end)
+	// -- always a real, already-known id (the whole point of processing backward below: by the time a statement is handled, everything textually after
+	// it is already built, so its own "what happens next" is always a concrete target, never a forward reference needing a later patch-up).
+	function recurse(stmts: Statement[], contId: number): number {
+		let cont = contId;
+		let trailing: Statement[] = [];	// ordinary statements seen so far, nearest-to-`cont` first
+		const flush = (): number => {
+			if (trailing.length === 0)
+				return cont;
+			const id = reserve();
+			define(id, trailing.reverse(), { type: 'goto', target: cont });
+			trailing = [];
+			cont = id;
+			return id;
+		};
+		for (let i = stmts.length - 1; i >= 0; i--) {
+			const stmt = stmts[i];
+			const boundary = suspendBoundary(stmt);
+			if (boundary) {
+				const id = reserve();
+				define(id, [], { ...boundary, type: 'suspend', resumeId: flush() });
+				cont = id;
+
+			} else if (containsSuspend(stmt)) {
+				switch (stmt.type) {
+					case 'block':
+						cont = recurse(stmt.body, flush());
+						break;
+
+					case 'if': {
+						const cont0 = flush();
+						cont = reserve();
+						define(cont, [], {
+							type: 'branch', test: stmt.test,
+							then: recurse(bodyStmtsOf(stmt.consequent), cont0),
+							else: stmt.alternate ? recurse(bodyStmtsOf(stmt.alternate), cont0) : cont0,
+						});
+						break;
+					}
+					case 'while': {
+						if (containsOwnBreakOrContinue(stmt.body))
+							throw new Error("'break'/'continue' inside a yield-containing loop is not yet supported");
+						const cont0 = flush();
+						cont = reserve();
+						define(cont, [], { type: 'branch', test: stmt.test, then: recurse(bodyStmtsOf(stmt.body), cont), else: cont0 });
+						break;
+					}
+					case 'do_while': {
+						if (containsOwnBreakOrContinue(stmt.body))
+							throw new Error("'break'/'continue' inside a yield-containing loop is not yet supported");
+						const cont0		= flush();
+						const testId	= reserve();
+						cont = recurse(bodyStmtsOf(stmt.body), testId);
+						define(testId, [], { type: 'branch', test: stmt.test, then: cont, else: cont0 });
+						break;
+					}
+					case 'for': {
+						if (containsOwnBreakOrContinue(stmt.body))
+							throw new Error("'break'/'continue' inside a yield-containing loop is not yet supported");
+						const cont0		= flush();
+						cont = reserve();
+						const updateId	= reserve();
+						const bodyEntry = recurse(bodyStmtsOf(stmt.body), updateId);
+						switch (stmt.kind) {
+							case 'normal':
+								define(updateId, stmt.update ? [{ type: 'expression', expression: stmt.update } as Statement] : [], { type: 'goto', target: cont });
+								define(cont, [], stmt.test ? { type: 'branch', test: stmt.test, then: bodyEntry, else: cont0 } : { type: 'goto', target: bodyEntry });
+								break;
+						}
+						if (stmt.init) {
+							const cont2 = reserve();
+							define(cont2, [stmt.init.type === 'var_decl' ? stmt.init : { type: 'expression', expression: stmt.init } as Statement], { type: 'goto', target: cont });
+							cont = cont2;
+						}
+						break;
+					}
+					default:
+						throw new Error("a yield/await here is not yet supported (only a bare 'yield x;'/'await x;' statement, 'return await x;', 'const v = yield x;', or one of those nested in a plain 'if'/'while'/'do..while'/'for' -- not embedded in a larger expression, and not inside a 'switch'/'try')");
+				}
+
+			} else {
+				trailing.push(stmt);
+			}
+		}
+		return flush();
+	}
+	const completeId	= reserve();
+	const entryId		= recurse(stmts, completeId);
+	define(completeId, [], { type: 'complete' });
+
 	return {
 		entryId, completeId,
-		segments: b.segments.map((s, id) => {
+		segments: segments.map((s, id) => {
 			if (!s)
-				throw new Error(`towasm: internal: state-machine segment ${id} was reserved but never defined`);
+				throw new Error(`internal: state-machine segment ${id} was reserved but never defined`);
 			return s;
 		}),
 	};
 }
+
 
 // Debug/visualization only: renders a `StateMachine` back into a plain, printable JS AST -- a
 // `while (true) { switch (state) { ... } }` dispatch loop -- so `Output.toCode` can show exactly
@@ -615,7 +430,7 @@ export function StateMachineToAST(machine: StateMachine) {
 
 				case 'suspend': {
 					if (next.delegate)
-						throw new Error("towasm: 'yield*' delegation is not supported");
+						throw new Error("'yield*' delegation is not supported");
 					stmts.push(setState(next.resumeId));
 					stmts.push({ type: 'return', argument: next.kind === 'yield'
 						? { type: 'yield', operand: next.operand, delegate: next.delegate } as Expr
@@ -779,8 +594,8 @@ function makeDiagnostic(func: (d: Diagnostic) => void): Err {
 }
 
 // Folds any depth-budget hits from type-utils.ts's structural recursion into one summary GAP diagnostic, not one per occurrence.
-function pushDepthExhaustionGap(diagnostics: Diagnostic[]) {
-	const depthHits = T.takeDepthExhaustion();
+function pushDepthExhaustionGap(TC: T.TypeContext, diagnostics: Diagnostic[]) {
+	const depthHits = TC.depthExhaustion;
 	if (depthHits.size) {
 		diagnostics.push({
 			severity: SEVERITY.GAP,
@@ -799,36 +614,13 @@ function pushDepthExhaustionGap(diagnostics: Diagnostic[]) {
 // a scope its own code actually reaches. Optional and defaults to a bare `T.makeGlobal()`, unchanged
 // from before, for callers with no such consumer (e.g. `TStoDecl`-only or checker-only use).
 export function TStypeCheck(ast: TS.Program, libScope?: Scope): Diagnostic[] {
-	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
 	const diagnostics: Diagnostic[] = [];
 	const global = libScope ? new Scope(libScope) : T.makeGlobal();
-	checkBlock(ast.body, global, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
-	pushDepthExhaustionGap(diagnostics);
+	const TC = new T.TypeContext;
+	checkBlock(ast.body, global, TC, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
+	pushDepthExhaustionGap(TC, diagnostics);
 	ast.scope = global;
 	return diagnostics;
-}
-
-// Cached per `libSpecs`, not per-call -- `stampScope` (type-utils.ts) mutates lib refs in place, so a fresh `Scope`
-// per file left every ref pointing at whichever file's `Scope` got there first.
-const libScopeCache = new Map<string, Promise<Scope>>();
-
-async function getLibScope(loader: ModuleLoader, options: CompilerOptions1): Promise<Scope> {
-	const key = options.lib!.join(';');
-	let cached = libScopeCache.get(key);
-	if (!cached) {
-		cached = (async () => {
-			//const checker	= makeChecker(makeDiagnostic(() => {}));
-			const global	= T.makeGlobal();
-			for (const spec of options.lib!) {
-				const lib = await loader.get(spec, '.');
-				if (lib)
-					checkBlock(lib.body, global);
-			}
-			return global;
-		})();
-		libScopeCache.set(key, cached);
-	}
-	return cached;
 }
 
 // `tainted`: this build (or one it awaited) had to skip something to avoid deadlocking on a genuine import cycle -- real and usable, just incomplete.
@@ -875,15 +667,24 @@ async function safely<T>(waiter: LoadedModule, target: LoadedModule, func: () =>
 	}
 }
 
+export async function loadLib(loader: ModuleLoader, libs: string[]): Promise<T.Scope> {
+	const global	= T.makeGlobal();
+	for (const spec of libs!) {
+		const lib = await loader.get(spec, '.');
+		if (lib)
+			checkBlock(lib.body, global, new T.TypeContext);
+	}
+	return global;
+}
+
 // `libScope`: see `TStypeCheck`'s own comment -- same purpose here, but only chained in as an extra
 // ancestor on top of whatever `options.lib` already loads (not merged with it); no current caller needs
 // both a real module-loaded lib set *and* a `TStoWasm`-style `libScope` at once, so a real combination
 // (e.g. copying `libScope`'s own bindings into the loaded scope) is left for whenever one actually does.
-export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, options: CompilerOptions1, libScope?: Scope) {
-	T.takeDepthExhaustion();	// discard any carry-over from a previous check in this same process (e.g. a corpus sweep)
+export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, global: Scope) {
 	const diagnostics: Diagnostic[] = [];
 	const err		= makeDiagnostic(d => diagnostics.push(d));
-	const global	= libScope ? new Scope(libScope) : await getLibScope(loader, options);
+	const TC		= new T.TypeContext;
 
 	// Resolves one `import` into `importScope` (shared by `makeScope` and the entry program); return value feeds
 	// `makeScope`'s own `tainted` verdict (false = cycle truncation).
@@ -929,7 +730,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 		const importScope = new Scope(global);
 		const cached = Promise.all(src.body.filter(s => s.type === 'import').map(s => resolveImport(src, importScope, s, src.canonical))).then(async imports => {
 			let tainted = imports.some(clean => !clean);
-			const { scope, value, isAlias } = exportScope(src.body, importScope);
+			const { scope, value, isAlias } = exportScope(src.body, importScope, TC);
 			// Recorded before the (possibly cyclic) re-export loop awaits anything -- see `ownScopeSettled` for why placement matters.
 			ownScopeSettled.set(src, { scope, value, isAlias });
 			for (const stmt of src.body) {
@@ -975,8 +776,8 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 	const entryScope = new Scope(global);
 	await Promise.all(program.body.filter(s => s.type === 'import').map(s => resolveImport(entrySrc, entryScope, s, '.')));
 
-	checkBlock(program.body, entryScope, undefined, undefined, err);
-	pushDepthExhaustionGap(diagnostics);
+	checkBlock(program.body, entryScope, TC, undefined, undefined, err);
+	pushDepthExhaustionGap(TC, diagnostics);
 	program.scope = entryScope;
 	return diagnostics;
 }
@@ -984,6 +785,30 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 // ===================================================================
 //  TStoDecl -- TypeScript AST to a .d.ts-shaped AST
 // ===================================================================
+
+export const OutputOptionsDefault = {
+	declaration:							false,
+	declarationDir:							undefined,
+	declarationMap:							undefined,
+	downlevelIteration:						undefined,
+	emitBOM:								undefined,
+	emitDeclarationOnly:					undefined,
+	importHelpers:							undefined,
+	inlineSourceMap:						undefined,
+	inlineSources:							undefined,
+	mapRoot:								undefined,
+	newLine:								'\n',
+	noEmit:									undefined,
+	noEmitHelpers:							undefined,
+	noEmitOnError:							undefined,
+	outDir:									undefined,
+	outFile:								undefined,
+	preserveConstEnums:						undefined,
+	removeComments:							undefined,
+	sourceMap:								undefined,
+	sourceRoot:								undefined,
+	stripInternal:							undefined,
+};
 
 // The type-node kinds `T.resolve` can actually simplify -- constructs with no printable name of their own
 // (unlike a plain `ref`, which should stay a name rather than get flattened to its structural body).
@@ -998,7 +823,7 @@ const RESOLVABLE = new Set(['mapped', 'conditional', 'indexed_access', 'keyof', 
 // Plain named refs (interfaces/classes/type aliases) are deliberately left as names rather than expanded --
 // matches real declaration emit (which preserves alias identity) and avoids flattening self-referential types.
 
-function resolveTypes(entryScope: Scope, importScope: Scope | undefined) {
+function resolveTypes(entryScope: Scope, importScope: Scope | undefined, TC: T.TypeContext) {
 	// Tracks (alias, first type-argument) pairs currently on the inline/resolve stack -- not "ever expanded",
 	// since a type can be self/mutually recursive and re-entering it while still expanding would loop forever.
 	// Keyed on the *argument* too, not just the alias: a generic like `ReadType<T>` legitimately re-enters
@@ -1111,7 +936,7 @@ function resolveTypes(entryScope: Scope, importScope: Scope | undefined) {
 		if (RESOLVABLE.has(type.type)) {
 			// `stopAtRef` -- once resolution bottoms out at a named type (e.g. a conditional's chosen branch is just
 			// `MappedMemory`), print that name rather than recursing one hop further into its structural body.
-			const resolved = T.resolve(scope, type, undefined, true);
+			const resolved = TC.resolve(scope, type, undefined, true);
 			if (resolved !== type) {
 				const found = scope.findDeclaredName(resolved);
 				return process(found ? T.withScope(TS.RefType(found.name), found.scope) : resolved, true);	// recall
@@ -1121,39 +946,10 @@ function resolveTypes(entryScope: Scope, importScope: Scope | undefined) {
 	};
 }
 
-// A single generic type parameter constrained to a union of literals, used directly (unparameterized) as exactly
-// one parameter's type, expands into one non-generic overload per literal member -- each overload's return type
-// collapses toward its own concrete result (e.g. a conditional keyed off the now-literal T narrows to one table
-// entry) instead of the printed signature needing to expose whatever machinery type (often a big lookup table)
-// computed the generic return for every member at once.
-function expandConstrainedGeneric(typeParams: TS.TypeParam[] | undefined, params: JS.Param<any>[], returnType: Type | undefined, scope: Scope) {
-	const tparam = typeParams?.length === 1 ? typeParams[0] : undefined;
-	if (!tparam?.constraint)
-		return undefined;
-	let target: JS.Param<any> | undefined;
-	for (const p of params) {
-		if (p.typeAnnotation?.type === 'ref' && !p.typeAnnotation.typeArgs && p.typeAnnotation.name === tparam.name) {
-			if (target)
-				return undefined;	// ambiguous -- more than one param depends directly on T
-			target = p;
-		}
-	}
-	if (!target)
-		return undefined;
-
-	const constraint	= T.resolve(scope, tparam.constraint);
-	const members		= constraint.type === 'union' ? constraint.types : [constraint];
-	if (!members.every(m => T.isLiteral(m, 'string') || T.isLiteral(m, 'number')))
-		return undefined;
-
-	return members.map(m => ({
-		params:		params.map(p => p === target ? { ...p, typeAnnotation: m } : p),
-		returnType:	returnType && T.expandRefOnce(scope, T.substituteType(returnType, new Map([[tparam.name, m]]))),
-	}));
-}
-
-export function TStoDecl(ast: TS.Program): TS.Program {
-	const importScope = ast.scope as Scope | undefined;
+export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOptionsDefault>): TS.Program {
+	const options		= {...OutputOptionsDefault, ...opts};
+	const importScope	= program.scope as Scope | undefined;
+	const TC			= new T.TypeContext;
 
 	// ---- Gathering every top-level declaration, and seeding `reachable` with the explicit exports ----
 
@@ -1173,7 +969,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 	// ---- Shared checking/resolution machinery, needed by the strip helpers below --------------------
 
 	const global	= importScope ? new Scope(importScope) : T.makeGlobal();
-	checkBlock(ast.body, global);
+	checkBlock(program.body, global, TC);
 
 	// A class whose heritage is a call expression (e.g. `bin.Class(spec)`) can't keep that expression in a
 	// `declare class` -- collected here and prepended to `stripped`'s body (below) as `declare const <Name>_base:
@@ -1186,7 +982,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 	// Cheap, non-recursive scan of every top-level name -- seeded before any stripping starts, so a
 	// synthesized base name can't collide with a real declaration the single pass below hasn't reached yet.
 	const usedNames = new Set<string>();
-	for (let stmt of ast.body) {
+	for (let stmt of program.body) {
 		if (stmt.type === 'export_decl')
 			stmt = stmt.declaration;
 		switch (stmt.type) {
@@ -1213,7 +1009,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 
 	// `undefined` (rather than an explicit `: any` annotation) keeps unknowable types implicit, as before
 	const inferType		= (e: Expr, narrow: boolean): Type | undefined => {
-		const t = typeOf(e, global, !narrow);
+		const t = typeOf(e, global, TC, !narrow);
 		return t.type === 'ref' && t.name === 'any' ? undefined : t;
 	};
 
@@ -1236,7 +1032,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 	const GENERATOR_TYPES	= new Set(['Generator', 'IterableIterator', 'Iterator', 'Iterable']);
 
 	const stripFunctionDecl = (stmt: JS.FunctionDecl<any>): JS.Declaration<any> => {
-		const returnType: Type = stmt.returnType ? stmt.returnType as Type : stmt.body ? inferReturn(stmt, stmt.body, global) : T.ANY;
+		const returnType: Type = stmt.returnType ? stmt.returnType as Type : stmt.body ? inferReturn(stmt, stmt.body, global, TC) : T.ANY;
 		return JS.FunctionDecl(stmt.name, {
 			params:		stmt.params.map(stripParam),
 			typeParams:	stmt.typeParams,
@@ -1245,6 +1041,37 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 					:	returnType
 		}, undefined, {ambient: true});
 	};
+
+	// A single generic type parameter constrained to a union of literals, used directly (unparameterized) as exactly
+	// one parameter's type, expands into one non-generic overload per literal member -- each overload's return type
+	// collapses toward its own concrete result (e.g. a conditional keyed off the now-literal T narrows to one table
+	// entry) instead of the printed signature needing to expose whatever machinery type (often a big lookup table)
+	// computed the generic return for every member at once.
+	function expandConstrainedGeneric(typeParams: TS.TypeParam[] | undefined, params: JS.Param<any>[], returnType: Type | undefined) {
+		const tparam = typeParams?.length === 1 ? typeParams[0] : undefined;
+		if (!tparam?.constraint)
+			return undefined;
+		let target: JS.Param<any> | undefined;
+		for (const p of params) {
+			if (p.typeAnnotation?.type === 'ref' && !p.typeAnnotation.typeArgs && p.typeAnnotation.name === tparam.name) {
+				if (target)
+					return undefined;	// ambiguous -- more than one param depends directly on T
+				target = p;
+			}
+		}
+		if (!target)
+			return undefined;
+
+		const constraint	= TC.resolve(global, tparam.constraint);
+		const members		= constraint.type === 'union' ? constraint.types : [constraint];
+		if (!members.every(m => T.isLiteral(m, 'string') || T.isLiteral(m, 'number')))
+			return undefined;
+
+		return members.map(m => ({
+			params:		params.map(p => p === target ? { ...p, typeAnnotation: m } : p),
+			returnType:	returnType && T.expandRefOnce(global, T.substituteType(returnType, new Map([[tparam.name, m]]))),
+		}));
+	}
 
 	const stripClassDecl = (stmt: JS.ClassDecl<any>): JS.Declaration<any> => {
 		const setKeys	= new Set(stmt.body.map(m => m.type === 'set' && typeof m.key === 'string' ? m.key : undefined).filter(m => m !== undefined));
@@ -1257,7 +1084,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 		if (superClass && superClass.type !== 'identifier') {
 			const name = uniqueName((stmt.name ?? '_default') + '_base');
 			reachable.add(name);
-			syntheticBases.push(JS.AmbientVarDecl('const', JS.Var(name, undefined, typeOf(superClass, global))));
+			syntheticBases.push(JS.AmbientVarDecl('const', JS.Var(name, undefined, typeOf(superClass, global, TC))));
 			superClass = Identifier(name);
 		}
 
@@ -1296,8 +1123,8 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 							//return [JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams})];
 						}
 						const params		= m.params.map(stripParam);
-						const returnType	= m.returnType ?? (m.body ? inferReturn(m, m.body, global) : undefined);
-						const expansions	= expandConstrainedGeneric(m.typeParams, params, returnType, global);
+						const returnType	= m.returnType ?? (m.body ? inferReturn(m, m.body, global, TC) : undefined);
+						const expansions	= expandConstrainedGeneric(m.typeParams, params, returnType);
 						if (expansions)
 							return expansions.map(o => JS.Method('method', m.key, { params: o.params, rest: m.rest, returnType: o.returnType, typeParams: undefined }, undefined, m.modifiers));
 
@@ -1321,7 +1148,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 
 	// ---- Strip bodies/initializers down to their essentials in one pass, registering owners as we go --
 
-	const stripped = walk(ast, (stmt, process) => {
+	const stripped = walk(program, (stmt, process) => {
 		switch (stmt.type) {
 			case 'import':
 				return stmt;
@@ -1481,464 +1308,7 @@ export function TStoDecl(ast: TS.Program): TS.Program {
 			}
 		},
 		undefined,
-		resolveTypes(global, importScope)
+		resolveTypes(global, importScope, TC)
 	)!;
 }
 
-
-// VSDG
-type Node = any;
-
-interface StateEdge {
-	from:	Node;
-	to:		Node;
-}
-interface ValueEdge extends StateEdge {
-	inputSlot:	number; // Specifies which argument (e.g., left vs right operand)
-}
-
-class VSDG {
-	valueEdges: ValueEdge[] = [];
-	stateEdges: StateEdge[] = [];
-	nodes		= new Set<Node>();
-	getEdge(node: Node, slot: number) {
-		return this.valueEdges.find(e => e.to === node && e.inputSlot === slot);
-	}
-	removeNode(node: Node) {
-		this.nodes.delete(node);
-		this.valueEdges = this.valueEdges.filter(e => e.to !== node);
-	}
-
-	optimize(): void {
-		let changed = true;
-
-		while (changed) {
-			changed = false;
-
-			for (const node of this.nodes) {
-				// 1. Try to fold constant math operations
-				if (foldConstantsVSDG(this, node))
-					changed = true;
-
-				// 2. Try to eliminate dead if/else branches
-				if (foldDeadBranches(this, node))
-					changed = true;
-			}
-		}
-	}
-
-	linearize(): Node[] {
-		const orderedNodes: Node[] = [];
-		const readyQueue: Node[] = [];
-
-		// Track how many incoming dependencies each node is waiting on
-		const inDegree = new Map<Node, number>();
-
-		// 1. Initialize in-degree counters for all nodes
-		for (const nodeId of this.nodes.keys())
-			inDegree.set(nodeId, 0);
-
-		// Count incoming Value Edges
-		for (const edge of this.valueEdges)
-			inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
-
-		// Count incoming State Edges
-		for (const edge of this.stateEdges)
-			inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
-
-		// 2. Find all root nodes that have 0 dependencies to start with
-		for (const [nodeId, count] of inDegree.entries()) {
-			if (count === 0)
-				readyQueue.push(nodeId);
-		}
-
-		// 3. Process the queue
-		while (readyQueue.length > 0) {
-			// Strategy: Prioritize state/side-effect nodes to keep code ordered cleanly,
-			// otherwise just pull the first available ready node.
-
-			// Look for a node that handles state or side-effects first
-			const stateNodeIndex = readyQueue.findIndex(node => {
-				const type = node.type;
-				return type === 'call' || type === 'gamma' || type === 'mu';
-			});
-
-			// If found, splice it out of the queue; otherwise take the first item
-			const indexToPull = stateNodeIndex !== -1 ? stateNodeIndex : 0;
-			const current = readyQueue.splice(indexToPull, 1)[0];
-
-			// Add to our final sequential execution order
-			orderedNodes.push(current);
-
-			// 4. Update downstream nodes that depended on this node
-			// Check downstream Value Consumers
-			for (const edge of this.valueEdges) {
-				if (edge.from === current) {
-					const remaining = inDegree.get(edge.to)! - 1;
-					inDegree.set(edge.to, remaining);
-					if (remaining === 0)
-						readyQueue.push(edge.to);
-				}
-			}
-
-			// Check downstream State Consumers
-			for (const edge of this.stateEdges) {
-				if (edge.from === current) {
-					const remaining = inDegree.get(edge.to)! - 1;
-					inDegree.set(edge.to, remaining);
-					if (remaining === 0)
-						readyQueue.push(edge.to);
-				}
-			}
-		}
-
-		// Safety check: If orderedNodes length doesn't match graph size, you have a cycle
-		if (orderedNodes.length !== this.nodes.size)
-			throw new Error("Cyclic dependency detected! Graph cannot be fully linearized.");
-
-		return orderedNodes;
-	}
-
-	toAST(sequentialNodes: Node[]): any[] {
-		// A map to track the name of variables assigned to temporary node values
-		const nodeVariableNames = new Map<Node, string>();
-		let tempVarCounter = 0;
-
-		function makeVar(node: Node) {
-			const varName 	= `t${tempVarCounter++}`;
-			nodeVariableNames.set(node, varName);
-			return varName;
-		}
-
-		const resolveOperand = (to: Node, slot: number) => {
-			// 1. Find the edge connecting to this specific slot
-			const edge = this.getEdge(to, slot);
-			if (!edge)
-				throw new Error(`Missing operand edge for slot ${slot} on node ${to}`);
-
-			const sourceNode = edge.from;
-
-			// 2. If the source is a pure constant, we can inline its value directly into the statement
-			if (sourceNode.type === 'literal')
-				return sourceNode;
-
-			// 3. Otherwise, look up the name of the temporary variable we assigned to that calculation
-			const varName = nodeVariableNames.get(sourceNode.id);
-			if (!varName)
-				throw new Error(`Node ${sourceNode.id} was consumed before it was assigned a variable name!`);
-
-			return Identifier(varName);
-		};
-
-		const statements: Statement[] = [];
-
-		for (const node of sequentialNodes) {
-			switch (node.type) {
-
-				case 'literal':
-					// Pure constants don't need a standalone line of code; 
-					// they will be inline-read by their consumer expressions.
-					break;
-
-				case 'unary': {
-					// This computation needs a name so downstream lines can reference it
-					// Emit an AST Variable Declaration statement: const t0 = left + right;
-					const un = node as (Expr & {type: 'unary'});
-					statements.push(JS.VarDecl('const', JS.Var(makeVar(node), {...un, 
-						operand: resolveOperand(node.id, 0),
-					})));
-					break;
-				}
-				case 'binary': {
-					// This computation needs a name so downstream lines can reference it
-					// Emit an AST Variable Declaration statement: const t0 = left + right;
-					const bin = node as (Expr & {type: 'binary'});
-					statements.push(JS.VarDecl('const', JS.Var(makeVar(node), {...bin,
-						left: resolveOperand(node.id, 0),
-						right: resolveOperand(node.id, 1)
-					})));
-					break;
-				}
-
-				case 'call': {
-					// Emit a standalone function call AST statement: console.log(arg0);
-					const call = node as (Expr & {type: 'call'});
-					statements.push(JS.Expression({...call,
-						arguments: call.arguments.map((a, i) => resolveOperand(node.id, i))
-					} as Expr));
-					break;
-				}
-			}
-		}
-
-		return statements;
-	}
-
-}
-
-export function BuildVSDG(ast: Walkable): VSDG {
-	const graph		= new VSDG();
-	let environment = new Map<string, any>();
-	let current: Node;
-
-	function copyState() {
-		return { environment: new Map(environment), end: current };
-	}
-	function connectState(from: Node, to: Node): void {
-		graph.stateEdges.push({ from, to });
-	}
-	function connectValue(from: Node, to: Node, inputSlot: number): void {
-		graph.valueEdges.push({ from, to, inputSlot });
-	}
-	walkB(ast,
-		(s, process, recurse) => {
-			switch (s.type) {
-				case 'if': {
-					// 1. Evaluate the condition expression to get a value node
-					recurse(s.test);
-
-					// 2. Snapshot the current state and environment before entering branches
-					const preIf	= copyState();
-
-					// 3. Walk the TRUE branch
-					process(s.consequent);
-					const trueBranch	= copyState();
-
-					// 4. Reset state and environment, then walk the FALSE branch
-					current		= preIf.end;
-					environment	= new Map(preIf.environment);
-
-					if (s.alternate)
-						process(s.alternate);
-
-					const falseBranch	= copyState();
-
-					// 5. Reconcile the STATE
-					// If either branch modified state, we must merge the state paths using a Gamma node
-					if (trueBranch.end !== preIf.end || falseBranch.end !== preIf.end) {
-						const stateGammaNode = {type: 'gamma'};
-
-						// Connect Condition
-						connectValue(s.test, stateGammaNode, 0); // Slot 0 = Condition
-						// Connect the two different resulting state paths as VALUE inputs to the Gamma
-						connectValue(trueBranch.end, stateGammaNode, 1);  // Slot 1 = True State
-						connectValue(falseBranch.end, stateGammaNode, 2); // Slot 2 = False State
-
-						// The current global state of the compiler is now the output of this Gamma
-						current = stateGammaNode;
-					}
-
-					// 6. Reconcile the ENVIRONMENT (Variables like 'x')
-					// Find every variable name that was modified in either branch
-					const allVariables = new Set([...trueBranch.environment.keys(), ...falseBranch.environment.keys()]);
-
-					for (const varName of allVariables) {
-						const trueVal	= trueBranch.environment.get(varName);
-						const falseVal	= falseBranch.environment.get(varName);
-
-						// If the variable diverged between branches, merge them with a Gamma node
-						if (trueVal !== falseVal) {
-							const valueGammaNode = {type: 'gamma', value: varName};
-							connectValue(s.test, valueGammaNode, 0); // Slot 0 = Condition
-							connectValue(trueVal || preIf.environment.get(varName)!, valueGammaNode, 1);
-							connectValue(falseVal || preIf.environment.get(varName)!, valueGammaNode, 2);
-
-							// Update the main environment to point to this merged Gamma result
-							environment.set(varName, valueGammaNode);
-						}
-					}
-					return false;
-				}
-
-				case 'while': {
-					// 1. Snapshot variables and state that exist before entering the loop
-					const preLoop = copyState();
-
-					// 2. Create MU (Entry) nodes for every variable and the global State
-					// We need these because the loop body reads variables that mutate across iterations.
-					const stateMuNode = { type: 'mu' };
-					connectValue(preLoop.end, stateMuNode, 0); // Slot 0 = Initial value from outside
-					current = stateMuNode;
-
-					const valueMuNodes = new Map<string, Node>();
-					for (const [varName, initialValueNodeId] of preLoop.environment) {
-						const mu = {type: 'mu', value: varName};
-						connectValue(initialValueNodeId, mu, 0); // Slot 0 = Initial value from outside
-
-						valueMuNodes.set(varName, mu);
-						environment.set(varName, mu); // Direct reads inside the loop to this Mu node
-					}
-
-					// 3. Walk the loop condition expression
-					// It evaluates using the values provided by our new Mu entry nodes.
-					recurse(s.test);
-
-					// 4. Walk the loop body statements
-					process(s.body);
-
-					// 5. Connect the loop body feedback loops back into the MU nodes (Slot 1)
-					// Connect the final side-effect state of the loop body back to the State Mu
-					connectValue(current, stateMuNode, 1); // Slot 1 = Feedback loop
-
-					// Connect updated variable values back to their respective Value Mus
-					for (const [varName, muNodeId] of valueMuNodes)
-						connectValue(environment.get(varName)!, muNodeId, 1); // Slot 1 = Feedback loop
-
-					// 6. Create THETA (Exit) nodes to export the final values outside the loop
-					// The Theta node prevents values from escaping until the condition is false.
-					const stateThetaNode = { type: 'theta' };
-					connectValue(s.test, stateThetaNode, 0); 			// Slot 0 = Loop termination condition
-					connectValue(stateMuNode, stateThetaNode, 1);		// Slot 1 = Value to pass out
-					current = stateThetaNode;							// Future global side-effects depend on this exit state
-
-					for (const [varName, muNodeId] of valueMuNodes) {
-						const theta = { type: 'theta', value: varName};
-						connectValue(s.test, theta, 0); // Slot 0 = Condition
-						connectValue(muNodeId, theta, 1);        // Slot 1 = Value to pass out
-
-						// Update global environment so downstream code reads the post-loop value
-						environment.set(varName, theta);
-					}
-
-					return false;
-				}
-
-
-			}
-			return process(s);
-		},
-		(s, process) => {
-			switch (s.type) {
-				case 'unary': {
-					connectValue(s.operand, s, 0);
-					break;
-				}
-				case 'binary': {
-					if (ASSIGN_OPS.has(s.operator)) {
-						if (s.left.type === 'identifier')
-							environment.set(s.left.name, s);
-
-					} else {
-						connectValue(s.left, s, 0);
-						connectValue(s.right, s, 1);
-					}
-					break;
-				}
-
-				case 'call': {
-					// 1. Thread the State Edge to preserve sequence
-					connectState(current, s);
-					// Update the current state pointer to this new call
-					current = s;
-
-					// 2. Thread Value Edges for the function arguments
-					s.arguments.forEach((arg, index) => connectValue(arg, s, index));
-					break;
-				}
-
-			}
-			return process(s);
-		}
-	);
-	return graph;
-}
-
-function foldConstantsVSDG(graph: VSDG, node: Node): boolean {
-	switch (node.type) {
-		case 'binary': {
-			// Find the incoming value edges for this node
-			const leftEdge = graph.getEdge(node, 0);
-			const rightEdge = graph.getEdge(node, 1);
-			if (!leftEdge || !rightEdge)
-				return false;
-
-			// Get the actual source nodes
-			const left	= leftEdge.from as Expr;
-			const right = rightEdge.from as Expr;
-
-			// If both inputs are constants, we can fold them!
-			if (left.type === 'literal' && right.type === 'literal') {
-				const r = calcBinary(node.operator, left.value, right.value);
-				if (r !== undefined) {
-					// 1. Change this node into a pure Constant node
-					node.type = 'literal';
-					node.value = r;
-
-					// 2. Remove the incoming edges since it no longer computes anything
-					graph.valueEdges = graph.valueEdges.filter(e => e.to !== node.id);
-
-					return true; // Graph was modified!
-				}
-			}
-			return false;
-		}
-		case 'unary': {
-			const edge = graph.getEdge(node, 0);
-			if (!edge)
-				return false;
-			const operand	= edge.from as Expr;
-			if (operand.type === 'literal') {
-				const r = calcUnary(node.operator, operand.value);
-				if (r !== undefined) {
-					// 1. Change this node into a pure Constant node
-					node.type = 'literal';
-					node.value = r;
-
-					// 2. Remove the incoming edges since it no longer computes anything
-					graph.valueEdges = graph.valueEdges.filter(e => e.to !== node.id);
-
-					return true; // Graph was modified!
-				}
-			}
-			return false;
-		}
-	}
-	return false;
-			
-}
-function foldDeadBranches(graph: VSDG, node: Node): boolean {
-	// We are looking for Gamma nodes (Value or State)
-	if (node.type !== 'gamma')
-		return false;
-
-	// Find the edge supplying the condition (Slot 0)
-	const condEdge = graph.getEdge(node, 0);
-	if (!condEdge)
-		return false;
-
-	const condNode = condEdge.from;
-
-	// If the condition is a known constant boolean (or truthy/falsy value)
-	if (condNode.type === 'literal') {
-		// Slot 1 is the True path, Slot 2 is the False path
-
-		// Find the edge representing the winning path
-		const winningEdge = graph.getEdge(node, condNode.value ? 1 : 2);
-		if (!winningEdge)
-			return false;
-
-		// Bypass this Gamma node entirely! 
-		// Find every downstream node that reads from this Gamma node, 
-		// and reconnect them to read directly from the winning branch source.
-		for (const edge of graph.valueEdges) {
-			if (edge.from === node)
-				edge.from = winningEdge.from;
-		}
-
-		// Do the exact same thing for state edges if this is a GammaState node
-		for (const edge of graph.stateEdges) {
-			if (edge.from === node)
-				edge.from = winningEdge.from;
-			if (edge.to === node)
-				edge.to = winningEdge.from;
-		}
-
-		// Delete the Gamma node and its incoming edges from the graph
-		//graph.nodes.delete(node.id);
-		graph.valueEdges = graph.valueEdges.filter(e => e.to !== node.id);
-
-		return true; // Graph was modified!
-	}
-
-	return false;
-}
