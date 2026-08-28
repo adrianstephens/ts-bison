@@ -3,8 +3,9 @@
 //-----------------------------------------------------------------------------
 //	RegExp -- a JS-compatible "core" regex engine: literals, `.`, character classes
 //	(negation/ranges), \d\D\w\W\s\S, anchors ^$, greedy/lazy quantifiers * + ? {n,m},
-//	capturing/non-capturing groups, alternation, backreferences \1-\9, flags g i m.
-//	Not supported (documented scope, not silently wrong): lookahead/lookbehind, named
+//	capturing/non-capturing groups, alternation, backreferences \1-\9, flags g i m,
+//	lookahead (?=X) (?!X).
+//	Not supported (documented scope, not silently wrong): lookbehind, named
 //	groups, unicode property escapes, u/v/y/s flags, multi-digit backreferences,
 //	escaped range bounds in a class (e.g. `[\--/]`), \D\W\S *inside* a class.
 //
@@ -70,6 +71,9 @@ class RegExpCompiler {
 	static readonly OP_FAIL:	number = 12;
 	static readonly OP_SPACE:	number = 13;
 	static readonly OP_NSPACE:	number = 14;
+	static readonly OP_LA_ENTER:number = 15;
+	static readonly OP_LA_EXIT:	number = 16;
+	static readonly OP_LA_FAIL:	number = 17;
 
 //	pat:		string;
 	pos			= 0;
@@ -419,15 +423,27 @@ class RegExpCompiler {
 	}
 	private parseGroup(): void {
 		let capturing = true;
+		let lookMode = 0; // 0 none, 1 positive lookahead '(?=', 2 negative lookahead '(?!'
 		if (this.charAt(this.pos) === 63) {
-			if (this.charAt(this.pos + 1) === 58) {
+			const d: number = this.charAt(this.pos + 1);
+			if (d === 58) {
 				capturing = false;
 				this.pos = this.pos + 2;
-			}
-			else { this.failed = true; return; } // '?=' '?!' '?<' -- lookaround/named groups, out of scope
+			} else if (d === 61) {
+				capturing = false;
+				lookMode = 1;
+				this.pos = this.pos + 2;
+			} else if (d === 33) {
+				capturing = false;
+				lookMode = 2;
+				this.pos = this.pos + 2;
+			} else { this.failed = true; return; } // '?<' -- lookbehind/named groups, out of scope
 		}
 		let idx = 0;
-		if (capturing) {
+		let enterPos = 0;
+		if (lookMode !== 0) {
+			enterPos = this.emit2(RegExpCompiler.OP_LA_ENTER, -1); // arg patched below, once failAddr is known
+		} else if (capturing) {
 			idx = this.nextGroup;
 			this.nextGroup = this.nextGroup + 1;
 			this.emit2(RegExpCompiler.OP_SAVE, idx * 2);
@@ -440,8 +456,21 @@ class RegExpCompiler {
 			return;
 		}
 		++this.pos; // consume ')'
-		if (capturing)
+		if (lookMode !== 0) {
+			// See RegExp.runVM's OP_LA_* cases for the runtime semantics this shape relies on:
+			// EXIT is reached only if the body matched; FAIL is reached only via normal backtracking
+			// once the body has exhausted every alternative -- the two paths are each other's negation.
+			const negate = lookMode === 2 ? 1 : 0;
+			const exitPos: number = this.emit3(RegExpCompiler.OP_LA_EXIT, negate, -1);
+			const failAddr: number = this.progLen;
+			this.emit3(RegExpCompiler.OP_LA_FAIL, negate, -1);
+			const contAddr: number = this.progLen;
+			this.patchWord(enterPos + 1, failAddr);
+			this.patchWord(exitPos + 2, contAddr);
+			this.patchWord(failAddr + 2, contAddr);
+		} else if (capturing) {
 			this.emit2(RegExpCompiler.OP_SAVE, idx * 2 + 1);
+		}
 	}
 	private parseEscape(): void {
 		let c: number = this.charAt(this.pos++);
@@ -563,6 +592,9 @@ export class RegExp {
 	static readonly OP_FAIL: 	number = 12;
 	static readonly OP_SPACE: 	number = 13;
 	static readonly OP_NSPACE: 	number = 14;
+	static readonly OP_LA_ENTER:number = 15;
+	static readonly OP_LA_EXIT:	number = 16;
+	static readonly OP_LA_FAIL:	number = 17;
 
 	global: 	boolean;
 	ignoreCase: boolean;
@@ -576,6 +608,11 @@ export class RegExp {
 	private stackTop	= 0;
 	private bpc			= 0;
 	private bsp			= 0;
+	// Per-lookahead-assertion (sp, backtrack-stack-depth) snapshots, pushed by OP_LA_ENTER and
+	// consumed by OP_LA_EXIT/OP_LA_FAIL -- see runVM's own comment on those opcodes.
+	private laBase		= new Array<i32>(16);
+	private laSp		= new Array<i32>(16);
+	private laDepth		= 0;
 
 	constructor(public source: string, flags = '') {
 		this.global		= hasFlag(flags, 103);	// 'g'
@@ -633,6 +670,7 @@ export class RegExp {
 
 	private runVM(s: string, start: number): boolean {
 		this.stackTop = 0;
+		this.laDepth = 0;
 		for (let gi = 0; gi < this.groups.length; gi++)
 			this.groups[gi] = -1;
 
@@ -736,6 +774,58 @@ export class RegExp {
 						pc = pc + 1;
 						ok = true;
 					}
+					break;
+				}
+				// Lookahead assertions ((?=X) / (?!X)) compile to ENTER <failPc> ... body ... EXIT
+				// <negate> <contPc>, FAIL <negate> <contPc> (see RegExpCompiler.parseGroup). ENTER
+				// pushes a normal backtrack frame at failPc (so exhausting every alternative in the
+				// body naturally lands on FAIL via the usual popFrame path below) plus a small
+				// (sp, backtrack-depth) snapshot on the side so a body that *succeeds* can discard
+				// its own leftover choice points -- once an assertion has passed or failed, later
+				// backtracking must never revisit which of the body's alternatives did it.
+				case RegExp.OP_LA_ENTER: {
+					const failPc = this.compiled.prog[pc + 1];
+					this.pushFrame(failPc, sp);
+					this.laBase[this.laDepth] = this.stackTop;
+					this.laSp[this.laDepth] = sp;
+					this.laDepth = this.laDepth + 1;
+					pc = pc + 2;
+					ok = true;
+					break;
+				}
+				case RegExp.OP_LA_EXIT: {
+					const negate = this.compiled.prog[pc + 1];
+					const contPc = this.compiled.prog[pc + 2];
+					this.laDepth = this.laDepth - 1;
+					const savedBase = this.laBase[this.laDepth];
+					const savedSp = this.laSp[this.laDepth];
+					if (negate === 0) {
+						// Positive lookahead matched: zero-width, keep the body's captures, drop its
+						// unexplored alternatives, and continue past the assertion.
+						this.stackTop = savedBase;
+						sp = savedSp;
+						pc = contPc;
+						ok = true;
+					} else {
+						// Negative lookahead's body matched, so the assertion itself fails -- discard
+						// the body's own choice points *and* the ENTER frame in one step, then fall
+						// through to the normal backtrack below as if this assertion never had one.
+						this.stackTop = savedBase - (2 + this.groups.length);
+					}
+					break;
+				}
+				case RegExp.OP_LA_FAIL: {
+					const negate = this.compiled.prog[pc + 1];
+					const contPc = this.compiled.prog[pc + 2];
+					this.laDepth = this.laDepth - 1;
+					if (negate === 1) {
+						// Negative lookahead's body exhausted every alternative without matching: the
+						// assertion succeeds, zero-width (sp/groups are already the pre-assertion
+						// snapshot -- popFrame restored them getting here).
+						pc = contPc;
+						ok = true;
+					}
+					break;
 				}
 			}
 			if (!ok) {

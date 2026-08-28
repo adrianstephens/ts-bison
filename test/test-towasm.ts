@@ -2602,6 +2602,8 @@ async function main() {
 			braceRangeLength, groupBackrefMatch, groupBackrefNoMatch, groupCaptureLength, alternation,
 			anchors, ignoreCaseFlag, globalExecCount, wordBoundary,
 			flagsContent, stickyFailsAtWrongOffset, stickyMatchesAtOffset, globalStillScansPastOffset,
+			negLookaheadMatches, negLookaheadRejects, posLookaheadMatches, posLookaheadRejects,
+			negLookaheadAlternation, lookaheadCaptureGroup,
 		} = await compile(`
 			export function literalMatch(): number { const re = new RegExp("abc"); return re.test("xxabcyy") ? 1 : 0; }
 			export function literalNoMatch(): number { const re = new RegExp("abc"); return re.test("xyz") ? 1 : 0; }
@@ -2692,6 +2694,23 @@ async function main() {
 				re.lastIndex = 0;
 				return re.exec("ab") !== null ? 1 : 0;
 			}
+			// Lookahead (?=X) (?!X) -- confirmed-bug regression coverage: "(?!" was silently parsed as
+			// an always-failing pattern (never a compile error), so any regex using it just never matched.
+			export function negLookaheadMatches(): number { const re = new RegExp("readonly(?!\\\\w)"); return re.test("readonly ") ? 1 : 0; }
+			export function negLookaheadRejects(): number { const re = new RegExp("readonly(?!\\\\w)"); return re.test("readonlyX") ? 1 : 0; }
+			export function posLookaheadMatches(): number { const re = new RegExp("foo(?=bar)"); return re.test("foobar") ? 1 : 0; }
+			export function posLookaheadRejects(): number { const re = new RegExp("foo(?=bar)"); return re.test("foobaz") ? 1 : 0; }
+			export function negLookaheadAlternation(): number {
+				const re = new RegExp("(?!a|b)c");
+				return (re.test("cc") ? 1 : 0) * 10 + (re.test("ac") ? 1 : 0);
+			}
+			export function lookaheadCaptureGroup(): number {
+				const re = new RegExp("(?=(a))a");
+				const m = re.exec("a");
+				if (m === null) return -1;
+				const g1 = m.group(1);
+				return g1.length;
+			}
 		`);
 		check('RegExp: literal match', literalMatch(), 1);
 		check('RegExp: literal no-match', literalNoMatch(), 0);
@@ -2718,6 +2737,12 @@ async function main() {
 		check('RegExp: "y" (sticky) fails when the match is past lastIndex, not scanned to', stickyFailsAtWrongOffset(), 1);
 		check('RegExp: "y" (sticky) matches exactly at lastIndex', stickyMatchesAtOffset(), 1);
 		check('RegExp: "g" (non-sticky) still scans forward past lastIndex', globalStillScansPastOffset(), 1);
+		check('RegExp: readonly(?!\\w) matches when not followed by a word char', negLookaheadMatches(), 1);
+		check('RegExp: readonly(?!\\w) rejects when followed by a word char', negLookaheadRejects(), 0);
+		check('RegExp: foo(?=bar) matches when followed by "bar"', posLookaheadMatches(), 1);
+		check('RegExp: foo(?=bar) rejects when not followed by "bar"', posLookaheadRejects(), 0);
+		check('RegExp: (?!a|b)c rejects "cc" at pos 0 (matches at pos 1), matches "ac" (assertion true at pos 1)', negLookaheadAlternation(), 11);
+		check('RegExp: (?=(a))a captures group 1 through the lookahead', lookaheadCaptureGroup(), 1);
 	}
 
 	{
