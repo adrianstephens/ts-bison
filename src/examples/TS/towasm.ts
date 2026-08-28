@@ -1609,6 +1609,109 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		return m.type === 'index' && m.paramType.type === 'ref' && m.paramType.name === 'string' ? m.typeAnnotation : undefined;
 	}
 
+	// The raw {params, result, hasRest, defaults} for one `TS.CallSig`-shaped signature -- shared by a bare
+	// function TYPE (`case 'function'`, below) and each individual member of a genuinely overloaded object
+	// type (`mergeOverloadSigs`, below): both are the exact same shape (`TS.TypeCall`'s own `TypeCall()`
+	// constructor just wraps a `CallSig` with `{type:'call', ...sig}`), so building each overload's own
+	// physical signature reuses this identical generic-substitution/optional-param/anon-return-type logic,
+	// not a second copy of it. Returns `undefined` only when the return type genuinely can't be represented
+	// at all (never silently drops a param -- an unrepresentable param type still throws, same as before).
+	function closureSigParts(sig: TS.CallSig): Required<FuncSig> | undefined {
+		// See `emitClosureLiteral`'s own identical comment (this is the type-annotation-side twin of that
+		// expression-side case, e.g. a `const redo: <T extends U>(t?: T) => T` binding, or a generic closure
+		// passed through a function's own return type) -- same bound substitution, same free-when-bounded
+		// reasoning.
+		let func = sig;
+		if (func.typeParams?.length) {
+			const map = new Map(func.typeParams.map(p => [p.name, p.constraint ?? T.ANY]));
+			func = { ...func, typeParams: undefined, params: func.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p), returnType: func.returnType && T.substituteType(func.returnType, map) };
+		}
+		const params = func.params.map(p => {
+			if (p.default)
+				throw `function type parameter '${describeBinding(p.key)}' cannot have a default value`;
+			// `void` is real, valid TS here (real TS lets a param/field declare `void`, if uselessly) --
+			// there's just no wasm value it can itself represent, so box it as `any` like any other
+			// "no meaningful value" position instead of rejecting otherwise-valid source.
+			const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
+			const boxed = wt === 'void' ? REF_ANY : wt;
+			if (!boxed)
+				throw `function type parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
+			// A bare `p?: T` (optional, no `=`) widens to `T | undefined` for real TS -- give it a
+			// nullable physical slot so an omitted trailing arg's synthesized implicit-`undefined`
+			// default (`defaultsWithImplicitUndefined`, below) is a valid value through `call_ref`.
+			// `p.default` above already rejects a real `= value` default (needs a source expression a
+			// bare function TYPE has no room to write), unaffected by this.
+			return hasMod(p, 'optional') ? nullableWtype(boxed) : boxed;
+		});
+		const defaults = defaultsWithImplicitUndefined(func.params);
+		let hasRest = false;
+		if (func.rest?.typeAnnotation) {
+			const wt = typeOf(func.rest.typeAnnotation);
+			if (!wt || wt === 'void')
+				throw "a function type's rest parameter needs an explicit array type";
+			params.push(wt);
+			hasRest = true;
+		}
+		let result = func.returnType ? typeOf(func.returnType) : 'void';
+		// A function TYPE's return position (as opposed to a value's own inferred type -- `typeOf`'s
+		// general 'object' case deliberately doesn't attempt this, see `ensureAnonObjectShape`'s own
+		// comment) is a genuine declared-type position: an inline `{value: T; consumed: number}`
+		// return annotation, never given a name via `interface`/`type X = ...`, is still real TS and
+		// still needs *some* physical representation. Scoped narrowly to exactly this spot (not a
+		// general `typeOf` fallback) specifically to avoid colliding with a NAMED type that lost its
+		// own `ref` wrapper somewhere upstream (e.g. `T.combineTypes` flattening a union of one
+		// nominal class into its bare structural shape) -- that already-regressed once when tried as
+		// a general fallback; a function type's own return annotation never has this ambiguity, since
+		// nothing upstream of `typeOf` here strips a name off it.
+		if (!result && func.returnType) {
+			const returnResolved = TC.resolve(global, func.returnType);
+			if (returnResolved.type === 'object' && !indexSignatureValueType(returnResolved)) {
+				const cls = ensureAnonObjectShape(returnResolved);
+				result = cls && ownerThisType(cls);
+			}
+		}
+		if (!result)
+			return undefined;
+		return { params, result, hasRest, defaults };
+	}
+
+	// A genuinely overloaded VALUE type (every member of an object type is a 'call' signature, e.g. real
+	// TS's own multi-signature-object representation of an overloaded declaration) -- real TS overloads
+	// are a type-checking-only fiction: there is always exactly one real underlying function at runtime, no
+	// per-call-site dispatch (unlike a NAMED function-declaration *group*, which `resolveOverload` already
+	// handles for real, since there each overload genuinely can share one common implementation body found
+	// by name). A plain VALUE has no name to look up multiple declarations by, and no way to have two
+	// different physical closures underneath one wasm value either way -- so this merges every overload's
+	// own physical signature (each built via `closureSigParts`, above -- same generic-substitution/optional-
+	// param handling as a single function type) into ONE, position by position: a param present in every
+	// overload keeps its own type (boxed `any` if it genuinely varies in kind across overloads); one
+	// missing from some but not all becomes optional/nullable, matching a real omittable trailing arg (the
+	// common case -- one overload a strict prefix of another). Confirmed against a real case (js-parser.ts's
+	// `Rule`, from tison.ts's `makeRule`): its own local `rule` overload group erases to exactly this shape
+	// at runtime -- one implementation, one optional trailing param.
+	function mergeOverloadSigs(sigs: Required<FuncSig>[]): Required<FuncSig> | undefined {
+		if (!sigs.length)
+			return undefined;
+		const maxParams = Math.max(...sigs.map(s => s.params.length));
+		const params: WasmType[] = [];
+		const defaults: (Expr | undefined)[] = [];
+		for (let i = 0; i < maxParams; i++) {
+			const present = sigs.filter(s => s.params.length > i);
+			const distinct = new Set(present.map(s => wasmTypeKey(s.params[i])));
+			const shared = distinct.size === 1 ? present[0].params[i] : REF_ANY;
+			if (present.length < sigs.length) {
+				params.push(nullableWtype(shared));
+				defaults.push({ type: 'identifier', name: 'undefined' });
+			} else {
+				params.push(shared);
+				defaults.push(undefined);
+			}
+		}
+		const resultKinds = new Set(sigs.map(s => wasmTypeKey(s.result)));
+		const result = resultKinds.size === 1 ? sigs[0].result : REF_ANY;
+		return { params, result, hasRest: sigs.some(s => s.hasRest), defaults };
+	}
+
 	function typeOf(t: Type): WasmType | undefined {
 		if (t.type === 'ref' && t.typeArgs?.length) {
 			const decl = LIB_DECL_MAP.get(t.name) ?? userGenericClassDecls.get(t.name);
@@ -1626,6 +1729,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				const cls	= vt && ensureClass('Map', [TS.RefType('string'), vt]);
 				if (cls)
 					return ownerThisType(cls);
+				if (resolved.members.length && resolved.members.every(m => m.type === 'call')) {
+					const sigs = resolved.members.map(closureSigParts);
+					// Every overload must resolve, or this isn't attempted at all -- a partial merge would
+					// silently misrepresent the physical signature rather than honestly falling through to
+					// whatever error the caller's own unresolved-type handling already gives.
+					if (sigs.every((s): s is Required<FuncSig> => !!s)) {
+						const merged = mergeOverloadSigs(sigs);
+						if (merged) {
+							const key = `(${merged.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(merged.result)}${merged.hasRest ? '...' : ''}${merged.defaults.map(d => d ? '?' : '.').join('')}`;
+							let wt = closureWasmTypes.get(key);
+							if (!wt)
+								closureWasmTypes.set(key, wt = { closure: merged });
+							return wt;
+						}
+					}
+				}
 				break;
 			}
 			/*
@@ -1676,70 +1795,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			}
 			case 'function': {
 				// Builds (and memoizes) the `{closure: FuncSig}` `WasmType` for a TS function type
-				let func = resolved;
-				//return closureFuncSigType(resolved);
-				// See `emitClosureLiteral`'s own identical comment (this is the type-annotation-side twin of
-				// that expression-side case, e.g. a `const redo: <T extends U>(t?: T) => T` binding, or a
-				// generic closure passed through a function's own return type) -- same bound substitution,
-				// same free-when-bounded reasoning.
-				if (func.typeParams?.length) {
-					const map = new Map(func.typeParams.map(p => [p.name, p.constraint ?? T.ANY]));
-					func = { ...func, typeParams: undefined, params: func.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p), returnType: func.returnType && T.substituteType(func.returnType, map) };
-				}
-				const params = func.params.map(p => {
-					if (p.default)
-						throw `function type parameter '${describeBinding(p.key)}' cannot have a default value`;
-					// `void` is real, valid TS here (real TS lets a param/field declare `void`, if uselessly) --
-					// there's just no wasm value it can itself represent, so box it as `any` like any other
-					// "no meaningful value" position instead of rejecting otherwise-valid source.
-					const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
-					const boxed = wt === 'void' ? REF_ANY : wt;
-					if (!boxed)
-						throw `function type parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
-					// A bare `p?: T` (optional, no `=`) widens to `T | undefined` for real TS -- give it a
-					// nullable physical slot so an omitted trailing arg's synthesized implicit-`undefined`
-					// default (`defaultsWithImplicitUndefined`, below) is a valid value through `call_ref`.
-					// `p.default` above already rejects a real `= value` default (needs a source expression a
-					// bare function TYPE has no room to write), unaffected by this.
-					return hasMod(p, 'optional') ? nullableWtype(boxed) : boxed;
-				});
-				const defaults = defaultsWithImplicitUndefined(func.params);
-				if (func.rest?.typeAnnotation) {
-					const wt = typeOf(func.rest.typeAnnotation);
-					if (!wt || wt === 'void')
-						throw "a function type's rest parameter needs an explicit array type";
-					params.push(wt);
-				}
-				let result = func.returnType ? typeOf(func.returnType) : 'void';
-				// A function TYPE's return position (as opposed to a value's own inferred type -- `typeOf`'s
-				// general 'object' case deliberately doesn't attempt this, see `ensureAnonObjectShape`'s own
-				// comment) is a genuine declared-type position: an inline `{value: T; consumed: number}`
-				// return annotation, never given a name via `interface`/`type X = ...`, is still real TS and
-				// still needs *some* physical representation. Scoped narrowly to exactly this spot (not a
-				// general `typeOf` fallback) specifically to avoid colliding with a NAMED type that lost its
-				// own `ref` wrapper somewhere upstream (e.g. `T.combineTypes` flattening a union of one
-				// nominal class into its bare structural shape) -- that already-regressed once when tried as
-				// a general fallback; a function type's own return annotation never has this ambiguity, since
-				// nothing upstream of `typeOf` here strips a name off it.
-				if (!result && func.returnType) {
-					const returnResolved = TC.resolve(global, func.returnType);
-					if (returnResolved.type === 'object' && !indexSignatureValueType(returnResolved)) {
-						const cls = ensureAnonObjectShape(returnResolved);
-						result = cls && ownerThisType(cls);
-					}
-				}
-				if (!result)
+				const parts = closureSigParts(resolved);
+				if (!parts)
 					throw 'a function type has an unsupported return type';
+				const { params, result, hasRest, defaults } = parts;
 				// `hasRest` folded into the memoization key too -- see `funcSigEq`'s own comment on why it's part
 				// of a closure's real type identity, not just incidental metadata. Which *positions* are
 				// omittable is folded in too (`defaults.map(...)`) -- two closure types can share an identical
 				// physical `WasmType` signature (a genuinely-nullable-but-required param and a truly optional
 				// one both widen to the same nullable wtype) while differing on whether a call site may omit
 				// the argument, so the physical signature alone isn't a safe cache key here.
-				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${func.rest ? '...' : ''}${defaults.map(d => d ? '?' : '.').join('')}`;
+				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${hasRest ? '...' : ''}${defaults.map(d => d ? '?' : '.').join('')}`;
 				let wt = closureWasmTypes.get(key);
 				if (!wt)
-					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest: !!func.rest, defaults } });
+					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest, defaults } });
 				return wt;
 			}
 		}
