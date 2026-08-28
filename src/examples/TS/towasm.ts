@@ -6387,13 +6387,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// comment on unreachable-code handling only actually held for those, not top-level functions, until now.
 	// A generic entry additionally has no single physical function to eagerly compile at all (like a generic
 	// top-level class, kept out of the eagerly-seeded `classes` map for the same reason) -- only a real call
-	// site (`ensureGenericFunc`) can ever produce a concrete instantiation, so an *exported* generic function
-	// (no fixed signature to give the export) is a real error, not silently skipped.
+	// site (`ensureGenericFunc`) can ever produce a concrete instantiation. An *exported* generic function has
+	// no fixed signature to give a wasm-level export, so it's just skipped here -- a library module's own
+	// generic exports are still reachable to other compiled-in files via the ordinary named/namespace-import
+	// resolution in `emitCall` etc., which needs no wasm-level export at all.
 	for (const [name, decl] of functionDeclByName) {
 		if (!exportedNames.has(name))
 			continue;
 		if (decl.typeParams?.length)
-			continue;//throw `exported function '${name}' is generic -- a generic function has no single fixed signature to export`;
+			continue;
 		const info = compileFunc(name, decl);
 		if (info)
 			(mod.exports??=[]).push({ name, kind: 'func', index: info.funcIndex });
