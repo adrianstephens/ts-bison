@@ -787,6 +787,17 @@ function hoist(stmts: TS.Statement[], scope: Scope, TC: T.TypeContext) {
 						if (value)
 							T.stampScope(value, scope);
 						Object.defineProperty(t, 'returnType', { value, writable: true, configurable: true, enumerable: true });
+						// Also stamped onto the REAL declaration (`d`, reachable via `Scope.decl` -- the same
+						// object `functionDeclByName` holds) -- `t` itself is only ever a throwaway synthetic
+						// clone built fresh by `FixSig`, never seen again once `hoist()` returns. Without this, a
+						// consumer needing to actually COMPILE `d` (not just type-check a reference to it) has
+						// no way to see this inferred type at all -- `d.returnType` stays permanently unset even
+						// after real inference has already happened. Safe to stamp unconditionally: `t`'s own
+						// typeParams came from `d.typeParams` (via `FixSig`), so this represents the function's
+						// own template-level shape (in terms of its own still-abstract type params, if generic)
+						// either way -- the exact same shape an explicit annotation on `d` would already give,
+						// consistent regardless of which caller happens to trigger the inference first.
+						d.returnType = value;
 					},
 				});
 

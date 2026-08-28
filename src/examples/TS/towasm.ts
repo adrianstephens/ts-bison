@@ -2963,6 +2963,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			throw "'this' inside a function expression is not supported -- only an arrow function's lexical 'this' is";
 
 		for (const name of free) {
+			// `undefined`/`NaN`/`Infinity` are always-valid identifiers `case 'identifier'`'s own codegen
+			// (and `isNullLiteral`, for `undefined` specifically) handles directly, regardless of lexical
+			// scope -- never real bindings `collectFreeVars` should have treated as needing capture/
+			// resolution at all (a real, pre-existing gap: any of the three used inside a nested closure,
+			// e.g. `extra !== undefined`, threw here unconditionally before this).
+			if (name === 'undefined' || name === 'NaN' || name === 'Infinity')
+				continue;
 			if (!ctx.resolvesName(name) && !resolvesGlobally(ctx.homeModule, name))
 				throw `unresolved identifier '${name}'`;
 		}
@@ -4638,6 +4645,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			}
 
 			case 'function_decl':
+				// A bodyless declaration is one signature of a local overload group (`hoist()`'s own top-
+				// level handling already treats these the same way -- only the one real, bodied
+				// implementation a group always has gets registered/compiled; the signatures exist purely
+				// for the checker's own overload resolution, nothing to emit here at all). Without this, two
+				// or more overload signatures sharing a name each tried to declare their own same-named
+				// local, hitting the genuine "redeclared" guard below meant for real, user-visible shadowing.
+				if (!s.body)
+					return;
 				ctx.emit(I.local.set(ctx.declareLocal(s.name, emitClosureLiteral(s, ctx, true)).index));
 				return;
 
