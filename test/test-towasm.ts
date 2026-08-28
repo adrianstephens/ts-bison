@@ -38,13 +38,13 @@ for (let i = 0; i < f.length; i++) {
 // accepts/rejects a program, independent of whatever towasm.ts backend gaps its shape might otherwise hit.
 function typeErrors(src: string): string[] {
 	const program		= parser.parse(src);
-	const diagnostics	= TStypeCheck(program, libScope);
+	const diagnostics	= TStypeCheck(program, new T.Scope(libScope));
 	return diagnostics.filter(d => d.severity === SEVERITY.ERROR).map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`);
 }
 
 async function compile(src: string) {
 	const program		= parser.parse(src);
-	const diagnostics	= TStypeCheck(program, libScope);
+	const diagnostics	= TStypeCheck(program, new T.Scope(libScope));
 	const errors		= diagnostics.filter(d => d.severity === SEVERITY.ERROR);
 	if (errors.length)
 		throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
@@ -4323,7 +4323,7 @@ async function main() {
 				return g(p.x);
 			}
 		`);
-		const diagnostics = TStypeCheck(program, libScope);
+		const diagnostics = TStypeCheck(program, new T.Scope(libScope));
 		assert(!diagnostics.some(d => d.severity === SEVERITY.ERROR), 'unexpected type errors');
 		const mod = TStoWasm(program);
 		const { types, groupSizes } = mod.types!;

@@ -613,9 +613,8 @@ function pushDepthExhaustionGap(TC: T.TypeContext, diagnostics: Diagnostic[]) {
 // that consumer doesn't need to re-check the program a second time just to see those declarations from
 // a scope its own code actually reaches. Optional and defaults to a bare `T.makeGlobal()`, unchanged
 // from before, for callers with no such consumer (e.g. `TStoDecl`-only or checker-only use).
-export function TStypeCheck(ast: TS.Program, libScope?: Scope): Diagnostic[] {
+export function TStypeCheck(ast: TS.Program, global: Scope): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
-	const global = libScope ? new Scope(libScope) : T.makeGlobal();
 	const TC = new T.TypeContext;
 	checkBlock(ast.body, global, TC, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
 	pushDepthExhaustionGap(TC, diagnostics);

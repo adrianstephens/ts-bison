@@ -2090,7 +2090,7 @@ export class Scope {
 	addType(name: string, type: Type, typeParams?: TS.TypeParam[])	{ this.types.set(name, {type, typeParams}); }
 	// See `TypeEntry.isTypeParam`'s own comment -- `constraint` is only an upper-bound approximation, not
 	// a real resolvable alias; `isAbstract` treats a flagged entry as still abstract accordingly.
-	addTypeParam(name: string, constraint: Type)						{ this.types.set(name, {type: constraint, isTypeParam: true}); }
+	addTypeParam(name: string, constraint: Type)	{ this.types.set(name, {type: constraint, isTypeParam: true}); }
 	addNarrowing(name: string, t: Type)				{ (this.narrowings ??= new Map()).set(name, t); }
 	addAlias(d: JS.Var<any>)						{ (this.aliases ??= new Map()).set(d.name, d.init); }
 	addNamespace(name: string, s: Scope)			{ (this.namespaces ??= new Map()).set(name, s); }

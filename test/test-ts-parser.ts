@@ -1,5 +1,6 @@
 import * as JSX from '../src/examples/TS/jsx-parser';
 import * as TS from '../src/examples/TS/ts-parser';
+import * as T from '../src/examples/TS/type-utils';
 import * as vsdg from '../src/examples/TS/vsdg';
 
 import { Output} from '../src/examples/TS/tocode';
@@ -24,7 +25,7 @@ function test(name: string, code: string, format = 20) {
 	try {
 		console.log('====' + name + '====');
 		const program		= parser.parse(code);
-		const diagnostics	= TStypeCheck(program);
+		const diagnostics	= TStypeCheck(program, T.makeGlobal());
 
 		for (const d of diagnostics) {
 			total_sev[d.severity] ??= 0;
