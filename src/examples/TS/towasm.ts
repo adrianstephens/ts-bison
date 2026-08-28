@@ -1341,6 +1341,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	const moduleBodies			= new Map<string, TS.Statement[]>([['.', ast.body], ...(modules ?? [])]);
 	const namespaceImportsByModule = namespaceImports ?? new Map<string, Map<string, string>>();
 	const namedImportsByModule = namedImports ?? new Map<string, Map<string, { module: string; name: string }>>();
+	// Recovers a top-level statement's own home module string -- `Scope.decl(name)` (via `declScope`) gives
+	// back the real declaration object directly, but a plain `var_decl` (unlike a function/class, both
+	// already `homeKey`-scoped via `functionDeclByName`/per-module `classes`) has no other module-scoped
+	// registration at all, so a consumer needing to compile ITS OWN cross-module references correctly
+	// (`ensureLazyGlobal`'s own `FunctionContext.homeModule`) has no other way to recover which module it
+	// came from. Populated once, below, in the same pass that already visits every module's own statements.
+	const stmtHomeModule		= new Map<TS.Statement, string>();
 
 	function homeKey(homeModule: string, name: string) {
 		return homeModule === '.' ? name : homeModule + '\0' + name;
@@ -1385,6 +1392,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	let data				= new Uint8Array(0);
 	const strings			= new Map<string, number>;
 	const globals			= new Map<string, Global>;
+	// `ensureLazyGlobal`'s own wrapper `FuncInfo`s, keyed the same `homeKey` way as `funcs` itself.
+	const lazyGlobals		= new Map<string, FuncInfo>;
 
 	let forTempCounter			= 0;
 	let destructureTempCounter	= 0;
@@ -1464,6 +1473,53 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		if (!globals.has(name))
 			globals.set(name, {wtype, index: globals.size, init, mut});
 		return globals.get(name)!;
+	}
+
+	// A top-level `const X = someFactory(...)` (a real, non-foldable call expression, not a compile-time
+	// constant `ensureGlobal` already handles, and not `function_decl`-shaped either -- the pervasive
+	// declarative-DSL idiom this whole grammar-spec pair is built from: `export const Rule =
+	// makeRule<any>(...)`, `terminal(...)`, `Rules(...)`, ...) has no wasm-level representation at all until
+	// something actually calls the factory. Real wasm globals can only be initialized from a compile-time
+	// constant, so this can't just become an eagerly-initialized global the way a foldable const does --
+	// lazy-on-first-use instead (the user's own explicit call over eager cross-module init ordering): a real
+	// mutable, nullable global starts `null`; a tiny wrapper function checks it once per program run,
+	// computing and caching the real value on the first call, returning the cached value on every one after.
+	// `d`/`declScope`: the declarator and its own declaring scope, both from `Scope.decl`'s new lookup
+	// (`hoist()`'s `exportScope` loop stamps `addDecl` for exactly this shape) -- `d.init` is compiled with
+	// `declScope` as this wrapper's own home scope, so any name it references (another lazy global, a
+	// sibling function) resolves against ITS OWN declaring module, not the caller's.
+	function ensureLazyGlobal(name: string, homeModule: string, d: JS.Var<Type>, declScope: Scope): FuncInfo | undefined {
+		const key = homeKey(homeModule, name);
+		const existing = lazyGlobals.get(key);
+		if (existing)
+			return existing;
+
+		const checkedType = declScope.value(name);
+		const wt = checkedType && typeOf(checkedType);
+		if (!wt || wt === 'void' || !d.init)
+			return undefined;
+		const slotName = `$lazy$${key}`;
+		const g = ensureGlobal(slotName, nullableWtype(wt), { type: 'identifier', name: 'undefined' }, true);
+
+		const { funcIndex, typeIndex } = registerFunc([], toResults(wt));
+		const info: FuncInfo = { params: [], result: wt, funcIndex, typeIndex };
+		lazyGlobals.set(key, info);
+		worklist.push(withCatch(() => {
+			const ctx = new FunctionContext(name, new Scope(declScope), plainReturn(wt), undefined, homeModule);
+			// Hand-emitted, not `emitStmt`/AST-synthesized like most of this file's other desugarings --
+			// `wtypeOf`/`checkerTypeOf` (used throughout ordinary codegen to re-derive an expression's own
+			// static type) can't see `slotName` at all, since it was never real source the checker ever
+			// type-checked; only `d.init` itself (real source) goes through the ordinary, checker-aware
+			// `emitAs`. `if (slot === null) slot = <init>; return slot!;`
+			ctx.emit(I.global.get(g.index), I.ref.is_null);
+			const old = ctx.swapOut();
+			emitAs(d.init!, ctx, g.wtype);
+			ctx.emit(I.global.set(g.index));
+			ctx.emit(I.if(undefined, ctx.swapOut(old)));
+			ctx.emit(I.global.get(g.index), I.ref.as_non_null, I.return);
+			info.body = ctx.toFuncBody(0, toValType);
+		}, name, homeModule));
+		return info;
 	}
 
 	function addData(newdata: Uint8Array, align = 1): number {
@@ -3887,6 +3943,37 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 							// The code pointer (funcref) is pushed last -- `call_ref` consumes it off the stack top, after every real argument.
 							ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 							return sig.result;
+						}
+					}
+					// A cross-module (or same-module, non-entry) `const X = someFactory(...)` -- not a
+					// `function_decl`, so nothing above ever finds it. `ctx.scope` (correctly rooted at this
+					// function's own declaring module, see `compileFunc`'s `homeScope`) resolves it via the
+					// same `Scope.decl` mechanism `ensureClass`'s own `declScope` param already uses for a
+					// non-entry class. `ensureLazyGlobal` computes the real value once, lazily, on first call
+					// (the pervasive `Rule([...], ...)`/`terminal(...)`/`Rules(...)` idiom this whole grammar-
+					// spec pair is built from); the result is then called through the ordinary closure
+					// `call_ref` mechanism, same as any other closure value.
+					{
+						const calleeName = e.callee.name;
+						const varStmt = ctx.scope.decl(calleeName);
+						if (varStmt?.type === 'var_decl') {
+							const d = varStmt.declarations.find(d => d.name === calleeName);
+							if (d) {
+								// `ctx.homeModule` is the CALLER's own home module, not necessarily where this
+								// value is actually declared -- `stmtHomeModule` recovers the real one.
+								const wrapper = ensureLazyGlobal(calleeName, stmtHomeModule.get(varStmt) ?? ctx.homeModule, d, ctx.scope);
+								const calleeWtype = wrapper?.result;
+								if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
+									const sig = calleeWtype.closure;
+									const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
+									ctx.emit(I.call(wrapper!.funcIndex));
+									const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
+									ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
+									emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx);
+									ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+									return sig.result;
+								}
+							}
 						}
 					}
 					// One-shot: consumed here (for this call's own generic type-param inference, if it applies)
@@ -6336,6 +6423,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		for (let s of body) {
 			if (s.type === 'export_decl')
 				s = s.declaration;
+			stmtHomeModule.set(s, moduleId);
 			if (s.type === 'function_decl' && s.body) {
 				functionDeclByName.set(homeKey(moduleId, s.name), s);
 			} else if (moduleId === '.' && s.type === 'class_decl') {
@@ -6530,6 +6618,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	}
 
 	for (const info of funcs.values())
+		place(info);
+
+	for (const info of lazyGlobals.values())
 		place(info);
 
 	for (const info of closureLiterals)

@@ -835,8 +835,17 @@ export function exportScope(body: TS.Statement[], parent: Scope, TC: T.TypeConte
 	for (let stmt of body) {
 		if (stmt.type === 'export_decl')
 			stmt = stmt.declaration;
-		if (stmt.type === 'var_decl')
-			stmt.declarations.forEach(d => hoistVar(inner, TC, d, stmt.kind !== 'const'));
+		if (stmt.type === 'var_decl') {
+			const varStmt = stmt;
+			stmt.declarations.forEach(d => {
+				hoistVar(inner, TC, d, varStmt.kind !== 'const');
+				// Lets a consumer that needs the real initializer (not just its derived type) -- e.g. towasm.ts
+				// lazily initializing a cross-module `const X = someFactory(...)` on first use -- reach it via
+				// the same `declScope`/`Scope.decl` mechanism a function/class declaration already does.
+				if (typeof d.name === 'string')
+					inner.addDecl(d.name, varStmt);
+			});
+		}
 	}
 
 	const assign = body.find(s => s.type === 'export_assignment');
