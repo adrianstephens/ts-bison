@@ -4821,8 +4821,26 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			if (decl.typeParams?.length)
 				throw `generic function '${name}' is not supported`;
 
-			// No annotation defaults to `void` (matching real TS's inference) -- but an annotation that's present and doesn't resolve is still a real error, not silently `void` too.
-			const result = decl.returnType ? typeOf(decl.returnType) : 'void';
+			// No annotation defaults to `void` (matching real TS's inference) -- but an annotation that's
+			// present and doesn't resolve is still a real error, not silently `void` too.
+			// A cross-module function's own `decl` (straight from `functionDeclByName`, the real AST node)
+			// never gets its inferred return type back-filled at all -- that only ever happens on a
+			// throwaway synthetic clone `hoist()` builds for the declaring module's own scope entry
+			// (`exportScope`'s lazy, self-memoizing `returnType` accessor -- see its own comment), never
+			// copied back onto `decl` itself. `global.value(name)`, when this name is imported directly
+			// into the entry module (the reachable case: type-checking the call site that made this
+			// function's own compilation necessary in the first place already had to trigger+cache that
+			// lazy accessor with the correct, properly `declScope`-stamped result), recovers the exact same
+			// already-correctly-inferred signature -- far safer than re-deriving inference here with no way
+			// to see the declaring module's own local names. Falls through to the old `'void'` default
+			// whenever this doesn't apply (not a function-typed value, or the name isn't directly reachable
+			// this way at all -- e.g. a function only ever called indirectly through another non-entry
+			// module), unchanged from before.
+			const inferredType = !decl.returnType ? global.value(name) : undefined;
+			const inferredReturnType = inferredType?.type === 'function' ? inferredType.returnType : undefined;
+			const result = decl.returnType ? typeOf(decl.returnType)
+				: inferredReturnType ? typeOf(inferredReturnType)
+				: 'void';
 			if (!result)
 				throw `'${name}' has an unsupported return type`;
 
