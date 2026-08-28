@@ -2021,6 +2021,14 @@ export class Scope {
 	private narrowings?:	Map<string, Type>;	// control-flow refinements, consulted before declarations
 	private aliases?:		Map<string, Expr>;	// const initializers -- narrowing a const also narrows through its initializer (TS 4.4 aliased conditions)
 	private namespaces?:	Map<string, Scope>;	// nested namespace/module scopes, keyed by their bound name -- consulted by `resolve` for a dotted type ref (`NS.Foo`)
+	// The real `function_decl`/`class_decl` statement a name resolves to, alongside its derived `value`/
+	// `type` entries -- a consumer that needs to actually COMPILE a declaration (not just type-check a
+	// reference to it) has no other way to get from "this name, in this scope" back to real source: `value`/
+	// `type` only ever carry a *derived* `Type`, never a pointer to what produced it. Lets a cross-module
+	// consumer resolve via the same scope-chain/`declScope` mechanism already used for types, instead of a
+	// separate name-mangling scheme (e.g. towasm.ts's own `homeModule`/`homeKey`) reinventing module-scoped
+	// lookup on the side.
+	private decls?:			Map<string, TS.Statement>;
 
 	// Set only on a generic class's own instance scope (`checkClassMembers`, when the class declares type
 	// params) -- marks every scope descending from it (an instance method's own body scope, any nested
@@ -2038,6 +2046,7 @@ export class Scope {
 	declared(name: string): Type | undefined		{ return this.values.get(name) ?? this.parent?.declared(name); }
 	alias(name: string): Expr | undefined			{ return this.aliases?.get(name) ?? (this.values.has(name) ? undefined : this.parent?.alias(name)); }
 	namespace(name: string): Scope | undefined		{ return this.namespaces?.get(name) ?? this.parent?.namespace(name); }
+	decl(name: string): TS.Statement | undefined	{ return this.decls?.get(name) ?? this.parent?.decl(name); }
 
 	// Reverse of a normal ref lookup: a resolved structural type may happen to be *exactly* some declared class/
 	// interface/alias's own registered shape (e.g. `infer R` binding to a class reference's instance type, reached
@@ -2085,6 +2094,7 @@ export class Scope {
 	addNarrowing(name: string, t: Type)				{ (this.narrowings ??= new Map()).set(name, t); }
 	addAlias(d: JS.Var<any>)						{ (this.aliases ??= new Map()).set(d.name, d.init); }
 	addNamespace(name: string, s: Scope)			{ (this.namespaces ??= new Map()).set(name, s); }
+	addDecl(name: string, stmt: TS.Statement)		{ (this.decls ??= new Map()).set(name, stmt); }
 
 	mergeType(name: string, type: Type, typeParams: TS.TypeParam[] | undefined) {
 		return this.mergeTypeEntry(name, {type, typeParams});
@@ -2137,6 +2147,9 @@ export class Scope {
 			const ns = from.namespace(local);
 			if (ns)
 				this.addNamespace(pub, ns);
+			const d = from.decl(local);
+			if (d)
+				this.addDecl(pub, d);
 		}
 		const te = from.type(local);
 		if (te)

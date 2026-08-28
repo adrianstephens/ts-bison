@@ -710,6 +710,7 @@ function hoist(stmts: TS.Statement[], scope: Scope, TC: T.TypeContext) {
 				const { instance, value } = classShapes(stmt as TS.Class, scope, TC);
 				scope.mergeType(stmt.name, instance, stmt.typeParams as TS.TypeParam[]);
 				scope.addValue(stmt.name, value);
+				scope.addDecl(stmt.name, stmt);
 				break;
 			}
 			case 'enum_decl': {
@@ -759,6 +760,11 @@ function hoist(stmts: TS.Statement[], scope: Scope, TC: T.TypeContext) {
 		if (chosen.length > 1) {
 			// `declScope`/`stampSig`: each overload's own param/return types resolve in *this* module's scope, not whichever module calls it.
 			scope.addValue(name, TS.ObjectType(chosen.map(d => TS.TypeCall(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope)))));
+			// The real, compilable implementation (the one non-bodyless declaration a real overload group
+			// always has) -- there's no single decl a bodyless *signature* alone could resolve to.
+			const impl = decls.find(d => d.body);
+			if (impl)
+				scope.addDecl(name, impl);
 		} else {
 			const d = chosen[0];
 			const t = TS.FunctionType(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope));
@@ -787,6 +793,7 @@ function hoist(stmts: TS.Statement[], scope: Scope, TC: T.TypeContext) {
 
 			}
 			scope.addValue(name, t);
+			scope.addDecl(name, d);
 		}
 	}
 }
