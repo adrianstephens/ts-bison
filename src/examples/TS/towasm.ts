@@ -333,7 +333,10 @@ function wTypeKey(type: wasm.SubType): string|undefined {
 }
 
 
-interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean }
+// `defaults`: only ever set for a function TYPE with a bare `p?: T` (optional, no `=`) trailing param --
+// see `case 'function'`'s own comment. A closure *literal*'s own params can never be optional (a real,
+// separate restriction, unaffected), so this stays `undefined` for every other `FuncSig` producer.
+interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean; defaults?: (Expr | undefined)[] }
 interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; defaults?: (Expr | undefined)[]; reassignsThis?: boolean }
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
@@ -1620,8 +1623,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				const params = func.params.map(p => {
 					if (p.default)
 						throw `function type parameter '${describeBinding(p.key)}' cannot have a default value`;
-					if (p.modifiers?.includes('optional'))
-						throw `function type parameter '${describeBinding(p.key)}' cannot be optional`;
 					// `void` is real, valid TS here (real TS lets a param/field declare `void`, if uselessly) --
 					// there's just no wasm value it can itself represent, so box it as `any` like any other
 					// "no meaningful value" position instead of rejecting otherwise-valid source.
@@ -1629,8 +1630,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					const boxed = wt === 'void' ? REF_ANY : wt;
 					if (!boxed)
 						throw `function type parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
-					return boxed;
+					// A bare `p?: T` (optional, no `=`) widens to `T | undefined` for real TS -- give it a
+					// nullable physical slot so an omitted trailing arg's synthesized implicit-`undefined`
+					// default (`defaultsWithImplicitUndefined`, below) is a valid value through `call_ref`.
+					// `p.default` above already rejects a real `= value` default (needs a source expression a
+					// bare function TYPE has no room to write), unaffected by this.
+					return hasMod(p, 'optional') ? nullableWtype(boxed) : boxed;
 				});
+				const defaults = defaultsWithImplicitUndefined(func.params);
 				if (func.rest?.typeAnnotation) {
 					const wt = typeOf(func.rest.typeAnnotation);
 					if (!wt || wt === 'void')
@@ -1658,16 +1665,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				if (!result)
 					throw 'a function type has an unsupported return type';
 				// `hasRest` folded into the memoization key too -- see `funcSigEq`'s own comment on why it's part
-				// of a closure's real type identity, not just incidental metadata.
-				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${func.rest ? '...' : ''}`;
+				// of a closure's real type identity, not just incidental metadata. Which *positions* are
+				// omittable is folded in too (`defaults.map(...)`) -- two closure types can share an identical
+				// physical `WasmType` signature (a genuinely-nullable-but-required param and a truly optional
+				// one both widen to the same nullable wtype) while differing on whether a call site may omit
+				// the argument, so the physical signature alone isn't a safe cache key here.
+				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${func.rest ? '...' : ''}${defaults.map(d => d ? '?' : '.').join('')}`;
 				let wt = closureWasmTypes.get(key);
 				if (!wt)
-					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest: !!func.rest } });
+					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest: !!func.rest, defaults } });
 				return wt;
 			}
 		}
 		if (t.type === 'ref') {
-			const cls = ensureClass(t.name, t.typeArgs);
+			const cls = ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
 			if (cls)
 				return ownerThisType(cls);
 		}
@@ -1852,7 +1863,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// an `intersection` type, which no longer carries a traceable class name/typeArgs at all. Safe
 			// unconditionally: `ensureClass` returns `undefined`, no throw, for a name that's neither a real
 			// class nor a valid alias, so this simply falls through to the existing logic below when it doesn't apply.
-			const direct = ensureClass(t.name, t.typeArgs);
+			const direct = ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
 			if (direct)
 				return direct;
 		}
@@ -2487,7 +2498,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				ctx.emit(I.struct.get(owner.typeIndex, fieldIndex!));
 				const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, fieldWtype);
 				ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-				emitCallArgs(name, sig.params, undefined, !!sig.hasRest, args, ctx);
+				emitCallArgs(name, sig.params, sig.defaults, !!sig.hasRest, args, ctx);
 				ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 				return sig.result;
 			}
@@ -2790,15 +2801,18 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const params = e.params.map((p): ResolvedParam => {
 			if (p.default)
 				throw `closure parameter '${describeBinding(p.key)}' cannot have a default value`;
-			if (hasMod(p, 'optional'))
-				throw `closure parameter '${describeBinding(p.key)}' cannot be optional`;
 			// See `closureFuncSigType`'s own identical comment -- box a real but wasm-unrepresentable
 			// `void` as `any` rather than reject otherwise-valid source.
 			const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
 			const boxed = wt === 'void' ? REF_ANY : wt;
 			if (!boxed)
 				throw `closure parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
-			return {key: p.key, wtype: boxed, tsType: p.typeAnnotation! };
+			// A bare `p?: T` param here just needs a nullable physical slot to receive whatever a *caller*
+			// passes for an omitted argument -- omission itself is entirely the caller's own concern
+			// (`closureFuncSigType`'s `defaults`, built from the field/variable's own declared TYPE, not
+			// this literal), since nothing ever calls this literal's own compiled function directly while
+			// skipping an argument; `call_ref` always supplies a real value for every physical param.
+			return {key: p.key, wtype: hasMod(p, 'optional') ? nullableWtype(boxed) : boxed, tsType: p.typeAnnotation! };
 		});
 		if (e.rest?.typeAnnotation) {
 			const wt = typeOf(e.rest.typeAnnotation);
@@ -3942,9 +3956,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						emitExpr(e.callee, ctx);
 						const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
 						ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-						// No defaults for a closure (an explicit restriction above, on the literal side) --
-						// same rest-packing as a plain named function's own call site, reusing `emitCallArgs`.
-						emitCallArgs(e.callee.name, sig.params, undefined, !!sig.hasRest, e.arguments, ctx);
+						// A closure *literal*'s own params still can't be optional (a real, separate
+						// restriction, unaffected) -- `sig.defaults` is only ever populated when this closure's
+						// static TYPE (not necessarily its concrete value) declared a bare `p?: T` trailing
+						// param, same rest-packing as a plain named function's own call site either way.
+						emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx);
 						// The code pointer (funcref) is pushed last -- `call_ref` consumes it off the stack top, after every real argument.
 						ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 						return sig.result;
@@ -3965,7 +3981,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						emitAs(e.callee, ctx, calleeWtype);
 						const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
 						ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-						emitCallArgs('<indexed closure>', sig.params, undefined, !!sig.hasRest, e.arguments, ctx);
+						emitCallArgs('<indexed closure>', sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx);
 						ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 						return sig.result;
 					}
@@ -5421,22 +5437,29 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		return info;
 	}
 
-	function ensureObjectShape(name: string, typeArgs?: Type[]): ClassInfo | undefined {
+	// `declScope`: a cross-module reference (`t.declScope` on the original `RefType`, see checker.ts's/
+	// type-utils.ts's own `withScope`/`declScopeOf`) resolves `name` where it was actually *declared*, not
+	// wherever it's referenced from -- `global` (the entry module's own checked scope) never sees a type
+	// that was only ever reached transitively (e.g. inferred off an imported function's own return type)
+	// without itself being explicitly imported by name. Defaults to `global`, matching every existing
+	// same-module caller unaffected by this.
+	function ensureObjectShape(name: string, typeArgs?: Type[], declScope?: Scope): ClassInfo | undefined {
+		const scope = declScope ?? global;
 		// Same composite-key convention as `ensureClass` itself -- two different type arguments are two
 		// different physical shapes (e.g. `TypeParam<Type>` vs. a bare, implicitly-`any` `TypeParam`).
-		const key = typeArgs?.length ? `${name}<${typeArgs.map(t => T.typeKey(TC.resolve(global, t))).join(',')}>` : name;
+		const key = typeArgs?.length ? `${name}<${typeArgs.map(t => T.typeKey(TC.resolve(scope, t))).join(',')}>` : name;
 		const existing = classes.get(key);
 		if (existing)
 			return existing;
 
-		if (!global.type(name))
+		if (!scope.type(name))
 			return undefined;
 		// Via a `RefType` (not the entry's own raw, still-generic `.type` directly) so a reference to a
 		// generic interface/alias -- bare (`TypeParam`) or explicit (`TypeParam<X>`) -- goes through
 		// `resolve`'s own type-arg substitution (each param -> its given arg, its own default, or `any`)
 		// instead of leaving the type param itself unresolved in every member's type.
 
-		let resolved = TC.resolve(global, TS.RefType(name, typeArgs));
+		let resolved = TC.resolve(scope, TS.RefType(name, typeArgs));
 		if (resolved.type === 'intersection') {
 			const collectMembers = (t: Type): TS.TypeMember[] => t.type === 'object' ? t.members : t.type === 'intersection' ? t.types.flatMap(t => collectMembers(t)) : [];
 			resolved = TS.ObjectType(collectMembers(resolved));
@@ -5474,7 +5497,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 	// Resolves fields and the struct type eagerly, but only collects method/ctor decls -- building each is
 	// deferred to `ensureMethod`/`ensureCtor`, the same lazy treatment `ensureFunc` gives top-level functions.
-	function ensureClass(name: string, typeArgs?: Type[]): ClassInfo | undefined {
+	function ensureClass(name: string, typeArgs?: Type[], declScope?: Scope): ClassInfo | undefined {
 		// A real generic instantiation (`Box<number>`) is cached under a composite key, not the bare class
 		// name -- two different type arguments are two different physical classes. Keying off the *unresolved* class name (not `TC.resolve`'s expanded form) keeps two classes with identical field shapes from colliding.
 		// A wasm pseudo-type argument (`TypedArray<u8>`/`<i32>`/etc, see `TYPED_ARRAY_TAGS`) is kept
@@ -5510,9 +5533,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				if (!typeArgs?.length) {
 					const alias = resolveClassAlias(name);
 					if (alias)
-						return ensureClass(alias.name, alias.typeArgs);
+						return ensureClass(alias.name, alias.typeArgs, declScope);
 				}
-				return ensureObjectShape(name, typeArgs);
+				return ensureObjectShape(name, typeArgs, declScope);
 			}
 			if (decl.typeParams?.length) {
 				const got = typeArgs?.length ?? 0;
