@@ -1496,6 +1496,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		return offset;
 	}
 
+	function withCatch(item: ()=>void, ...scopes: string[]) {
+		return () => {
+			try {
+				item();
+			} catch (e) {
+				throw new TSWError(e as any, undefined, ...scopes);
+			}
+		};
+	}
+
 	// Every class declaration in the whole program (lib + user, generic + not), scanned once for a plain
 	// named `superClass` reference -- shared by two things that each need "the whole program's inheritance
 	// graph" known up front, before any lazy per-class resolution begins: `ensureClass`'s `final` flag
@@ -2855,7 +2865,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex };
 		closureLiterals.push(info);
 
-		worklist.push(() => {
+		worklist.push(withCatch(() => {
 			const fnCtx		= new FunctionContext(e.name ?? '<anonymous>', new Scope(libGlobal), plainReturn(result), undefined, ctx.homeModule);
 			// Env param first (real wasm param index 0), then this literal's own params -- `toFuncBody`'s `numParams` assumes the first `1 + params.length` declared locals are the real wasm params, in order.
 			const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
@@ -2884,7 +2894,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				emitStmt({ type: 'return', argument: body }, fnCtx);
 			}
 			info.body = fnCtx.toFuncBody(1 + params.length, toValType);
-		});
+		}));
 
 		// Creation site: `struct.new` pops fields in declaration order (`ensureClosureType`'s `[code,
 		// env]`), so the code pointer goes on the stack before the env struct. Each captured value is read via the identifier-read case above, so a capture-of-a-capture resolves like a plain local.
@@ -3030,36 +3040,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	function emitExpr(e: Expr, ctx: FunctionContext, want?: WasmType): WasmType {
 		try { switch (e.type) {
 			case 'literal':
-				if (Array.isArray(e.value)) {
-					// No interpolation at all -- a template of just `${x}` (one part, `.exp` set) still needs the general path below, not this shortcut.
-					if (e.value.length === 1 && !e.value[0].exp) {
-						emitStringConst(e.value[0].str, ctx);
-						return ARR_WTYPE.i16;
-					}
-
-					for (const p of e.value)
-						emitStringConst(p.str, ctx);
-					const hasTrailingLiteral = !e.value[e.value.length - 1].exp;
-					if (!hasTrailingLiteral)
-						emitStringConst('', ctx);
-					ctx.emit(I.array.new_fixed(ensureArrayType('ref'), e.value.length + (hasTrailingLiteral ? 0 : 1)));
-					// The real interpolation count -- not `e.value.length - 1`, which undercounts whenever `hasTrailingLiteral` is false.
-					let valueCount = 0;
-					for (const p of e.value) {
-						if (p.exp) {
-							emitAs(p.exp, ctx, REF_ANY);
-							valueCount++;
-						}
-					}
-					ctx.emit(I.array.new_fixed(ensureArrayType('ref'), valueCount));
-					const decl = LIB_DECL_MAP.get('stringTemplate');
-					if (decl && decl.type === 'function_decl') {
-						const info = funcs.get('stringTemplate') ?? compileFunc('stringTemplate', decl);
-						if (info)
-							ctx.emit(I.call(info.funcIndex));
-					}
-					return ARR_WTYPE.i16;
-				}
 				switch (typeof e.value) {
 					case 'number':
 						// `typeof want === 'string'`: the i32 shortcut only makes sense when the caller wants a
@@ -3084,17 +3064,41 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						return 'i64';
 
 					case 'object':
-						// A `/pattern/flags` literal's own `.value` is a real, native JS `RegExp` object (the
-						// parser's own `REGEX_LITERAL` rule constructs it directly, see `type-utils.ts`'s
-						// identical `REGEXP` type-inference for this same shape) -- desugars to an ordinary
-						// `new RegExp(source, flags)` against `lib/regexp.ts`'s own self-hosted class, reusing
-						// `case 'new'`'s generic `ensureClass`/`ensureCtor` dispatch rather than duplicating it.
 						if (e.value instanceof RegExp) {
+							// desugars to an ordinary `new RegExp(source, flags)` against `lib/regexp.ts`'s own self-hosted class
 							return emitExpr({
 								type: 'new',
 								callee: { type: 'identifier', name: 'RegExp' },
 								arguments: [Literal(e.value.source), Literal(e.value.flags)],
 							}, ctx, want);
+						}
+						if (Array.isArray(e.value)) {
+							if (e.value.length === 1 && !e.value[0].exp) {
+								emitStringConst(e.value[0].str, ctx);
+								return ARR_WTYPE.i16;
+							}
+
+							for (const p of e.value)
+								emitStringConst(p.str, ctx);
+							const hasTrailingLiteral = !e.value[e.value.length - 1].exp;
+							if (!hasTrailingLiteral)
+								emitStringConst('', ctx);
+							ctx.emit(I.array.new_fixed(ensureArrayType('ref'), e.value.length + (hasTrailingLiteral ? 0 : 1)));
+							let valueCount = 0;
+							for (const p of e.value) {
+								if (p.exp) {
+									emitAs(p.exp, ctx, REF_ANY);
+									valueCount++;
+								}
+							}
+							ctx.emit(I.array.new_fixed(ensureArrayType('ref'), valueCount));
+							const decl = LIB_DECL_MAP.get('stringTemplate');
+							if (decl && decl.type === 'function_decl') {
+								const info = ensureFunc('stringTemplate', decl);
+								if (info)
+									ctx.emit(I.call(info.funcIndex));
+							}
+							return ARR_WTYPE.i16;
 						}
 						throw `unsupported literal type '${typeof e.value}'`;
 
@@ -3803,7 +3807,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				// optimization this used to hand-implement here.
 				if (e.callee.type !== 'identifier')
 					throw `'new' is only supported for a known class`;
-				const cls = ensureClass(e.callee.name, e.typeArgs);
+				// `ctx.scope` (not `global`): a non-entry function's own compiled body now roots its scope at
+				// its OWN declaring module (see `compileFunc`'s `homeScope`), so a class declared in the SAME
+				// file as the function being compiled resolves here even when the entry module itself never
+				// imports that class by name at all.
+				const cls = ensureClass(e.callee.name, e.typeArgs, ctx.scope);
 				if (!cls)
 					throw `'new' is only supported for a known class`;
 				const ctor = ensureCtor(cls, e.arguments, ctx);
@@ -3850,54 +3858,93 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					}
 				}
 
+				if (e.callee.type === 'identifier') {
+					// A recursive call to the nested `function_decl` currently being compiled, from inside its
+					// own body -- resolved to a direct, statically-known `call` (reusing the same env), not a
+					// `call_ref` through a closure struct (see `FuncCtx.selfCall`'s own comment for why).
+					if (ctx.selfCall && ctx.name === e.callee.name) {
+						const { funcIndex, params, result, hasRest } = ctx.selfCall;
+						ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index));
+						emitCallArgs(e.callee.name, params, undefined, !!hasRest, e.arguments, ctx);
+						ctx.emit(I.call(funcIndex));
+						return result;
+					}
+					// A closure value, called directly (`callback(x)`) -- checked via `ctx.resolvesName` so a local
+					// shadowing a same-named global function takes priority, matching JS scoping. Bare identifier callee only for now (not e.g. `obj.field(x)`) -- v1 scope, not a fundamental limit.
+					if (ctx.resolvesName(e.callee.name)) {
+						const calleeWtype = ctx.resolvedWtype(e.callee.name);
+						if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
+							const sig = calleeWtype.closure;
+							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
+							emitExpr(e.callee, ctx);
+							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
+							ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
+							// A closure *literal*'s own params still can't be optional (a real, separate
+							// restriction, unaffected) -- `sig.defaults` is only ever populated when this closure's
+							// static TYPE (not necessarily its concrete value) declared a bare `p?: T` trailing
+							// param, same rest-packing as a plain named function's own call site either way.
+							emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx);
+							// The code pointer (funcref) is pushed last -- `call_ref` consumes it off the stack top, after every real argument.
+							ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+							return sig.result;
+						}
+					}
+					// One-shot: consumed here (for this call's own generic type-param inference, if it applies)
+					// and cleared immediately, so it can't leak into this same call's own arguments below (see
+					// `contextualReturn`'s own comment on why that would be wrong).
+					const contextualReturn = ctx.contextualReturn;
+					ctx.contextualReturn = undefined;
+					return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn);
+				}
+
 				// `obj?.method(...)` -- the `?.` sits on the `member` callee (or a chain further out
 				// continues one, e.g. `obj?.a.method(...)` -- `isOptionalChainLink`, not a bare
 				// `e.callee.optional`, see `case 'member'`'s own comment). Treated as one guarded operation:
 				// `obj` evaluated once, checked for null, call only in the non-null arm -- restricted to a real user method (`ensureMethod`), not a `Math`/prelude intrinsic whose result type depends on the call site.
-				if (e.callee.type === 'member' && isOptionalChainLink(e.callee)) {
-					const objExpr = e.callee.object;
-					const methodName = e.callee.property;
-					const objWtype = wtypeOf(objExpr, ctx);
-					if (!objWtype || typeof objWtype === 'string')
-						throw `'a?.${methodName}(...)' needs an object-typed value on its left`;
-					const owner = ownerOf(objExpr, ctx);
-					if (!owner)
-						throw `unknown method '${methodName}'`;
-					const typeArgs = e.typeArgs;
-					const method = ensureMethod(owner, methodName, e.arguments, ctx, typeArgs);
-					if (!method)
-						throw `'a?.${methodName}(...)' is not supported -- only a plain user-defined method (not a 'Math'/prelude intrinsic) can be guarded by '?.' in this pass`;
-					if (method.result === 'void')
-						throw `'a?.${methodName}(...)' is not supported -- '${methodName}' returns 'void', which can't become 'void | undefined'`;
-					emitAs(objExpr, ctx, objWtype);
-					const resultWtype = nullableWtype(method.result);
-					return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
-						// Receiver pushed directly, skipping `emitMethodCall`'s own `receiver` param
-						// needs an explicit `ref.as_non_null` here, always sound since `readCore` only runs in the proven-non-null arm.
-						ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
-						coerceTop(emitMethodCall(owner, methodName, e.arguments, ctx, typeArgs), ctx, resultWtype);
-					});
-				}
-
-				// `super.method(...)` -- by definition never virtual: real TS's own `super.x()` semantics
-				// mean "the ancestor's own implementation, whichever one actually defines it," never "redo
-				// the receiver's runtime-type dispatch" (that's exactly what distinguishes it from
-				// `this.method()`). `emitMethodCall(superClass, ...)` -- not the cascade `ensureVirtualDispatch`
-				// might otherwise route a same-named call through -- reaches `ensureMethod`'s own ordinary
-				// "not overridden by `superClass` itself -> delegate further up the chain" fallback for free,
-				// so this resolves correctly even when `superClass` itself doesn't define `method` either.
-				if (e.callee.type === 'member' && e.callee.object.type === 'super') {
-					const superClass = (ctx.owner && 'fields' in ctx.owner ? ctx.owner as ClassInfo : undefined)?.superClass;
-					if (!superClass)
-						throw `'super.${e.callee.property}(...)' has no superclass to resolve against`;
-					// `this`'s own static type is the current class (more derived than `superClass`) --
-					// wasm-GC struct subtyping (`ensureClass`'s own `supertypes`) makes it directly usable as
-					// `superClass`'s own receiver type, no cast needed, same as any other upcast in this file.
-					emitAs({ type: 'this' }, ctx, superClass.thisWtype!);
-					return emitMethodCall(superClass, e.callee.property, e.arguments, ctx, e.typeArgs, true);
-				}
-
 				if (e.callee.type === 'member') {
+					if (isOptionalChainLink(e.callee)) {
+						const objExpr		= e.callee.object;
+						const methodName	= e.callee.property;
+						const objWtype		= wtypeOf(objExpr, ctx);
+						if (!objWtype || typeof objWtype === 'string')
+							throw `'a?.${methodName}(...)' needs an object-typed value on its left`;
+						const owner = ownerOf(objExpr, ctx);
+						if (!owner)
+							throw `unknown method '${methodName}'`;
+						const typeArgs = e.typeArgs;
+						const method = ensureMethod(owner, methodName, e.arguments, ctx, typeArgs);
+						if (!method)
+							throw `'a?.${methodName}(...)' is not supported -- only a plain user-defined method (not a 'Math'/prelude intrinsic) can be guarded by '?.' in this pass`;
+						if (method.result === 'void')
+							throw `'a?.${methodName}(...)' is not supported -- '${methodName}' returns 'void', which can't become 'void | undefined'`;
+						emitAs(objExpr, ctx, objWtype);
+						const resultWtype = nullableWtype(method.result);
+						return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
+							// Receiver pushed directly, skipping `emitMethodCall`'s own `receiver` param
+							// needs an explicit `ref.as_non_null` here, always sound since `readCore` only runs in the proven-non-null arm.
+							ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
+							coerceTop(emitMethodCall(owner, methodName, e.arguments, ctx, typeArgs), ctx, resultWtype);
+						});
+					}
+
+					// `super.method(...)` -- by definition never virtual: real TS's own `super.x()` semantics
+					// mean "the ancestor's own implementation, whichever one actually defines it," never "redo
+					// the receiver's runtime-type dispatch" (that's exactly what distinguishes it from
+					// `this.method()`). `emitMethodCall(superClass, ...)` -- not the cascade `ensureVirtualDispatch`
+					// might otherwise route a same-named call through -- reaches `ensureMethod`'s own ordinary
+					// "not overridden by `superClass` itself -> delegate further up the chain" fallback for free,
+					// so this resolves correctly even when `superClass` itself doesn't define `method` either.
+					if (e.callee.object.type === 'super') {
+						const superClass = (ctx.owner && 'fields' in ctx.owner ? ctx.owner as ClassInfo : undefined)?.superClass;
+						if (!superClass)
+							throw `'super.${e.callee.property}(...)' has no superclass to resolve against`;
+						// `this`'s own static type is the current class (more derived than `superClass`) --
+						// wasm-GC struct subtyping (`ensureClass`'s own `supertypes`) makes it directly usable as
+						// `superClass`'s own receiver type, no cast needed, same as any other upcast in this file.
+						emitAs({ type: 'this' }, ctx, superClass.thisWtype!);
+						return emitMethodCall(superClass, e.callee.property, e.arguments, ctx, e.typeArgs, true);
+					}
+
 					const obj = e.callee.object;
 					const typeArgs = e.typeArgs;
 					if (obj.type === 'identifier') {
@@ -3951,36 +3998,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					emitAs(obj, ctx, (owner as ClassInfo).thisWtype!);
 					return emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
 				}
-				// A recursive call to the nested `function_decl` currently being compiled, from inside its
-				// own body -- resolved to a direct, statically-known `call` (reusing the same env), not a
-				// `call_ref` through a closure struct (see `FuncCtx.selfCall`'s own comment for why).
-				if (e.callee.type === 'identifier' && ctx.selfCall && ctx.name === e.callee.name) {
-					const { funcIndex, params, result, hasRest } = ctx.selfCall;
-					ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index));
-					emitCallArgs(e.callee.name, params, undefined, !!hasRest, e.arguments, ctx);
-					ctx.emit(I.call(funcIndex));
-					return result;
-				}
-				// A closure value, called directly (`callback(x)`) -- checked via `ctx.resolvesName` so a local
-				// shadowing a same-named global function takes priority, matching JS scoping. Bare identifier callee only for now (not e.g. `obj.field(x)`) -- v1 scope, not a fundamental limit.
-				if (e.callee.type === 'identifier' && ctx.resolvesName(e.callee.name)) {
-					const calleeWtype = ctx.resolvedWtype(e.callee.name);
-					if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
-						const sig = calleeWtype.closure;
-						const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
-						emitExpr(e.callee, ctx);
-						const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
-						ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-						// A closure *literal*'s own params still can't be optional (a real, separate
-						// restriction, unaffected) -- `sig.defaults` is only ever populated when this closure's
-						// static TYPE (not necessarily its concrete value) declared a bare `p?: T` trailing
-						// param, same rest-packing as a plain named function's own call site either way.
-						emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx);
-						// The code pointer (funcref) is pushed last -- `call_ref` consumes it off the stack top, after every real argument.
-						ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
-						return sig.result;
-					}
-				}
 
 				// A closure value read off an array element, called directly (`arr[i](x)`) -- same shape as
 				// the bare-identifier case above, generalized via the callee's own static type (`wtypeOf`)
@@ -4002,15 +4019,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					}
 				}
 
-				if (e.callee.type !== 'identifier')
-					throw 'only direct calls to named functions, methods, or Math intrinsics are supported';
+				throw 'only direct calls to named functions, methods, or Math intrinsics are supported';
 
-				// One-shot: consumed here (for this call's own generic type-param inference, if it applies)
-				// and cleared immediately, so it can't leak into this same call's own arguments below (see
-				// `contextualReturn`'s own comment on why that would be wrong).
-				const contextualReturn = ctx.contextualReturn;
-				ctx.contextualReturn = undefined;
-				return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn);
 			}
 
 			// Closures: a captured arrow/function-expression literal compiles to a 2-field `{code, env}`
@@ -4446,9 +4456,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					ctx.enterBreakTarget();
 					ctx.enterLabel(n);
 
-					// `br`/`br_if` labels are already relative to the branch point -- case `i`'s own block is
-					// the `i`-th one opened above (case 0 innermost), and "no default" falls through all `n`
-					// case-blocks to the enclosing break-target block at relative depth `n`.
 					for (let i = 0; i < n; i++) {
 						const c = s.cases[i];
 						if (c.test) {
@@ -4461,10 +4468,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					ctx.emit(I.br(defaultIndex >= 0 ? defaultIndex : n));
 
 					let content = ctx.out;
-					for (let k = 0; k < n; k++) {
+					for (let i = 0; i < n; i++) {
 						ctx.exitLabel();
 						ctx.out = [I.block(undefined, content)];
-						s.cases[k].consequent.forEach(st => emitStmt(st, ctx));
+						s.cases[i].consequent.forEach(st => emitStmt(st, ctx));
 						content = ctx.out;
 					}
 					ctx.exitBreakTarget();
@@ -4836,13 +4843,23 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// whenever this doesn't apply (not a function-typed value, or the name isn't directly reachable
 			// this way at all -- e.g. a function only ever called indirectly through another non-entry
 			// module), unchanged from before.
-			const inferredType = !decl.returnType ? global.value(name) : undefined;
-			const inferredReturnType = inferredType?.type === 'function' ? inferredType.returnType : undefined;
+			const checkedType = global.value(name);
+			const inferredReturnType = !decl.returnType && checkedType?.type === 'function' ? checkedType.returnType : undefined;
 			const result = decl.returnType ? typeOf(decl.returnType)
 				: inferredReturnType ? typeOf(inferredReturnType)
 				: 'void';
 			if (!result)
 				throw `'${name}' has an unsupported return type`;
+
+			// This function's own declaring module's scope (`stampSig` stamps `declScope` onto a hoisted
+			// signature once, using the exact scope `hoist()` itself was given for that module) -- rooting
+			// the compiled body's own scope here, instead of always `libGlobal`, is what lets a bare
+			// identifier referenced inside the body (a sibling class in the same file, another top-level
+			// const, ...) resolve against ITS OWN module's declarations rather than only the entry's. Same
+			// reachability limitation as the return-type fallback just above (only when `name` is directly
+			// reachable via `global`) -- `homeScope` is simply `undefined` otherwise, falling back to
+			// `libGlobal` exactly as before.
+			const homeScope = checkedType?.type === 'function' ? checkedType.declScope as Scope | undefined : undefined;
 
 			const params	= decl.params.map(p => resolveParam(p));
 			if (decl.rest?.typeAnnotation)
@@ -4851,22 +4868,19 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			const {funcIndex, typeIndex} = registerFunc(toParams2(params), toResults(result));
 			const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), hasRest: !!decl.rest?.typeAnnotation};
 			funcs.set(homeKey(homeModule, name), info);
-			worklist.push(() => { try {
-				const ctx	= new FunctionContext(name, new Scope(libGlobal), plainReturn(result), undefined, homeModule);
+			worklist.push(withCatch(() => {
+				const ctx	= new FunctionContext(name, new Scope(homeScope ?? libGlobal), plainReturn(result), undefined, homeModule);
 				ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope, TC);
 				ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 				decl.body!.forEach(st => emitStmt(st, ctx));
 				emitTrailingUnreachable(ctx, result);
 				info.body		= ctx.toFuncBody(params.length, toValType);
-			} catch (e) {
-				//console.log(e);
-				throw new TSWError(e as any, undefined, name, homeModule);
-			} });
+			}));
 			return info;
 
 		} catch (e) {
 			//console.log(e);
-			throw new TSWError(e as any, undefined, name, homeModule);//`async ${e}`;
+			throw new TSWError(e as any, undefined, name, homeModule);
 		}
 	}
 
@@ -4941,15 +4955,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		// rather than fighting it.
 		const rt = (global.value(name) as TS.FunctionType | undefined)?.returnType;
 		if (rt?.type !== 'ref' || rt.name !== 'Generator' || (rt.typeArgs?.length ?? 0) !== 3)
-			throw `generator function '${name}' has an unexpected inferred return type`;
+			throw `unexpected inferred return type`;
 		const [Y, R, N] = rt.typeArgs!;
 		const yWtype = typeOf(Y), nWtype = typeOf(N);
 		if (!yWtype || yWtype === 'void')
-			throw `generator function '${name}' has an unsupported yielded type`;
+			throw `unsupported yielded type`;
 		if (!typeOf(R))
-			throw `generator function '${name}' has an unsupported return type`;
+			throw `unsupported return type`;
 		if (!nWtype || nWtype === 'void')
-			throw `generator function '${name}' has an unsupported '.next()' argument type`;
+			throw `unsupported '.next()' argument type`;
 
 		const resultClass	= ensureClass('IteratorResult', [Y, R]);
 		const genClass		= ensureClass('Generator', [Y, R, N]);
@@ -4984,134 +4998,129 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		// that one case instead of trusting `checkerTypeOf`, or the field ends up `anyref`-typed against
 		// an `N`-typed write.
 		const widenedTypes	= collectRangeWidenings(decl.body!, libGlobal, TC);
-		try {
-			const { localFields, frameFields } = buildFrameFields(decl, params, widenedTypes, N);
-			const frameTypeIndex = addType({ final: true, supertypes: [envBase], type: { kind: 'struct', fields: frameFields } });
-			const machine		= BuildStateMachine(decl.body!);
+		const { localFields, frameFields } = buildFrameFields(decl, params, widenedTypes, N);
+		const frameTypeIndex = addType({ final: true, supertypes: [envBase], type: { kind: 'struct', fields: frameFields } });
+		const machine		= BuildStateMachine(decl.body!);
 
-			const { funcIndex: stepFuncIndex } = registerFuncAtType(funcTypeIndex);
-			const stepInfo: FuncInfo = { params: sig.params, result: sig.result, hasRest: false, funcIndex: stepFuncIndex, typeIndex: funcTypeIndex };
-			closureLiterals.push(stepInfo);
+		const { funcIndex: stepFuncIndex } = registerFuncAtType(funcTypeIndex);
+		const stepInfo: FuncInfo = { params: sig.params, result: sig.result, hasRest: false, funcIndex: stepFuncIndex, typeIndex: funcTypeIndex };
+		closureLiterals.push(stepInfo);
 
-			worklist.push(() => {
-				const fnCtx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(resultWtype), undefined, homeModule);
-				// Param order must match `ensureClosureType`'s real wasm signature exactly (env, then `sig.params`)
-				// -- the cast-down frame local is declared *after* both real params, as one more genuine local, same as an ordinary closure literal's own `#env` (`emitClosureLiteral`).
-				const envParam		= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
-				const sentParam		= fnCtx.declareLocal('#sent', nWtype);
-				const frameLocal	= fnCtx.declareLocal('#frame', { typeIndex: frameTypeIndex, nullable: false });
-				fnCtx.emit(I.local.get(envParam.index), I.ref.cast(frameTypeIndex), I.local.set(frameLocal.index));
-				// Every hoisted local reads/writes through the frame automatically from here on --
-				// `case 'identifier'`/`emitAssignTarget` already check `closureEnv.fields` first, same as a
-				// real closure capture; `case 'var_decl'` gained the one new branch that *writes* one instead
-				// of declaring a real wasm local, when its own name is already a frame field.
-				fnCtx.closureEnv = { envLocal: frameLocal, envTypeIndex: frameTypeIndex, fields: localFields };
-				for (const [localName, { tsType }] of localFields)
-					fnCtx.declareCaptured(localName, tsType);
-				// The same map already consulted above, building the frame's own field types -- reused (not
-				// recomputed) so `case 'var_decl'`'s actual write agrees with what the field was declared as.
-				fnCtx.widenedTypes	= widenedTypes;
+		worklist.push(withCatch(() => {
+			const fnCtx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(resultWtype), undefined, homeModule);
+			// Param order must match `ensureClosureType`'s real wasm signature exactly (env, then `sig.params`)
+			// -- the cast-down frame local is declared *after* both real params, as one more genuine local, same as an ordinary closure literal's own `#env` (`emitClosureLiteral`).
+			const envParam		= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
+			const sentParam		= fnCtx.declareLocal('#sent', nWtype);
+			const frameLocal	= fnCtx.declareLocal('#frame', { typeIndex: frameTypeIndex, nullable: false });
+			fnCtx.emit(I.local.get(envParam.index), I.ref.cast(frameTypeIndex), I.local.set(frameLocal.index));
+			// Every hoisted local reads/writes through the frame automatically from here on --
+			// `case 'identifier'`/`emitAssignTarget` already check `closureEnv.fields` first, same as a
+			// real closure capture; `case 'var_decl'` gained the one new branch that *writes* one instead
+			// of declaring a real wasm local, when its own name is already a frame field.
+			fnCtx.closureEnv = { envLocal: frameLocal, envTypeIndex: frameTypeIndex, fields: localFields };
+			for (const [localName, { tsType }] of localFields)
+				fnCtx.declareCaptured(localName, tsType);
+			// The same map already consulted above, building the frame's own field types -- reused (not
+			// recomputed) so `case 'var_decl'`'s actual write agrees with what the field was declared as.
+			fnCtx.widenedTypes	= widenedTypes;
 
-				const setFrame = (state: number) => fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(state), I.struct.set(frameTypeIndex, STATE_FIELD));
+			const setFrame = (state: number) => fnCtx.emit(I.local.get(frameLocal.index), I.i32.const(state), I.struct.set(frameTypeIndex, STATE_FIELD));
 
-				const resultCtor = ensureCtor(resultClass, [], fnCtx);
-				// `resultCtor.params[0]` -- not the bare `rWtype` -- is `IteratorResult<Y,R>.value`'s own real,
-				// already-resolved wasm representation: identical to `rWtype` whenever `R` is an ordinary type,
-				// but when `R` is `void` (a real, common case -- `Generator<Y, void, N>`), `ensureClass` already
-				// boxed that instantiation's `value: Y | R` field to `any` (`void` is never valid as a field's
-				// own type -- see `addField`'s guard), and this must push a value matching what the field/
-				// constructor was actually built to accept, not the un-substituted bare type.
-				const valueWtype = resultCtor.params[0];
-				// A plain `return expr;` inside a generator body means "done", not an ordinary wasm return of
-				// `expr` (the step function's real wasm result is always an `IteratorResult`, never the bare
-				// yield/return type).
-				fnCtx.onReturn = {
-					wtype: () => valueWtype,
-					emit(ctx, argument) {
-						setFrame(machine.completeId);
-						if (argument)
-							emitAs(argument, ctx, valueWtype);
-						else
-							emitDefaultValue(valueWtype, ctx);
-						ctx.emit(I.i32.const(1), I.call(resultCtor.funcIndex), I.return);
-					},
-				};
-
-				// 'const v = yield x;' -- `v`'s own resume-side binding lives on the *suspending* segment's own
-				// `next` (the only place the flattener has it), not the segment it resumes into, so build the
-				// reverse lookup once: which segment (by id) needs to write the sent value into which frame field,
-				// right before running its own statements.
-				const sentBindings = new Map<number, number>();
-				for (const seg of machine.segments) {
-					if (seg.next.type === 'suspend' && seg.next.resultVar)
-						sentBindings.set(seg.next.resumeId, fnCtx.closureEnv!.fields.get(seg.next.resultVar)!.index);
-				}
-
-				const oldOuter = fnCtx.swapOut();
-				fnCtx.emit(I.local.get(frameLocal.index), I.struct.get(frameTypeIndex, STATE_FIELD));
-				fnCtx.emitResumableDispatch(machine,
-					setFrame,
-					test => emitTruthy(test, fnCtx),
-					id => {
-						const sentField = sentBindings.get(id);
-						if (sentField !== undefined)
-							fnCtx.emit(I.local.get(frameLocal.index), I.local.get(sentParam.index), I.struct.set(frameTypeIndex, sentField));
-						machine.segments[id].stmts.forEach(st => emitStmt(st, fnCtx));
-					},
-					(next, resumeId) => {
-						if (next.kind !== 'yield')
-							throw "'await' is not supported yet (generators only, for now)";
-						if (next.delegate)
-							throw "'yield*' delegation is not supported";
-						// `valueWtype` (`IteratorResult<Y,R>.value`'s own real, already-resolved type -- see its
-						// own comment above), not the bare `yWtype`: identical whenever `Y` and `R` happen to be
-						// the same type (every existing test, until now), but a real, different representation
-						// once they're not (this constructor's own single `value` param always expects exactly
-						// one physical shape, whichever path -- yield or return -- is calling it).
-						if (next.operand)
-							emitAs(next.operand, fnCtx, valueWtype);
-						else
-							emitDefaultValue(valueWtype, fnCtx);
-						setFrame(resumeId);
-						fnCtx.emit(I.i32.const(0), I.call(resultCtor.funcIndex), I.return);
-					},
-					() => {
-						// Natural completion, or a repeat call once already pinned here -- either way,
-						// idempotent: re-pin `state` to this same segment's own id, done forever after.
-						emitDefaultValue(valueWtype, fnCtx);
-						fnCtx.emit(I.i32.const(1), I.call(resultCtor.funcIndex), I.return);
-					}
-				);
-				fnCtx.emit(I.loop(undefined, fnCtx.swapOut(oldOuter)));
-
-				emitTrailingUnreachable(fnCtx, resultWtype);
-				stepInfo.body		= fnCtx.toFuncBody(2, toValType);
-			});
-
-			const outerResult = ownerThisType(genClass);
-			const { funcIndex: outerFuncIndex, typeIndex: outerTypeIndex } = registerFunc(toParams2(params), toResults(outerResult));
-			const info: FuncInfo = { params: params.map(p => p.wtype), result: outerResult, funcIndex: outerFuncIndex, typeIndex: outerTypeIndex, hasRest: false };
-			funcs.set(name, info);
-
-			worklist.push(() => {
-				const ctx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(outerResult), undefined);
-				ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
-				const genCtor		= ensureCtor(genClass, [], ctx);
-				const paramNames	= new Set(params.map(p => p.key as string));
-				ctx.emit(I.ref.func(stepFuncIndex), I.i32.const(machine.entryId));
-				for (const [localName, field] of localFields) {
-					if (paramNames.has(localName))
-						ctx.emit(I.local.get(ctx.lookup(localName)!.index));
+			const resultCtor = ensureCtor(resultClass, [], fnCtx);
+			// `resultCtor.params[0]` -- not the bare `rWtype` -- is `IteratorResult<Y,R>.value`'s own real,
+			// already-resolved wasm representation: identical to `rWtype` whenever `R` is an ordinary type,
+			// but when `R` is `void` (a real, common case -- `Generator<Y, void, N>`), `ensureClass` already
+			// boxed that instantiation's `value: Y | R` field to `any` (`void` is never valid as a field's
+			// own type -- see `addField`'s guard), and this must push a value matching what the field/
+			// constructor was actually built to accept, not the un-substituted bare type.
+			const valueWtype = resultCtor.params[0];
+			// A plain `return expr;` inside a generator body means "done", not an ordinary wasm return of
+			// `expr` (the step function's real wasm result is always an `IteratorResult`, never the bare
+			// yield/return type).
+			fnCtx.onReturn = {
+				wtype: () => valueWtype,
+				emit(ctx, argument) {
+					setFrame(machine.completeId);
+					if (argument)
+						emitAs(argument, ctx, valueWtype);
 					else
-						emitDefaultValue(field.wtype, ctx);
+						emitDefaultValue(valueWtype, ctx);
+					ctx.emit(I.i32.const(1), I.call(resultCtor.funcIndex), I.return);
+				},
+			};
+
+			// 'const v = yield x;' -- `v`'s own resume-side binding lives on the *suspending* segment's own
+			// `next` (the only place the flattener has it), not the segment it resumes into, so build the
+			// reverse lookup once: which segment (by id) needs to write the sent value into which frame field,
+			// right before running its own statements.
+			const sentBindings = new Map<number, number>();
+			for (const seg of machine.segments) {
+				if (seg.next.type === 'suspend' && seg.next.resultVar)
+					sentBindings.set(seg.next.resumeId, fnCtx.closureEnv!.fields.get(seg.next.resultVar)!.index);
+			}
+
+			const oldOuter = fnCtx.swapOut();
+			fnCtx.emit(I.local.get(frameLocal.index), I.struct.get(frameTypeIndex, STATE_FIELD));
+			fnCtx.emitResumableDispatch(machine,
+				setFrame,
+				test => emitTruthy(test, fnCtx),
+				id => {
+					const sentField = sentBindings.get(id);
+					if (sentField !== undefined)
+						fnCtx.emit(I.local.get(frameLocal.index), I.local.get(sentParam.index), I.struct.set(frameTypeIndex, sentField));
+					machine.segments[id].stmts.forEach(st => emitStmt(st, fnCtx));
+				},
+				(next, resumeId) => {
+					if (next.kind !== 'yield')
+						throw "'await' is not supported in generators yet";
+					if (next.delegate)
+						throw "'yield*' delegation is not supported";
+					// `valueWtype` (`IteratorResult<Y,R>.value`'s own real, already-resolved type -- see its
+					// own comment above), not the bare `yWtype`: identical whenever `Y` and `R` happen to be
+					// the same type (every existing test, until now), but a real, different representation
+					// once they're not (this constructor's own single `value` param always expects exactly
+					// one physical shape, whichever path -- yield or return -- is calling it).
+					if (next.operand)
+						emitAs(next.operand, fnCtx, valueWtype);
+					else
+						emitDefaultValue(valueWtype, fnCtx);
+					setFrame(resumeId);
+					fnCtx.emit(I.i32.const(0), I.call(resultCtor.funcIndex), I.return);
+				},
+				() => {
+					// Natural completion, or a repeat call once already pinned here -- either way,
+					// idempotent: re-pin `state` to this same segment's own id, done forever after.
+					emitDefaultValue(valueWtype, fnCtx);
+					fnCtx.emit(I.i32.const(1), I.call(resultCtor.funcIndex), I.return);
 				}
-				ctx.emit(I.struct.new(frameTypeIndex), I.struct.new(structTypeIndex), I.call(genCtor.funcIndex), I.return);
-				info.body = ctx.toFuncBody(params.length, toValType);
-			});
-			return info;
-		} catch (e) {
-			throw `generator ${e}`;
-		}
+			);
+			fnCtx.emit(I.loop(undefined, fnCtx.swapOut(oldOuter)));
+			emitTrailingUnreachable(fnCtx, resultWtype);
+			stepInfo.body		= fnCtx.toFuncBody(2, toValType);
+		}, name, homeModule));
+
+		const outerResult = ownerThisType(genClass);
+		const { funcIndex: outerFuncIndex, typeIndex: outerTypeIndex } = registerFunc(toParams2(params), toResults(outerResult));
+		const info: FuncInfo = { params: params.map(p => p.wtype), result: outerResult, funcIndex: outerFuncIndex, typeIndex: outerTypeIndex, hasRest: false };
+		funcs.set(name, info);
+
+		worklist.push(withCatch(() => {
+			const ctx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(outerResult), undefined);
+			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
+			const genCtor		= ensureCtor(genClass, [], ctx);
+			const paramNames	= new Set(params.map(p => p.key as string));
+			ctx.emit(I.ref.func(stepFuncIndex), I.i32.const(machine.entryId));
+			for (const [localName, field] of localFields) {
+				if (paramNames.has(localName))
+					ctx.emit(I.local.get(ctx.lookup(localName)!.index));
+				else
+					emitDefaultValue(field.wtype, ctx);
+			}
+			ctx.emit(I.struct.new(frameTypeIndex), I.struct.new(structTypeIndex), I.call(genCtor.funcIndex), I.return);
+			info.body = ctx.toFuncBody(params.length, toValType);
+		}, name, homeModule));
+		return info;
 
 	}
 
@@ -5169,7 +5178,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const stepInfo: FuncInfo = { params: [{ typeIndex: frameTypeIndex, nullable: false }, REF_ANY], result: 'void', hasRest: false, funcIndex: stepFuncIndex, typeIndex: stepFuncTypeIndex };
 		closureLiterals.push(stepInfo);
 
-		worklist.push(() => {
+		worklist.push(withCatch(() => {
 			const fnCtx			= new FunctionContext(name, new Scope(libGlobal), plainReturn(), undefined, homeModule);
 			const frameLocal	= fnCtx.declareLocal('#frame', { typeIndex: frameTypeIndex, nullable: false });
 			const sentParam		= fnCtx.declareLocal('#sent', REF_ANY);
@@ -5328,12 +5337,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			);
 			fnCtx.emit(I.loop(undefined, fnCtx.swapOut(oldOuter)));
 			stepInfo.body = fnCtx.toFuncBody(2, toValType);
-		});
+		}, name, homeModule));
 
 		const { funcIndex: outerFuncIndex, typeIndex: outerTypeIndex } = registerFunc(toParams2(params), toResults(promiseWtype));
 		const info: FuncInfo = { params: params.map(p => p.wtype), result: promiseWtype, funcIndex: outerFuncIndex, typeIndex: outerTypeIndex, hasRest: false };
 		funcs.set(name, info);
-		worklist.push(() => {
+		worklist.push(withCatch(() => {
 			const ctx = new FunctionContext(name, new Scope(libGlobal), plainReturn(promiseWtype), undefined);
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 
@@ -5373,7 +5382,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				I.local.get(resultPromiseLocal.index), I.return
 			);
 			info.body = ctx.toFuncBody(params.length, toValType);
-		});
+		}, name));
 		return info;
 	}
 
@@ -5480,13 +5489,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const scope = declScope ?? global;
 		// Same composite-key convention as `ensureClass` itself -- two different type arguments are two
 		// different physical shapes (e.g. `TypeParam<Type>` vs. a bare, implicitly-`any` `TypeParam`).
-		const key = typeArgs?.length ? `${name}<${typeArgs.map(t => T.typeKey(TC.resolve(scope, t))).join(',')}>` : name;
-		const existing = classes.get(key);
+		const key		= typeArgs?.length ? `${name}<${typeArgs.map(t => T.typeKey(TC.resolve(scope, t))).join(',')}>` : name;
+		const existing	= classes.get(key);
 		if (existing)
 			return existing;
 
 		if (!scope.type(name))
 			return undefined;
+
 		// Via a `RefType` (not the entry's own raw, still-generic `.type` directly) so a reference to a
 		// generic interface/alias -- bare (`TypeParam`) or explicit (`TypeParam<X>`) -- goes through
 		// `resolve`'s own type-arg substitution (each param -> its given arg, its own default, or `any`)
@@ -5503,7 +5513,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		// struct at all -- `ownerFor`'s own caller already has a real, more appropriate fallback for this
 		// exact shape (`indexSignatureValueType`, routing to the `Map`-backed dynamic-object path) once
 		// `ensureClass` declines here, same as it always safely declined before `typeArgs` was threaded in.
-		if (resolved.members.some(m => m.type === 'index'))
+
+		if (resolved.members.some(m => m.type !== 'property' && m.type !== 'method'))
 			return undefined;
 
 		return buildObjectShape(key, resolved.members, TS.RefType(name, typeArgs), name, !everExtended.has(name));
@@ -5516,16 +5527,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// syntactically-identical anonymous shapes (including after generic substitution, e.g. two different
 	// instantiations that happen to produce the same concrete member types) collapse to one physical struct,
 	// which is correct -- there's no name to keep them apart by even if desired.
-	function ensureAnonObjectShape(resolved: Type & { type: 'object' }): ClassInfo | undefined {
-		if (resolved.members.some(m => m.type === 'index'))
+	function ensureAnonObjectShape(obj: TS.ObjectType): ClassInfo | undefined {
+		if (obj.members.some(m => m.type !== 'property' && m.type !== 'method'))
 			return undefined;
-		if (resolved.members.some(m => m.type !== 'property' && m.type !== 'method'))
-			return undefined;
-		const key = T.typeKey(resolved);
-		const existing = classes.get(key);
+		const key		= T.typeKey(obj);
+		const existing	= classes.get(key);
 		if (existing)
 			return existing;
-		return buildObjectShape(key, resolved.members, resolved, key, true);
+		return buildObjectShape(key, obj.members, obj, key, true);
 	}
 
 	// Resolves fields and the struct type eagerly, but only collects method/ctor decls -- building each is
@@ -5558,7 +5567,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 		if (!info) {
 			// A plain lib-internal class -- an ordinary struct seeded into `classes` lazily on first reference.
-			let decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
+			// `declScope?.decl(name)`: a non-entry module's own class, never eagerly seeded the way an entry-
+			// module class is (`TStoWasm`'s own top-level seeding loop stays entry-only) -- resolves via the
+			// exact same scope-chain mechanism `ensureObjectShape`'s own `declScope` param already uses, now
+			// landing on the *real* class declaration (fields/constructor/methods) instead of that fallback's
+			// structural-shape-only reconstruction, which has no representation for a real class's own
+			// methods at all.
+			let decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name) ?? declScope?.decl(name);
 			if (decl?.type !== 'class_decl') {
 				// `resolveClassAlias` only covers a *lib* alias to a real class name, never generic --
 				// a generic interface/type-alias reference (with or without explicit type args, e.g.
@@ -5829,7 +5844,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				const call = st.expression;
 				const superClass = cls.superClass;
 				if (!superClass)
-					throw `'${cls.name}' has no superclass -- 'super(...)' is not supported here`;
+					throw `no superclass -- 'super(...)' is not supported here`;
 				if (call.arguments.some(a => a.type === 'spread'))
 					throw `'super(...)': a spread argument is not supported`;
 				const superDecls = superClass.methodDecls.get('constructor');
@@ -5837,7 +5852,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					throw `superclass '${superClass.name}' needs an explicit constructor for 'super(...)' to call`;
 				const superCtor = resolveOverload(`${superClass.name}'s constructor`, superDecls, call.arguments, ctx);
 				if (!superCtor.body)
-					throw `'${superClass.name}'s constructor needs a body (overload signatures are not supported)`;
+					throw `needs a body (overload signatures are not supported)`;
 
 				// Binds the base ctor's own param names to this call's own argument expressions -- a plain
 				// `var_decl` per param, reusing the ordinary local-declaration path (including its own
@@ -5848,15 +5863,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					superCtor.params.forEach((p, i) => {
 						const argExpr = call.arguments[i] ?? p.default;
 						if (!argExpr)
-							throw `'super(...)': missing argument for '${superClass.name}'s constructor parameter '${describeBinding(p.key)}'`;
+							throw `'super(...)': missing argument parameter '${describeBinding(p.key)}'`;
 						emitStmt(JS.VarDecl('const', JS.Var(p.key, argExpr, p.typeAnnotation)), ctx);
 					});
 					emitCtorStatements(superCtor, superClass, ctx, setField);
 				});
 				emitParamPropertyInits();
 				emitOwnFieldInits();
-				continue;
-			}
+			} else
 			// An ordinary `this.field = value` statement, written directly in the constructor body (not a
 			// param property, not a class-level field initializer) -- the historically-supported way to
 			// assign an object-typed field (`this.inner = new Other(...)`, needs a real value collected
@@ -5870,9 +5884,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// `case 'this'`'s own guard if attempted too early.
 			if (st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '=' && st.expression.left.type === 'member' && st.expression.left.object.type === 'this' && cls.fieldIndex.has(st.expression.left.property)) {
 				setField(st.expression.left.property, st.expression.right);
-				continue;
+			} else {
+				emitStmt(st, ctx);
 			}
-			emitStmt(st, ctx);
 		}
 	}
 
@@ -5910,7 +5924,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			},
 		};
 
-		worklist.push(() => { try {
+		worklist.push(withCatch(() => {
 			const ctx		= new FunctionContext(key, new Scope(libGlobal), plainReturn(thisWtype), cls);
 			ctx.widenedTypes = collectRangeWidenings(ctor.body!, ctx.scope, TC);
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
@@ -5962,7 +5976,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					}
 				});
 				if (remaining.size)
-					throw `'${cls.name}'s constructor never assigns field(s) ${[...remaining].join(', ')}`;
+					throw `never assigns field(s) ${[...remaining].join(', ')}`;
 				ctx.emit(I.local.get(ctx.ctorThis!.index), I.return);
 
 			} else {
@@ -5981,10 +5995,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			}
 
 			info.body = ctx.toFuncBody(ctor.params.length + (ctor.rest ? 1 : 0), toValType);
-		} catch (e) {
-			//console.log(e);
-			throw new TSWError(e as any, undefined, key);
-		} });
+		}, key));
 		return info;
 	}
 
@@ -6067,7 +6078,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
 		funcs.set(key, info);
-		worklist.push(() => {
+		worklist.push(withCatch(() => {
 			const ctx	= new FunctionContext(key.replace('.', '_').replace('#', '_'), new Scope(libGlobal), plainReturn(result), owner);
 			if (!isStatic)
 				ctx.declareValue('this', thisWtype, owner.thisTsType);
@@ -6094,7 +6105,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
 			info.body = ctx.toFuncBody((isStatic ? 0 : 1) + params.length, toValType);
-		});
+		}, key));
 		return info;
 	}
 
@@ -6202,7 +6213,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		unionFieldDispatchFuncs.set(key, info);
 		funcs.set(`<union field dispatch>.${key}`, info);
 
-		worklist.push(() => {
+		worklist.push(withCatch(() => {
 			const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(result), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY);
 
@@ -6219,7 +6230,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 			dctx.emit(...buildArm(0));
 			info.body = dctx.toFuncBody(1, toValType);
-		});
+		}, key));
 		return info;
 	}
 
@@ -6440,7 +6451,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	const info: FuncInfo = {params: [], result: 'void', funcIndex, typeIndex};
 	funcs.set('__toplevel', info);
 	mod.start	= funcIndex;
-	worklist.push(() => {try {
+	worklist.push(withCatch(() => {
 		const ctx	= new FunctionContext('__toplevel', new Scope(libGlobal), plainReturn('void'), undefined);
 		ctx.widenedTypes = collectRangeWidenings(ast.body!, ctx.scope, TC);
 		ast.body!.forEach(st => {
@@ -6457,10 +6468,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		});
 		//emitTrailingUnreachable(ctx, result);
 		info.body = ctx.toFuncBody(0, toValType);
-	} catch (e) {
-		//console.log(e);
-		throw new TSWError(e as any);
-	} });
+	}));
 
 
 	// The exported function name(s) a top-level `export_decl`'s inner declaration represents, or `[]` if
