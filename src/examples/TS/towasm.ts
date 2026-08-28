@@ -1637,7 +1637,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						throw "a function type's rest parameter needs an explicit array type";
 					params.push(wt);
 				}
-				const result = func.returnType ? typeOf(func.returnType) : 'void';
+				let result = func.returnType ? typeOf(func.returnType) : 'void';
+				// A function TYPE's return position (as opposed to a value's own inferred type -- `typeOf`'s
+				// general 'object' case deliberately doesn't attempt this, see `ensureAnonObjectShape`'s own
+				// comment) is a genuine declared-type position: an inline `{value: T; consumed: number}`
+				// return annotation, never given a name via `interface`/`type X = ...`, is still real TS and
+				// still needs *some* physical representation. Scoped narrowly to exactly this spot (not a
+				// general `typeOf` fallback) specifically to avoid colliding with a NAMED type that lost its
+				// own `ref` wrapper somewhere upstream (e.g. `T.combineTypes` flattening a union of one
+				// nominal class into its bare structural shape) -- that already-regressed once when tried as
+				// a general fallback; a function type's own return annotation never has this ambiguity, since
+				// nothing upstream of `typeOf` here strips a name off it.
+				if (!result && func.returnType) {
+					const returnResolved = TC.resolve(global, func.returnType);
+					if (returnResolved.type === 'object' && !indexSignatureValueType(returnResolved)) {
+						const cls = ensureAnonObjectShape(returnResolved);
+						result = cls && ownerThisType(cls);
+					}
+				}
 				if (!result)
 					throw 'a function type has an unsupported return type';
 				// `hasRest` folded into the memoization key too -- see `funcSigEq`'s own comment on why it's part
@@ -5357,6 +5374,53 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// Cached into the same `classes` map real classes use -- a name can't be both a `class_decl` and a
 	// type alias, so no key collision risk -- which is what lets ordinary field access (`classOf`/`case
 	// 'member'`) work completely unchanged afterward, same as any other class.
+	// Shared struct-building core for both a named object-shape (`ensureObjectShape`) and an anonymous
+	// inline one (`ensureAnonObjectShape`) -- registers `info` into `classes` (with a real `typeIndex`
+	// already allocated) *before* resolving any member's own type, same self-/mutually-referential-safety
+	// reasoning as `ensureClass`'s own placeholder-first ordering: a union type reachable again through one
+	// of its own members' fields (confirmed real: `Type`'s own recursive AST-node union in ts-parser.ts)
+	// finds `info` already in `classes` and returns immediately, well before this loop runs twice.
+	function buildObjectShape(key: string, members: TS.TypeMember[], thisTsType: Type, declName: string, everFinal: boolean): ClassInfo {
+		const info: ClassInfo = {
+			name:		key, thisTsType,
+			decl:		{ name: declName, body: [] },
+			fields:		[],
+			fieldIndex:	new Map(),
+			methodDecls: new Map(),
+			thisWtype: { ref: key },
+			typeIndex:	addType({kind: 'struct', fields: []}),
+		};
+		classes.set(key, info);
+
+		for (const m of members) {
+			switch (m.type) {
+				case 'property': {
+					if (typeof m.key !== 'string')
+						throw `object-shape type '${declName}' has a computed property name -- not supported`;
+					addField(info, m.key, m.typeAnnotation, hasMod(m, 'optional'));
+					break;
+				}
+				case 'method': {
+					if (typeof m.key !== 'string')
+						throw `object-shape type '${declName}' has a computed property name -- not supported`;
+					addField(info, m.key, {...(m as TS.CallSig), type: 'function'}, hasMod(m, 'optional'));
+					break;
+				}
+				default:
+					throw `object-shape type '${declName}' can only have plain properties (no methods/index/call signatures) to be an object literal's target type`;
+			}
+		}
+
+		types[info.typeIndex] = {
+			final: everFinal,
+			supertypes: [], type: {
+				kind: 'struct',
+				fields: info.fields.map(f => ({ type: toValType(f.wtype), mut: true })),
+			}
+		};
+		return info;
+	}
+
 	function ensureObjectShape(name: string, typeArgs?: Type[]): ClassInfo | undefined {
 		// Same composite-key convention as `ensureClass` itself -- two different type arguments are two
 		// different physical shapes (e.g. `TypeParam<Type>` vs. a bare, implicitly-`any` `TypeParam`).
@@ -5386,51 +5450,26 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		if (resolved.members.some(m => m.type === 'index'))
 			return undefined;
 
-		const info: ClassInfo = {
-			name:		key, thisTsType: TS.RefType(name, typeArgs),
-			decl:		{ name, body: [] },
-			fields:		[],
-			fieldIndex:	new Map(),
-			methodDecls: new Map(),
-			thisWtype: { ref: key },
-			typeIndex:	addType({kind: 'struct', fields: []}),
-		};
-		classes.set(key, info);
+		return buildObjectShape(key, resolved.members, TS.RefType(name, typeArgs), name, !everExtended.has(name));
+	}
 
-		// Registering `info` (with a real `typeIndex` already allocated) into `classes` *before* resolving
-		// any member's own type is what makes a self-/mutually-referential shape safe -- e.g. a union type
-		// reachable again through one of its own members' fields (confirmed real: `Type`'s own recursive
-		// AST-node union in ts-parser.ts, reached the moment a union's own member types started being
-		// resolved eagerly for `typeOf`'s own boxing decision). A reentrant `ensureObjectShape`/`ensureClass`
-		// call for this same `key` finds `info` already in `classes` and returns it immediately (see each
-		// function's own top-of-function check), well before this loop ever gets a chance to run twice.
-		for (const m of resolved.members) {
-			switch (m.type) {
-				case 'property': {
-					if (typeof m.key !== 'string')
-						throw `object-shape type '${name}' has a computed property name -- not supported`;
-					addField(info, m.key, m.typeAnnotation, hasMod(m, 'optional'));
-					break;
-				}
-				case 'method': {
-					if (typeof m.key !== 'string')
-						throw `object-shape type '${name}' has a computed property name -- not supported`;
-					addField(info, m.key, {...(m as TS.CallSig), type: 'function'}, hasMod(m, 'optional'));
-					break;
-				}
-				default:
-					throw `object-shape type '${name}' can only have plain properties (no methods/index/call signatures) to be an object literal's target type`;
-			}
-		}
-
-		types[info.typeIndex] = {
-			final: !everExtended.has(name),
-			supertypes: [], type: {
-				kind: 'struct',
-				fields: info.fields.map(f => ({ type: toValType(f.wtype), mut: true })),
-			}
-		};
-		return info;
+	// An anonymous inline object-type annotation (`{value: T; consumed: number}` as a return/field/param
+	// type, never named via `interface`/`type X = ...`) has no name to key `ensureObjectShape` by -- real TS
+	// treats these structurally, but this compiler's struct system is nominal, so it needs *some* identity.
+	// Uses the already-resolved type's own rendered source text (`T.typeKey`) as that identity: two
+	// syntactically-identical anonymous shapes (including after generic substitution, e.g. two different
+	// instantiations that happen to produce the same concrete member types) collapse to one physical struct,
+	// which is correct -- there's no name to keep them apart by even if desired.
+	function ensureAnonObjectShape(resolved: Type & { type: 'object' }): ClassInfo | undefined {
+		if (resolved.members.some(m => m.type === 'index'))
+			return undefined;
+		if (resolved.members.some(m => m.type !== 'property' && m.type !== 'method'))
+			return undefined;
+		const key = T.typeKey(resolved);
+		const existing = classes.get(key);
+		if (existing)
+			return existing;
+		return buildObjectShape(key, resolved.members, resolved, key, true);
 	}
 
 	// Resolves fields and the struct type eagerly, but only collects method/ctor decls -- building each is
