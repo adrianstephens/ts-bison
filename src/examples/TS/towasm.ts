@@ -3083,6 +3083,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						ctx.emit(I.i64.const(e.value));
 						return 'i64';
 
+					case 'object':
+						// A `/pattern/flags` literal's own `.value` is a real, native JS `RegExp` object (the
+						// parser's own `REGEX_LITERAL` rule constructs it directly, see `type-utils.ts`'s
+						// identical `REGEXP` type-inference for this same shape) -- desugars to an ordinary
+						// `new RegExp(source, flags)` against `lib/regexp.ts`'s own self-hosted class, reusing
+						// `case 'new'`'s generic `ensureClass`/`ensureCtor` dispatch rather than duplicating it.
+						if (e.value instanceof RegExp) {
+							return emitExpr({
+								type: 'new',
+								callee: { type: 'identifier', name: 'RegExp' },
+								arguments: [Literal(e.value.source), Literal(e.value.flags)],
+							}, ctx, want);
+						}
+						throw `unsupported literal type '${typeof e.value}'`;
+
 					default:
 						throw `unsupported literal type '${typeof e.value}'`;
 				}
