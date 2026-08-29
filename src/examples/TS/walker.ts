@@ -25,7 +25,8 @@ export const isJsStatement		= guard<JS.Statement<any>>(stmts);
 type Type		= TS.Type;
 type Expr		= TS.Expr;
 type Statement	= TS.Statement;
-export type Walkable = TS.Program | TS.Statement | Expr | Type | Statement[];
+export type Walkable0 = TS.Statement | Expr | Type;
+export type Walkable = Walkable0 | TS.Program | Statement[];
 
 //-----------------------------------------------------------------------------
 // Constant folding
@@ -98,7 +99,7 @@ interface Process<U> {
 }
 // Lets a hook recurse into a child of another domain (e.g. an expression from onStatement),
 // using the same shape-based dispatch `walk()` itself uses at its own entry point.
-type Recurse		= <T extends Walkable>(x: T) => T | undefined;
+type Recurse		= <T extends Walkable0>(x: T) => T | undefined;
 type OnAST<U>		= (x: U, process: Process<U>, recurse: Recurse) => U | undefined;
 
 function makeProcess<U>(parts: (x: U) => U, on: OnAST<U> | undefined, recurse: Recurse, always = false) {
@@ -480,14 +481,10 @@ export function walk<T extends Walkable>(ast: T,
 
 	};
 	const recurse: Recurse = x => {
-		if (Array.isArray(x))
-			return mapArray(mapStatement)(x) as typeof x;
-		if (isProgram(x))
-			return {...x, body: mapArray(mapStatement)(x.body)};
 		if (isType(x))
-			return mapType(x) as typeof x;
+			return mapType(x);
 		if (isJsStatement(x) || isTsDeclaration(x))
-			return mapStatement(x) as typeof x;
+			return mapStatement(x);
 		return mapExpression(x) as typeof x;
 	};
 
@@ -502,16 +499,11 @@ export function walk<T extends Walkable>(ast: T,
 	const mapStatementA		= mapDefined(mapStatement);
 	const mapClassMemberU	= (m: JS.ClassMember<any>) => mapClassMember(m as TS.ClassMember) as JS.ClassMember<any>;
 
-	if (Array.isArray(ast))
-		return mapArray(mapStatement)(ast) as T;
 	if (isProgram(ast))
 		return {...ast, body: mapArray(mapStatement)(ast.body)};
-	if (isType(ast))
-		return mapType(ast) as T;
-	if (isJsStatement(ast) || isTsDeclaration(ast))
-		return mapStatement(ast) as T;
-	return mapExpression(ast) as T;
-
+	if (Array.isArray(ast))
+		return mapArray(mapStatement)(ast) as typeof ast;
+	return recurse(ast) as T;
 }
 
 //-----------------------------------------------------------------------------
@@ -519,7 +511,11 @@ export function walk<T extends Walkable>(ast: T,
 //-----------------------------------------------------------------------------
 
 type ProcessB<U>	= <T extends U>(x?: T, recall?: boolean)=>boolean;
-type RecurseB		= (x: Walkable) => boolean;
+// `kind` lets a caller that already knows what `x` is (e.g. an `if`/`while` test, always an
+// expression) skip the shape-based guess below -- needed because some tags genuinely can't be
+// told apart by shape alone (a 'literal' node is IDENTICAL, field for field, whether it's a
+// type-level literal type or an expression-level literal value; see `recurse`'s own comment).
+type RecurseB		= (x: Walkable0, kind?: 'expression' | 'statement' | 'type') => boolean;
 type OnASTB<U>		= (x: U, process: ProcessB<U>, recurse: RecurseB) => boolean;
 
 function makeProcessB<U>(parts: (x: U) => boolean, on: OnASTB<U> | undefined, recurse: RecurseB, always = false) {
@@ -681,13 +677,13 @@ export function walkB<T extends Walkable>(ast: T,
 		}
 	};
 
-	const recurse: RecurseB = x => {
-		if (Array.isArray(x))
-			return x.some(walkStatement);
-		if (isProgram(x))
-			return x.body.some(walkStatement);
-		if (isType(x))
-			return walkType(x);
+	const recurse: RecurseB = (x, kind) => {
+		if (kind === 'expression')
+			return walkExpression(x as JS.Expr);
+		if (kind === 'statement')
+			return walkStatement(x as TS.Statement);
+		if (kind === 'type' || isType(x))
+			return walkType(x as Type);
 		if (isJsStatement(x) || isTsDeclaration(x))
 			return walkStatement(x);
 		return walkExpression(x);

@@ -594,8 +594,7 @@ function makeDiagnostic(func: (d: Diagnostic) => void): Err {
 }
 
 // Folds any depth-budget hits from type-utils.ts's structural recursion into one summary GAP diagnostic, not one per occurrence.
-function pushDepthExhaustionGap(TC: T.TypeContext, diagnostics: Diagnostic[]) {
-	const depthHits = TC.depthExhaustion;
+function pushDepthExhaustionGap(depthHits: Map<string, number>, diagnostics: Diagnostic[]) {
 	if (depthHits.size) {
 		diagnostics.push({
 			severity: SEVERITY.GAP,
@@ -614,10 +613,12 @@ function pushDepthExhaustionGap(TC: T.TypeContext, diagnostics: Diagnostic[]) {
 // a scope its own code actually reaches. Optional and defaults to a bare `T.makeGlobal()`, unchanged
 // from before, for callers with no such consumer (e.g. `TStoDecl`-only or checker-only use).
 export function TStypeCheck(ast: TS.Program, global: Scope): Diagnostic[] {
+	const depthExhaustion = new Map<string, number>();
+	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
+
 	const diagnostics: Diagnostic[] = [];
-	const TC = new T.TypeContext;
-	checkBlock(ast.body, global, TC, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
-	pushDepthExhaustionGap(TC, diagnostics);
+	checkBlock(ast.body, global, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
+	pushDepthExhaustionGap(depthExhaustion, diagnostics);
 	ast.scope = global;
 	return diagnostics;
 }
@@ -671,7 +672,7 @@ export async function loadLib(loader: ModuleLoader, libs: string[]): Promise<T.S
 	for (const spec of libs!) {
 		const lib = await loader.get(spec, '.');
 		if (lib)
-			checkBlock(lib.body, global, new T.TypeContext);
+			checkBlock(lib.body, global);
 	}
 	return global;
 }
@@ -682,8 +683,6 @@ export async function loadLib(loader: ModuleLoader, libs: string[]): Promise<T.S
 // (e.g. copying `libScope`'s own bindings into the loaded scope) is left for whenever one actually does.
 export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, global: Scope) {
 	const diagnostics: Diagnostic[] = [];
-	const err		= makeDiagnostic(d => diagnostics.push(d));
-	const TC		= new T.TypeContext;
 
 	// Resolves one `import` into `importScope` (shared by `makeScope` and the entry program); return value feeds
 	// `makeScope`'s own `tainted` verdict (false = cycle truncation).
@@ -729,7 +728,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 		const importScope = new Scope(global);
 		const cached = Promise.all(src.body.filter(s => s.type === 'import').map(s => resolveImport(src, importScope, s, src.canonical))).then(async imports => {
 			let tainted = imports.some(clean => !clean);
-			const { scope, value, isAlias } = exportScope(src.body, importScope, TC);
+			const { scope, value, isAlias } = exportScope(src.body, importScope);
 			// Recorded before the (possibly cyclic) re-export loop awaits anything -- see `ownScopeSettled` for why placement matters.
 			ownScopeSettled.set(src, { scope, value, isAlias });
 			for (const stmt of src.body) {
@@ -775,8 +774,10 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 	const entryScope = new Scope(global);
 	await Promise.all(program.body.filter(s => s.type === 'import').map(s => resolveImport(entrySrc, entryScope, s, '.')));
 
-	checkBlock(program.body, entryScope, TC, undefined, undefined, err);
-	pushDepthExhaustionGap(TC, diagnostics);
+	const depthExhaustion = new Map<string, number>();
+	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
+	checkBlock(program.body, entryScope, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
+	pushDepthExhaustionGap(depthExhaustion, diagnostics);
 	program.scope = entryScope;
 	return diagnostics;
 }
@@ -822,7 +823,7 @@ const RESOLVABLE = new Set(['mapped', 'conditional', 'indexed_access', 'keyof', 
 // Plain named refs (interfaces/classes/type aliases) are deliberately left as names rather than expanded --
 // matches real declaration emit (which preserves alias identity) and avoids flattening self-referential types.
 
-function resolveTypes(entryScope: Scope, importScope: Scope | undefined, TC: T.TypeContext) {
+function resolveTypes(entryScope: Scope, importScope: Scope | undefined) {
 	// Tracks (alias, first type-argument) pairs currently on the inline/resolve stack -- not "ever expanded",
 	// since a type can be self/mutually recursive and re-entering it while still expanding would loop forever.
 	// Keyed on the *argument* too, not just the alias: a generic like `ReadType<T>` legitimately re-enters
@@ -935,7 +936,7 @@ function resolveTypes(entryScope: Scope, importScope: Scope | undefined, TC: T.T
 		if (RESOLVABLE.has(type.type)) {
 			// `stopAtRef` -- once resolution bottoms out at a named type (e.g. a conditional's chosen branch is just
 			// `MappedMemory`), print that name rather than recursing one hop further into its structural body.
-			const resolved = TC.resolve(scope, type, undefined, true);
+			const resolved = T.resolve(scope, type, undefined, true);
 			if (resolved !== type) {
 				const found = scope.findDeclaredName(resolved);
 				return process(found ? T.withScope(TS.RefType(found.name), found.scope) : resolved, true);	// recall
@@ -948,7 +949,6 @@ function resolveTypes(entryScope: Scope, importScope: Scope | undefined, TC: T.T
 export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOptionsDefault>): TS.Program {
 	const options		= {...OutputOptionsDefault, ...opts};
 	const importScope	= program.scope as Scope | undefined;
-	const TC			= new T.TypeContext;
 
 	// ---- Gathering every top-level declaration, and seeding `reachable` with the explicit exports ----
 
@@ -968,7 +968,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 	// ---- Shared checking/resolution machinery, needed by the strip helpers below --------------------
 
 	const global	= importScope ? new Scope(importScope) : T.makeGlobal();
-	checkBlock(program.body, global, TC);
+	checkBlock(program.body, global);
 
 	// A class whose heritage is a call expression (e.g. `bin.Class(spec)`) can't keep that expression in a
 	// `declare class` -- collected here and prepended to `stripped`'s body (below) as `declare const <Name>_base:
@@ -1008,7 +1008,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 
 	// `undefined` (rather than an explicit `: any` annotation) keeps unknowable types implicit, as before
 	const inferType		= (e: Expr, narrow: boolean): Type | undefined => {
-		const t = typeOf(e, global, TC, !narrow);
+		const t = typeOf(e, global, !narrow);
 		return t.type === 'ref' && t.name === 'any' ? undefined : t;
 	};
 
@@ -1031,7 +1031,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 	const GENERATOR_TYPES	= new Set(['Generator', 'IterableIterator', 'Iterator', 'Iterable']);
 
 	const stripFunctionDecl = (stmt: JS.FunctionDecl<any>): JS.Declaration<any> => {
-		const returnType: Type = stmt.returnType ? stmt.returnType as Type : stmt.body ? inferReturn(stmt, stmt.body, global, TC) : T.ANY;
+		const returnType: Type = stmt.returnType ? stmt.returnType as Type : stmt.body ? inferReturn(stmt, stmt.body, global) : T.ANY;
 		return JS.FunctionDecl(stmt.name, {
 			params:		stmt.params.map(stripParam),
 			typeParams:	stmt.typeParams,
@@ -1061,7 +1061,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 		if (!target)
 			return undefined;
 
-		const constraint	= TC.resolve(global, tparam.constraint);
+		const constraint	= T.resolve(global, tparam.constraint);
 		const members		= constraint.type === 'union' ? constraint.types : [constraint];
 		if (!members.every(m => T.isLiteral(m, 'string') || T.isLiteral(m, 'number')))
 			return undefined;
@@ -1083,7 +1083,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 		if (superClass && superClass.type !== 'identifier') {
 			const name = uniqueName((stmt.name ?? '_default') + '_base');
 			reachable.add(name);
-			syntheticBases.push(JS.AmbientVarDecl('const', JS.Var(name, undefined, typeOf(superClass, global, TC))));
+			syntheticBases.push(JS.AmbientVarDecl('const', JS.Var(name, undefined, typeOf(superClass, global))));
 			superClass = Identifier(name);
 		}
 
@@ -1122,7 +1122,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 							//return [JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams})];
 						}
 						const params		= m.params.map(stripParam);
-						const returnType	= m.returnType ?? (m.body ? inferReturn(m, m.body, global, TC) : undefined);
+						const returnType	= m.returnType ?? (m.body ? inferReturn(m, m.body, global) : undefined);
 						const expansions	= expandConstrainedGeneric(m.typeParams, params, returnType);
 						if (expansions)
 							return expansions.map(o => JS.Method('method', m.key, { params: o.params, rest: m.rest, returnType: o.returnType, typeParams: undefined }, undefined, m.modifiers));
@@ -1307,7 +1307,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 			}
 		},
 		undefined,
-		resolveTypes(global, importScope, TC)
+		resolveTypes(global, importScope)
 	)!;
 }
 
