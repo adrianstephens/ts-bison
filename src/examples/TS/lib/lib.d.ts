@@ -24,6 +24,8 @@ declare module 'wasi:io/resource-error' {
 // it's assigned to, and this is what supplies it.
 declare function __asm<P extends any[], R>(asm: string): (...args: P) => R;
 
+declare function pure(target: any, propertyKey: string, descriptor: PropertyDescriptor): void;
+
 // Pseudo-types for `__asm`'s own `P`/`R` generic args, purely so an asm-backed method can declare its
 // *real* wasm-level param/result type when it isn't `number`'s usual `f64` -- e.g. `String.charCodeAt`'s
 // index param is a genuine wasm `i32` (an array index), not a general-purpose `number`; declaring it
@@ -51,13 +53,32 @@ interface Function {}
 interface CallableFunction {}
 interface NewableFunction {}
 interface IArguments {}
-interface Symbol {}
 interface Boolean {}
 interface BigInt {}
 
 //-----------------------------------------------------------------------------
 //	Object
 //-----------------------------------------------------------------------------
+
+interface Symbol {
+	toString(): string;
+	valueOf(): symbol;
+}
+
+declare type PropertyKey = string | number | symbol;
+
+interface PropertyDescriptor {
+	configurable?: boolean;
+	enumerable?: boolean;
+	value?: any;
+	writable?: boolean;
+	get?(): any;
+	set?(v: any): void;
+}
+
+interface PropertyDescriptorMap {
+	[key: PropertyKey]: PropertyDescriptor;
+}
 
 // `entries` only, for now -- a compiler intrinsic (see `emitObjectEntries` in towasm.ts), not real TS
 // source: what fields exist depends on the argument's own concrete type at each call site, which only

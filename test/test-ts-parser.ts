@@ -44,9 +44,9 @@ function test(name: string, code: string, format = 20) {
 			case 3: console.log(output.toCode(TStoDecl(program))); break;
 			case 20: {
 				console.log(output.toCode(program));
-				const g		= vsdg.BuildVSDG(program);
-				const out	= new vsdg.Output(g);
-				const stmts = out.emitLocalStatements(Array.from(g.keys()));
+				const graph		= vsdg.BuildVSDG(program);
+				const { blockIds, blockControl } = vsdg.applyGlobalCodeMotion(graph);
+				const stmts = vsdg.blocksToAST(blockIds, blockControl, graph);
 				console.log(output.toCode(stmts));
 				break;
 			}

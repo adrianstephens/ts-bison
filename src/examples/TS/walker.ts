@@ -25,8 +25,7 @@ export const isJsStatement		= guard<JS.Statement<any>>(stmts);
 type Type		= TS.Type;
 type Expr		= TS.Expr;
 type Statement	= TS.Statement;
-export type Walkable0 = TS.Statement | Expr | Type;
-export type Walkable = Walkable0 | TS.Program | Statement[];
+export type Walkable = Statement | Expr | Type | TS.Program | Statement[];
 
 //-----------------------------------------------------------------------------
 // Constant folding
@@ -93,26 +92,14 @@ export function calcBinary(op: JS.binaryOps, a: any, b: any) {
 // walk
 //-----------------------------------------------------------------------------
 
-interface Process<U> {
-	<T extends U>(x: T, recall?: false): T;
-	<T extends U>(x?: T, recall?: boolean): T | undefined;
-}
 // Lets a hook recurse into a child of another domain (e.g. an expression from onStatement),
 // using the same shape-based dispatch `walk()` itself uses at its own entry point.
-type Recurse		= <T extends Walkable0>(x: T) => T | undefined;
-type OnAST<U>		= (x: U, process: Process<U>, recurse: Recurse) => U | undefined;
+type Recurse		= <T extends TS.Statement | Expr | Type>(x: T) => T | undefined;
+type OnAST<U>		= (x: U, process: <T extends U>(x: T) => T, recurse: Recurse) => U | undefined;
 
 function makeProcess<U>(parts: (x: U) => U, on: OnAST<U> | undefined, recurse: Recurse, always = false) {
-	if (on) {
-		function process<T extends U>(t: T, recall?: false): T;
-		function process<T extends U>(t?: T, recall?: boolean): T | undefined;
-		function process<T extends U>(t?: T, recall?: boolean): T | undefined {
-			return !t ? undefined : recall ? redo(t) : parts(t) as T;
-		}
-		const redo = <T extends U>(t?: T) => t ? on(t, process, recurse) as T | undefined : undefined;
-		return redo;
-	}
-	return always	? <T extends U>(t?: T) => t ? parts(t) as T : undefined
+	return	on 		? <T extends U>(t?: T) => t ? on(t, <T extends U>(t: T) => parts(t) as T, recurse) as T | undefined : undefined
+		:	always	? <T extends U>(t?: T) => t ? parts(t) as T : undefined
 					: <T extends U>(t?: T) => t;
 }
 
@@ -510,21 +497,16 @@ export function walk<T extends Walkable>(ast: T,
 // walkB
 //-----------------------------------------------------------------------------
 
-type ProcessB<U>	= <T extends U>(x?: T, recall?: boolean)=>boolean;
 // `kind` lets a caller that already knows what `x` is (e.g. an `if`/`while` test, always an
 // expression) skip the shape-based guess below -- needed because some tags genuinely can't be
 // told apart by shape alone (a 'literal' node is IDENTICAL, field for field, whether it's a
 // type-level literal type or an expression-level literal value; see `recurse`'s own comment).
-type RecurseB		= (x: Walkable0, kind?: 'expression' | 'statement' | 'type') => boolean;
-type OnASTB<U>		= (x: U, process: ProcessB<U>, recurse: RecurseB) => boolean;
+export type RecurseB	= (x: TS.Statement | Expr | Type | undefined, kind?: 'expression' | 'statement' | 'type') => boolean;
+type OnASTB<U>		= (x: U, process: (x: U) => boolean, recurse: RecurseB) => boolean;
 
 function makeProcessB<U>(parts: (x: U) => boolean, on: OnASTB<U> | undefined, recurse: RecurseB, always = false) {
-	if (on) {
-		const process	= (t?: U, recall?: boolean) => !t ? false : recall ? redo(t) : parts(t);
-		const redo		= (t?: U) => t ? on(t, process, recurse) : false;
-		return redo;
-	}
-	return always	? (t?: U) => t ? parts(t) : false
+	return	on 		? (t?: U) => t ? on(t, (t: U) => parts(t), recurse) : false
+		:	always	? (t?: U) => t ? parts(t) : false
 					: (_?: U) => false;
 }
 
@@ -678,6 +660,8 @@ export function walkB<T extends Walkable>(ast: T,
 	};
 
 	const recurse: RecurseB = (x, kind) => {
+		if (!x)
+			return false;
 		if (kind === 'expression')
 			return walkExpression(x as JS.Expr);
 		if (kind === 'statement')

@@ -516,17 +516,17 @@ export function substituteThisType(t: Type, thisType: Type): Type {
 // Whether `name` occurs somewhere `inferTypeArgs` would actually descend into -- tells "no argument could ever determine
 // this" apart from "an argument should have but didn't" (a real gap). Mirrors `inferTypeArgs`'s recursion shape, not a blanket walk.
 export function mentionsTypeParam(t: Type, name: string): boolean {
-	return walkB(t, undefined, undefined, (t, process) => {
+	return walkB(t, undefined, undefined, (t, process, recurse) => {
 		switch (t.type) {
 			case 'ref':				return t.typeArgs ? process(t) : t.name === name;
 			case 'function':
-			case 'constructor':		return t.params.some(p => process(p.typeAnnotation, true)) || process(t.returnType, true);
+			case 'constructor':		return t.params.some(p => recurse(p.typeAnnotation)) || recurse(t.returnType);
 			case 'object':			return t.members.some(m =>
-				m.type === 'property' ? process(m.typeAnnotation, true)
-				: m.type === 'method' ? process(m.returnType, true)
+				m.type === 'property' ? recurse(m.typeAnnotation)
+				: m.type === 'method' ? recurse(m.returnType)
 				: false
 			);
-			case 'conditional':		return process(t.trueType, true) || process(t.falseType, true);
+			case 'conditional':		return recurse(t.trueType) || recurse(t.falseType);
 			case 'array': case 'tuple': case 'intersection': case 'union': case 'predicate':
 				return process(t);
 			// `keyof`/`indexed_access`/`mapped`/`typeof`/`this`/`template_literal`/`infer`: not positions `inferTypeArgs` inverts.
@@ -1712,7 +1712,7 @@ export function argsFit(sig: TS.CallSig, argTs: (Type | undefined)[], scope: Sco
 // `deferred` (every caller except `instantiate()`) reproduces the exact old behavior throughout.
 export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<string, TS.TypeParam>, out: Map<string, Type>, scope: Scope, declScope: Scope = scope, deferred?: { paramT: Type; argT: Type }[]): void {
 	return recurse(paramT, argT, 6);
-	
+
 	function recurse(paramT: Type, argT: Type, depth: number) {
 		if (depth < 0)
 			return;

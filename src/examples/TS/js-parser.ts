@@ -175,8 +175,9 @@ export function SwitchCase<T, S>(test: Expr<T>, ...consequent: S[]) : SwitchCase
 export function Switch<T>(discriminant: Expr, ...cases: SwitchCase<T>[]): Statement<T> { return { type: 'switch', discriminant, cases }; }
 export function Block<T>(...body: Statement<T>[]): { type: 'block'; body: Statement<T>[] } { return { type: 'block', body }; }
 export function For<T>(init: ForInit<T>|undefined, test: Expr|undefined, update: Expr|undefined, body: Statement<T>): Statement<T> { return { type: 'for', kind: 'normal', init, test, update, body }; }
-export function If<T>(test: Expr, consequent: Statement<T>, alternate?: Statement<T>) { return {type: 'if', test, consequent, alternate }; }
-export function While<T>(test: Expr, body: Statement<T>) { return {type: 'while', test, body }; }
+export function If<T>(test: Expr, consequent: Statement<T>, alternate?: Statement<T>): Statement<T> { return {type: 'if', test, consequent, alternate }; }
+export function While<T>(test: Expr, body: Statement<T>): Statement<T> { return {type: 'while', test, body }; }
+export function DoWhile<T>(body: Statement<T>, test: Expr<T>): Statement<T> { return {type: 'do_while', body, test }; }
 
 export type Statement<T> = Declaration<T>
 	| { type: 'block'; body: Statement<T>[] }

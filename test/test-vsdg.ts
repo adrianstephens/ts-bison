@@ -499,6 +499,44 @@ async function main() {
 		h(i);
 	`);
 
+	// The bug this guards against: a reassignment right before a `break` INSIDE a nested `if` (so the
+	// if's own two branches disagree on whether they exited) used to have its value silently dropped
+	// from the merge -- correct for a plain `if` (nothing past it is reachable except via the live
+	// branch), but wrong once the enclosing construct is a LOOP: `break` exits the loop itself, and
+	// code after the loop is reachable via EVERY break point, not just the one where nothing broke.
+	// Before the fix, `return total;` here always saw total's PRE-loop value (0), never either
+	// branch's own reassignment.
+	check('while: a reassignment right before break, nested in an if, survives to after the loop', `
+		function f(c) {
+			let total = 0;
+			while (true) {
+				if (c) {
+					total = 10;
+					break;
+				}
+				total = 20;
+				break;
+			}
+			return total;
+		}
+	`, `
+		function f(c) {
+			let total = 0;
+			while (true) {
+				if (!true) {
+					break;
+				}
+				if (c) {
+					total = 10;
+					break;
+				}
+				total = 20;
+				break;
+			}
+			return total;
+		}
+	`);
+
 	// The bug this guards against: a NAMED gamma (a per-variable merge, e.g. an `else if` chain's
 	// inner merge) unconditionally resolved to `Identifier(name)`, same as the `binary`-reassignment
 	// bug fixed earlier -- correct only if something actually printed `name = ...;` for it. A purely
@@ -527,18 +565,24 @@ async function main() {
 	`);
 
 	// `switch` didn't exist as a statement type at all before this batch (and had a prerequisite:
-	// break/continue support, above). It's lowered into an ordinary `if`/`while` cascade with a
-	// synthetic `__hit` fallthrough flag, fed back through `recurse` -- reusing the if-handler's own
-	// exit-tracking/gamma machinery and the while-handler's own mu/theta/loop-rotation machinery
-	// entirely as-is. Building this exposed two genuinely pre-existing, unrelated bugs, both fixed
-	// alongside it: (1) `walker.ts`'s `isType` guard mis-routed ANY bare expression-level `literal`
-	// node (e.g. `while (true)`'s own test) to the no-op type-walker, since a type-level literal type
-	// and an expression-level literal value are IDENTICAL shapes with no structural way to tell them
-	// apart -- fixed by letting `recurse` take an explicit `'expression'` hint that bypasses the
-	// shape-based guess (a real, general bug: even a hand-parsed `if (true) {...}` hit it, nothing to
-	// do with switch specifically); (2) the discriminant's own wrapper node was built by hand
-	// (`makeNode`/`connectValue`) but never threaded into the state chain via `rebindVar`, so its own
-	// `let __disc = ...;` declaration never printed even though every case read its name.
+	// break/continue support, above). It's lowered into an ordinary `if` cascade with a synthetic
+	// `__hit` fallthrough flag, fed back through `recurse` -- reusing the if-handler's own
+	// exit-tracking/gamma machinery entirely as-is. Building this exposed three genuinely
+	// pre-existing/newly-introduced bugs, all fixed alongside it:
+	// (1) `walker.ts`'s `isType` guard mis-routed ANY bare expression-level `literal` node (e.g. a
+	// `while (true)` test) to the no-op type-walker, since a type-level literal type and an
+	// expression-level literal value are IDENTICAL shapes with no structural way to tell them
+	// apart -- fixed by letting `recurse` take an explicit `'expression'` hint (a real, general
+	// bug: even a hand-parsed `if (true) {...}` hit it, nothing to do with switch specifically);
+	// (2) the discriminant's own wrapper node was built by hand but never threaded into the state
+	// chain via `rebindVar`, so `let __disc = ...;` never printed even though every case read it;
+	// (3) an initial `while (true) { ...; break; }` wrapping (chosen for break's syntactic
+	// validity) was itself a real loop, so a `continue` inside a case -- which real JS routes PAST
+	// a switch to the nearest enclosing loop -- got wrongly caught by the wrapper instead, an
+	// infinite loop whenever the switch's own discriminant stayed constant. Fixed by giving switch
+	// its own minimal `break_scope` graph anchor (no mu/theta, no continue target of its own),
+	// reconstructed as an always-matching `switch (0) { case 0: ... }` purely for break's
+	// syntactic target -- real JS's own `continue` already skips past a switch correctly.
 	check('switch: break exits, default matches when nothing else does', `
 		let x = 1;
 		switch (x) {
@@ -554,30 +598,28 @@ async function main() {
 		h(x);
 	`, `
 		let x = 1;
-		let __disc_var4 = x;
-		let __match0_var4 = __disc_var4 === 1;
-		let __match1_var4 = __disc_var4 === 2;
-		let __hit_var4 = false;
-		while (true) {
-			if (!true) {
-				break;
-			}
-			if (__hit_var4 || __match0_var4) {
-				__hit_var4 = true;
-				g(1);
-				break;
-			}
-			if (__hit_var4 || __match1_var4) {
-				__hit_var4 = true;
-				g(2);
-				break;
-			}
-			var t0 = __hit_var4 || !(__match0_var4 || __match1_var4);
-			if (t0) {
-				__hit_var4 = t0 ? true : __hit_var4;
-				g(99);
-			}
-			break;
+		switch (0) {
+			case 0:
+				let __disc_var4 = x;
+				let __match0_var4 = __disc_var4 === 1;
+				let __hit_var4 = false;
+				var t0 = __hit_var4 || __match0_var4;
+				if (t0) {
+					__hit_var4 = true;
+					g(1);
+					break;
+				}
+				let __match1_var4 = __disc_var4 === 2;
+				var t1 = __hit_var4 || __match1_var4;
+				if (t1) {
+					__hit_var4 = true;
+					g(2);
+					break;
+				}
+				var t2 = __hit_var4 || !(__match0_var4 || __match1_var4);
+				if (t2) {
+					g(99);
+				}
 		}
 		h(x);
 	`);
@@ -601,37 +643,34 @@ async function main() {
 		h(x);
 	`, `
 		let x = 2;
-		let __disc_var4 = x;
-		let __match0_var4 = __disc_var4 === 1;
-		let __match1_var4 = __disc_var4 === 2;
-		let __match2_var4 = __disc_var4 === 3;
-		let __match3_var4 = __disc_var4 === 4;
-		let __hit_var4 = false;
-		while (true) {
-			if (!true) {
-				break;
-			}
-			var t0 = __hit_var4 || __match0_var4;
-			if (t0) {
-				g(1);
-			}
-			__hit_var4 = t0 ? true : __hit_var4;
-			var t1 = __hit_var4 || __match1_var4;
-			if (t1) {
-				g(2);
-			}
-			__hit_var4 = t1 ? true : __hit_var4;
-			if (__hit_var4 || __match2_var4) {
-				__hit_var4 = true;
-				g(3);
-				break;
-			}
-			var t2 = __hit_var4 || __match3_var4;
-			if (t2) {
-				__hit_var4 = t2 ? true : __hit_var4;
-				g(4);
-			}
-			break;
+		switch (0) {
+			case 0:
+				let __disc_var4 = x;
+				let __match0_var4 = __disc_var4 === 1;
+				let __hit_var4 = false;
+				var t0 = __hit_var4 || __match0_var4;
+				if (t0) {
+					g(1);
+				}
+				let __match1_var4 = __disc_var4 === 2;
+				__hit_var4 = t0 ? true : __hit_var4;
+				var t1 = __hit_var4 || __match1_var4;
+				if (t1) {
+					g(2);
+				}
+				let __match2_var4 = __disc_var4 === 3;
+				let __match3_var4 = __disc_var4 === 4;
+				__hit_var4 = t1 ? true : __hit_var4;
+				var t2 = __hit_var4 || __match2_var4;
+				if (t2) {
+					__hit_var4 = true;
+					g(3);
+					break;
+				}
+				var t3 = __hit_var4 || __match3_var4;
+				if (t3) {
+					g(4);
+				}
 		}
 		h(x);
 	`);
@@ -650,25 +689,375 @@ async function main() {
 				break;
 		}
 	`, `
-		let x;
-		let __disc_var4 = 5;
-		let __match1_var4 = __disc_var4 === 1;
-		let __hit_var4 = false;
+		switch (0) {
+			case 0:
+				let x;
+				let __disc_var4 = 5;
+				let __match1_var4 = __disc_var4 === 1;
+				let __hit_var4 = false;
+				var t0 = __hit_var4 || !__match1_var4;
+				if (t0) {
+					__hit_var4 = true;
+					g(0);
+					break;
+				}
+				var t1 = __hit_var4 || __match1_var4;
+				if (t1) {
+					__hit_var4 = true;
+					g(1);
+					break;
+				}
+		}
+	`);
+
+	// The bug break_scope exists to fix: `continue` inside a switch case, itself nested in a real
+	// enclosing loop, must skip PAST the switch to the outer loop (real JS semantics -- a switch is
+	// not a continue target). With the earlier `while (true)` wrapping, this infinite-looped (the
+	// synthetic wrapper caught the continue instead of the real outer while). Since break_scope
+	// reconstructs as a plain `switch`, not a loop, real JS's own continue semantics get this right
+	// with no special handling needed at all -- the switch(0){} wrapper is simply not a valid
+	// continue target, exactly like a real switch statement.
+	check('switch: continue inside a case skips past the switch to the outer loop', `
+		let i = 0;
+		while (i < 3) {
+			switch (i) {
+				case 1:
+					i = i + 1;
+					continue;
+				default:
+					h(i);
+			}
+			i = i + 1;
+		}
+	`, `
+		let i = 0;
 		while (true) {
-			if (!true) {
+			if (!(i < 3)) {
 				break;
 			}
-			if (__hit_var4 || !__match1_var4) {
-				__hit_var4 = true;
-				g(0);
+			switch (0) {
+				case 0:
+					let __disc_var8 = i;
+					let __match0_var8 = __disc_var8 === 1;
+					let __hit_var8 = false;
+					if (__hit_var8 || __match0_var8) {
+						__hit_var8 = true;
+						i = i + 1;
+						continue;
+					}
+					var t0 = __hit_var8 || !__match0_var8;
+					if (t0) {
+						h(i);
+					}
+			}
+			i = i + 1;
+		}
+	`);
+
+	// A variable reassigned in MULTIPLE cases, each ending in `break` -- the case this session's own
+	// exit-value-merging bug hid in: `break` only exits the switch's own break_scope, not the whole
+	// function, so code after the switch is reachable via EVERY case's own break point, not just the
+	// path where nothing matched. Before the fix, each case's own reassignment was silently dropped
+	// from the merge (kept only via forcedPrint, in place), so `return total;` after the switch never
+	// actually observed any of case 1/2's own values -- always the pre-switch default.
+	check('switch: a variable reassigned in multiple break-ending cases survives to after the switch', `
+		function f(x) {
+			let total = 0;
+			switch (x) {
+				case 1:
+					total = 10;
+					break;
+				case 2:
+					total = 20;
+					break;
+				default:
+					total = -1;
+			}
+			return total;
+		}
+	`, `
+		function f(x) {
+			let total;
+			let __disc_var7 = x;
+			let __match0_var7 = __disc_var7 === 1;
+			let __match1_var7 = __disc_var7 === 2;
+			let __hit_var7 = false;
+			var t0 = __hit_var7 || __match0_var7;
+			var t1 = __hit_var7 || __match1_var7;
+			var t2 = __hit_var7 || !(__match0_var7 || __match1_var7);
+			switch (0) {
+				case 0:
+					if (t0) {
+						__hit_var7 = true;
+						total = 10;
+						break;
+					}
+					if (t1) {
+						__hit_var7 = true;
+						total = 20;
+						break;
+					}
+			}
+			return t2 ? -1 : t1 ? total : t0 ? total : 0;
+		}
+	`);
+
+	// `do_while` didn't exist as a statement type at all before this batch. Unlike `while`, it
+	// needs no loop-rotation trick at all: the body already runs before the test in do-while's own
+	// native semantics (the loop-carried mu's INITIAL value is what the body sees on its first
+	// pass), so `do { body } while (test);` reconstructs directly -- reusing the exact same
+	// mu/theta machinery `while` already has (factored into a shared `buildLoop` helper), just
+	// walking body before test instead of after.
+	check('do_while: body runs once unconditionally before the first test', `
+		let i = 0;
+		do {
+			g(i);
+			i = i + 1;
+		} while (i < 3);
+		h(i);
+	`, `
+		let i = 0;
+		do {
+			g(i);
+			i = i + 1;
+		} while (i < 3);
+		h(i);
+	`);
+
+	// The bug this guards against: a REAL, previously-latent GCM scheduling gap, not a do-while-
+	// specific workaround. `scheduleLate` never excluded a STATE theta's own condition edge (port
+	// 1) from ordinary "must be ready by this consumer's block" treatment, the way it already
+	// excluded a mu's feedback edge and a named gamma's value ports -- the theta's own block
+	// represents "after the loop has exited" (logically outside it), but the condition it reads is
+	// physically computed INSIDE the loop, every iteration. A `while` loop's test is always read
+	// BEFORE the body, so it can never depend on a body-computed reassignment directly -- only
+	// `do...while` can (its test runs AFTER the body), which is why this never surfaced until now.
+	// Left unfixed, `i = i + 1;` was scheduled one loop-nesting level too shallow (tied with, and
+	// losing a depth tie-break to, the loop header itself), printing AFTER `if (i === 2) { break; }`
+	// instead of before it -- silently reordering two statements relative to their real source order.
+	check('do_while: a reassignment the test reads directly stays correctly ordered before a later break', `
+		let i = 0;
+		do {
+			i = i + 1;
+			if (i === 2) {
 				break;
 			}
-			if (__hit_var4 || __match1_var4) {
-				__hit_var4 = true;
-				g(1);
+		} while (i < 5);
+		h(i);
+	`, `
+		let i = 0;
+		do {
+			i = i + 1;
+			if (i === 2) {
 				break;
 			}
-			break;
+		} while (i < 5);
+		h(i);
+	`);
+
+	// `for` didn't exist as a statement type at all before this batch. Desugars to `while (test) {
+	// body; update; }` (init runs once, before the loop), reusing buildLoop's existing while-shaped
+	// mu/theta machinery entirely as-is -- no new graph machinery needed for the ordinary,
+	// no-continue case.
+	check('for: init/test/update reconstruct as an ordinary while loop', `
+		for (let i = 0; i < 3; i = i + 1) {
+			g(i);
+		}
+		h(0);
+	`, `
+		let i = 0;
+		while (true) {
+			if (!(i < 3)) {
+				break;
+			}
+			g(i);
+			i = i + 1;
+		}
+		h(0);
+	`);
+
+	// The bug this guards against: real `for`-loop semantics run `update` even when the body
+	// `continue`s (only the REST of the body is skipped) -- but a bare `continue;`, lowered onto
+	// the same while-shaped graph a plain `while` uses, would otherwise skip `update` entirely
+	// (jumping straight to the re-test, past anything else in the same block, exactly like a real
+	// while-loop's own continue). `continue`'s own handler re-walks a fresh clone of `update`
+	// first, right before its own marker, so it still runs on the continue path too.
+	check('for: continue still runs update before re-testing', `
+		let sum = 0;
+		for (let i = 0; i < 5; i = i + 1) {
+			if (i === 2) {
+				continue;
+			}
+			sum = sum + i;
+		}
+		h(sum);
+	`, `
+		let sum = 0;
+		let i = 0;
+		while (true) {
+			if (!(i < 5)) {
+				break;
+			}
+			if (i === 2) {
+				i = i + 1;
+				continue;
+			}
+			sum = sum + i;
+			i = i + 1;
+		}
+		h(sum);
+	`);
+
+	// `continue` inside a `switch` nested in a `for` must still re-run the FOR's own `update` --
+	// `switch` pushes nothing onto the loop-context stack that tracks which update to re-run (it's
+	// not a loop and has no update of its own), so it's correctly transparent here, same as it is
+	// to a real `continue` at runtime.
+	check('for: continue inside a nested switch still runs the enclosing loop\'s update', `
+		for (let i = 0; i < 5; i = i + 1) {
+			switch (i) {
+				case 2:
+					continue;
+				default:
+					g(i);
+			}
+		}
+	`, `
+		let i = 0;
+		while (true) {
+			if (!(i < 5)) {
+				break;
+			}
+			switch (0) {
+				case 0:
+					let __disc_var8 = i;
+					let __match0_var8 = __disc_var8 === 2;
+					let __hit_var8 = false;
+					if (__hit_var8 || __match0_var8) {
+						__hit_var8 = true;
+						i = i + 1;
+						continue;
+					}
+					var t0 = __hit_var8 || !__match0_var8;
+					if (t0) {
+						g(i);
+					}
+			}
+			i = i + 1;
+		}
+	`);
+
+	// `try`/`catch` didn't exist at all before this batch (and needed `throw` alongside it to be
+	// testable at all). Reconstructed as a real `try {...} catch (e) {...}` -- no rotation or
+	// synthetic wrapper needed, unlike a loop or switch, since try/catch is already exactly the
+	// shape it needs to be. Deliberately doesn't model implicit exceptions from an ordinary call
+	// that might itself throw (see BuildVSDG's 'try' case) -- only an explicit `throw` is a
+	// control-flow event in the graph; nothing here reorders a `try` body's own statements, so real
+	// JS's own exception routing at runtime is unaffected either way. `x`'s merged value after the
+	// try/catch has no printable condition to build a ternary from the way an if/else's gamma can
+	// (there's no boolean "did it throw" to write), so each branch keeps and prints its own
+	// `x = ...;` under the same name instead (a new `except` node exists purely so GCM schedules
+	// `h(x)` no earlier than whichever branch actually ran).
+	check('try/catch: merged value has no printable condition, so each branch keeps its own name', `
+		let x = 0;
+		try {
+			x = f();
+		} catch (e) {
+			x = 0;
+		}
+		h(x);
+	`, `
+		let x;
+		try {
+			x = f();
+		} catch (e) {
+			x = 0;
+		}
+		h(x);
+	`);
+
+	// An explicit `throw` is a break/continue-style marker carrying a real value (its own operand,
+	// resolved at print time) -- `catch (e)`'s own parameter is opaque and externally provided, no
+	// different from a function parameter, with no connection to any computation inside `try`.
+	check('try/catch: throw carries its own value into the catch parameter', `
+		try {
+			g(1);
+			throw 99;
+		} catch (e) {
+			h(e);
+		}
+	`, `
+		try {
+			g(1);
+			throw 99;
+		} catch (e) {
+			h(e);
+		}
+	`);
+
+	// `finally` runs after the try/catch merge, walked like ordinary code -- NOT modeling "runs on
+	// every exit path" at the graph level at all (see BuildVSDG's 'try' case for why real JS's own
+	// finally semantics already guarantee this for free, once it's reconstructed as a REAL finally
+	// clause). A `let`/const (or, as here, a reassignment read back afterward) declared directly in
+	// `try`/`catch`/`finally`'s own body needs an extra scope layer with closeAndFlush -- unlike an
+	// if's consequent/alternate, `s.block`/`s.handlerBody`/`s.finalizer` are plain statement arrays
+	// with no enclosing 'block' AST node to filter locals the way if/else already benefits from;
+	// without it, `catch`'s own parameter name leaked into the merge's diverged-variable
+	// reconciliation and crashed on the branch that never bound it.
+	check('try/catch/finally: finally sees the merged value and always runs', `
+		let x = 0;
+		try {
+			x = f();
+		} catch (e) {
+			x = 0;
+		} finally {
+			g(x);
+		}
+		h(x);
+	`, `
+		let x;
+		try {
+			x = f();
+		} catch (e) {
+			x = 0;
+		} finally {
+			g(x);
+		}
+		h(x);
+	`);
+
+	// `break` inside a `try` nested in a `while` correctly propagates out to the loop -- try/catch
+	// introduces no break-target of its own (unlike `switch`), so this needs no special handling at
+	// all beyond what break_scope/buildLoop already provide; the printed `break;` inside `try`
+	// already routes to the enclosing `while` via real JS semantics, exactly like it would with no
+	// try/catch there at all.
+	check('try/catch: break inside try still exits the enclosing loop', `
+		let i = 0;
+		while (i < 3) {
+			try {
+				g(i);
+				if (i === 1) {
+					break;
+				}
+			} catch (e) {
+				h(0);
+			}
+			i = i + 1;
+		}
+	`, `
+		let i = 0;
+		while (true) {
+			if (!(i < 3)) {
+				break;
+			}
+			try {
+				g(i);
+				if (i === 1) {
+					break;
+				}
+			} catch (e) {
+				h(0);
+			}
+			i = i + 1;
 		}
 	`);
 

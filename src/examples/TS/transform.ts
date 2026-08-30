@@ -538,7 +538,7 @@ export function TStoJS(ast: TS.Program) {
 
 		},
 		//onExpr
-		(expr, process) => {
+		(expr, process, recurse) => {
 			switch (expr.type) {
 
 				case 'function':
@@ -557,10 +557,10 @@ export function TStoJS(ast: TS.Program) {
 				case 'as':
 				case 'satisfies':
 				case 'instantiation':
-					return process(expr.expression, true);
+					return recurse(expr.expression);
 
 				case 'unary_post':
-					return expr.operator === '!' ? process(expr.operand, true) : process(expr);
+					return expr.operator === '!' ? recurse(expr.operand) : process(expr);
 
 				default:
 					return process(expr);
