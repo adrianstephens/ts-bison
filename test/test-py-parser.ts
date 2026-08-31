@@ -95,7 +95,12 @@ finally:
 test('with statement', `
 with open("f") as fh, lock:
     data = fh.read()
-with (ctx):
+with a as b, c as d:
+    pass
+with (
+    first() as x,
+    second() as y,
+):
     pass
 `);
 

@@ -32,7 +32,7 @@ import { makeCachedParser } from '../../tableCache';
 //   * `match`/`case`/`type` are ordinary identifiers (no soft keywords).
 //   * f-strings are a single opaque STRING token (interpolations unparsed).
 //   * targets / argument ordering are not validated (permissive).
-//   * `with (a as b, c as d):` (parenthesised context managers) -- see `with_stmt`.
+//   * `with (a, b):` (no `as`) parses as one tuple context manager, not two (CPython 3.10+).
 
 // ===================================================================
 //  Lexer
@@ -637,15 +637,17 @@ try_stmt = Rules<Stmt>(
 
 with_item = Rules<WithItem>(
 	Rule([test],						$ => ({ context: $[0] })),
-	Rule([test, 'as', exprlist],		$ => ({ context: $[0], optional_vars: $[2] })),
+	Rule([test, 'as', expr_bitor],		$ => ({ context: $[0], optional_vars: $[2] })),
 ),
 with_items = List<WithItem>(with_item, ','),
-// `with (a as b, c as d):` -- the 3.10 parenthesised form -- is not supported: `(` there is
-// indistinguishable in one token of lookahead from a parenthesised expression context manager,
-// and CPython itself only parses it via PEG backtracking. `with (expr):` still works (the parens
-// are just a grouped `test`); so does the unparenthesised `with a as b, c as d:`.
+// The 3.10 parenthesised form (`with (a as b, c as d):`) is genuinely ambiguous with a
+// parenthesised-expression context manager in one token of lookahead -- CPython resolves it with
+// PEG backtracking. Here tison's on-demand GLR forks at `with (` and the wrong branch dies at the
+// first `as` (or both branches merge harmlessly when there is no `as`).
 with_stmt = Rules<Stmt>(
-	Rule(['with', with_items, ':', suite],	$ => ({ type: 'with', items: $[1], body: $[3], is_async: false })),
+	Rule(['with', with_items, ':', suite],						$ => ({ type: 'with', items: $[1], body: $[3], is_async: false })),
+	Rule(['with', oparen, with_items, cparen, ':', suite],		$ => ({ type: 'with', items: $[2], body: $[5], is_async: false })),
+	Rule(['with', oparen, with_items, ',', cparen, ':', suite],	$ => ({ type: 'with', items: $[2], body: $[6], is_async: false })),
 ),
 
 funcdef = Rules<Stmt>(
