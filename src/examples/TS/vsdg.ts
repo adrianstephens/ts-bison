@@ -3398,7 +3398,15 @@ function getStructuralKey(node: Node): string {
 			// documents for reconstruction.
 			case 'member': key += node.value + (node.optional ? '?' : '');
 				break;
-			default: key += node.value;
+			// JSON.stringify, not a bare `+=`: the SAME falsy-collision class the `!== undefined`
+			// gate above already fixed once survives here for the empty string specifically --
+			// `key += ''` appends nothing, so literal('') produced the exact same key as a genuinely
+			// valueless node (indistinguishable from literal(undefined)) and got silently CSE-merged
+			// with one -- found on real code (binary-libs/src/pe.ts): a ternary's own `: ''` alternate
+			// printed as `: undefined` after merging with an unrelated function's synthetic
+			// fall-off-the-end literal(undefined). Stringifying unambiguously distinguishes every
+			// value (including '', 0, false, null) from "no value at all" and from each other.
+			default: key += JSON.stringify(node.value);
 		}
 	}
 

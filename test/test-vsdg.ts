@@ -1115,6 +1115,28 @@ export async function main() {
 	// -- excluding both real consumers from scheduleLate's own LCA constraint and stranding the
 	// shared value outside the function it belongs to, printing `var t0 = a * b;` at the top level
 	// and referencing parameters that don't exist there (a real ReferenceError, not cosmetic).
+	// getStructuralKey's own `!== undefined` gate (see its own comment) correctly separates "has a
+	// value" from "has none" -- but the CONTENTS of that value were still just `+=`'d onto the key
+	// raw, and an empty string concatenates to nothing: literal('') produced the exact same key as
+	// a genuinely valueless node (indistinguishable from f's own synthetic fall-off-the-end
+	// literal(undefined)), so CSE silently merged them, and h's own `: ""` alternate printed as
+	// `: undefined` instead -- found on real code (binary-libs/src/pe.ts).
+	check("structural CSE: an empty-string literal doesn't collide with a valueless node", `
+		function f() {
+			g();
+		}
+		function h(cond) {
+			return cond ? "x" : "";
+		}
+	`, `
+		function f() {
+			g();
+		}
+		function h(cond) {
+			return cond ? "x" : "";
+		}
+	`);
+
 	check('structural CSE: two separately-written identical expressions share one computation', `
 		function f(a, b) {
 			g(a * b);
