@@ -1872,6 +1872,28 @@ function isCalleeEdge(consumer: Node, port: number): boolean {
 	return (v.type === 'call' || v.type === 'new') && port === (v.arguments?.length ?? 0) + 1;
 }
 
+// True when `consumer` reads its own producer, at `port`, in a way that requires the producer to
+// be addressable BY NAME -- never resolved/recomputed inline, regardless of reuse count (unlike an
+// ordinary value, which only needs a name once it has 2+ real readers). Two shapes: a mu/muValue's
+// own initial-value (port 0) or feedback (port 1) port -- neither is ever actually READ via
+// resolveNode (the mu itself is what's read everywhere it's used, never these edges), so a
+// producer feeding either must be a real statement, or `i = i + 1;`/`i`'s own `= 0` silently
+// vanish; or a rebind's own "old value" port (port 0 of a prefix/postfix unary or a compound
+// assignment) -- inlining THAT away would silently turn a real mutation into a no-op recompute
+// (`++0` printed in place of `++i`, `i` itself never advancing). Used by needsTemp to replace what
+// used to be two separate, identically-shaped "return true unconditionally" checks.
+function mustNameOwnValue(consumer: Node, port: number): boolean {
+	if (consumer.type === 'mu' || consumer.type === 'muValue')
+		return true;
+	if (port !== 0)
+		return false;
+	if (consumer.type === 'unary_post')
+		return true;
+	if (consumer.type === 'unary')
+		return ['++', '--'].includes((consumer.value as Expr & { type: 'unary' }).operator);
+	return consumer.type === 'binary' && ASSIGN_OPS.has((consumer.value as Expr & { type: 'binary' }).operator);
+}
+
 export class Output {
 	nodeVariableNames	= new Map<NodeId, string>();
 	declaredNames		= new Set<string>();
@@ -2050,32 +2072,11 @@ export class Output {
 		// preserve the receiver through a bound call or `.call(receiver, ...)` rewrite.
 		if (node.type === 'member' && consumers.some(e => isCalleeEdge(this.graph.get(e.nodeId)!, e.port)))
 			return false;
-		// NEITHER of a mu's own input ports -- initial value (0) or feedback (1) -- is ever actually
-		// READ via resolveNode/inlining: the mu itself is what's read everywhere it's used (as a plain
-		// Identifier), never these edges. They're purely structural (what to start the loop-carried
-		// variable at, what updates it each iteration), so a producer feeding either must always be a
-		// real, materialized statement -- skipping it here would silently drop it instead of inlining
-		// it anywhere (`i = i + 1;` vanishing and `i` never advancing; `i`'s own `= 0` going missing
-		// and starting the loop from `undefined`).
-		if (consumers.some(e => { const t = this.graph.get(e.nodeId)!.type; return t === 'mu' || t === 'muValue'; }))
-			return true;
-		// A rebind's own "old value"/left-operand edge (port 0 of a prefix/postfix unary or a compound
-		// assignment) needs the producer addressable BY NAME in the reconstructed mutating syntax
-		// (`++i`, `i += 1`) -- inlining the producer away as a bare literal there (safe for an ordinary
-		// pure consumer, which just recomputes a value) would silently turn a real mutation into a
-		// no-op recompute instead (`++0` printed in place of `++i`, `i` itself never advancing).
-		if (consumers.some(e => {
-			const target = this.graph.get(e.nodeId)!;
-			if (e.port !== 0)
-				return false;
-			if (target.type === 'unary_post')
-				return true;
-			if (target.type === 'unary') {
-				const op = (target.value as Expr & { type: 'unary' }).operator;
-				return op === '++' || op === '--';
-			}
-			return target.type === 'binary' && ASSIGN_OPS.has((target.value as Expr & { type: 'binary' }).operator);
-		}))
+		// Two edge shapes -- a mu/muValue's own initial-value/feedback port, or a rebind's own "old
+		// value" port -- both need the producer addressable BY NAME regardless of reuse count, never
+		// resolved/recomputed inline the way an ordinary single-consumer value safely would (see
+		// mustNameOwnValue's own comment for why each specifically breaks).
+		if (consumers.some(e => mustNameOwnValue(this.graph.get(e.nodeId)!, e.port)))
 			return true;
 		// A postfix ++/--'s captured old-value snapshot (see 'unary_post' in BuildVSDG) exists solely
 		// to freeze `i`'s value at this exact point, before the increment -- inlining it into a
