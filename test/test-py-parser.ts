@@ -1,14 +1,36 @@
-import { parse } from '../src/examples/PY/py-parser';
+import { parse, Expr, Stmt } from '../src/examples/PY/py-parser';
+import { Output } from '../src/examples/PY/tocode';
+import { walk, walkB } from '../src/examples/PY/walker';
 
 let pass = 0, fail = 0;
 const dump = process.argv.includes('-v');
+const out = new Output();
 
 function test(name: string, code: string) {
 	try {
 		const ast = parse(code);
+		const printed = out.toCode(ast);
+
+		// tocode round-trip: print -> parse -> print, the second printing must be identical.
+		const printed2 = out.toCode(parse(printed));
+
+		// walk() identity transform + walkB() full traversal: rebuilding every visited node must
+		// leave a tree that prints the same, and walkB must reach every node it structurally can.
+		let visited = 0;
+		const rebuilt = walk(ast, (s, p) => p(s) as Stmt, (e, p) => p(e) as Expr)!;
+		walkB(ast, s => (visited++, false), e => (visited++, false));
+
+		if (dump) {
+			console.log(`\u2713 ${name}`);
+			console.log('--- tocode ---\n' + printed);
+		}
+		if (printed !== printed2)
+			throw new Error(`tocode not stable\n--- 1 ---\n${printed}\n--- 2 ---\n${printed2}`);
+		if (out.toCode(rebuilt) !== printed)
+			throw new Error(`walk() identity changed the tree\n${out.toCode(rebuilt)}`);
+		if (visited === 0)
+			throw new Error('walkB visited nothing');
 		console.log(`\u2713 ${name}`);
-		if (dump)
-			console.log(JSON.stringify(ast, null, 1));
 		pass++;
 	} catch (e) {
 		console.error(`\u2717 ${name}:`, (e as Error).message);

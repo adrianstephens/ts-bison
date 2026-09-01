@@ -1,5 +1,5 @@
 import * as path from 'path';
-import { terminal, OneOf, List, MaybeList, Forward, Rules, WithPrec, makeRule, Terminal, type RecoveryCallback } from '../../tison';
+import { terminal, OneOf, List, MaybeList, Forward, Rules, makeRule, Terminal, type RecoveryCallback } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { Literal, Identifier, Unary, Binary } from '../common';
 
@@ -374,25 +374,6 @@ const Rule = makeRule<Ctx>();
 
 const AUGASSIGN = OneOf(['+=', '-=', '*=', '/=', '//=', '%=', '**=', '>>=', '<<=', '&=', '^=', '|=', '@=']);
 
-// Precedence ladder, lowest to highest.
-export const PREC = {
-	ternary:	{ assoc: 'right' },
-	or:			{ assoc: 'left' },
-	and:		{ assoc: 'left' },
-	not:		{ assoc: 'right' },
-	comparison:	{ assoc: 'left' },
-	bor:		{ assoc: 'left' },
-	bxor:		{ assoc: 'left' },
-	band:		{ assoc: 'left' },
-	shift:		{ assoc: 'left' },
-	arith:		{ assoc: 'left' },
-	term:		{ assoc: 'left' },
-	factor:		{ assoc: 'right' },
-	power:		{ assoc: 'right' },
-	awaitp:		{ assoc: 'right' },
-	trailer:	{ assoc: 'left' },
-} as const;
-
 // Declared bottom-up so a rule can reference an already-declared group by object (typed); genuine
 // cycles are cut with `Forward` (one edge per cycle), same as c-parser.ts.
 export const
@@ -476,40 +457,85 @@ atom = Rules<Expr>(
 	Rule([FOPEN_DQ3, fstringParts(FTEXT_DQ3), FCLOSE_DQ3],		$ => ({ type: 'fstring', parts: $[1] })),
 ),
 
-// `expr_bitor` -- everything up to (and including) the bitwise-or level: trailers, unary/binary
-// arithmetic, `await`, `**`. This is CPython's `expr`, and it is what `for`/`del`/`with ... as`
-// targets and `*x` use -- deliberately below comparison so the `in` in `for x in xs` is never
-// swallowed as the `in` comparison operator.
-expr_bitor = Rules<Expr>(self => [
-	atom,
-	WithPrec(Rule([self, oparen, cparen],					$ => ({ type: 'call', func: $[0], args: [] })), PREC.trailer),
-	WithPrec(Rule([self, oparen, fwd_arglist, cparen],		$ => ({ type: 'call', func: $[0], args: $[2] })), PREC.trailer),
-	WithPrec(Rule([self, obrack, fwd_subscriptlist, cbrack],	$ => ({ type: 'subscript', value: $[0], slice: $[2] })), PREC.trailer),
-	WithPrec(Rule([self, '.', NAME],						$ => ({ type: 'attr', value: $[0], attr: $[2] })), PREC.trailer),
-	WithPrec(Rule(['await', self],							$ => ({ type: 'await', value: $[1] })), PREC.awaitp),
-	WithPrec(Rule([self, '**', self],						$ => PyBinary('**', $[0], $[2])), PREC.power),
-	WithPrec(Rule([OneOf(['+', '-', '~']), self],			$ => PyUnary($[0], $[1])), PREC.factor),
-	WithPrec(Rule([self, OneOf(['*', '/', '//', '%', '@']), self],	$ => PyBinary($[1], $[0], $[2])), PREC.term),
-	WithPrec(Rule([self, OneOf(['+', '-']), self],			$ => PyBinary($[1], $[0], $[2])), PREC.arith),
-	WithPrec(Rule([self, OneOf(['<<', '>>']), self],			$ => PyBinary($[1], $[0], $[2])), PREC.shift),
-	WithPrec(Rule([self, '&', self],						$ => PyBinary('&', $[0], $[2])), PREC.band),
-	WithPrec(Rule([self, '^', self],						$ => PyBinary('^', $[0], $[2])), PREC.bxor),
-	WithPrec(Rule([self, '|', self],						$ => PyBinary('|', $[0], $[2])), PREC.bor),
-]),
+// The expression grammar is a precedence *cascade* -- one nonterminal per level, each referencing
+// the level above -- rather than one `Rules` block leaning on `WithPrec`. Cross-level precedence is
+// then purely structural, and each `self OP higher` rule is left-associative for free (the right
+// operand is a *different* nonterminal that can't absorb the next same-level operator). This is the
+// shape js-parser.ts's `binaryChain` uses; the single-block-plus-`WithPrec` alternative silently
+// produces right-associative, wrongly-nested trees when the operator sits behind an `OneOf`.
 
-// `or_test` adds the comparison / `not` / `and` / `or` levels. It stops short of the ternary and
-// `lambda` (which `test` adds) so `x for x in xs if cond` stays unambiguous.
-or_test = Rules<Expr>(self => [
+// trailers: call / subscript / attribute, left-recursive
+atom_expr = Rules<Expr>(self => [
+	atom,
+	Rule([self, oparen, cparen],					$ => ({ type: 'call', func: $[0], args: [] })),
+	Rule([self, oparen, fwd_arglist, cparen],		$ => ({ type: 'call', func: $[0], args: $[2] })),
+	Rule([self, obrack, fwd_subscriptlist, cbrack],	$ => ({ type: 'subscript', value: $[0], slice: $[2] })),
+	Rule([self, '.', NAME],							$ => ({ type: 'attr', value: $[0], attr: $[2] })),
+]),
+await_expr = Rules<Expr>(
+	atom_expr,
+	Rule(['await', atom_expr],		$ => ({ type: 'await', value: $[1] })),
+),
+// `factor` (unary +/-/~) and `power` (**) are mutually recursive, exactly as in CPython's grammar:
+// `factor: ('+'|'-'|'~') factor | power` and `power: await_expr ['**' factor]`. This gives
+// `-2 ** 2 == -(2 ** 2)` and `2 ** -3 == 2 ** (-3)`.
+factor = Rules<Expr>(self => [
+	Forward<Expr>(() => power),
+	Rule([OneOf(['+', '-', '~']), self],	$ => PyUnary($[0], $[1])),
+]),
+power = Rules<Expr>(
+	await_expr,
+	Rule([await_expr, '**', factor],		$ => PyBinary('**', $[0], $[2])),
+),
+term = Rules<Expr>(self => [
+	factor,
+	Rule([self, OneOf(['*', '/', '//', '%', '@']), factor],	$ => PyBinary($[1], $[0], $[2])),
+]),
+arith_expr = Rules<Expr>(self => [
+	term,
+	Rule([self, OneOf(['+', '-']), term],	$ => PyBinary($[1], $[0], $[2])),
+]),
+shift_expr = Rules<Expr>(self => [
+	arith_expr,
+	Rule([self, OneOf(['<<', '>>']), arith_expr],	$ => PyBinary($[1], $[0], $[2])),
+]),
+band_expr = Rules<Expr>(self => [
+	shift_expr,
+	Rule([self, '&', shift_expr],	$ => PyBinary('&', $[0], $[2])),
+]),
+bxor_expr = Rules<Expr>(self => [
+	band_expr,
+	Rule([self, '^', band_expr],	$ => PyBinary('^', $[0], $[2])),
+]),
+// `expr_bitor` is CPython's `expr` -- the bitwise-or level. `for`/`del`/`with ... as` targets and
+// `*x` use it, deliberately below comparison so the `in` in `for x in xs` is never taken as the
+// `in` comparison operator.
+expr_bitor = Rules<Expr>(self => [
+	bxor_expr,
+	Rule([self, '|', bxor_expr],	$ => PyBinary('|', $[0], $[2])),
+]),
+comparison = Rules<Expr>(self => [
 	expr_bitor,
-	WithPrec(Rule([self, comp_op, expr_bitor],				$ => compare($[0], $[1], $[2])), PREC.comparison),
-	WithPrec(Rule(['not', self],							$ => PyUnary('not', $[1])), PREC.not),
-	WithPrec(Rule([self, 'and', self],						$ => PyBinary('and', $[0], $[2])), PREC.and),
-	WithPrec(Rule([self, 'or', self],						$ => PyBinary('or', $[0], $[2])), PREC.or),
+	Rule([self, comp_op, expr_bitor],	$ => compare($[0], $[1], $[2])),
+]),
+not_test = Rules<Expr>(self => [
+	comparison,
+	Rule(['not', self],		$ => PyUnary('not', $[1])),
+]),
+and_test = Rules<Expr>(self => [
+	not_test,
+	Rule([self, 'and', not_test],	$ => PyBinary('and', $[0], $[2])),
+]),
+// `or_test` is the top of the cascade -- it stops short of the ternary and `lambda` (which `test`
+// adds) so `x for x in xs if cond` stays unambiguous.
+or_test = Rules<Expr>(self => [
+	and_test,
+	Rule([self, 'or', and_test],	$ => PyBinary('or', $[0], $[2])),
 ]),
 
 test = Rules<Expr>(self => [
 	or_test,
-	WithPrec(Rule([or_test, 'if', or_test, ELSE, self],	$ => ({ type: 'ifexp', test: $[2], body: $[0], orelse: $[4] })), PREC.ternary),
+	Rule([or_test, 'if', or_test, ELSE, self],	$ => ({ type: 'ifexp', test: $[2], body: $[0], orelse: $[4] })),
 	lambdef,
 ]),
 
@@ -839,8 +865,10 @@ const recover: RecoveryCallback = (lex, row) => {
 export const skip = [/[ \t\f]+/, /#[^\n]*/, /\\\r?\n/, WS];
 
 export const rules = {
-	expr_bitor, or_test, test, namedexpr_test, testlist, exprlist, testlist_star_expr,
-	atom, comp_op, lambdef, yield_expr, star_expr,
+	atom, atom_expr, await_expr, factor, power, term, arith_expr, shift_expr,
+	band_expr, bxor_expr, expr_bitor, comparison, not_test, and_test, or_test,
+	test, namedexpr_test, testlist, exprlist, testlist_star_expr,
+	comp_op, lambdef, yield_expr, star_expr,
 	testlist_comp, comp_for, comp_if_tail, dictorsetmaker,
 	argument, arglist, subscript, subscriptlist,
 	param, paramlist, parameters,
@@ -855,7 +883,6 @@ export const rules = {
 export const parser = makeCachedParser({
 	skip,
 	recover,
-	precedence: PREC,
 	start: file_input,
 	rules,
 }, path.join(__dirname, '../../../.tables-cache/py-parser.json.gz'));
