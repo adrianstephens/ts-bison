@@ -116,6 +116,15 @@ q = -2 ** 2
 walrus = [y for x in data if (y := f(x)) is not None]
 `);
 
+test('literals: shared common.ts leaf shapes', `
+flag = True or False or None
+count = 0xFF_00 + 1_000_000 + 0o17 + 0b1010
+ratio = 3.14e-2
+imag = 2j
+text = "adjacent" " strings" ' concat'
+huge = 123456789012345678901234567890
+`);
+
 test('imports', `
 import os
 import os.path as p

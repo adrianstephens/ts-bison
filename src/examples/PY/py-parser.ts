@@ -1,6 +1,7 @@
 import * as path from 'path';
 import { terminal, OneOf, List, MaybeList, Forward, Rules, WithPrec, makeRule, Terminal, type RecoveryCallback } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
+import { Literal, Identifier, Unary, Binary } from '../common';
 
 // ===================================================================
 //  Python 3 parser using tison
@@ -28,9 +29,16 @@ import { makeCachedParser } from '../../tableCache';
 //     `DEDENT` per still-open block at EOF (the lexer loop never runs at
 //     offset === length).
 //
+// Leaf expression nodes are the shared `../common` shapes (`Identifier`, `Literal`, `Unary`,
+// `Binary`) -- the same vocabulary c-parser.ts and js-parser.ts emit -- so a single walker /
+// analysis / codegen pass can span all three. `and`/`or` are nested `Binary`; only chained
+// comparison keeps a Python-specific `Compare` node (CPython's AST does the same).
+//
 // Known simplifications:
 //   * `match`/`case`/`type` are ordinary identifiers (no soft keywords).
 //   * targets / argument ordering are not validated (permissive).
+//   * string `Literal`s carry raw concatenated inner text, not the unescaped value (c-parser.ts
+//     takes the same shortcut); string/bytes prefix is dropped.
 //   * `with (a, b):` (no `as`) parses as one tuple context manager, not two (CPython 3.10+).
 //   * f-strings parse `{...}` fields as real expressions (see `fstringOpen`/`fstringText` etc.),
 //     but a literal `\` immediately before `{`/`}` always suppresses that field (`rf"C:\{x}"` is
@@ -186,14 +194,24 @@ const BANG			= terminal('!', /!/);
 //  AST
 // ===================================================================
 
-export interface Name		{ type: 'name'; id: string }
-export interface Num		{ type: 'num'; raw: string }
-export interface Str		{ type: 'str'; parts: string[] }
-export interface Const		{ type: 'const'; value: null | boolean | '...' }
-export interface Unary		{ type: 'unary'; op: string; operand: Expr }
-export interface BinOp		{ type: 'binop'; op: string; left: Expr; right: Expr }
-export interface BoolOp		{ type: 'boolop'; op: 'and' | 'or'; values: Expr[] }
-export interface Compare	{ type: 'compare'; left: Expr; ops: string[]; comparators: Expr[] }
+// Leaf expression nodes are the shared shapes from `../common` -- the same ones c-parser.ts and
+// js-parser.ts build -- so cross-language tooling sees one vocabulary:
+//   `Identifier`  { type:'identifier', name }
+//   `Literal<T>`  { type:'literal', value }   -- numbers, strings (raw, not unescaped), True/False/None
+//   `Unary`       { type:'unary', operator, operand }
+//   `Binary`      { type:'binary', operator, left, right }   -- includes `and`/`or`, nested left-assoc
+// Chained comparison genuinely has no `Binary` form, so `Compare` stays its own node (CPython's AST
+// likewise never emits a comparison as a plain binary op).
+export type unaryOps	= '+' | '-' | '~' | 'not';
+export type binaryOps	=
+	| '+' | '-' | '*' | '/' | '//' | '%' | '@' | '**'
+	| '&' | '|' | '^' | '<<' | '>>'
+	| 'and' | 'or';
+export type compareOps	= '<' | '>' | '<=' | '>=' | '==' | '!=' | '<>' | 'in' | 'not in' | 'is' | 'is not';
+
+export interface Imaginary	{ type: 'imaginary'; value: number }
+export interface Ellipsis	{ type: 'ellipsis' }
+export interface Compare		{ type: 'compare'; left: Expr; ops: compareOps[]; comparators: Expr[] }
 export interface IfExp		{ type: 'ifexp'; test: Expr; body: Expr; orelse: Expr }
 export interface Lambda		{ type: 'lambda'; params: Param[]; body: Expr }
 export interface NamedExpr	{ type: 'namedexpr'; target: string; value: Expr }
@@ -226,7 +244,12 @@ export interface FStringPart	{ text: string; field?: FStringField }
 export interface FStringLit	{ type: 'fstring'; parts: FStringPart[] }
 
 export type Expr =
-	| Name | Num | Str | Const | Unary | BinOp | BoolOp | Compare | IfExp | Lambda | NamedExpr
+	| Identifier
+	| Literal<number | bigint | string | boolean | null>
+	| Imaginary | Ellipsis
+	| Unary<Expr, unaryOps>
+	| Binary<Expr, binaryOps>
+	| Compare | IfExp | Lambda | NamedExpr
 	| Starred | Attribute | Subscript | SliceExpr | Call | Tuple | ListLit | SetLit | DictLit
 	| GeneratorExp | ListComp | SetComp | DictComp | Await | YieldExpr | FStringLit;
 
@@ -269,19 +292,40 @@ interface CompContent { comp: CompClause[] | null; list: CommaList }
 
 // --- AST helpers ---
 
-const Bin = (op: string, left: Expr, right: Expr): BinOp => ({ type: 'binop', op, left, right });
+const PyUnary	= Unary<Expr, unaryOps>;
+const PyBinary	= Binary<Expr, binaryOps>;
 
-function boolOp(op: 'and' | 'or', left: Expr, right: Expr): BoolOp {
-	return {
-		type: 'boolop', op,
-		values: left.type === 'boolop' && left.op === op ? [...left.values, right] : [left, right],
-	};
-}
-
-function compare(left: Expr, op: string, right: Expr): Compare {
+// `a < b < c` -> one `Compare` with all the ops; a lone `a < b` is still a `Compare` (single-op),
+// matching CPython -- a C/analysis backend desugars either the same way.
+function compare(left: Expr, op: compareOps, right: Expr): Compare {
 	return left.type === 'compare'
 		? { type: 'compare', left: left.left, ops: [...left.ops, op], comparators: [...left.comparators, right] }
 		: { type: 'compare', left, ops: [op], comparators: [right] };
+}
+
+// Numbers -> `Literal<number|bigint>` (or `Imaginary` for a `j` suffix); strings -> `Literal<string>`
+// carrying the concatenated *raw* inner text (escapes not processed -- same shortcut c-parser.ts takes).
+function pyNumber(raw: string): Literal<number | bigint> | Imaginary {
+	const t = raw.replace(/_/g, '');
+	if (/[jJ]$/.test(t))
+		return { type: 'imaginary', value: parseFloat(t.slice(0, -1)) };
+	if (/^0[xX]/.test(t))
+		return Literal(bigOrNum(parseInt(t.slice(2), 16), t));
+	if (/^0[oO]/.test(t))
+		return Literal(bigOrNum(parseInt(t.slice(2), 8), t));
+	if (/^0[bB]/.test(t))
+		return Literal(bigOrNum(parseInt(t.slice(2), 2), t));
+	if (/[.eE]/.test(t))
+		return Literal(parseFloat(t));
+	return Literal(bigOrNum(parseInt(t, 10), t));
+}
+const bigOrNum = (n: number, lit: string): number | bigint => Number.isSafeInteger(n) ? n : BigInt(lit);
+
+function pyString(parts: string[]): Literal<string> {
+	return Literal(parts.map(p => {
+		const m = /^[A-Za-z]*('''|"""|'|")([\s\S]*)\1$/.exec(p);
+		return m ? m[2] : p;
+	}).join(''));
 }
 
 const tupleOrSingle = (c: CommaList): Expr => c.items.length === 1 && !c.trailing ? c.items[0] : { type: 'tuple', elts: c.items };
@@ -362,7 +406,7 @@ fwd_testlist_comp	= Forward<CompContent>(() => testlist_comp),
 fwd_dictorset		= Forward<Expr>(() => dictorsetmaker),
 fwd_stmt			= Forward<Stmt[]>(() => stmt),
 
-comp_op = Rules<string>(
+comp_op = Rules<compareOps>(
 	Rule([OneOf(['<', '>', '==', '>=', '<=', '!=', '<>'])],	$ => $[0]),
 	Rule(['in'],											() => 'in'),
 	Rule(['not', 'in'],										() => 'not in'),
@@ -406,13 +450,13 @@ fstring_spec_opt = Rules<FStringSpecPart[] | undefined>(
 ),
 
 atom = Rules<Expr>(
-	Rule([NAME],					$ => ({ type: 'name', id: $[0] })),
-	Rule([NUMBER],					$ => ({ type: 'num', raw: $[0] })),
-	Rule([string_list],				$ => ({ type: 'str', parts: $[0] })),
-	Rule(['None'],					() => ({ type: 'const', value: null })),
-	Rule(['True'],					() => ({ type: 'const', value: true })),
-	Rule(['False'],					() => ({ type: 'const', value: false })),
-	Rule(['...'],					() => ({ type: 'const', value: '...' })),
+	// `True`/`False`/`None` are folded in here rather than given their own string terminals: an
+	// upper-case-initial keyword loses tison's longest-match tie-break to the `NAME` regex (its
+	// pattern sorts before the keyword's), so they'd otherwise lex as plain identifiers.
+	Rule([NAME],					$ => $[0] === 'True' ? Literal(true) : $[0] === 'False' ? Literal(false) : $[0] === 'None' ? Literal(null) : Identifier($[0])),
+	Rule([NUMBER],					$ => pyNumber($[0])),
+	Rule([string_list],				$ => pyString($[0])),
+	Rule(['...'],					() => ({ type: 'ellipsis' } as const)),
 	Rule([oparen, cparen],			() => ({ type: 'tuple', elts: [] })),
 	Rule([oparen, fwd_yield, cparen],			$ => $[1]),
 	Rule([oparen, fwd_testlist_comp, cparen],	$ => {
@@ -443,24 +487,24 @@ expr_bitor = Rules<Expr>(self => [
 	WithPrec(Rule([self, obrack, fwd_subscriptlist, cbrack],	$ => ({ type: 'subscript', value: $[0], slice: $[2] })), PREC.trailer),
 	WithPrec(Rule([self, '.', NAME],						$ => ({ type: 'attr', value: $[0], attr: $[2] })), PREC.trailer),
 	WithPrec(Rule(['await', self],							$ => ({ type: 'await', value: $[1] })), PREC.awaitp),
-	WithPrec(Rule([self, '**', self],						$ => Bin('**', $[0], $[2])), PREC.power),
-	WithPrec(Rule([OneOf(['+', '-', '~']), self],			$ => ({ type: 'unary', op: $[0], operand: $[1] })), PREC.factor),
-	WithPrec(Rule([self, OneOf(['*', '/', '//', '%', '@']), self],	$ => Bin($[1], $[0], $[2])), PREC.term),
-	WithPrec(Rule([self, OneOf(['+', '-']), self],			$ => Bin($[1], $[0], $[2])), PREC.arith),
-	WithPrec(Rule([self, OneOf(['<<', '>>']), self],			$ => Bin($[1], $[0], $[2])), PREC.shift),
-	WithPrec(Rule([self, '&', self],						$ => Bin('&', $[0], $[2])), PREC.band),
-	WithPrec(Rule([self, '^', self],						$ => Bin('^', $[0], $[2])), PREC.bxor),
-	WithPrec(Rule([self, '|', self],						$ => Bin('|', $[0], $[2])), PREC.bor),
+	WithPrec(Rule([self, '**', self],						$ => PyBinary('**', $[0], $[2])), PREC.power),
+	WithPrec(Rule([OneOf(['+', '-', '~']), self],			$ => PyUnary($[0], $[1])), PREC.factor),
+	WithPrec(Rule([self, OneOf(['*', '/', '//', '%', '@']), self],	$ => PyBinary($[1], $[0], $[2])), PREC.term),
+	WithPrec(Rule([self, OneOf(['+', '-']), self],			$ => PyBinary($[1], $[0], $[2])), PREC.arith),
+	WithPrec(Rule([self, OneOf(['<<', '>>']), self],			$ => PyBinary($[1], $[0], $[2])), PREC.shift),
+	WithPrec(Rule([self, '&', self],						$ => PyBinary('&', $[0], $[2])), PREC.band),
+	WithPrec(Rule([self, '^', self],						$ => PyBinary('^', $[0], $[2])), PREC.bxor),
+	WithPrec(Rule([self, '|', self],						$ => PyBinary('|', $[0], $[2])), PREC.bor),
 ]),
 
 // `or_test` adds the comparison / `not` / `and` / `or` levels. It stops short of the ternary and
 // `lambda` (which `test` adds) so `x for x in xs if cond` stays unambiguous.
 or_test = Rules<Expr>(self => [
 	expr_bitor,
-	WithPrec(Rule([self, comp_op, expr_bitor],				$ => compare($[0], $[1] as string, $[2])), PREC.comparison),
-	WithPrec(Rule(['not', self],							$ => ({ type: 'unary', op: 'not', operand: $[1] })), PREC.not),
-	WithPrec(Rule([self, 'and', self],						$ => boolOp('and', $[0], $[2])), PREC.and),
-	WithPrec(Rule([self, 'or', self],						$ => boolOp('or', $[0], $[2])), PREC.or),
+	WithPrec(Rule([self, comp_op, expr_bitor],				$ => compare($[0], $[1], $[2])), PREC.comparison),
+	WithPrec(Rule(['not', self],							$ => PyUnary('not', $[1])), PREC.not),
+	WithPrec(Rule([self, 'and', self],						$ => PyBinary('and', $[0], $[2])), PREC.and),
+	WithPrec(Rule([self, 'or', self],						$ => PyBinary('or', $[0], $[2])), PREC.or),
 ]),
 
 test = Rules<Expr>(self => [
