@@ -3124,12 +3124,17 @@ export class Output {
 				} else {
 					// LOOP ROTATION: the condition needs values that only exist once already inside the
 					// loop body, so `while (cond) { ... }` is structurally impossible here --
-					// `while (true) { <compute cond>; if (!cond) break; body }` isn't.
+					// `while (true) { <compute cond>; if (!cond) break; body }` isn't. A condition that
+					// resolves to the literal `true` (a real `for(;;)`, or any desugaring -- e.g.
+					// for-of/for-in's own iterator-protocol loop -- that hands buildLoop a
+					// compile-time-constant test) makes the check provably dead: `if (!true)` never
+					// runs its `break`, so it's dropped instead of printed as inert clutter.
+					const condExpr = this.resolveOperand(thetaNode.id, 1);
 					statements.push(JS.While(Literal(true), JS.Block(
 						...testStatements as JS.Statement<any>[],
-						JS.If({ type: 'unary', operator: '!', operand: this.resolveOperand(thetaNode.id, 1) } as Expr,
+						...(condExpr.type === 'literal' && condExpr.value === true ? [] : [JS.If({ type: 'unary', operator: '!', operand: condExpr } as Expr,
 							JS.Block({ type: 'break' } as JS.Statement<any>)
-						) as JS.Statement<any>,
+						) as JS.Statement<any>]),
 						...restStatements as JS.Statement<any>[],
 						...restOfBody as JS.Statement<any>[]
 					)) as Statement);

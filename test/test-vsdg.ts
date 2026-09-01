@@ -533,9 +533,6 @@ export async function main() {
 		function f(c) {
 			let total = 0;
 			while (true) {
-				if (!true) {
-					break;
-				}
 				if (c) {
 					total = 10;
 					break;
