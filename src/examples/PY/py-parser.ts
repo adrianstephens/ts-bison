@@ -1,5 +1,5 @@
 import * as path from 'path';
-import { terminal, OneOf, List, Forward, Rules, WithPrec, makeRule, Terminal, type RecoveryCallback } from '../../tison';
+import { terminal, OneOf, List, MaybeList, Forward, Rules, WithPrec, makeRule, Terminal, type RecoveryCallback } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 
 // ===================================================================
@@ -30,9 +30,13 @@ import { makeCachedParser } from '../../tableCache';
 //
 // Known simplifications:
 //   * `match`/`case`/`type` are ordinary identifiers (no soft keywords).
-//   * f-strings are a single opaque STRING token (interpolations unparsed).
 //   * targets / argument ordering are not validated (permissive).
 //   * `with (a, b):` (no `as`) parses as one tuple context manager, not two (CPython 3.10+).
+//   * f-strings parse `{...}` fields as real expressions (see `fstringOpen`/`fstringText` etc.),
+//     but a literal `\` immediately before `{`/`}` always suppresses that field (`rf"C:\{x}"` is
+//     one literal-text part) even in a raw string, where real CPython still starts a field there
+//     -- raw only changes escape *values*, not brace recognition; not worth the doubled terminal
+//     count (raw × non-raw × 4 quote styles) for this one adjacency.
 
 // ===================================================================
 //  Lexer
@@ -143,7 +147,40 @@ const obrace = bracket('{', +1), cbrace = bracket('}', -1);
 
 export const NAME	= terminal('NAME', /[A-Za-z_]\w*/);
 export const NUMBER	= terminal('NUMBER', /0[xX](?:_?[0-9a-fA-F])+|0[oO](?:_?[0-7])+|0[bB](?:_?[01])+|(?:\d(?:_?\d)*\.?(?:\d(?:_?\d)*)?|\.\d(?:_?\d)*)(?:[eE][-+]?\d(?:_?\d)*)?[jJ]?/);
-export const STRING	= terminal('STRING', /(?:[rRbBuUfF]|[rR][bBfF]|[bBfF][rR])?(?:'''[\s\S]*?'''|"""[\s\S]*?"""|'(?:\\.|[^\\'\n])*'|"(?:\\.|[^\\"\n])*")/);
+// `f`/`F` deliberately excluded here (unlike a plain `r`/`b`/`u` prefix) -- f-strings are split
+// into their own terminals below so `{...}` interpolations parse as real expressions.
+export const STRING	= terminal('STRING', /(?:[rRbBuU]|[rR][bB]|[bB][rR])?(?:'''[\s\S]*?'''|"""[\s\S]*?"""|'(?:\\.|[^\\'\n])*'|"(?:\\.|[^\\"\n])*")/);
+
+// --- f-strings: prefix+quote opens a real sub-grammar (text runs + `{expr[=][!conv][:spec]}`
+// fields) instead of one opaque token, one dedicated terminal family per quote style (triple
+// binds longer so it always wins over the single-quote form at the same position). Nested `{`/`}`
+// reuse the ordinary `obrace`/`cbrace` bracket terminals -- an interpolation is a real expression
+// context, so `f"{ {1: 2}[1] }"` (a dict literal inside a field) tracks paren-depth correctly too.
+function fstringOpen(name: string, q: string) { return terminal(name, new RegExp(`(?:[fF][rR]?|[rR][fF])${q}`)); }
+function fstringClose(name: string, q: string) { return terminal(name, new RegExp(q)); }
+// Runs to (but not including) an unescaped `{` (interpolation) or the closing quote; `{{`/`}}` are
+// literal-brace escapes. Triple-quoted text may contain raw newlines and lone `'`/`"`.
+function fstringText(name: string, close: string) {
+	return terminal(name, new RegExp(`(?:\\\\.|\\{\\{|\\}\\}|(?!${close}|\\{(?!\\{))[\\s\\S])*`));
+}
+// No need to exclude the triple case here: `f'''` is 4 chars, `f'` only 2 -- longest match wins.
+const FOPEN_SQ		= fstringOpen('f\'',	'\'');
+const FOPEN_DQ		= fstringOpen('f"',		'"');
+const FOPEN_SQ3		= fstringOpen('f\'\'\'', '\'\'\'');
+const FOPEN_DQ3		= fstringOpen('f"""',	'"""');
+const FCLOSE_SQ		= fstringClose('\'',	'\'');
+const FCLOSE_DQ		= fstringClose('"',		'"');
+const FCLOSE_SQ3	= fstringClose('\'\'\'', '\'\'\'');
+const FCLOSE_DQ3	= fstringClose('"""',	'"""');
+const FTEXT_SQ		= fstringText('ftext\'',	'[\'\\n]');
+const FTEXT_DQ		= fstringText('ftext"',	'["\\n]');
+const FTEXT_SQ3		= fstringText('ftext\'\'\'', '\'\'\'');
+const FTEXT_DQ3		= fstringText('ftext"""',	'"""');
+// A nested replacement field's own format spec (e.g. the `{width}` in `f"{x:{width}}"`) is plain
+// text up to the next brace -- delimiter-independent, since format specs don't carry a Python
+// quote of their own.
+const FSPEC_TEXT	= terminal('fspec', /[^{}]*/);
+const BANG			= terminal('!', /!/);
 
 // ===================================================================
 //  AST
@@ -179,10 +216,19 @@ export interface DictComp		{ type: 'dictcomp'; key: Expr; value: Expr; gens: Com
 export interface Await			{ type: 'await'; value: Expr }
 export interface YieldExpr		{ type: 'yield'; value?: Expr; from?: Expr }
 
+// A `{expr[=][!conv][:spec]}` field inside an f-string. `spec`'s own text/nested-field parts
+// mirror `FStringPart` one level down (`f"{x:{width}}"`'s spec is `[{text:''},{expr:width}]`) --
+// real Python allows recursion here too, but a nested field's own `!conv`/`:spec`/`=` are dropped
+// (CPython's own grammar barely exercises that either).
+export interface FStringField	{ expr: Expr; selfDoc?: boolean; conv?: string; spec?: FStringSpecPart[] }
+export type FStringSpecPart	= { text: string } | { expr: Expr };
+export interface FStringPart	{ text: string; field?: FStringField }
+export interface FStringLit	{ type: 'fstring'; parts: FStringPart[] }
+
 export type Expr =
 	| Name | Num | Str | Const | Unary | BinOp | BoolOp | Compare | IfExp | Lambda | NamedExpr
 	| Starred | Attribute | Subscript | SliceExpr | Call | Tuple | ListLit | SetLit | DictLit
-	| GeneratorExp | ListComp | SetComp | DictComp | Await | YieldExpr;
+	| GeneratorExp | ListComp | SetComp | DictComp | Await | YieldExpr | FStringLit;
 
 export interface Arg { kind: 'pos' | 'kw' | 'star' | 'dstar'; name?: string; value: Expr }
 
@@ -251,6 +297,31 @@ function commaList(item: Rules<Expr>) {
 	]);
 }
 
+// A factory, not a shared rule: `fstring_field` sits right before each delimiter's own closing
+// quote or continuing text run, so if all four delimiters shared one rule OBJECT here, its
+// reduce's LALR lookahead would be the *union* of all four delimiters' follow terminals -- the
+// lexer, handed that combined `allowed` set the instant `}` is shifted, would try every quote
+// style's text/close terminal at once and (wrongly) take whichever matches the most characters
+// (a triple-quote text terminal, say, cheerfully consuming straight through a single-quote's
+// closing `"` since it only excludes `'''`). A fresh rule instance per delimiter keeps each
+// reduce's lookahead delimiter-specific.
+function fstringField() {
+	return Rules<FStringField>(
+		Rule([obrace, fwd_test, fstring_eq_opt, fstring_conv_opt, fstring_spec_opt, cbrace],
+			$ => ({ expr: $[1], selfDoc: $[2] || undefined, conv: $[3], spec: $[4] })),
+	);
+}
+
+// A text run + its optional trailing interpolation, repeated -- same shape as
+// js-parser.ts's `template_literal_part`/`_parts`, just per f-string quote style (`FTEXT`
+// already excludes that style's own closing sequence, see `fstringText` above).
+function fstringParts(FTEXT: Terminal) {
+	return List<FStringPart>(Rules<FStringPart>(
+		Rule([FTEXT, fstringField()],	$ => ({ text: $[0], field: $[1] })),
+		Rule([FTEXT],					$ => ({ text: $[0] })),
+	));
+}
+
 // ===================================================================
 //  Grammar
 // ===================================================================
@@ -316,6 +387,24 @@ lambdef = Rules<Expr>(
 
 string_list = List<string>(Rules(Rule([STRING], $ => $[0]))),
 
+// --- f-string interpolation fields: `{expr[=][!conv][:spec]}` ---
+fstring_eq_opt = Rules<boolean>(
+	Rule([],					() => false),
+	Rule(['='],					() => true),
+),
+fstring_conv_opt = Rules<string | undefined>(
+	Rule([],					() => undefined),
+	Rule([BANG, NAME],			$ => $[1]),
+),
+fstring_spec_part = Rules<FStringSpecPart>(
+	Rule([FSPEC_TEXT],			$ => ({ text: $[0] })),
+	Rule([obrace, fwd_test, cbrace],	$ => ({ expr: $[1] })),
+),
+fstring_spec_opt = Rules<FStringSpecPart[] | undefined>(
+	Rule([],					() => undefined),
+	Rule([':', MaybeList(fstring_spec_part)],	$ => $[1]),
+),
+
 atom = Rules<Expr>(
 	Rule([NAME],					$ => ({ type: 'name', id: $[0] })),
 	Rule([NUMBER],					$ => ({ type: 'num', raw: $[0] })),
@@ -337,6 +426,10 @@ atom = Rules<Expr>(
 	}),
 	Rule([obrace, cbrace],			() => ({ type: 'dict', keys: [], values: [] })),
 	Rule([obrace, fwd_dictorset, cbrace],		$ => $[1]),
+	Rule([FOPEN_SQ, fstringParts(FTEXT_SQ), FCLOSE_SQ],		$ => ({ type: 'fstring', parts: $[1] })),
+	Rule([FOPEN_DQ, fstringParts(FTEXT_DQ), FCLOSE_DQ],		$ => ({ type: 'fstring', parts: $[1] })),
+	Rule([FOPEN_SQ3, fstringParts(FTEXT_SQ3), FCLOSE_SQ3],		$ => ({ type: 'fstring', parts: $[1] })),
+	Rule([FOPEN_DQ3, fstringParts(FTEXT_DQ3), FCLOSE_DQ3],		$ => ({ type: 'fstring', parts: $[1] })),
 ),
 
 // `expr_bitor` -- everything up to (and including) the bitwise-or level: trailers, unary/binary

@@ -154,6 +154,20 @@ raise RuntimeError("x") from err
 s = data[::2, 1:]
 `);
 
+test('f-strings: fields, conv, spec, nested spec, self-doc, all quote styles', `
+a = f"hi {name}"
+b = f'{val!r}'
+c = f"{val:.2f}"
+d = f"{val:>{width}}"
+e = f"{val=}"
+g = f"{{literal}} {val}"
+h = f"""multi
+line {x}
+end"""
+i = f'''also {y} works'''
+j = rf"C:\\path\\{drive}"
+`);
+
 test('no trailing newline', 'def f():\n    if x:\n        return 1');
 
 test('tab indentation', 'if x:\n\treturn 1\nelse:\n\treturn 2\n');
