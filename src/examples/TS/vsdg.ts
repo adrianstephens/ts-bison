@@ -112,6 +112,16 @@ class Node {
 	// value got folded into a real "did an earlier case match" merge, which is correct for the
 	// ACTUAL running switch but wrong for the independent, one-shot match flags computed here.
 	switchInternal?: boolean;
+	// Stamped on a 'this'/'super' node with its enclosing function_decl's own id -- unlike a param,
+	// which reaches its owning function via a real graph edge (inputs[0]), 'this'/'super' have NO
+	// inputs at all (BuildVSDG's own getExprNode just registers a bare node), so scheduleEarly has
+	// nothing to floor their placement against and defaults them to block_entry, the top-level
+	// program -- found the hard way, testing against a real multi-method class: a `this`-derived
+	// value forced to materialize (a genuinely loop-invariant `this.method` reference, hoisted by
+	// scheduleEarly's own loop-invariant logic) printed OUTSIDE the class entirely, referencing
+	// `this` where it doesn't exist. scheduleEarly's own param-edge redirect (see its own comment)
+	// uses this the same way it uses a param's function_decl edge, via functionBodyBlockOf.
+	scopeAnchorId?: NodeId;
 	// Stamped on whatever node `export`/`export_decl` left behind (via `end`, right after
 	// recursing its own wrapped declaration through the ordinary statement dispatch) -- read back
 	// by whichever print site produces that node's own statement, to wrap it in `export `/
@@ -377,6 +387,10 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	const expnodes	= new Map<Expr, Node>;
 	let scope		= new Scope(null); // The global scope
 	let nextId		= 0;
+	// The innermost function_decl currently being walked (undefined at the top level) -- set/
+	// restored around buildFunctionBody's own recursion, purely so a 'this'/'super' node created
+	// anywhere inside can be stamped with its own scopeAnchorId (see Node's own field comment).
+	let currentFunctionEntry: Node | undefined;
 
 	// Names never declared anywhere in this file -- globals, built-ins (`console`, `Math`), and
 	// anything imported. Real cross-file/ambient resolution is somebody else's job (TStypeCheckAsync),
@@ -799,6 +813,16 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 		setState(fnScope, bodyStart);
 
+		// Set for the body's own walk, restored after -- a 'this'/'super' created anywhere inside
+		// (including a nested function/method) gets stamped with the INNERMOST entryNode, not
+		// necessarily the one real lexical `this` in JS would resolve to for an arrow function
+		// nested here (arrows share the ENCLOSING `this`, but go through this exact same
+		// buildFunctionBody path, with no distinction made). Still strictly better than the prior
+		// zero-anchoring: it keeps a this-derived hoisted value inside SOME real function's region
+		// instead of escaping to the top level; getting the precise arrow-lexical-this floor right
+		// is a separate, not-yet-hit gap.
+		const outerFunctionEntry = currentFunctionEntry;
+		currentFunctionEntry = entryNode;
 		if (Array.isArray(body)) {
 			for (const stmt of body)
 				recurse(stmt, 'statement');
@@ -807,6 +831,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 			recurse(body, 'expression');
 			connectValue(getExprNode(body), 0, returnNode, 1);
 		}
+		currentFunctionEntry = outerFunctionEntry;
 
 		connectValue(end, 0, returnNode, 0);
 
@@ -1478,13 +1503,20 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					return false;
 
 				case 'super':
-				case 'this':
+				case 'this': {
 					// Unlike 'identifier', which getExprNode resolves via a dedicated scope lookup that
 					// bypasses expnodes entirely, `this`/`super` have no such lookup -- they need a real
 					// node registered here, or any consumer (`this.x`, `f(this)`, ...) throws "missing
 					// node" trying to look one up that was never created.
-					expnodes.set(s, makeNode(s.type));
+					const node = makeNode(s.type);
+					// See Node's own scopeAnchorId comment -- without this, a this-derived value that
+					// GCM forces to materialize (its own scheduleEarly has nothing to floor it against,
+					// unlike a param's real function_decl edge) defaults to block_entry, escaping the
+					// function/class it belongs to entirely.
+					node.scopeAnchorId = currentFunctionEntry?.id;
+					expnodes.set(s, node);
 					return false;
+				}
 
 				case 'unary': {
 					process(s);
@@ -1795,6 +1827,26 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	);
 	programStart.programEndId = end.id;
 	return graph;
+}
+
+// True for a node reached via the state chain's own port-2 "triggering rebind" convention (see
+// BuildVSDG's threadMutation/rebindVar): a rebind (compound-assign/++/--, the same type check
+// needsTemp itself uses at vsdg.ts:1965-1976 -- duplicated here since this asks "am I one of
+// these" about the CONSUMER, where needsTemp asks it about the target of one of the consumer's
+// edges), or a genuine local declaration (declKind set). Shared between Output.needsDirectPlacement
+// (the no-blocks fallback discovery) and applyGlobalCodeMotion's own scheduleEarly/scheduleLate
+// (the real-GCM pin, added after finding a real scheduling bug on real code: treating a port-2 edge
+// as merely an ORDINARY floor let two adjacent declarations at the same loop depth, each with its
+// own dedicated anchor, get scheduleLate-sunk into EACH OTHER'S slot -- `let e = i + len; let i =
+// off;`, reading `i` before its own declaration).
+function isOwnAnchorTarget(node: Node): boolean {
+	if (node.type === 'unary_post')
+		return true;
+	if (node.type === 'unary')
+		return ['++', '--'].includes((node.value as Expr & { type: 'unary' }).operator);
+	if (node.type === 'binary')
+		return ASSIGN_OPS.has((node.value as Expr & { type: 'binary' }).operator);
+	return node.type === 'var' && node.declKind !== undefined;
 }
 
 export class Output {
@@ -2110,7 +2162,17 @@ export class Output {
 		// here instead of adding a second, redundant way to reach the callee's own node.
 		const calleeEdge = node.inputs[value.arguments.length + 1];
 		const calleeNode = calleeEdge && this.graph.get(calleeEdge.nodeId);
-		const callee = calleeNode && !this.isPureSubgraph(calleeNode) ? this.resolveNode(calleeNode.id) : value.callee;
+		// A PURE callee can still have been forced to materialize as its own named temp (e.g.
+		// needsTemp's own loop-invariant check hoisting `this.method` -- a pure member read -- out
+		// of a loop it's read inside): printing value.callee verbatim in that case duplicates the
+		// raw source instead of referencing the temp GCM already decided to place elsewhere,
+		// silently discarding the whole point of hoisting it. nodeVariableNames is checked
+		// directly (rather than unconditionally calling resolveNode, which would also change output
+		// for the common untouched case by routing every pure callee through buildExpr's own
+		// reconstruction instead of the verbatim original source).
+		const calleeTemp = calleeNode && this.nodeVariableNames.get(calleeNode.id);
+		const callee = calleeTemp ? Identifier(calleeTemp)
+			: calleeNode && !this.isPureSubgraph(calleeNode) ? this.resolveNode(calleeNode.id) : value.callee;
 		return { ...value, callee, arguments: value.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
 	}
 
@@ -2463,6 +2525,41 @@ export class Output {
 		const sorted: NodeId[] = [];
 		const visited = new Set<NodeId>();
 		const nodeSet = new Set(ids);
+		// Separate from `visited`: tracks nodes OUTSIDE nodeSet already searched through, below --
+		// never pushed to `sorted` themselves (they're not being ordered, just walked past), but
+		// still need their own cycle guard.
+		const walkedThrough = new Set<NodeId>();
+
+		// mu/theta/literal (and a var with no declKind -- a bare read, not a declaration: see below)
+		// resolve directly (a name lookup or a constant), never by combining their own inputs -- in
+		// particular, a mu's port-1 feedback edge points at whatever the loop body computes from the
+		// mu ITSELF, so following it here as an ordinary "compute this first" dependency is both
+		// unnecessary (the mu never needs it to resolve) and cyclic.
+		const hasOrderedInputs = (node: Node) =>
+			node.type !== 'mu' && node.type !== 'muValue' && node.type !== 'theta' && node.type !== 'thetaValue' && node.type !== 'literal'
+			&& (node.type !== 'var' || node.declKind !== undefined);
+
+		// Before emitting `node`, everything it depends on must be emitted first -- including
+		// TRANSITIVELY, through an input that's itself inlined (not its own nodeSet member, so
+		// never separately visited/printed): e.g. `let e = i + len;` where `i + len` never gets its
+		// own statement, only its dependency on `i` does, is still a real ordering constraint on `e`
+		// (found the hard way, testing a real file: without this, `i`/`e`'s relative order was
+		// undefined, silently printing `let e = i + len; let i = off;` -- reading `i` before its own
+		// declaration).
+		const visitDeps = (node: Node) => {
+			if (!hasOrderedInputs(node))
+				return;
+			for (const edge of node.inputs) {
+				if (!edge)
+					continue;
+				if (nodeSet.has(edge.nodeId)) {
+					visit(edge.nodeId);
+				} else if (!walkedThrough.has(edge.nodeId)) {
+					walkedThrough.add(edge.nodeId);
+					visitDeps(this.graph.get(edge.nodeId)!);
+				}
+			}
+		};
 
 		const visit = (id: NodeId) => {
 			if (visited.has(id))
@@ -2471,21 +2568,7 @@ export class Output {
 			// (that's what makes it a loop) -- marking early means a cycle that reaches back here just
 			// gets skipped by the `visited.has` check above, instead of recursing forever.
 			visited.add(id);
-
-			const node = this.graph.get(id)!;
-
-			// mu/theta/var/literal resolve directly (a name lookup or a constant), never by combining
-			// their own inputs -- in particular, a mu's port-1 feedback edge points at whatever the
-			// loop body computes from the mu ITSELF, so following it here as an ordinary "compute this
-			// first" dependency is both unnecessary (the mu never needs it to resolve) and cyclic.
-			if (node.type !== 'mu' && node.type !== 'muValue' && node.type !== 'theta' && node.type !== 'thetaValue' && node.type !== 'var' && node.type !== 'literal') {
-				// Before emitting this node, all its inputs that belong to the SAME block must be emitted first
-				for (const edge of node.inputs) {
-					if (edge && nodeSet.has(edge.nodeId))
-						visit(edge.nodeId);
-				}
-			}
-
+			visitDeps(this.graph.get(id)!);
 			sorted.push(id);
 		};
 
@@ -2631,29 +2714,23 @@ export class Output {
 
 	// True for a node reached via the state chain's own port-2 "triggering rebind" convention (see
 	// BuildVSDG's threadMutation/rebindVar) whose statement must be printed under its own name
-	// regardless of block placement: a rebind (compound-assign/++/--, the same type check needsTemp
-	// itself uses at vsdg.ts:1965-1976 -- duplicated here since this asks "am I one of these" about
-	// the CONSUMER, where needsTemp asks it about the target of one of the consumer's edges), or a
-	// genuine local declaration (declKind set) -- unlike a gammaValue/named-except merge (a pure,
-	// non-effectful value with no state anchor at all), both of these are the ONLY named slots that
-	// use this port-2 convention, so this stays narrow rather than matching slotName() broadly.
+	// regardless of block placement: a rebind (compound-assign/++/--), or a genuine local
+	// declaration (declKind set) -- unlike a gammaValue/named-except merge (a pure, non-effectful
+	// value with no state anchor at all), both of these are the ONLY named slots that use this
+	// port-2 convention, so this stays narrow rather than matching slotName() broadly.
 	private needsDirectPlacement(node: Node): boolean {
-		if (node.type === 'unary_post')
-			return true;
-		if (node.type === 'unary')
-			return ['++', '--'].includes((node.value as Expr & { type: 'unary' }).operator);
+		if (!isOwnAnchorTarget(node))
+			return false;
 		// Unlike ++/--/unary_post (an intrinsic side effect -- always prints, with or without a real
 		// consumer, matching emitNamedSlot's own unconditional handling of those two types), a plain
 		// binary reassignment CAN be genuinely dead (isInlinableSlot already decides this correctly,
 		// block-independent -- it's pure graph structure, not GCM output) -- respect that instead of
 		// force-materializing every one found this way, or a dead `__hit_var4 = true;` etc. would
 		// print here that GCM would otherwise have silently never scheduled anywhere reachable.
-		if (node.type === 'binary')
-			return ASSIGN_OPS.has((node.value as Expr & { type: 'binary' }).operator) && !this.isInlinableSlot(node);
 		// isInlinableVarDecl/hasRealConsumer-driven elision for a genuinely dead 'var' declaration
-		// already lives entirely inside emitNamedSlot (down to a bare `let x;` or nothing at all) --
-		// safe to force-include unconditionally here and let it make that call.
-		return node.type === 'var' && node.declKind !== undefined;
+		// already lives entirely inside emitNamedSlot (down to a bare `let x;` or nothing at all),
+		// so a 'var' is always safe to force-include unconditionally here and let it make that call.
+		return node.type !== 'binary' || !this.isInlinableSlot(node);
 	}
 
 	// Which nodes GCM scheduled alongside a given control-anchor node (blockNodes, keyed via the
@@ -3165,7 +3242,13 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 	for (const node of graph.values()) {
 		// Skip nodes with side-effects or loop/branch control flow tokens.
 		// These are sequence-dependent and cannot be collapsed based purely on data inputs.
-		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect'].includes(node.type))
+		// 'this'/'super' are ALSO unsafe despite having no inputs at all (found the hard way,
+		// testing against a real multi-method class): every occurrence gets an identical
+		// structural key ('this:'/'super:', no operands to distinguish them by), but each one's
+		// real value is bound per CALL, not shared across the whole graph -- merging `this` from
+		// one method with `this` from a completely different method conflates two different
+		// receivers into one shared variable, corrupting both.
+		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super'].includes(node.type))
 			continue;
 
 		// Generate the unique structural signature for this node
@@ -3423,11 +3506,15 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 			return;
 		}
 
-		// Default to the first entry block of the program
-		let earliestBlock = "block_entry";
+		const node = graph.get(nodeId)!;// as NodeWithBlock;
+
+		// Default to the first entry block of the program -- unless this is a 'this'/'super' node
+		// (or anything else ever stamped with scopeAnchorId), which has NO input edges at all to
+		// otherwise floor it against its own function (see scopeAnchorId's own comment, and
+		// functionBodyBlockOf's).
+		let earliestBlock = node.scopeAnchorId !== undefined ? functionBodyBlockOf(node.scopeAnchorId) : "block_entry";
 
 		// Recursively process all input dependencies first
-		const node = graph.get(nodeId)!;// as NodeWithBlock;
 		node.inputs.forEach((edge, port) => {
 			if (!edge)
 				return;
@@ -3485,6 +3572,7 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 			return;
 
 		const node = graph.get(nodeId)!;
+
 		// Recursively process all downstream consumers first
 		for (const portChannels of node.outputs) {
 			if (!portChannels)
@@ -3597,6 +3685,16 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 		// consumer lives right next to it (same depth, later in the chain) gets needlessly hoisted
 		// all the way back to its earliest position, landing in a DIFFERENT block than the consumer
 		// that needs it, which breaks emitLocalStatements' single-block topological sort entirely.
+		//
+		// KNOWN GAP, deliberately NOT fixed here (tried and reverted -- see the tracked plan): two
+		// adjacent, same-depth declarations that are each other's own dedicated anchor (`let i = off,
+		// e = i + len;`) can have this tie-break pick the WRONG one of the two, swapping their
+		// printed order (`let e = i + len; let i = off;`, reading `i` before its own declaration --
+		// found testing real code). A version that preferred a node's own port-2 anchor on a tie
+		// fixed that case but broke dead-bookkeeping elision elsewhere (a switch's own unused
+		// `__hit`/`__match` scaffolding, normally sunk out of anything ever visited by THIS exact
+		// same "prefer closer to latest" choice, started printing instead) -- the two cases are
+		// genuinely indistinguishable from information available at this point in scheduling.
 		const earliestBlock	= blockIds.get(nodeId)!;
 		const floor			= getLoopDepth(earliestBlock);
 		let bestBlock: BlockId | undefined;
