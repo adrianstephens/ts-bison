@@ -699,6 +699,18 @@ export async function main() {
 	// "nothing happens" the way a bare `break` is, so neither case here is switchIsNoOp-eligible --
 	// and each is genuinely read twice (once by its own case's match test, once more by default's
 	// own "did nothing else match" exclusion test), so needsTemp correctly keeps them named.
+	//
+	// The discriminant's own wrapper (`__disc_varN`, real in the graph -- see BuildVSDG's own
+	// 'switch' case) no longer needs a name here: it has exactly one real graph consumer (the
+	// match test) plus the switch header's own read, and isInlinableVarDecl's own reuse-count
+	// check already handles that correctly (both end up reading `i` directly). It USED to stay
+	// named regardless, but only because isInlinableVarDecl's old isPureSubgraph gate walked mu's
+	// own port-1 feedback edge (never excluded as vestigial the way needsTemp's own consumer-count
+	// exclusion already does) all the way back to a real 'effect' node (PROGRAM_START) purely by
+	// chasing the loop's own control-predecessor chain, not because `i` was ever genuinely impure
+	// -- an accidental side effect of a purity check that's no longer part of the decision at all
+	// (see isInlinableVarDecl's own comment), not a real requirement. Confirmed safe via real
+	// execution (assistant/verify-switch-disc-inline.ts) before updating this golden.
 	check('switch: continue inside a case skips past the switch to the outer loop', `
 		let i = 0;
 		while (i < 3) {
@@ -717,11 +729,10 @@ export async function main() {
 			if (!(i < 3)) {
 				break;
 			}
-			let __disc_var8 = i;
-			let __match0_var8 = __disc_var8 === 1;
+			let __match0_var8 = i === 1;
 			let __hit_var8 = false;
 			var t0 = i + 1;
-			switch (__disc_var8) {
+			switch (i) {
 				case 1:
 					i = t0;
 					continue;
@@ -959,11 +970,10 @@ export async function main() {
 			if (!(i < 5)) {
 				break;
 			}
-			let __disc_var8 = i;
-			let __match0_var8 = __disc_var8 === 2;
+			let __match0_var8 = i === 2;
 			let __hit_var8 = false;
 			var t0 = i + 1;
-			switch (__disc_var8) {
+			switch (i) {
 				case 2:
 					i = t0;
 					continue;

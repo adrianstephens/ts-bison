@@ -2440,9 +2440,17 @@ export class Output {
 	// all of this: "one real reader, safe to recompute inline" only holds within a single execution,
 	// which a read from inside another function isn't (see its own comment on Node).
 	private isInlinableVarDecl(node: Node): boolean {
-		if (node.type !== 'var' || !node.inputs[0] || node.capturedRead)
+		// declKind, not just node.type === 'var': a PARAM is ALSO a bare 'var' node, with its own
+		// inputs[0] wired to the function's own entry node (see buildFunctionBody's own param
+		// wiring) -- structural plumbing, never a real initializer expression to recompute. It's
+		// already correctly handled elsewhere (resolveNode's own no-declKind "read by name" case,
+		// no declaration ever needed), and was ONLY ever excluded here as an accidental side effect
+		// of isPureSubgraph's own function_decl check (an entry node has no real value, so treating
+		// it as a param's own "initializer" and resolving it produces a bare `null` where the param's
+		// real value belongs) -- removing isPureSubgraph below re-exposed exactly that, so it's
+		// excluded directly now instead of relying on that check's own incidental side effect.
+		if (node.type !== 'var' || !node.inputs[0] || node.capturedRead || node.declKind === undefined)
 			return false;
-		const init = this.graph.get(node.inputs[0].nodeId)!;
 		// needsTemp's own "reused more than once, so give it a name" heuristic exists to avoid
 		// RECOMPUTING an expression at every read site -- the right tradeoff for something with a
 		// real (if cheap) operation, but not for a bare literal: duplicating `false` costs nothing,
@@ -2454,7 +2462,19 @@ export class Output {
 		// but its value is a provably-constant literal -- see switchInternal -- so there's nothing to
 		// gain by naming it; a DIFFERENT real case, `let i = 0;` feeding a loop's own mu, is why the
 		// exemption can't be broader than that one heuristic).
-		return !this.needsTemp(node, init.type === 'literal') && this.isPureSubgraph(init);
+		// No isPureSubgraph gate any more: every node ALREADY has its own, independent, correct
+		// inline-or-materialize decision (an effect included, since valueConsumers(node).length===1
+		// -- see emitLocalStatements' own isEffect branch), so a dependency's own impurity is
+		// irrelevant here -- init must be OUTPUT before this declaration's own value is ever read
+		// regardless (the state chain/scheduling already guarantees that), so whatever effects it
+		// contains have already run wherever they needed to by the time anything reads `node`. The
+		// only question left for THIS node is its own reuse count. Dropping the gate stopped two
+		// real, needless materializations on real code (binary-libs/src/pe.ts): a pure expression
+		// merely DERIVED from an effect several hops back (an over-conservative transitive walk that
+		// didn't stop at an already-independently-safe intermediate), and a directly effectful
+		// initializer with exactly one real reader (redundant now that the effect it wraps already
+		// inlines safely on its own).
+		return !this.needsTemp(node, this.graph.get(node.inputs[0].nodeId)!.type === 'literal');
 	}
 
 	// Conservative, single-pass purity check over `node`'s own transitive inputs: true only if NO
