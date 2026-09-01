@@ -3,7 +3,7 @@ import * as TS from '../src/examples/TS/ts-parser';
 import { BuildVSDG, applyGlobalCodeMotion, Output } from '../src/examples/TS/vsdg';
 import { Output as CodeOutput } from '../src/examples/TS/tocode';
 
-// Regression suite for vsdg.ts's BuildVSDG -> applyGlobalCodeMotion -> blocksToAST pipeline: builds
+// Regression suite for vsdg.ts's BuildVSDG -> applyGlobalCodeMotion -> Output pipeline: builds
 // the VSDG for a program, schedules it, and reconstructs source from the result, then checks the
 // EXACT printed output against a known-correct expected string. Each test below traces back to a
 // real bug found (and fixed) while getting this pipeline working; the comment on each names the bug
@@ -14,6 +14,11 @@ import { Output as CodeOutput } from '../src/examples/TS/tocode';
 // check in BuildVSDG's 'call' case. Every other call name is treated as effectful.
 
 const printer = new CodeOutput();
+
+// Every (name, src, expected) triple `check` is given, in call order -- populated as a side effect
+// of running `main` below, purely so a SEPARATE harness (e.g. one verifying Output's no-blocks path
+// against the same sources) can reuse them without duplicating 36 test cases by hand.
+export const testCases: { name: string; src: string; expected: string }[] = [];
 
 function compile(src: string): string {
 	const prog		= TS.parse(src);
@@ -43,9 +48,10 @@ function dedent(s: string): string {
 	}).join('\n');
 }
 
-async function main() {
+export async function main() {
 	let failures = 0;
 	const check = (name: string, src: string, expected: string) => {
+		testCases.push({ name, src, expected });
 		let actual: string;
 		try {
 			actual = compile(src);
@@ -1103,4 +1109,5 @@ async function main() {
 	console.log('all vsdg tests passed');
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+if (require.main === module)
+	main().catch(e => { console.error(e); process.exit(1); });

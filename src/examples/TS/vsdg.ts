@@ -1811,11 +1811,19 @@ export class Output {
 
 	// The inverse of blockIds: which nodes GCM scheduled into a given block, grouped once on first
 	// use (a block's node list has no identity of its own beyond "whichever nodes point at it").
+	// A node with NO entry in blockIds (blockIds missing entirely, or -- shouldn't happen once real
+	// GCM has run, since scheduleEarly visits every node -- an individual gap) is deliberately left
+	// out of every block's list, not defaulted into 'block_entry': that used to silently dump the
+	// WHOLE graph into block_entry's own list whenever blockIds was incomplete, since every missing
+	// node collapsed onto the same fallback bucket. Left genuinely unplaced, such a node instead
+	// falls through to resolveNode's own inline fallback wherever it's actually read.
 	private blockNodes(blockId: BlockId): NodeId[] {
 		if (!this.blockNodesCache) {
 			this.blockNodesCache = new Map();
 			for (const id of this.graph.keys()) {
-				const bId = this.blockIds?.get(id) ?? 'block_entry';
+				const bId = this.blockIds?.get(id);
+				if (bId === undefined)
+					continue;
 				if (!this.blockNodesCache.has(bId))
 					this.blockNodesCache.set(bId, []);
 				this.blockNodesCache.get(bId)!.push(id);
@@ -2371,10 +2379,28 @@ export class Output {
 			&& !(typeof node.value === 'string' && this.hasForcedSibling(node.value, node.id)))
 			return this.resolveOperand(id, 0);
 
+		// A muValue always corresponds to a real, mutable loop-carried variable, forced to materialize
+		// regardless of blocks (needsTemp's own mu/muValue-consumer check) -- always safe to trust by
+		// name. (Its own correct PLACEMENT without a block assigned is a separate, still-open gap --
+		// see this file's own no-blocks plan -- not addressed here.)
+		if (node.type === 'muValue')
+			return Identifier(node.value);
+
 		// Params and declared locals alike are just a name to read; whether a DECLARATION statement is
 		// also needed for a local is handled separately, by emitLocalStatements's nodeSlotName check.
-		if ((node.type === 'var' && typeof node.value === 'string') || node.type === 'muValue')
-			return Identifier(node.value);
+		// A param (no declKind at all -- it's already bound by the function signature, never printed
+		// as its own statement, so declaredNames never sees it) is always safe to trust by name
+		// unconditionally. A genuine local declaration (declKind set) has the same declaredNames
+		// caveat as the slotName() check above: without a block, nothing may ever have printed it, so
+		// fall back to rebuilding the initializer inline instead of trusting an undeclared name --
+		// safe here because a bare 'var' read (as opposed to a rebind, which resolves through a
+		// DIFFERENT, boundName-tagged node instead) always means "this exact declaration's own
+		// initializer", never a value some later reassignment produced.
+		if (node.type === 'var' && typeof node.value === 'string') {
+			if (!node.declKind || this.declaredNames.has(node.value))
+				return Identifier(node.value);
+			return this.resolveOperand(id, 0);
+		}
 
 		// A thetaValue's exported value IS its mu source's value, unchanged -- it exists only to mark
 		// where a loop-carried variable becomes readable again after the loop, not to compute
@@ -2382,8 +2408,13 @@ export class Output {
 		if (node.type === 'thetaValue')
 			return this.resolveOperand(id, 1);
 
+		// declaredNames confirms `name`'s own statement was ACTUALLY printed somewhere reachable, not
+		// just that isInlinableSlot considers it worth a name -- without a block to schedule it, that
+		// statement may never have been visited at all (same failure mode isInlinableSlot's own
+		// comment already documents for a no-real-effect gammaValue). Falls through to the same
+		// rebuild-inline path below when it wasn't, instead of trusting an undeclared identifier.
 		const name = node.slotName();
-		if (name !== undefined && !this.isInlinableSlot(node))
+		if (name !== undefined && !this.isInlinableSlot(node) && this.declaredNames.has(name))
 			return Identifier(name);
 
 		const varName = this.nodeVariableNames.get(id);
@@ -2572,10 +2603,63 @@ export class Output {
 		return statements;
 	}
 
+	// True for a node reached via the state chain's own port-2 "triggering rebind" convention (see
+	// BuildVSDG's threadMutation/rebindVar) whose statement must be printed under its own name
+	// regardless of block placement: a rebind (compound-assign/++/--, the same type check needsTemp
+	// itself uses at vsdg.ts:1965-1976 -- duplicated here since this asks "am I one of these" about
+	// the CONSUMER, where needsTemp asks it about the target of one of the consumer's edges), or a
+	// genuine local declaration (declKind set) -- unlike a gammaValue/named-except merge (a pure,
+	// non-effectful value with no state anchor at all), both of these are the ONLY named slots that
+	// use this port-2 convention, so this stays narrow rather than matching slotName() broadly.
+	private needsDirectPlacement(node: Node): boolean {
+		if (node.type === 'unary_post')
+			return true;
+		if (node.type === 'unary')
+			return ['++', '--'].includes((node.value as Expr & { type: 'unary' }).operator);
+		// Unlike ++/--/unary_post (an intrinsic side effect -- always prints, with or without a real
+		// consumer, matching emitNamedSlot's own unconditional handling of those two types), a plain
+		// binary reassignment CAN be genuinely dead (isInlinableSlot already decides this correctly,
+		// block-independent -- it's pure graph structure, not GCM output) -- respect that instead of
+		// force-materializing every one found this way, or a dead `__hit_var4 = true;` etc. would
+		// print here that GCM would otherwise have silently never scheduled anywhere reachable.
+		if (node.type === 'binary')
+			return ASSIGN_OPS.has((node.value as Expr & { type: 'binary' }).operator) && !this.isInlinableSlot(node);
+		// isInlinableVarDecl/hasRealConsumer-driven elision for a genuinely dead 'var' declaration
+		// already lives entirely inside emitNamedSlot (down to a bare `let x;` or nothing at all) --
+		// safe to force-include unconditionally here and let it make that call.
+		return node.type === 'var' && node.declKind !== undefined;
+	}
+
 	// Which nodes GCM scheduled alongside a given control-anchor node (blockNodes, keyed via the
 	// anchor's own block id -- see the constructor's own comment on blockIds/blockControl).
+	// Without an assigned block, still returns [anchorId] itself, not []: GCM's own convention (an
+	// anchor is always a member of its OWN block) is what lets emitControlNode's default case print
+	// an ordinary effect/call by simply being one of the ids handed to emitLocalStatements -- lose
+	// that and the anchor would never be discovered at all. Every OTHER emitControlNode case already
+	// excludes control.id from what it hands to emitLocalStatements itself (it builds that node's own
+	// statement directly instead), so including it here is harmless for them too.
+	//
+	// ALSO checks for a rebind (compound-assign/++/--) whose own state-anchor trigger (port 2, the
+	// same convention BuildVSDG's own reassignment machinery always uses -- see e.g. its 'unary'
+	// case) is this anchor: needsTemp forces such a node to materialize under its own name
+	// regardless of reuse count, so unlike an ordinary pure value it can't safely fall back to
+	// resolveNode's inline-duplicate path when GCM never scheduled it anywhere -- it needs a real,
+	// single, correctly-positioned statement, and this MUTATION_MARKER anchor (always visited
+	// directly by emitChain, block or no block) is the only point that can still give it one.
 	private nodesAt(anchorId: NodeId): NodeId[] {
-		return this.blockNodes(this.blockIds?.get(anchorId) ?? 'block_entry');
+		const bId = this.blockIds?.get(anchorId);
+		if (bId !== undefined)
+			return this.blockNodes(bId);
+		const ids = [anchorId];
+		for (const edges of this.graph.get(anchorId)!.outputs) {
+			if (!edges)
+				continue;
+			for (const e of edges) {
+				if (e.port === 2 && this.needsDirectPlacement(this.graph.get(e.nodeId)!))
+					ids.push(e.nodeId);
+			}
+		}
+		return ids;
 	}
 
 	// Reconstructs the statement span (fromId, boundaryId] -- i.e. everything from fromId back to
@@ -2812,10 +2896,12 @@ export class Output {
 	// nothing before it to recurse into), followed by everything else, walked backward from
 	// programEndId (see the Node field's own comment) down to PROGRAM_START itself. 'block_entry' is
 	// still GCM's own fixed, well-known id for PROGRAM_START (see buildBlockTree), reused here purely
-	// to recover its real NodeId via blockControl -- the one place this class still deals in BlockId
-	// at all, since nothing else needs a fixed starting point the way this top-level entry point does.
+	// to recover its real NodeId via blockControl when available. Without blockControl (or without a
+	// 'block_entry' entry in it), PROGRAM_START is found the same way buildBlockTree itself identifies
+	// it -- by type and value -- so this still works with no GCM output at all.
 	buildProgram(): Statement[] {
-		const programStartId = this.blockControl?.get('block_entry');
+		const programStartId = this.blockControl?.get('block_entry')
+			?? [...this.graph.values()].find(n => n.type === 'effect' && n.value === 'PROGRAM_START')?.id;
 		if (!programStartId)
 			return [];
 		const programStart = this.graph.get(programStartId)!;
