@@ -1091,17 +1091,19 @@ export async function main() {
 
 	// A call/new's own callee used to be printed verbatim, straight from the raw source AST, on the
 	// (mostly true) assumption that a callee has nothing a graph resolution would change -- wrong
-	// specifically when the callee's own OBJECT is itself an effect: `f()` here is materialized as
-	// its own statement (its sole consumer is the pure 'member' node `f().m`, not another effect or
-	// a rebind, so isInlinableEffect can't defer it the way `g(h())` safely does), but the callee was
-	// still reprinted from the untouched original AST -- calling `f()` a SECOND time. Resolving the
-	// callee through the graph (buildEffectExpr) picks up the same `t0` the statement already
-	// declared instead of re-embedding the raw source.
+	// specifically when the callee's own OBJECT is itself an effect that got a SEPARATE materialized
+	// name elsewhere: reprinting raw source there would still say `f()`, calling it a SECOND time
+	// instead of picking up the name already declared for it. `f()` itself now correctly inlines here
+	// (its sole real consumer, valueConsumers-counted, is the pure 'member' node `f().m` -- no
+	// separate name at all needed), so there's nothing to duplicate: `f()` appears exactly once in
+	// the reconstructed source, calling it exactly once (verified via real execution, not just
+	// inspection -- assistant/verify-callee-not-rerun.ts). Kept as a regression test for the
+	// original bug's own shape (a call whose result is immediately used as a callee's object) even
+	// though the fix that bug needed no longer manifests in THIS exact golden.
 	check('call: effectful object of a member callee is not re-run', `
 		h(f().m());
 	`, `
-		var t0 = f();
-		h(t0.m());
+		h(f().m());
 	`);
 
 	// optimizeStructuralCSE: two separately-written but structurally identical pure expressions

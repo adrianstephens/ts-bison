@@ -2138,35 +2138,6 @@ export class Output {
 		return this.valueConsumers(node).length > 0;
 	}
 
-	// A call is safe to inline directly into its consumer (skipping its own `const tN = f();`
-	// statement entirely) only under a narrower condition than a pure value: it must have EXACTLY one
-	// value-consumer, AND that consumer must also be the call's own DIRECT state-chain successor (an
-	// edge to it at port 0) -- i.e. nothing else can possibly run between them. That's what makes
-	// `g(h())` safe (h's only consumer, g, is also h's immediate next state-chain step) but rules out
-	// e.g. a call whose sole reader is reached only after something else happens first, where
-	// inlining would silently move the call's execution point. A single-value-consumer check alone
-	// isn't enough for effects the way it is for pure values, since pure recomputation is free but
-	// re-running a call is not -- this only ever removes a statement, never re-runs one.
-	private isInlinableEffect(node: Node): boolean {
-		const consumers = this.valueConsumers(node);
-		if (consumers.length !== 1)
-			return false;
-		const consumer = this.graph.get(consumers[0].nodeId)!;
-
-		// Case 1: the consumer is itself another call, and IS this call's direct state successor
-		// (e.g. `g(h())`).
-		if (this.isEffect(consumer))
-			return (node.outputs[0] ?? []).some(e => e.nodeId === consumer.id && e.port === 0);
-
-		// Case 2: the consumer is a named-slot rebind (a var_decl or a reassignment -- e.g. `let y =
-		// g();` or `x = g();`) whose OWN mutation-marker (port 2; see threadMutation) is this call's
-		// direct state successor. Nothing can run between the call and the marker (that's the
-		// marker's entire job), so this is exactly as safe as inlining into another call -- just one
-		// more hop, through the marker, to find the real successor.
-		const markerEdge = consumer.inputs[2];
-		return !!markerEdge && (node.outputs[0] ?? []).some(e => e.nodeId === markerEdge.nodeId && e.port === 0);
-	}
-
 	// A pure value only needs its own `const tN = ...;` statement if it's genuinely REUSED (more than
 	// one consumer). A single consumer can always resolve it lazily and inline it on demand instead
 	// (see resolveNode's fallback to buildExpr) -- which block either one is scheduled to doesn't
@@ -2429,8 +2400,9 @@ export class Output {
 				return { ...call, arguments: call.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
 			}
 			case 'effect':
-				// Reaching here means an inlinable EFFECTFUL call (see isInlinableEffect) was left
-				// unmaterialized and its sole consumer is now resolving it directly. Other 'effect'
+				// Reaching here means an inlinable EFFECTFUL call (see emitLocalStatements' own
+				// isEffect branch) was left unmaterialized and its sole consumer is now resolving it
+				// directly. Other 'effect'
 				// nodes (mutation markers, RETURN_ANCHOR, etc.) are never resolved as a value in the
 				// first place, so isEffect's guard should always hold here.
 				if (this.isEffect(node))
@@ -2462,8 +2434,8 @@ export class Output {
 	// an unused temp) or its one real reader is a single consumer that can just recompute the (pure)
 	// initializer inline instead, same as any other pure value. Only safe when the initializer is
 	// PURE -- an effectful one (`let x = f();`) with a real reader must still run at its declared
-	// position, so it stays combined with the declaration there (see isInlinableEffect for how the
-	// call attaches). A DEAD effectful initializer is handled separately, in emitNamedSlot: the call
+	// position, so it stays combined with the declaration there. A DEAD effectful initializer is
+	// handled separately, in emitNamedSlot: the call
 	// still needs to run, just not as x's value (see hasRealConsumer there). capturedRead overrides
 	// all of this: "one real reader, safe to recompute inline" only holds within a single execution,
 	// which a read from inside another function isn't (see its own comment on Node).
@@ -2777,7 +2749,26 @@ export class Output {
 			}
 
 			if (this.isEffect(node)) {
-				if (this.isInlinableEffect(node))
+				// A call is safe to inline (skip its own `var tN = f();`) whenever it has EXACTLY ONE
+				// real value consumer -- not the narrower isInlinableEffect it used to be gated on,
+				// which also required that consumer to be the call's own DIRECT state-chain successor.
+				// That extra requirement isn't actually load-bearing: an effect is always rootBlocks-
+				// anchored to its own fixed position (never GCM-floating), so a pure node consuming it
+				// already has its own scheduleEarly/scheduleLate window floored/capped at that fixed
+				// position, and buildExpr always reconstructs an operand chain in the same left-to-right
+				// order BuildVSDG threaded the underlying effects into the state chain -- so inlining
+				// through an arbitrary pure single-consumer chain (not just another call, or a rebind's
+				// own marker) preserves the required order regardless (found via a real duplicated pair
+				// of temps on real code, binary-libs/src/pe.ts: `t44 = uint16.get(...); t45 =
+				// bin.text.stringCode("MZ"); return t44 === t45;`, where each side had exactly one real
+				// consumer -- the `===` -- but neither matched isInlinableEffect's narrower shape).
+				// valueConsumers, not needsTemp: needsTemp's own consumer count is shared by every OTHER
+				// caller (reassignments, mu/rebind forcing, loop-hoisting), and reusing needsTemp itself
+				// here (routing an effect's count through the exact same shared function) turned out to
+				// change those OTHER callers' behavior too -- content silently vanished from reconstructed
+				// loop bodies in testing. valueConsumers alone, called directly, keeps the blast radius
+				// to just this decision.
+				if (this.valueConsumers(node).length === 1)
 					continue; // deferred -- the sole consuming call inlines it via resolveNode's fallback
 				statements.push(
 					this.hasValueConsumer(node)
