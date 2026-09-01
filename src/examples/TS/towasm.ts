@@ -99,6 +99,11 @@ import * as WAT from '../wat-parser';
 //      check (which the checker does correctly narrow on) doesn't reach codegen's own owner/field
 //      resolution inside the guarded branch -- there is currently no way to narrow a caught 'any'
 //      down to a concrete class by either route
+//    - indexing ('arr[i]'/'arr[i] = x') a receiver whose static type is a real union of different
+//      struct-backed array-likes (e.g. 'Uint8Array | number[]') -- plain '.property' access on the
+//      same kind of union already dispatches per-member ('ensureUnionFieldDispatch'), but indexing
+//      has no equivalent yet; only a single concrete number[]/boolean[]/Uint8Array/Int32Array/
+//      Uint32Array element type is supported
 //  - Numbers:
 //    - an i32/u32-targeted float-to-int coercion (bitwise ops, an explicit i32/u32-typed local, etc.)
 //      of a non-finite (NaN/+-Infinity) or huge finite f64 value doesn't replicate real JS's exact
@@ -337,7 +342,11 @@ function wTypeKey(type: wasm.SubType): string|undefined {
 // see `case 'function'`'s own comment. A closure *literal*'s own params can never be optional (a real,
 // separate restriction, unaffected), so this stays `undefined` for every other `FuncSig` producer.
 interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean; defaults?: (Expr | undefined)[] }
-interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; defaults?: (Expr | undefined)[]; reassignsThis?: boolean }
+// `resolvedParams`: the same params `defaults` came from, before flattening to bare `WasmType`s --
+// only ever set for a real user function/method/constructor (never a closure, which can't have
+// defaults at all), and only actually needed by `emitCallArgs` when a default value itself reads an
+// earlier parameter (`resolveParams`'s own comment) rather than standing alone as a literal.
+interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; defaults?: (Expr | undefined)[]; resolvedParams?: ResolvedParam[]; reassignsThis?: boolean }
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
 interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number }
@@ -1397,6 +1406,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	let destructureTempCounter	= 0;
 	let optionalTempCounter 	= 0;
 	let switchTempCounter		= 0;
+	let defaultArgTempCounter	= 0;
 
 	const types: wasm.SubType[] = [];
 	const typeMap			= new Map<string, number>();
@@ -1785,9 +1795,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					// case, or a genuinely unrepresentable shape) is trivially "not the same physical type as
 					// everything else" -- still a real reason to box as `any`, not a reason to give up on the
 					// whole union. Only every member resolving to the exact same WasmType stays unboxed.
-					return memberWtypes.every(w => w !== undefined) && new Set(memberWtypes.map(w => wasmTypeKey(w!))).size === 1
-						? memberWtypes[0]
-						: REF_ANY;
+					if (!memberWtypes.every((w): w is WasmType => w !== undefined))
+						return REF_ANY;
+					if (new Set(memberWtypes.map(w => wasmTypeKey(w))).size === 1)
+						return memberWtypes[0];
+					// Every member a plain scalar number, just spelled with a different physical narrowing
+					// (`i32` vs `number`/`f64` -- the same wasm-pseudo-type-vs-real-type mismatch the top-of-file
+					// `WASM_PSEUDO_TYPES` comment already documents for a ternary's two branches, here surfacing
+					// via a union of two *classes* whose own declared property types for the same name happen to
+					// spell "number" differently, e.g. `Uint8Array.length: i32` vs `Array<T>.length: number`) --
+					// the union's real, single logical type is `number` regardless of which member declared it
+					// narrower, so this widens to that one canonical representation instead of boxing as `any`.
+					if (memberWtypes.every(w => scalarKind(w) !== undefined))
+						return 'f64';
+					return REF_ANY;
 				}
 				break;
 			}
@@ -2520,7 +2541,23 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// its length isn't known until runtime, so there's no way to know how many of the fixed params it
 	// fills. Every caller used to duplicate (inconsistently, some not at all) an "any spread anywhere is
 	// rejected" check of its own; centralized here instead, precisely scoped to what's actually unsupported.
-	function emitCallArgs(label: string, params: WasmType[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FunctionContext): void {
+	// A default value that reads an earlier parameter (`b.length`) is re-emitted at the call site just
+	// like a plain literal default -- but the *identifier* naming that earlier parameter obviously can't
+	// resolve against the call site's own scope (it means something else there, or nothing at all), so
+	// every reference to it is rewritten to the scratch local `emitCallArgs` binds that parameter's real
+	// value into first. Scoped to exactly the grammar `isReemittableDefault` accepts (identifier, or a
+	// non-optional property-read chain off one) -- nothing here needs to handle anything wider.
+	function substituteEarlierParamRefs(e: Expr, rename: ReadonlyMap<string, string>): Expr {
+		if (e.type === 'identifier') {
+			const to = rename.get(e.name);
+			return to ? { ...e, name: to } : e;
+		}
+		if (e.type === 'member')
+			return { ...e, object: substituteEarlierParamRefs(e.object, rename) };
+		return e;
+	}
+
+	function emitCallArgs(label: string, params: WasmType[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FunctionContext, resolvedParams?: ResolvedParam[]): void {
 		if (!hasRest) {
 			if (args.some(a => a.type === 'spread'))
 				throw `'${label}' takes no rest parameter -- a spread argument has nowhere to expand into`;
@@ -2531,6 +2568,34 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				const missing = defaults.slice(args.length);
 				if (missing.some(d => !d))
 					throw `'${label}' takes exactly ${params.length} argument(s)`;
+
+				// A default that isn't a self-contained literal must be reading an earlier parameter
+				// (the only other shape `isReemittableDefault` accepts) -- bind every argument (explicit
+				// or defaulted) into its own scratch local first, in declaration order, so each default
+				// sees its earlier siblings' real, already-computed values exactly once, matching real
+				// JS's own left-to-right default-evaluation semantics (never by re-emitting -- and so
+				// re-evaluating -- the original argument expression, which could carry a side effect).
+				if (missing.some(d => !isReemittableDefault(d!))) {
+					if (!resolvedParams)
+						throw `internal: '${label}' has a non-literal default with no resolved parameter info`;
+					const rename = new Map<string, string>();
+					ctx.openScope();
+					const locals = resolvedParams.map((p, i) => {
+						const a = i < args.length ? args[i] : substituteEarlierParamRefs(missing[i - args.length]!, rename);
+						emitAs(a, ctx, params[i]);
+						const name = `$default$${defaultArgTempCounter++}`;
+						const local = ctx.declareLocal(name, params[i]);
+						ctx.scope.addValue(name, p.tsType);
+						ctx.emit(I.local.set(local.index));
+						if (typeof p.key === 'string')
+							rename.set(p.key, name);
+						return local;
+					});
+					locals.forEach(local => ctx.emit(I.local.get(local.index)));
+					ctx.closeScope();
+					return;
+				}
+
 				args = [...args, ...missing as Expr[]];
 			}
 			args.forEach((a, i) => emitAs(a, ctx, params[i]));
@@ -2593,7 +2658,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			: ensureFunc(name, decl!, homeModule);
 		if (!info)
 			throw `call to unknown function '${name}'`;
-		emitCallArgs(name, info.params, info.defaults, !!info.hasRest, args, ctx);
+		emitCallArgs(name, info.params, info.defaults, !!info.hasRest, args, ctx, info.resolvedParams);
 		ctx.emit(I.call(info.funcIndex));
 		return info.result;
 	}
@@ -2637,7 +2702,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			}
 			throw `unknown method '${name}' on ${owner.name}`;
 		}
-		emitCallArgs(name, method.params, method.defaults, !!method.hasRest, args, ctx);
+		emitCallArgs(name, method.params, method.defaults, !!method.hasRest, args, ctx, method.resolvedParams);
 		ctx.emit(I.call(method.funcIndex));
 		return method.result;
 	}
@@ -3344,7 +3409,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						const owners = t.types.filter(m => !T.isNullish(m, ctx.scope)).map(m => ownerFor(m));
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1)) {
 							emitAs(e.object, ctx, REF_ANY);
-							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property);
+							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property, T.lookupMember(t, e.property, ctx.scope));
 							ctx.emit(I.call(info.funcIndex));
 							return info.result;
 						}
@@ -3482,7 +3547,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				// is already the next one's receiver -- no scratch local needed.
 				if (owner.decl.name === 'Map') {
 					const ctor = ensureCtor(owner, [], ctx);
-					emitCallArgs(`${owner.name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, [], ctx);
+					emitCallArgs(`${owner.name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, [], ctx, ctor.resolvedParams);
 					ctx.emit(I.call(ctor.funcIndex));
 					if (!e.properties.some(p => p.type === 'spread')) {
 						// `set` returns `this`, so each call's result is already the next one's receiver -- no scratch local needed.
@@ -3945,7 +4010,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				if (!cls)
 					throw `'new' is only supported for a known class`;
 				const ctor = ensureCtor(cls, e.arguments, ctx);
-				emitCallArgs(`${e.callee.name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, e.arguments, ctx);
+				emitCallArgs(`${e.callee.name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, e.arguments, ctx, ctor.resolvedParams);
 				ctx.emit(I.call(ctor.funcIndex));
 				return cls.thisWtype!;
 			}
@@ -4884,11 +4949,19 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// itself, verbatim, once per real omitted-argument call it compiles), not evaluated once and
 	// shared the way a closure capture would be -- which is fine (matches real JS's own "fresh each
 	// call" semantics) as long as the expression never references anything outside its own literal
-	// value (an identifier/call/member-access would resolve against the *call site's* scope, not the
-	// declaring function's -- wrong, or simply unresolvable, there). A literal has no such reference
-	// by construction; an array literal is exactly as safe whenever every element recursively is too.
-	function isReemittableDefault(e: Expr): boolean {
-		return e.type === 'literal' || (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el)));
+	// value, or an *earlier* parameter (`earlierNames`, e.g. real code like `updateBuffer(b: Uint8Array,
+	// off = 0, len = b.length)`) -- any other identifier/call would resolve against the *call site's*
+	// scope, not the declaring function's, so is still rejected. A literal has no such reference by
+	// construction; an array literal is exactly as safe whenever every element recursively is too; a
+	// (possibly chained) plain, non-optional property read off an earlier parameter is safe the same way
+	// a literal is -- no call, no side effect, nothing but a value already known by the time it's needed.
+	// `emitCallArgs` is the one that actually makes an earlier-parameter reference resolve correctly (see
+	// its own comment) -- this only decides whether the *shape* of the expression is safe to attempt.
+	function isReemittableDefault(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
+		return e.type === 'literal'
+			|| (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el, earlierNames)))
+			|| (e.type === 'identifier' && !!earlierNames?.has(e.name))
+			|| (e.type === 'member' && !e.optional && isReemittableDefault(e.object, earlierNames));
 	}
 
 	// A bare `p?: T` (optional, no `= value`) is real, valid TS distinct from `p: T = value` (a real
@@ -4904,12 +4977,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		return params.map(p => p.default ?? (hasMod(p, 'optional') ? { type: 'identifier', name: 'undefined' } : undefined));
 	}
 
-	function resolveParam(p: JS.Param<Type>): ResolvedParam {
+	// `earlierNames`/`scope`: only ever passed by `resolveParams` below, threading in the sibling
+	// parameters already resolved to its own left -- needed both to validate an earlier-parameter-
+	// referencing default (`isReemittableDefault`) and, when the default itself has no explicit type
+	// annotation, to infer its type against a scope that actually has those earlier parameters declared
+	// (plain `libGlobal` can't see them at all -- they're this function's own locals, not global names).
+	function resolveParam(p: JS.Param<Type>, earlierNames?: ReadonlySet<string>, scope: Scope = libGlobal): ResolvedParam {
 		let tsType = p.typeAnnotation;
 		if (p.default) {
-			if (!isReemittableDefault(p.default))
-				throw `'param '${describeBinding(p.key)}''s default value must be a literal (or an array literal of them)`;
-			tsType ??= checkerTypeOf(p.default, libGlobal);
+			if (!isReemittableDefault(p.default, earlierNames))
+				throw `'param '${describeBinding(p.key)}''s default value must be a literal (an array literal of them), or a read of an earlier parameter (e.g. 'b.length')`;
+			tsType ??= checkerTypeOf(p.default, scope);
 		}
 		if (!tsType)
 			throw `'param '${describeBinding(p.key)}' needs an explicit type`;
@@ -4919,6 +4997,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as `any`
 		// rather than reject otherwise-valid source.
 		return { key: p.key, wtype: rawWtype === 'void' ? REF_ANY : rawWtype, tsType };
+	}
+
+	// Resolves a whole param list left to right, growing the earlier-names/scope `resolveParam` needs to
+	// validate and type a default that reads an earlier parameter -- each param sees every param resolved
+	// before it (real JS default-evaluation order), never one declared after it.
+	function resolveParams(params: readonly JS.Param<Type>[]): ResolvedParam[] {
+		const earlierNames = new Set<string>();
+		const scope = new Scope(libGlobal);
+		return params.map(p => {
+			const r = resolveParam(p, earlierNames, scope);
+			if (typeof p.key === 'string') {
+				earlierNames.add(p.key);
+				scope.addValue(p.key, r.tsType);
+			}
+			return r;
+		});
 	}
 
 	// Resolves the type-argument substitution map for a generic call (top-level function or method) --
@@ -5030,12 +5124,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// `libGlobal` exactly as before.
 			const homeScope = checkedType?.type === 'function' ? checkedType.declScope as Scope | undefined : undefined;
 
-			const params	= decl.params.map(p => resolveParam(p));
+			const params	= resolveParams(decl.params);
 			if (decl.rest?.typeAnnotation)
 				params.push({key: decl.rest.key, wtype: typeOf(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
 
 			const {funcIndex, typeIndex} = registerFunc(toParams2(params), toResults(result));
-			const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), hasRest: !!decl.rest?.typeAnnotation};
+			const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation};
 			funcs.set(homeKey(homeModule, name), info);
 			worklist.push(withCatch(() => {
 				const ctx	= new FunctionContext(name, new Scope(homeScope ?? libGlobal), plainReturn(result), undefined, homeModule);
@@ -6070,7 +6164,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		if (existing)
 			return existing;
 
-		const params		= ctor.params.map(p => resolveParam(p));
+		const params		= resolveParams(ctor.params);
 		if (ctor.rest?.typeAnnotation)
 			params.push({key: ctor.rest.key, wtype: typeOf(ctor.rest.typeAnnotation)!, tsType: ctor.rest.typeAnnotation});
 
@@ -6078,7 +6172,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const thisWtype		= cls.thisWtype!;
 
 		const {funcIndex, typeIndex} = registerFunc(toParams2(params), toResults(thisWtype));
-		const info: FuncInfo = { params: params.map(r => r.wtype), result: thisWtype, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(ctor.params), hasRest: !!ctor.rest?.typeAnnotation };
+		const info: FuncInfo = { params: params.map(r => r.wtype), result: thisWtype, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(ctor.params), resolvedParams: params, hasRest: !!ctor.rest?.typeAnnotation };
 		funcs.set(key, info);
 
 		// A constructor's own `return;` never carries a value (real TS syntax already enforces this at
@@ -6233,7 +6327,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		if (!result)
 			throw `'${fullName}' has an unsupported return type`;
 
-		const params		= decl.params.map(p => resolveParam(p));
+		const params		= resolveParams(decl.params);
 		if (decl.rest?.typeAnnotation)
 			params.push({key: decl.rest.key, wtype: typeOf(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
 
@@ -6245,7 +6339,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			reassignsThis	? [...toResults(result), toValType(thisWtype)] : toResults(result)
 		);
 
-		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
+		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
 		funcs.set(key, info);
 		worklist.push(withCatch(() => {
 			const ctx	= new FunctionContext(key.replace('.', '_').replace('#', '_'), new Scope(libGlobal), plainReturn(result), owner);
@@ -6334,7 +6428,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					dctx.emit(I.struct.get(c.heapType, 0));
 				// The call site is zero-`args`, but the candidate may still declare optional/defaulted trailing
 				// params beyond `this` -- wasm has no "optional", so their defaults must still be pushed (`emitCallArgs`, shared with `emitMethodCall`).
-				emitCallArgs(name, c.funcInfo.params, c.funcInfo.defaults, !!c.funcInfo.hasRest, [], dctx);
+				emitCallArgs(name, c.funcInfo.params, c.funcInfo.defaults, !!c.funcInfo.hasRest, [], dctx, c.funcInfo.resolvedParams);
 				dctx.emit(I.call(c.funcInfo.funcIndex));
 				coerceTop(c.funcInfo.result, dctx, want);
 				return [..._cond, I.if(want === 'void' ? undefined : toValType(want), dctx.swapOut(), buildArm(i + 1))];
@@ -6356,26 +6450,51 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// every member declares this field before allowing the access at all, so this never needs a fallback
 	// "no candidate matched" arm the way `ensureAnyDispatch` does; a receiver failing every `ref.test` here
 	// would mean the checker was wrong, an internal inconsistency, not a real program to guard against.
-	function ensureUnionFieldDispatch(members: readonly ClassInfo[], name: string): FuncInfo {
+	function ensureUnionFieldDispatch(members: readonly ClassInfo[], name: string, resultTsType: Type | undefined): FuncInfo {
 		const key = `${name}=>[${members.map(m => m.typeIndex).join(',')}]`;
 		const existing = unionFieldDispatchFuncs.get(key);
 		if (existing)
 			return existing;
 
-		// Each member's own field, looked up once up front -- an internal inconsistency (not a real
-		// program error) if any member turns out not to declare it, since the checker already required
-		// every member of a union to have a given property before allowing `.property` on it at all.
+		// Scratch ctx, live for this whole function's life (not just the deferred body below) -- a
+		// getter-backed member (`.length` on `Array<T>`, e.g. `Uint8Array | number[]`) needs `ensureMethod`
+		// run right now, synchronously, same as any other method-resolving call site, to learn its real
+		// result type before `result` (and so this dispatcher's own signature) can be decided; `onReturn`
+		// is swapped in below once `result` is known, but nothing here ever actually reads it -- `buildArm`
+		// emits its own raw `I.return`-free branching directly, never through `ctx.onReturn`.
+		const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(REF_ANY), undefined);
+
+		// Each member's own field or `get` accessor, looked up once up front -- an internal inconsistency
+		// (not a real program error) if any member turns out to have neither, since the checker already
+		// required every member of a union to have a given property before allowing `.property` on it at all.
 		const memberFields = members.map(m => {
 			const idx = m.fieldIndex.get(name);
-			if (idx === undefined)
-				throw `internal: '${m.name}' (a member of a union type) has no field '${name}'`;
-			return { cls: m, fieldIdx: idx, wtype: m.fields[idx].wtype };
+			if (idx !== undefined)
+				return { cls: m, kind: 'field' as const, fieldIdx: idx, wtype: m.fields[idx].wtype };
+			// `methodSig`, not `ensureMethod` directly -- a getter like `Array<T>.length` is inline asm
+			// (`inlineMethods`, not `methodDecls`), same "either shape" dispatch `methodSig` already
+			// handles for index-syntax `get(i)`/`set(i,v)`; `ensureMethod` alone would silently miss it.
+			if (m.getterNames?.has(name)) {
+				const sig = methodSig(m, accessorKey('get', name), dctx);
+				if (sig)
+					return { cls: m, kind: 'getter' as const, wtype: sig.result };
+			}
+			throw `internal: '${m.name}' (a member of a union type) has no field '${name}'`;
 		});
-		// The dispatch's own result type: every member's field shares one identical physical type in the
-		// overwhelmingly common case (as real TS itself would usually require anyway, absent a `never`-
-		// narrowed exception) -- boxed `any` otherwise, same "differently-shaped values through one slot"
-		// fallback this file already uses everywhere else a value's own shape isn't uniform.
-		const result = memberFields.every(f => wasmTypeEq(f.wtype, memberFields[0].wtype)) ? memberFields[0].wtype : REF_ANY;
+		// The dispatch's own result type comes from the property's real checker type on the union
+		// (`T.lookupMember`'s own 'union' case unions each constituent's own property type together) --
+		// NOT from comparing each member's raw *physical* wtype, which can legitimately differ even when
+		// every member's own declared TS type for the property is identical (e.g. `Uint8Array.length`'s
+		// internally-narrowed `i32` field storage vs. `Array<T>.length`'s getter, raw asm result `u32` --
+		// both really just `number`). Getting this wrong doesn't just pick a clumsier representation: a
+		// per-member `coerceTop(f.wtype, dctx, REF_ANY)` boxes strictly by *physical* wtype (an `i32`-kind
+		// box), while the caller's own `coerceTop(REF_ANY, ctx, wantWtype)` unboxes strictly by *wanted*
+		// type (here `f64`'s box kind) -- two different box shapes, so the caller's `ref.cast` traps at
+		// runtime. Falls back to `REF_ANY` only if the property type genuinely couldn't be resolved here
+		// (shouldn't happen -- the one real call site already required `owners.every(o => ...)` to
+		// succeed, which needs the same property to exist on every member).
+		const result = resultTsType && typeOf(resultTsType) || REF_ANY;
+		dctx.onReturn = plainReturn(result);
 
 		const { funcIndex, typeIndex } = registerFunc(toParams2([{ key: 'recv', wtype: REF_ANY, tsType: T.ANY }]), toResults(result));
 		const info: FuncInfo = { params: [REF_ANY], result, funcIndex, typeIndex };
@@ -6383,7 +6502,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		funcs.set(`<union field dispatch>.${key}`, info);
 
 		worklist.push(withCatch(() => {
-			const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(result), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY);
 
 			function buildArm(i: number): wasm.Instr[] {
@@ -6392,7 +6510,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				const f = memberFields[i];
 				dctx.emit(I.local.get(recv.index), I.ref.test(f.cls.typeIndex));
 				const _cond = dctx.swapOut();
-				dctx.emit(I.local.get(recv.index), I.ref.cast(f.cls.typeIndex), I.struct.get(f.cls.typeIndex, f.fieldIdx));
+				dctx.emit(I.local.get(recv.index), I.ref.cast(f.cls.typeIndex));
+				if (f.kind === 'getter')
+					emitMethodCall(f.cls, accessorKey('get', name), [], dctx);
+				else
+					dctx.emit(I.struct.get(f.cls.typeIndex, f.fieldIdx));
 				coerceTop(f.wtype, dctx, result);
 				return [..._cond, I.if(result === 'void' ? undefined : toValType(result), dctx.swapOut(), buildArm(i + 1))];
 			}
