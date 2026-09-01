@@ -3624,9 +3624,17 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 			// We find the deepest block among all inputs. A param edge (see functionBodyBlockOf's
 			// own comment) uses the function's own body block instead of the function_decl's own
 			// (edge.port is the PRODUCER's own output port here -- port 0 is reserved for the state
-			// chain, so port !== 0 into a function_decl node is unambiguously a param read).
+			// chain, so port !== 0 into a function-entry node is unambiguously a param read).
+			// Checked via `returnNodeId` (stamped unconditionally by buildFunctionBody, never
+			// cleared), not `.type === 'function_decl'`: an arrow/function EXPRESSION's own entry
+			// node has its `.type` overwritten to 'effect' right after buildFunctionBody returns
+			// (see BuildVSDG's 'arrow'/'function' case), so the type check alone silently never
+			// matched a param read inside one -- an arrow's own param-derived, GCM-hoisted pure
+			// value could float all the way out of the arrow entirely, past its own parameter's
+			// scope (found via a real ReferenceError on real code: `v.address` hoisted out of a
+			// `.map((v, i) => ...)` callback to the enclosing function's top level).
 			const targetNode	= graph.get(edge.nodeId)!;
-			const edgeBlock	= targetNode.type === 'function_decl' && edge.port !== 0
+			const edgeBlock	= targetNode.returnNodeId !== undefined && edge.port !== 0
 				? functionBodyBlockOf(edge.nodeId)
 				: blockIds.get(edge.nodeId);
 			if (edgeBlock !== undefined && isDeeperThan(blockTree, edgeBlock, earliestBlock))
