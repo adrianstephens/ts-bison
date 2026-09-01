@@ -1453,6 +1453,45 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					return false;
 				}
 
+				case 'import': {
+					// Previously fell to the generic `default:` case below: verbatim passthru, correctly
+					// ordered in the state chain, but its bound names (namespace/default/named specifiers)
+					// were never bound into scope at all -- any later read of e.g. `bin` in `import * as
+					// bin from '...'` found nothing there and silently fell back to getExprNode's
+					// undeclared-external-name path (the same one `console`/`Math` use), a bare 'var' node
+					// sharing only the string "bin", with zero real inputs and no connection whatsoever to
+					// this import statement. scheduleEarly had nothing to floor it against but block_entry,
+					// so anything derived from it (`bin.text`, say) could get hoisted above the import that
+					// actually provides it. Fixed by giving each bound name its own declKind-less, boundName-
+					// less 'var' node (the same shape externalNodes already uses -- see its own comment --
+					// so it never gets a declaration statement of its own; the import statement's own
+					// passthru node is what actually declares it, verbatim) with a threadMutation scheduling
+					// anchor (the same port-2 convention rebindVar already uses for var_decl/reassignment)
+					// chained right after the import's own passthru node, so GCM can never place a read of
+					// it earlier than the import that provides it. A type-only import (or a type-only named
+					// specifier within an otherwise-real one) is erased entirely at runtime and binds no
+					// real value, so it's skipped -- nothing should ever read it as a value in the first
+					// place.
+					process(s);
+					const node = makeNode('passthru', s);
+					connectEnd(node);
+					if (!s.typeOnly) {
+						const bindImport = (name: string) => {
+							const varNode = makeNode('var', name);
+							threadMutation(varNode);
+							scope.create(name, varNode);
+						};
+						if (s.namespace)
+							bindImport(s.namespace);
+						if (s.default)
+							bindImport(s.default);
+						for (const spec of s.specifiers ?? [])
+							if (!spec.typeOnly)
+								bindImport(spec.local);
+					}
+					return false;
+				}
+
 				case 'export': {
 					// `export default class Foo {...}`/`export default function f() {...}` -- same
 					// double-processing risk and same fix as export_decl above. A plain-expression
@@ -3283,7 +3322,14 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 		// real value is bound per CALL, not shared across the whole graph -- merging `this` from
 		// one method with `this` from a completely different method conflates two different
 		// receivers into one shared variable, corrupting both.
-		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super'].includes(node.type))
+		// 'array'/'object' are unsafe for a DIFFERENT reason -- found the hard way on real code
+		// (binary-libs/src/pe.ts, two `[]` literals in two completely separate functions, each
+		// EXPECTED to start fresh on every call): unlike a real literal (`5`, `"x"`), `[]`/`{}`
+		// create a NEW, DISTINCT object identity on every evaluation in real JS. Merging two
+		// structurally-identical ones collapses that into ONE shared, persistent instance --
+		// mutating it in one place (`result.push(...)`) leaks into every other site that reads
+		// the "same" literal, across calls and even across unrelated functions.
+		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super', 'array', 'object'].includes(node.type))
 			continue;
 
 		// Generate the unique structural signature for this node
