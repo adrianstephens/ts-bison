@@ -46,7 +46,8 @@ function test(name: string, code: string, format = 20) {
 				console.log(output.toCode(program));
 				const graph		= vsdg.BuildVSDG(program);
 				const { blockIds, blockControl } = vsdg.applyGlobalCodeMotion(graph);
-				const stmts = vsdg.blocksToAST(blockIds, blockControl, graph);
+				const stmts = new vsdg.Output(graph, blockIds, blockControl).buildProgram();
+				console.log('==== VSDG');
 				console.log(output.toCode(stmts));
 				break;
 			}
@@ -85,9 +86,9 @@ async function testAsync(parser: Parser, name: string, filename: string, format 
 				break;
 			}
 			case 20: {
-				const g		= vsdg.BuildVSDG(program);
-				const out	= new vsdg.Output(g);
-				const stmts = out.emitLocalStatements(Array.from(g.keys()));
+				const graph		= vsdg.BuildVSDG(program);
+				const { blockIds, blockControl } = vsdg.applyGlobalCodeMotion(graph);
+				const stmts = new vsdg.Output(graph, blockIds, blockControl).buildProgram();
 				console.log(output.toCode(stmts));
 				break;
 			}
@@ -114,7 +115,7 @@ async function testDir(dir: string, ext: string, parser: Parser, format = 0) {
 
 (async()=> {
 
-await testAsync(parser, 'source', '/Volumes/DevSSD/dev/packages/binary-libs/src/pe.ts', 13);
+await testAsync(parser, 'source', '/Volumes/DevSSD/dev/packages/binary-libs/src/pe.ts', 20);
 //await testAsync('source', path.join(__dirname, '../examples/TS/ts-codegen.ts'));
 
 test('typed function', `

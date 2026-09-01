@@ -1,7 +1,8 @@
+/* eslint-disable @typescript-eslint/no-this-alias */
 import * as JS from './js-parser';
 import * as TS from './ts-parser';
 import { Identifier, Literal } from '../common';
-import { Walkable, walkB, calcUnary, calcBinary, RecurseB } from './walker';
+import { Walkable, walkB, calcUnary, calcBinary, RecurseB, isJsStatement, isTsDeclaration } from './walker';
 
 const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
 type Expr			= TS.Expr;
@@ -15,6 +16,15 @@ interface Edge {
 	nodeId:	NodeId;
 	port:	number; 
 }
+interface ClassMember {
+	keyNodeId?: NodeId;
+	entryNodeId?: NodeId;
+	valueNodeId?: NodeId;
+}
+interface ClassInfo {
+	superClassNodeId?: NodeId;
+	members: ClassMember[];
+};
 
 class Node {
 	inputs:		Edge[]		= [];	// inputs[port] = The single specific source edge feeding this slot
@@ -51,21 +61,87 @@ class Node {
 	// string is still what distinguishes a NAMED (per-variable) theta from the unnamed state one
 	// (mu/gamma each get their own type tag instead, muValue/gammaValue, so `.value` is free there
 	// for other purposes -- but this field stays separate regardless, since it's meaningless for
-	// anything but a do-while's own state mu). Read only by blocksToAST, to pick which shape to
-	// reconstruct: `do { body } while (test);` needs no loop-rotation trick at all (the body
-	// already runs before the test, unlike `while`, so there's nothing to rotate).
+	// anything but a do-while's own state mu). Read only by Output's own 'mu' handling
+	// (emitControlNode), to pick which shape to reconstruct: `do { body } while (test);` needs no
+	// loop-rotation trick at all (the body already runs before the test, unlike `while`, so there's
+	// nothing to rotate).
 	loopKind?: 'do';
 	// The catch clause's own binding name (e.g. 'e'), stamped on the STATE `except` anchor for
-	// blocksToAST to reconstruct `catch (e) {...}` with. Can't reuse `.value` here either, for the
-	// exact same reason as `loopKind` above -- it's what distinguishes a NAMED (per-variable)
-	// except from the unnamed state one.
+	// Output's own 'except' handling (emitControlNode) to reconstruct `catch (e) {...}` with. Can't
+	// reuse `.value` here either, for the exact same reason as `loopKind` above -- it's what
+	// distinguishes a NAMED (per-variable) except from the unnamed state one.
 	catchParam?: string;
 	// A function_decl/class_decl's own RETURN_ANCHOR node id, stamped on the entry node so
-	// blocksToAST's function_decl reconstruction can find it -- there's no ordinary graph edge from
+	// Output's own reconstructFunctionBody can find it -- there's no ordinary graph edge from
 	// entry to return (the only edge is FINAL STATE -> return, discovered by walking the body's own
 	// chain backward, which for an EMPTY body coincides with entry itself and so can't be told apart
 	// from "there is no return node" by edge-walking alone).
 	returnNodeId?: NodeId;
+	// Stamped ONLY on the top-level PROGRAM_START node, right before BuildVSDG returns: the id of
+	// the program's own final state-chain node (whatever `end` held at that point). The top-level
+	// program has no RETURN_ANCHOR/return value the way a function does, so unlike returnNodeId this
+	// points directly at the final state itself -- Output's own top-level entry point uses it as the
+	// starting point for the same backward walk reconstructFunctionBody already does for a function.
+	programEndId?: NodeId;
+	// Stamped on a `break_scope` node that reconstructs a real `switch`, not just an arbitrary
+	// break-target: the discriminant to print in `switch(...)`, and each case's own printable test
+	// (undefined for `default`) plus the graph span its body actually occupies. `testNodeId` is the
+	// VSDG node c.test resolved to when it was walked (as part of building `__matchN = disc ===
+	// c.test`, see BuildVSDG's 'switch' case) -- resolving THAT node for printing, rather than
+	// printing the raw source `c.test` expression directly, is what makes a non-literal case test
+	// (an identifier VSDG renamed, or one with a real effect) print correctly instead of bypassing
+	// VSDG's own resolution entirely. `boundaryId` is deliberately NOT the same node `mergeState`'s
+	// own predecessor plumbing would use -- it's captured AFTER the case's own `hit = true;` marker,
+	// so that marker falls OUTSIDE the span Output's own emitChain walks, hence never printed.
+	// `__hit`/`__match` themselves aren't pointless, though: a value reassigned
+	// differently across fallthrough-connected cases still needs them as the post-switch merge's own
+	// condition (see reconcileVariables) -- they're just no longer used to DRIVE printed control flow,
+	// only to correctly compute a merge when one survives, and cleanly disappear from output otherwise.
+	switchDiscriminantId?: NodeId;
+	switchCases?: { testNodeId?: NodeId; boundaryId: NodeId; tailId: NodeId }[];
+	// Stamped on switch's own internal bookkeeping nodes (`__hit`'s reassignment, each case's own
+	// `__matchN` boolean) -- these are NOT real user data, but reach reconcileVariables/resolveNode
+	// through the exact same generic path an ordinary reassignment does (see BuildVSDG's 'switch'
+	// case), since they're synthesized as fake source and walked via the normal expression hook.
+	// Without this tag, resolveNode has no way to tell "this must always resolve by name, its own
+	// mutation is structurally never printed" (true for __hit/__matchN -- switchCases's own
+	// boundaryId is captured AFTER the `hit = true;` marker specifically so it falls outside the
+	// printed span) apart from an ordinary reassignment like `total = 10;`, whose own inlining
+	// decision legitimately depends on forcedPrint/needsTemp. Conflating the two is what broke case
+	// dispatch when forcedPrint was made conditional (see isLoopCarried's own comment): __hit's
+	// value got folded into a real "did an earlier case match" merge, which is correct for the
+	// ACTUAL running switch but wrong for the independent, one-shot match flags computed here.
+	switchInternal?: boolean;
+	// Stamped on whatever node `export`/`export_decl` left behind (via `end`, right after
+	// recursing its own wrapped declaration through the ordinary statement dispatch) -- read back
+	// by whichever print site produces that node's own statement, to wrap it in `export `/
+	// `export default `. Recursing the wrapped declaration through the SAME dispatch every other
+	// statement uses (rather than giving `export`/`export_decl` their own separate verbatim
+	// wrapper) is what keeps a `class_decl`/`function_decl` inside an export from being built
+	// twice -- once by that recursion, once more by the export wrapper's own now-redundant verbatim
+	// reprint (which used to embed the already-recursed declaration a second time).
+	exported?: 'named' | 'default';
+	// Stamped on a var declaration's own node the first time it's READ from inside a DIFFERENT
+	// function than the one it's declared in (see getExprNode's own identifier resolution, and
+	// isLocalToCurrentFunction). A single apparent consumer normally makes a pure value safe to
+	// inline (isInlinableVarDecl) -- sound only when that consumer runs within the SAME, single
+	// execution as the declaration. A captured read doesn't: the reading function may run zero,
+	// one, or many times, at a point this pass can't place relative to the declaration, so it must
+	// always re-read the variable BY NAME, never substitute whatever value happened to be true at
+	// declaration time. Same reasoning as forcedPrint for a captured WRITE (BuildVSDG's 'binary'
+	// case) -- this is its read-side counterpart, found the hard way (a runtime check, not just
+	// print inspection, was what actually caught this: `n = n + 1;` prints correctly under either
+	// bug, but silently computes `0 + 1` every call instead of re-reading `n`).
+	capturedRead?: boolean;
+	// Stamped on a class's own anchor node (an 'effect' for a class EXPRESSION, a 'passthru' for a
+	// class_decl -- see BuildVSDG's buildClass) with whatever of its own pieces got real VSDG
+	// resolution: the heritage expression, and each member's own computed key / static field value /
+	// method-or-accessor-or-static-block-or-instance-field-initializer body (via its own independent
+	// function-scoped subgraph, entryNodeId -- see buildFunctionBody's own comment for why it
+	// carries no graph edge of its own). `members` is index-aligned with the ORIGINAL `body` array
+	// node.value still holds -- Output's own rebuildClass splices each resolved piece back in,
+	// everything else still copied through verbatim.
+	classInfo?: ClassInfo;
 	constructor(public id: string, public type: string, public value?: any) {}
 	inDegree()	{ return this.inputs.length; }
 	outDegree() { return this.outputs.reduce((sum, arr) => sum + arr.length, 0); }
@@ -105,20 +181,36 @@ class Node {
 			return true;
 		if (this.type === 'thetaValue' && port === 0)
 			return true;
-		// A state gamma's true/false-tail ports (2/3) are structural only: blocksToAST reads
-		// `control.inputs[2]/[3]` directly (via branchEntryBlock) to find where each branch's content
-		// starts, never through resolveOperand -- so a call that happens to be the last effect in its
-		// branch is never actually "read" for its VALUE just by virtue of being that branch's tail.
+		// threadMutation's own marker edge (always port 2, on whatever node rebindVar just bound --
+		// a var_decl/rebind, or a reassignment expression): purely a GCM ordering anchor, never read
+		// as a value by resolveOperand/buildExpr (a var's real value is always port 0; a reassignment
+		// only ever reads its right operand, port 1). Without this, isPureSubgraph's own recursion
+		// (which has no other way to tell a scheduling-only edge from a real value dependency) walks
+		// straight into the marker -- an 'effect' node -- and wrongly calls the WHOLE subgraph
+		// impure, even when nothing in the actual value chain has any real effect at all.
+		if ((this.type === 'var' || this.type === 'binary') && port === 2)
+			return true;
+		// A state gamma's true/false-tail ports (2/3) are structural only: Output's own emitChain
+		// walks `control.inputs[2]/[3]` directly (backward from each branch's own tail) to find where
+		// each branch's content starts, never through resolveOperand -- so a call that happens to be
+		// the last effect in its branch is never actually "read" for its VALUE just by virtue of
+		// being that branch's tail.
 		if (this.type === 'gamma' && (port === 2 || port === 3))
 			return true;
-		// A break_scope's own tail port (1): same reasoning as a gamma's tail ports -- blocksToAST
-		// reads it directly (via branchEntryBlock) to find where the scope's wrapped content
-		// starts, never through resolveOperand.
+		// A switchInternal gamma's own condition (port 1) too -- unlike an ordinary if's gamma, which
+		// genuinely needs to read it to print `if (cond)`, this one belongs to switch's own internal
+		// if-cascade, which switchCases's own print-time reconstruction bypasses entirely (see
+		// BuildVSDG's own switch case, which tags exactly this gamma switchInternal for this reason).
+		if (this.type === 'gamma' && this.switchInternal && port === 1)
+			return true;
+		// A break_scope's own tail port (1): same reasoning as a gamma's tail ports -- Output's own
+		// emitChain walks it directly (backward from the scope's own tail) to find where the scope's
+		// wrapped content starts, never through resolveOperand.
 		if (this.type === 'break_scope' && port === 1)
 			return true;
 		// A state-merging (unnamed) except's try/catch/finally tails (1/2/3): same reasoning as a
-		// state-gamma's own tail ports -- blocksToAST finds each part's content via
-		// branchEntryBlock, never through resolveOperand. Unlike gamma, a NAMED except's own value
+		// state-gamma's own tail ports -- Output's own emitChain finds each part's content the same
+		// way, never through resolveOperand. Unlike gamma, a NAMED except's own value
 		// ports (0/1, try/catch) are NOT vestigial here either way -- resolveNode never resolves
 		// them directly (there's no printable condition to build a ternary from the way a named
 		// gamma's ternary can), so they simply never get visited via that path in the first place.
@@ -153,6 +245,12 @@ class Scope {
 	// Maps variable names to the VSDG NodeId that currently holds its value
 	local	= new Set<string>;
 	bindings = new Map<string, Node>();
+	// Set only on the scope functionScope creates (never on an ordinary block scope -- if/while
+	// body, etc). Distinguishes "reassigns a name declared somewhere in the ENCLOSING function"
+	// (an ordinary local, ultimately merged/reconciled the normal way) from "reassigns a name
+	// CAPTURED from further out" (crosses a function boundary -- see isLocalToCurrentFunction,
+	// used by BuildVSDG's 'binary' case to decide whether a reassignment needs forcedPrint).
+	isFunctionBoundary = false;
 
 	constructor(public parent: Scope | null = null) { }
 	closeAndFlush() {
@@ -174,6 +272,25 @@ class Scope {
 	get(name: string): Node | undefined {
 		return this.bindings.get(name) ?? this.parent?.get(name);
 	}
+
+	// True if `name` is declared somewhere between the current scope and the nearest enclosing
+	// function boundary (an ordinary local -- an if/while/for body is just another Scope link in
+	// this same chain, so this walks straight through those). False means it's CAPTURED from
+	// further out -- reassigning it is an effect that escapes the current function, needing
+	// forcedPrint the same way a property assignment does (see BuildVSDG's 'binary' case): its
+	// value can't be safely inlined based on a same-region consumer count when the actual
+	// "consumer" might be arbitrarily far away, in a caller that hasn't run yet. No enclosing
+	// function at all (true top-level code) has no boundary to cross, so it's trivially "local".
+	isLocalToCurrentFunction(name: string): boolean {
+		for (let s: Scope | null = this; s; s = s.parent) {
+			if (s.local.has(name))
+				return true;
+			if (s.isFunctionBoundary)
+				return false;
+		}
+		return true;
+	}
+
 }
 
 class ScopeMu extends Scope {
@@ -244,24 +361,6 @@ class VSDG extends Map<NodeId, Node> {
 			}
 		}
 	}
-
-	optimize(): void {
-		let changed = true;
-
-		while (changed) {
-			changed = false;
-
-			for (const node of this.values()) {
-				// 1. Try to fold constant math operations
-				if (foldConstants(this, node))
-					changed = true;
-
-				// 2. Try to eliminate dead if/else branches
-				if (foldDeadBranches(this, node))
-					changed = true;
-			}
-		}
-	}
 }
 
 export function BuildVSDG(ast: Walkable): VSDG {
@@ -287,9 +386,10 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	}
 	// Seeds the top-level (and, transitively, each function body's) state chain. Without a real anchor
 	// here, any effect appearing before the first function_decl -- or a program with no function_decl
-	// wrapper at all, which is what applyGlobalCodeMotion/blocksToAST currently assume -- has nothing
-	// valid to thread its first state edge from.
+	// wrapper at all, which is what applyGlobalCodeMotion/Output's own reconstruction currently
+	// assume -- has nothing valid to thread its first state edge from.
 	let end: Node = makeNode('effect', 'PROGRAM_START');
+	const programStart = end;
 
 	// True when the path just walked (a branch, a case body) never falls through to its own lexical
 	// successor -- it broke, continued, or returned. Tracked the same way `end`/`scope` are (reset
@@ -330,8 +430,15 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	function getExprNode(expr: Expr) {
 		if (expr.type === 'identifier') {
 			const found = scope.get(expr.name);
-			if (found)
+			if (found) {
+				// See capturedRead's own comment on Node: a read reaching outside the function it's
+				// declared in must never be statically inlined, since the reading function might run
+				// zero, one, or many times, each needing to see whatever the variable ACTUALLY holds
+				// at that point, not whatever it held when declared.
+				if (!scope.isLocalToCurrentFunction(expr.name))
+					found.capturedRead = true;
 				return found;
+			}
 			let ext = externalNodes.get(expr.name);
 			if (!ext) {
 				ext = makeNode('var', expr.name);
@@ -353,6 +460,13 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		exited		= _exited;
 		brokeOut	= _brokeOut;
 	}
+
+	function connectEnd(effect: Node) {
+		connectValue(end, 0, effect, 0);
+		end = effect;
+	}
+
+
 	// Walks the state chain backwards from `tail` to `boundary`, ignoring MUTATION_MARKER nodes, to
 	// check whether a REAL effect (a call) happened along the way. Used to decide whether an if/else
 	// branch needs a structural state-merge (a gamma wrapping actual code) -- a branch that only
@@ -398,9 +512,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// left for later rather than risk a repeat of that bug now.
 	function threadMutation(node: Node) {
 		const marker = makeNode('effect', 'MUTATION_MARKER');
-		connectValue(end, 0, marker, 0);
 		connectValue(marker, 0, node, 2);
-		end = marker;
+		connectEnd(marker);
 	}
 	// The single place a name becomes (re)bound to a node: tags it for Output, updates scope, and
 	// orders it -- all three always travel together, so they live in one place instead of being
@@ -425,9 +538,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		if (isDoWhile)
 			muEnd.loopKind = 'do';
 		const muScope	= new ScopeMu(scope, makeNode, muEnd);
-		connectValue(end, 0, muEnd, 0); // Slot 0 = Initial value from outside
 		scope	= muScope;
-		end		= muEnd;
+		connectEnd(muEnd);
 
 		loopUpdateStack.push(forUpdate);
 		let testNode: Node;
@@ -484,7 +596,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// gamma (a call, or an exit -- see 'if's own original comment for why), or does state simply
 	// continue unchanged past a branch that only reassigned variables. Sets `end`/`exited` for
 	// whatever comes next -- the next case in a switch chain, or whatever follows the whole if.
-	function mergeState(parent: State, test: Node, trueState: State, falseState: State) {
+	function mergeState(parent: State, test: Node, trueState: State, falseState: State): Node | undefined {
 		if (trueState.exited || falseState.exited || hasRealEffect(trueState.end, parent.end) || hasRealEffect(falseState.end, parent.end)) {
 			const gamma = makeNode('gamma');
 			connectValue(parent.end, 0, gamma, 0);		// Slot 0 = State predecessor
@@ -492,23 +604,43 @@ export function BuildVSDG(ast: Walkable): VSDG {
 			connectValue(trueState.end, 0, gamma, 2);		// Slot 2 = True State
 			connectValue(falseState.end, 0, gamma, 3);	// Slot 3 = False State
 			end = gamma;
-		} else {
-			// No real effect in either branch: the reassignment(s), if any, are already fully
-			// captured by reconcileVariables's own per-variable named gamma (a pure ternary needs no
-			// structural if/else). `end` must still be reset -- left alone, it would dangle off
-			// whichever branch's mutation-marker chain was walked last, instead of the state that
-			// actually continues past this (structurally absent) branch.
-			end = parent.end;
+			// This branch pair only counts as "exited" (to whatever encloses it) when BOTH sides did --
+			// an implicit empty else (or, for a switch case, simply not matching) always falls through,
+			// so the non-existent side's own state already correctly reports exited: false.
+			exited = trueState.exited && falseState.exited;
+			// Propagated the same way: only true when BOTH sides exited AND both did so via break
+			// (mixed kinds -- e.g. one side breaks, the other returns -- fall back to false here, same
+			// as reconcileVariables's own "both exited" case: nothing downstream is reachable from
+			// EITHER path there anyway, so which value it "would" merge to is moot).
+			brokeOut = exited && trueState.brokeOut && falseState.brokeOut;
+			return gamma;
 		}
-		// This branch pair only counts as "exited" (to whatever encloses it) when BOTH sides did --
-		// an implicit empty else (or, for a switch case, simply not matching) always falls through,
-		// so the non-existent side's own state already correctly reports exited: false.
+		// No real effect in either branch: the reassignment(s), if any, are already fully
+		// captured by reconcileVariables's own per-variable named gamma (a pure ternary needs no
+		// structural if/else). `end` must still be reset -- left alone, it would dangle off
+		// whichever branch's mutation-marker chain was walked last, instead of the state that
+		// actually continues past this (structurally absent) branch.
+		end = parent.end;
 		exited = trueState.exited && falseState.exited;
-		// Propagated the same way: only true when BOTH sides exited AND both did so via break (mixed
-		// kinds -- e.g. one side breaks, the other returns -- fall back to false here, same as
-		// reconcileVariables's own "both exited" case: nothing downstream is reachable from EITHER
-		// path there anyway, so which value it "would" merge to is moot).
 		brokeOut = exited && trueState.brokeOut && falseState.brokeOut;
+		return undefined;
+	}
+
+	// True if `name` is currently loop-carried: reassigning it needs a REAL, PRINTED, MUTATED
+	// variable (not just a value edge folded into a ternary), because a `while`'s NEXT iteration
+	// sees the update only through the ACTUAL runtime variable -- unlike a one-shot merge (if/
+	// switch), there's no graph edge connecting one iteration's value to the next one's read.
+	// ScopeMu.get() lazily creates the mu binding the first time something inside the loop reads a
+	// name bound further out; reconcileVariables always calls scope.get(name) for both sides before
+	// this is checked, so by now the binding (if this reassignment would ever trigger one) already
+	// exists. The NEAREST ScopeMu ancestor is always the one that would own it -- its own get()
+	// override intercepts before ever delegating further out -- so there's no need to walk past it.
+	function isLoopCarried(name: string): boolean {
+		for (let s: Scope | null = scope; s; s = s.parent) {
+			if (s instanceof ScopeMu)
+				return s.muNodes.has(name);
+		}
+		return false;
 	}
 
 	// The VALUE half: per-variable reconciliation of everything either branch reassigned.
@@ -567,12 +699,23 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				const trueExitedViaBreak	= trueState.exited && !falseState.exited && trueState.brokeOut;
 				const falseExitedViaBreak	= falseState.exited && !trueState.exited && falseState.brokeOut;
 
-				if (trueExitedViaBreak && trueVal.boundName === name)
+				// forcedPrint is only actually NECESSARY when `name` is loop-carried (see
+				// isLoopCarried's own comment) -- a one-shot merge (if/switch, no enclosing loop) has
+				// no "next iteration" that needs a real, mutated variable to see the update through;
+				// the value is just as correctly represented purely as a graph edge into the
+				// (neverMaterialize) merge below, exactly like an ordinary non-exited branch's
+				// reassignment already is. switchInternal (see resolveNode's own check) is the OTHER
+				// reason to stay forced regardless of loop-carriedness: switch's own bookkeeping
+				// (hit=true;) needs its boundName kept ONLY in exactly the situations that used to
+				// force it unconditionally (trueExitedViaBreak) -- an ordinary, non-exiting case (a
+				// fall-through with no break) must still clear it exactly like before, or its
+				// per-case merge stops collapsing to a bare name the way it always has.
+				if (trueExitedViaBreak && trueVal.boundName === name && (trueVal.switchInternal || isLoopCarried(name)))
 					trueVal.forcedPrint = true;
 				else if (trueVal.boundName === name && !trueVal.declKind)
 					trueVal.boundName = undefined;
 
-				if (falseExitedViaBreak && falseVal.boundName === name)
+				if (falseExitedViaBreak && falseVal.boundName === name && (falseVal.switchInternal || isLoopCarried(name)))
 					falseVal.forcedPrint = true;
 				else if (falseVal.boundName === name && !falseVal.declKind)
 					falseVal.boundName = undefined;
@@ -599,68 +742,177 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		}
 	}
 
+	// A method/get/set/static_block's own independent function-scoped subgraph -- own entry/return
+	// anchor pair, own scope chained to the enclosing one -- reusing the exact same machinery a
+	// top-level function_decl gets (see its own comment), including connecting entryNode into the
+	// outer state chain: not because the BODY runs at this point (it doesn't -- a method body runs
+	// only when called, later; a static block does run once, at class-definition time, but that's
+	// already correctly ordered via the class's own anchor node regardless), but because
+	// applyGlobalCodeMotion's own region-boundary logic (regionRootOf, in scheduleLate) needs
+	// entryNode's own block to nest under whichever region it's declared in, so anything genuinely
+	// INSIDE this function (reached via the marker chain, not this edge) is correctly recognized as
+	// a separate region rather than folded into the caller's own. Multiple class members' entry
+	// nodes end up sharing the same `outer.end` predecessor here (buildClassMember never advances
+	// it between members) -- an ordinary multi-consumer output edge, not a conflict.
+	function buildFunctionBody(recurse: RecurseB, params: JS.Params<TS.Type> | undefined, body: Expr | Statement[]): Node {
+		const outer			= getState();
+		const entryNode		= makeNode('function_decl');
+		const returnNode	= makeNode('effect', 'RETURN_ANCHOR');
+		entryNode.returnNodeId = returnNode.id;
+		connectValue(outer.end, 0, entryNode, 0);
+
+		// See the top-level function_decl case's own comment on its matching bodyStart: gives the
+		// body its own, unambiguous region root for regionRootOf (applyGlobalCodeMotion) to find --
+		// entryNode's own block isn't safe to use for that (see FUNCTION_BODY_START's own comment).
+		const bodyStart = makeNode('effect', 'FUNCTION_BODY_START');
+		connectValue(entryNode, 0, bodyStart, 0);
+
+
+		const fnScope = new Scope(scope);
+		fnScope.isFunctionBoundary = true;
+
+		if (params) {
+			// Wire incoming output ports from the entry node directly to parameter bindings.
+			// Each param gets its own node (port 0 = State, so params occupy port index + 1);
+			let port = 1;
+			function addParam(key: JS.BindingTarget) {
+				if (typeof key === 'string') {
+					const paramNode = makeNode('var', key);
+					connectValue(entryNode, port++, paramNode, 0);
+					fnScope.create(key, paramNode);
+				} else {
+					console.log(`not handling destructured parameter`);
+				}
+
+			}
+			params.params.forEach(p => addParam(p.key));
+			if (params.rest)
+				addParam(params.rest.key);
+		}
+
+		setState(fnScope, bodyStart);
+
+		if (Array.isArray(body)) {
+			for (const stmt of body)
+				recurse(stmt, 'statement');
+			connectValue(makeNode('literal', undefined), 0, returnNode, 1);
+		} else {
+			recurse(body, 'expression');
+			connectValue(getExprNode(body), 0, returnNode, 1);
+		}
+
+		connectValue(end, 0, returnNode, 0);
+
+		// closeAndFlush propagates a CAPTURED variable's own reassignment back into the caller's
+		// own bindings, so a later read resolves to it by name (see the top-level function_decl
+		// case's own comment for the full reasoning, and why this is now safe: forcedPrint plus
+		// scheduleLate's own region-boundary exclusion together keep the reassignment correctly
+		// printed INSIDE this function, never inlined away and never dragged outside it).
+		fnScope.closeAndFlush();
+		setState(outer.scope, outer.end, outer.exited, outer.brokeOut);
+		return entryNode;
+	}
+
+	// Heritage and every member's own computed key are real expressions that can call out and
+	// reference outer values -- resolved through VSDG (rather than left in the OLD generic,
+	// print-blind `process(s)` walk) so a referenced outer variable's own declaration doesn't get
+	// its value silently inlined/orphaned away. Each resolved value is wired into `anchor` (the
+	// class's own 'effect'/'passthru' node, created by the caller before this runs) at its own
+	// port, ports 1.. (0 is the state predecessor, same convention 'call'/'new'/'jsx' already use)
+	// -- a REAL graph edge, not just a value recorded in classInfo for printing: without one,
+	// hasRealConsumer sees no consumer at all for it (classInfo's own NodeId references are
+	// invisible to ordinary graph-edge-based consumer counting), so its value looks unused --
+	// exactly the bug this whole pass exists to fix (see Output's own rebuildClass, which reads
+	// classInfo back to splice the resolved values into the printed member list).
+	function buildClass(recurse: RecurseB, anchor: Node, s: { superClass?: JS.Expr<any>; body: JS.ClassMember<any>[] }): NonNullable<Node['classInfo']> {
+		let port = 1;
+		let superClassNodeId: NodeId | undefined;
+		if (s.superClass) {
+			recurse(s.superClass, 'expression');
+			const node = getExprNode(s.superClass);
+			connectValue(node, 0, anchor, port++);
+			superClassNodeId = node.id;
+		}
+		return {
+			superClassNodeId,
+			// Two ports per member (key, static field value) -- unused ones (a non-computed key, a
+			// non-static/non-field member) just go unclaimed, harmless.
+			members: s.body.map(m => {
+
+				// A computed member key (`[expr]: ...`) is a real expression that can call out -- resolved
+				// through VSDG like any other, so a class's printed key correctly reflects VSDG's own
+				// resolution instead of the raw, un-walked source (same reasoning as switchCases's own
+				// testNodeId). A plain (non-computed) key is just a name, nothing to walk. Wired into `anchor`
+				// at the next free port (see buildClass's own comment for why this matters, not just resolving
+				// the value): without a REAL graph edge, this is a "phantom" reference invisible to
+				// hasRealConsumer, so the key's own value looks unused -- silently inlining/orphaning away
+				// whatever variable it reads, and (if it's a real effect) getting printed a second time,
+				// standalone, as if nothing consumed its result.
+				let keyNodeId;
+				if ('key' in m && typeof m.key !== 'string') {
+					const expr = m.key.computed;
+					recurse(expr, 'expression');
+					const node = getExprNode(expr);
+					connectValue(node, 0, anchor, port++);
+					keyNodeId = node.id;
+				}
+
+				switch (m.type) {
+					case 'method':
+					case 'get':
+					case 'set':
+						return m.body ? { keyNodeId, entryNodeId: buildFunctionBody(recurse, m, m.body).id } : { keyNodeId };
+					case 'static_block':
+						return { entryNodeId: buildFunctionBody(recurse, undefined, m.body).id };
+					case 'field': {
+						if (!m.value)
+							return { keyNodeId };
+						if (m.modifiers?.includes('static')) {
+							// A static field's own initializer runs once, at class-definition time, same as
+							// heritage/keys -- resolved and threaded directly into the outer (class-anchored)
+							// chain, wired into `anchor` at its own port (port+1 -- port itself is the key's,
+							// see buildClassKey) for the same reason heritage/keys need one: without a real
+							// graph edge, hasRealConsumer sees no consumer for it at all (this is a "phantom"
+							// reference, resolved later via valueNodeId, not a graph edge on its own).
+							recurse(m.value, 'expression');
+							const valueNode = getExprNode(m.value);
+							connectValue(valueNode, 0, anchor, port++);
+							return { keyNodeId, valueNodeId: valueNode.id };
+						}
+						// An INSTANCE field's own initializer runs once per `new`, not at class-definition
+						// time -- threading it into the outer chain directly (like a static field) would be
+						// exactly the same bug class as a method body before it got its own entry/bodyStart
+						// isolation: something that runs repeatedly, at an unknown future point, forced into
+						// a single, one-time position in the class's own definition sequence. Reuses
+						// buildFunctionBody wholesale (own entry/bodyStart/return-anchor pair, no params),
+						// passing `m.value` directly as an expression body (the same shape an
+						// expression-bodied arrow uses) -- its own resolved value ends up on returnNode's
+						// port 1 directly, no synthetic `return` statement/EARLY_RETURN_MARKER involved.
+						// Output's own resolveFieldInitializer (a second callback, alongside
+						// reconstructFunctionBody -- see its own comment) reads exactly that port. A
+						// captured variable read or reassigned from inside the initializer gets the same
+						// capturedRead/forcedPrint treatment as anywhere else (isLocalToCurrentFunction
+						// doesn't care how the function boundary was built).
+						return { keyNodeId, entryNodeId: buildFunctionBody(recurse, undefined, m.value).id };
+					}
+					default:
+						// 'index_signature' has no runtime code at all (a type-only member).
+						return { keyNodeId };
+				}
+
+			}),
+		};
+	}
+
 	walkB(ast,
 		(s, process, recurse) => {
 			switch (s.type) {
-				case 'function_decl': {
-					const outer = getState();
-
-					// 1. Establish the internal localized graph builder context
-
-					// 2. Instantiate the Function Boundary Nodes
-					const entryNode		= makeNode('function_decl', s);
-					const returnNode	= makeNode('effect', 'RETURN_ANCHOR');
-					entryNode.returnNodeId = returnNode.id;
-					// Anchor the DECLARATION's own position in the OUTER state chain -- same as any
-					// ordinary sequential statement (real hoisting semantics aren't modeled; this pass
-					// never reorders anyway, so "declared at this point, in this order" is always safe).
-					// Without this it's an unanchored island: nothing ever schedules or visits it, so it
-					// silently never gets printed (its own outputs are never a real value edge either --
-					// see buildEffectExpr's call/new handling for why a callee is never resolved through
-					// the graph -- so scheduleLate would never place it anywhere on its own).
-					connectValue(outer.end, 0, entryNode, 0);
-
-					// 3. Seed an isolated local scope for the function body
-					// This isolates function variables completely from the outer global scope
-					const fnScope = new Scope(scope);
-
-					// Wire incoming output ports from the entry node directly to parameter bindings.
-					// Each param gets its own node (port 0 = State, so params occupy port index + 1);
-					// without a dedicated node per param they'd all alias entryNode's port 0.
-					s.params.forEach((p, index) => {
-						if (typeof p.key === 'string') {
-							const paramNode = makeNode('var', p.key);
-							connectValue(entryNode, index + 1, paramNode, 0);
-							fnScope.create(p.key, paramNode);
-						} else {
-							console.log(`not handling destructured parameter`);
-						}
-					});
-
-					// 4. Temporarily swap the master compiler pointers into the function's region
-
-					setState(fnScope, entryNode); // The sequential state chain inside the function hangs off the entry node
-
-					// 5. Recursively walk and generate the entire function body statements block
-					process(s);
-
-					// 6. Connect the final sequential execution state to the return anchor
-					connectValue(end, 0, returnNode, 0); // Slot 0 = Final State
-
-					// 7. returnNode's own port 1 is left otherwise unused: every explicit `return`
-					// (early or not) now prints itself in place, via its own EARLY_RETURN_MARKER --
-					// see emitLocalStatements -- so there's no real value left to reconcile HERE.
-					// A synthetic `undefined` keeps the port populated for GCM/blocksToAST's own
-					// "is there really a value here" check (see emitFrom's function_decl case).
-					connectValue(makeNode('literal', undefined), 0, returnNode, 1); // Slot 1 = Return Value
-
-					// 8. Restore the master compiler pointers back to the global file scope
-					// `entryNode`, not `outer.end` -- it's now part of the sequential chain (see the
-					// connectValue above), so whatever textually follows must chain from IT, not skip
-					// past it back to where the chain was before this declaration.
-					setState(outer.scope, entryNode, outer.exited, outer.brokeOut);
+				case 'function_decl':
+					if (s.body) {
+						end = buildFunctionBody(recurse, s, s.body);
+						end.value = s;
+					}
 					return false;
-				}
 
 				case 'return': {
 					// Same shape as 'throw' below: the marker carries its own value directly at port 1
@@ -677,10 +929,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					if (s.argument)
 						recurse(s.argument, 'expression');
 					const marker = makeNode('effect', 'EARLY_RETURN_MARKER');
-					connectValue(end, 0, marker, 0);
+					connectEnd(marker);
 					if (s.argument)
 						connectValue(getExprNode(s.argument), 0, marker, 1);
-					end = marker;
 					exited = true;
 					return false;
 				}
@@ -692,11 +943,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// relative to each other, so real JS's own exception routing at runtime is
 					// unaffected either way).
 					recurse(s.argument, 'expression');
-					const argNode = getExprNode(s.argument);
 					const marker = makeNode('effect', 'THROW_MARKER');
-					connectValue(end, 0, marker, 0);
-					connectValue(argNode, 0, marker, 1);
-					end = marker;
+					connectEnd(marker);
+					connectValue(getExprNode(s.argument), 0, marker, 1);
 					exited = true;
 					return false;
 				}
@@ -711,11 +960,10 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// `if`s correctly treat this branch as not falling through -- which is what keeps
 					// whatever textually follows (more of the loop body, more switch cases) from being
 					// wired up as if it always runs -- and (2) leave a marker in the state chain so
-					// blocksToAST prints a literal `break;` here. The printed statement itself is what
-					// real JS routes to the nearest enclosing loop/switch at runtime.
-					const marker = makeNode('effect', 'BREAK_MARKER');
-					connectValue(end, 0, marker, 0);
-					end = marker;
+					// Output's own emitLocalStatements prints a literal `break;` here. The printed
+					// statement itself is what real JS routes to the nearest enclosing loop/switch at
+					// runtime.
+					connectEnd(makeNode('effect', 'BREAK_MARKER'));
 					exited = true;
 					brokeOut = true;
 					return false;
@@ -737,9 +985,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					const forUpdate = loopUpdateStack[loopUpdateStack.length - 1];
 					if (forUpdate)
 						recurse(structuredClone(forUpdate), 'expression');
-					const marker = makeNode('effect', 'CONTINUE_MARKER');
-					connectValue(end, 0, marker, 0);
-					end = marker;
+					connectEnd(makeNode('effect', 'CONTINUE_MARKER'));
 					exited = true;
 					return false;
 				}
@@ -841,15 +1087,15 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// dedicated-wrapper comment, a few cases up).
 					recurse(s.discriminant, 'expression');
 					const discValue = getExprNode(s.discriminant);
-					const discNode = makeNode('var');
+					const discNode	= makeNode('var');
 					connectValue(discValue, 0, discNode, 0);
 					discNode.declKind = 'let';
-					const suffix = discNode.id;
-					const discName = `__disc_${suffix}`;
-					discNode.value = discName;
+					const suffix	= discNode.id;
+					const discName	= `__disc_${suffix}`;
+					discNode.value	= discName;
 					// rebindVar (not a bare scope.create) matters here: it's what threads discNode
 					// into the state chain via threadMutation. Without it, discNode is never
-					// scheduled anywhere blocksToAST's traversal reaches -- `let __disc = ...;`
+					// scheduled anywhere Output's own reconstruction reaches -- `let __disc = ...;`
 					// silently never gets printed even though every case test still reads its name.
 					rebindVar(discName, discNode, true);
 
@@ -858,15 +1104,21 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// order -- reusing the same expression object a second time, to compute
 					// `default`'s condition below, would re-walk and re-run it). Captured into its
 					// own named boolean so nothing else ever needs to read the comparison twice.
-					const matchNames = s.cases.map((c, i) => {
+					// `c.test` itself gets walked here too, as the comparison's RHS -- its resolved VSDG
+					// node (captured alongside matchName, not re-walked) is what the printed case label
+					// reads later, instead of the raw source expression: reusing this walk is what keeps
+					// evaluation to exactly once while still letting the label reflect VSDG's own
+					// resolution (a renamed identifier, an inlined value, correct effect ordering, ...).
+					const caseTestInfo = s.cases.map((c, i) => {
 						if (!c.test)
-							return undefined;
+							return { matchName: undefined, testNodeId: undefined };
 						const matchName = `__match${i}_${suffix}`;
 						recurse(JS.VarDecl('let', JS.Var(matchName,
 							{ type: 'binary', operator: '===', left: Identifier(discName), right: c.test } as Expr
 						)));
-						return matchName;
+						return { matchName, testNodeId: getExprNode(c.test).id };
 					});
+					const matchNames = caseTestInfo.map(t => t.matchName);
 
 					// A hidden "have we entered some case yet" flag, reassigned exactly like an
 					// ordinary variable -- rides the SAME per-variable gamma/mu/theta machinery as
@@ -895,7 +1147,6 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// chains walkBranch/mergeState/reconcileVariables directly, once per case, instead
 					// of synthesizing a whole `JS.If` statement per case just to recurse back into it:
 					// exactly the same shape 'if' itself now uses, just looped instead of called once.
-					const hasCases = s.cases.length > 0;
 
 					// A `break_scope`: a scope that `break` exits, with none of a loop's iteration
 					// machinery (no mu/theta, no re-entry point) -- a switch shares a loop's "break
@@ -912,29 +1163,31 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// Skipping this also avoids a real degenerate case: with no cases to walk, `end`
 					// would still be `breakScope` itself when connecting its own tail, wiring the
 					// anchor to itself.
-					if (hasCases) {
+					if (s.cases.length > 0) {
 						// The anchor is created AFTER walking the cases, not before -- exactly like
 						// a gamma's own predecessor/tail split. Creating it first (and setting `end`
 						// to it before walking) would make the first case's own `parent.end` BE the
-						// anchor itself, so branchEntryBlock's backward walk (in blocksToAST) would
-						// hit the anchor's own block on its very first step, before ever reaching the
-						// real predecessor -- returning the anchor's own (already-being-emitted) block
-						// as "the content's entry", which prints as empty.
+						// anchor itself, so Output's own emitChain (walking backward from a case's
+						// own tail to its boundary) would stop at the anchor's own, still-being-built
+						// node on its very first step, before ever reaching the real predecessor.
 						//
 						// A dedicated start marker sits BETWEEN the real predecessor and the cases'
 						// own walk, rather than letting them share `predecessor` directly: the first
 						// case, if it needs a real state-gamma of its own (e.g. it contains a break),
 						// would otherwise have that gamma share the EXACT SAME predecessor node as
-						// break_scope itself -- two "preferred" (gamma/mu/break_scope) targets
-						// competing for the one port-0 edge successorBlock uses to find "what comes
-						// next" from that shared predecessor, with no way to tell them apart. The start
-						// marker is a plain 'effect' (not a preferred type), so it can't collide.
+						// break_scope itself -- giving each of them their own, distinct anchor node
+						// keeps every switchCaseInfos boundary/tail pair unambiguous.
 						const predecessor = end;
 						const startMarker = makeNode('effect', 'BREAK_SCOPE_START');
-						connectValue(predecessor, 0, startMarker, 0);
-						end = startMarker;
-						exited = false;
-						brokeOut = false;
+						connectEnd(startMarker);
+						exited		= false;
+						brokeOut	= false;
+
+						// Recorded per case for Output's own emitControlNode to reconstruct a REAL
+						// `switch`/`case` -- see switchCases's own comment on Node for why
+						// `boundaryId` is captured AFTER `hit = true;`, not at the case's own
+						// `parent.end`, and why testNodeId isn't just `c.test` printed directly.
+						const switchCaseInfos: { testNodeId?: NodeId; boundaryId: NodeId; tailId: NodeId }[] = [];
 
 						for (const [i, c] of s.cases.entries()) {
 							const testExpr = {
@@ -945,29 +1198,49 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							recurse(testExpr, 'expression');
 							const testNode	= getExprNode(testExpr);
 							const parent	= getState();
+							let bodyBoundary: Node | undefined;
 							const trueState = walkBranch(parent, () => {
 								// A real 'binary' '=' node (not a bare rebind to a fresh literal), so
 								// it's eligible for the same isInlinableSlot elision as any ordinary
 								// reassignment -- matches what the original synthetic `hit = true;`
 								// AST fragment would have built by going through the same expression hook.
+								// switchInternal (see Node's own field comment) is what keeps THIS
+								// specific reassignment always resolving by name, regardless of
+								// forcedPrint/needsTemp -- its own mutation is structurally never
+								// printed (see switchCases's own boundaryId comment), so anything else
+								// must be safe to fold in exactly the same way.
 								recurse({ type: 'binary', operator: '=', left: Identifier(hitName), right: Literal(true) } as Expr, 'expression');
+								scope.get(hitName)!.switchInternal = true;
+								bodyBoundary = end;
 								for (const stmt of c.consequent)
 									recurse(stmt, 'statement');
 							});
 							const falseState = walkBranch(parent, () => {});
-							mergeState(parent, testNode, trueState, falseState);
+							// The state gamma mergeState MAY build here (if this case has a real effect
+							// or exits) belongs entirely to switch's own internal if-cascade, which
+							// switchCases's own print-time reconstruction bypasses completely -- its
+							// condition edge (unlike an ordinary if's gamma, which genuinely needs it to
+							// print `if (cond)`) is never actually read. Tagged switchInternal so
+							// isVestigialEdge can exclude it (see its own comment) the same way it
+							// already excludes an ordinary gamma's structural tail ports.
+							const stateGamma = mergeState(parent, testNode, trueState, falseState);
+							if (stateGamma)
+								stateGamma.switchInternal = true;
 							reconcileVariables(parent, testNode, trueState, falseState);
+							switchCaseInfos.push({ testNodeId: caseTestInfo[i].testNodeId, boundaryId: bodyBoundary!.id, tailId: trueState.end.id });
 						}
 						const tail = end;
 
 						const breakScope = makeNode('break_scope');
 						connectValue(predecessor, 0, breakScope, 0);
-						// Port 1 = the scope's own tail (mirrors a gamma's true/false-tail ports): where
-						// blocksToAST finds the wrapped content ends.
+						// Port 1 = the scope's own tail (mirrors a gamma's true/false-tail ports): the
+						// node Output's own emitChain walks backward from to find the wrapped content.
 						connectValue(tail, 0, breakScope, 1);
-						end = breakScope;
-						exited = false;
-						brokeOut = false;
+						breakScope.switchDiscriminantId = discNode.id;
+						breakScope.switchCases = switchCaseInfos;
+						end			= breakScope;
+						exited		= false;
+						brokeOut	= false;
 					}
 					return false;
 				}
@@ -985,8 +1258,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// effect) between the shared predecessor and its own walk -- same reasoning as
 					// break_scope's own start marker: without one, if a branch's OWN first
 					// statement also needed a real gamma/mu/break_scope/except of its own, it would
-					// compete with `except` itself for the shared predecessor's one port-0 edge, an
-					// order-dependent ambiguity successorBlock has no way to resolve correctly.
+					// share the EXACT SAME predecessor node as `except` itself; giving each of them
+					// their own, distinct anchor node keeps their spans unambiguous.
 					const startMarker = (pred: Node, tag: string) => {
 						const marker = makeNode('effect', tag);
 						connectValue(pred, 0, marker, 0);
@@ -1017,8 +1290,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					if (typeof s.handlerParam === 'string') {
 						// Opaque and externally provided -- no input edge; there's no computation
 						// inside `try` this could ever be resolved back to.
-						const excValue = makeNode('var', s.handlerParam);
-						scope.create(s.handlerParam, excValue);
+						scope.create(s.handlerParam, makeNode('var', s.handlerParam));
 					} else if (s.handlerParam) {
 						console.log(`not handling destructured catch parameter`);
 					}
@@ -1066,8 +1338,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// `finally` runs after the merge on the normal (non-exited) path -- reusing the
 					// same "walk it like ordinary code, tag its own tail" shape as everything else
 					// here, NOT trying to model "runs on every exit path" at the graph level at all:
-					// since this reconstructs a REAL `finally` clause (see blocksToAST), real JS's
-					// own semantics already guarantee that on their own, for every exit (including
+					// since this reconstructs a REAL `finally` clause (see Output's own emitControlNode),
+					// real JS's own semantics already guarantee that on their own, for every exit (including
 					// a return/break/continue escaping try/catch), with no extra machinery needed.
 					let finallyExited = false;
 					let finallyBrokeOut = false;
@@ -1086,8 +1358,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						scope = scope.closeAndFlush()!;
 						finallyExited = exited;
 						finallyBrokeOut = brokeOut;
-						// Port 3 = finally's own tail (mirrors a gamma's true/false-tail ports):
-						// where blocksToAST finds the wrapped content ends.
+						// Port 3 = finally's own tail (mirrors a gamma's true/false-tail ports): the
+						// node Output's own emitChain walks backward from to find the wrapped content.
 						connectValue(end, 0, exc, 3);
 						end = exc;
 					}
@@ -1106,18 +1378,85 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				case 'expression':
 					break;
 
+				case 'export_decl': {
+					// `export class Foo {...}`/`export function f() {...}`/`export const x = 1;` --
+					// previously entirely unhandled, falling to the generic `default:` case below,
+					// whose own `process(s)` ALSO independently walks `s.declaration` as part of its
+					// generic descent (see walker.ts's `case 'export_decl': return
+					// walkStatement(stmt.declaration);`), on top of `default:`'s own passthru node
+					// embedding the whole (declaration-inclusive) `s` verbatim -- building the
+					// declaration TWICE (once from that independent recursion, once from the outer
+					// verbatim reprint), hence the literal duplicate class this fixes. Recursing here
+					// runs the declaration's own dedicated handler EXACTLY once; `exported` (stamped on
+					// whatever node it left behind) is read back wherever THAT node's own type gets
+					// printed, to wrap it in `export `.
+					recurse(s.declaration, 'statement');
+					if (s.declaration.type === 'var_decl') {
+						// `end` here is a MUTATION_MARKER (threadMutation's own bookkeeping wrapper
+						// around the LAST declarator's rebindVar, see its own comment) -- never printed
+						// itself, and wrong besides for `export const a = 1, b = 2;` (every declarator
+						// needs the flag, not just the last). Each declared name's REAL node is looked
+						// up directly from scope instead, where rebindVar left it.
+						for (const v of s.declaration.declarations)
+							if (typeof v.name === 'string')
+								scope.get(v.name)!.exported = 'named';
+					} else {
+						end.exported = 'named';
+					}
+					return false;
+				}
+
+				case 'export': {
+					// `export default class Foo {...}`/`export default function f() {...}` -- same
+					// double-processing risk and same fix as export_decl above. A plain-expression
+					// default (`export default 1 + 1;`) has no declared name to anchor a node under,
+					// so it stays on the generic passthru fallback below -- same partial-fidelity
+					// tradeoff 'class'/'passthru' already accept elsewhere for anything without a
+					// dedicated reconstruction. `export {a, b};`/`export * from '...'` (no `default`
+					// at all) reference only ALREADY-declared bindings by name, so passthru is exactly
+					// right for those too: nothing there needs VSDG resolution in the first place.
+					if (s.default !== undefined && (isJsStatement(s.default) || isTsDeclaration(s.default))) {
+						recurse(s.default, 'statement');
+						end.exported = 'default';
+						return false;
+					}
+					process(s);
+					connectEnd(makeNode('passthru', s));
+					return false;
+				}
+
+				case 'class_decl': {
+					// Previously fell to the generic `default:` case below (a bare 'passthru' node),
+					// same as any other codeless-from-VSDG's-perspective declaration (interface,
+					// type alias, ...) -- but a class_decl isn't codeless, and needing to check
+					// `typeof node.value === 'object' && node.value.type === 'class_decl'` at print
+					// time to tell "this passthru is actually a resolved class" apart from "this one
+					// really is verbatim" is exactly the fragile, shared-tag-disambiguated-by-value
+					// pattern gamma/gammaValue, mu/muValue, and theta/thetaValue all got split out of
+					// this session, for the same reason: it's a real, avoidable source of bugs (see
+					// gammaValue's own history). A dedicated type tag makes "this always needs
+					// rebuildClass, unconditionally" a property of the node itself. Anchored as its
+					// own statement (not an 'effect', which 'class' the expression uses instead) since
+					// a class_decl produces no value of its own the way a class expression does. See
+					// buildClass's own comment for what's resolved vs. still verbatim.
+					const node = makeNode('class_decl', s);
+					node.classInfo = buildClass(recurse, node, s);
+					connectEnd(node);
+					return false;
+				}
+
 				default:	{
 					// like function_decl above, for the same reason (an unreferenced declaration is otherwise an unanchored island nothing ever schedules or visits).
 					process(s);
 					const node = makeNode('passthru', s);
-					connectValue(end, 0, node, 0);
-					end = node;
+					connectEnd(node);
 					return false;
 				}
 			}
 			return process(s);
 		},
-		(s, process) => {
+		// on EXPRESSION
+		(s, process, recurse) => {
 			// Every case below that needs its children processed first calls `process(s)` itself, then
 			// returns `false` immediately -- never `break` -- so control never reaches a second, implicit
 			// `process(s)` call. Falling through to that (the previous behavior) walked children TWICE,
@@ -1179,8 +1518,32 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					connectValue(getExprNode(s.left), 0, node, 0);
 					connectValue(getExprNode(s.right), 0, node, 1);
 					if (ASSIGN_OPS.has(s.operator)) {
-						if (s.left.type === 'identifier')
+						if (s.left.type === 'identifier') {
+							// A reassignment of a variable CAPTURED from an enclosing function (not
+							// declared anywhere within the current one -- see isLocalToCurrentFunction)
+							// is, like a property assignment, an effect that escapes this function: its
+							// only real "consumer" may be a caller that hasn't run yet, so a same-region
+							// consumer-count check (needsTemp/isInlinableSlot) can't safely decide it's
+							// dead or inlinable. forcedPrint makes sure it always prints under its own
+							// name; scheduleLate's own region-boundary check (see regionRootOf) is what
+							// keeps it correctly scheduled INSIDE this function rather than dragged out
+							// to wherever a later, outer read of the same name happens to live.
+							if (!scope.isLocalToCurrentFunction(s.left.name))
+								node.forcedPrint = true;
 							rebindVar(s.left.name, node);
+						} else {
+							// A property/index assignment (`obj.prop = x`/`arr[i] = x`) mutates something
+							// OUTSIDE this pass's own scope tracking -- always an observable effect,
+							// unlike reassigning a local variable (whose entire observable effect IS the
+							// scope rebind rebindVar does above). threadMutation (not rebindVar -- there's
+							// no name to bind here) anchors it into the state chain the same way a
+							// var_decl's own declaration is; forcedPrint (see emitLocalStatements's own
+							// default case) makes sure it always prints regardless of consumer count --
+							// unlike a bound variable, nothing ever reads it back through scope, so
+							// needsTemp alone would see zero consumers and silently drop it.
+							node.forcedPrint = true;
+							threadMutation(node);
+						}
 					}
 					return false;
 				}
@@ -1193,19 +1556,24 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// both code paths can be exercised from the same source snippet -- has nothing to
 					// do with actual purity and should be replaced once real analysis exists.
 					const pure = s.callee.type === 'identifier' && s.callee.name.startsWith('pure');
-					if (pure) {
-						const node = makeExprNode(s);
-						s.arguments.forEach((arg, index) => connectValue(getExprNode(arg), 0, node, index + 1));
+					const node = pure ? makeExprNode(s) : makeExprNode(s, 'effect');
+					if (!pure)
+						connectEnd(node); // Slot 0 = Input State
 
-					} else {
-						const node = makeExprNode(s, 'effect');
-						connectValue(end, 0, node, 0); // Slot 0 = Input State
-						// Update the current state pointer to this new call
-						end = node;
+					// 2. Thread Value Edges for the function arguments
+					s.arguments.forEach((arg, index) => connectValue(getExprNode(arg), 0, node, index + 1));
 
-						// 2. Thread Value Edges for the function arguments
-						s.arguments.forEach((arg, index) => connectValue(getExprNode(arg), 0, node, index + 1));
-					}
+					// The callee itself is still printed verbatim, unresolved (buildEffectExpr spreads
+					// `value` through unchanged, only overriding `arguments`) -- a callee can be an
+					// arbitrary expression (`(a || b)()`, `obj.method()`, ...), and there's no call site
+					// here that would benefit from resolving it as a VALUE. But a bare identifier
+					// callee still needs a REAL graph edge, purely so hasRealConsumer sees it: without
+					// one, a variable whose only remaining read is `f()` (its declared value never used
+					// any other way) looks entirely unread, and gets dropped as dead -- `const g =
+					// makeThing(); g();` printed `makeThing(); let g; g();` (already broken before ANY
+					// of this call even runs, since `g` was never assigned). The extra port (right after
+					// the arguments) is never read back for VALUE resolution, only for this counting.
+					connectValue(getExprNode(s.callee), 0, node, s.arguments.length + 1);
 					return false;
 				}
 
@@ -1214,9 +1582,11 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// arbitrary code, so there's no equivalent of `call`'s "pureFoo" opt-in here.
 					process(s);
 					const node = makeExprNode(s, 'effect');
-					connectValue(end, 0, node, 0);
-					end = node;
+					connectEnd(node);
 					s.arguments.forEach((arg, index) => connectValue(getExprNode(arg), 0, node, index + 1));
+					// See 'call' above for why the callee still needs a real edge despite never being
+					// resolved as a value.
+					connectValue(getExprNode(s.callee), 0, node, s.arguments.length + 1);
 					return false;
 				}
 
@@ -1229,8 +1599,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// source in the right order -- nothing about generator state needs modeling here.
 					process(s);
 					const node = makeExprNode(s, 'effect');
-					connectValue(end, 0, node, 0);
-					end = node;
+					connectEnd(node);
 					if (s.operand)
 						connectValue(getExprNode(s.operand), 0, node, 1);
 					return false;
@@ -1245,8 +1614,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// for elisions.
 					process(s);
 					const node = makeExprNode(s, 'effect');
-					connectValue(end, 0, node, 0);
-					end = node;
+					connectEnd(node);
 					s.quasi.forEach((part, index) => {
 						if (part.exp)
 							connectValue(getExprNode(part.exp), 0, node, index + 1);
@@ -1255,18 +1623,16 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				}
 
 				case 'class': {
-					// A class expression's own definition can run arbitrary code (a computed key, a
-					// field initializer, or the heritage clause can all call out) -- always order-anchored,
-					// exactly like 'new'. `process(s)` already walks members/heritage/computed-keys
-					// generically (walker.ts's own classMember handling), so any calls nested inside
-					// correctly thread into the state chain; the class body itself isn't decomposed into
-					// the graph any further than that (the same partial-fidelity 'call' already accepts
-					// for its own callee -- see buildEffectExpr), so a GCM-moved value referenced inside
-					// a method/initializer body won't be reflected in the reconstructed literal.
-					process(s);
+					// A class expression's own definition can run arbitrary code (a computed key, or
+					// the heritage clause, can call out) -- always order-anchored, exactly like 'new'.
+					// buildClass resolves heritage/keys/method-and-accessor-and-static-block bodies
+					// through VSDG properly (see its own comment); an instance field's own initializer
+					// is the one piece still left verbatim (see buildClassMember). Deliberately NOT
+					// `process(s)` any more -- that walked the SAME pieces again, generically, on top
+					// of buildClass's own targeted walk, double-processing them.
 					const node = makeExprNode(s, 'effect');
-					connectValue(end, 0, node, 0);
-					end = node;
+					node.classInfo = buildClass(recurse, node, s);
+					connectEnd(node);
 					return false;
 				}
 
@@ -1278,8 +1644,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// and each attribute's own key are compile-time metadata, carried through unchanged.
 					process(s);
 					const node = makeExprNode(s, 'effect');
-					connectValue(end, 0, node, 0);
-					end = node;
+					connectEnd(node);
 					let port = 1;
 					s.attributes.forEach(attr => {
 						if (attr.value)
@@ -1291,56 +1656,26 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 				case 'arrow':
 				case 'function': {
-					const outer = getState();
-
-					// 1. Establish the internal localized graph builder context
-
-					// 2. Instantiate the Function Boundary Nodes
-					const entryNode		= makeExprNode(s);
-					const returnNode	= makeNode('effect', 'RETURN_ANCHOR');
-
-					// 3. Seed an isolated local scope for the function body
-					// This isolates function variables completely from the outer global scope
-					const fnScope = new Scope(scope);
-
-					// Wire incoming output ports from the entry node directly to parameter bindings.
-					// Each param gets its own node (port 0 = State, so params occupy port index + 1);
-					// without a dedicated node per param they'd all alias entryNode's port 0.
-					s.params.forEach((p, index) => {
-						if (typeof p.key === 'string') {
-							const paramNode = makeNode('var', p.key);
-							connectValue(entryNode, index + 1, paramNode, 0);
-							fnScope.create(p.key, paramNode);
-						} else {
-							console.log(`not handling destructured parameter`);
-						}
-					});
-
-					// 4. Temporarily swap the master compiler pointers into the function's region
-
-					// The sequential state chain inside the function hangs off the entry node
-					setState(fnScope, entryNode);
-
-					// 5. Recursively walk and generate the entire function body statements block
-					process(s);
-
-					// 6. Connect the final sequential execution state to the return anchor
-					connectValue(end, 0, returnNode, 0); // Slot 0 = Final State
-
-					// 7. An expression-bodied arrow (`x => x + 1`) has no `return` statement at all --
-					// its body IS the implicit return value; `process(s)` above already walked the bare
-					// expression body through the expression hook (walker.ts's own 'arrow' case routes a
-					// non-array body there), so its resolved node is available directly. A block-bodied
-					// arrow/function has none of that -- every explicit `return` inside now prints
-					// itself in place (see the 'return' case's own comment), so port 1 here is left
-					// otherwise unused; a synthetic `undefined` just keeps the port populated.
-					const finalReturnValNode = s.type === 'arrow' && !Array.isArray(s.body)
-						? getExprNode(s.body)
-						: makeNode('literal', undefined);
-					connectValue(finalReturnValNode, 0, returnNode, 1); // Slot 1 = Return Value
-
-					// 8. Restore the master compiler pointers back to the global file scope
-					setState(outer.scope, outer.end, outer.exited, outer.brokeOut);
+					if (!s.body)
+						return false;
+					// Type 'effect' (not buildFunctionBody's own default, 'function_decl') is what
+					// makes isEffect/buildBlockTree recognize this as a printable value, resolved via
+					// buildEffectExpr's own 'arrow'/'function' case (which prints `.value` verbatim --
+					// so it must be set here; buildFunctionBody doesn't, since its other two callers
+					// don't need the raw source at all). expnodes.set is what makeExprNode would
+					// normally do for an expression -- needed so a LATER getExprNode(s) (e.g. this
+					// arrow assigned to a variable, or returned) can find this node at all.
+					const entry = buildFunctionBody(recurse, s, s.body);
+					entry.type = 'effect';
+					entry.value = s;
+					expnodes.set(s, entry);
+					// `entry`, not outer.end: buildFunctionBody's own restore always reverts to
+					// outer.end (correct for a class member) -- but evaluating a function expression
+					// (closure creation) is itself an observable, ordered event, same as a call, so
+					// whatever reads it next (as a value) or comes after it (as a statement) must
+					// chain from it instead.
+					const state = getState();
+					setState(state.scope, entry, state.exited, state.brokeOut);
 					return false;
 				}
 
@@ -1384,10 +1719,10 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// and computed keys are real gaps, not silently mishandled: `process(s)` above still
 					// walks them generically, so any calls nested inside still thread into the state
 					// chain, but the reconstructed object literal won't reflect a GCM-moved value for them.
-					process(s);
 					const node = makeExprNode(s);
 					s.properties.forEach((prop, index) => {
 						if (prop.type === 'spread') {
+							recurse(prop.operand);
 							connectValue(getExprNode(prop.operand), 0, node, index);
 							return;
 						}
@@ -1399,6 +1734,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							console.log(`not handling computed object key`);
 							return;
 						}
+						recurse(prop.value, 'expression');
 						connectValue(getExprNode(prop.value!), 0, node, index);
 					});
 					return false;
@@ -1441,8 +1777,16 @@ export function BuildVSDG(ast: Walkable): VSDG {
 //					console.log(`not handling expr ${s.type}`);
 //					return false;
 			}
-		}
+		},
+		// on TYPE
+		//(m, process) => process(m),
+		// on CLASSMEMBER -- unreachable: 'class'/'class_decl' (see their own cases, above) walk their
+		// own members directly via buildClass/buildClassMember now, instead of going through
+		// process(s)'s generic per-member descent (which used to land here). Kept as a documented
+		// no-op, not deleted outright, in case that ever changes.
+		//() => false
 	);
+	programStart.programEndId = end.id;
 	return graph;
 }
 
@@ -1451,7 +1795,34 @@ export class Output {
 	declaredNames		= new Set<string>();
 	tempVarCounter		= 0;
 
-	constructor(public graph: Map<NodeId, Node>) {}
+	// blockIds/blockControl are GCM's own output (applyGlobalCodeMotion) -- which anchor node a given
+	// (possibly pure/floating) node was scheduled next to, and the reverse lookup from a block's id
+	// back to its anchor node. Both undefined for a caller that constructs an Output directly with no
+	// VSDG graph behind it at all (there's no such caller today, but resolveNode/buildExpr/
+	// emitLocalStatements don't inherently need them -- only buildProgram/emitChain and anything that
+	// reaches a control-anchor node do).
+	constructor(
+		public graph: Map<NodeId, Node>,
+		private blockIds?: Map<NodeId, BlockId>,
+		private blockControl?: Map<BlockId, NodeId>,
+	) {}
+
+	private blockNodesCache?: Map<BlockId, NodeId[]>;
+
+	// The inverse of blockIds: which nodes GCM scheduled into a given block, grouped once on first
+	// use (a block's node list has no identity of its own beyond "whichever nodes point at it").
+	private blockNodes(blockId: BlockId): NodeId[] {
+		if (!this.blockNodesCache) {
+			this.blockNodesCache = new Map();
+			for (const id of this.graph.keys()) {
+				const bId = this.blockIds?.get(id) ?? 'block_entry';
+				if (!this.blockNodesCache.has(bId))
+					this.blockNodesCache.set(bId, []);
+				this.blockNodesCache.get(bId)!.push(id);
+			}
+		}
+		return this.blockNodesCache.get(blockId) ?? [];
+	}
 
 	private makeTempVar(id: NodeId) {
 		const varName = `t${this.tempVarCounter++}`;
@@ -1471,8 +1842,28 @@ export class Output {
 	// A call node's return value is consumed as a VALUE if any of its output-port-0 consumers reads it
 	// at a port other than the state-chain's own port 0 -- e.g. a `let y = f();` wrapper node reads
 	// the call's result at ITS port 0 too, so the target's TYPE (not just the port) has to be checked.
+	// True if `edge` is a gammaValue's own CONDITION port (0), where both branches are guaranteed to
+	// resolve to the exact same name -- buildExpr's own "cond ? x : x" collapse (see its own
+	// comment) -- so the condition is never actually READ once the merge collapses, despite being a
+	// real graph edge. switchInternal is the reliable signal for this: it's exclusively stamped on
+	// switch's own `hit` reassignment, whose merge always collapses this way (both trueVal and
+	// falseVal resolve to the same slot name -- see resolveNode's own switchInternal check and the
+	// var_decl-boundName-never-cleared rule in reconcileVariables). Counting it as a real consumer
+	// would materialize a needless temp for a value whose only OTHER use already accounts for every
+	// reference the printed output actually contains.
+	private isCollapsingGammaValueCondition(edge: Edge): boolean {
+		if (edge.port !== 0)
+			return false;
+		const target = this.graph.get(edge.nodeId)!;
+		if (target.type !== 'gammaValue')
+			return false;
+		const trueVal = target.inputs[1] && this.graph.get(target.inputs[1].nodeId);
+		const falseVal = target.inputs[2] && this.graph.get(target.inputs[2].nodeId);
+		return !!(trueVal?.switchInternal || falseVal?.switchInternal);
+	}
+
 	private valueConsumers(node: Node): Edge[] {
-		const CONTROL = new Set(['effect', 'gamma', 'gammaValue', 'mu', 'muValue', 'theta', 'thetaValue', 'break_scope', 'except', 'function_decl', 'passthru']);
+		const CONTROL = new Set(['effect', 'gamma', 'gammaValue', 'mu', 'muValue', 'theta', 'thetaValue', 'break_scope', 'except', 'function_decl', 'passthru', 'class_decl']);
 		return (node.outputs[0] ?? []).filter(e => {
 			const target = this.graph.get(e.nodeId)!;
 			if (CONTROL.has(target.type) && e.port === 0)
@@ -1486,6 +1877,8 @@ export class Output {
 			if ((target.type === 'mu' || target.type === 'muValue') && e.port === 1)
 				return false;
 			if (target.isVestigialEdge(e.port))
+				return false;
+			if (this.isCollapsingGammaValueCondition(e))
 				return false;
 			// A var_decl target that will itself print bare (its own value has no further real
 			// reader) never actually surfaces this value anywhere -- e.g. `let x = f();` where x is
@@ -1539,13 +1932,22 @@ export class Output {
 	// becomes `let x = a + b;` -- and, past a block boundary, also what lets a branch-local pure
 	// candidate (e.g. one side of an if/else merge) collapse straight into the merge's own ternary
 	// instead of needing a temp of its own.
-	private needsTemp(node: Node): boolean {
+	// `allowReuse`, when true, exempts ONLY the final "read more than once, so give it a name for
+	// readability" heuristic below -- never the structural checks above it (mu-consumer, a rebind's
+	// own old-value operand, unary_post_old), which are about correctness, not readability, and must
+	// always hold regardless of how cheap the value is to recompute. Used exclusively by
+	// isInlinableVarDecl for a literal initializer: duplicating a literal at every read site costs
+	// nothing, so multiple readers alone shouldn't force it to have a name -- but a literal feeding a
+	// mu's own initial-value port still needs a REAL, MUTABLE variable for the loop to advance
+	// (found the hard way: exempting the whole function via a blanket check first, instead of just
+	// this one line, silently inlined a loop's own `i = 0;` away, breaking every loop-carried var).
+	private needsTemp(node: Node, allowReuse = false): boolean {
 		// A named theta's own condition edge is real in the GRAPH (GCM needs it) but never actually
 		// read by codegen (see isVestigialEdge) -- e.g. a while loop's own test feeds not just the
 		// state-theta's condition (the one real read) but ALSO every named theta's condition port,
 		// one per loop-carried variable. Left uncounted, a loop with two loop-carried variables would
 		// see the test as "reused" and give it a needless temp even though it's read exactly once.
-		const consumers = (node.outputs[0] ?? []).filter(e => !this.graph.get(e.nodeId)!.isVestigialEdge(e.port));
+		const consumers = (node.outputs[0] ?? []).filter(e => !this.graph.get(e.nodeId)!.isVestigialEdge(e.port) && !this.isCollapsingGammaValueCondition(e));
 		// NEITHER of a mu's own input ports -- initial value (0) or feedback (1) -- is ever actually
 		// READ via resolveNode/inlining: the mu itself is what's read everywhere it's used (as a plain
 		// Identifier), never these edges. They're purely structural (what to start the loop-carried
@@ -1581,7 +1983,7 @@ export class Output {
 		// here, at its own (correctly state-anchored) point instead.
 		if (node.type === 'unary_post_old')
 			return consumers.length > 0;
-		return consumers.length > 1;
+		return !allowReuse && consumers.length > 1;
 	}
 
 	// A named slot (a plain reassignment or a gammaValue merge) whose value can be resolved
@@ -1593,7 +1995,7 @@ export class Output {
 	// resolves to `Identifier(name)` (see resolveNode's own shortcut) -- correct only when
 	// something actually printed `name = ...;` for it, which isn't guaranteed: a purely-value
 	// merge with no real effect in either branch has no state anchor forcing its own block to be
-	// visited by blocksToAST's traversal at all, so it can end up scheduled into a block nothing
+	// visited by Output's own emitChain at all, so it can end up scheduled into a block nothing
 	// ever reaches, silently never printed while its consumer still reads its name as if it had
 	// been. (The state gamma never reaches here at all -- slotName() only ever returns something
 	// for gammaValue/named-except, so every caller already gates on that first.)
@@ -1605,17 +2007,54 @@ export class Output {
 	private isEffect(node: Node): boolean {
 		return node.type === 'effect' && !!node.value && typeof node.value === 'object'
 			&& (node.value.type === 'call' || node.value.type === 'new' || node.value.type === 'yield'
-				|| node.value.type === 'tagged_template' || node.value.type === 'class' || node.value.type === 'jsx');
+				|| node.value.type === 'tagged_template' || node.value.type === 'class' || node.value.type === 'jsx'
+				|| node.value.type === 'arrow' || node.value.type === 'function');
+	}
+
+	// Splices VSDG's own resolution of a class's heritage/computed-keys/static-field-values/method-
+	// and-accessor-and-static-block-and-instance-field-initializer bodies back into its otherwise-
+	// verbatim member list (see buildClass's own comment for what's covered). `raw` is whatever
+	// node.value already holds (a class expression, or a class_decl statement) -- loosely typed
+	// since both shapes reach here, differing only in a few decl-specific fields (name, ambient,
+	// ...) this never touches.
+	private rebuildClass(raw: any, info: NonNullable<Node['classInfo']>): any {
+		return {
+			...raw,
+			superClass: info.superClassNodeId ? this.resolveNode(info.superClassNodeId) : raw.superClass,
+			body: raw.body.map((m: any, i: number) => {
+				const mi = info.members[i];
+				if (!mi)
+					return m;
+				const withKey = mi.keyNodeId ? { ...m, key: { computed: this.resolveNode(mi.keyNodeId) } } : m;
+				if (mi.valueNodeId)
+					return { ...withKey, value: this.resolveNode(mi.valueNodeId) };
+				if (m.type === 'field')
+					return mi.entryNodeId
+						? { ...withKey, value: this.resolveFieldInitializer(this.graph.get(mi.entryNodeId)!) }
+						: withKey;
+				return mi.entryNodeId
+					? { ...withKey, body: this.reconstructFunctionBody(this.graph.get(mi.entryNodeId)!) }
+					: withKey;
+			}),
+		};
 	}
 
 	private buildEffectExpr(node: Node): Expr {
-		const value = node.value as (Expr & {type: 'call' | 'new' | 'yield' | 'tagged_template' | 'class' | 'jsx'});
+		const value = node.value as (Expr & {type: 'call' | 'new' | 'yield' | 'tagged_template' | 'class' | 'jsx' | 'arrow' | 'function'});
+		if (value.type === 'arrow' || value.type === 'function')
+			// GCM never moves anything INTO or OUT OF a function/arrow body (it's an isolated
+			// sub-region, walked into its own entry/return-anchor pair -- see BuildVSDG's own case),
+			// so node.value is still the original, untouched AST for the whole expression -- safe
+			// to print verbatim, same partial-fidelity 'class' already accepted before its own
+			// heritage/keys/method-bodies got real decomposition. Only entryNode's own SCHEDULING
+			// (this node, as a whole) is real GCM's concern here -- not what's printed for it.
+			return value;
 		if (value.type === 'yield')
 			return { ...value, operand: value.operand ? this.resolveOperand(node.id, 1) : undefined };
 		if (value.type === 'tagged_template')
 			return { ...value, quasi: value.quasi.map((part, i) => part.exp ? { ...part, exp: this.resolveOperand(node.id, i + 1) } : part) };
 		if (value.type === 'class')
-			return value;
+			return node.classInfo ? this.rebuildClass(value, node.classInfo) : value;
 		if (value.type === 'jsx') {
 			let port = 1;
 			return {
@@ -1624,7 +2063,21 @@ export class Output {
 				children: value.children.map(() => this.resolveOperand(node.id, port++)),
 			};
 		}
-		return { ...value, arguments: value.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
+		// A call/new's own callee is normally left raw, unresolved (most shapes -- an identifier, a
+		// member-of-identifier -- have nothing a graph resolution would change, and there's no need
+		// for buildExpr's own coverage to be exhaustive over every possible callee shape). It's only
+		// actually WRONG to leave verbatim when the callee itself embeds a real effect somewhere --
+		// e.g. `new Point(3,4).sum()` (the member's own object is an effectful 'new') or a class
+		// EXPRESSION callee's own heritage/keys/method-bodies (`new (class extends Base(FLAGS) {})()`)
+		// -- since the graph ALSO threads that effect into the state chain as its own real node:
+		// printing the raw source there duplicates its execution instead of reusing whatever the
+		// graph already decided for it (inlined verbatim, or a materialized temp var). Found via the
+		// SAME edge added purely for consumer-counting (see BuildVSDG's 'call'/'new' cases) -- reused
+		// here instead of adding a second, redundant way to reach the callee's own node.
+		const calleeEdge = node.inputs[value.arguments.length + 1];
+		const calleeNode = calleeEdge && this.graph.get(calleeEdge.nodeId);
+		const callee = calleeNode && !this.isPureSubgraph(calleeNode) ? this.resolveNode(calleeNode.id) : value.callee;
+		return { ...value, callee, arguments: value.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
 	}
 
 	private buildExpr(node: Node): Expr {
@@ -1665,13 +2118,6 @@ export class Output {
 				const sp = node.value as (Expr & {type: 'spread'});
 				return { ...sp, operand: this.resolveOperand(node.id, 0) };
 			}
-			case 'arrow':
-			case 'function':
-				// GCM never moves anything INTO or OUT OF a function/arrow body (it's an isolated
-				// sub-region, walked into its own entry/return-anchor pair -- see BuildVSDG's own case),
-				// so node.value is still the original, untouched AST for the whole expression -- safe
-				// to print verbatim, same partial-fidelity 'class' already accepts for its own body.
-				return node.value as Expr;
 			case 'binary': {
 				const bin = node.value as (Expr & {type: 'binary'});
 				if (ASSIGN_OPS.has(bin.operator)) {
@@ -1689,7 +2135,8 @@ export class Output {
 				return { ...bin, left: this.resolveOperand(node.id, 0), right: this.resolveOperand(node.id, 1) };
 			}
 			case 'gammaValue': {
-				// A state gamma never reaches here at all -- reconstructed separately by blocksToAST.
+				// A state gamma never reaches here at all -- reconstructed separately, by
+				// emitControlNode's own 'gamma' case, as a real if/else.
 				// A gammaValue is a pure per-variable value merge -- reconstruct it as a ternary,
 				// which is exactly what it means.
 				const consequent	= this.resolveOperand(node.id, 1);
@@ -1755,10 +2202,25 @@ export class Output {
 	// PURE -- an effectful one (`let x = f();`) with a real reader must still run at its declared
 	// position, so it stays combined with the declaration there (see isInlinableEffect for how the
 	// call attaches). A DEAD effectful initializer is handled separately, in emitNamedSlot: the call
-	// still needs to run, just not as x's value (see hasRealConsumer there).
+	// still needs to run, just not as x's value (see hasRealConsumer there). capturedRead overrides
+	// all of this: "one real reader, safe to recompute inline" only holds within a single execution,
+	// which a read from inside another function isn't (see its own comment on Node).
 	private isInlinableVarDecl(node: Node): boolean {
-		return node.type === 'var' && !!node.inputs[0]
-			&& !this.needsTemp(node) && this.isPureSubgraph(this.graph.get(node.inputs[0].nodeId)!);
+		if (node.type !== 'var' || !node.inputs[0] || node.capturedRead)
+			return false;
+		const init = this.graph.get(node.inputs[0].nodeId)!;
+		// needsTemp's own "reused more than once, so give it a name" heuristic exists to avoid
+		// RECOMPUTING an expression at every read site -- the right tradeoff for something with a
+		// real (if cheap) operation, but not for a bare literal: duplicating `false` costs nothing,
+		// no matter how many places read it. allowReuse (passed only when the initializer is a
+		// literal) exempts JUST that heuristic -- needsTemp's own structural checks (a mu's initial-
+		// value port still needing a real, mutable variable to advance the loop, chief among them)
+		// stay fully in force regardless, since those are about correctness, not readability (found
+		// via a real case: __hit's own declaration is genuinely read twice, by two different tests,
+		// but its value is a provably-constant literal -- see switchInternal -- so there's nothing to
+		// gain by naming it; a DIFFERENT real case, `let i = 0;` feeding a loop's own mu, is why the
+		// exemption can't be broader than that one heuristic).
+		return !this.needsTemp(node, init.type === 'literal') && this.isPureSubgraph(init);
 	}
 
 	// Conservative, single-pass purity check over `node`'s own transitive inputs: true only if NO
@@ -1769,10 +2231,56 @@ export class Output {
 		seen.add(node.id);
 		if (node.type === 'effect')
 			return false;
-		return node.inputs.every(e => !e || this.isPureSubgraph(this.graph.get(e.nodeId)!, seen));
+		// A method/get/set/static_block's own entry node (see BuildVSDG's buildFunctionBody) has NO
+		// input edges at all -- deliberately disconnected from the outer state chain, since a method
+		// BODY has no observable ordering effect just from being defined. Without this check,
+		// `.inputs.every(...)` on that empty array is vacuously true, wrongly marking it "pure" --
+		// which, for a PARAM whose only real reader treats it as inlinable, actually inlines the
+		// entry node ITSELF in place of the param's own value (resolveOperand(param.id, 0) follows
+		// the param's inputs[0], which IS the entry node -- see functionScope's own param wiring).
+		// A top-level function_decl's own entry node never hits this: its inputs[0] is the real
+		// outer state predecessor, whose own chain always reaches a genuine 'effect' eventually.
+		if (node.type === 'function_decl')
+			return false;
+		// A PARAMETER's own value is always pure regardless of what's "behind" it (the entry node's
+		// own wiring to it, or -- for a top-level function's own params -- the outer state chain
+		// beyond that): reading a parameter has no side effect of its own. Recursing PAST it (into
+		// its own inputs[0], the entry node) would incorrectly poison every computation that merely
+		// READS a param's value based on whatever else happens to run before this function is even
+		// called -- entirely unrelated to whether THIS specific computation is safe to inline (found
+		// via a real case: `x === 1` inside a switch, x a plain param, was never treated as
+		// inlinable, needlessly materializing a real `let` for every case's own match flag).
+		if (node.type === 'var' && node.inputs[0] && this.graph.get(node.inputs[0].nodeId)!.type === 'function_decl')
+			return true;
+		// Skip vestigial edges (see isVestigialEdge's own comment) -- e.g. threadMutation's own
+		// scheduling-only marker port: a real graph edge GCM needs, but never part of the actual
+		// value computation, so it must not count toward whether THIS subgraph is pure.
+		return node.inputs.every((e, port) => !e || node.isVestigialEdge(port) || this.isPureSubgraph(this.graph.get(e.nodeId)!, seen));
 	}
 
-	private emitNamedSlot(name: string, node: Node): Statement {
+	// True if some node OTHER than `excludeId` shares `name` as its own boundName and is
+	// forcedPrint -- i.e. will print its own `name = ...;` regardless of what THIS node's own
+	// consumer count says, the way every branch of a try/catch merge with no printable condition
+	// does (see BuildVSDG's 'try' case). Whether the ORIGINAL declaration can be dropped is not a
+	// question this node can answer from its own consumers alone: dropping it while a sibling still
+	// prints under the same name would leave that later assignment referencing a name that was never
+	// declared. A graph-wide scan (small in practice -- one function body's worth of nodes) is the
+	// only way to answer it, since forcedPrint status is finalized during BuildVSDG, well before any
+	// of this print-time reasoning runs. switchInternal siblings count too, despite never printing
+	// their OWN statement: resolveNode's own switchInternal check (see its comment) guarantees THEY
+	// still resolve to Identifier(name) wherever they're READ, which needs `name` declared exactly
+	// as much as an ordinary forced statement would (found the hard way: excluding them first caused
+	// a real ReferenceError -- __hit's own name referenced by a later case's test, but never declared
+	// at all once its own declaration was dropped).
+	private hasForcedSibling(name: string, excludeId: NodeId): boolean {
+		for (const other of this.graph.values()) {
+			if (other.id !== excludeId && other.boundName === name && other.forcedPrint)
+				return true;
+		}
+		return false;
+	}
+
+	private emitNamedSlot(name: string, node: Node): Statement | undefined {
 		if (node.type === 'var') {
 			if (node.inputs[0]) {
 				// Either the initializer is pure and doesn't need printing under x's own name
@@ -1781,8 +2289,33 @@ export class Output {
 				// statement, via the ordinary isEffect path -- see valueConsumers), just not attached
 				// to x: `let x = f();` where x is dead becomes bare `let x;` plus a standalone `f();`.
 				if (node.declKind && (this.isInlinableVarDecl(node) || !this.hasRealConsumer(node))) {
+					const forcedElsewhere = this.hasForcedSibling(name, node.id);
+					// A forced sibling elsewhere still needs `name` to hold the CORRECT value when
+					// read. If this node's own value is genuinely dead (hasRealConsumer false), that's
+					// fine -- nothing reads it through THIS node either way, so a bare declaration (no
+					// initializer) is still correct, just kept (not dropped) so the sibling's `name`
+					// exists at all. But if isInlinableVarDecl reached here via literal-duplication
+					// (real consumers exist, just cheap to recompute -- e.g. __hit_var8, a literal read
+					// by two different tests), going bare would silently replace those reads' value
+					// with `undefined` instead of the real one -- fall back to the ordinary,
+					// value-bearing declaration instead (found via a real ReferenceError this session:
+					// dropping __hit_var8's own value here, while switchInternal still referenced it by
+					// name elsewhere, is exactly this case). declaredNames is deliberately NOT set
+					// before this call -- declareOrAssign needs to see it as not-yet-declared, to
+					// correctly print `let name = ...;` rather than a bare `name = ...;` reassignment.
+					if (forcedElsewhere && this.hasRealConsumer(node))
+						return this.declareOrAssign(name, node, this.resolveOperand(node.id, 0));
 					this.declaredNames.add(name);
-					return JS.VarDecl(node.declKind, JS.Var(name)) as Statement;
+					// Safe to drop the bare declaration entirely only when NOTHING else, anywhere,
+					// still needs `x` declared; exported bindings keep it too, for the same reason
+					// (external code may import it by name, which this graph can't see/track).
+					if (!node.exported && !forcedElsewhere)
+						return undefined;
+					// `const` requires an initializer -- a real one existed in the source (that's the
+					// only way declKind could be 'const' here at all), just not printed under x's own
+					// name any more (inlined elsewhere, or genuinely dead); downgraded to `let` rather
+					// than emitting the syntax-invalid `const x;`.
+					return JS.VarDecl(node.declKind === 'const' ? 'let' : node.declKind, JS.Var(name)) as Statement;
 				}
 				return this.declareOrAssign(name, node, this.resolveOperand(node.id, 0));
 			}
@@ -1810,12 +2343,32 @@ export class Output {
 	resolveNode(id: NodeId): Expr {
 		const node = this.graph.get(id)!;
 
+		// switch's own internal bookkeeping (see Node's own field comment) must always resolve by
+		// name, regardless of forcedPrint/needsTemp -- its own mutation is structurally never
+		// printed, so folding its VALUE into a ternary elsewhere (as an ordinary reassignment might
+		// safely do) would be wrong: it'd model a real "did this already happen" merge for a flag
+		// that's meant to stay an independent, one-shot value at every read site. Only applies while
+		// it's STILL a named slot, though (reconcileVariables clears boundName for an ordinary,
+		// non-exiting case exactly like it always did -- that path needs no protecting at all, since
+		// there's no downstream "already ran" merge to conflate it with).
+		const switchInternalName = node.switchInternal ? node.slotName() : undefined;
+		if (switchInternalName !== undefined)
+			return Identifier(switchInternalName);
+
 		if (node.type === 'literal')
 			return Literal(node.value);
 
 		// A local declaration left bare (see isInlinableVarDecl) never actually assigned its name --
 		// its sole reader inlines the (pure) initializer directly instead of reading the name back.
-		if (node.type === 'var' && this.isInlinableVarDecl(node))
+		// Skipped when a forced sibling exists (see hasForcedSibling), though: that guarantees SOME
+		// other node sharing this same name resolves via Identifier(name) regardless (an ordinary
+		// forced reassignment, or a switchInternal one, see this function's own earlier check) -- if
+		// THIS declaration instead inlined its own value, the two would stop being the same
+		// expression, and a merge combining them (e.g. __hit's own per-case gammaValue) would lose
+		// buildExpr's "cond ? x : x -> x" collapse, printing a real (if always-equivalent) ternary
+		// instead of the bare name both sides actually agree on.
+		if (node.type === 'var' && this.isInlinableVarDecl(node)
+			&& !(typeof node.value === 'string' && this.hasForcedSibling(node.value, node.id)))
 			return this.resolveOperand(id, 0);
 
 		// Params and declared locals alike are just a name to read; whether a DECLARATION statement is
@@ -1840,7 +2393,7 @@ export class Output {
 		// Not materialized as a statement anywhere reachable -- most commonly a pure value (e.g. one
 		// branch's reassignment candidate, now feeding only a per-variable named gamma) whose own
 		// block was never visited, because a no-real-effect if/else has no structural wrapper for
-		// blocksToAST to reach it through. Building it inline is always safe for a pure value: it just
+		// Output's own emitChain to reach it through. Building it inline is always safe for a pure value: it just
 		// recomputes the same result on demand. It's NOT safe for an effect (a call) -- buildExpr has
 		// no case for those (type 'effect'; isEffect-classified nodes are always handled directly by
 		// emitLocalStatements) and falls through to its own default, so this can't accidentally
@@ -1947,7 +2500,9 @@ export class Output {
 				// never to be materialized itself.
 				if (node.type === 'except')
 					continue;
-				statements.push(this.emitNamedSlot(name, node));
+				const namedStmt = this.emitNamedSlot(name, node);
+				if (namedStmt)
+					statements.push(wrapExported(namedStmt, node.exported));
 				continue;
 			}
 
@@ -1968,13 +2523,24 @@ export class Output {
 					break;
 
 				case 'passthru':
-					// Same partial-fidelity treatment as a 'class' expression's buildEffectExpr: the
-					// body isn't decomposed through the graph, so node.value is still the original,
-					// untouched declaration -- printed verbatim, as its own real statement (a
-					// declaration always prints regardless of whether the class is ever referenced,
-					// same as var_decl -- unlike an ordinary value, there's no "unused, so inline or
-					// drop it" question for a declaration).
-					statements.push(node.value as Statement);
+					// Every declaration type reaching here (interface/type-alias/enum/namespace/...) is
+					// genuinely codeless from VSDG's own perspective, or not yet decomposed -- node.value
+					// prints verbatim, as its own real statement (a declaration always prints regardless
+					// of whether it's ever referenced, same as var_decl -- unlike an ordinary value,
+					// there's no "unused, so inline or drop it" question for one). wrapExported restores
+					// `export `/`export default ` when this declaration came from one.
+					statements.push(wrapExported(node.value as Statement, node.exported));
+					break;
+
+				case 'class_decl':
+					// Its own type tag (not folded into 'passthru', which used to need a runtime
+					// `typeof node.value === 'object' && node.value.type === 'class_decl'` check here to
+					// tell "this passthru is actually a resolved class" apart from "this one's really
+					// verbatim") -- see BuildVSDG's own 'class_decl' case for why that shared-tag-
+					// disambiguated-by-value shape was worth splitting out. rebuildClass splices VSDG's
+					// own resolution of the heritage/keys/method-bodies back into the otherwise-verbatim
+					// class before printing.
+					statements.push(wrapExported(this.rebuildClass(node.value, node.classInfo!), node.exported));
 					break;
 
 				case 'function_decl':
@@ -1985,14 +2551,275 @@ export class Output {
 					break;
 
 				default:
-					if (this.needsTemp(node))
+					// forcedPrint: an unnamed node with a real side effect but no value consumer at all
+					// (a property/index assignment -- see BuildVSDG's 'binary' case) -- needsTemp alone
+					// would see zero consumers and conclude it's safe to drop entirely, which is only
+					// true for an actual PURE value, never for an effect nothing happens to read back.
+					// Built directly here, not via buildExpr's own 'binary' case: THAT one assumes an
+					// assignment reaching it is being read as a VALUE (superseded by an if/else merge,
+					// e.g. `y = (x = 1)`), so it deliberately returns just the right-hand value, not
+					// `left = right` -- exactly wrong for printing the assignment itself as a statement.
+					if (node.forcedPrint) {
+						statements.push(JS.Expression({ ...(node.value as Expr & { type: 'binary' }), left: this.resolveOperand(node.id, 0), right: this.resolveOperand(node.id, 1) }) as Statement);
+					} else if (this.needsTemp(node)) {
 						statements.push(JS.VarDecl('var', JS.Var(this.makeTempVar(id), this.buildExpr(node))));
+					}
 					// else: single-use, same-block -- left unmaterialized; its sole consumer inlines it
 					// directly via resolveNode's fallback when it resolves this operand.
 			}
 		}
 
 		return statements;
+	}
+
+	// Which nodes GCM scheduled alongside a given control-anchor node (blockNodes, keyed via the
+	// anchor's own block id -- see the constructor's own comment on blockIds/blockControl).
+	private nodesAt(anchorId: NodeId): NodeId[] {
+		return this.blockNodes(this.blockIds?.get(anchorId) ?? 'block_entry');
+	}
+
+	// Reconstructs the statement span (fromId, boundaryId] -- i.e. everything from fromId back to
+	// (not including) boundaryId, in original execution order -- by walking inputs[0] backward
+	// (always exactly one real state predecessor per control-anchor node, by construction) and
+	// appending this node's own contribution AFTER recursing into its predecessor, so output comes
+	// out forward despite the recursion going backward. Replaces the old forward walk (successorBlock
+	// + emitFrom's while loop), which needed a fallback heuristic to disambiguate several simultaneous
+	// forward consumers of the same state token (each branch's own entry AND the eventual merge all
+	// read the branch point as their own predecessor) -- a backward walk from a KNOWN endpoint has no
+	// such ambiguity: there's only ever one predecessor to ask for.
+	private emitChain(fromId: NodeId | undefined, boundaryId: NodeId): Statement[] {
+		if (fromId === undefined || fromId === boundaryId)
+			return [];
+		const node = this.graph.get(fromId)!;
+		// A state-theta's own predecessor (inputs[0]) IS its loop's mu (see buildLoop) -- theta has no
+		// printable statement of its own; the whole loop, including whatever theta's own co-scheduled
+		// locals need, is reconstructed once, by the mu, when the recursion reaches it via this skip.
+		if (node.type === 'theta')
+			return this.emitChain(node.inputs[0]?.nodeId, boundaryId);
+		return [...this.emitChain(node.inputs[0]?.nodeId, boundaryId), ...this.emitControlNode(node)];
+	}
+
+	// This control-anchor node's OWN contribution to its enclosing statement list -- the reconstructed
+	// if/switch/try/while/function declaration it anchors (plus whatever pure nodes GCM scheduled
+	// right alongside it), or (the default case) just those pure nodes, for an anchor with no nested
+	// structure of its own (an ordinary call, a declaration, PROGRAM_START, ...).
+	private emitControlNode(control: Node): Statement[] {
+		const nodes = this.nodesAt(control.id);
+
+		if (control.type === 'gamma') {
+			// Ports: 0 = predecessor, 1 = condition, 2 = true tail, 3 = false tail.
+			const predecessorId	= control.inputs[0].nodeId;
+			const trueStmts		= this.emitChain(control.inputs[2].nodeId, predecessorId);
+			// A false tail that never got anywhere past the branch point (no real content) means
+			// there's no `else` at all -- as opposed to one that's genuinely empty, which still prints
+			// `else {}` (see JS.If's own falseStmts check just below).
+			const falseStmts		= control.inputs[3].nodeId !== predecessorId ? this.emitChain(control.inputs[3].nodeId, predecessorId) : undefined;
+
+			// Anything else GCM scheduled alongside the merge itself needs to be split by whether it's
+			// a DEPENDENCY of the gamma (e.g. a `let a = ...;` the test itself reads -- must print
+			// BEFORE the if) or a DEPENDENT of it (reads the merged result -- prints after).
+			const sortedIds	= this.localTopologicalSort(nodes);
+			const gammaIndex	= sortedIds.indexOf(control.id);
+			return [
+				...this.emitLocalStatements(sortedIds.slice(0, gammaIndex)),
+				JS.If(
+					this.resolveOperand(control.id, 1),
+					JS.Block(...trueStmts as JS.Statement<any>[]),
+					falseStmts ? JS.Block(...falseStmts as JS.Statement<any>[]) : undefined
+				) as Statement,
+				...this.emitLocalStatements(sortedIds.slice(gammaIndex + 1)),
+			];
+		}
+
+		if (control.type === 'break_scope') {
+			// Reconstructed as a REAL `switch`/`case`. break_scope has exactly one creation site (see
+			// BuildVSDG's own 'switch' case), which always stamps switchCases right before returning
+			// -- relied on unconditionally here, not re-checked. Each case's own body is found the
+			// same way a gamma's branches are.
+			const sortedIds	= this.localTopologicalSort(nodes);
+			const scopeIndex	= sortedIds.indexOf(control.id);
+
+			// The discriminant's (and each case test's) own GCM schedule is driven entirely by its
+			// GRAPH consumers -- the now-bypassed "hit || matchN" test machinery -- since resolving
+			// it for PRINTING here is a plain value lookup, not a graph edge GCM ever saw. That
+			// usually places it somewhere this reconstruction never otherwise visits, so it needs
+			// forcing here or it silently never prints -- unless some OTHER surviving value already
+			// forced it under its own name first (checked via declaredNames, to avoid a duplicate).
+			const forceDeclare = (id: NodeId): Statement[] => {
+				const n = this.graph.get(id)!;
+				return n.type === 'var' && typeof n.value === 'string' && !this.declaredNames.has(n.value)
+					? this.emitLocalStatements([id]) : [];
+			};
+			const cases = control.switchCases!.map(c => ({
+				test:		c.testNodeId ? this.resolveNode(c.testNodeId) : undefined,
+				consequent:	this.emitChain(c.tailId, c.boundaryId) as JS.Statement<any>[],
+			}));
+
+			// Once every case's own value has been elided into the post-switch merge (see
+			// isLoopCarried's own comment -- exactly the shape a break-ending case with only a
+			// pure reassignment reduces to), a case's own body can end up with NOTHING left to run
+			// except its own trailing `break;` -- which, if EVERY case (and default, if present)
+			// is in that same shape, has nothing left to jump PAST either: every entry point,
+			// direct match or fallthrough, does nothing and falls out the same way regardless.
+			// The whole dispatch is then observably a no-op and can be dropped entirely -- NOT
+			// just each case's own reassignment the way isInlinableSlot already elides individual
+			// values. A `continue`/`return`/`throw` (a jump somewhere OTHER than "right after the
+			// switch") is real content and blocks this, unlike a bare `break`.
+			const isNoOp = (stmts: JS.Statement<any>[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
+			const switchIsNoOp = cases.every(c => isNoOp(c.consequent));
+
+			return [
+				...this.emitLocalStatements(sortedIds.slice(0, scopeIndex)),
+				...forceDeclare(control.switchDiscriminantId!),
+				...control.switchCases!.flatMap(c => c.testNodeId ? forceDeclare(c.testNodeId) : []),
+				...(switchIsNoOp ? [] : [JS.Switch(this.resolveNode(control.switchDiscriminantId!), ...cases) as Statement]),
+				...this.emitLocalStatements(sortedIds.slice(scopeIndex + 1)),
+			];
+		}
+
+		if (control.type === 'except' && typeof control.value !== 'string') {
+			// Ports: 0 = predecessor, 1 = try's own tail, 2 = catch's own tail, 3 = finally's own tail.
+			const predecessorId	= control.inputs[0].nodeId;
+			const tryStmts		= this.emitChain(control.inputs[1].nodeId, predecessorId);
+			const catchStmts	= this.emitChain(control.inputs[2].nodeId, predecessorId);
+			// finally's own tail (port 3) is anchored back on `control` itself, not `predecessorId` --
+			// its own first statement's predecessor is the except node directly (see BuildVSDG's 'try'
+			// case), not the state from before the whole try/catch.
+			const finallyEdge	= control.inputs[3];
+			const finallyStmts	= finallyEdge ? this.emitChain(finallyEdge.nodeId, control.id) : undefined;
+
+			const sortedIds		= this.localTopologicalSort(nodes);
+			const exceptIndex	= sortedIds.indexOf(control.id);
+			return [
+				...this.emitLocalStatements(sortedIds.slice(0, exceptIndex)),
+				{
+					type:			'try',
+					block:			tryStmts as JS.Statement<any>[],
+					handlerParam:	control.catchParam,
+					handlerBody:	catchStmts as JS.Statement<any>[],
+					finalizer:		finallyStmts as JS.Statement<any>[] | undefined,
+				} as Statement,
+				...this.emitLocalStatements(sortedIds.slice(exceptIndex + 1)),
+			];
+		}
+
+		if (control.type === 'function_decl') {
+			const bodyStatements	= this.reconstructFunctionBody(control);
+			const sortedIds			= this.localTopologicalSort(nodes);
+			const declIndex			= sortedIds.indexOf(control.id);
+			return [
+				...this.emitLocalStatements(sortedIds.slice(0, declIndex)),
+				wrapExported({ ...(control.value as JS.FunctionDecl<any>), body: bodyStatements } as Statement, control.exported),
+				...this.emitLocalStatements(sortedIds.slice(declIndex + 1)),
+			];
+		}
+
+		if (control.type === 'mu') {
+			const thetaEdge	= (control.outputs[0] ?? []).find(e => this.graph.get(e.nodeId)!.type === 'theta');
+			const thetaNode	= thetaEdge && this.graph.get(thetaEdge.nodeId)!;
+
+			// The mu's own block holds the mu node itself plus any loop-body computation whose only
+			// real dependency IS the mu (e.g. `i = i + 1;` with no calls in the body) -- GCM schedules
+			// those into the mu's own block since there's no other anchor to place them at. Anything
+			// with a real effect continues from the body's own entry, via port 1 (the feedback input).
+			const ownIds		= nodes.filter(id => id !== control.id);
+			const restOfBody	= this.emitChain(control.inputs[1].nodeId, control.id);
+
+			const statements: Statement[] = [];
+
+			if (thetaNode) {
+				const testId	= thetaNode.inputs[1].nodeId;
+				const testNode	= this.graph.get(testId)!;
+				// The test's only REAL reader (besides itself) is normally the state-theta's own
+				// condition port -- everything else pointing at it (each named theta's own condition
+				// port, one per loop-carried variable) is vestigial, never actually read by codegen.
+				const onlyReadByLoopExit = (testNode.outputs[0] ?? []).filter(e => !this.graph.get(e.nodeId)!.isVestigialEdge(e.port))
+					.every(e => e.nodeId === thetaNode.id);
+				const testStatements	= onlyReadByLoopExit ? [] : this.emitLocalStatements([testId]);
+				const restStatements	= this.emitLocalStatements(ownIds.filter(id => id !== testId));
+
+				if (control.loopKind === 'do') {
+					// No rotation needed: the body already runs before the test in do-while's own
+					// native semantics (the mu's INITIAL value is what the body sees on its first pass).
+					statements.push(JS.DoWhile(JS.Block(
+						...restOfBody as JS.Statement<any>[],
+						...restStatements as JS.Statement<any>[],
+						...testStatements as JS.Statement<any>[]
+					), this.resolveOperand(thetaNode.id, 1)) as Statement);
+				} else {
+					// LOOP ROTATION: the condition needs values that only exist once already inside the
+					// loop body, so `while (cond) { ... }` is structurally impossible here --
+					// `while (true) { <compute cond>; if (!cond) break; body }` isn't.
+					statements.push(JS.While(Literal(true), JS.Block(
+						...testStatements as JS.Statement<any>[],
+						JS.If({ type: 'unary', operator: '!', operand: this.resolveOperand(thetaNode.id, 1) } as Expr,
+							JS.Block({ type: 'break' } as JS.Statement<any>)
+						) as JS.Statement<any>,
+						...restStatements as JS.Statement<any>[],
+						...restOfBody as JS.Statement<any>[]
+					)) as Statement);
+				}
+			} else {
+				// No exit condition could be found at all (shouldn't normally happen -- every `while`
+				// creates a state-theta) -- fall back to reconstructing without rotation.
+				statements.push(JS.While(Literal(true),
+					JS.Block(...this.emitLocalStatements(ownIds) as JS.Statement<any>[], ...restOfBody as JS.Statement<any>[])
+				) as Statement);
+			}
+
+			if (thetaNode) {
+				// Anything scheduled into the state-theta's OWN block (besides the theta node itself)
+				// needs to be emitted explicitly here, right after the loop: a pure computation that
+				// depends only on a named theta's exported value has nothing to state-chain through, so
+				// the recursive walk would never otherwise find it.
+				statements.push(...this.emitLocalStatements(this.nodesAt(thetaNode.id).filter(id => id !== thetaNode!.id)));
+			}
+
+			return statements;
+		}
+
+		return this.emitLocalStatements(nodes);
+	}
+
+	// Reconstructs a 'function_decl'-anchored subgraph's own body (a top-level function, or a class
+	// method/get/set/static_block -- see BuildVSDG's buildFunctionBody) -- its own fully independent
+	// region (own entry/RETURN_ANCHOR pair, own scope). returnNodeId (stamped in BuildVSDG) is the
+	// only way to find the RETURN_ANCHOR from here -- there's no ordinary graph edge from entry to
+	// return that survives an EMPTY body (see the Node field's own comment).
+	private reconstructFunctionBody(entryNode: Node): Statement[] {
+		const returnNode		= this.graph.get(entryNode.returnNodeId!)!;
+		const bodyStatements	= this.emitChain(returnNode.inputs[0].nodeId, entryNode.id);
+
+		const returnValueNode = this.graph.get(returnNode.inputs[1].nodeId)!;
+		// Both "no return statement at all" and a bare `return;` fall back to the SAME synthetic
+		// literal(undefined) -- indistinguishable from an explicit `return undefined;` here, but all
+		// three are runtime-equivalent, so omitting the trailing statement is never wrong.
+		if (!(returnValueNode.type === 'literal' && returnValueNode.value === undefined))
+			bodyStatements.push({ type: 'return', argument: this.resolveOperand(returnNode.id, 1) } as Statement);
+		return bodyStatements;
+	}
+
+	// A single-expression counterpart to reconstructFunctionBody, for an INSTANCE field's own
+	// initializer (see BuildVSDG's buildClassMember, which passes `m.value` directly as an EXPRESSION
+	// body -- the same shape an expression-bodied arrow uses, not a statement list, so there's no
+	// EARLY_RETURN_MARKER involved at all). returnNode's own port 1 IS where the value lives here.
+	private resolveFieldInitializer(entryNode: Node): Expr {
+		const returnNode = this.graph.get(entryNode.returnNodeId!)!;
+		return this.resolveOperand(returnNode.id, 1);
+	}
+
+	// The whole program's own statement list -- PROGRAM_START's own co-scheduled locals (there's
+	// nothing before it to recurse into), followed by everything else, walked backward from
+	// programEndId (see the Node field's own comment) down to PROGRAM_START itself. 'block_entry' is
+	// still GCM's own fixed, well-known id for PROGRAM_START (see buildBlockTree), reused here purely
+	// to recover its real NodeId via blockControl -- the one place this class still deals in BlockId
+	// at all, since nothing else needs a fixed starting point the way this top-level entry point does.
+	buildProgram(): Statement[] {
+		const programStartId = this.blockControl?.get('block_entry');
+		if (!programStartId)
+			return [];
+		const programStart = this.graph.get(programStartId)!;
+		return [...this.emitControlNode(programStart), ...this.emitChain(programStart.programEndId, programStartId)];
 	}
 }
 
@@ -2050,6 +2877,27 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 	return false;
 			
 }
+
+
+export function Optimize(graph: VSDG): void {
+	let changed = true;
+
+	while (changed) {
+		changed = false;
+
+		for (const node of graph.values()) {
+			// 1. Try to fold constant math operations
+			if (foldConstants(graph, node))
+				changed = true;
+
+			// 2. Try to eliminate dead if/else branches
+			if (foldDeadBranches(graph, node))
+				changed = true;
+		}
+	}
+}
+
+
 function foldDeadBranches(graph: VSDG, node: Node): boolean {
 	// We are looking for Gamma nodes (gammaValue or the state gamma)
 	if (node.type !== 'gamma' && node.type !== 'gammaValue')
@@ -2200,8 +3048,8 @@ type BlockId = string;
 function buildBlockTree(graph: Map<NodeId, Node>) {
 	// 1. Discover control anchors (mu, gamma, effect) and build 'rootBlocks'.
 	// BuildVSDG's PROGRAM_START seed node (the whole program's state root) gets the well-known id
-	// 'block_entry' directly, rather than an auto-numbered one like every other anchor -- blocksToAST
-	// needs a fixed, known starting point to begin its traversal from.
+	// 'block_entry' directly, rather than an auto-numbered one like every other anchor -- Output's
+	// own buildProgram needs a fixed, known starting point to begin its traversal from.
 	const rootBlocks = new Map<NodeId, BlockId>();
 	let blockCounter = 0;
 	for (const [id, node] of graph.entries()) {
@@ -2228,7 +3076,7 @@ function buildBlockTree(graph: Map<NodeId, Node>) {
 			// see BuildVSDG's 'try' case, which builds a real `makeNode('except', name)` directly
 			// (not through reconcileVariables/gammaValue) -- so the typeof check still matters here.
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
-		} else if (node.type === 'function_decl' || node.type === 'passthru') {
+		} else if (node.type === 'function_decl' || node.type === 'passthru' || node.type === 'class_decl') {
 			// A declaration statement, threaded sequentially into the state chain exactly like an
 			// effect (see BuildVSDG's own cases) -- needs its own block for the same reason every other
 			// state-chain link does: emitFrom's traversal only ever visits rootBlocks-anchored nodes.
@@ -2302,6 +3150,29 @@ function buildBlockTree(graph: Map<NodeId, Node>) {
 export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 	const blockIds = new Map<NodeId, BlockId>();
 	const { rootBlocks, blockControl, blockTree, getLoopDepth } = buildBlockTree(graph);
+
+	// Which function's own region a block belongs to -- walks blockTree up until hitting either
+	// 'block_entry' (the top-level program) or a function's own FUNCTION_BODY_START marker,
+	// memoized since scheduleLate calls this once per consumer edge. Deliberately NOT the
+	// function_decl node's own block: that's reachable from BOTH the function's own body AND
+	// whatever textually follows the declaration (entryNode's port-0 output has two logically
+	// different consumers -- see FUNCTION_BODY_START's own comment, in BuildVSDG), so blockTree
+	// ancestry alone can't tell "genuinely inside this function" apart from "next, outside it".
+	// The dedicated start marker is what actually disambiguates: only the body threads from IT.
+	const regionRootMemo = new Map<BlockId, BlockId>();
+	function regionRootOf(blockId: BlockId): BlockId {
+		const cached = regionRootMemo.get(blockId);
+		if (cached !== undefined)
+			return cached;
+		const control = blockId !== 'block_entry' ? graph.get(blockControl.get(blockId)!) : undefined;
+		let root = blockId;
+		if (blockId !== 'block_entry' && !(control?.type === 'effect' && control.value === 'FUNCTION_BODY_START')) {
+			const parent = blockTree.get(blockId);
+			root = parent !== undefined ? regionRootOf(parent) : blockId;
+		}
+		regionRootMemo.set(blockId, root);
+		return root;
+	}
 
 	// 2. Phase 1: Push everything as early as possible
 	const visitedEarly = new Set<NodeId>();
@@ -2437,6 +3308,21 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 				if ((consumerNode.type === 'mu' || consumerNode.type === 'muValue') && consumerEdge.port === 0)
 					consumerBlock = blockTree.get(consumerBlock) || "block_entry";
 
+				// A consumer belonging to a DIFFERENT function's own region (see regionRootOf) isn't
+				// "must be ready by this consumer's block" the way an ordinary same-region consumer
+				// is -- it's an edge crossing a function's own call boundary (e.g. a captured
+				// variable's reassignment, later read by name after the function returns -- see
+				// BuildVSDG's 'binary' case). That consumer might run zero, one, or many times, at a
+				// point this static schedule has no way to place relative to this node's own
+				// position, so treating it as an ordinary constraint would (and did, empirically)
+				// drag the node out of the function it structurally belongs in, to sit wherever the
+				// consumer's own shallow, outer block happens to be. forcedPrint (see the same
+				// 'binary' case) is what keeps such a node from being silently dropped once its only
+				// consumer is excluded here -- this only controls WHERE it's scheduled, not whether
+				// it still needs to print.
+				if (regionRootOf(consumerBlock) !== regionRootOf(blockIds.get(nodeId)!))
+					continue;
+
 				latestBlock = latestBlock === null
 					? consumerBlock
 					: findLeastCommonAncestor(blockTree, latestBlock, consumerBlock);
@@ -2487,287 +3373,12 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 	return { blockIds, blockControl };
 }
 
-export function blocksToAST(
-	blockIds:		Map<NodeId, BlockId>,
-	blockControl:	Map<BlockId, NodeId>,
-	graph:			Map<NodeId, Node>
-): Statement[] {
-	const output	= new Output(graph);
-	const emitted	= new Set<BlockId>();
-	const CONTROL	= new Set(['effect', 'gamma', 'gammaValue', 'mu', 'muValue', 'theta', 'thetaValue', 'break_scope', 'except', 'function_decl', 'passthru']);
-
-	// Which nodes GCM scheduled into each block -- the inverse of blockIds, grouped once up front
-	// rather than carried around as its own returned data structure (a block's node list has no
-	// identity of its own beyond "whichever nodes point at this blockId").
-	const blockNodes = new Map<BlockId, NodeId[]>();
-	for (const id of graph.keys()) {
-		const bId = blockIds.get(id) || 'block_entry';
-		if (!blockNodes.has(bId))
-			blockNodes.set(bId, []);
-		blockNodes.get(bId)!.push(id);
-	}
-
-	// Finds the next block in the SAME state-chain -- i.e. "whatever comes next in sequence" -- by
-	// following this control node's state output to whichever consumer reads it as ITS OWN state
-	// input (port 0 on another control-anchor node). Other port-0 consumers can exist too (e.g. a
-	// `let y = f();` wrapper reading a call's return value at ITS OWN port 0), so the target's type
-	// has to be checked as well as the port, or those would be mistaken for "the next block."
-	function successorBlock(control: Node): BlockId | undefined {
-		// At a branch point, `control`'s output can have several simultaneous port-0 consumers: the
-		// first effect of EACH branch (each branch independently treats `control` as ITS OWN state
-		// predecessor) AND the eventual merge-gamma (same reasoning: `parent.end` -- this function's
-		// `control` -- is the gamma's own predecessor too). Only the gamma is really "what comes next
-		// in sequence"; a branch's own entry is reachable ONLY via the gamma's own branchEntryBlock
-		// lookup, as nested content, not as an ordinary successor.
-		//
-		// When NEITHER branch had a real effect, no gamma gets created at all (the if/else fully
-		// dissolves into a per-variable named gamma instead), and each branch's mutation-ordering
-		// markers are left dangling off `control` with nothing to distinguish them from the REAL
-		// continuation that follows the whole if-statement -- also a direct port-0 consumer of the
-		// same `control`. Preferring the LAST such candidate (over the first) resolves it correctly:
-		// the AST walk always finishes walking a branch's entire content before it ever reaches
-		// whatever comes textually after the if, so the real continuation is always inserted last.
-		let fallback: BlockId | undefined;
-		for (const edge of control.outputs[0] ?? []) {
-			if (edge.port !== 0)
-				continue;
-			const target = graph.get(edge.nodeId)!;
-			if (target.type === 'gamma' || target.type === 'gammaValue' || target.type === 'mu' || target.type === 'muValue' || target.type === 'break_scope' || target.type === 'except') {
-				const id = blockIds.get(edge.nodeId);
-				if (id)
-					return id;
-			} else if (CONTROL.has(target.type)) {
-				fallback = blockIds.get(edge.nodeId) ?? fallback;
-			}
-		}
-		return fallback;
-	}
-
-	// The mirror image of successorBlock: given the LAST node of a branch/loop-body (e.g. a gamma's
-	// own trueState/falseState input, or a mu's own feedback input) and the boundary node it started
-	// right after, walks the state chain backwards (via inputs[0], now consistently the real
-	// predecessor for every control-anchor type) to find the FIRST block of that branch/body -- the
-	// entry point emitFrom needs to start its forward walk from. Not stored on the node itself: it's
-	// fully recoverable on demand from data the graph already has, the same way blockTree itself is.
-	function branchEntryBlock(tailNodeId: NodeId, boundaryNodeId: NodeId): BlockId | undefined {
-		let entryBlockId: BlockId | undefined;
-		let currentId = tailNodeId;
-		while (currentId !== boundaryNodeId) {
-			entryBlockId = blockIds.get(currentId);
-			const pred = graph.get(currentId)?.inputs[0];
-			if (!pred)
-				break;
-			currentId = pred.nodeId;
-		}
-		return entryBlockId;
-	}
-
-	// Emits a block plus everything that follows it in sequence at this same nesting level (an
-	// ordinary run of blocks, walked forward via successorBlock -- NOT Map/graph iteration order,
-	// which has no guaranteed relationship to actual control-flow order).
-	function emitFrom(blockId: BlockId | undefined): Statement[] {
-		const statements: Statement[] = [];
-
-		while (blockId && !emitted.has(blockId)) {
-			emitted.add(blockId);
-			const nodes		= blockNodes.get(blockId) ?? [];
-			const control	= graph.get(blockControl.get(blockId) ?? blockId)!;
-
-			if (control.type === 'gamma') {
-				// A gamma anchoring its own block is a STATE merge (an if/else where at least one
-				// branch has a side effect) -- gammaValues are pure values, never anchor their own
-				// block, and are handled by emitLocalStatements instead.
-				// Ports, per the reordering above: 0 = predecessor, 1 = condition, 2 = true tail, 3 = false tail.
-				const predecessorId	= control.inputs[0].nodeId;
-				const trueEntryId		= branchEntryBlock(control.inputs[2].nodeId, predecessorId);
-				const falseEntryId	= branchEntryBlock(control.inputs[3].nodeId, predecessorId);
-
-				// Anything else GCM scheduled alongside the merge itself needs to be split by whether
-				// it's a DEPENDENCY of the gamma (e.g. a `let a = ...;` the test itself reads -- must
-				// print BEFORE the if) or a DEPENDENT of it (reads the merged result -- prints after).
-				// Blindly appending everything after the if was wrong: it printed the test variable's
-				// own declaration AFTER the `if` that already reads it.
-				const sortedIds	= output.localTopologicalSort(nodes);
-				const gammaIndex	= sortedIds.indexOf(control.id);
-				statements.push(...output.emitLocalStatements(sortedIds.slice(0, gammaIndex)));
-				statements.push(JS.If(
-					output.resolveOperand(control.id, 1),
-					JS.Block(...emitFrom(trueEntryId) as JS.Statement<any>[]),
-					falseEntryId ? JS.Block(...emitFrom(falseEntryId) as JS.Statement<any>[]) : undefined
-				) as Statement);
-				statements.push(...output.emitLocalStatements(sortedIds.slice(gammaIndex + 1)));
-				blockId = successorBlock(control);
-				continue;
-			}
-
-			if (control.type === 'break_scope') {
-				// A scope that `break` exits but `continue` does NOT re-enter (unlike a loop) --
-				// reconstructed as a minimal, always-matching `switch`, purely for that "break exits
-				// me" property. Real JS's own `continue` already correctly skips PAST a switch to
-				// the nearest REAL enclosing loop, which is exactly why this isn't a `while (true)`
-				// wrapper (see BuildVSDG's 'switch' case for the infinite-loop bug that came from
-				// using one). Ports mirror a gamma's: 0 = predecessor, 1 = the scope's own tail.
-				const predecessorId	= control.inputs[0].nodeId;
-				const contentEntryId	= branchEntryBlock(control.inputs[1].nodeId, predecessorId);
-
-				const sortedIds	= output.localTopologicalSort(nodes);
-				const scopeIndex	= sortedIds.indexOf(control.id);
-				statements.push(...output.emitLocalStatements(sortedIds.slice(0, scopeIndex)));
-				statements.push(JS.Switch(Literal(0), JS.SwitchCase(Literal(0),
-					...(contentEntryId ? emitFrom(contentEntryId) : []) as JS.Statement<any>[]
-				)) as Statement);
-				statements.push(...output.emitLocalStatements(sortedIds.slice(scopeIndex + 1)));
-				blockId = successorBlock(control);
-				continue;
-			}
-
-			if (control.type === 'except' && typeof control.value !== 'string') {
-				// Reconstructed as a real `try {...} catch (e) {...}` (optionally `finally {...}`)
-				// -- no rotation or synthetic wrapper needed, unlike a loop or switch: try/catch is
-				// already exactly the shape it needs to be. Ports: 0 = predecessor, 1 = try's own
-				// tail, 2 = catch's own tail, 3 = finally's own tail (only if finally exists).
-				const predecessorId	= control.inputs[0].nodeId;
-				const tryEntryId	= branchEntryBlock(control.inputs[1].nodeId, predecessorId);
-				const catchEntryId	= branchEntryBlock(control.inputs[2].nodeId, predecessorId);
-
-				const sortedIds		= output.localTopologicalSort(nodes);
-				const exceptIndex	= sortedIds.indexOf(control.id);
-				statements.push(...output.emitLocalStatements(sortedIds.slice(0, exceptIndex)));
-
-				// finally's own tail (port 3) is anchored back on `control` itself, not
-				// `predecessorId` -- its own first statement's predecessor is the except node
-				// directly (see BuildVSDG's 'try' case), not the state from before the whole
-				// try/catch, so that's the boundary its own backward walk needs to stop at.
-				const finallyEdge	= control.inputs[3];
-				const finallyEntryId = finallyEdge ? branchEntryBlock(finallyEdge.nodeId, control.id) : undefined;
-
-				statements.push({
-					type:			'try',
-					block:			emitFrom(tryEntryId) as JS.Statement<any>[],
-					handlerParam:	control.catchParam,
-					handlerBody:	emitFrom(catchEntryId) as JS.Statement<any>[],
-					finalizer:		finallyEdge ? emitFrom(finallyEntryId) as JS.Statement<any>[] : undefined,
-				} as Statement);
-
-				statements.push(...output.emitLocalStatements(sortedIds.slice(exceptIndex + 1)));
-				blockId = successorBlock(control);
-				continue;
-			}
-
-			if (control.type === 'function_decl') {
-				// Recurse into the function's OWN internal region -- its body is a fully independent
-				// sub-graph (own entry/RETURN_ANCHOR pair, own scope), scheduled by the very same GCM
-				// pass that scheduled everything at this level, so the exact same block-walking
-				// machinery reconstructs it. returnNodeId (stamped in BuildVSDG) is the only way to
-				// find the RETURN_ANCHOR from here -- there's no ordinary graph edge from entry to
-				// return that survives an empty body (see the Node field's own comment).
-				const returnNode	= graph.get(control.returnNodeId!)!;
-				const bodyEntryId	= branchEntryBlock(returnNode.inputs[0].nodeId, control.id);
-				const bodyStatements = bodyEntryId ? emitFrom(bodyEntryId) : [];
-
-				const returnValueNode = graph.get(returnNode.inputs[1].nodeId)!;
-				// Both "no return statement at all" and a bare `return;` fall back to the SAME
-				// synthetic literal(undefined) (see BuildVSDG's 'function_decl'/'return' cases) --
-				// indistinguishable from an explicit `return undefined;` here, but all three are
-				// runtime-equivalent, so omitting the trailing statement is never wrong, just
-				// sometimes less literal than the original source.
-				if (!(returnValueNode.type === 'literal' && returnValueNode.value === undefined))
-					bodyStatements.push({ type: 'return', argument: output.resolveOperand(returnNode.id, 1) } as Statement);
-
-				const sortedIds	= output.localTopologicalSort(nodes);
-				const declIndex	= sortedIds.indexOf(control.id);
-				statements.push(...output.emitLocalStatements(sortedIds.slice(0, declIndex)));
-				statements.push({ ...(control.value as JS.FunctionDecl<any>), body: bodyStatements } as Statement);
-				statements.push(...output.emitLocalStatements(sortedIds.slice(declIndex + 1)));
-				blockId = successorBlock(control);
-				continue;
-			}
-
-			if (control.type === 'mu') {
-				const thetaEdge	= (control.outputs[0] ?? []).find(e => graph.get(e.nodeId)!.type === 'theta');
-				const thetaNode	= thetaEdge && graph.get(thetaEdge.nodeId)!;
-
-				// The mu's own block holds the mu node itself plus any loop-body computation whose
-				// only real dependency IS the mu (e.g. `i = i + 1;` with no calls in the body) -- GCM
-				// schedules those into the mu's own block since there's no other anchor to place them
-				// at. Anything with a real effect continues from the body's entry block, chained
-				// forward as usual (port 1 = the mu's own feedback input, i.e. the body's tail node).
-				const ownIds			= nodes.filter(id => id !== control.id);
-				const bodyEntryId		= branchEntryBlock(control.inputs[1].nodeId, control.id);
-				const restOfBody		= bodyEntryId ? emitFrom(bodyEntryId) : [];
-
-				if (thetaNode) {
-					const testId	= thetaNode.inputs[1].nodeId;
-					const testNode	= graph.get(testId)!;
-					// The test's only REAL reader (besides itself) is normally the state-theta's own
-					// condition port -- everything else pointing at it (each named theta's own
-					// condition port, one per loop-carried variable) is vestigial, never actually read
-					// by codegen. When that's the whole story, force-materializing it via a standalone
-					// emitLocalStatements call (which only sees this one node, with no way to know its
-					// true consumer is the theta it's about to be resolved through anyway) would make
-					// `needsTemp` see it as "reused across a block boundary" and spill it needlessly --
-					// so skip that and let `resolveOperand(thetaNode.id, 1)` below inline it directly.
-					const onlyReadByLoopExit = (testNode.outputs[0] ?? []).filter(e => !graph.get(e.nodeId)!.isVestigialEdge(e.port))
-						.every(e => e.nodeId === thetaNode.id);
-					const testStatements	= onlyReadByLoopExit ? [] : output.emitLocalStatements([testId]);
-					const restStatements	= output.emitLocalStatements(ownIds.filter(id => id !== testId));
-
-					if (control.loopKind === 'do') {
-						// No rotation needed: unlike `while`, the body already runs before the test in
-						// do-while's own native semantics (the mu's INITIAL value is what the body sees
-						// on its first pass) -- `do { body } while (test);` reconstructs directly.
-						statements.push(JS.DoWhile(JS.Block(
-							...restOfBody as JS.Statement<any>[],
-							...restStatements as JS.Statement<any>[],
-							...testStatements as JS.Statement<any>[]
-						), output.resolveOperand(thetaNode.id, 1)) as Statement);
-					} else {
-						// LOOP ROTATION: the condition is computed using the mu nodes' CURRENT (this
-						// iteration's) values, which only exist once we're already inside the loop body
-						// -- there is no way to compute it "before" a `while (cond) { ... }` header, since
-						// the header would need something the body alone provides. `while (cond) { body }`
-						// is structurally impossible here; `while (true) { <compute cond>; if (!cond) break; body }`
-						// isn't -- it just moves the same condition check to the top of the body instead
-						// of the (unavailable) position before it.
-						statements.push(JS.While(Literal(true), JS.Block(
-							...testStatements as JS.Statement<any>[],
-							JS.If({ type: 'unary', operator: '!', operand: output.resolveOperand(thetaNode.id, 1) } as Expr,
-								JS.Block({ type: 'break' } as JS.Statement<any>)
-							) as JS.Statement<any>,
-							...restStatements as JS.Statement<any>[],
-							...restOfBody as JS.Statement<any>[]
-						)) as Statement);
-					}
-				} else {
-					// No exit condition could be found at all (shouldn't normally happen -- every
-					// `while` creates a state-theta) -- fall back to reconstructing without rotation.
-					statements.push(JS.While(Literal(true),
-						JS.Block(...output.emitLocalStatements(ownIds) as JS.Statement<any>[], ...restOfBody as JS.Statement<any>[])
-					) as Statement);
-				}
-
-				if (thetaNode) {
-					// Anything scheduled into the state-theta's OWN block (besides the theta node
-					// itself) needs to be emitted explicitly here, right after the loop: a pure
-					// computation that depends only on a named theta's exported value (no state edge
-					// at all -- e.g. a side-effect-free call, once purity analysis exists) has nothing
-					// to state-chain through, so successorBlock below would never otherwise find it.
-					const thetaBlockId = blockIds.get(thetaNode.id);
-					const thetaBlockNodes = thetaBlockId && blockNodes.get(thetaBlockId);
-					if (thetaBlockNodes)
-						statements.push(...output.emitLocalStatements(thetaBlockNodes.filter(id => id !== thetaNode.id)));
-				}
-
-				blockId = thetaNode ? successorBlock(thetaNode) : undefined;
-				continue;
-			}
-
-			statements.push(...output.emitLocalStatements(nodes));
-			blockId = successorBlock(control);
-		}
-
-		return statements;
-	}
-
-	return emitFrom('block_entry');
+// Wraps a reconstructed statement in `export `/`export default `, per a node's own `exported`
+// stamp (see the Node field's own comment) -- shared by 'passthru' and 'function_decl' printing,
+// the two node types `export`/`export_decl` can currently leave behind.
+function wrapExported(stmt: Statement, exported: 'named' | 'default' | undefined): Statement {
+	return exported === 'named' ? { type: 'export_decl', declaration: stmt } as Statement
+		: exported === 'default' ? { type: 'export', default: stmt } as Statement
+		: stmt;
 }
+

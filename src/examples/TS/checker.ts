@@ -2105,7 +2105,7 @@ function checkStmt(stmt: TS.Statement, scope: Scope, onReturn?: (argument: Expr|
 
 export function inferReturn(fnj: JS.CallSig<any>, body: JS.Statement<any>[], outer: Scope): Type {
 	if (fnj.returnType)
-		return fnj.returnType as Type;
+		return fnj.returnType;
 	const sig = { ...fnj } as TS.CallSig;
 	checkFunctionBody(sig, body, outer, false);
 	return sig.returnType ?? T.VOID;

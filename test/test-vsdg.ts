@@ -1,6 +1,6 @@
 import assert from 'assert';
 import * as TS from '../src/examples/TS/ts-parser';
-import { BuildVSDG, applyGlobalCodeMotion, blocksToAST } from '../src/examples/TS/vsdg';
+import { BuildVSDG, applyGlobalCodeMotion, Output } from '../src/examples/TS/vsdg';
 import { Output as CodeOutput } from '../src/examples/TS/tocode';
 
 // Regression suite for vsdg.ts's BuildVSDG -> applyGlobalCodeMotion -> blocksToAST pipeline: builds
@@ -19,7 +19,7 @@ function compile(src: string): string {
 	const prog		= TS.parse(src);
 	const graph		= BuildVSDG(prog.body);
 	const { blockIds, blockControl } = applyGlobalCodeMotion(graph);
-	const stmts = blocksToAST(blockIds, blockControl, graph);
+	const stmts = new Output(graph, blockIds, blockControl).buildProgram();
 	return printer.toCode(stmts as any).trim();
 }
 
@@ -83,11 +83,13 @@ async function main() {
 	// declared-locals materialization (`let a = 1;` was never emitted at all, before that fix), the
 	// per-variable named-gamma value merge (never had a codegen case before -- always threw), and
 	// dead-initializer elimination (`x`'s declared value of 1 is unconditionally overwritten by both
-	// branches before anything reads it, so it becomes `let x;` instead of `let x = 1;`). `a`'s own
-	// declared value inlines too, by the same single-consumer rule as any other local: its only
-	// reader is the merge's own condition. The merge itself (`x`) has exactly one real reader too
-	// (`h(x)`) -- named gammas are just as inlinable as an ordinary reassignment (isInlinableSlot),
-	// so it inlines straight into `h(...)` instead of needing its own `x = ...;` statement.
+	// branches before anything reads it, so its own declaration drops -- see emitNamedSlot's own
+	// comment: nothing ever reads `x`/`a` by name once their value's fully inlined, so an unassigned
+	// `let x;`/`let a;` has no purpose and prints nothing at all). `a`'s own declared value inlines
+	// too, by the same single-consumer rule as any other local: its only reader is the merge's own
+	// condition. The merge itself (`x`) has exactly one real reader too (`h(x)`) -- named gammas are
+	// just as inlinable as an ordinary reassignment (isInlinableSlot), so it inlines straight into
+	// `h(...)` instead of needing its own `x = ...;` statement.
 	check('if: merged value, both branches always reassign -> dead initializer dropped', `
 		let x = 1;
 		let a = 1;
@@ -98,8 +100,6 @@ async function main() {
 		}
 		h(x);
 	`, `
-		let x;
-		let a;
 		h(1 ? 2 : 3);
 	`);
 
@@ -181,8 +181,6 @@ async function main() {
 		let x = a + b;
 		h(x + x);
 	`, `
-		let a;
-		let b;
 		let x = 1 + 2;
 		h(x + x);
 	`);
@@ -194,6 +192,11 @@ async function main() {
 	// only the gamma is really "what comes next in sequence"). `g(2)`/`h(3)` print bare, with no
 	// temp: being a branch's own state-chain tail (feeding the merge-gamma's trueTail/falseTail ports)
 	// is structural bookkeeping, not a real value read -- neither call's result is used by anything.
+	//
+	// `a` itself is never reassigned, so its own declared value (1) is a provably-constant literal --
+	// isInlinableVarDecl's own literal exemption (see its comment) means it's cheap to duplicate at
+	// EVERY reader, not just a single one, so `a`'s own declaration drops entirely and both `if (a)`
+	// and `k(a)` read the literal directly.
 	check('if: multi-statement branches with real effects reconstruct as a real if/else', `
 		let a = 1;
 		if (a) {
@@ -204,14 +207,13 @@ async function main() {
 		}
 		k(a);
 	`, `
-		let a = 1;
-		if (a) {
+		if (1) {
 			f(1);
 			g(2);
 		} else {
 			h(3);
 		}
-		k(a);
+		k(1);
 	`);
 
 	// One branch has only a pure reassignment (no real effect at all -- must NOT be wrapped in a
@@ -223,7 +225,10 @@ async function main() {
 	// (2 and 3) are single-consumer pure literals, so they inline straight into the merge ternary --
 	// leaving the true branch genuinely empty (an unavoidable byproduct here, not a "spurious" wrapper:
 	// something still has to conditionally guard `f(9)`). The merge itself is ALSO single-consumer
-	// (only `h(x)` reads it), so it inlines too, straight into `h(...)`.
+	// (only `h(x)` reads it), so it inlines too, straight into `h(...)`. `a`'s own declared value (1)
+	// is never reassigned either, so it's ALSO a duplicable literal (isInlinableVarDecl's own literal
+	// exemption) -- its declaration drops too, and both `if (a)` and the merge's own condition read
+	// the literal directly.
 	check('if: one branch pure, one branch effectful -- no spurious empty branch', `
 		let x = 1;
 		let a = 1;
@@ -235,14 +240,12 @@ async function main() {
 		}
 		h(x);
 	`, `
-		let x;
-		let a = 1;
-		if (a) {
+		if (1) {
 			
 		} else {
 			f(9);
 		}
-		h(a ? 2 : 3);
+		h(1 ? 2 : 3);
 	`);
 
 	// A reassignment sandwiched between two effects in the SAME branch (`x = 2; f(x); x = 3;`):
@@ -253,6 +256,9 @@ async function main() {
 	// values too -- both inline straight into the merge ternary, which is what actually needs them
 	// (the `if` has no `else`, so the false path genuinely falls through to x's original value of 1).
 	// The merge itself has exactly one real reader (`h(x)`), so it inlines too.
+	// `a`'s own declared value (1) is never reassigned, so it's a duplicable literal too
+	// (isInlinableVarDecl's own literal exemption) -- its declaration drops, `if (a)`/the merge's
+	// own condition both read the literal directly.
 	check('if: reassignment between two effects in the same branch stays correctly ordered', `
 		let x = 1;
 		let a = 1;
@@ -263,12 +269,10 @@ async function main() {
 		}
 		h(x);
 	`, `
-		let x;
-		let a = 1;
-		if (a) {
+		if (1) {
 			f(2);
 		}
-		h(a ? 3 : 1);
+		h(1 ? 3 : 1);
 	`);
 
 	// An `if` nested inside a `while`: the reassignment ordering fix's first attempt (reverted --
@@ -352,8 +356,6 @@ async function main() {
 		h(x);
 	`, `
 		f();
-		let x;
-		let a;
 		h(1 ? 2 : 3);
 	`);
 
@@ -559,8 +561,6 @@ async function main() {
 		}
 		h(x);
 	`, `
-		let x;
-		let a;
 		h(1 ? 10 : 2 ? 20 : 30);
 	`);
 
@@ -583,6 +583,10 @@ async function main() {
 	// its own minimal `break_scope` graph anchor (no mu/theta, no continue target of its own),
 	// reconstructed as an always-matching `switch (0) { case 0: ... }` purely for break's
 	// syntactic target -- real JS's own `continue` already skips past a switch correctly.
+	//
+	// `x`'s own declared value (1) is never reassigned, so it's a duplicable literal
+	// (isInlinableVarDecl's own literal exemption) -- its declaration drops, and both the
+	// discriminant's own initializer and `h(x)` read the literal directly.
 	check('switch: break exits, default matches when nothing else does', `
 		let x = 1;
 		switch (x) {
@@ -597,36 +601,25 @@ async function main() {
 		}
 		h(x);
 	`, `
-		let x = 1;
-		switch (0) {
-			case 0:
-				let __disc_var4 = x;
-				let __match0_var4 = __disc_var4 === 1;
-				let __hit_var4 = false;
-				var t0 = __hit_var4 || __match0_var4;
-				if (t0) {
-					__hit_var4 = true;
-					g(1);
-					break;
-				}
-				let __match1_var4 = __disc_var4 === 2;
-				var t1 = __hit_var4 || __match1_var4;
-				if (t1) {
-					__hit_var4 = true;
-					g(2);
-					break;
-				}
-				var t2 = __hit_var4 || !(__match0_var4 || __match1_var4);
-				if (t2) {
-					g(99);
-				}
+		let __disc_var4 = 1;
+		switch (__disc_var4) {
+			case 1:
+				g(1);
+				break;
+			case 2:
+				g(2);
+				break;
+			default:
+				g(99);
 		}
-		h(x);
+		h(1);
 	`);
 
 	// A case with no `break` falls straight into the next one (the classic switch fallthrough
 	// footgun) -- once `__hit` is set by case 1 matching, every later case's own test becomes
 	// irrelevant, so cases 2 and 3 both run (case 3's own `break` then stops it before case 4).
+	// `x`'s own declared value (2) is never reassigned, so (isInlinableVarDecl's own literal
+	// exemption) it's a duplicable literal -- its declaration drops in favor of both real readers.
 	check('switch: fallthrough runs every case until the next break', `
 		let x = 2;
 		switch (x) {
@@ -642,42 +635,32 @@ async function main() {
 		}
 		h(x);
 	`, `
-		let x = 2;
-		switch (0) {
-			case 0:
-				let __disc_var4 = x;
-				let __match0_var4 = __disc_var4 === 1;
-				let __hit_var4 = false;
-				var t0 = __hit_var4 || __match0_var4;
-				if (t0) {
-					g(1);
-				}
-				let __match1_var4 = __disc_var4 === 2;
-				__hit_var4 = t0 ? true : __hit_var4;
-				var t1 = __hit_var4 || __match1_var4;
-				if (t1) {
-					g(2);
-				}
-				let __match2_var4 = __disc_var4 === 3;
-				let __match3_var4 = __disc_var4 === 4;
-				__hit_var4 = t1 ? true : __hit_var4;
-				var t2 = __hit_var4 || __match2_var4;
-				if (t2) {
-					__hit_var4 = true;
-					g(3);
-					break;
-				}
-				var t3 = __hit_var4 || __match3_var4;
-				if (t3) {
-					g(4);
-				}
+		let __disc_var4 = 2;
+		switch (__disc_var4) {
+			case 1:
+				g(1);
+			case 2:
+				g(2);
+			case 3:
+				g(3);
+				break;
+			case 4:
+				g(4);
 		}
-		h(x);
+		h(2);
 	`);
 
 	// `default` written FIRST must still only match when no other case does -- real switch
 	// semantics are position-independent (default only wins when nothing else matches, wherever
 	// it's written), unlike a naive "positional hit cascade" would give.
+	//
+	// `x`'s own value (5) is a provably dead, single-use initializer, so it inlines into __disc's
+	// own declaration same as any other local -- and __disc itself is now ALSO correctly seen as
+	// inlinable (isPureSubgraph's own fix this session: threadMutation's scheduling-only marker edge
+	// was wrongly making every declaration that goes through rebindVar look "impure", including
+	// __disc's own). With nothing ever reading __disc by name (its value, 5, inlines directly at its
+	// one real use, the switch's own discriminant), its own declaration has no purpose and drops
+	// entirely (see emitNamedSlot's own comment on dropping an unassigned, unreferenced `let`).
 	check('switch: default matches by exclusion regardless of its position', `
 		let x = 5;
 		switch (x) {
@@ -689,24 +672,13 @@ async function main() {
 				break;
 		}
 	`, `
-		switch (0) {
-			case 0:
-				let x;
-				let __disc_var4 = 5;
-				let __match1_var4 = __disc_var4 === 1;
-				let __hit_var4 = false;
-				var t0 = __hit_var4 || !__match1_var4;
-				if (t0) {
-					__hit_var4 = true;
-					g(0);
-					break;
-				}
-				var t1 = __hit_var4 || __match1_var4;
-				if (t1) {
-					__hit_var4 = true;
-					g(1);
-					break;
-				}
+		switch (5) {
+			default:
+				g(0);
+				break;
+			case 1:
+				g(1);
+				break;
 		}
 	`);
 
@@ -717,6 +689,11 @@ async function main() {
 	// reconstructs as a plain `switch`, not a loop, real JS's own continue semantics get this right
 	// with no special handling needed at all -- the switch(0){} wrapper is simply not a valid
 	// continue target, exactly like a real switch statement.
+	//
+	// __match0/__hit both print (with real initializers): `continue` is a real jump elsewhere, not
+	// "nothing happens" the way a bare `break` is, so neither case here is switchIsNoOp-eligible --
+	// and each is genuinely read twice (once by its own case's match test, once more by default's
+	// own "did nothing else match" exclusion test), so needsTemp correctly keeps them named.
 	check('switch: continue inside a case skips past the switch to the outer loop', `
 		let i = 0;
 		while (i < 3) {
@@ -735,20 +712,15 @@ async function main() {
 			if (!(i < 3)) {
 				break;
 			}
-			switch (0) {
-				case 0:
-					let __disc_var8 = i;
-					let __match0_var8 = __disc_var8 === 1;
-					let __hit_var8 = false;
-					if (__hit_var8 || __match0_var8) {
-						__hit_var8 = true;
-						i = i + 1;
-						continue;
-					}
-					var t0 = __hit_var8 || !__match0_var8;
-					if (t0) {
-						h(i);
-					}
+			let __disc_var8 = i;
+			let __match0_var8 = __disc_var8 === 1;
+			let __hit_var8 = false;
+			switch (__disc_var8) {
+				case 1:
+					i = i + 1;
+					continue;
+				default:
+					h(i);
 			}
 			i = i + 1;
 		}
@@ -757,9 +729,40 @@ async function main() {
 	// A variable reassigned in MULTIPLE cases, each ending in `break` -- the case this session's own
 	// exit-value-merging bug hid in: `break` only exits the switch's own break_scope, not the whole
 	// function, so code after the switch is reachable via EVERY case's own break point, not just the
-	// path where nothing matched. Before the fix, each case's own reassignment was silently dropped
+	// path where nothing matched. Before that fix, each case's own reassignment was silently dropped
 	// from the merge (kept only via forcedPrint, in place), so `return total;` after the switch never
 	// actually observed any of case 1/2's own values -- always the pre-switch default.
+	//
+	// forcedPrint used to be unconditional for a break-exited branch's own reassignment -- correct
+	// for the case above, but needlessly conservative for a one-shot merge like this one (no
+	// enclosing loop): a pure value has no "next iteration" that needs a real, mutated variable to
+	// carry it forward, so it's just as safe to fold straight into the merge, exactly like default's
+	// `-1` already did. forcedPrint is now conditional on the reassignment being loop-carried
+	// (isLoopCarried) -- so case 1/2's own `total = ...;` folds directly into the return ternary too.
+	// switch's own internal bookkeeping (__hit_var8's `hit = true;`) is unaffected by this relaxation
+	// -- it's tagged switchInternal specifically so it keeps resolving by name regardless, which is
+	// what keeps t0/t1/t2 computing the same independent, one-shot match flags as before (a real bug
+	// this session: relaxing forcedPrint without that tag let __hit_var8's value get folded into a
+	// genuine "did an earlier case already match" merge, which is wrong for these pre-switch flags).
+	// With every case's own value elided, each case's body reduces to a bare `break;` -- and once
+	// EVERY case (including default) is in that shape, the whole dispatch is observably a no-op
+	// (every entry point does nothing and falls out the same way) and gets dropped entirely, not
+	// just each case's own value -- see emitControlNode's own switchIsNoOp check.
+	//
+	// t0/t1/t2 themselves are now also single-use (their only real reader, once the state gamma
+	// bypassed by switchCases and __hit's own collapsing merge are correctly excluded from counting
+	// -- both real graph edges, neither ever actually read at print time -- is `total`'s own merge,
+	// which reads them as ITS condition), so they inline straight into the return ternary too,
+	// instead of needing their own `var tN = ...;` statement.
+	//
+	// __hit_var8's own gammaValue merge (per case) still collapses to a bare `Identifier('__hit_var8')`
+	// -- isInlinableVarDecl's own literal exemption (letting a genuinely-read literal declaration
+	// drop when nothing ELSE needs it named) would otherwise make the ORIGINAL declaration resolve
+	// straight to the literal `false` instead, breaking the "both branches are the exact same
+	// expression" match buildExpr's "cond ? x : x -> x" shortcut needs -- resolveNode's own
+	// isInlinableVarDecl check additionally requires !hasForcedSibling, so whenever a switchInternal
+	// (or ordinary forced) sibling guarantees SOME other read resolves by name, this declaration
+	// stays consistent with it instead of inlining its own value.
 	check('switch: a variable reassigned in multiple break-ending cases survives to after the switch', `
 		function f(x) {
 			let total = 0;
@@ -777,28 +780,48 @@ async function main() {
 		}
 	`, `
 		function f(x) {
-			let total;
-			let __disc_var7 = x;
-			let __match0_var7 = __disc_var7 === 1;
-			let __match1_var7 = __disc_var7 === 2;
-			let __hit_var7 = false;
-			var t0 = __hit_var7 || __match0_var7;
-			var t1 = __hit_var7 || __match1_var7;
-			var t2 = __hit_var7 || !(__match0_var7 || __match1_var7);
-			switch (0) {
-				case 0:
-					if (t0) {
-						__hit_var7 = true;
-						total = 10;
-						break;
-					}
-					if (t1) {
-						__hit_var7 = true;
-						total = 20;
-						break;
-					}
+			let __disc_var8 = x;
+			let __match0_var8 = __disc_var8 === 1;
+			let __match1_var8 = __disc_var8 === 2;
+			let __hit_var8 = false;
+			return (__hit_var8 || !(__match0_var8 || __match1_var8)) ? -1 : (__hit_var8 || __match1_var8) ? 20 : (__hit_var8 || __match0_var8) ? 10 : 0;
+		}
+	`);
+
+	// The regression this session's own switchInternal fix guards: __hit's own reassignment used to
+	// be indistinguishable from an ordinary user reassignment once forcedPrint became conditional
+	// (see the previous test's own comment) -- letting its merged value fold into a real "already
+	// matched" ternary broke case dispatch entirely (every input returned the SAME, wrong result).
+	// This is deliberately the minimal repro: two break-ending cases with nothing but a pure
+	// reassignment in each, verified to still dispatch correctly to the RIGHT case's own value.
+	// With no default at all, both cases end up effectively empty too, so the switch itself elides
+	// entirely -- exactly the same switchIsNoOp path as the previous test's own. __match0/__match1
+	// have only one real reader each (their own case's own test -- no default means no "did nothing
+	// else match" exclusion test to read them a second time), so they inline directly into t0/t1's
+	// own computation (an isPureSubgraph fix: threadMutation's own scheduling-only marker edge was
+	// wrongly making every rebindVar'd declaration look impure). t0/t1 themselves are then also
+	// single-use once more (total's own merge is their only real reader, same reasoning as the
+	// previous test's own), so they inline straight into the return ternary too. __hit_var8's own
+	// per-case merge still collapses to the bare name too, same hasForcedSibling-gated reasoning as
+	// the previous test's own comment.
+	check('switch: internal hit/match bookkeeping stays independent when case values are elided', `
+		function f(x) {
+			let total = 0;
+			switch (x) {
+				case 1:
+					total = 10;
+					break;
+				case 2:
+					total = 20;
+					break;
 			}
-			return t2 ? -1 : t1 ? total : t0 ? total : 0;
+			return total;
+		}
+	`, `
+		function f(x) {
+			let __disc_var8 = x;
+			let __hit_var8 = false;
+			return (__hit_var8 || (__disc_var8 === 2)) ? 20 : (__hit_var8 || (__disc_var8 === 1)) ? 10 : 0;
 		}
 	`);
 
@@ -911,7 +934,9 @@ async function main() {
 	// `continue` inside a `switch` nested in a `for` must still re-run the FOR's own `update` --
 	// `switch` pushes nothing onto the loop-context stack that tracks which update to re-run (it's
 	// not a loop and has no update of its own), so it's correctly transparent here, same as it is
-	// to a real `continue` at runtime.
+	// to a real `continue` at runtime. __match0/__hit both print for the same reason as the earlier
+	// `while`-nested version of this test: `continue` is a real jump, not switchIsNoOp-eligible, and
+	// each is genuinely read twice (its own case's test, plus default's own exclusion test).
 	check('for: continue inside a nested switch still runs the enclosing loop\'s update', `
 		for (let i = 0; i < 5; i = i + 1) {
 			switch (i) {
@@ -927,20 +952,15 @@ async function main() {
 			if (!(i < 5)) {
 				break;
 			}
-			switch (0) {
-				case 0:
-					let __disc_var8 = i;
-					let __match0_var8 = __disc_var8 === 2;
-					let __hit_var8 = false;
-					if (__hit_var8 || __match0_var8) {
-						__hit_var8 = true;
-						i = i + 1;
-						continue;
-					}
-					var t0 = __hit_var8 || !__match0_var8;
-					if (t0) {
-						g(i);
-					}
+			let __disc_var8 = i;
+			let __match0_var8 = __disc_var8 === 2;
+			let __hit_var8 = false;
+			switch (__disc_var8) {
+				case 2:
+					i = i + 1;
+					continue;
+				default:
+					g(i);
 			}
 			i = i + 1;
 		}
@@ -1059,6 +1079,21 @@ async function main() {
 			}
 			i = i + 1;
 		}
+	`);
+
+	// A call/new's own callee used to be printed verbatim, straight from the raw source AST, on the
+	// (mostly true) assumption that a callee has nothing a graph resolution would change -- wrong
+	// specifically when the callee's own OBJECT is itself an effect: `f()` here is materialized as
+	// its own statement (its sole consumer is the pure 'member' node `f().m`, not another effect or
+	// a rebind, so isInlinableEffect can't defer it the way `g(h())` safely does), but the callee was
+	// still reprinted from the untouched original AST -- calling `f()` a SECOND time. Resolving the
+	// callee through the graph (buildEffectExpr) picks up the same `t0` the statement already
+	// declared instead of re-embedding the raw source.
+	check('call: effectful object of a member callee is not re-run', `
+		h(f().m());
+	`, `
+		var t0 = f();
+		h(t0.m());
 	`);
 
 	if (failures) {
