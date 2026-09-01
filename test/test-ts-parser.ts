@@ -45,8 +45,9 @@ function test(name: string, code: string, format = 20) {
 			case 20: {
 				console.log(output.toCode(program));
 				const graph		= vsdg.BuildVSDG(program);
-				const { blockIds, blockControl } = vsdg.applyGlobalCodeMotion(graph);
-				const stmts = new vsdg.Output(graph, blockIds, blockControl).buildProgram();
+				vsdg.Optimize(graph);
+				const { blockIds, blockControl, getLoopDepth } = vsdg.applyGlobalCodeMotion(graph);
+				const stmts = new vsdg.Output(graph, blockIds, blockControl, getLoopDepth).buildProgram();
 				console.log('==== VSDG');
 				console.log(output.toCode(stmts));
 				break;
@@ -87,8 +88,9 @@ async function testAsync(parser: Parser, name: string, filename: string, format 
 			}
 			case 20: {
 				const graph		= vsdg.BuildVSDG(program);
-				const { blockIds, blockControl } = vsdg.applyGlobalCodeMotion(graph);
-				const stmts = new vsdg.Output(graph, blockIds, blockControl).buildProgram();
+				vsdg.Optimize(graph);
+				const { blockIds, blockControl, getLoopDepth } = vsdg.applyGlobalCodeMotion(graph);
+				const stmts = new vsdg.Output(graph, blockIds, blockControl, getLoopDepth).buildProgram();
 				console.log(output.toCode(stmts));
 				break;
 			}

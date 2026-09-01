@@ -1,6 +1,6 @@
 import assert from 'assert';
 import * as TS from '../src/examples/TS/ts-parser';
-import { BuildVSDG, applyGlobalCodeMotion, Output } from '../src/examples/TS/vsdg';
+import { BuildVSDG, Optimize, applyGlobalCodeMotion, Output } from '../src/examples/TS/vsdg';
 import { Output as CodeOutput } from '../src/examples/TS/tocode';
 
 // Regression suite for vsdg.ts's BuildVSDG -> applyGlobalCodeMotion -> Output pipeline: builds
@@ -23,8 +23,9 @@ export const testCases: { name: string; src: string; expected: string }[] = [];
 function compile(src: string): string {
 	const prog		= TS.parse(src);
 	const graph		= BuildVSDG(prog.body);
-	const { blockIds, blockControl } = applyGlobalCodeMotion(graph);
-	const stmts = new Output(graph, blockIds, blockControl).buildProgram();
+	Optimize(graph);
+	const { blockIds, blockControl, getLoopDepth } = applyGlobalCodeMotion(graph);
+	const stmts = new Output(graph, blockIds, blockControl, getLoopDepth).buildProgram();
 	return printer.toCode(stmts as any).trim();
 }
 
@@ -453,12 +454,13 @@ export async function main() {
 			if (i === 7) {
 				break;
 			}
+			var t0 = i + 1;
 			if ((i % 2) === 0) {
-				i = i + 1;
+				i = t0;
 				continue;
 			}
 			n = n + i;
-			i = i + 1;
+			i = t0;
 		}
 		h(n);
 	`);
@@ -721,14 +723,15 @@ export async function main() {
 			let __disc_var8 = i;
 			let __match0_var8 = __disc_var8 === 1;
 			let __hit_var8 = false;
+			var t0 = i + 1;
 			switch (__disc_var8) {
 				case 1:
-					i = i + 1;
+					i = t0;
 					continue;
 				default:
 					h(i);
 			}
-			i = i + 1;
+			i = t0;
 		}
 	`);
 
@@ -927,12 +930,13 @@ export async function main() {
 			if (!(i < 5)) {
 				break;
 			}
+			var t0 = i + 1;
 			if (i === 2) {
-				i = i + 1;
+				i = t0;
 				continue;
 			}
 			sum = sum + i;
-			i = i + 1;
+			i = t0;
 		}
 		h(sum);
 	`);
@@ -961,14 +965,15 @@ export async function main() {
 			let __disc_var8 = i;
 			let __match0_var8 = __disc_var8 === 2;
 			let __hit_var8 = false;
+			var t0 = i + 1;
 			switch (__disc_var8) {
 				case 2:
-					i = i + 1;
+					i = t0;
 					continue;
 				default:
 					g(i);
 			}
-			i = i + 1;
+			i = t0;
 		}
 	`);
 
@@ -1100,6 +1105,55 @@ export async function main() {
 	`, `
 		var t0 = f();
 		h(t0.m());
+	`);
+
+	// optimizeStructuralCSE: two separately-written but structurally identical pure expressions
+	// (not two reads of the same variable -- BuildVSDG creates a fresh graph node per AST
+	// occurrence) collapse to one shared computation. Also regression-covers a real bug found
+	// wiring Optimize into this pipeline: `a`/`b` are function PARAMETERS, so the shared node's own
+	// scheduleEarly position naturally lands at the function_decl's own block (function_decl_0),
+	// which regionRootOf used to resolve to block_entry -- the TOP-LEVEL program, not the function
+	// -- excluding both real consumers from scheduleLate's own LCA constraint and stranding the
+	// shared value outside the function it belongs to, printing `var t0 = a * b;` at the top level
+	// and referencing parameters that don't exist there (a real ReferenceError, not cosmetic).
+	check('structural CSE: two separately-written identical expressions share one computation', `
+		function f(a, b) {
+			g(a * b);
+			h(a * b);
+		}
+	`, `
+		function f(a, b) {
+			var t0 = a * b;
+			g(t0);
+			h(t0);
+		}
+	`);
+
+	// Loop-invariant hoisting: neither `a` nor `b` is ever reassigned inside the loop, so `a * b`
+	// is provably the same value every iteration. scheduleEarly recognizes this via a muValue's own
+	// trivial self-feedback (see its own comment in applyGlobalCodeMotion) and stops the mu-tie from
+	// flooring the value's placement inside the loop; needsTemp's own loop-depth check (comparing a
+	// node's scheduled depth against its consumer's) is what actually forces it to materialize at
+	// its new, shallower position instead of silently being recomputed every iteration anyway via
+	// ordinary single-use inlining.
+	check('loop-invariant hoisting: a*b never changes across iterations, computed once before the loop', `
+		let a = 2;
+		let b = 3;
+		let s = 0;
+		while (cond) {
+			s = s + a * b;
+		}
+	`, `
+		let a = 2;
+		let b = 3;
+		let s = 0;
+		var t0 = a * b;
+		while (true) {
+			if (!cond) {
+				break;
+			}
+			s = s + t0;
+		}
 	`);
 
 	if (failures) {

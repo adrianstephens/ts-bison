@@ -344,6 +344,13 @@ class VSDG extends Map<NodeId, Node> {
 			const down = this.getNode(e.nodeId);
 			down.outputs[e.port] = down.outputs[e.port].filter(e => e.nodeId !== node.id);
 		}
+		// Clears node's OWN inputs too, not just the producers' outputs -- a caller that folds
+		// `node` into a self-contained literal (see foldConstants) but leaves this array stale
+		// left a dangling reference nothing else would ever clean up: harmless for printing (a
+		// literal's own inputs are never read), but a later pass that walks EVERY node's inputs
+		// unconditionally (e.g. applyGlobalCodeMotion's scheduleEarly) would still chase it,
+		// crashing once the now-truly-unreferenced producer got removed by a later CSE pass.
+		node.inputs = [];
 	}
 	removeNode(node: Node) {
 		this.removeInputs(node);
@@ -1795,16 +1802,18 @@ export class Output {
 	declaredNames		= new Set<string>();
 	tempVarCounter		= 0;
 
-	// blockIds/blockControl are GCM's own output (applyGlobalCodeMotion) -- which anchor node a given
-	// (possibly pure/floating) node was scheduled next to, and the reverse lookup from a block's id
-	// back to its anchor node. Both undefined for a caller that constructs an Output directly with no
-	// VSDG graph behind it at all (there's no such caller today, but resolveNode/buildExpr/
-	// emitLocalStatements don't inherently need them -- only buildProgram/emitChain and anything that
-	// reaches a control-anchor node do).
+	// blockIds/blockControl/getLoopDepth are GCM's own output (applyGlobalCodeMotion) -- which
+	// anchor node a given (possibly pure/floating) node was scheduled next to, the reverse lookup
+	// from a block's id back to its anchor node, and how many loops enclose a given block. All
+	// undefined for a caller that constructs an Output directly with no GCM pass behind it at all
+	// (see the no-blocks work this session) -- resolveNode/buildExpr/emitLocalStatements don't
+	// inherently need them, only buildProgram/emitChain/needsTemp's own loop-invariant check do,
+	// and each degrades gracefully (no hoisting-driven materialization without a real schedule).
 	constructor(
 		public graph: Map<NodeId, Node>,
 		private blockIds?: Map<NodeId, BlockId>,
 		private blockControl?: Map<BlockId, NodeId>,
+		private getLoopDepth?: (blockId?: BlockId) => number,
 	) {}
 
 	private blockNodesCache?: Map<BlockId, NodeId[]>;
@@ -1991,6 +2000,23 @@ export class Output {
 		// here, at its own (correctly state-anchored) point instead.
 		if (node.type === 'unary_post_old')
 			return consumers.length > 0;
+		// A value GCM scheduled SHALLOWER (fewer enclosing loops) than one of its own real
+		// consumers is loop-invariant relative to that consumer -- e.g. `a * b` inside a loop
+		// where neither operand is ever reassigned, hoisted by scheduleEarly to before the loop
+		// (see its own comment on a muValue's trivial self-feedback). Inlining it at the
+		// consumer's own position, the way an ordinary single-use value safely would, would
+		// silently recompute it every iteration anyway, discarding the whole point of hoisting it
+		// -- materializing it as its own statement, at its OWN (shallower) position, is the only
+		// way the hoist is ever actually visible in the reconstructed source. Unconditional on
+		// allowReuse/consumer count for the same reason the mu/rebind cases above are: this is a
+		// structural necessity, not a "reused more than once" heuristic. No-ops gracefully without
+		// a real GCM schedule (blockIds/getLoopDepth both undefined -- see the constructor's own
+		// comment), since there's nothing to compare depths against.
+		if (this.blockIds && this.getLoopDepth) {
+			const ownDepth = this.getLoopDepth(this.blockIds.get(node.id));
+			if (consumers.some(e => this.getLoopDepth!(this.blockIds!.get(e.nodeId)) > ownDepth))
+				return true;
+		}
 		return !allowReuse && consumers.length > 1;
 	}
 
@@ -2691,6 +2717,19 @@ export class Output {
 		const nodes = this.nodesAt(control.id);
 
 		if (control.type === 'gamma') {
+			// Anything else GCM scheduled alongside the merge itself needs to be split by whether it's
+			// a DEPENDENCY of the gamma (e.g. a `let a = ...;` the test itself reads -- must print
+			// BEFORE the if) or a DEPENDENT of it (reads the merged result -- prints after). Computed,
+			// and the "before" half emitted, BEFORE the branches themselves: a value CSE shared between
+			// a branch's own content and this gamma's own co-scheduled slot (the exact shape a value
+			// used by BOTH a sibling branch and the code after it takes -- see optimizeStructuralCSE)
+			// must already be registered in nodeVariableNames by the time the branch tries to resolve
+			// it, or it silently re-resolves/duplicates instead of referencing the shared temp (found
+			// the hard way: wiring CSE into the real pipeline surfaced this immediately).
+			const sortedIds	= this.localTopologicalSort(nodes);
+			const gammaIndex	= sortedIds.indexOf(control.id);
+			const beforeStmts	= this.emitLocalStatements(sortedIds.slice(0, gammaIndex));
+
 			// Ports: 0 = predecessor, 1 = condition, 2 = true tail, 3 = false tail.
 			const predecessorId	= control.inputs[0].nodeId;
 			const trueStmts		= this.emitChain(control.inputs[2].nodeId, predecessorId);
@@ -2699,13 +2738,8 @@ export class Output {
 			// `else {}` (see JS.If's own falseStmts check just below).
 			const falseStmts		= control.inputs[3].nodeId !== predecessorId ? this.emitChain(control.inputs[3].nodeId, predecessorId) : undefined;
 
-			// Anything else GCM scheduled alongside the merge itself needs to be split by whether it's
-			// a DEPENDENCY of the gamma (e.g. a `let a = ...;` the test itself reads -- must print
-			// BEFORE the if) or a DEPENDENT of it (reads the merged result -- prints after).
-			const sortedIds	= this.localTopologicalSort(nodes);
-			const gammaIndex	= sortedIds.indexOf(control.id);
 			return [
-				...this.emitLocalStatements(sortedIds.slice(0, gammaIndex)),
+				...beforeStmts,
 				JS.If(
 					this.resolveOperand(control.id, 1),
 					JS.Block(...trueStmts as JS.Statement<any>[]),
@@ -2720,8 +2754,12 @@ export class Output {
 			// BuildVSDG's own 'switch' case), which always stamps switchCases right before returning
 			// -- relied on unconditionally here, not re-checked. Each case's own body is found the
 			// same way a gamma's branches are.
+			// Computed, and the "before" half emitted, BEFORE each case's own content -- same reasoning
+			// as the gamma case just above (a CSE-shared value scheduled here must already be
+			// registered before a case tries to resolve it).
 			const sortedIds	= this.localTopologicalSort(nodes);
 			const scopeIndex	= sortedIds.indexOf(control.id);
+			const beforeStmts	= this.emitLocalStatements(sortedIds.slice(0, scopeIndex));
 
 			// The discriminant's (and each case test's) own GCM schedule is driven entirely by its
 			// GRAPH consumers -- the now-bypassed "hit || matchN" test machinery -- since resolving
@@ -2753,7 +2791,7 @@ export class Output {
 			const switchIsNoOp = cases.every(c => isNoOp(c.consequent));
 
 			return [
-				...this.emitLocalStatements(sortedIds.slice(0, scopeIndex)),
+				...beforeStmts,
 				...forceDeclare(control.switchDiscriminantId!),
 				...control.switchCases!.flatMap(c => c.testNodeId ? forceDeclare(c.testNodeId) : []),
 				...(switchIsNoOp ? [] : [JS.Switch(this.resolveNode(control.switchDiscriminantId!), ...cases) as Statement]),
@@ -2762,6 +2800,12 @@ export class Output {
 		}
 
 		if (control.type === 'except' && typeof control.value !== 'string') {
+			// Computed, and the "before" half emitted, BEFORE try/catch/finally's own content -- same
+			// reasoning as the gamma case above.
+			const sortedIds		= this.localTopologicalSort(nodes);
+			const exceptIndex	= sortedIds.indexOf(control.id);
+			const beforeStmts	= this.emitLocalStatements(sortedIds.slice(0, exceptIndex));
+
 			// Ports: 0 = predecessor, 1 = try's own tail, 2 = catch's own tail, 3 = finally's own tail.
 			const predecessorId	= control.inputs[0].nodeId;
 			const tryStmts		= this.emitChain(control.inputs[1].nodeId, predecessorId);
@@ -2772,10 +2816,8 @@ export class Output {
 			const finallyEdge	= control.inputs[3];
 			const finallyStmts	= finallyEdge ? this.emitChain(finallyEdge.nodeId, control.id) : undefined;
 
-			const sortedIds		= this.localTopologicalSort(nodes);
-			const exceptIndex	= sortedIds.indexOf(control.id);
 			return [
-				...this.emitLocalStatements(sortedIds.slice(0, exceptIndex)),
+				...beforeStmts,
 				{
 					type:			'try',
 					block:			tryStmts as JS.Statement<any>[],
@@ -2788,11 +2830,14 @@ export class Output {
 		}
 
 		if (control.type === 'function_decl') {
-			const bodyStatements	= this.reconstructFunctionBody(control);
+			// Before, then body -- same reasoning as the gamma case above (a function's own body is
+			// its own separate scope, so this is lower-risk than the branch cases, but kept consistent).
 			const sortedIds			= this.localTopologicalSort(nodes);
 			const declIndex			= sortedIds.indexOf(control.id);
+			const beforeStmts			= this.emitLocalStatements(sortedIds.slice(0, declIndex));
+			const bodyStatements	= this.reconstructFunctionBody(control);
 			return [
-				...this.emitLocalStatements(sortedIds.slice(0, declIndex)),
+				...beforeStmts,
 				wrapExported({ ...(control.value as JS.FunctionDecl<any>), body: bodyStatements } as Statement, control.exported),
 				...this.emitLocalStatements(sortedIds.slice(declIndex + 1)),
 			];
@@ -2807,7 +2852,6 @@ export class Output {
 			// those into the mu's own block since there's no other anchor to place them at. Anything
 			// with a real effect continues from the body's own entry, via port 1 (the feedback input).
 			const ownIds		= nodes.filter(id => id !== control.id);
-			const restOfBody	= this.emitChain(control.inputs[1].nodeId, control.id);
 
 			const statements: Statement[] = [];
 
@@ -2819,8 +2863,12 @@ export class Output {
 				// port, one per loop-carried variable) is vestigial, never actually read by codegen.
 				const onlyReadByLoopExit = (testNode.outputs[0] ?? []).filter(e => !this.graph.get(e.nodeId)!.isVestigialEdge(e.port))
 					.every(e => e.nodeId === thetaNode.id);
+				// Emitted BEFORE restOfBody (the loop body's own content, below) -- same reasoning as
+				// the gamma case above: a value CSE shares between the mu's own co-scheduled slot and
+				// the body itself must already be registered by the time the body tries to resolve it.
 				const testStatements	= onlyReadByLoopExit ? [] : this.emitLocalStatements([testId]);
 				const restStatements	= this.emitLocalStatements(ownIds.filter(id => id !== testId));
+				const restOfBody		= this.emitChain(control.inputs[1].nodeId, control.id);
 
 				if (control.loopKind === 'do') {
 					// No rotation needed: the body already runs before the test in do-while's own
@@ -2845,9 +2893,12 @@ export class Output {
 				}
 			} else {
 				// No exit condition could be found at all (shouldn't normally happen -- every `while`
-				// creates a state-theta) -- fall back to reconstructing without rotation.
+				// creates a state-theta) -- fall back to reconstructing without rotation. Own content
+				// emitted before restOfBody, same reasoning as the thetaNode branch above.
+				const restStatements = this.emitLocalStatements(ownIds);
+				const restOfBody = this.emitChain(control.inputs[1].nodeId, control.id);
 				statements.push(JS.While(Literal(true),
-					JS.Block(...this.emitLocalStatements(ownIds) as JS.Statement<any>[], ...restOfBody as JS.Statement<any>[])
+					JS.Block(...restStatements as JS.Statement<any>[], ...restOfBody as JS.Statement<any>[])
 				) as Statement);
 			}
 
@@ -2965,7 +3016,49 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 }
 
 
+// Every NodeId referenced OUTSIDE the ordinary inputs/outputs edge graph -- switchDiscriminantId/
+// switchCases (BuildVSDG's own 'switch' case), returnNodeId/programEndId (function_decl/
+// PROGRAM_START's own anchors), classInfo's superClassNodeId and each member's keyNodeId/
+// entryNodeId/valueNodeId (BuildVSDG's own buildClass). None of foldConstants/foldDeadBranches/
+// optimizeStructuralCSE know about these side channels -- they only rewire inputs/outputs -- so a
+// node reachable ONLY this way must never be removed/merged away, or the reference left pointing
+// at a deleted id (found the hard way: optimizeStructuralCSE merging a switch case's own literal
+// test value into an earlier structurally-identical literal elsewhere left switchCases[].testNodeId
+// dangling, crashing resolveNode). These fields are stamped once during BuildVSDG and never
+// revisited by any of the three passes, so the protected set is stable for one whole Optimize call.
+function collectProtectedNodeIds(graph: VSDG): Set<NodeId> {
+	const ids = new Set<NodeId>();
+	for (const node of graph.values()) {
+		if (node.returnNodeId !== undefined)
+			ids.add(node.returnNodeId);
+		if (node.programEndId !== undefined)
+			ids.add(node.programEndId);
+		if (node.switchDiscriminantId !== undefined)
+			ids.add(node.switchDiscriminantId);
+		for (const c of node.switchCases ?? []) {
+			if (c.testNodeId !== undefined)
+				ids.add(c.testNodeId);
+			ids.add(c.boundaryId);
+			ids.add(c.tailId);
+		}
+		if (node.classInfo) {
+			if (node.classInfo.superClassNodeId !== undefined)
+				ids.add(node.classInfo.superClassNodeId);
+			for (const m of node.classInfo.members) {
+				if (m.keyNodeId !== undefined)
+					ids.add(m.keyNodeId);
+				if (m.entryNodeId !== undefined)
+					ids.add(m.entryNodeId);
+				if (m.valueNodeId !== undefined)
+					ids.add(m.valueNodeId);
+			}
+		}
+	}
+	return ids;
+}
+
 export function Optimize(graph: VSDG): void {
+	const protectedIds = collectProtectedNodeIds(graph);
 	let changed = true;
 
 	while (changed) {
@@ -2977,16 +3070,29 @@ export function Optimize(graph: VSDG): void {
 				changed = true;
 
 			// 2. Try to eliminate dead if/else branches
-			if (foldDeadBranches(graph, node))
+			if (foldDeadBranches(graph, node, protectedIds))
 				changed = true;
 		}
+
+		// 3. Merge structurally-identical pure computations -- runs once per round (it's a
+		// whole-graph pass, not a per-node check like the two above), each round: constant
+		// folding can turn two previously-different expressions into identical ones, and CSE
+		// merging two nodes can turn a previously-non-constant condition into one, so a single
+		// pass over each in isolation wouldn't converge on everything reachable together.
+		if (optimizeStructuralCSE(graph, protectedIds))
+			changed = true;
 	}
 }
 
 
-function foldDeadBranches(graph: VSDG, node: Node): boolean {
+function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): boolean {
 	// We are looking for Gamma nodes (gammaValue or the state gamma)
 	if (node.type !== 'gamma' && node.type !== 'gammaValue')
+		return false;
+	// Never remove a node some out-of-band NodeId field still points at -- see
+	// collectProtectedNodeIds's own comment. A gamma/gammaValue isn't a typical side-channel
+	// target, but this stays a real guard rather than an assumption.
+	if (protectedIds.has(node.id))
 		return false;
 
 	// A gammaValue has [condition, true, false] at ports 0/1/2; the state gamma has an extra
@@ -3007,14 +3113,20 @@ function foldDeadBranches(graph: VSDG, node: Node): boolean {
 		if (!winningEdge)
 			return false;
 
-		// Bypass this Gamma node entirely! 
-		// Find every downstream node that reads from this Gamma node, 
-		// and reconnect them to read directly from the winning branch source.
+		// Bypass this Gamma node entirely!
+		// Find every downstream node that reads from this Gamma node,
+		// and reconnect them to read directly from the winning branch source. Each entry in
+		// node.outputs[port] is CONSUMER-shaped ({nodeId: consumer, port: consumer's own slot}),
+		// the opposite shape from winningEdge (PRODUCER-shaped) -- the consumer's own inputs[]
+		// entry is what actually needs to change, and winningNode's outputs[] needs a fresh,
+		// correctly-shaped descriptor, not the mutated consumer-side one (same pattern
+		// optimizeStructuralCSE already uses correctly, just below).
 		const winningNode = graph.getNode(winningEdge.nodeId);
-		for (const edge of node.outputs[0]) {
-			edge.nodeId = winningEdge.nodeId;
-			edge.port   = winningEdge.port;
-			winningNode.outputs[0].push(edge);
+		for (const subscribers of node.outputs) {
+			for (const consumerEdge of subscribers) {
+				graph.getNode(consumerEdge.nodeId).inputs[consumerEdge.port] = { nodeId: winningEdge.nodeId, port: winningEdge.port };
+				(winningNode.outputs[winningEdge.port] ??= []).push({ nodeId: consumerEdge.nodeId, port: consumerEdge.port });
+			}
 		}
 
 		// Delete the Gamma node and its incoming edges from the graph
@@ -3027,7 +3139,12 @@ function foldDeadBranches(graph: VSDG, node: Node): boolean {
 
 function getStructuralKey(node: Node): string {
 	let key = node.type;
-	if (node.value) {
+	// !== undefined, not a truthy check: a literal's own value is frequently falsy (0, false,
+	// '', null) and still a real, distinct value -- a truthy check collapsed literal(0),
+	// literal(false), literal(''), literal(null), and a valueless node all onto the SAME key
+	// (found the hard way: literal(0) and a function's own synthetic literal(undefined) merged,
+	// producing a spurious extra `return 0;` after the real, always-taken early return).
+	if (node.value !== undefined) {
 		switch (node.type) {
 			case 'binary':
 			case 'unary': key += (node.value as any).operator;
@@ -3039,7 +3156,7 @@ function getStructuralKey(node: Node): string {
 	return key + ':' + node.inputs.map(e => e ? `${e.nodeId}:${e.port}` : '').join(',');
 }
 
-export function optimizeStructuralCSE(graph: VSDG): boolean {
+export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): boolean {
 	let anyChanges = false;
 
 	// Maps a structural string signature back to the first Node that computed it
@@ -3056,6 +3173,14 @@ export function optimizeStructuralCSE(graph: VSDG): boolean {
 
 		// Check if an identical calculation has already been recorded
 		const masterNode = structuralTable.get(key);
+
+		// A protected node (some out-of-band NodeId field still points at it -- see
+		// collectProtectedNodeIds's own comment) must never be the one removed: merging IT away
+		// would leave that field dangling. Left unregistered in structuralTable too (not just
+		// skipped), so it stays its own, separate, un-mergeable node rather than silently
+		// becoming a future duplicate's "master" via a table entry nothing here actually created.
+		if (masterNode && masterNode.id !== node.id && protectedIds.has(node.id))
+			continue;
 
 		if (masterNode && masterNode.id !== node.id) {
 			// Found a duplicate! We must merge 'node' into 'masterNode'.
@@ -3260,6 +3385,29 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 		return root;
 	}
 
+	// A function_decl's own block is deliberately ambiguous for regionRootOf (see its own comment
+	// just above) -- but a PARAM reading that function_decl node directly is never one of the two
+	// ambiguous cases at all: it's unconditionally inside the function, regardless of blockId
+	// sharing. Params read the function_decl node at ports >= 1 (port 0 is reserved for the state
+	// chain -- see BuildVSDG's buildFunctionBody, "port 0 = State, so params occupy port index+1"),
+	// so scheduleEarly uses THIS instead of the function_decl's own block whenever it follows one
+	// of those edges -- otherwise a value derived only from params (e.g. a CSE-shared `a * b`) gets
+	// its own earliestBlock pinned at the function_decl's block, which regionRootOf resolves to
+	// block_entry, excluding it from every real in-function consumer's own scheduleLate constraint
+	// and stranding it outside the function -- referencing parameters that don't exist there.
+	const functionBodyBlockMemo = new Map<NodeId, BlockId>();
+	function functionBodyBlockOf(functionDeclId: NodeId): BlockId {
+		const cached = functionBodyBlockMemo.get(functionDeclId);
+		if (cached !== undefined)
+			return cached;
+		const bodyStart = (graph.get(functionDeclId)!.outputs[0] ?? [])
+			.map(e => graph.get(e.nodeId)!)
+			.find(n => n.type === 'effect' && n.value === 'FUNCTION_BODY_START');
+		const block = (bodyStart && rootBlocks.get(bodyStart.id)) ?? rootBlocks.get(functionDeclId)!;
+		functionBodyBlockMemo.set(functionDeclId, block);
+		return block;
+	}
+
 	// 2. Phase 1: Push everything as early as possible
 	const visitedEarly = new Set<NodeId>();
 
@@ -3292,11 +3440,29 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 			// value (port 0) and its scheduling-anchor edge, if any, ever determine that.
 			if ((node.type === 'mu' || node.type === 'muValue') && port === 1)
 				return;
+			// A muValue's port 2 ties it to its owning mu's own block unconditionally -- correct
+			// for a genuinely loop-carried variable (it can't be computed before the loop it's
+			// carried by even exists), but wrong for one that's never actually reassigned in this
+			// loop at all: its own port-1 feedback is then just a trivial self-loop
+			// (node.inputs[1].nodeId === nodeId), proving it's loop-invariant, so nothing about
+			// this loop should floor its placement -- only its real value-producing edges (port 0,
+			// the initial/only value) should. Loop-invariant hoisting falls out of this for free:
+			// scheduleEarly already computes "as early as legal", so skipping this one floor lets
+			// it land wherever its own (non-loop-carried) inputs actually require.
+			if (node.type === 'muValue' && port === 2 && node.inputs[1]?.nodeId === nodeId)
+				return;
 			scheduleEarly(edge.nodeId);
 			// The current node must be scheduled AFTER its inputs are ready.
-			// We find the deepest block among all inputs.
-			if (blockIds.has(edge.nodeId) && isDeeperThan(blockTree, blockIds.get(edge.nodeId), earliestBlock))
-				earliestBlock = blockIds.get(edge.nodeId)!;
+			// We find the deepest block among all inputs. A param edge (see functionBodyBlockOf's
+			// own comment) uses the function's own body block instead of the function_decl's own
+			// (edge.port is the PRODUCER's own output port here -- port 0 is reserved for the state
+			// chain, so port !== 0 into a function_decl node is unambiguously a param read).
+			const targetNode	= graph.get(edge.nodeId)!;
+			const edgeBlock	= targetNode.type === 'function_decl' && edge.port !== 0
+				? functionBodyBlockOf(edge.nodeId)
+				: blockIds.get(edge.nodeId);
+			if (edgeBlock !== undefined && isDeeperThan(blockTree, edgeBlock, earliestBlock))
+				earliestBlock = edgeBlock;
 		});
 
 		blockIds.set(nodeId, earliestBlock);
@@ -3456,7 +3622,7 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 	for (const nodeId of graph.keys())
 		scheduleLate(nodeId);
 
-	return { blockIds, blockControl };
+	return { blockIds, blockControl, getLoopDepth };
 }
 
 // Wraps a reconstructed statement in `export `/`export default `, per a node's own `exported`
