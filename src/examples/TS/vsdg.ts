@@ -1933,9 +1933,39 @@ function mustNameOwnValue(consumer: Node, port: number): boolean {
 	return consumer.type === 'binary' && ASSIGN_OPS.has((consumer.value as Expr & { type: 'binary' }).operator);
 }
 
+// A real source-level name (`dir`, `sect`, `result`, ...) is only unique WITHIN its own function --
+// two unrelated functions are free to each declare their own local by the same name. A flat
+// `Set<string>` can't tell those apart: whichever one prints first claims the name, and every later,
+// completely unrelated same-named local anywhere else in the file is then treated as "already
+// declared," printed as a bare `name = ...;` reassignment to a name nothing ever actually declared --
+// a guaranteed ReferenceError (ES modules are always strict mode). Found on real code
+// (binary-libs/src/pe.ts): `dir`/`sect`/`result` each reused across unrelated functions, only the
+// first occurrence in the file keeping its `const`. A stack of frames (one pushed per function body --
+// see reconstructFunctionBody) fixes this while still correctly resolving a genuinely CAPTURED
+// variable (declared in an enclosing function, read from a nested one): `has` walks the whole stack
+// outward, `add` only ever writes to the innermost/current frame.
+class ScopedNames {
+	private stack: Set<string>[] = [new Set()];
+	has(name: string): boolean {
+		for (let i = this.stack.length - 1; i >= 0; i--)
+			if (this.stack[i].has(name))
+				return true;
+		return false;
+	}
+	add(name: string): void {
+		this.stack[this.stack.length - 1].add(name);
+	}
+	push(): void {
+		this.stack.push(new Set());
+	}
+	pop(): void {
+		this.stack.pop();
+	}
+}
+
 export class Output {
 	nodeVariableNames	= new Map<NodeId, string>();
-	declaredNames		= new Set<string>();
+	declaredNames		= new ScopedNames();
 	tempVarCounter		= 0;
 
 	// blockIds/blockControl/getLoopDepth are GCM's own output (applyGlobalCodeMotion) -- which
@@ -3074,6 +3104,10 @@ export class Output {
 	// return that survives an EMPTY body (see the Node field's own comment).
 	private reconstructFunctionBody(entryNode: Node): Statement[] {
 		const returnNode		= this.graph.get(entryNode.returnNodeId!)!;
+		// A fresh declaredNames frame per function body (see ScopedNames' own comment): this
+		// function's own locals must never collide with -- or be shadowed by -- an unrelated
+		// sibling/enclosing function's locals that merely happen to share a name.
+		this.declaredNames.push();
 		const bodyStatements	= this.emitChain(returnNode.inputs[0].nodeId, entryNode.id);
 
 		const returnValueNode = this.graph.get(returnNode.inputs[1].nodeId)!;
@@ -3082,6 +3116,7 @@ export class Output {
 		// three are runtime-equivalent, so omitting the trailing statement is never wrong.
 		if (!(returnValueNode.type === 'literal' && returnValueNode.value === undefined))
 			bodyStatements.push({ type: 'return', argument: this.resolveOperand(returnNode.id, 1) } as Statement);
+		this.declaredNames.pop();
 		return bodyStatements;
 	}
 
