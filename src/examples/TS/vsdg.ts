@@ -34,6 +34,13 @@ class Node {
 	// it once via `declKind`, then a plain reassignment) instead of an anonymous `const tN = ...` temp.
 	boundName?:	string;
 	declKind?:	JS.DeclarationKind;
+	// The declarator's own source type annotation (`let x: Foo = ...`), stamped once at var_decl
+	// construction and threaded back through at every reconstruction of `x`'s own declaration.
+	// Without it, an explicitly-typed empty-collection literal (`const result: ExportEntry[] = [];`)
+	// silently reconstructs as an untyped one (`const result = [];`), changing what TS infers for
+	// `result` -- found on real code (binary-libs/src/pe.ts): downstream `.sort((a: ExportEntry,
+	// b: ExportEntry) => ...)` became a real type error once the annotation was gone.
+	typeAnnotation?: TS.Type;
 	// A reassignment whose branch exited (break/continue/return): its merge into "whatever
 	// continues after the if" was skipped entirely (see the 'if' handler's exit-collapse), since
 	// that merge point is unreachable from an exited path -- so it has no value-consumer for
@@ -1057,6 +1064,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							if (v.init)
 								connectValue(getExprNode(v.init), 0, varNode, 0);
 							varNode.declKind = s.kind;
+							varNode.typeAnnotation = v.typeAnnotation;
 							// A declaration is an observable event too, same as a reassignment: `resolveNode`
 							// prints ANY 'var' node as a bare `Identifier(name)` unconditionally (it has to --
 							// that's also how parameters, which really do pre-exist, are read), so nothing
@@ -2442,7 +2450,7 @@ export class Output {
 	private declareOrAssign(name: string, node: Node, expr: Expr): Statement {
 		if (node.declKind && !this.declaredNames.has(name)) {
 			this.declaredNames.add(name);
-			return JS.VarDecl(node.declKind, JS.Var(name, expr)) as Statement;
+			return JS.VarDecl(node.declKind, JS.Var(name, expr, node.typeAnnotation)) as Statement;
 		}
 		this.declaredNames.add(name);
 		return JS.Expression({ type: 'binary', operator: '=', left: Identifier(name), right: expr } as Expr) as Statement;
@@ -2569,12 +2577,12 @@ export class Output {
 					// only way declKind could be 'const' here at all), just not printed under x's own
 					// name any more (inlined elsewhere, or genuinely dead); downgraded to `let` rather
 					// than emitting the syntax-invalid `const x;`.
-					return JS.VarDecl(node.declKind === 'const' ? 'let' : node.declKind, JS.Var(name)) as Statement;
+					return JS.VarDecl(node.declKind === 'const' ? 'let' : node.declKind, JS.Var(name, undefined, node.typeAnnotation)) as Statement;
 				}
 				return this.declareOrAssign(name, node, this.resolveOperand(node.id, 0));
 			}
 			this.declaredNames.add(name);
-			return JS.VarDecl(node.declKind ?? 'let', JS.Var(name)) as Statement;
+			return JS.VarDecl(node.declKind ?? 'let', JS.Var(name, undefined, node.typeAnnotation)) as Statement;
 		}
 		if (node.type === 'unary' || node.type === 'unary_post') {
 			// A prefix or postfix ++/-- already performs its own assignment as a side effect when
