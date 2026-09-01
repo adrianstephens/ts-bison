@@ -143,6 +143,14 @@ class Node {
 	// print inspection, was what actually caught this: `n = n + 1;` prints correctly under either
 	// bug, but silently computes `0 + 1` every call instead of re-reading `n`).
 	capturedRead?: boolean;
+	// Stamped on a 'member' node (`obj.prop`) with the source's own `?.` marker -- `case 'member':`
+	// keeps only `s.property` (a plain string) as `.value`, unlike 'index' (`obj[expr]`), which
+	// keeps the WHOLE original expr object (so its own `.optional` survives for free); this is
+	// `member`'s equivalent, tracked as its own field for the same reason. Dropped entirely before
+	// this field existed: `this.PE.opt?.DataDirectory` silently reconstructed as
+	// `this.PE.opt.DataDirectory`, a real behavior change (throws instead of short-circuiting to
+	// undefined when `opt` is nullish) -- found on real code (binary-libs/src/pe.ts).
+	optional?: boolean;
 	// Stamped on a class's own anchor node (an 'effect' for a class EXPRESSION, a 'passthru' for a
 	// class_decl -- see BuildVSDG's buildClass) with whatever of its own pieces got real VSDG
 	// resolution: the heritage expression, and each member's own computed key / static field value /
@@ -1820,6 +1828,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				case 'member': {
 					process(s);
 					const node = makeNode('member', s.property);
+					node.optional = s.optional;
 					expnodes.set(s, node);
 					connectValue(getExprNode(s.object), 0, node, 0);
 					return false;
@@ -2397,7 +2406,7 @@ export class Output {
 				return { type: 'conditional', test: this.resolveOperand(node.id, 0), consequent, alternate };
 			}
 			case 'member':
-				return JS.Member(this.resolveOperand(node.id, 0), node.value as string);
+				return JS.Member(this.resolveOperand(node.id, 0), node.value as string, node.optional);
 			case 'index': {
 				const idx = node.value as (Expr & {type: 'index'});
 				return { ...idx, object: this.resolveOperand(node.id, 0), property: this.resolveOperand(node.id, 1) };
@@ -3379,6 +3388,11 @@ function getStructuralKey(node: Node): string {
 		switch (node.type) {
 			case 'binary':
 			case 'unary': key += (node.value as any).operator;
+				break;
+			// `obj.prop` and `obj?.prop` are structurally different expressions -- merging them would
+			// silently drop the short-circuit, same failure mode `optional`'s own field comment
+			// documents for reconstruction.
+			case 'member': key += node.value + (node.optional ? '?' : '');
 				break;
 			default: key += node.value;
 		}
