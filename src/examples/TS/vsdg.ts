@@ -1096,11 +1096,56 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					return false;
 
 				case 'for': {
-					// `for...in`/`for...of` are a separate, much bigger feature (iterator protocol,
-					// destructuring targets) -- not attempted here.
-					if (s.kind !== 'normal') {
+					// `for await...of` needs the ASYNC iterator protocol (Symbol.asyncIterator, and
+					// awaiting each `.next()`) -- `await` has no dedicated case anywhere in this file
+					// at all (only 'yield' does), so it's left on the same "not attempted" fallback
+					// for-of/for-in used to sit on entirely.
+					if (s.kind === 'of await') {
 						console.log(`not handling for-${s.kind}`);
 						return process(s);
+					}
+					if (s.kind !== 'normal') {
+						// Desugar to the real (synchronous) iterator protocol, reusing buildLoop's
+						// existing while-shaped mu/theta/break/continue machinery entirely as-is (same
+						// idea as the C-style 'for' desugar just below):
+						//   const __iterN = <iterable>[Symbol.iterator]();
+						//   while (true) {
+						//     const __rN = __iterN.next();
+						//     if (__rN.done) break;
+						//     <binding> = __rN.value;
+						//     <body>
+						//   }
+						// `for...in` reuses the exact same shape over `Object.keys(<iterable>)` instead of
+						// the iterable itself -- an accepted simplification (own enumerable keys only, not
+						// the full prototype-chain walk real for-in does; matches this file's existing
+						// "partial fidelity is fine, silent wrongness is not" bar elsewhere, e.g. class
+						// printing). No `forUpdate` (unlike the C-style 'for' below): there's no separate
+						// update step distinct from the body's own natural top-of-loop advance-and-check,
+						// so an ordinary `continue` (falling through to the top of the while's own body)
+						// already re-runs the advance for the next iteration, exactly like a real for-of's
+						// continue should. The bound name/target (simple identifier, member, index, or a
+						// destructured pattern) is threaded through the SAME existing var_decl/assignment
+						// machinery a normal declaration or reassignment already uses -- including its
+						// existing "not handling destructured declarator" gap-report, unchanged, for a
+						// destructured loop variable.
+						const suffix		= String(nextId++);
+						const iterName		= `__iter${suffix}`;
+						const resultName	= `__r${suffix}`;
+						const iterable		= s.kind === 'in' ? JS.Call<TS.Type>(JS.Member<TS.Type>(Identifier('Object'), 'keys'), [s.right]) : s.right;
+						recurse(JS.VarDecl<TS.Type>('const', JS.Var<TS.Type>(iterName,
+							JS.Call<TS.Type>(JS.Index<TS.Type>(iterable, JS.Member<TS.Type>(Identifier('Symbol'), 'iterator')), [])
+						)), 'statement');
+
+						const value = JS.Member<TS.Type>(Identifier(resultName), 'value');
+						buildLoop(recurse, Literal(true), JS.Block<TS.Type>(
+							JS.VarDecl<TS.Type>('const', JS.Var<TS.Type>(resultName, JS.Call<TS.Type>(JS.Member<TS.Type>(Identifier(iterName), 'next'), []))),
+							{ type: 'if', test: JS.Member<TS.Type>(Identifier(resultName), 'done'), consequent: { type: 'break' } } as JS.Statement<TS.Type>,
+							(s.init.type === 'var_decl'
+								? JS.VarDecl<TS.Type>(s.init.kind, JS.Var<TS.Type>(s.init.declarations[0].name, value))
+								: JS.Expression<TS.Type>({ type: 'binary', operator: '=', left: s.init, right: value } as Expr)) as JS.Statement<TS.Type>,
+							s.body
+						), false);
+						return false;
 					}
 					// 1. Run init exactly once, before the loop -- behaves the same as running it
 					// just before a `while` for every purpose that matters here (nothing else
