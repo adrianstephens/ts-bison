@@ -122,6 +122,21 @@ class Node {
 	// `this` where it doesn't exist. scheduleEarly's own param-edge redirect (see its own comment)
 	// uses this the same way it uses a param's function_decl edge, via functionBodyBlockOf.
 	scopeAnchorId?: NodeId;
+	// Pure ORDERING constraint, not a real dependency: "some other declaration/rebind's own value
+	// transitively reads me, so I must never be scheduled LATER than it." Computed once, after
+	// Optimize, by applyGlobalCodeMotion's own linkOrderingHints (walking each isOwnAnchorTarget
+	// node's value transitively through inlined intermediates -- same traversal shape as
+	// localTopologicalSort's visitDeps). Deliberately NOT stored in inputs/outputs: it must stay
+	// invisible to everything that reads those as real dataflow (needsTemp's own reuse-count check,
+	// resolveOperand/buildExpr, getStructuralKey/CSE, foldConstants/foldDeadBranches's rewiring) --
+	// only scheduleLate's own latestBlock computation ever consults it. Exists because two
+	// same-depth declarations each with their own dedicated anchor (`let i = off, e = i + len;`)
+	// are otherwise indistinguishable, order-wise, from scheduleLate's perspective -- its existing
+	// "prefer closer to latest" tie-break can pick either one for the other's slot, since nothing
+	// in the ordinary dependency graph says which must come first (found on real code: `let e = i +
+	// len; let i = off;`, reading `i` before its own declaration -- see the tracked plan for the
+	// two abandoned, narrower attempts before this one).
+	orderingHints?: NodeId[];
 	// Stamped on whatever node `export`/`export_decl` left behind (via `end`, right after
 	// recursing its own wrapped declaration through the ordinary statement dispatch) -- read back
 	// by whichever print site produces that node's own statement, to wrap it in `export `/
@@ -1022,9 +1037,24 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					return false;
 				}
 				case 'var_decl': {
-					process(s);
+					// Each declarator's own initializer is walked (via `recurse`, not a blanket
+					// `process(s)` up front) THEN immediately bound into scope, one at a time -- not
+					// all initializers first, then all bindings after. Real `let`/`const`/`var`
+					// declarators in ONE statement bind strictly left to right, so `e`'s own
+					// initializer in `let i = off, e = i + len;` must see `i` ALREADY in scope. With
+					// the old "walk everything, then bind everything" order, `e`'s own read of `i`
+					// happened before `i` had a scope entry at all, silently falling back to the
+					// undeclared-external-name path -- a real, disconnected placeholder node sharing
+					// only the STRING "i", not a real graph edge to i's own declaration. Printing
+					// still looked right (name-based resolution doesn't care which node it is), but
+					// anything that actually needs the real edge (GCM scheduling, ordering hints) had
+					// nothing to find (found on real code: `let e = i + len; let i = off;`, reading
+					// `i` before its own declaration -- see the tracked plan for the two GCM-side
+					// fixes tried and reverted before finding this, the actual root cause).
 					for (const v of s.declarations) {
 						if (typeof v.name === 'string') {
+							if (v.init)
+								recurse(v.init, 'expression');
 							// A dedicated wrapper node per declared variable, rather than aliasing directly
 							// to the initializer's node: without it, `let x = 5; let y = 5;` would bind BOTH
 							// names to the very same literal node (or, worse, to whatever a later CSE pass
@@ -1834,11 +1864,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 // needsTemp itself uses at vsdg.ts:1965-1976 -- duplicated here since this asks "am I one of
 // these" about the CONSUMER, where needsTemp asks it about the target of one of the consumer's
 // edges), or a genuine local declaration (declKind set). Shared between Output.needsDirectPlacement
-// (the no-blocks fallback discovery) and applyGlobalCodeMotion's own scheduleEarly/scheduleLate
-// (the real-GCM pin, added after finding a real scheduling bug on real code: treating a port-2 edge
-// as merely an ORDINARY floor let two adjacent declarations at the same loop depth, each with its
-// own dedicated anchor, get scheduleLate-sunk into EACH OTHER'S slot -- `let e = i + len; let i =
-// off;`, reading `i` before its own declaration).
+// (the no-blocks fallback discovery) and applyGlobalCodeMotion's own linkOrderingHints (see its own
+// comment -- two of these at the same loop depth can otherwise be scheduleLate-sunk into EACH
+// OTHER'S slot, since nothing in the ordinary dependency graph says which must come first).
 function isOwnAnchorTarget(node: Node): boolean {
 	if (node.type === 'unary_post')
 		return true;
@@ -1847,6 +1875,78 @@ function isOwnAnchorTarget(node: Node): boolean {
 	if (node.type === 'binary')
 		return ASSIGN_OPS.has((node.value as Expr & { type: 'binary' }).operator);
 	return node.type === 'var' && node.declKind !== undefined;
+}
+
+// The "value" input port to walk for ordering purposes -- a 'var' declaration's own initializer
+// (port 0), or a rebind's own new-value (port 1, e.g. binary10's own right-hand side in `i = i +
+// 1`) -- NOT the "old value"/operand ports (needsTemp's own rebind-target check) or the port-2
+// own-anchor edge itself, neither of which represents "what does my printed value depend on".
+// unary/unary_post (++/--) have no separate value port at all (their own operand IS what's
+// mutated, with no OTHER declaration's value threading through it) -- excluded here for that
+// reason, not because ordering never matters for them.
+function ownValuePort(node: Node): number | undefined {
+	if (node.type === 'var')
+		return 0;
+	if (node.type === 'binary')
+		return 1;
+	return undefined;
+}
+
+// True when `consumer` reads its own producer, at `port`, as a call/new's own CALLEE -- the same
+// port convention BuildVSDG's own 'call'/'new' cases use (`s.arguments.length + 1`, right after
+// every argument) and buildEffectExpr's own callee resolution relies on. Used by needsTemp to keep
+// a member-access callee (`obj.method`) from ever materializing as a standalone temp: see its own
+// comment for why that specifically breaks (the receiver `obj` gets lost).
+function isCalleeEdge(consumer: Node, port: number): boolean {
+	if (consumer.type !== 'effect' || typeof consumer.value !== 'object' || consumer.value === null)
+		return false;
+	const v = consumer.value as { type?: string; arguments?: unknown[] };
+	return (v.type === 'call' || v.type === 'new') && port === (v.arguments?.length ?? 0) + 1;
+}
+
+// Stamps Node.orderingHints (see its own comment): for every isOwnAnchorTarget node E, walks E's
+// own value transitively through non-isOwnAnchorTarget intermediates (same shape as
+// localTopologicalSort's own visitDeps, minus the mu/theta/literal skip -- those never appear on
+// a value chain feeding a declaration/rebind in the first place) to find any OTHER
+// isOwnAnchorTarget node(s) it directly-or-transitively reads, and records, on EACH of those,
+// "I must not be scheduled later than E". Stops at the first isOwnAnchorTarget node found along
+// each path (not past it) -- that node's OWN hint, from its OWN walk, is what propagates any
+// further transitive ordering, via scheduleLate's own recursion order, not a second hint here.
+function linkOrderingHints(graph: Map<NodeId, Node>) {
+	const walked = new Set<NodeId>();
+	function walk(id: NodeId, dependent: Node) {
+		if (walked.has(id))
+			return;
+		walked.add(id);
+		const node = graph.get(id)!;
+		if (isOwnAnchorTarget(node)) {
+			(node.orderingHints ??= []).push(dependent.id);
+			return;
+		}
+		node.inputs.forEach((edge, port) => {
+			if (!edge)
+				return;
+			// A mu/muValue's port 1 is its FEEDBACK edge -- "what I become for the NEXT iteration",
+			// a genuine back-edge, not a real "what do I read" dependency (same exclusion
+			// scheduleEarly's own input-direction walk already needs, for the same reason). Missing
+			// this walked BACKWARD through the next iteration's own value and concluded the
+			// loop-tail's own reassignment must never be scheduled later than the if-branch's --
+			// exactly backwards, forcing it out of the branch and printed unconditionally instead
+			// (found the hard way, immediately, testing this).
+			if ((node.type === 'mu' || node.type === 'muValue') && port === 1)
+				return;
+			walk(edge.nodeId, dependent);
+		});
+	}
+	for (const node of graph.values()) {
+		const port = isOwnAnchorTarget(node) ? ownValuePort(node) : undefined;
+		const edge = port !== undefined ? node.inputs[port] : undefined;
+		if (edge) {
+			walked.clear();
+			walked.add(node.id); // never hint a node against itself
+			walk(edge.nodeId, node);
+		}
+	}
 }
 
 export class Output {
@@ -2017,6 +2117,16 @@ export class Output {
 		// one per loop-carried variable. Left uncounted, a loop with two loop-carried variables would
 		// see the test as "reused" and give it a needless temp even though it's read exactly once.
 		const consumers = (node.outputs[0] ?? []).filter(e => !this.graph.get(e.nodeId)!.isVestigialEdge(e.port) && !this.isCollapsingGammaValueCondition(e));
+		// A member-access expression (`obj.method`) read as a call's own callee must NEVER
+		// materialize as a standalone temp, regardless of what would otherwise force it below (a
+		// loop-invariant hoist, a reuse count > 1): extracting it loses its receiver -- `var t0 =
+		// this.update; t0(x);` calls with `this` undefined instead of the original object, a silent
+		// runtime bug (found on real code, crc16.ts's own updateBuffer -- `this.update`, correctly
+		// recognized as loop-invariant, got hoisted and called through the hoisted name). Checked
+		// first and unconditionally, ahead of every rule below -- simpler and safer than trying to
+		// preserve the receiver through a bound call or `.call(receiver, ...)` rewrite.
+		if (node.type === 'member' && consumers.some(e => isCalleeEdge(this.graph.get(e.nodeId)!, e.port)))
+			return false;
 		// NEITHER of a mu's own input ports -- initial value (0) or feedback (1) -- is ever actually
 		// READ via resolveNode/inlining: the mu itself is what's read everywhere it's used (as a plain
 		// Identifier), never these edges. They're purely structural (what to start the loop-carried
@@ -2230,6 +2340,7 @@ export class Output {
 				}
 				return { ...bin, left: this.resolveOperand(node.id, 0), right: this.resolveOperand(node.id, 1) };
 			}
+			case 'conditional':
 			case 'gammaValue': {
 				// A state gamma never reaches here at all -- reconstructed separately, by
 				// emitControlNode's own 'gamma' case, as a real if/else.
@@ -3442,6 +3553,7 @@ function buildBlockTree(graph: Map<NodeId, Node>) {
 }
 
 export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
+	linkOrderingHints(graph);
 	const blockIds = new Map<NodeId, BlockId>();
 	const { rootBlocks, blockControl, blockTree, getLoopDepth } = buildBlockTree(graph);
 
@@ -3573,13 +3685,18 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 
 		const node = graph.get(nodeId)!;
 
-		// Recursively process all downstream consumers first
+		// Recursively process all downstream consumers first -- and, alongside them, anything
+		// linkOrderingHints recorded as "must not be scheduled later than me" (see Node's own
+		// orderingHints comment): settling those here too is what lets the latestBlock computation
+		// below treat their own final block as a real constraint, not just an ordinary edge.
 		for (const portChannels of node.outputs) {
 			if (!portChannels)
 				continue;
 			for (const consumerEdge of portChannels)
 				scheduleLate(consumerEdge.nodeId);
 		}
+		for (const hintId of node.orderingHints ?? [])
+			scheduleLate(hintId);
 
 		// Find the Least Common Ancestor (LCA) block of all consumers
 		let latestBlock: BlockId | null = null;
@@ -3667,6 +3784,20 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 					? consumerBlock
 					: findLeastCommonAncestor(blockTree, latestBlock, consumerBlock);
 			}
+		}
+
+		// An orderingHints target's own FINAL block (settled above, before this point) caps how late
+		// THIS node can be sunk -- but at the target's own PARENT, not the target's own block
+		// directly: the target's block itself is still a legal (tied-depth) candidate for THIS
+		// node too, and the walk below's own "prefer closest to latest" tie-break would just pick
+		// it right back (the exact swap this whole mechanism exists to prevent). The parent is
+		// "strictly before the target", which is what "must not be scheduled later than" actually
+		// needs here.
+		for (const hintId of node.orderingHints ?? []) {
+			const hintBlock = blockTree.get(blockIds.get(hintId)!) ?? blockIds.get(hintId)!;
+			latestBlock = latestBlock === null
+				? hintBlock
+				: findLeastCommonAncestor(blockTree, latestBlock, hintBlock);
 		}
 
 		// Click's Core Sinking Choice:
