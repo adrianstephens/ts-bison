@@ -1071,8 +1071,24 @@ function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<str
 // explicit-type-args and inferred-from-arguments cases: the caller resolves `map` either way (see
 // `ensureGenericFunc`), this just applies it structurally through params/return type/body alike.
 function substituteTypeParams<N extends Walkable>(node: N, map: ReadonlyMap<string, Type>): N {
-	return walk(node, undefined, undefined, (t, process) =>
-		t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
+	return walk(node,
+		// `checkStmt`'s own `(stmt as any).scope ??= scope` stamp (checker.ts) is a plain, enumerable
+		// property set once, during the *original*, unsubstituted (generic-level, `T` still opaque)
+		// check of this function's body -- `walk`'s own `mapObject` primitive copies it along verbatim,
+		// same reference, onto every rebuilt statement here, still pointing at the stale generic-level
+		// scope (where a type parameter like `N` never resolved to the real per-call-site argument
+		// type). Stripped here so `stmtScope = (s as any).scope ?? ctx.scope` (towasm.ts's own read of
+		// it) correctly falls back to `ctx.scope` -- the *real*, per-instantiation scope this exact
+		// monomorphization builds via `declareParams` -- instead of silently re-deriving a type through
+		// the substituted body's own values via a scope that never learned about the substitution at
+		// all (found via `walker.ts`'s own self-hosting attempt: `{...node}` inside a generic function
+		// resolved `node`'s type as the bare, unsubstituted type parameter itself). Trades away
+		// whatever flow-narrowing the generic-level check had already computed for this statement --
+		// accepted: it could only ever have narrowed the type parameter itself, never the concrete
+		// per-instantiation type this compiled body actually needs.
+		(s, process) => { const built = process(s); delete (built as any).scope; return built; },
+		undefined,
+		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
 	)!;
 }
 
