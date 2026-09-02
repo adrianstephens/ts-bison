@@ -13,23 +13,6 @@ type Statement		= TS.Statement;
 
 type NodeId = string;
 
-// The full vocabulary of Node.type tags. Not a true discriminated union -- most of Node's own
-// optional fields are shared across several of these (forcedPrint spans mutation/unary_post,
-// scopeAnchorId spans muValue and any 'floating' node whose value.type is this/super, ...) rather
-// than exclusive to one, and .type is mutated in place at a few real sites (foldConstants folding
-// a binary/unary into a literal; an arrow/function expression's entry retagged from function_decl
-// to effect) -- so this exists purely to catch a typo'd tag and give autocomplete, not to narrow
-// which other fields are present.
-type NodeType =
-	| 'literal' | 'var'
-	| 'mu' | 'muValue' | 'theta' | 'thetaValue'
-	| 'gamma' | 'gammaValue'
-	| 'break_scope' | 'except'
-	| 'function_decl' | 'passthru' | 'class_decl'
-	| 'effect' | 'member'
-	| 'unary_post' | 'unary_post_old'
-	| 'floating' | 'mutation';
-
 interface Edge {
 	nodeId:	NodeId;
 	port:	number; 
@@ -43,6 +26,56 @@ interface ClassInfo {
 	superClassNodeId?: NodeId;
 	members: ClassMember[];
 };
+
+class RawNode {
+	inputs:		Edge[]		= [];	// inputs[port] = the single source edge feeding this slot
+	outputs:	Edge[][]	= [];	// outputs[port] = every downstream edge consuming this channel
+	constructor(public id: string) {}
+	inDegree()	{ return this.inputs.length; }
+	outDegree() { return this.outputs.reduce((sum, arr) => sum + arr.length, 0); }
+	isUnused(port: number) { return this.outputs[port]?.length === 0; }
+}
+
+// The full vocabulary of Node.type tags. Not a true discriminated union -- most of Node's own
+// optional fields are shared across several of these (forcedPrint spans mutation/unary_post,
+// scopeAnchorId spans muValue and any 'floating' node whose value.type is this/super, ...) rather
+// than exclusive to one, and .type is mutated in place at a few real sites (foldConstants folding
+// a binary/unary into a literal; an arrow/function expression's entry retagged from function_decl
+// to effect) -- so this exists purely to catch a typo'd tag and give autocomplete, not to narrow
+// which other fields are present.
+
+type INode =
+	| { type: 'gamma' }
+	| { type: 'gammaValue', boundName: string }
+	| { type: 'mu', loopEnd?: string}
+	| { type: 'muValue', name: string, scopeAnchorId?: NodeId }
+	| { type: 'theta' }
+	| { type: 'thetaValue', name: string }
+	| { type: 'var'; name: string }
+	| { type: 'break_scope' }
+	| { type: 'except' }
+	| { type: 'function_decl', returnNodeId: NodeId, destructuredParams: Map<JS.BindingTarget, string>; }
+	| { type: 'class_decl', stmt: Statement, classInfo: ClassInfo }
+	| { type: 'passthru', stmt: Statement }
+	| { type: 'effect', name: string }
+	| { type: 'effect', expr: Expr }
+	| { type: 'member', name: string }
+	| { type: 'unary_post', expr: Expr, forcedPrint?: boolean }
+	| { type: 'unary_post_old', expr: Expr }
+	| { type: 'floating', expr: Expr, scopeAnchorId?: NodeId }
+	| { type: 'mutation', expr: Expr, forcedPrint?: boolean, boundName: string }
+	;
+
+type NodeType = INode['type'];
+
+// A concrete node: RawNode's edge machinery plus one INode variant's own payload, inferred
+// from the literal passed to MakeNode so `n.type` narrows the rest of `n` at the call site.
+type MadeNode<N extends INode = INode> = RawNode & N;
+
+function MakeNode<N extends INode>(id: string, inode: N): MadeNode<N> {
+	return Object.assign(new RawNode(id), inode);
+}
+
 
 class Node {
 	inputs:		Edge[]		= [];	// inputs[port] = the single source edge feeding this slot
@@ -1270,7 +1303,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 			// twice (a nested call like `f(g())` would compile `g` to run twice).
 			switch (s.type) {
 				case 'literal':
-					makeExprNode(s, 'literal');
+					// A literal is just a 'floating' node whose expr.type is 'literal' -- no dedicated
+					// tag (foldConstants folds a binary/unary into one in place, same shape).
+					makeExprNode(s);
 					return false;
 
 				case 'identifier':
@@ -1902,9 +1937,6 @@ export function BuildProgram(
 
 	function buildExpr(node: Node): Expr {
 		switch (node.type) {
-			case 'literal':
-				return node.expr!;
-
 			case 'unary_post':
 				return { ...(node.expr as Expr & {type: 'unary_post'}), operand: resolveTarget(node.id, 0) };
 			case 'unary_post_old':
@@ -1919,6 +1951,7 @@ export function BuildProgram(
 			case 'floating': {
 				const expr = node.expr!;
 				switch (expr.type) {
+					case 'literal':
 					case 'this':
 					case 'super':
 						return expr;
@@ -1999,7 +2032,7 @@ export function BuildProgram(
 		// not needed for a bare literal, which costs nothing to duplicate. allowReuse (only for a
 		// literal initializer) exempts just that heuristic; needsTemp's structural checks (a mu's
 		// initial-value port needing a real mutable variable, chief among them) stay in force.
-		return !needsTemp(node, graph.get(node.inputs[0].nodeId)!.type === 'literal');
+		return !needsTemp(node, isLiteralNode(graph.get(node.inputs[0].nodeId)!));
 	}
 
 	// Conservative, single-pass purity check over `node`'s own transitive inputs: true only if NO
@@ -2112,9 +2145,6 @@ export function BuildProgram(
 			return Identifier(switchInternalName);
 
 		switch (node.type) {
-			case 'literal':
-				return node.expr!;
-
 			// A local declaration left bare (see isInlinableVarDecl) never actually assigned its name --
 			// its sole reader inlines the pure initializer directly. Skipped when a forced sibling
 			// exists: some other node already resolves via Identifier(name), and inlining here too
@@ -2176,7 +2206,7 @@ export function BuildProgram(
 		// inputs -- a mu's port-1 feedback edge in particular points at whatever the loop body
 		// computes from the mu itself, so following it here would be both unnecessary and cyclic.
 		const hasOrderedInputs = (node: Node) =>
-			node.type !== 'mu' && node.type !== 'muValue' && node.type !== 'theta' && node.type !== 'thetaValue' && node.type !== 'literal'
+			node.type !== 'mu' && node.type !== 'muValue' && node.type !== 'theta' && node.type !== 'thetaValue' && !isLiteralNode(node)
 			&& (node.type !== 'var' || node.declKind !== undefined);
 
 		// Before emitting `node`, everything it depends on must be emitted first -- including
@@ -2278,18 +2308,22 @@ export function BuildProgram(
 				continue;
 			}
 
+			// A pure literal is read directly by resolveNode, never its own statement -- same as the
+			// var/mu/... group below (a 'floating' literal has no dedicated tag to list there).
+			if (isLiteralNode(node))
+				continue;
+
 			switch (node.type) {
-				case 'literal':
 				case 'var':
 				case 'mu':
 				case 'muValue':
 				case 'theta':
 				case 'thetaValue':
 				case 'effect':
-					// No statement of their own: literals/vars/mu/muValue/theta/thetaValue are read
-					// directly by resolveNode, and non-call effect nodes reaching here are internal
-					// bookkeeping markers with no source-level representation (BREAK/CONTINUE/THROW/
-					// EARLY_RETURN are already intercepted above).
+					// No statement of their own: vars/mu/muValue/theta/thetaValue are read directly by
+					// resolveNode, and non-call effect nodes reaching here are internal bookkeeping
+					// markers with no source-level representation (BREAK/CONTINUE/THROW/EARLY_RETURN are
+					// already intercepted above).
 					break;
 
 				case 'passthru':
@@ -2610,6 +2644,12 @@ export function BuildProgram(
 
 }
 
+// A constant: a 'floating' node whose own expr is a literal (an original literal, or one
+// foldConstants folded a binary/unary into in place -- same shape, no distinct tag).
+function isLiteralNode(node: Node): node is Node & { expr: Expr & { type: 'literal' } } {
+	return node.type === 'floating' && node.expr?.type === 'literal';
+}
+
 function foldConstants(graph: VSDG, node: Node): boolean {
 	// 'mutation' is deliberately excluded (not just practically inert, since calcUnary has no
 	// '++'/'--' case and a real assignment's left operand is never itself a literal) -- folding a
@@ -2630,14 +2670,12 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 			const right = graph.getNode(rightEdge.nodeId);
 
 			// If both inputs are constants, we can fold them!
-			if (left.type === 'literal' && right.type === 'literal') {
-				const r = calcBinary(expr.operator, (left.expr as Expr & { type: 'literal' }).value, (right.expr as Expr & { type: 'literal' }).value);
+			if (isLiteralNode(left) && isLiteralNode(right)) {
+				const r = calcBinary(expr.operator, left.expr.value, right.expr.value);
 				if (r !== undefined) {
-					// 1. Change this node into a pure Constant node
-					node.type = 'literal';
+					// Fold in place into a literal (a 'floating' node with a literal expr), then
+					// drop the now-meaningless incoming edges.
 					node.expr = Literal(r);
-
-					// 2. Remove the incoming edges since it no longer computes anything
 					graph.removeInputs(node);
 					return true; // Graph was modified!
 				}
@@ -2650,14 +2688,10 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 				return false;
 
 			const operand	= graph.getNode(edge.nodeId);
-			if (operand.type === 'literal') {
-				const r = calcUnary(expr.operator, (operand.expr as Expr & { type: 'literal' }).value);
+			if (isLiteralNode(operand)) {
+				const r = calcUnary(expr.operator, operand.expr.value);
 				if (r !== undefined) {
-					// 1. Change this node into a pure Constant node
-					node.type = 'literal';
 					node.expr = Literal(r);
-
-					// 2. Remove the incoming edges since it no longer computes anything
 					graph.removeInputs(node);
 					return true; // Graph was modified!
 				}
@@ -2760,9 +2794,9 @@ function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): b
 	const condNode = graph.getNode(condEdge.nodeId);
 
 	// If the condition is a known constant boolean (or truthy/falsy value)
-	if (condNode.type === 'literal') {
+	if (isLiteralNode(condNode)) {
 		// Find the edge representing the winning path (true path, then false path)
-		const winningEdge = graph.getEdge0(node, (condNode.expr as Expr & { type: 'literal' }).value ? port + 1 : port + 2);
+		const winningEdge = graph.getEdge0(node, condNode.expr.value ? port + 1 : port + 2);
 		if (!winningEdge)
 			return false;
 
