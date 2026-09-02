@@ -3,6 +3,7 @@ import * as JS from './js-parser';
 import * as TS from './ts-parser';
 import { Identifier, Literal } from '../common';
 import { Walkable, walkB, calcUnary, calcBinary, RecurseB, isJsStatement, isTsDeclaration } from './walker';
+import { patternBindings as buildPatternBindings } from './transform';
 
 const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
 type Expr			= TS.Expr;
@@ -2154,43 +2155,32 @@ function isOwnAnchorTarget(node: Node): boolean {
 // already be a stable, side-effect-free reference (a hidden temp name the caller bound the real
 // initializer/param/catch-value to ONCE), never the raw initializer expression itself: an array/
 // object pattern reads its own value MULTIPLE times (once per element/property), and re-evaluating
-// an effectful initializer that many times would silently re-run it. Mirrors towasm.ts's own
-// patternBindings (same overall shape, same `??`-based default simplification -- real default-value
-// semantics use an `=== undefined` check, not `??`, which also triggers on `null`, but reusing `??`'s
-// own single-evaluation-of-the-left codegen wholesale beats hand-rolling a second copy of that exact
-// logic, and towasm.ts's own comment already documents this as a deliberate, accepted approximation)
-// and the same two deliberate scope boundaries (no computed keys, no object rest -- a genuinely new
-// "all fields except these" object type isn't modeled). Unlike towasm.ts's own version, `kind` is a
-// real parameter, not hardcoded to 'const': a `let`-destructured binding that's later reassigned
-// needs to stay reassignable, or the reconstructed source is invalid TypeScript.
+// an effectful initializer that many times would silently re-run it. transform.ts's own
+// patternBindings (shared with towasm.ts) does this same desugaring, and can be reused as-is here
+// rather than keeping a second copy: it recurses on a nested array-rest pattern too (real JS
+// allows one, `[a, ...{length}] = arr`), unlike this file's OWN prior version, which left that
+// specific case to embed the nested pattern directly as a `var_decl`'s own name instead -- verified
+// that's still fully, correctly flattened here regardless, since every call site below already
+// feeds patternBindings' own output back through `recurse(stmt, 'statement')`, which re-enters
+// `case 'var_decl':`, which recurses into any non-string declarator name it finds -- the exact same
+// flattening, just one round-trip through that existing mechanism instead of transform.ts's own
+// internal recursion doing it directly.
+//
+// One real behavioral difference remains, wrapped below rather than reconciled: transform.ts's
+// version hard-throws (a bare string, not an Error) on the two gaps it doesn't cover (a rest
+// PROPERTY in an object pattern, a computed property key) -- unlike every other unhandled construct
+// in this file, which degrades gracefully (log + skip just that one piece, keep compiling). Because
+// that recursion is entirely internal to transform.ts's own function, the throw unwinds through
+// every level of it -- catching it here can only discard the WHOLE pattern's bindings, not just the
+// one offending leaf (coarser than this file's prior per-leaf handling of these two specific gaps).
+// Accepted since both are already rare, already-unsupported constructs.
 function patternBindings(kind: JS.DeclarationKind, target: JS.BindingTarget, valueExpr: Expr): Statement[] {
-	if (typeof target === 'string')
-		return [JS.VarDecl<TS.Type>(kind, JS.Var<TS.Type>(target, valueExpr)) as Statement];
-
-	if (target.type === 'array_pattern') {
-		const stmts = target.elements.flatMap((el, i): Statement[] => {
-			if (!el)
-				return [];
-			const elemExpr: Expr = JS.Index<TS.Type>(valueExpr, Literal(i));
-			return patternBindings(kind, el.target, el.default ? { type: 'binary', operator: '??', left: elemExpr, right: el.default } as Expr : elemExpr);
-		});
-		if (target.rest)
-			stmts.push(...patternBindings(kind, target.rest, JS.Call<TS.Type>(JS.Member<TS.Type>(valueExpr, 'slice'), [Literal(target.elements.length)])));
-		return stmts;
-	}
-
-	if (target.rest) {
-		console.log(`not handling destructured object rest`);
+	try {
+		return buildPatternBindings(kind, target, valueExpr);
+	} catch (e) {
+		console.log(`not handling destructuring pattern: ${e}`);
 		return [];
 	}
-	return target.properties.flatMap((prop): Statement[] => {
-		if (typeof prop.key !== 'string') {
-			console.log(`not handling computed key in destructuring pattern`);
-			return [];
-		}
-		const propExpr: Expr = JS.Member<TS.Type>(valueExpr, prop.key);
-		return patternBindings(kind, prop.value, prop.default ? { type: 'binary', operator: '??', left: propExpr, right: prop.default } as Expr : propExpr);
-	});
 }
 
 // True when `consumer` reads its own producer, at `port`, as a call/new's own CALLEE -- the same
