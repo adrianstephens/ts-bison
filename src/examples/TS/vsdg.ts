@@ -209,7 +209,7 @@ class Node {
 	//    its mu source (port 1) instead -- the condition edge exists only so GCM can see the dependency
 	//    that makes the export valid no earlier than loop-exit, never because codegen reads it.
 	isVestigialEdge(port: number): boolean {
-		if (this.type === 'binary' && port === 0
+		if (this.type === 'pure' && (this.value as Expr).type === 'binary' && port === 0
 			&& ASSIGN_OPS.has((this.value as Expr & { type: 'binary' }).operator)
 			&& (this.value as Expr & { type: 'binary' }).operator === '='
 		)
@@ -223,7 +223,7 @@ class Node {
 		// (which has no other way to tell a scheduling-only edge from a real value dependency) walks
 		// straight into the marker -- an 'effect' node -- and wrongly calls the WHOLE subgraph
 		// impure, even when nothing in the actual value chain has any real effect at all.
-		if ((this.type === 'var' || this.type === 'binary') && port === 2)
+		if ((this.type === 'var' || (this.type === 'pure' && (this.value as Expr).type === 'binary')) && port === 2)
 			return true;
 		// A state gamma's true/false-tail ports (2/3) are structural only: Output's own emitChain
 		// walks `control.inputs[2]/[3]` directly (backward from each branch's own tail) to find where
@@ -486,7 +486,15 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// would double-process the same expression object.
 	const loopUpdateStack: (Expr | undefined)[] = [];
 
-	function makeExprNode(expr: Expr, type: string = expr.type) {
+	// The VSDG node's own type used to default to expr.type -- redundant, since node.value already
+	// IS the original expr object (its own .type field is right there, and reading it through the
+	// value gets TypeScript's real discriminated-union narrowing for free instead of the `as Expr &
+	// {type: 'binary'}`-style casts that redundancy needed everywhere). 'pure' is the uniform tag
+	// for every ordinary value-producing expression node (unary/binary/call-when-pure/index/
+	// conditional/array/object/spread) -- exactly mirroring how an EFFECTFUL expression node
+	// (yield/tagged_template/class/jsx/arrow/function/call-when-impure/await) already gets the
+	// uniform 'effect' tag instead of its own expr.type, for the same reason.
+	function makeExprNode(expr: Expr, type = 'pure') {
 		const node = makeNode(type, expr);
 		expnodes.set(expr, node);
 		return node;
@@ -2052,10 +2060,13 @@ export function BuildVSDG(ast: Walkable): VSDG {
 function isOwnAnchorTarget(node: Node): boolean {
 	if (node.type === 'unary_post')
 		return true;
-	if (node.type === 'unary')
-		return ['++', '--'].includes((node.value as Expr & { type: 'unary' }).operator);
-	if (node.type === 'binary')
-		return ASSIGN_OPS.has((node.value as Expr & { type: 'binary' }).operator);
+	if (node.type === 'pure') {
+		const expr = node.value as Expr;
+		if (expr.type === 'unary')
+			return ['++', '--'].includes(expr.operator);
+		if (expr.type === 'binary')
+			return ASSIGN_OPS.has(expr.operator);
+	}
 	return node.type === 'var' && node.declKind !== undefined;
 }
 
@@ -2131,9 +2142,12 @@ function mustNameOwnValue(consumer: Node, port: number): boolean {
 		return false;
 	if (consumer.type === 'unary_post')
 		return true;
-	if (consumer.type === 'unary')
-		return ['++', '--'].includes((consumer.value as Expr & { type: 'unary' }).operator);
-	return consumer.type === 'binary' && ASSIGN_OPS.has((consumer.value as Expr & { type: 'binary' }).operator);
+	if (consumer.type !== 'pure')
+		return false;
+	const expr = consumer.value as Expr;
+	if (expr.type === 'unary')
+		return ['++', '--'].includes(expr.operator);
+	return expr.type === 'binary' && ASSIGN_OPS.has(expr.operator);
 }
 
 // A real source-level name (`dir`, `sect`, `result`, ...) is only unique WITHIN its own function --
@@ -2363,7 +2377,7 @@ export class Output {
 	// been. (The state gamma never reaches here at all -- slotName() only ever returns something
 	// for gammaValue/named-except, so every caller already gates on that first.)
 	private isInlinableSlot(node: Node): boolean {
-		return (node.type === 'binary' || node.type === 'gammaValue') && !node.forcedPrint
+		return ((node.type === 'pure' && (node.value as Expr).type === 'binary') || node.type === 'gammaValue') && !node.forcedPrint
 			&& (node.neverMaterialize || !this.needsTemp(node));
 	}
 
@@ -2476,6 +2490,23 @@ export class Output {
 		return { ...value, callee, arguments: value.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
 	}
 
+	// Shared by 'pure''s own 'conditional' case and the outer 'gammaValue' case -- a gammaValue is
+	// a per-variable value merge, reconstructed as a ternary (exactly what it means), the same shape
+	// a real conditional expression already is; the state gamma itself never reaches here at all
+	// (reconstructed separately, by emitControlNode's own 'gamma' case, as a real if/else).
+	private buildConditional(node: Node): Expr {
+		const consequent	= this.resolveOperand(node.id, 1);
+		const alternate	= this.resolveOperand(node.id, 2);
+		// Both operands can genuinely resolve to the SAME bare name -- e.g. a broken-out merge (see
+		// reconcileVariables's own neverMaterialize case) where the live side is still the original
+		// declaration, itself read elsewhere too many times to inline: reading that name is correct
+		// EITHER way (the reassignment already happened, in place, before the exit), so the
+		// condition is pure noise -- `cond ? x : x` always just equals `x`.
+		if (consequent.type === 'identifier' && alternate.type === 'identifier' && consequent.name === alternate.name)
+			return consequent;
+		return { type: 'conditional', test: this.resolveOperand(node.id, 0), consequent, alternate };
+	}
+
 	private buildExpr(node: Node): Expr {
 		switch (node.type) {
 			case 'literal':
@@ -2485,84 +2516,70 @@ export class Output {
 			case 'super':
 				return { type: node.type };
 
-			case 'unary': {
-				const un = node.value as (Expr & {type: 'unary'});
-				return { ...un, operand: this.resolveOperand(node.id, 0) };
-			}
-			case 'unary_post': {
-				const un = node.value as (Expr & {type: 'unary_post'});
-				return { ...un, operand: this.resolveOperand(node.id, 0) };
-			}
+			case 'unary_post':
+				return { ...(node.value as Expr & {type: 'unary_post'}), operand: this.resolveOperand(node.id, 0) };
 			case 'unary_post_old':
 				return this.resolveOperand(node.id, 0);
-			case 'array': {
-				const arr = node.value as (Expr & {type: 'array'});
-				return { ...arr, elements: arr.elements.map((elem, i) => elem ? this.resolveOperand(node.id, i) : elem) };
-			}
-			case 'object': {
-				const obj = node.value as (Expr & {type: 'object'});
-				return {
-					...obj,
-					properties: obj.properties.map((prop, i) =>
-						prop.type === 'spread' ? { ...prop, operand: this.resolveOperand(node.id, i) }
-						: prop.type === 'field' && typeof prop.key === 'string' ? { ...prop, value: this.resolveOperand(node.id, i) }
-						: prop
-					),
-				};
-			}
-			case 'spread': {
-				const sp = node.value as (Expr & {type: 'spread'});
-				return { ...sp, operand: this.resolveOperand(node.id, 0) };
-			}
-			case 'binary': {
-				const bin = node.value as (Expr & {type: 'binary'});
-				if (ASSIGN_OPS.has(bin.operator)) {
-					// Reaching here (rather than declareOrAssign) means this assignment node was
-					// superseded by an if/else merge -- it's not being printed as its own `x = ...;`
-					// statement, so what's needed is just the VALUE it would have produced: the right
-					// operand for a plain `=`, or the computed result for a compound `+=`/`-=`/etc.
-					// (Reconstructing the full `left = right` syntax here, as the generic case below
-					// does, would wrongly re-print the assignment itself as part of a value expression.)
-					const right = this.resolveOperand(node.id, 1);
-					return bin.operator === '='
-						? right
-						: { type: 'binary', operator: bin.operator.slice(0, -1) as JS.binaryOps, left: this.resolveOperand(node.id, 0), right };
-				}
-				return { ...bin, left: this.resolveOperand(node.id, 0), right: this.resolveOperand(node.id, 1) };
-			}
-			case 'conditional':
-			case 'gammaValue': {
-				// A state gamma never reaches here at all -- reconstructed separately, by
-				// emitControlNode's own 'gamma' case, as a real if/else.
-				// A gammaValue is a pure per-variable value merge -- reconstruct it as a ternary,
-				// which is exactly what it means.
-				const consequent	= this.resolveOperand(node.id, 1);
-				const alternate	= this.resolveOperand(node.id, 2);
-				// Both operands can genuinely resolve to the SAME bare name -- e.g. a broken-out
-				// merge (see reconcileVariables's own neverMaterialize case) where the live side is
-				// still the original declaration, itself read elsewhere too many times to inline:
-				// reading that name is correct EITHER way (the reassignment already happened, in
-				// place, before the exit), so the condition is pure noise -- `cond ? x : x` always
-				// just equals `x`.
-				if (consequent.type === 'identifier' && alternate.type === 'identifier' && consequent.name === alternate.name)
-					return consequent;
-				return { type: 'conditional', test: this.resolveOperand(node.id, 0), consequent, alternate };
-			}
 			case 'member':
 				return JS.Member(this.resolveOperand(node.id, 0), node.value as string, node.optional);
-			case 'index': {
-				const idx = node.value as (Expr & {type: 'index'});
-				return { ...idx, object: this.resolveOperand(node.id, 0), property: this.resolveOperand(node.id, 1) };
+			case 'gammaValue':
+				return this.buildConditional(node);
+
+			// Every ordinary, value-producing expression (unary/binary/call-when-pure/index/
+			// conditional/array/object/spread) shares this one tag -- see makeExprNode's own comment
+			// for why -- so node.value's own .type (the real, original AST expression, discriminated-
+			// union-narrowed for free instead of an `as Expr & {type: ...}` cast) is what actually
+			// picks the shape here, not a second, redundant VSDG-level tag.
+			case 'pure': {
+				const expr = node.value as Expr;
+				switch (expr.type) {
+					case 'unary':
+						return { ...expr, operand: this.resolveOperand(node.id, 0) };
+					case 'array':
+						return { ...expr, elements: expr.elements.map((elem, i) => elem ? this.resolveOperand(node.id, i) : elem) };
+					case 'object':
+						return {
+							...expr,
+							properties: expr.properties.map((prop, i) =>
+								prop.type === 'spread' ? { ...prop, operand: this.resolveOperand(node.id, i) }
+								: prop.type === 'field' && typeof prop.key === 'string' ? { ...prop, value: this.resolveOperand(node.id, i) }
+								: prop
+							),
+						};
+					case 'spread':
+						return { ...expr, operand: this.resolveOperand(node.id, 0) };
+					case 'binary': {
+						if (ASSIGN_OPS.has(expr.operator)) {
+							// Reaching here (rather than declareOrAssign) means this assignment node was
+							// superseded by an if/else merge -- it's not being printed as its own `x = ...;`
+							// statement, so what's needed is just the VALUE it would have produced: the right
+							// operand for a plain `=`, or the computed result for a compound `+=`/`-=`/etc.
+							// (Reconstructing the full `left = right` syntax here, as the generic case below
+							// does, would wrongly re-print the assignment itself as part of a value expression.)
+							const right = this.resolveOperand(node.id, 1);
+							return expr.operator === '='
+								? right
+								: { type: 'binary', operator: expr.operator.slice(0, -1) as JS.binaryOps, left: this.resolveOperand(node.id, 0), right };
+						}
+						return { ...expr, left: this.resolveOperand(node.id, 0), right: this.resolveOperand(node.id, 1) };
+					}
+					case 'conditional':
+						return this.buildConditional(node);
+					case 'index':
+						return { ...expr, object: this.resolveOperand(node.id, 0), property: this.resolveOperand(node.id, 1) };
+					case 'call':
+						// A PURE call (no observable side effects, so it never threads through the state
+						// chain -- see the `pure` check in BuildVSDG's 'call' case) keeps the SAME uniform
+						// 'pure' tag any other pure value gets, unlike an effectful one (always 'effect').
+						// It's otherwise just an ordinary value node: scheduled and (via needsTemp)
+						// materialized-or-inlined the same as any pure expression.
+						return { ...expr, arguments: expr.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
+					default:
+						console.log(`not handling pure value node ${expr.type}`);
+						return Literal(null);
+				}
 			}
-			case 'call': {
-				// A PURE call (no observable side effects, so it never threads through the state
-				// chain -- see the `pure` check in BuildVSDG's 'call' case) keeps its literal `.value.type`
-				// ('call') as its OWN node type too, unlike an effectful one (always 'effect'). It's
-				// otherwise just an ordinary value node: scheduled and (via needsTemp) materialized-or-
-				// inlined the same as any pure expression.
-				const call = node.value as (Expr & {type: 'call'});
-				return { ...call, arguments: call.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
-			}
+
 			case 'effect':
 				// Reaching here means an inlinable EFFECTFUL call (see emitLocalStatements' own
 				// isEffect branch) was left unmaterialized and its sole consumer is now resolving it
@@ -2740,7 +2757,7 @@ export class Output {
 			this.declaredNames.add(name);
 			return JS.VarDecl(node.declKind ?? 'let', JS.Var(name, undefined, node.typeAnnotation)) as Statement;
 		}
-		if (node.type === 'unary' || node.type === 'unary_post') {
+		if ((node.type === 'pure' && (node.value as Expr).type === 'unary') || node.type === 'unary_post') {
 			// A prefix or postfix ++/-- already performs its own assignment as a side effect when
 			// evaluated -- printed as a bare expression statement, `++i;`/`i++;` is both correct and
 			// sufficient. Routing it through declareOrAssign like an ordinary reassignment would wrap
@@ -3071,7 +3088,7 @@ export class Output {
 		// isInlinableVarDecl/hasRealConsumer-driven elision for a genuinely dead 'var' declaration
 		// already lives entirely inside emitNamedSlot (down to a bare `let x;` or nothing at all),
 		// so a 'var' is always safe to force-include unconditionally here and let it make that call.
-		return node.type !== 'binary' || !this.isInlinableSlot(node);
+		return !(node.type === 'pure' && (node.value as Expr).type === 'binary') || !this.isInlinableSlot(node);
 	}
 
 	// Which nodes GCM scheduled alongside a given control-anchor node (blockNodes, keyed via the
@@ -3389,7 +3406,10 @@ export class Output {
 }
 
 function foldConstants(graph: VSDG, node: Node): boolean {
-	switch (node.type) {
+	if (node.type !== 'pure')
+		return false;
+	const expr = node.value as Expr;
+	switch (expr.type) {
 		case 'binary': {
 			// Find the incoming value edges for this node
 			const leftEdge	= graph.getEdge0(node, 0);
@@ -3403,7 +3423,6 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 
 			// If both inputs are constants, we can fold them!
 			if (left.type === 'literal' && right.type === 'literal') {
-				const expr = node.value as (Expr & {type: 'binary'});
 				const r = calcBinary(expr.operator, left.value, right.value);
 				if (r !== undefined) {
 					// 1. Change this node into a pure Constant node
@@ -3424,7 +3443,6 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 
 			const operand	= graph.getNode(edge.nodeId);
 			if (operand.type === 'literal') {
-				const expr = node.value as (Expr & {type: 'unary'});
 				const r = calcUnary(expr.operator, operand.value);
 				if (r !== undefined) {
 					// 1. Change this node into a pure Constant node
@@ -3440,7 +3458,6 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 		}
 	}
 	return false;
-			
 }
 
 
@@ -3573,7 +3590,13 @@ function getStructuralKey(node: Node): string {
 	// (found the hard way: literal(0) and a function's own synthetic literal(undefined) merged,
 	// producing a spurious extra `return 0;` after the real, always-taken early return).
 	if (node.value !== undefined) {
-		switch (node.type) {
+		// A 'pure' node's own real discriminator lives in node.value's own .type now (see
+		// makeExprNode's own comment), not node.type -- only 'binary'/'unary' need the special
+		// operator-only key (matching two structurally-different-but-same-operator expressions is
+		// otherwise still correctly told apart by node.inputs, appended below); every other 'pure'
+		// shape (array/object/call/index/conditional/spread) falls to the same JSON.stringify
+		// default any OTHER node type without special handling already used.
+		switch (node.type === 'pure' ? (node.value as Expr).type : node.type) {
 			case 'binary':
 			case 'unary': key += (node.value as any).operator;
 				break;
@@ -3619,7 +3642,13 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 		// structurally-identical ones collapses that into ONE shared, persistent instance --
 		// mutating it in one place (`result.push(...)`) leaks into every other site that reads
 		// the "same" literal, across calls and even across unrelated functions.
-		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super', 'array', 'object'].includes(node.type))
+		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super'].includes(node.type))
+			continue;
+		// 'array'/'object' can't be listed by name any more (see makeExprNode's own comment -- both
+		// now share the uniform 'pure' tag with every other ordinary value expression), so the check
+		// moves to node.value's own .type instead -- same exclusion, same reasoning, just following
+		// where the real discriminator lives now.
+		if (node.type === 'pure' && ((node.value as Expr).type === 'array' || (node.value as Expr).type === 'object'))
 			continue;
 
 		// Generate the unique structural signature for this node
