@@ -99,11 +99,10 @@ import * as WAT from '../wat-parser';
 //      check (which the checker does correctly narrow on) doesn't reach codegen's own owner/field
 //      resolution inside the guarded branch -- there is currently no way to narrow a caught 'any'
 //      down to a concrete class by either route
-//    - indexing ('arr[i]'/'arr[i] = x') a receiver whose static type is a real union of different
-//      struct-backed array-likes (e.g. 'Uint8Array | number[]') -- plain '.property' access on the
-//      same kind of union already dispatches per-member ('ensureUnionFieldDispatch'), but indexing
-//      has no equivalent yet; only a single concrete number[]/boolean[]/Uint8Array/Int32Array/
-//      Uint32Array element type is supported
+//    - writing through an index ('arr[i] = x') on a receiver whose static type is a real union of
+//      different struct-backed array-likes (e.g. 'Uint8Array | number[]') -- a *read* ('arr[i]')
+//      dispatches per-member same as '.property' access does ('ensureUnionIndexDispatch'/
+//      'ensureUnionFieldDispatch'), but there's no write-side equivalent ('set(i,v)' dispatch) yet
 //  - Numbers:
 //    - an i32/u32-targeted float-to-int coercion (bitwise ops, an explicit i32/u32-typed local, etc.)
 //      of a non-finite (NaN/+-Infinity) or huge finite f64 value doesn't replicate real JS's exact
@@ -324,6 +323,27 @@ function wasmTypeKey(w: WasmType): string {
 	if ('typeIndex' in w)
 		return `typeIndex:${w.typeIndex}:${!!w.nullable}`;
 	return '?';
+}
+
+// The one shared `WasmType` a union of >=2 members' own physical representations collapses to --
+// `typeOf`'s own 'union' case, and `ensureUnionIndexDispatch`'s own per-member `get(i)` result
+// (`case 'member'`'s sibling `ensureUnionFieldDispatch` instead goes through the checker's own
+// `T.lookupMember`, since a named property's type unions cleanly there; indexing has no such
+// checker-side precision for a union receiver yet, so this compares physical wtypes directly, same
+// as before that fix existed). Members that already physically agree stay exactly as they are (a
+// degenerate union like `IteratorResult<Y,R>.value: Y | R` monomorphized with `Y`/`R` both `number`
+// must stay a plain `f64`, not box as `any` just because a union with >1 syntactic member showed up).
+// Members that only differ by a wasm-pseudo-type-vs-real-type spelling of the same scalar (`i32` vs
+// `number`/`f64` -- the top-of-file `WASM_PSEUDO_TYPES` comment's own ternary example, also hit by
+// `Uint8Array.length: i32` vs `Array<T>.length: number`) widen to the one canonical `f64`. Anything
+// else (class vs. class, scalar vs. struct/array, ...) boxes as `any`, the same physical
+// representation this compiler already gives every other "could be one of several shapes" value.
+function combineUnionWtypes(wtypes: readonly WasmType[]): WasmType {
+	if (new Set(wtypes.map(w => wasmTypeKey(w))).size === 1)
+		return wtypes[0];
+	if (wtypes.every(w => scalarKind(w) !== undefined))
+		return 'f64';
+	return REF_ANY;
 }
 
 function storageTypeKey(v: wasm.StorageType): string {
@@ -1379,6 +1399,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// "every class ever reached" like `anyDispatchFuncs`), so a real union type's own field access never
 	// silently succeeds via some unrelated third class that happens to share the same field name.
 	const unionFieldDispatchFuncs = new Map<string, FuncInfo>();
+	// `ensureUnionIndexDispatch`'s own cache -- same "keyed by the exact, bounded member set" reasoning as
+	// `unionFieldDispatchFuncs`, just for `arr[i]` reads instead of `.property` access.
+	const unionIndexDispatchFuncs = new Map<string, FuncInfo>();
 	// A plain named function used as a *value* (not a direct call) -- `case 'call'` already resolves
 	// `name(...)` straight to `funcs.get(name)`/`compileFunc`, no closure struct involved at all, so
 	// this is only ever populated the first time some *other* expression shape needs `name` to behave
@@ -1794,21 +1817,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					// A member with no representation of its own (e.g. a further-nested union hitting this same
 					// case, or a genuinely unrepresentable shape) is trivially "not the same physical type as
 					// everything else" -- still a real reason to box as `any`, not a reason to give up on the
-					// whole union. Only every member resolving to the exact same WasmType stays unboxed.
+					// whole union.
 					if (!memberWtypes.every((w): w is WasmType => w !== undefined))
 						return REF_ANY;
-					if (new Set(memberWtypes.map(w => wasmTypeKey(w))).size === 1)
-						return memberWtypes[0];
-					// Every member a plain scalar number, just spelled with a different physical narrowing
-					// (`i32` vs `number`/`f64` -- the same wasm-pseudo-type-vs-real-type mismatch the top-of-file
-					// `WASM_PSEUDO_TYPES` comment already documents for a ternary's two branches, here surfacing
-					// via a union of two *classes* whose own declared property types for the same name happen to
-					// spell "number" differently, e.g. `Uint8Array.length: i32` vs `Array<T>.length: number`) --
-					// the union's real, single logical type is `number` regardless of which member declared it
-					// narrower, so this widens to that one canonical representation instead of boxing as `any`.
-					if (memberWtypes.every(w => scalarKind(w) !== undefined))
-						return 'f64';
-					return REF_ANY;
+					return combineUnionWtypes(memberWtypes);
 				}
 				break;
 			}
@@ -2346,6 +2358,25 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			}
 		}
 		throw `internal: cannot convert ${wasmTypeKey(got)} to ${wasmTypeKey(want)}`;
+	}
+
+	// `coerceTop`, but for one arm of a union dispatch (`ensureUnionFieldDispatch`/
+	// `ensureUnionIndexDispatch`) whose overall `result` boxes as `any` because its *sibling* arms
+	// genuinely differ (not this arm's own fault) -- every scalar arm still needs to land in the SAME
+	// canonical box kind (`f64`) as every other scalar arm, not each one's own narrower physical storage
+	// (`i32`/`u32`/etc, `combineUnionWtypes`'s own comment): boxing `i32` straight to `any` uses an
+	// `i32`-kind box (`coerceTop`'s own scalar->any rule), but a caller unboxing a `number`-typed result
+	// back out always assumes the `f64`-kind box -- two sibling arms boxing by their own different
+	// physical kind would each individually "work" in isolation yet disagree with each other, and the
+	// caller's `ref.cast` traps on whichever one didn't match what it assumed. Widening every scalar arm
+	// to `f64` first (a real, cheap numeric conversion, not a box) before the actual `coerceTop` to
+	// `result` makes every scalar arm agree on one box shape regardless of which member produced it.
+	function coerceUnionArm(got: WasmType, ctx: FunctionContext, result: WasmType): void {
+		if (typeof result !== 'string' && 'ref' in result && result.ref === 'any' && !result.nullable && got !== 'f64' && scalarKind(got) !== undefined) {
+			coerceTop(got, ctx, 'f64');
+			got = 'f64';
+		}
+		coerceTop(got, ctx, result);
 	}
 
 	function emitAs(e: Expr, ctx: FunctionContext, want: WasmType): WasmType {
@@ -3482,8 +3513,27 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					return emitMethodCall(cls, 'get', [e.property], ctx);
 				}
 				const kind = objectArrayKind(e.object, ctx);
-				if (!kind || kind === 'i16' || kind === 'i8')
+				if (!kind || kind === 'i16' || kind === 'i8') {
+					// Neither a single class with its own `get(i)` nor a single raw array kind -- the one
+					// remaining shape this supports is a real union of different indexable classes (e.g.
+					// `Uint8Array | number[]`, `updateBuffer`'s own `b[i]`, found compiling `dwg/src/crc16.ts`)
+					// -- every member resolves to a real `get(i)`-owning `ClassInfo` via `ownerFor` (a plain
+					// `number[]`/`boolean[]` included, via its own 'array' case, same as a genuine typed-array
+					// view), so this is exactly `case 'member'`'s own `ensureUnionFieldDispatch` shape, just
+					// always through `get(i)` rather than a field/getter (see `ensureUnionIndexDispatch`).
+					const t = T.resolve(ctx.scope, checkerTypeOf(unwrapAs(e.object), ctx.scope));
+					if (t.type === 'union') {
+						const owners = t.types.filter(m => !T.isNullish(m, ctx.scope)).map(m => ownerFor(m));
+						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1 && methodSig(o, 'get', ctx))) {
+							emitAs(e.object, ctx, REF_ANY);
+							emitAs(e.property, ctx, 'i32');
+							const info = ensureUnionIndexDispatch(owners as ClassInfo[]);
+							ctx.emit(I.call(info.funcIndex));
+							return info.result;
+						}
+					}
 					throw "indexing is only supported on number[]/boolean[]/Uint8Array/Int32Array/Uint32Array ('string' is immutable and not indexable in this pass)";
+				}
 				// `nullable: true` on the 'ref' case -- `ensureArrayType`'s `'ref'`-kind field is declared
 				// nullable (shared physical storage for every non-scalar kind), so `array.get` always really
 				// produces a nullable `anyref`, whatever the caller's declared TS element type claims.
@@ -6450,7 +6500,33 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// every member declares this field before allowing the access at all, so this never needs a fallback
 	// "no candidate matched" arm the way `ensureAnyDispatch` does; a receiver failing every `ref.test` here
 	// would mean the checker was wrong, an internal inconsistency, not a real program to guard against.
+	// A plain-array-typed union member (`number[]`, `boolean[]`, ...) has TWO real, valid physical forms
+	// at runtime, not one: its own natural element-typed representation (`ownerFor`'s own `Array<number>`,
+	// a real `f64` array) when the value came from a precisely-typed local/field, OR the ref-kind,
+	// boxed-`any`-element representation (`Array<any>`) when it was built as a literal directly in a
+	// boxed-`any` position -- `case 'array'`'s own "a literal about to be boxed as `any` picks ref-kind
+	// storage regardless of how scalar its elements look" rule (found via `dwg/src/crc16.ts`'s own
+	// `updateBuffer([1,2,3])`, an array literal passed straight into a `Uint8Array | number[]` parameter,
+	// boxed `any` for the union -- traps at runtime, `ref.test`-ing only the `f64`-array form the
+	// literal never actually took). A union member resolving to `Array` dispatches through both forms;
+	// `dedupe` by `typeIndex` covers a member that already directly names `Array<any>` (nothing to add).
+	function expandArrayMembers(members: readonly ClassInfo[]): ClassInfo[] {
+		const seen = new Set<number>();
+		const out: ClassInfo[] = [];
+		const add = (m: ClassInfo) => { if (!seen.has(m.typeIndex)) { seen.add(m.typeIndex); out.push(m); } };
+		for (const m of members) {
+			add(m);
+			if (m.decl.name === 'Array') {
+				const anyForm = ensureClass('Array', [T.ANY]);
+				if (anyForm)
+					add(anyForm);
+			}
+		}
+		return out;
+	}
+
 	function ensureUnionFieldDispatch(members: readonly ClassInfo[], name: string, resultTsType: Type | undefined): FuncInfo {
+		members = expandArrayMembers(members);
 		const key = `${name}=>[${members.map(m => m.typeIndex).join(',')}]`;
 		const existing = unionFieldDispatchFuncs.get(key);
 		if (existing)
@@ -6515,12 +6591,77 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					emitMethodCall(f.cls, accessorKey('get', name), [], dctx);
 				else
 					dctx.emit(I.struct.get(f.cls.typeIndex, f.fieldIdx));
-				coerceTop(f.wtype, dctx, result);
+				coerceUnionArm(f.wtype, dctx, result);
 				return [..._cond, I.if(result === 'void' ? undefined : toValType(result), dctx.swapOut(), buildArm(i + 1))];
 			}
 
 			dctx.emit(...buildArm(0));
 			info.body = dctx.toFuncBody(1, toValType);
+		}, key));
+		return info;
+	}
+
+	// `arr[i]` on a real union of indexable classes (e.g. `Uint8Array | number[]`) -- same per-member
+	// `ref.test`/`ref.cast` dispatch shape as `ensureUnionFieldDispatch`, just always through each
+	// member's own `get(i)` method rather than a field/getter: every indexable class in this compiler
+	// (a typed-array view, or the real `Array<T>` struct a plain `number[]`/`boolean[]`/etc. resolves to
+	// via `ownerFor`'s own 'array' case) shares this one convention, so there's no separate "raw array"
+	// arm to handle the way `case 'index'`'s own single-receiver path still needs one.
+	function ensureUnionIndexDispatch(members: readonly ClassInfo[]): FuncInfo {
+		members = expandArrayMembers(members);
+		const key = `[]=>[${members.map(m => m.typeIndex).join(',')}]`;
+		const existing = unionIndexDispatchFuncs.get(key);
+		if (existing)
+			return existing;
+
+		// Same scratch-ctx-live-for-the-whole-function reasoning as `ensureUnionFieldDispatch` -- `get`'s
+		// own result type must be known, synchronously, before `result` (and so this dispatcher's own
+		// signature) can be decided.
+		const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(REF_ANY), undefined);
+
+		// Each member's own `get(i)` -- an internal inconsistency (not a real program error) if any member
+		// turns out not to have one, since the one real call site already required every member to satisfy
+		// `methodSig(o, 'get', ctx)` before ever calling this.
+		const memberGets = members.map(m => {
+			const sig = methodSig(m, 'get', dctx);
+			if (!sig)
+				throw `internal: '${m.name}' (a member of a union type) has no 'get' method`;
+			return { cls: m, wtype: sig.result };
+		});
+		// `combineUnionWtypes`, not the checker's own indexing type (unlike `ensureUnionFieldDispatch`'s
+		// `T.lookupMember`-based result) -- `checkerTypeOf` on a union receiver's own indexed-access
+		// expression doesn't resolve to the same per-member-unioned precision `lookupMember` gives a named
+		// property (confirmed directly: `(Uint8Array | number[])[i]` checker-types as plain `any`, not
+		// `u8 | number`), so this compares each member's own real `get(i)` result physically instead.
+		const result = combineUnionWtypes(memberGets.map(m => m.wtype));
+		dctx.onReturn = plainReturn(result);
+
+		const { funcIndex, typeIndex } = registerFunc(
+			toParams2([{ key: 'recv', wtype: REF_ANY, tsType: T.ANY }, { key: 'idx', wtype: 'i32', tsType: T.NUMBER }]),
+			toResults(result)
+		);
+		const info: FuncInfo = { params: [REF_ANY, 'i32'], result, funcIndex, typeIndex };
+		unionIndexDispatchFuncs.set(key, info);
+		funcs.set(`<union index dispatch>.${key}`, info);
+
+		worklist.push(withCatch(() => {
+			const recv = dctx.declareLocal('$recv', REF_ANY);
+			dctx.declareValue('$idx', 'i32', T.NUMBER);
+
+			function buildArm(i: number): wasm.Instr[] {
+				if (i >= memberGets.length)
+					return [I.unreachable];
+				const m = memberGets[i];
+				dctx.emit(I.local.get(recv.index), I.ref.test(m.cls.typeIndex));
+				const _cond = dctx.swapOut();
+				dctx.emit(I.local.get(recv.index), I.ref.cast(m.cls.typeIndex));
+				emitMethodCall(m.cls, 'get', [{ type: 'identifier', name: '$idx' }], dctx);
+				coerceUnionArm(m.wtype, dctx, result);
+				return [..._cond, I.if(result === 'void' ? undefined : toValType(result), dctx.swapOut(), buildArm(i + 1))];
+			}
+
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(2, toValType);
 		}, key));
 		return info;
 	}

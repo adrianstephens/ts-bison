@@ -507,10 +507,23 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 // resolved lazily, contextually, at each individual assignability check against `scope.value('this')`
 // -- see `OPAQUE`'s own inclusion of `'this'`), but a consumer needing one concrete, materialized
 // type up front (codegen) does.
+// `walk`'s own `mapObject` primitive always rebuilds a fresh shallow copy of every node it visits,
+// even one it leaves otherwise untouched (it has no "nothing changed here" fast path) -- so walking
+// a whole type tree just to end up substituting nothing anywhere still returns an all-new object
+// graph, structurally identical but never `===` the original. Real, general cost: a caller like
+// `ensureMethod` doing this unconditionally for every param on every method call, or a scope's own
+// `resolve()`/`lookupMember()` caching (both keyed by the exact type object, `WeakMap`s) never
+// getting a hit for a value it already resolved once under the original object's identity. Checking
+// first means a type with no 'this' anywhere -- the overwhelming majority -- comes back as the exact
+// same object, no rebuild, and every object-identity-keyed cache downstream keeps working normally.
+function containsThis(t: Type): boolean {
+	return walkB(t, undefined, undefined, (x, process) => x.type === 'this' || process(x));
+}
+
 export function substituteThisType(t: Type, thisType: Type): Type {
-	return walk(t, undefined, undefined, (x, process) =>
+	return containsThis(t) ? walk(t, undefined, undefined, (x, process) =>
 		x.type === 'this' ? thisType : process(x)
-	) ?? t;
+	) ?? t : t;
 }
 
 // Whether `name` occurs somewhere `inferTypeArgs` would actually descend into -- tells "no argument could ever determine
