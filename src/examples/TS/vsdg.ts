@@ -326,7 +326,11 @@ class ScopeMu extends Scope {
 	// state), so without some real dependency pulling it deeper than the pre-loop block, GCM would
 	// happily schedule anything that depends on it (e.g. the loop body's own reassignment) as if it
 	// were loop-invariant and float it out before the loop entirely.
-	constructor(parent: Scope, public makeNode: (type: string, varName: string) => Node, public stateAnchor: Node) {
+	// `currentFunctionEntry` is a GETTER (not a value) for the same reason scopeAnchorId's own
+	// stamping site reads it live rather than capturing it once: a name looked up from a FURTHER
+	// nested function inside this loop's own body (its own scope chain reaching back here) needs
+	// THAT function's entry, not whichever one was current when this ScopeMu was constructed.
+	constructor(parent: Scope, public makeNode: (type: string, varName: string) => Node, public stateAnchor: Node, public currentFunctionEntry: () => Node | undefined) {
 		super(parent);
 	}
 	public get(name: string): Node | undefined {
@@ -336,6 +340,20 @@ class ScopeMu extends Scope {
 		const old = this.parent?.get(name);
 		if (old) {
 			const mu = this.makeNode('muValue', name);
+			// A name read from OUTSIDE the current function (see capturedRead's own comment,
+			// getExprNode's identifier case) that ALSO happens to be read inside a loop -- e.g.
+			// `sorted` here, a plain outer const, never reassigned, but still wrapped in a muValue
+			// like any other outer-scope read a loop body touches (this constructor doesn't know in
+			// advance which names will actually be reassigned) -- needs the SAME floor this/super
+			// already get: without it, scheduleEarly's own loop-invariant-hoisting rule (correctly
+			// recognizing the trivial self-feedback here, see its own comment) can float a value
+			// PURELY DERIVED from this mu (e.g. `sorted.length`) out past the function/arrow it's
+			// lexically inside entirely, into the ENCLOSING function -- which never reads it, since
+			// an arrow/function EXPRESSION's own body prints verbatim from its original source,
+			// completely unaware of anything GCM decided (found on real code, binary-libs/src/pe.ts:
+			// `var t14 = sorted.length;` materialized outside a `.map()` callback, read only INSIDE
+			// it, in a nested while loop's own test -- computed but never referenced anywhere).
+			mu.scopeAnchorId = this.currentFunctionEntry()?.id;
 			this.muNodes.set(name, mu);		//original mu
 			this.bindings.set(name, mu);	// current node
 			connectValue(old, 0, mu, 0);			// Slot 0 = Initial value from outside
@@ -573,7 +591,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		const muEnd		= makeNode('mu');
 		if (isDoWhile)
 			muEnd.loopKind = 'do';
-		const muScope	= new ScopeMu(scope, makeNode, muEnd);
+		const muScope	= new ScopeMu(scope, makeNode, muEnd, () => currentFunctionEntry);
 		scope	= muScope;
 		connectEnd(muEnd);
 
