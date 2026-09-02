@@ -1278,6 +1278,24 @@ export async function main() {
 		}
 	`);
 
+	// Splitting the unified 'pure' tag into 'floating'/'mutation' (see makeExprNode's own comment)
+	// touched BuildVSDG's 'unary' case directly, which surfaced the exact same bug prefix-side:
+	// `++obj.prop` had no forced-print anchor at all for a non-identifier target (only the
+	// identifier branch called rebindVar), so a statement-only `++o.count;` would have vanished
+	// entirely, same failure mode as unary_post's own non-identifier branch above.
+	check('unary (prefix): member-target ++ prints against the real property, not a stale copy', `
+		function f(o) {
+			++o.count;
+			return o.count;
+		}
+	`, `
+		function f(o) {
+			var t0 = o.count;
+			++o.count;
+			return o.count;
+		}
+	`);
+
 	// New this session: an object literal with a method/get/set property. Its reconstruction
 	// depends on an out-of-band reference (objectMembers), not a real graph edge, so it's tagged
 	// 'effect' unconditionally (like a class expression) rather than judged "pure" -- isPureSubgraph

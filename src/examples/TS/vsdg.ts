@@ -177,7 +177,7 @@ class Node {
 	// node.value still holds -- Output's own rebuildClass splices each resolved piece back in,
 	// everything else still copied through verbatim.
 	classInfo?: ClassInfo;
-	// A 'pure' object-literal node's own method/get/set properties (`{ foo() {...} }`), same shape
+	// An object-literal node's own method/get/set properties (`{ foo() {...} }`), same shape
 	// and same reasoning as classInfo's own members (a method body needs its own independent
 	// function-scoped subgraph, entryNodeId, carrying no graph edge of its own -- see
 	// buildFunctionBody's own comment), just without a class's own heritage/computed-key/static-
@@ -218,21 +218,21 @@ class Node {
 	//    its mu source (port 1) instead -- the condition edge exists only so GCM can see the dependency
 	//    that makes the export valid no earlier than loop-exit, never because codegen reads it.
 	isVestigialEdge(port: number): boolean {
-		if (this.type === 'pure' && (this.value as Expr).type === 'binary' && port === 0
-			&& ASSIGN_OPS.has((this.value as Expr & { type: 'binary' }).operator)
+		if (this.type === 'mutation' && (this.value as Expr).type === 'binary' && port === 0
 			&& (this.value as Expr & { type: 'binary' }).operator === '='
 		)
 			return true;
 		if (this.type === 'thetaValue' && port === 0)
 			return true;
 		// threadMutation's own marker edge (always port 2, on whatever node rebindVar just bound --
-		// a var_decl/rebind, or a reassignment expression): purely a GCM ordering anchor, never read
-		// as a value by resolveOperand/buildExpr (a var's real value is always port 0; a reassignment
-		// only ever reads its right operand, port 1). Without this, isPureSubgraph's own recursion
+		// a var_decl/rebind, or a reassignment/++/-- expression): purely a GCM ordering anchor,
+		// never read as a value by resolveOperand/buildExpr (a var's real value is always port 0; a
+		// binary reassignment only ever reads its right operand, port 1; a mutating unary reads its
+		// OWN operand, port 0, but never port 2). Without this, isPureSubgraph's own recursion
 		// (which has no other way to tell a scheduling-only edge from a real value dependency) walks
 		// straight into the marker -- an 'effect' node -- and wrongly calls the WHOLE subgraph
 		// impure, even when nothing in the actual value chain has any real effect at all.
-		if ((this.type === 'var' || (this.type === 'pure' && (this.value as Expr).type === 'binary')) && port === 2)
+		if ((this.type === 'var' || this.type === 'mutation') && port === 2)
 			return true;
 		// A state gamma's true/false-tail ports (2/3) are structural only: Output's own emitChain
 		// walks `control.inputs[2]/[3]` directly (backward from each branch's own tail) to find where
@@ -498,12 +498,19 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// The VSDG node's own type used to default to expr.type -- redundant, since node.value already
 	// IS the original expr object (its own .type field is right there, and reading it through the
 	// value gets TypeScript's real discriminated-union narrowing for free instead of the `as Expr &
-	// {type: 'binary'}`-style casts that redundancy needed everywhere). 'pure' is the uniform tag
-	// for every ordinary value-producing expression node (unary/binary/call-when-pure/index/
-	// conditional/array/object/spread) -- exactly mirroring how an EFFECTFUL expression node
-	// (yield/tagged_template/class/jsx/arrow/function/call-when-impure/await) already gets the
-	// uniform 'effect' tag instead of its own expr.type, for the same reason.
-	function makeExprNode(expr: Expr, type = 'pure') {
+	// {type: 'binary'}`-style casts that redundancy needed everywhere). 'floating' is the uniform
+	// tag for every ordinary, genuinely pure value-producing expression node (non-assignment
+	// binary/non-++/-- unary/call-when-pure/index/conditional/array/object/spread) -- exactly
+	// mirroring how an EFFECTFUL expression node (yield/tagged_template/class/jsx/arrow/function/
+	// call-when-impure/await) already gets the uniform 'effect' tag instead of its own expr.type,
+	// for the same reason. A MUTATING binary (assignment operator) or unary (++/--) gets its OWN
+	// separate uniform tag, 'mutation', instead -- despite sharing the exact same 'binary'/'unary'
+	// AST shape as their pure counterparts, they carry a real effect (see isVestigialEdge's own
+	// port-2 comment) and must never be treated as an ordinary poolable value the way 'floating' is
+	// (constant-foldable, CSE-mergeable, freely inlinable/duplicable) -- see each of those passes'
+	// own exclusion of 'mutation' for why. Both call sites that construct one (BuildVSDG's 'binary'
+	// and 'unary' cases) classify it explicitly rather than relying on this default.
+	function makeExprNode(expr: Expr, type = 'floating') {
 		const node = makeNode(type, expr);
 		expnodes.set(expr, node);
 		return node;
@@ -1736,11 +1743,24 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						return false;
 					}
 					process(s);
-					const node = makeExprNode(s as Expr);
+					const isMutation = s.operator === '++' || s.operator === '--';
+					const node = makeExprNode(s as Expr, isMutation ? 'mutation' : 'floating');
 					connectValue(getExprNode(s.operand), 0, node, 0);
-					if (s.operator === '++' || s.operator === '--') {
-						if (s.operand.type === 'identifier')
+					if (isMutation) {
+						if (s.operand.type === 'identifier') {
 							rebindVar(s.operand.name, node);
+						} else {
+							// A property/index target (`++obj.prop`/`--arr[i]`) mutates something outside
+							// this pass's own scope tracking -- same shape and same reasoning as
+							// unary_post's own non-identifier branch: nothing ever reads this back
+							// through scope, so needsTemp alone would see zero consumers and silently
+							// drop the whole mutation if nothing happens to read its (already correct,
+							// unlike postfix) own value either. A dedicated forcedPrint anchor, same as
+							// that case (found the same way: `++obj.count;` alone, no consumer at all,
+							// vanished from the reconstructed source entirely).
+							node.forcedPrint = true;
+							threadMutation(node);
+						}
 					}
 					return false;
 				}
@@ -1799,10 +1819,11 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				}
 				case 'binary': {
 					process(s);
-					const node = makeExprNode(s as Expr);
+					const isMutation = ASSIGN_OPS.has(s.operator);
+					const node = makeExprNode(s as Expr, isMutation ? 'mutation' : 'floating');
 					connectValue(getExprNode(s.left), 0, node, 0);
 					connectValue(getExprNode(s.right), 0, node, 1);
-					if (ASSIGN_OPS.has(s.operator)) {
+					if (isMutation) {
 						if (s.left.type === 'identifier') {
 							// A reassignment of a variable CAPTURED from an enclosing function (not
 							// declared anywhere within the current one -- see isLocalToCurrentFunction)
@@ -2106,22 +2127,14 @@ export function BuildVSDG(ast: Walkable): VSDG {
 }
 
 // True for a node reached via the state chain's own port-2 "triggering rebind" convention (see
-// BuildVSDG's threadMutation/rebindVar): a rebind (compound-assign/++/--, the same type check
-// needsTemp itself uses at vsdg.ts:1965-1976 -- duplicated here since this asks "am I one of
-// these" about the CONSUMER, where needsTemp asks it about the target of one of the consumer's
-// edges), or a genuine local declaration (declKind set). Used by Output.needsDirectPlacement (the
-// no-blocks fallback discovery).
+// BuildVSDG's threadMutation/rebindVar): a rebind (compound-assign/++/--, the same 'mutation' tag
+// mustNameOwnValue itself checks -- duplicated here since this asks "am I one of these" about the
+// CONSUMER, where mustNameOwnValue asks it about the target of one of the consumer's edges), or a
+// genuine local declaration (declKind set). Used by Output.needsDirectPlacement (the no-blocks
+// fallback discovery).
 function isOwnAnchorTarget(node: Node): boolean {
-	if (node.type === 'unary_post')
-		return true;
-	if (node.type === 'pure') {
-		const expr = node.value as Expr;
-		if (expr.type === 'unary')
-			return ['++', '--'].includes(expr.operator);
-		if (expr.type === 'binary')
-			return ASSIGN_OPS.has(expr.operator);
-	}
-	return node.type === 'var' && node.declKind !== undefined;
+	return node.type === 'unary_post' || node.type === 'mutation'
+		|| (node.type === 'var' && node.declKind !== undefined);
 }
 
 // Desugars a destructuring BindingTarget into flat var_decls reading off valueExpr -- which MUST
@@ -2194,14 +2207,7 @@ function mustNameOwnValue(consumer: Node, port: number): boolean {
 		return true;
 	if (port !== 0)
 		return false;
-	if (consumer.type === 'unary_post')
-		return true;
-	if (consumer.type !== 'pure')
-		return false;
-	const expr = consumer.value as Expr;
-	if (expr.type === 'unary')
-		return ['++', '--'].includes(expr.operator);
-	return expr.type === 'binary' && ASSIGN_OPS.has(expr.operator);
+	return consumer.type === 'unary_post' || consumer.type === 'mutation';
 }
 
 // A real source-level name (`dir`, `sect`, `result`, ...) is only unique WITHIN its own function --
@@ -2431,7 +2437,7 @@ export class Output {
 	// been. (The state gamma never reaches here at all -- slotName() only ever returns something
 	// for gammaValue/named-except, so every caller already gates on that first.)
 	private isInlinableSlot(node: Node): boolean {
-		return ((node.type === 'pure' && (node.value as Expr).type === 'binary') || node.type === 'gammaValue') && !node.forcedPrint
+		return ((node.type === 'mutation' && (node.value as Expr).type === 'binary') || node.type === 'gammaValue') && !node.forcedPrint
 			&& (node.neverMaterialize || !this.needsTemp(node));
 	}
 
@@ -2569,7 +2575,7 @@ export class Output {
 		return { ...value, callee, arguments: value.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
 	}
 
-	// Shared by 'pure''s own 'conditional' case and the outer 'gammaValue' case -- a gammaValue is
+	// Shared by 'floating''s own 'conditional' case and the outer 'gammaValue' case -- a gammaValue is
 	// a per-variable value merge, reconstructed as a ternary (exactly what it means), the same shape
 	// a real conditional expression already is; the state gamma itself never reaches here at all
 	// (reconstructed separately, by emitControlNode's own 'gamma' case, as a real if/else).
@@ -2604,12 +2610,13 @@ export class Output {
 			case 'gammaValue':
 				return this.buildConditional(node);
 
-			// Every ordinary, value-producing expression (unary/binary/call-when-pure/index/
-			// conditional/array/object/spread) shares this one tag -- see makeExprNode's own comment
-			// for why -- so node.value's own .type (the real, original AST expression, discriminated-
-			// union-narrowed for free instead of an `as Expr & {type: ...}` cast) is what actually
-			// picks the shape here, not a second, redundant VSDG-level tag.
-			case 'pure': {
+			// Every ordinary, genuinely pure value-producing expression (non-assignment binary/
+			// non-++/-- unary/call-when-pure/index/conditional/array/object/spread) shares this one
+			// tag -- see makeExprNode's own comment for why -- so node.value's own .type (the real,
+			// original AST expression, discriminated-union-narrowed for free instead of an `as Expr &
+			// {type: ...}` cast) is what actually picks the shape here, not a second, redundant
+			// VSDG-level tag.
+			case 'floating': {
 				const expr = node.value as Expr;
 				switch (expr.type) {
 					case 'unary':
@@ -2620,21 +2627,8 @@ export class Output {
 						return this.buildObjectExpr(node, expr);
 					case 'spread':
 						return { ...expr, operand: this.resolveOperand(node.id, 0) };
-					case 'binary': {
-						if (ASSIGN_OPS.has(expr.operator)) {
-							// Reaching here (rather than declareOrAssign) means this assignment node was
-							// superseded by an if/else merge -- it's not being printed as its own `x = ...;`
-							// statement, so what's needed is just the VALUE it would have produced: the right
-							// operand for a plain `=`, or the computed result for a compound `+=`/`-=`/etc.
-							// (Reconstructing the full `left = right` syntax here, as the generic case below
-							// does, would wrongly re-print the assignment itself as part of a value expression.)
-							const right = this.resolveOperand(node.id, 1);
-							return expr.operator === '='
-								? right
-								: { type: 'binary', operator: expr.operator.slice(0, -1) as JS.binaryOps, left: this.resolveOperand(node.id, 0), right };
-						}
+					case 'binary':
 						return { ...expr, left: this.resolveOperand(node.id, 0), right: this.resolveOperand(node.id, 1) };
-					}
 					case 'conditional':
 						return this.buildConditional(node);
 					case 'index':
@@ -2642,14 +2636,32 @@ export class Output {
 					case 'call':
 						// A PURE call (no observable side effects, so it never threads through the state
 						// chain -- see the `pure` check in BuildVSDG's 'call' case) keeps the SAME uniform
-						// 'pure' tag any other pure value gets, unlike an effectful one (always 'effect').
-						// It's otherwise just an ordinary value node: scheduled and (via needsTemp)
-						// materialized-or-inlined the same as any pure expression.
+						// 'floating' tag any other pure value gets, unlike an effectful one (always
+						// 'effect'). It's otherwise just an ordinary value node: scheduled and (via
+						// needsTemp) materialized-or-inlined the same as any pure expression.
 						return { ...expr, arguments: expr.arguments.map((_, i) => this.resolveOperand(node.id, i + 1)) };
 					default:
-						console.log(`not handling pure value node ${expr.type}`);
+						console.log(`not handling floating value node ${expr.type}`);
 						return Literal(null);
 				}
+			}
+
+			// A 'mutation' node (assignment-operator binary, or prefix ++/--) reaching here as a
+			// VALUE means it was superseded by an if/else merge (e.g. `y = (x = 1)`) rather than
+			// printed as its own statement (see emitLocalStatements's own forcedPrint path, and
+			// declareOrAssign, for that case) -- what's needed is just the value it produced, not
+			// the mutation's own syntax again. The operand/left resolves via resolveTarget, not
+			// resolveOperand: unlike an ordinary read, a member/index target's value can genuinely
+			// differ once the mutation runs, so it must always rebuild fresh (see resolveTarget's own
+			// comment) rather than risk reusing an already-materialized, now-stale copy.
+			case 'mutation': {
+				const expr = node.value as Expr & { type: 'unary' | 'binary' };
+				if (expr.type === 'unary')
+					return { ...expr, operand: this.resolveTarget(node.id, 0) };
+				const right = this.resolveOperand(node.id, 1);
+				return expr.operator === '='
+					? right
+					: { type: 'binary', operator: expr.operator.slice(0, -1) as JS.binaryOps, left: this.resolveTarget(node.id, 0), right };
 			}
 
 			case 'effect':
@@ -2829,7 +2841,7 @@ export class Output {
 			this.declaredNames.add(name);
 			return JS.VarDecl(node.declKind ?? 'let', JS.Var(name, undefined, node.typeAnnotation)) as Statement;
 		}
-		if ((node.type === 'pure' && (node.value as Expr).type === 'unary') || node.type === 'unary_post') {
+		if ((node.type === 'mutation' && (node.value as Expr).type === 'unary') || node.type === 'unary_post') {
 			// A prefix or postfix ++/-- already performs its own assignment as a side effect when
 			// evaluated -- printed as a bare expression statement, `++i;`/`i++;` is both correct and
 			// sufficient. Routing it through declareOrAssign like an ordinary reassignment would wrap
@@ -2853,7 +2865,8 @@ export class Output {
 	// read, the object/property this addresses can (and here, does) hold a DIFFERENT value once
 	// the mutation runs, so a temp cached from an earlier read of the same expression would name
 	// the wrong thing -- the actual property write would silently land on that temp instead of
-	// the real object. Only 'member'/index-shaped ('pure' with an 'index' expr) operands have this
+	// the real object. Only 'member'/index-shaped ('floating' with an 'index' expr -- an index
+	// expression is itself always a plain read, never itself tagged 'mutation') operands have this
 	// hazard; every other operand shape (identifier var, loop-carried muValue, literal, ...)
 	// resolves by name/value already, with no snapshot-substitution risk, so it keeps the normal,
 	// full resolveNode path (bypassing straight to buildExpr for those has no 'muValue' case and
@@ -2863,7 +2876,7 @@ export class Output {
 		if (!edge)
 			throw new Error(`Missing operand edge for slot ${slot} on node ${to}`);
 		const opNode = this.graph.get(edge.nodeId)!;
-		return opNode.type === 'member' || (opNode.type === 'pure' && (opNode.value as Expr).type === 'index')
+		return opNode.type === 'member' || (opNode.type === 'floating' && (opNode.value as Expr).type === 'index')
 			? this.buildExpr(opNode) : this.resolveNode(opNode.id);
 	}
 
@@ -3151,12 +3164,12 @@ export class Output {
 					// `left = right` -- exactly wrong for printing the assignment itself as a statement.
 					if (node.forcedPrint) {
 						// Only an assignment-operator 'binary' node needs its left/right rebuilt from
-						// operand edges here (buildExpr's own 'binary' case has a merge-value shortcut
+						// operand edges here (buildExpr's own 'mutation' case has a merge-value shortcut
 						// that's wrong for statement position). Anything else with forcedPrint (e.g. a
-						// non-identifier-target unary_post mutation) already reconstructs correctly via
-						// buildExpr, which has no such shortcut for those shapes.
+						// non-identifier-target unary_post/prefix-++ mutation) already reconstructs
+						// correctly via buildExpr, which has no such shortcut for those shapes.
 						statements.push(JS.Expression(
-							node.type === 'pure' && (node.value as Expr).type === 'binary'
+							node.type === 'mutation' && (node.value as Expr).type === 'binary'
 								? { ...(node.value as Expr & { type: 'binary' }), left: this.resolveTarget(node.id, 0), right: this.resolveOperand(node.id, 1) }
 								: this.buildExpr(node)
 						) as Statement);
@@ -3189,7 +3202,7 @@ export class Output {
 		// isInlinableVarDecl/hasRealConsumer-driven elision for a genuinely dead 'var' declaration
 		// already lives entirely inside emitNamedSlot (down to a bare `let x;` or nothing at all),
 		// so a 'var' is always safe to force-include unconditionally here and let it make that call.
-		return !(node.type === 'pure' && (node.value as Expr).type === 'binary') || !this.isInlinableSlot(node);
+		return !(node.type === 'mutation' && (node.value as Expr).type === 'binary') || !this.isInlinableSlot(node);
 	}
 
 	// Which nodes GCM scheduled alongside a given control-anchor node (blockNodes, keyed via the
@@ -3507,7 +3520,10 @@ export class Output {
 }
 
 function foldConstants(graph: VSDG, node: Node): boolean {
-	if (node.type !== 'pure')
+	// 'mutation' is deliberately excluded (not just practically inert, since calcUnary has no
+	// '++'/'--' case and a real assignment's left operand is never itself a literal) -- folding a
+	// mutation into a bare literal would silently discard the effect it exists to perform.
+	if (node.type !== 'floating')
 		return false;
 	const expr = node.value as Expr;
 	switch (expr.type) {
@@ -3699,13 +3715,15 @@ function getStructuralKey(node: Node): string {
 	// (found the hard way: literal(0) and a function's own synthetic literal(undefined) merged,
 	// producing a spurious extra `return 0;` after the real, always-taken early return).
 	if (node.value !== undefined) {
-		// A 'pure' node's own real discriminator lives in node.value's own .type now (see
+		// A 'floating' node's own real discriminator lives in node.value's own .type now (see
 		// makeExprNode's own comment), not node.type -- only 'binary'/'unary' need the special
 		// operator-only key (matching two structurally-different-but-same-operator expressions is
-		// otherwise still correctly told apart by node.inputs, appended below); every other 'pure'
-		// shape (array/object/call/index/conditional/spread) falls to the same JSON.stringify
-		// default any OTHER node type without special handling already used.
-		switch (node.type === 'pure' ? (node.value as Expr).type : node.type) {
+		// otherwise still correctly told apart by node.inputs, appended below); every other
+		// 'floating' shape (array/object/call/index/conditional/spread) falls to the same
+		// JSON.stringify default any OTHER node type without special handling already used.
+		// (A 'mutation' node never reaches here at all -- optimizeStructuralCSE excludes it before
+		// ever calling this, its own only caller -- so there's no equivalent branch for it to need.)
+		switch (node.type === 'floating' ? (node.value as Expr).type : node.type) {
 			case 'binary':
 			case 'unary': key += (node.value as any).operator;
 				break;
@@ -3723,8 +3741,8 @@ function getStructuralKey(node: Node): string {
 			// fall-off-the-end literal(undefined). Stringifying unambiguously distinguishes every
 			// value (including '', 0, false, null) from "no value at all" and from each other.
 			// The replacer is needed for a bigint literal anywhere in node.value (even nested,
-			// e.g. inside a 'pure' node's own full AST expr) -- JSON.stringify throws outright on
-			// a raw bigint, a real crash found on real code (binary-libs/src/pe.ts).
+			// e.g. inside a 'floating' node's own full AST expr) -- JSON.stringify throws outright
+			// on a raw bigint, a real crash found on real code (binary-libs/src/pe.ts).
 			default: key += JSON.stringify(node.value, (_, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
 		}
 	}
@@ -3760,14 +3778,22 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 		// the actual value in between -- merging them would silently reuse a stale, pre-mutation
 		// value at the later read site (found the hard way: `o.count++; return o.count;` started
 		// returning the OLD count once the postfix mutation was fixed to actually write through).
-		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super', 'member'].includes(node.type))
+		// 'mutation' (an assignment operator or prefix ++/--) is unsafe for the most direct reason of
+		// all: each occurrence IS a distinct, real effect -- merging two structurally-identical ones
+		// (`x = 0;` appearing twice, say) would silently drop one of the two actual mutations, not
+		// just misplace a read. Every mutation is already guaranteed a structurally-unique key in
+		// practice (threadMutation gives each its own fresh MUTATION_MARKER input, never shared), so
+		// this exclusion is currently a belt-and-suspenders invariant rather than a fix for an
+		// observed collision -- but that uniqueness is an incidental property of the marker's own
+		// implementation, not something this pass should have to keep relying on implicitly.
+		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super', 'member', 'mutation'].includes(node.type))
 			continue;
 		// 'array'/'object'/'index' can't be listed by name any more (see makeExprNode's own comment
-		// -- all three now share the uniform 'pure' tag with every other ordinary value expression),
-		// so the check moves to node.value's own .type instead -- same exclusion, same reasoning
-		// (array/object: fresh identity per evaluation; index (`arr[i]`): same staleness-across-a-
-		// mutation hazard as 'member', just following where the real discriminator lives now).
-		if (node.type === 'pure' && (['array', 'object', 'index'] as (Expr['type'])[]).includes((node.value as Expr).type))
+		// -- all three now share the uniform 'floating' tag with every other ordinary value
+		// expression), so the check moves to node.value's own .type instead -- same exclusion, same
+		// reasoning (array/object: fresh identity per evaluation; index (`arr[i]`): same staleness-
+		// across-a-mutation hazard as 'member', just following where the real discriminator lives).
+		if (node.type === 'floating' && (['array', 'object', 'index'] as (Expr['type'])[]).includes((node.value as Expr).type))
 			continue;
 
 		// Generate the unique structural signature for this node
