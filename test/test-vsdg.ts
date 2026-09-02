@@ -1,6 +1,6 @@
 import assert from 'assert';
 import * as TS from '../src/examples/TS/ts-parser';
-import { BuildVSDG, Optimize, applyGlobalCodeMotion, Output } from '../src/examples/TS/vsdg';
+import { BuildVSDG, Optimize, applyGlobalCodeMotion, BuildProgram } from '../src/examples/TS/vsdg';
 import { Output as CodeOutput } from '../src/examples/TS/tocode';
 
 // Regression suite for vsdg.ts's BuildVSDG -> applyGlobalCodeMotion -> Output pipeline: builds
@@ -25,7 +25,7 @@ function compile(src: string): string {
 	const graph		= BuildVSDG(prog.body);
 	Optimize(graph);
 	const { blockIds, blockControl, getLoopDepth } = applyGlobalCodeMotion(graph);
-	const stmts = new Output(graph, blockIds, blockControl, getLoopDepth).buildProgram();
+	const stmts		= BuildProgram(graph, blockIds, blockControl, getLoopDepth);
 	return printer.toCode(stmts as any).trim();
 }
 
@@ -1315,6 +1315,28 @@ export async function main() {
 				}
 			};
 			return o.m() + o.m();
+		}
+	`);
+
+	// this/super were folded into the uniform 'floating' tag (same shape as every other pure
+	// expression) rather than kept as their own dedicated Node type -- re-verifies the exact bug
+	// the original this/super CSE exclusion was found on: two methods each get their own `this`,
+	// never merged across methods despite an identical structural key.
+	check('this: two methods reading `this.x` twice each stay independent, not CSE-merged', `
+		class A {
+			x = 1;
+			f() { return this.x + this.x; }
+			g() { return this.x * this.x; }
+		}
+	`, `
+		class A {
+			x = 1;
+			f() {
+				return this.x + this.x;
+			}
+			g() {
+				return this.x * this.x;
+			}
 		}
 	`);
 

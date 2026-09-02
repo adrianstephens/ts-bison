@@ -15,10 +15,11 @@ type NodeId = string;
 
 // The full vocabulary of Node.type tags. Not a true discriminated union -- most of Node's own
 // optional fields are shared across several of these (forcedPrint spans mutation/unary_post,
-// scopeAnchorId spans this/super/muValue, ...) rather than exclusive to one, and .type is mutated
-// in place at a few real sites (foldConstants folding a binary/unary into a literal; an arrow/
-// function expression's entry retagged from function_decl to effect) -- so this exists purely to
-// catch a typo'd tag and give autocomplete, not to narrow which other fields are present.
+// scopeAnchorId spans muValue and any 'floating' node whose value.type is this/super, ...) rather
+// than exclusive to one, and .type is mutated in place at a few real sites (foldConstants folding
+// a binary/unary into a literal; an arrow/function expression's entry retagged from function_decl
+// to effect) -- so this exists purely to catch a typo'd tag and give autocomplete, not to narrow
+// which other fields are present.
 type NodeType =
 	| 'literal' | 'var'
 	| 'mu' | 'muValue' | 'theta' | 'thetaValue'
@@ -27,8 +28,7 @@ type NodeType =
 	| 'function_decl' | 'passthru' | 'class_decl'
 	| 'effect' | 'member'
 	| 'unary_post' | 'unary_post_old'
-	| 'floating' | 'mutation'
-	| 'this' | 'super';
+	| 'floating' | 'mutation';
 
 interface Edge {
 	nodeId:	NodeId;
@@ -1247,11 +1247,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				case 'this': {
 					// Unlike 'identifier', `this`/`super` have no scope lookup -- they need a real node
 					// registered here, or any consumer throws "missing node" looking one up.
-					const node = makeNode(s.type);
 					// See Node's own scopeAnchorId comment -- without this, a this-derived value GCM
 					// forces to materialize has nothing to floor it, escaping its own function/class.
-					node.scopeAnchorId = currentFunctionEntry?.id;
-					expnodes.set(s, node);
+					makeExprNode(s).scopeAnchorId = currentFunctionEntry?.id;
 					return false;
 				}
 
@@ -1873,10 +1871,6 @@ export function BuildProgram(
 			case 'literal':
 				return Literal(node.value);
 
-			case 'this':
-			case 'super':
-				return { type: node.type };
-
 			case 'unary_post':
 				return { ...(node.value as Expr & {type: 'unary_post'}), operand: resolveTarget(node.id, 0) };
 			case 'unary_post_old':
@@ -1891,6 +1885,9 @@ export function BuildProgram(
 			case 'floating': {
 				const expr = node.value as Expr;
 				switch (expr.type) {
+					case 'this':
+					case 'super':
+						return expr;
 					case 'unary':
 						return { ...expr, operand: resolveOperand(node.id, 0) };
 					case 'array':
@@ -2794,11 +2791,13 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 		// get a fresh identity per evaluation in real JS, unlike a true literal. 'member'/'index'
 		// reads can observe an intervening mutation between two textually-identical occurrences.
 		// 'mutation' is unsafe for the most direct reason: each occurrence is a distinct real effect.
-		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super', 'member', 'mutation'].includes(node.type))
+		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'member', 'mutation'].includes(node.type))
 			continue;
-		// 'array'/'object'/'index' share the uniform 'floating' tag, so the check moves to
-		// node.value's own .type -- same exclusion, same reasoning as above.
-		if (node.type === 'floating' && (['array', 'object', 'index'] as (Expr['type'])[]).includes((node.value as Expr).type))
+		// 'array'/'object'/'index'/'this'/'super' share the uniform 'floating' tag, so the check
+		// moves to node.value's own .type -- same exclusion, same reasoning as above ('this'/'super':
+		// identical structural key regardless of which method they're in, but each one's real value
+		// is bound per call, so merging them conflates two different receivers).
+		if (node.type === 'floating' && (['array', 'object', 'index', 'this', 'super'] as (Expr['type'])[]).includes((node.value as Expr).type))
 			continue;
 
 		// Generate the unique structural signature for this node
