@@ -49,7 +49,7 @@ type INode =
 	| { type: 'passthru', stmt: Statement }
 	| { type: 'effect', name?: string, expr?: Expr }
 	| { type: 'member', name: string }
-	| { type: 'unary_post', expr?: Expr }
+	| { type: 'unary_post', expr: Expr }
 	| { type: 'unary_post_old', expr: Expr }
 	| { type: 'floating', expr: Expr }
 	| { type: 'mutation', expr: Expr }
@@ -1792,7 +1792,7 @@ export function BuildProgram(
 	// resolves to `Identifier(name)`, correct only when something actually printed `name = ...;` --
 	// not guaranteed for a purely-value merge with no state anchor forcing its own block to be visited.
 	function isInlinableSlot(node: Node): boolean {
-		return ((node.type === 'mutation' && node.expr!.type === 'binary') || node.type === 'gammaValue')
+		return ((node.type === 'mutation' && node.expr.type === 'binary') || node.type === 'gammaValue')
 			&& !node.forcedPrint
 			&& (node.neverMaterialize || !needsTemp(node));
 	}
@@ -1853,8 +1853,8 @@ export function BuildProgram(
 		};
 	}
 
-	function buildEffectExpr(node: Node): Expr {
-		const value = node.expr!;
+	function buildEffectExpr(node: Node<{ type: 'effect', expr: Expr }>): Expr {
+		const value = node.expr;
 		switch (value.type) {
 			case 'arrow': case 'function':
 				// GCM never moves anything into or out of a function/arrow body (an isolated
@@ -1924,14 +1924,14 @@ export function BuildProgram(
 			case 'unary_post_old':
 				return resolveTarget(node.id, 0);
 			case 'member':
-				return JS.Member(resolveOperand(node.id, 0), node.name!, node.optional);
+				return JS.Member(resolveOperand(node.id, 0), node.name, node.optional);
 			case 'gammaValue':
 				return buildConditional(node);
 
 			// Every ordinary, genuinely pure value-producing expression shares this one tag -- see
 			// makeExprNode's own comment -- so node.expr's own .type picks the shape here.
 			case 'floating': {
-				const expr = node.expr!;
+				const expr = node.expr;
 				switch (expr.type) {
 					case 'literal':
 					case 'this':
@@ -1962,7 +1962,7 @@ export function BuildProgram(
 			// the value produced. Resolves via resolveTarget, not resolveOperand: a member/index
 			// target's value can genuinely differ once the mutation runs, so it must rebuild fresh.
 			case 'mutation': {
-				const expr = node.expr!;
+				const expr = node.expr;
 				switch (expr.type) {
 					case 'unary':
 						return { ...expr, operand: resolveTarget(node.id, 0) };
@@ -2083,7 +2083,7 @@ export function BuildProgram(
 			declaredNames.add(name);
 			return JS.VarDecl(node.declKind ?? 'let', JS.Var(name, undefined, node.typeAnnotation)) as Statement;
 		}
-		if ((node.type === 'mutation' && node.expr!.type === 'unary') || node.type === 'unary_post') {
+		if ((node.type === 'mutation' && node.expr.type === 'unary') || node.type === 'unary_post') {
 			// A prefix or postfix ++/-- already performs its own assignment as a side effect when
 			// evaluated -- printed as a bare expression statement, `++i;`/`i++;` is both correct and
 			// sufficient. Routing it through declareOrAssign like an ordinary reassignment would wrap
@@ -2148,7 +2148,7 @@ export function BuildProgram(
 			// A muValue always corresponds to a real, mutable loop-carried variable, forced to
 			// materialize regardless of blocks -- always safe to trust by name.
 			case 'muValue':
-				return Identifier(node.name!);
+				return Identifier(node.name);
 
 			// A thetaValue's exported value IS its mu source's value unchanged -- it exists only to
 			// mark where a loop-carried variable becomes readable again after the loop.
@@ -2311,7 +2311,7 @@ export function BuildProgram(
 				case 'passthru':
 					// A genuinely codeless declaration (interface/type-alias/enum/...) -- node.stmt
 					// prints verbatim, always regardless of reference count, unlike an ordinary value.
-					statements.push(wrapExported(node.stmt!, node.exported));
+					statements.push(wrapExported(node.stmt, node.exported));
 					break;
 
 				case 'class_decl':
@@ -2333,7 +2333,7 @@ export function BuildProgram(
 					// (`y = (x = 1)`), returning just the right-hand side -- wrong for a statement.
 					if (node.forcedPrint) {
 						statements.push(JS.Expression(
-							node.type === 'mutation' && node.expr!.type === 'binary'
+							node.type === 'mutation' && node.expr.type === 'binary'
 								? { ...(node.expr as Expr & { type: 'binary' }), left: resolveTarget(node.id, 0), right: resolveOperand(node.id, 1) }
 								: buildExpr(node)
 						) as Statement);
@@ -2353,7 +2353,7 @@ export function BuildProgram(
 	// local declaration -- unlike a gammaValue/named-except merge (a pure value with no state anchor).
 	function needsDirectPlacement(node: Node): boolean {
 		if (node.type === 'unary_post' || node.type === 'mutation' || (node.type === 'var' && node.declKind !== undefined))
-			return !(node.type === 'mutation' && node.expr!.type === 'binary') || !isInlinableSlot(node);
+			return !(node.type === 'mutation' && node.expr.type === 'binary') || !isInlinableSlot(node);
 		return false;
 	}
 
@@ -2638,7 +2638,7 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 	// mutation into a bare literal would silently discard the effect it exists to perform.
 	if (node.type !== 'floating')
 		return false;
-	const expr = node.expr!;
+	const expr = node.expr;
 	switch (expr.type) {
 		case 'binary': {
 			// Find the incoming value edges for this node
@@ -2811,7 +2811,7 @@ function getStructuralKey(node: Node): string {
 		// (a 'mutation' node never reaches here -- excluded before this, its only caller, runs).
 		switch (node.type === 'floating' ? node.expr.type : node.type) {
 			case 'binary':
-			case 'unary': key += (node.expr as any).operator;
+			case 'unary': key += (node.expr as Expr & { type: 'binary' | 'unary' }).operator;
 				break;
 			// JSON.stringify, not a bare `+=`: this also naturally distinguishes a literal's own
 			// falsy value (0/false/''/null) from a genuinely valueless node, since `node.expr` is
@@ -2848,7 +2848,7 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 		// moves to node.expr's own .type -- same exclusion, same reasoning as above ('this'/'super':
 		// identical structural key regardless of which method they're in, but each one's real value
 		// is bound per call, so merging them conflates two different receivers).
-		if (node.type === 'floating' && (['array', 'object', 'index', 'this', 'super'] as (Expr['type'])[]).includes(node.expr!.type))
+		if (node.type === 'floating' && (['array', 'object', 'index', 'this', 'super'] as (Expr['type'])[]).includes(node.expr.type))
 			continue;
 
 		// Generate the unique structural signature for this node
