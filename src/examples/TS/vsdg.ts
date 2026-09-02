@@ -84,6 +84,16 @@ class Node {
 	// chain backward, which for an EMPTY body coincides with entry itself and so can't be told apart
 	// from "there is no return node" by edge-walking alone).
 	returnNodeId?: NodeId;
+	// Stamped on a function_decl/entry node for each of its own params that's a destructuring
+	// pattern (see buildFunctionBody's own addParam): maps the ORIGINAL pattern object (the exact
+	// same object still sitting in node.value's own .params, since that AST is otherwise printed
+	// verbatim) to the hidden temp name its own value was actually bound to. Without this, the
+	// printed signature keeps showing the original pattern while the body's own flat var_decls
+	// (patternBindings) read a name the signature never actually binds -- a real ReferenceError,
+	// not cosmetic. Consulted by Output's own function_decl/rebuildClass reconstruction (the only
+	// two places a function's signature is spliced back together, not printed fully verbatim) to
+	// rebuild the printed param list with each pattern replaced by its own temp name.
+	destructuredParams?: Map<JS.BindingTarget, string>;
 	// Stamped ONLY on the top-level PROGRAM_START node, right before BuildVSDG returns: the id of
 	// the program's own final state-chain node (whatever `end` held at that point). The top-level
 	// program has no RETURN_ANCHOR/return value the way a function does, so unlike returnNodeId this
@@ -825,6 +835,13 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		const fnScope = new Scope(scope);
 		fnScope.isFunctionBoundary = true;
 
+		// A destructured param's own hidden temp binding (its own opaque 'var' node -- externally
+		// provided, no input edge, exactly like an ordinary named param) is created below, same as
+		// any other param, but the flat var_decls that destructure it can't be recursed until the
+		// function's own state chain (fnScope/bodyStart) is live -- collected here, emitted right
+		// after setState, before the real body statements (so they're the first things the body
+		// actually does, matching the parameter's own left-to-right binding order).
+		const pendingParamPatterns: [JS.BindingTarget, string][] = [];
 		if (params) {
 			// Wire incoming output ports from the entry node directly to parameter bindings.
 			// Each param gets its own node (port 0 = State, so params occupy port index + 1);
@@ -835,7 +852,12 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					connectValue(entryNode, port++, paramNode, 0);
 					fnScope.create(key, paramNode);
 				} else {
-					console.log(`not handling destructured parameter`);
+					const tempName = `__destructure${nextId++}`;
+					const paramNode = makeNode('var', tempName);
+					connectValue(entryNode, port++, paramNode, 0);
+					fnScope.create(tempName, paramNode);
+					pendingParamPatterns.push([key, tempName]);
+					(entryNode.destructuredParams ??= new Map()).set(key, tempName);
 				}
 
 			}
@@ -856,6 +878,13 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		// is a separate, not-yet-hit gap.
 		const outerFunctionEntry = currentFunctionEntry;
 		currentFunctionEntry = entryNode;
+		// A destructured param's own flat var_decls are the first things the body actually does,
+		// matching the parameter's own left-to-right binding order -- walked here, not before
+		// currentFunctionEntry is set, for the same reason the real body statements need it set
+		// first (a 'this'/'super' or muValue anywhere in a default value needs the right floor).
+		for (const [key, tempName] of pendingParamPatterns)
+			for (const stmt of patternBindings('let', key, Identifier(tempName)))
+				recurse(stmt, 'statement');
 		if (Array.isArray(body)) {
 			for (const stmt of body)
 				recurse(stmt, 'statement');
@@ -1091,8 +1120,20 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							// reads `a` (e.g. an `if (a)` test right after it), since both just look like
 							// ordinary data to the scheduler.
 							rebindVar(v.name, varNode, true);
+						} else if (v.init) {
+							// Bind the real initializer to a hidden temp exactly once (patternBindings'
+							// own contract -- it may read valueExpr multiple times, once per element/
+							// property, so it must never be handed an effectful expression directly),
+							// then desugar the pattern into flat var_decls reading off that temp, each
+							// recursed through the SAME statement dispatch as any ordinary declarator --
+							// so a nested pattern (`const [a, ...{length}] = x;`) is handled for free by
+							// simply re-entering this exact case.
+							const tempName = `__destructure${nextId++}`;
+							recurse(JS.VarDecl<TS.Type>(s.kind, JS.Var<TS.Type>(tempName, v.init)) as Statement, 'statement');
+							for (const stmt of patternBindings(s.kind, v.name, Identifier(tempName)))
+								recurse(stmt, 'statement');
 						} else {
-							console.log(`not handling destructured declarator`);
+							console.log(`not handling destructured declarator with no initializer`);
 						}
 					}
 					return false;
@@ -1160,8 +1201,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						// continue should. The bound name/target (simple identifier, member, index, or a
 						// destructured pattern) is threaded through the SAME existing var_decl/assignment
 						// machinery a normal declaration or reassignment already uses -- including its
-						// existing "not handling destructured declarator" gap-report, unchanged, for a
-						// destructured loop variable.
+						// real destructuring support (patternBindings), so a destructured loop variable
+						// (`for (const [k, v] of entries)`) is handled for free, with no code here needing
+						// to know or care.
 						const suffix		= String(nextId++);
 						const iterName		= `__iter${suffix}`;
 						const resultName	= `__r${suffix}`;
@@ -1413,12 +1455,20 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 					setState(new Scope(parent.scope), startMarker(parent.end, 'CATCH_START'));
 					scope = new Scope(scope);
+					// catchParamName is what actually prints as `catch (<here>) {...}` -- for a
+					// destructured param, that's the hidden temp, with the real pattern desugared
+					// into flat var_decls at the top of the handler body (same split params/var_decl
+					// destructuring already use); the temp is just as opaque/externally-provided as
+					// an ordinary named catch param, so it gets the same no-input-edge 'var' node.
+					let catchParamName: string | undefined;
 					if (typeof s.handlerParam === 'string') {
-						// Opaque and externally provided -- no input edge; there's no computation
-						// inside `try` this could ever be resolved back to.
-						scope.create(s.handlerParam, makeNode('var', s.handlerParam));
+						catchParamName = s.handlerParam;
+						scope.create(catchParamName, makeNode('var', catchParamName));
 					} else if (s.handlerParam) {
-						console.log(`not handling destructured catch parameter`);
+						catchParamName = `__destructure${nextId++}`;
+						scope.create(catchParamName, makeNode('var', catchParamName));
+						for (const stmt of patternBindings('let', s.handlerParam, Identifier(catchParamName)))
+							recurse(stmt, 'statement');
 					}
 					for (const stmt of s.handlerBody)
 						recurse(stmt, 'statement');
@@ -1430,8 +1480,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// `if`/`else`, which really can dissolve into a pure ternary with no structural
 					// trace left), so it always needs a real anchor to reconstruct from.
 					const exc = makeNode('except');
-					if (typeof s.handlerParam === 'string')
-						exc.catchParam = s.handlerParam;
+					if (catchParamName !== undefined)
+						exc.catchParam = catchParamName;
 					connectValue(parent.end, 0, exc, 0);
 					connectValue(tryState.end, 0, exc, 1);
 					connectValue(catchState.end, 0, exc, 2);
@@ -2009,6 +2059,49 @@ function isOwnAnchorTarget(node: Node): boolean {
 	return node.type === 'var' && node.declKind !== undefined;
 }
 
+// Desugars a destructuring BindingTarget into flat var_decls reading off valueExpr -- which MUST
+// already be a stable, side-effect-free reference (a hidden temp name the caller bound the real
+// initializer/param/catch-value to ONCE), never the raw initializer expression itself: an array/
+// object pattern reads its own value MULTIPLE times (once per element/property), and re-evaluating
+// an effectful initializer that many times would silently re-run it. Mirrors towasm.ts's own
+// patternBindings (same overall shape, same `??`-based default simplification -- real default-value
+// semantics use an `=== undefined` check, not `??`, which also triggers on `null`, but reusing `??`'s
+// own single-evaluation-of-the-left codegen wholesale beats hand-rolling a second copy of that exact
+// logic, and towasm.ts's own comment already documents this as a deliberate, accepted approximation)
+// and the same two deliberate scope boundaries (no computed keys, no object rest -- a genuinely new
+// "all fields except these" object type isn't modeled). Unlike towasm.ts's own version, `kind` is a
+// real parameter, not hardcoded to 'const': a `let`-destructured binding that's later reassigned
+// needs to stay reassignable, or the reconstructed source is invalid TypeScript.
+function patternBindings(kind: JS.DeclarationKind, target: JS.BindingTarget, valueExpr: Expr): Statement[] {
+	if (typeof target === 'string')
+		return [JS.VarDecl<TS.Type>(kind, JS.Var<TS.Type>(target, valueExpr)) as Statement];
+
+	if (target.type === 'array_pattern') {
+		const stmts = target.elements.flatMap((el, i): Statement[] => {
+			if (!el)
+				return [];
+			const elemExpr: Expr = JS.Index<TS.Type>(valueExpr, Literal(i));
+			return patternBindings(kind, el.target, el.default ? { type: 'binary', operator: '??', left: elemExpr, right: el.default } as Expr : elemExpr);
+		});
+		if (target.rest)
+			stmts.push(...patternBindings(kind, target.rest, JS.Call<TS.Type>(JS.Member<TS.Type>(valueExpr, 'slice'), [Literal(target.elements.length)])));
+		return stmts;
+	}
+
+	if (target.rest) {
+		console.log(`not handling destructured object rest`);
+		return [];
+	}
+	return target.properties.flatMap((prop): Statement[] => {
+		if (typeof prop.key !== 'string') {
+			console.log(`not handling computed key in destructuring pattern`);
+			return [];
+		}
+		const propExpr: Expr = JS.Member<TS.Type>(valueExpr, prop.key);
+		return patternBindings(kind, prop.value, prop.default ? { type: 'binary', operator: '??', left: propExpr, right: prop.default } as Expr : propExpr);
+	});
+}
+
 // True when `consumer` reads its own producer, at `port`, as a call/new's own CALLEE -- the same
 // port convention BuildVSDG's own 'call'/'new' cases use (`s.arguments.length + 1`, right after
 // every argument) and buildEffectExpr's own callee resolution relies on. Used by needsTemp to keep
@@ -2284,6 +2377,21 @@ export class Output {
 				|| (node.value.type === 'unary' && (node.value as Expr & { type: 'unary' }).operator === 'await'));
 	}
 
+	// A destructured param prints as its own hidden temp name in the SIGNATURE too, not just the
+	// body -- see destructuredParams' own comment for why: the body's own flat var_decls
+	// (patternBindings) read the temp name, so the signature has to actually bind it under that
+	// same name, or the printed function references a name nothing in its own signature declares.
+	// A no-op (same object back) when this entry has no destructured params at all.
+	private rebuildParams<T extends { params: JS.Param<any>[]; rest?: JS.Rest<any> }>(raw: T, entryNode: Node): T {
+		if (!entryNode.destructuredParams)
+			return raw;
+		const rebuildKey = <P extends { key: JS.BindingTarget }>(p: P): P => {
+			const tempName = entryNode.destructuredParams!.get(p.key);
+			return tempName !== undefined ? { ...p, key: tempName } : p;
+		};
+		return { ...raw, params: raw.params.map(rebuildKey), rest: raw.rest && rebuildKey(raw.rest) };
+	}
+
 	// Splices VSDG's own resolution of a class's heritage/computed-keys/static-field-values/method-
 	// and-accessor-and-static-block-and-instance-field-initializer bodies back into its otherwise-
 	// verbatim member list (see buildClass's own comment for what's covered). `raw` is whatever
@@ -2305,9 +2413,10 @@ export class Output {
 					return mi.entryNodeId
 						? { ...withKey, value: this.resolveFieldInitializer(this.graph.get(mi.entryNodeId)!) }
 						: withKey;
-				return mi.entryNodeId
-					? { ...withKey, body: this.reconstructFunctionBody(this.graph.get(mi.entryNodeId)!) }
-					: withKey;
+				if (!mi.entryNodeId)
+					return withKey;
+				const entryNode = this.graph.get(mi.entryNodeId)!;
+				return { ...this.rebuildParams(withKey, entryNode), body: this.reconstructFunctionBody(entryNode) };
 			}),
 		};
 	}
@@ -3147,7 +3256,7 @@ export class Output {
 			const bodyStatements	= this.reconstructFunctionBody(control);
 			return [
 				...beforeStmts,
-				wrapExported({ ...(control.value as JS.FunctionDecl<any>), body: bodyStatements } as Statement, control.exported),
+				wrapExported({ ...this.rebuildParams(control.value as JS.FunctionDecl<any>, control), body: bodyStatements } as Statement, control.exported),
 				...this.emitLocalStatements(sortedIds.slice(declIndex + 1)),
 			];
 		}

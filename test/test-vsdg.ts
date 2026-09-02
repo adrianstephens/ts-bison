@@ -1224,6 +1224,38 @@ export async function main() {
 		}
 	`);
 
+	// Destructuring (patternBindings): a pattern's own real initializer is bound to a hidden temp
+	// exactly once (it may be effectful, and an array/object pattern reads its own value multiple
+	// times -- once per element/property), then desugared into flat var_decls reading off that
+	// temp, each recursed through the ordinary var_decl dispatch. A skipped element (elision), a
+	// default (`??`-based, same simplification towasm.ts's own patternBindings already accepts),
+	// and a rest element all exercise real, separate code paths.
+	check('destructuring: array pattern with elision, default, and rest all desugar off one temp', `
+		function f(arr) {
+			const [a, , b = 99, ...rest] = arr;
+			return [a, b, rest];
+		}
+	`, `
+		function f(arr) {
+			const __destructure5 = arr;
+			return [__destructure5[0], __destructure5[2] ?? 99, __destructure5.slice(3)];
+		}
+	`);
+
+	// The real bug this session found: a destructured PARAM's own hidden temp name has to be
+	// spliced into the printed SIGNATURE too (rebuildParams), not just the body's own flat
+	// var_decls (patternBindings) -- otherwise the body reads a name the signature never actually
+	// binds, a real ReferenceError, not cosmetic (found via real execution, not just inspection).
+	check('destructuring: a destructured param\'s hidden temp name is spliced into the signature too', `
+		function f({x, y}) {
+			return x + y;
+		}
+	`, `
+		function f(__destructure4) {
+			return __destructure4.x + __destructure4.y;
+		}
+	`);
+
 	if (failures) {
 		console.error(`${failures} failure(s)`);
 		process.exit(1);
