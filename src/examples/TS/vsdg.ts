@@ -2441,16 +2441,17 @@ export class Output {
 			&& (node.neverMaterialize || !this.needsTemp(node));
 	}
 
+	// 'effect' tags two very different things: a real effectful EXPRESSION (call/new/yield/
+	// tagged_template/class/jsx/arrow/function/method-bearing object/await-unary -- see each of
+	// their own BuildVSDG cases), whose value is always the actual AST Expr object; and an
+	// internal bookkeeping marker (MUTATION_MARKER/RETURN_ANCHOR/PROGRAM_START/EARLY_RETURN_MARKER/
+	// THROW_MARKER/BREAK_MARKER/CONTINUE_MARKER/BREAK_SCOPE_START/FUNCTION_BODY_START/a try branch's
+	// own startMarker), whose value is always a plain string tag. The object/string distinction
+	// alone is enough to tell them apart -- no marker's value is ever object-shaped, and no
+	// effectful expression's own .type is anything other than one of those listed above -- so
+	// there's nothing for a further .value.type enumeration to add.
 	private isEffect(node: Node): boolean {
-		return node.type === 'effect' && !!node.value && typeof node.value === 'object'
-			&& (node.value.type === 'call' || node.value.type === 'new' || node.value.type === 'yield'
-				|| node.value.type === 'tagged_template' || node.value.type === 'class' || node.value.type === 'jsx'
-				|| node.value.type === 'arrow' || node.value.type === 'function'
-				// A method/get/set-bearing object literal -- see BuildVSDG's own 'object' case for why.
-				|| node.value.type === 'object'
-				// `await x` -- see BuildVSDG's own 'unary' case for why it's tagged 'effect' at all
-				// despite sharing the plain 'unary' AST shape with pure operators like `-x`/`typeof x`.
-				|| (node.value.type === 'unary' && (node.value as Expr & { type: 'unary' }).operator === 'await'));
+		return node.type === 'effect' && !!node.value && typeof node.value === 'object';
 	}
 
 	// A destructured param prints as its own hidden temp name in the SIGNATURE too, not just the
