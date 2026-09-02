@@ -1,5 +1,7 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
+import * as W from '../walker';
+import {mapObject, mapArray, mapArrayA, mapDefined, makeProcess, makeProcessB} from '../walker';
 import { Literal } from '../common';
 
 // ===================================================================
@@ -25,6 +27,7 @@ export const isJsStatement		= guard<JS.Statement<any>>(stmts);
 type Type		= TS.Type;
 type Expr		= TS.Expr;
 type Statement	= TS.Statement;
+export type Walkable0 = Statement | Expr | Type;
 export type Walkable = Statement | Expr | Type | TS.Program | Statement[];
 
 //-----------------------------------------------------------------------------
@@ -94,54 +97,8 @@ export function calcBinary(op: JS.binaryOps, a: any, b: any) {
 
 // Lets a hook recurse into a child of another domain (e.g. an expression from onStatement),
 // using the same shape-based dispatch `walk()` itself uses at its own entry point.
-type Recurse		= <T extends TS.Statement | Expr | Type>(x: T) => T | undefined;
-type OnAST<U>		= (x: U, process: <T extends U>(x: T) => T, recurse: Recurse) => U | undefined;
-
-function makeProcess<U>(parts: (x: U) => U, on: OnAST<U> | undefined, recurse: Recurse, always = false) {
-	return	on 		? <T extends U>(t?: T) => t ? on(t, <T extends U>(t: T) => parts(t) as T, recurse) as T | undefined : undefined
-		:	always	? <T extends U>(t?: T) => t ? parts(t) as T : undefined
-					: <T extends U>(t?: T) => t;
-}
-
-function mapArray<T>(map: (x: T) => T | undefined) {
-	return (x: readonly T[]): T[] | undefined => {
-		const result = x.map(map).filter(i => i !== undefined);
-		return result.length > 0 ? result : undefined;
-	};
-}
-function mapArrayA<T>(map: (x: T) => T | undefined) {
-	return (x: readonly T[]): T[] => x.map(map).filter(i => i !== undefined);
-}
-
-function mapDefined<T>(map: (x: T) => T | undefined) {
-	return (x: T) => notUndefined(map(x));
-}
-
-function notUndefined<T>(x: T | undefined): T {
-	if (x === undefined)
-		throw new Error('mapor returned undefined');
-	return x;
-}
-
-type NodeMap<N>		= Partial<{[K in keyof N]: (x: Exclude<N[K], undefined>) => Exclude<N[K], undefined> | undefined}>
-
-function mapObject<N extends Record<string, any>>(node: N, fields: NodeMap<N>): N {
-	const r = {...node};
-	for (const f in fields) {
-		const k = f as keyof N;
-		if (node[k] !== undefined) {
-			const ret = fields[k]?.(node[k]);
-			if (ret !== undefined)
-				r[k] = ret;
-			else
-				delete r[k];
-		}
-	}
-	const pos = (node as any).pos;
-	if (pos)
-		Object.defineProperty(r, 'pos', {value: pos, enumerable: false, configurable: true, writable: false });
-	return r;
-}
+type Recurse		= W.Recurse<Walkable0>;
+type OnAST<U>		= W.OnAST<U, Recurse>;
 
 export function walk<T extends Walkable>(ast: T,
 	onStatement?:	OnAST<TS.Statement>,
@@ -502,13 +459,7 @@ export function walk<T extends Walkable>(ast: T,
 // told apart by shape alone (a 'literal' node is IDENTICAL, field for field, whether it's a
 // type-level literal type or an expression-level literal value; see `recurse`'s own comment).
 export type RecurseB	= (x: TS.Statement | Expr | Type | undefined, kind?: 'expression' | 'statement' | 'type') => boolean;
-type OnASTB<U>		= (x: U, process: (x: U) => boolean, recurse: RecurseB) => boolean;
-
-function makeProcessB<U>(parts: (x: U) => boolean, on: OnASTB<U> | undefined, recurse: RecurseB, always = false) {
-	return	on 		? (t?: U) => t ? on(t, (t: U) => parts(t), recurse) : false
-		:	always	? (t?: U) => t ? parts(t) : false
-					: (_?: U) => false;
-}
+type OnASTB<U>		= W.OnASTB<U, RecurseB>;
 
 export function walkB<T extends Walkable>(ast: T,
 	onStatement?:	OnASTB<TS.Statement>,

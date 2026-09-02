@@ -1,4 +1,6 @@
 import * as PY from './py-parser';
+import * as W from '../walker';
+import {mapObject, mapArrayA, mapDefined, makeProcess, makeProcessB} from '../walker';
 
 // ===================================================================
 //  Type guards
@@ -31,7 +33,8 @@ export const isStmt		= guard<PY.Stmt>(stmtTags);
 
 type Expr = PY.Expr;
 type Stmt = PY.Stmt;
-export type Walkable = Stmt | Expr | PY.Module | Stmt[];
+export type Walkable0 = Stmt | Expr;
+export type Walkable = Walkable0 | Stmt[];
 
 // ===================================================================
 //  Constant folding
@@ -99,63 +102,26 @@ export function calcBinary(op: PY.binaryOps, a: unknown, b: unknown): unknown {
 //  walk -- immutable transform
 // ===================================================================
 
-type Recurse	= <T extends Stmt | Expr>(x: T) => T | undefined;
-type OnAST<U>	= (x: U, process: <T extends U>(x: T) => T, recurse: Recurse) => U | undefined;
-
-function makeProcess<U>(parts: (x: U) => U, on: OnAST<U> | undefined, recurse: Recurse, always = false) {
-	return	on		? <T extends U>(t?: T) => t ? on(t, <T extends U>(t: T) => parts(t) as T, recurse) as T | undefined : undefined
-		:	always	? <T extends U>(t?: T) => t ? parts(t) as T : undefined
-					: <T extends U>(t?: T) => t;
-}
-
-function mapArrayA<T>(map: (x: T) => T | undefined) {
-	return (x: readonly T[]): T[] => x.map(map).filter(i => i !== undefined);
-}
-function mapDefined<T>(map: (x: T) => T | undefined) {
-	return (x: T) => {
-		const r = map(x);
-		if (r === undefined)
-			throw new Error('walk: mapper deleted a required node');
-		return r;
-	};
-}
-
-type NodeMap<N> = Partial<{[K in keyof N]: (x: Exclude<N[K], undefined>) => Exclude<N[K], undefined> | undefined}>;
-
-function mapObject<N extends Record<string, any>>(node: N, fields: NodeMap<N>): N {
-	const r = {...node};
-	for (const f in fields) {
-		const k = f as keyof N;
-		if (node[k] !== undefined) {
-			const ret = fields[k]?.(node[k]);
-			if (ret !== undefined)
-				r[k] = ret;
-			else
-				delete r[k];
-		}
-	}
-	return r;
-}
+type Recurse	= W.Recurse<Walkable0>;
+type OnAST<U>	= W.OnAST<U, Recurse>;
 
 export function walk<T extends Walkable>(ast: T,
 	onStatement?:	OnAST<Stmt>,
 	onExpression?:	OnAST<Expr>,
 ): T | undefined {
 
-	const param = (p: PY.Param): PY.Param => mapObject(p, {annotation: mapExpression, default: mapExpression});
-	const arg   = (a: PY.Arg): PY.Arg => mapObject(a, {value: mapExpressionA});
+	const param			= (p: PY.Param): PY.Param => mapObject(p, {annotation: mapExpression, default: mapExpression});
+	const arg   		= (a: PY.Arg): PY.Arg => mapObject(a, {value: mapExpressionA});
 
-	const compClause = (c: PY.CompClause): PY.CompClause =>
+	const compClause	= (c: PY.CompClause): PY.CompClause =>
 		c.type === 'for'	? mapObject(c, {target: mapExpressionA, iter: mapExpressionA})
 							: mapObject(c, {test: mapExpressionA});
 
-	const withItem = (w: PY.WithItem): PY.WithItem => mapObject(w, {context: mapExpressionA, optional_vars: mapExpression});
-	const handler  = (h: PY.ExceptHandler): PY.ExceptHandler => mapObject(h, {type: mapExpression, body: mapStmts});
+	const withItem		= (w: PY.WithItem): PY.WithItem => mapObject(w, {context: mapExpressionA, optional_vars: mapExpression});
+	const handler  		= (h: PY.ExceptHandler): PY.ExceptHandler => mapObject(h, {type: mapExpression, body: mapStmts});
 
-	const specPart = (s: PY.FStringSpecPart): PY.FStringSpecPart =>
-		'expr' in s ? {expr: mapExpressionA(s.expr)} : s;
-	const fstringPart = (p: PY.FStringPart): PY.FStringPart =>
-		p.field ? {...p, field: mapObject(p.field, {expr: mapExpressionA, spec: mapArrayA(specPart)})} : p;
+	const specPart 		= (s: PY.FStringSpecPart): PY.FStringSpecPart => 'expr' in s ? {expr: mapExpressionA(s.expr)} : s;
+	const fstringPart 	= (p: PY.FStringPart): PY.FStringPart => p.field ? {...p, field: mapObject(p.field, {expr: mapExpressionA, spec: mapArrayA(specPart)})} : p;
 
 	const expression = (e: Expr): Expr => {
 		switch (e.type) {
@@ -200,7 +166,7 @@ export function walk<T extends Walkable>(ast: T,
 			case 'del':					return mapObject(s, {targets: mapExpressionA});
 			case 'assert':				return mapObject(s, {test: mapExpressionA, msg: mapExpression});
 			case 'if':
-			case 'while':				return mapObject(s, {test: mapExpressionA, body: mapStmts, orelse: mapStmts} as NodeMap<typeof s>);
+			case 'while':				return mapObject(s, {test: mapExpressionA, body: mapStmts, orelse: mapStmts});
 			case 'for':					return mapObject(s, {target: mapExpressionA, iter: mapExpressionA, body: mapStmts, orelse: mapStmts});
 			case 'with':				return mapObject(s, {items: mapArrayA(withItem), body: mapStmts});
 			case 'try':					return mapObject(s, {body: mapStmts, handlers: mapArrayA(handler), orelse: mapStmts, finalbody: mapStmts});
@@ -218,10 +184,10 @@ export function walk<T extends Walkable>(ast: T,
 
 	const recurse: Recurse = x => (isStmt(x) ? mapStatement(x) : mapExpression(x)) as typeof x;
 
-	const mapStatement	= makeProcess(statement, onStatement, recurse, true);
-	const mapExpression	= makeProcess(expression, onExpression, recurse);
+	const mapStatement		= makeProcess(statement, onStatement, recurse, true);
+	const mapExpression		= makeProcess(expression, onExpression, recurse);
 	const mapExpressionA	= mapDefined(mapExpression);
-	const mapStmts		= mapArrayA(mapStatement);
+	const mapStmts			= mapArrayA(mapStatement);
 
 	if (isModule(ast))
 		return {...ast, body: mapStmts(ast.body)} as T;
@@ -234,26 +200,20 @@ export function walk<T extends Walkable>(ast: T,
 //  walkB -- boolean short-circuit search
 // ===================================================================
 
-type RecurseB	= (x: Stmt | Expr | undefined) => boolean;
-type OnASTB<U>	= (x: U, process: (x: U) => boolean, recurse: RecurseB) => boolean;
-
-function makeProcessB<U>(parts: (x: U) => boolean, on: OnASTB<U> | undefined, recurse: RecurseB, always = false) {
-	return	on		? (t?: U) => t ? on(t, (t: U) => parts(t), recurse) : false
-		:	always	? (t?: U) => t ? parts(t) : false
-					: (_?: U) => false;
-}
+type RecurseB	= W.RecurseB<Walkable0>;
+type OnASTB<U>	= W.OnASTB<U, RecurseB>;
 
 export function walkB<T extends Walkable>(ast: T,
 	onStatement?:	OnASTB<Stmt>,
 	onExpression?:	OnASTB<Expr>,
 ): boolean {
 
-	const param = (p: PY.Param) => walkExpression(p.annotation) || walkExpression(p.default);
-	const arg   = (a: PY.Arg) => walkExpression(a.value);
-	const compClause = (c: PY.CompClause) => c.type === 'for' ? walkExpression(c.target) || walkExpression(c.iter) : walkExpression(c.test);
-	const withItem = (w: PY.WithItem) => walkExpression(w.context) || walkExpression(w.optional_vars);
-	const handler = (h: PY.ExceptHandler) => walkExpression(h.type) || h.body.some(walkStatement);
-	const fstringPart = (p: PY.FStringPart) => !!p.field && (walkExpression(p.field.expr) || !!p.field.spec?.some(s => 'expr' in s && walkExpression(s.expr)));
+	const param 		= (p: PY.Param) => walkExpression(p.annotation) || walkExpression(p.default);
+	const arg   		= (a: PY.Arg) => walkExpression(a.value);
+	const compClause	= (c: PY.CompClause) => c.type === 'for' ? walkExpression(c.target) || walkExpression(c.iter) : walkExpression(c.test);
+	const withItem 		= (w: PY.WithItem) => walkExpression(w.context) || walkExpression(w.optional_vars);
+	const handler		= (h: PY.ExceptHandler) => walkExpression(h.type) || h.body.some(walkStatement);
+	const fstringPart	= (p: PY.FStringPart) => !!p.field && (walkExpression(p.field.expr) || !!p.field.spec?.some(s => 'expr' in s && walkExpression(s.expr)));
 
 	const expression = (e: Expr): boolean => {
 		switch (e.type) {
@@ -313,5 +273,5 @@ export function walkB<T extends Walkable>(ast: T,
 		return ast.body.some(walkStatement);
 	if (Array.isArray(ast))
 		return ast.some(walkStatement);
-	return recurse(ast as Stmt | Expr);
+	return recurse(ast);
 }

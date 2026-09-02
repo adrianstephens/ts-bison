@@ -1,19 +1,21 @@
 import * as C from './c-parser';
 import * as CPP from './cpp-parser';
+import * as W from '../walker';
+import {mapObject, mapArray, mapArrayA, mapDefined, makeProcess, makeProcessB} from '../walker';
 
-type Definition		= CPP.Definition;
-type Statement		= CPP.Statement;
-type Expr			= CPP.Expr;
+type Definition			= CPP.Definition;
+type Statement			= CPP.Statement;
+type Expr				= CPP.Expr;
 type ClassMember		= CPP.ClassMember;
-type Declarator		= CPP.Declarator;
+type Declarator			= CPP.Declarator;
 type AbstractDeclarator	= CPP.AbstractDeclarator;
-type TypeName		= CPP.TypeName;
-type TypeSpecifier	= CPP.TypeSpecifier;
+type TypeName			= CPP.TypeName;
+type TypeSpecifier		= CPP.TypeSpecifier;
 type TypeSpecifierExt	= CPP.TypeSpecifierExt;
-type DeclSpec		= CPP.DeclSpec;
-type ParamDecl		= CPP.ParamDecl;
-type InitDeclarator	= C.InitDeclarator<Declarator>;
-type Block			= C.Block<Declarator, TypeSpecifierExt>;
+type DeclSpec			= CPP.DeclSpec;
+type ParamDecl			= CPP.ParamDecl;
+type InitDeclarator	=	 C.InitDeclarator<Declarator>;
+type Block				= C.Block<Declarator, TypeSpecifierExt>;
 // The `declaration`/`typedef` tags, widened -- cpp's `Definition`/`Statement` unions inline these rather than
 // exporting them under their own names, so name the widened instantiations locally.
 type Declaration		= C.Declaration<Declarator, TypeSpecifierExt>;
@@ -47,64 +49,13 @@ export const isPackParameter	= (p: ParamDecl): p is CPP.PackParameter => !!packP
 // walk
 //-----------------------------------------------------------------------------
 
-interface Process<U> {
-	<T extends U>(x: T, recall?: false): T;
-	<T extends U>(x?: T, recall?: boolean): T | undefined;
-}
-type OnAST<U>		= (x: U, process: Process<U>) => U | undefined;
+export type Walkable0 = Definition | Statement | Expr | ClassMember;
+export type Walkable = C.TranslationUnit | Definition | Statement | Expr | ClassMember | Statement[] | Definition[] | ClassMember[];
 
-function makeProcess<U>(parts: (x: U) => U, on?: OnAST<U>, always = false) {
-	if (on) {
-		function process<T extends U>(t: T, recall?: false): T;
-		function process<T extends U>(t?: T, recall?: boolean): T | undefined;
-		function process<T extends U>(t?: T, recall?: boolean): T | undefined {
-			return !t ? undefined : recall ? redo(t) : parts(t) as T;
-		}
-		const redo = <T extends U>(t?: T) => t ? on(t, process) as T | undefined : undefined;
-		return redo;
-	}
-	return always	? <T extends U>(t?: T) => t ? parts(t) as T : undefined
-					: <T extends U>(t?: T) => t;
-}
+type Recurse		= W.Recurse<Walkable0>;
+type OnAST<U>		= W.OnAST<U, Recurse>;
 
-function mapArray<T>(map: (x: T) => T | undefined) {
-	return (x: readonly T[]): T[] | undefined => {
-		const result = x.map(map).filter(i => i !== undefined);
-		return result.length > 0 ? result : undefined;
-	};
-}
-function mapArrayA<T>(map: (x: T) => T | undefined) {
-	return (x: readonly T[]): T[] => x.map(map).filter(i => i !== undefined);
-}
-
-function mapDefined<T>(map: (x: T) => T | undefined) {
-	return (x: T) => notUndefined(map(x));
-}
-
-function notUndefined<T>(x: T | undefined): T {
-	if (x === undefined)
-		throw new Error('mapor returned undefined');
-	return x;
-}
-
-type NodeMap<N>		= Partial<{[K in keyof N]: (x: Exclude<N[K], undefined>) => Exclude<N[K], undefined> | undefined}>
-
-function mapObject<N extends Record<string, any>>(node: N, fields: NodeMap<N>): N {
-	const r = {...node};
-	for (const f in fields) {
-		const k = f as keyof N;
-		if (node[k] !== undefined) {
-			const ret = fields[k]?.(node[k]);
-			if (ret !== undefined)
-				r[k] = ret;
-			else
-				delete r[k];
-		}
-	}
-	return r;
-}
-
-export function walk<T extends C.TranslationUnit | Definition | Statement | Expr | ClassMember | Statement[] | Definition[] | ClassMember[]>(ast: T,
+export function walk<T extends Walkable>(ast: T,
 	onDefinition?:	OnAST<Definition>,
 	onStatement?:	OnAST<Statement>,
 	onExpression?:	OnAST<Expr>,
@@ -158,7 +109,7 @@ export function walk<T extends C.TranslationUnit | Definition | Statement | Expr
 
 	const enumerator = (e: C.Enumerator): C.Enumerator => mapObject(e, {init: mapExpression});
 
-	const declSpec = <S extends DeclSpec>(s: S): S => mapObject(s, {type: typeSpecifier} as NodeMap<S>);
+	const declSpec = <S extends DeclSpec>(s: S): S => mapObject(s, {type: typeSpecifier} as W.NodeMap<S>);
 
 	const typeName = (t: TypeName): TypeName => mapObject(t, {specifiers: declSpec, declarator: abstractDeclarator});
 	// C's plain `cast`/`sizeof_type` Expr variants keep C's narrow (never-extended) TypeName -- see the `Expr`
@@ -216,7 +167,7 @@ export function walk<T extends C.TranslationUnit | Definition | Statement | Expr
 			case 'new':					return mapObject(e, {typeName: typeSpecifier, arguments: mapArray(mapExpressionA), size: mapExpression, placement: mapArray(mapExpressionA)});
 			case 'delete':				return mapObject(e, {operand: mapExpressionA});
 			case 'pack_expansion':		return mapObject(e, {operand: mapExpressionA});
-			case 'cpp_cast':				return mapObject(e, {target: typeName, expression: mapExpressionA});
+			case 'cpp_cast':			return mapObject(e, {target: typeName, expression: mapExpressionA});
 			case 'typeid':				return mapObject(e, {expression: mapExpression, target: typeName});
 			case 'alignof':				return mapObject(e, {target: typeName});
 			case 'functional_cast':		return mapObject(e, {arguments: mapArrayA(mapExpressionA)});
@@ -235,19 +186,19 @@ export function walk<T extends C.TranslationUnit | Definition | Statement | Expr
 
 	const declarationLike = <S extends Declaration | TypedefDecl>(d: S): S =>
 		mapObject(d, {
-			specifiers:		declSpec,
-			initDeclarators: mapArray(initDeclarator),
-			declarators:	mapArray(initDeclarator),
-		} as NodeMap<S>);
+			specifiers:			declSpec,
+			initDeclarators:	mapArray(initDeclarator),
+			declarators:		mapArray(initDeclarator),
+		} as W.NodeMap<S>);
 
 	// `template<...> declaration` -- a class/struct/union head, a using-alias, or any other Definition variant.
 	const templateDeclaration = (x: Definition | CPP.ClassSpecifier | CPP.UsingAlias): Definition | CPP.ClassSpecifier | CPP.UsingAlias | undefined => {
 		switch (x.type) {
 			case 'class':
 			case 'struct':
-			case 'union':	return classSpecifier(x);
+			case 'union':		return classSpecifier(x);
 			case 'using_alias': return mapObject(x, {target: typeName});
-			default:		return mapDefinition(x);
+			default:			return mapDefinition(x);
 		}
 	};
 
@@ -255,20 +206,20 @@ export function walk<T extends C.TranslationUnit | Definition | Statement | Expr
 		switch (d.type) {
 			case 'declaration':
 			case 'typedef':				return declarationLike(d);
-			case 'function_def':			return mapObject(d, {specifiers: declSpec, declarator, body});
+			case 'function_def':		return mapObject(d, {specifiers: declSpec, declarator, body});
 			// cpp
 			case 'namespace':
 			case 'linkage':				return mapObject(d, {body: mapArrayA(mapDefinitionA)});
 			case 'using_namespace':
 			case 'using_decl':			return d;
 			case 'using_alias':			return mapObject(d, {target: typeName});
-			case 'template':				return mapObject(d, {
+			case 'template':			return mapObject(d, {
 				params:		mapArrayA(templateParam),
 				declaration: templateDeclaration,
 			});
 			case 'static_assert':		return mapObject(d, {condition: mapExpressionA});
 			case 'method_def':
-			case 'operator_def':			return mapObject(d, {
+			case 'operator_def':		return mapObject(d, {
 				specifiers:	declSpec,
 				params:		mapArrayA(paramDecl),
 				tail:		methodTail,
@@ -290,7 +241,7 @@ export function walk<T extends C.TranslationUnit | Definition | Statement | Expr
 			case 'block':				return mapObject(s, {body: mapArrayA(mapStatementA)});
 			case 'if':					return mapObject(s, {condition: mapExpressionA, then: mapStatementA, else: mapStatement});
 			case 'while':
-			case 'do_while':				return mapObject(s, {condition: mapExpressionA, body: mapStatementA});
+			case 'do_while':			return mapObject(s, {condition: mapExpressionA, body: mapStatementA});
 			case 'for':					return mapObject(s, {
 				// `ForClauses.init`'s `Expr` component is C's plain (never-extended) Expr too -- same residual
 				// narrowness as `ArrayDecl.size` above.
@@ -301,7 +252,7 @@ export function walk<T extends C.TranslationUnit | Definition | Statement | Expr
 				body:		mapStatementA,
 			});
 			case 'switch':				return mapObject(s, {condition: mapExpressionA, body: mapStatementA});
-			case 'case':					return mapObject(s, {value: mapExpressionA, body: mapStatementA});
+			case 'case':				return mapObject(s, {value: mapExpressionA, body: mapStatementA});
 			case 'default':				return mapObject(s, {body: mapStatementA});
 			case 'return':				return mapObject(s, {expression: mapExpression});
 			case 'labeled':				return mapObject(s, {body: mapStatementA});
@@ -339,16 +290,29 @@ export function walk<T extends C.TranslationUnit | Definition | Statement | Expr
 	};
 	const classMemberU = (m: ClassMember) => classMember(m);
 
-	const mapStatement		= makeProcess(statementExtra, onStatement, true);
-	const mapDefinition		= makeProcess(definitionExtra, onDefinition, true);
-	const mapExpression		= makeProcess(expression, onExpression);
-	const mapClassMember	= makeProcess(classMember as (x: ClassMember) => ClassMember, onClassMember, true);
+	const recurse: Recurse = x => {
+		if (isClassMember(x))
+			return mapClassMember(x) as typeof x;
+		if (isDefinition(x) && !isStatementOnly(x))
+			return mapDefinition(x) as typeof x;
+		if (isStatementOnly(x))
+			return mapStatement(x) as typeof x;
+		return mapExpression(x) as typeof x;
+	};
+
+
+	const mapStatement		= makeProcess(statementExtra, onStatement, recurse, true);
+	const mapDefinition		= makeProcess(definitionExtra, onDefinition, recurse, true);
+	const mapExpression		= makeProcess(expression, onExpression, recurse);
+	const mapClassMember	= makeProcess(classMember as (x: ClassMember) => ClassMember, onClassMember, recurse, true);
 
 	const mapExpressionA	= mapDefined(mapExpression);
 	const mapStatementA		= mapDefined(mapStatement);
 	const mapDefinitionA	= mapDefined(mapDefinition);
 	const mapClassMemberA	= mapDefined(mapClassMember);
 
+	if (isTranslationUnit(ast))
+		return {...ast, body: mapArray(mapDefinition)(ast.body) ?? []} as T;
 	if (Array.isArray(ast)) {
 		if (ast.length === 0)
 			return ast as T;
@@ -359,33 +323,15 @@ export function walk<T extends C.TranslationUnit | Definition | Statement | Expr
 			return mapArray(mapDefinition)(ast as Definition[]) as T;
 		return mapArray(mapStatement)(ast as Statement[]) as T;
 	}
-	if (isTranslationUnit(ast))
-		return {...ast, body: mapArray(mapDefinition)(ast.body) ?? []} as T;
-	if (isClassMember(ast))
-		return mapClassMember(ast as ClassMember) as T;
-	if (isDefinition(ast) && !isStatementOnly(ast))
-		return mapDefinition(ast as Definition) as T;
-	if (isStatementOnly(ast) || isDefinition(ast))
-		return mapStatement(ast as Statement) as T;
-	return mapExpression(ast as Expr) as T;
+	recurse(ast);
 }
 
 //-----------------------------------------------------------------------------
 // walkB
 //-----------------------------------------------------------------------------
 
-type ProcessB<U>	= <T extends U>(x?: T, recall?: boolean) => boolean;
-type OnASTB<U>		= (x: U, process: ProcessB<U>) => boolean;
-
-function makeProcessB<U>(parts: (x: U) => boolean, on?: OnASTB<U>, always = false) {
-	if (on) {
-		const process	= (t?: U, recall?: boolean) => !t ? false : recall ? redo(t) : parts(t);
-		const redo		= (t?: U) => t ? on(t, process) : false;
-		return redo;
-	}
-	return always	? (t?: U) => t ? parts(t) : false
-					: (_?: U) => false;
-}
+type RecurseB		= W.RecurseB<Walkable>
+type OnASTB<U>		= W.OnASTB<U, RecurseB>;
 
 export function walkB<T extends C.TranslationUnit | Definition | Statement | Expr | ClassMember | Statement[] | Definition[] | ClassMember[]>(ast: T,
 	onDefinition?:	OnASTB<Definition>,
@@ -418,20 +364,20 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 			default:		return false;
 		}
 	};
-	const walkDeclSpec = (s?: DeclSpec): boolean => !!s && walkTypeSpecifier(s.type);
-	const walkTypeName = (t?: TypeName): boolean => !!t && (walkDeclSpec(t.specifiers) || walkDeclarator(t.declarator));
-	const walkParamDecl = (p: ParamDecl): boolean => isPackParameter(p) ? false : walkDeclSpec(p.specifiers) || walkDeclarator(p.declarator) || walkExpression(p.default);
-	const walkInitDeclarator = (d: InitDeclarator): boolean => isDeclarator(d) ? walkDeclarator(d as Declarator) : walkDeclarator(d.declarator) || walkInitializer(d.initializer);
-	const walkInitializer = (i?: C.Initializer): boolean => !i ? false : isExpr(i) ? walkExpression(i as Expr) : i.elements.some(walkInitializer);
-	const walkStructDeclarator = (d: CPP.StructDeclarator): boolean => 'declarator' in d ? walkDeclarator(d.declarator) || walkExpression(d.initializer) : walkExpression(d.width);
-	const walkStructMember = (m: CPP.StructMember): boolean => walkDeclSpec(m.specifiers) || m.declarators.some(walkStructDeclarator);
-	const walkTemplateArg = (a: CPP.TemplateArg): boolean => isExpr(a.value) ? walkExpression(a.value) : walkTypeName(a.value);
-	const walkTemplateParam = (p: CPP.TemplateParam): boolean => walkDeclSpec(p.nonType) || (!!p.default && (isExpr(p.default) ? walkExpression(p.default) : walkTypeName(p.default)));
-	const walkBaseSpecifier = (b: CPP.BaseSpecifier): boolean => !!b.args?.some(walkTemplateArg);
-	const walkCatchClause = (c: CPP.CatchClause): boolean => walkTypeName(c.paramType) || c.body.body.some(walkStatement);
-	const walkMemberInitializer = (m: CPP.MemberInitializer): boolean => m.arguments.some(walkExpression);
-	const walkBlock = (b?: Block): boolean => !!b && b.body.some(walkStatement);
-	const walkMethodOrCtorTail = (t: CPP.MethodTail | CPP.CtorTail): boolean =>
+	const walkDeclSpec			= (s?: DeclSpec): boolean => !!s && walkTypeSpecifier(s.type);
+	const walkTypeName			= (t?: TypeName): boolean => !!t && (walkDeclSpec(t.specifiers) || walkDeclarator(t.declarator));
+	const walkParamDecl			= (p: ParamDecl): boolean => isPackParameter(p) ? false : walkDeclSpec(p.specifiers) || walkDeclarator(p.declarator) || walkExpression(p.default);
+	const walkInitDeclarator	= (d: InitDeclarator): boolean => isDeclarator(d) ? walkDeclarator(d as Declarator) : walkDeclarator(d.declarator) || walkInitializer(d.initializer);
+	const walkInitializer		= (i?: C.Initializer): boolean => !i ? false : isExpr(i) ? walkExpression(i as Expr) : i.elements.some(walkInitializer);
+	const walkStructDeclarator	= (d: CPP.StructDeclarator): boolean => 'declarator' in d ? walkDeclarator(d.declarator) || walkExpression(d.initializer) : walkExpression(d.width);
+	const walkStructMember		= (m: CPP.StructMember): boolean => walkDeclSpec(m.specifiers) || m.declarators.some(walkStructDeclarator);
+	const walkTemplateArg		= (a: CPP.TemplateArg): boolean => isExpr(a.value) ? walkExpression(a.value) : walkTypeName(a.value);
+	const walkTemplateParam		= (p: CPP.TemplateParam): boolean => walkDeclSpec(p.nonType) || (!!p.default && (isExpr(p.default) ? walkExpression(p.default) : walkTypeName(p.default)));
+	const walkBaseSpecifier		= (b: CPP.BaseSpecifier): boolean => !!b.args?.some(walkTemplateArg);
+	const walkCatchClause		= (c: CPP.CatchClause): boolean => walkTypeName(c.paramType) || c.body.body.some(walkStatement);
+	const walkMemberInitializer	= (m: CPP.MemberInitializer): boolean => m.arguments.some(walkExpression);
+	const walkBlock				= (b?: Block): boolean => !!b && b.body.some(walkStatement);
+	const walkMethodOrCtorTail	= (t: CPP.MethodTail | CPP.CtorTail): boolean =>
 		'initializerList' in t ? (!!t.initializerList?.some(walkMemberInitializer) || walkBlock(t.body))
 			: walkBlock((t as CPP.MethodTail).body);
 
@@ -451,7 +397,7 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 			case 'new':					return walkTypeSpecifier(e.typeName) || !!e.arguments?.some(walkExpression) || walkExpression(e.size) || !!e.placement?.some(walkExpression);
 			case 'delete':				return walkExpression(e.operand);
 			case 'pack_expansion':		return walkExpression(e.operand);
-			case 'cpp_cast':				return walkTypeName(e.target) || walkExpression(e.expression);
+			case 'cpp_cast':			return walkTypeName(e.target) || walkExpression(e.expression);
 			case 'typeid':				return walkExpression(e.expression) || walkTypeName(e.target);
 			case 'alignof':				return walkTypeName(e.target);
 			case 'functional_cast':		return e.arguments.some(walkExpression);
@@ -468,12 +414,12 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 		switch (d.type) {
 			case 'declaration':
 			case 'typedef':				return declarationLike(d);
-			case 'function_def':			return walkDeclSpec(d.specifiers) || walkDeclarator(d.declarator) || walkBlock(d.body);
+			case 'function_def':		return walkDeclSpec(d.specifiers) || walkDeclarator(d.declarator) || walkBlock(d.body);
 			// cpp
 			case 'namespace':
 			case 'linkage':				return d.body.some(walkDefinition);
 			case 'using_alias':			return walkTypeName(d.target);
-			case 'template':				return d.params.some(walkTemplateParam) || (
+			case 'template':			return d.params.some(walkTemplateParam) || (
 				d.declaration.type === 'class' || d.declaration.type === 'struct' || d.declaration.type === 'union'
 					? !!d.declaration.bases?.some(walkBaseSpecifier) || !!d.declaration.body?.some(walkClassMember)
 					: d.declaration.type === 'using_alias' ? walkTypeName(d.declaration.target)
@@ -481,7 +427,7 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 			);
 			case 'static_assert':		return walkExpression(d.condition);
 			case 'method_def':
-			case 'operator_def':			return walkDeclSpec(d.specifiers) || d.params.some(walkParamDecl) || walkMethodOrCtorTail(d.tail);
+			case 'operator_def':		return walkDeclSpec(d.specifiers) || d.params.some(walkParamDecl) || walkMethodOrCtorTail(d.tail);
 			case 'constructor_def':		return d.params.some(walkParamDecl) || walkMethodOrCtorTail(d.tail);
 			case 'destructor_def':		return walkMethodOrCtorTail(d.tail);
 			case 'static_member_def':	return walkDeclSpec(d.specifiers) || walkExpression(d.initializer) || !!d.ctorArgs?.some(walkExpression);
@@ -496,11 +442,11 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 			case 'block':				return s.body.some(walkStatement);
 			case 'if':					return walkExpression(s.condition) || walkStatement(s.then) || (!!s.else && walkStatement(s.else));
 			case 'while':
-			case 'do_while':				return walkExpression(s.condition) || walkStatement(s.body);
+			case 'do_while':			return walkExpression(s.condition) || walkStatement(s.body);
 			case 'for':					return (s.init ? (isExpr(s.init) ? walkExpression(s.init) : declarationLike(s.init)) : false)
 				|| walkExpression(s.condition) || walkExpression(s.update) || walkStatement(s.body);
 			case 'switch':				return walkExpression(s.condition) || walkStatement(s.body);
-			case 'case':					return walkExpression(s.value) || walkStatement(s.body);
+			case 'case':				return walkExpression(s.value) || walkStatement(s.body);
 			case 'default':				return walkStatement(s.body);
 			case 'return':				return walkExpression(s.expression);
 			case 'labeled':				return walkStatement(s.body);
@@ -528,11 +474,20 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 				: false;
 		}
 	};
+	const recurse: RecurseB = x => {
+		if (isClassMember(x))
+			return walkClassMember(x);
+		if (isDefinition(x) && !isStatementOnly(x))
+			return walkDefinition(x);
+		if (isStatementOnly(x))
+			return walkStatement(x);
+		return walkExpression(x as Expr);
+	};
 
-	const walkStatement		= makeProcessB(statement, onStatement, true);
-	const walkDefinition		= makeProcessB(definition, onDefinition, true);
-	const walkExpression	= makeProcessB(expression, onExpression);
-	const walkClassMember	= makeProcessB(classMember, onClassMember, true);
+	const walkStatement		= makeProcessB(statement, onStatement, recurse, true);
+	const walkDefinition	= makeProcessB(definition, onDefinition, recurse, true);
+	const walkExpression	= makeProcessB(expression, onExpression, recurse);
+	const walkClassMember	= makeProcessB(classMember, onClassMember, recurse, true);
 
 	if (Array.isArray(ast)) {
 		if (ast.length === 0)
@@ -546,11 +501,5 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 	}
 	if (isTranslationUnit(ast))
 		return ast.body.some(walkDefinition);
-	if (isClassMember(ast))
-		return walkClassMember(ast as ClassMember);
-	if (isDefinition(ast) && !isStatementOnly(ast))
-		return walkDefinition(ast as Definition);
-	if (isStatementOnly(ast) || isDefinition(ast))
-		return walkStatement(ast as Statement);
-	return walkExpression(ast as Expr);
+	return recurse(ast);
 }
