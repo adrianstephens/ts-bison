@@ -2359,15 +2359,10 @@ export function BuildProgram(
 		const nodes = nodesAt(control.id);
 
 		if (control.type === 'gamma') {
-			// Anything else GCM scheduled alongside the merge itself needs to be split by whether it's
-			// a DEPENDENCY of the gamma (e.g. a `let a = ...;` the test itself reads -- must print
-			// BEFORE the if) or a DEPENDENT of it (reads the merged result -- prints after). Computed,
-			// and the "before" half emitted, BEFORE the branches themselves: a value CSE shared between
-			// a branch's own content and this gamma's own co-scheduled slot (the exact shape a value
-			// used by BOTH a sibling branch and the code after it takes -- see optimizeStructuralCSE)
-			// must already be registered in nodeVariableNames by the time the branch tries to resolve
-			// it, or it silently re-resolves/duplicates instead of referencing the shared temp (found
-			// the hard way: wiring CSE into the real pipeline surfaced this immediately).
+			// Anything else GCM scheduled alongside the merge is split by whether it's a DEPENDENCY
+			// (must print before the if) or a DEPENDENT (prints after). The "before" half is emitted
+			// first: a value CSE shares between a branch's content and this gamma's own co-scheduled
+			// slot must already be registered by the time the branch tries to resolve it.
 			const sortedIds		= localTopologicalSort(nodes);
 			const gammaIndex	= sortedIds.indexOf(control.id);
 			const beforeStmts	= emitLocalStatements(sortedIds.slice(0, gammaIndex));
@@ -2392,23 +2387,17 @@ export function BuildProgram(
 		}
 
 		if (control.type === 'break_scope') {
-			// Reconstructed as a REAL `switch`/`case`. break_scope has exactly one creation site (see
-			// BuildVSDG's own 'switch' case), which always stamps switchCases right before returning
-			// -- relied on unconditionally here, not re-checked. Each case's own body is found the
-			// same way a gamma's branches are.
-			// Computed, and the "before" half emitted, BEFORE each case's own content -- same reasoning
-			// as the gamma case just above (a CSE-shared value scheduled here must already be
-			// registered before a case tries to resolve it).
+			// Reconstructed as a real `switch`/`case` -- break_scope has exactly one creation site
+			// (BuildVSDG's own 'switch' case), which always stamps switchCases first. The "before"
+			// half is emitted first, same reasoning as the gamma case above.
 			const sortedIds	= localTopologicalSort(nodes);
 			const scopeIndex	= sortedIds.indexOf(control.id);
 			const beforeStmts	= emitLocalStatements(sortedIds.slice(0, scopeIndex));
 
-			// The discriminant's (and each case test's) own GCM schedule is driven entirely by its
-			// GRAPH consumers -- the now-bypassed "hit || matchN" test machinery -- since resolving
-			// it for PRINTING here is a plain value lookup, not a graph edge GCM ever saw. That
-			// usually places it somewhere this reconstruction never otherwise visits, so it needs
-			// forcing here or it silently never prints -- unless some OTHER surviving value already
-			// forced it under its own name first (checked via declaredNames, to avoid a duplicate).
+			// The discriminant's (and each case test's) own GCM schedule is driven by its graph
+			// consumers, not by this print-time lookup, so it usually lands somewhere this
+			// reconstruction never otherwise visits -- needs forcing here, unless some other
+			// surviving value already forced it under the same name.
 			const forceDeclare = (id: NodeId): Statement[] => {
 				const n = graph.get(id)!;
 				return n.type === 'var' && typeof n.value === 'string' && !declaredNames.has(n.value)
@@ -2419,16 +2408,10 @@ export function BuildProgram(
 				consequent:	emitChain(c.tailId, c.boundaryId) as JS.Statement<any>[],
 			}));
 
-			// Once every case's own value has been elided into the post-switch merge (see
-			// isLoopCarried's own comment -- exactly the shape a break-ending case with only a
-			// pure reassignment reduces to), a case's own body can end up with NOTHING left to run
-			// except its own trailing `break;` -- which, if EVERY case (and default, if present)
-			// is in that same shape, has nothing left to jump PAST either: every entry point,
-			// direct match or fallthrough, does nothing and falls out the same way regardless.
-			// The whole dispatch is then observably a no-op and can be dropped entirely -- NOT
-			// just each case's own reassignment the way isInlinableSlot already elides individual
-			// values. A `continue`/`return`/`throw` (a jump somewhere OTHER than "right after the
-			// switch") is real content and blocks this, unlike a bare `break`.
+			// Once every case's own value is elided into the post-switch merge, a case's body can end
+			// up with nothing left but its own trailing `break;` -- if EVERY case is in that shape,
+			// the whole dispatch is observably a no-op and can be dropped entirely, not just each
+			// case's reassignment. A continue/return/throw is real content and blocks this.
 			const isNoOp = (stmts: JS.Statement<any>[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
 			const switchIsNoOp = cases.every(c => isNoOp(c.consequent));
 
@@ -2472,8 +2455,7 @@ export function BuildProgram(
 		}
 
 		if (control.type === 'function_decl') {
-			// Before, then body -- same reasoning as the gamma case above (a function's own body is
-			// its own separate scope, so this is lower-risk than the branch cases, but kept consistent).
+			// Before, then body -- same reasoning as the gamma case above.
 			const sortedIds			= localTopologicalSort(nodes);
 			const declIndex			= sortedIds.indexOf(control.id);
 			const beforeStmts			= emitLocalStatements(sortedIds.slice(0, declIndex));
@@ -2489,10 +2471,9 @@ export function BuildProgram(
 			const thetaEdge	= (control.outputs[0] ?? []).find(e => graph.get(e.nodeId)!.type === 'theta');
 			const thetaNode	= thetaEdge && graph.get(thetaEdge.nodeId)!;
 
-			// The mu's own block holds the mu node itself plus any loop-body computation whose only
-			// real dependency IS the mu (e.g. `i = i + 1;` with no calls in the body) -- GCM schedules
-			// those into the mu's own block since there's no other anchor to place them at. Anything
-			// with a real effect continues from the body's own entry, via port 1 (the feedback input).
+			// The mu's own block holds the mu node plus any loop-body computation whose only real
+			// dependency IS the mu (no other anchor to place it at). Anything with a real effect
+			// continues from the body's own entry, via port 1 (the feedback input).
 			const ownIds		= nodes.filter(id => id !== control.id);
 
 			const statements: Statement[] = [];
@@ -2501,13 +2482,10 @@ export function BuildProgram(
 				const testId	= thetaNode.inputs[1].nodeId;
 				const testNode	= graph.get(testId)!;
 				// The test's only REAL reader (besides itself) is normally the state-theta's own
-				// condition port -- everything else pointing at it (each named theta's own condition
-				// port, one per loop-carried variable) is vestigial, never actually read by codegen.
+				// condition port -- everything else pointing at it is vestigial.
 				const onlyReadByLoopExit = (testNode.outputs[0] ?? []).filter(e => !graph.get(e.nodeId)!.isVestigialEdge(e.port))
 					.every(e => e.nodeId === thetaNode.id);
-				// Emitted BEFORE restOfBody (the loop body's own content, below) -- same reasoning as
-				// the gamma case above: a value CSE shares between the mu's own co-scheduled slot and
-				// the body itself must already be registered by the time the body tries to resolve it.
+				// Emitted before restOfBody, same CSE-registration reasoning as the gamma case above.
 				const testStatements	= onlyReadByLoopExit ? [] : emitLocalStatements([testId]);
 				const restStatements	= emitLocalStatements(ownIds.filter(id => id !== testId));
 				const restOfBody		= emitChain(control.inputs[1].nodeId, control.id);
@@ -2522,12 +2500,10 @@ export function BuildProgram(
 					), resolveOperand(thetaNode.id, 1)) as Statement);
 				} else {
 					// LOOP ROTATION: the condition needs values that only exist once already inside the
-					// loop body, so `while (cond) { ... }` is structurally impossible here --
-					// `while (true) { <compute cond>; if (!cond) break; body }` isn't. A condition that
-					// resolves to the literal `true` (a real `for(;;)`, or any desugaring -- e.g.
-					// for-of/for-in's own iterator-protocol loop -- that hands buildLoop a
-					// compile-time-constant test) makes the check provably dead: `if (!true)` never
-					// runs its `break`, so it's dropped instead of printed as inert clutter.
+					// loop body, so `while (cond) {...}` is structurally impossible -- `while (true) {
+					// <compute cond>; if (!cond) break; body }` isn't. A condition resolving to the
+					// literal `true` (a real `for(;;)`, or a for-of/for-in desugar) makes the check
+					// provably dead, so it's dropped instead of printed as inert clutter.
 					const condExpr = resolveOperand(thetaNode.id, 1);
 					statements.push(JS.While(Literal(true), JS.Block(
 						...testStatements as JS.Statement<any>[],
@@ -2550,10 +2526,9 @@ export function BuildProgram(
 			}
 
 			if (thetaNode) {
-				// Anything scheduled into the state-theta's OWN block (besides the theta node itself)
-				// needs to be emitted explicitly here, right after the loop: a pure computation that
-				// depends only on a named theta's exported value has nothing to state-chain through, so
-				// the recursive walk would never otherwise find it.
+				// Anything scheduled into the state-theta's own block needs emitting explicitly here,
+				// right after the loop -- a pure computation depending only on a named theta's exported
+				// value has nothing to state-chain through, so the recursive walk would never find it.
 				statements.push(...emitLocalStatements(nodesAt(thetaNode.id).filter(id => id !== thetaNode!.id)));
 			}
 
@@ -2563,16 +2538,13 @@ export function BuildProgram(
 		return emitLocalStatements(nodes);
 	}
 
-	// Reconstructs a 'function_decl'-anchored subgraph's own body (a top-level function, or a class
-	// method/get/set/static_block -- see BuildVSDG's buildFunctionBody) -- its own fully independent
-	// region (own entry/RETURN_ANCHOR pair, own scope). returnNodeId (stamped in BuildVSDG) is the
-	// only way to find the RETURN_ANCHOR from here -- there's no ordinary graph edge from entry to
-	// return that survives an EMPTY body (see the Node field's own comment).
+	// Reconstructs a 'function_decl'-anchored subgraph's own body -- its own fully independent
+	// region (own entry/RETURN_ANCHOR pair, own scope). returnNodeId is the only way to find the
+	// RETURN_ANCHOR from here -- no ordinary graph edge from entry to return survives an empty body.
 	function reconstructFunctionBody(entryNode: Node): Statement[] {
 		const returnNode		= graph.get(entryNode.returnNodeId!)!;
-		// A fresh declaredNames frame per function body (see ScopedNames' own comment): this
-		// function's own locals must never collide with -- or be shadowed by -- an unrelated
-		// sibling/enclosing function's locals that merely happen to share a name.
+		// A fresh declaredNames frame per function body -- this function's own locals must never
+		// collide with an unrelated sibling/enclosing function's locals sharing the same name.
 		declaredNames.push();
 		const bodyStatements	= emitChain(returnNode.inputs[0].nodeId, entryNode.id);
 
@@ -2587,9 +2559,7 @@ export function BuildProgram(
 	}
 
 	// A single-expression counterpart to reconstructFunctionBody, for an INSTANCE field's own
-	// initializer (see BuildVSDG's buildClassMember, which passes `m.value` directly as an EXPRESSION
-	// body -- the same shape an expression-bodied arrow uses, not a statement list, so there's no
-	// EARLY_RETURN_MARKER involved at all). returnNode's own port 1 IS where the value lives here.
+	// initializer (an expression body, not a statement list, so no EARLY_RETURN_MARKER involved).
 	function resolveFieldInitializer(entryNode: Node): Expr {
 		return resolveOperand(entryNode.returnNodeId!, 1);
 	}
@@ -2655,16 +2625,10 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 }
 
 
-// Every NodeId referenced OUTSIDE the ordinary inputs/outputs edge graph -- switchDiscriminantId/
-// switchCases (BuildVSDG's own 'switch' case), returnNodeId/programEndId (function_decl/
-// PROGRAM_START's own anchors), classInfo's superClassNodeId and each member's keyNodeId/
-// entryNodeId/valueNodeId (BuildVSDG's own buildClass). None of foldConstants/foldDeadBranches/
-// optimizeStructuralCSE know about these side channels -- they only rewire inputs/outputs -- so a
-// node reachable ONLY this way must never be removed/merged away, or the reference left pointing
-// at a deleted id (found the hard way: optimizeStructuralCSE merging a switch case's own literal
-// test value into an earlier structurally-identical literal elsewhere left switchCases[].testNodeId
-// dangling, crashing resolveNode). These fields are stamped once during BuildVSDG and never
-// revisited by any of the three passes, so the protected set is stable for one whole Optimize call.
+// Every NodeId referenced OUTSIDE the ordinary inputs/outputs edge graph (switchCases, returnNodeId,
+// classInfo, ...). None of foldConstants/foldDeadBranches/optimizeStructuralCSE know about these
+// side channels -- they only rewire inputs/outputs -- so a node reachable ONLY this way must never
+// be removed/merged away, or the reference is left pointing at a deleted id.
 function collectProtectedNodeIds(graph: VSDG): Set<NodeId> {
 	const ids = new Set<NodeId>();
 	for (const node of graph.values()) {
@@ -2721,11 +2685,9 @@ export function Optimize(graph: VSDG): void {
 				changed = true;
 		}
 
-		// 3. Merge structurally-identical pure computations -- runs once per round (it's a
-		// whole-graph pass, not a per-node check like the two above), each round: constant
-		// folding can turn two previously-different expressions into identical ones, and CSE
-		// merging two nodes can turn a previously-non-constant condition into one, so a single
-		// pass over each in isolation wouldn't converge on everything reachable together.
+		// 3. Merge structurally-identical pure computations -- runs once per round (a whole-graph
+		// pass, unlike the two per-node checks above): constant folding can turn two expressions
+		// identical, and CSE merging can turn a condition constant, so neither converges alone.
 		if (optimizeStructuralCSE(graph, protectedIds))
 			changed = true;
 	}
@@ -2760,14 +2722,9 @@ function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): b
 		if (!winningEdge)
 			return false;
 
-		// Bypass this Gamma node entirely!
-		// Find every downstream node that reads from this Gamma node,
-		// and reconnect them to read directly from the winning branch source. Each entry in
-		// node.outputs[port] is CONSUMER-shaped ({nodeId: consumer, port: consumer's own slot}),
-		// the opposite shape from winningEdge (PRODUCER-shaped) -- the consumer's own inputs[]
-		// entry is what actually needs to change, and winningNode's outputs[] needs a fresh,
-		// correctly-shaped descriptor, not the mutated consumer-side one (same pattern
-		// optimizeStructuralCSE already uses correctly, just below).
+		// Bypass this Gamma node entirely: reconnect every downstream consumer to read directly from
+		// the winning branch source. node.outputs[port] entries are CONSUMER-shaped, the opposite
+		// shape from winningEdge (PRODUCER-shaped) -- the consumer's own inputs[] is what changes.
 		const winningNode = graph.getNode(winningEdge.nodeId);
 		for (const subscribers of node.outputs) {
 			for (const consumerEdge of subscribers) {
@@ -2786,40 +2743,22 @@ function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): b
 
 function getStructuralKey(node: Node): string {
 	let key = node.type;
-	// !== undefined, not a truthy check: a literal's own value is frequently falsy (0, false,
-	// '', null) and still a real, distinct value -- a truthy check collapsed literal(0),
-	// literal(false), literal(''), literal(null), and a valueless node all onto the SAME key
-	// (found the hard way: literal(0) and a function's own synthetic literal(undefined) merged,
-	// producing a spurious extra `return 0;` after the real, always-taken early return).
+	// !== undefined, not a truthy check: a literal's own value is frequently falsy (0, false, '',
+	// null) and still a real, distinct value, indistinguishable from a valueless node otherwise.
 	if (node.value !== undefined) {
-		// A 'floating' node's own real discriminator lives in node.value's own .type now (see
-		// makeExprNode's own comment), not node.type -- only 'binary'/'unary' need the special
-		// operator-only key (matching two structurally-different-but-same-operator expressions is
-		// otherwise still correctly told apart by node.inputs, appended below); every other
-		// 'floating' shape (array/object/call/index/conditional/spread) falls to the same
-		// JSON.stringify default any OTHER node type without special handling already used.
-		// (A 'mutation' node never reaches here at all -- optimizeStructuralCSE excludes it before
-		// ever calling this, its own only caller -- so there's no equivalent branch for it to need.)
+		// A 'floating' node's own real discriminator lives in node.value's own .type, not node.type
+		// (a 'mutation' node never reaches here -- excluded before this, its only caller, runs).
 		switch (node.type === 'floating' ? (node.value as Expr).type : node.type) {
 			case 'binary':
 			case 'unary': key += (node.value as any).operator;
 				break;
-			// `obj.prop` and `obj?.prop` are structurally different expressions -- merging them would
-			// silently drop the short-circuit, same failure mode `optional`'s own field comment
-			// documents for reconstruction.
+			// `obj.prop` and `obj?.prop` are structurally different -- merging them would drop the
+			// short-circuit.
 			case 'member': key += node.value + (node.optional ? '?' : '');
 				break;
-			// JSON.stringify, not a bare `+=`: the SAME falsy-collision class the `!== undefined`
-			// gate above already fixed once survives here for the empty string specifically --
-			// `key += ''` appends nothing, so literal('') produced the exact same key as a genuinely
-			// valueless node (indistinguishable from literal(undefined)) and got silently CSE-merged
-			// with one -- found on real code (binary-libs/src/pe.ts): a ternary's own `: ''` alternate
-			// printed as `: undefined` after merging with an unrelated function's synthetic
-			// fall-off-the-end literal(undefined). Stringifying unambiguously distinguishes every
-			// value (including '', 0, false, null) from "no value at all" and from each other.
-			// The replacer is needed for a bigint literal anywhere in node.value (even nested,
-			// e.g. inside a 'floating' node's own full AST expr) -- JSON.stringify throws outright
-			// on a raw bigint, a real crash found on real code (binary-libs/src/pe.ts).
+			// JSON.stringify, not a bare `+=`: `key += ''` appends nothing for an empty-string
+			// literal, colliding it with a genuinely valueless node. The replacer handles a bigint
+			// anywhere in node.value -- JSON.stringify otherwise throws outright on a raw bigint.
 			default: key += JSON.stringify(node.value, (_, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
 		}
 	}
@@ -2834,42 +2773,16 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 	const structuralTable = new Map<string, Node>();
 
 	for (const node of graph.values()) {
-		// Skip nodes with side-effects or loop/branch control flow tokens.
-		// These are sequence-dependent and cannot be collapsed based purely on data inputs.
-		// 'this'/'super' are ALSO unsafe despite having no inputs at all (found the hard way,
-		// testing against a real multi-method class): every occurrence gets an identical
-		// structural key ('this:'/'super:', no operands to distinguish them by), but each one's
-		// real value is bound per CALL, not shared across the whole graph -- merging `this` from
-		// one method with `this` from a completely different method conflates two different
-		// receivers into one shared variable, corrupting both.
-		// 'array'/'object' are unsafe for a DIFFERENT reason -- found the hard way on real code
-		// (binary-libs/src/pe.ts, two `[]` literals in two completely separate functions, each
-		// EXPECTED to start fresh on every call): unlike a real literal (`5`, `"x"`), `[]`/`{}`
-		// create a NEW, DISTINCT object identity on every evaluation in real JS. Merging two
-		// structurally-identical ones collapses that into ONE shared, persistent instance --
-		// mutating it in one place (`result.push(...)`) leaks into every other site that reads
-		// the "same" literal, across calls and even across unrelated functions.
-		// 'member'/'index' (`obj.prop`/`arr[i]`) are unsafe for yet another reason: two textually
-		// identical reads of the same property share a structural key, but nothing here tracks
-		// whether an intervening mutation (an assignment, `prop++`, an arbitrary call) changed
-		// the actual value in between -- merging them would silently reuse a stale, pre-mutation
-		// value at the later read site (found the hard way: `o.count++; return o.count;` started
-		// returning the OLD count once the postfix mutation was fixed to actually write through).
-		// 'mutation' (an assignment operator or prefix ++/--) is unsafe for the most direct reason of
-		// all: each occurrence IS a distinct, real effect -- merging two structurally-identical ones
-		// (`x = 0;` appearing twice, say) would silently drop one of the two actual mutations, not
-		// just misplace a read. Every mutation is already guaranteed a structurally-unique key in
-		// practice (threadMutation gives each its own fresh MUTATION_MARKER input, never shared), so
-		// this exclusion is currently a belt-and-suspenders invariant rather than a fix for an
-		// observed collision -- but that uniqueness is an incidental property of the marker's own
-		// implementation, not something this pass should have to keep relying on implicitly.
+		// Skip nodes with side-effects or control-flow tokens -- sequence-dependent, can't collapse
+		// on data inputs alone. 'this'/'super' are also unsafe: identical structural key regardless
+		// of which method they're in, but each one's real value is bound per call. 'array'/'object'
+		// get a fresh identity per evaluation in real JS, unlike a true literal. 'member'/'index'
+		// reads can observe an intervening mutation between two textually-identical occurrences.
+		// 'mutation' is unsafe for the most direct reason: each occurrence is a distinct real effect.
 		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super', 'member', 'mutation'].includes(node.type))
 			continue;
-		// 'array'/'object'/'index' can't be listed by name any more (see makeExprNode's own comment
-		// -- all three now share the uniform 'floating' tag with every other ordinary value
-		// expression), so the check moves to node.value's own .type instead -- same exclusion, same
-		// reasoning (array/object: fresh identity per evaluation; index (`arr[i]`): same staleness-
-		// across-a-mutation hazard as 'member', just following where the real discriminator lives).
+		// 'array'/'object'/'index' share the uniform 'floating' tag, so the check moves to
+		// node.value's own .type -- same exclusion, same reasoning as above.
 		if (node.type === 'floating' && (['array', 'object', 'index'] as (Expr['type'])[]).includes((node.value as Expr).type))
 			continue;
 
@@ -2879,11 +2792,9 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 		// Check if an identical calculation has already been recorded
 		const masterNode = structuralTable.get(key);
 
-		// A protected node (some out-of-band NodeId field still points at it -- see
-		// collectProtectedNodeIds's own comment) must never be the one removed: merging IT away
-		// would leave that field dangling. Left unregistered in structuralTable too (not just
-		// skipped), so it stays its own, separate, un-mergeable node rather than silently
-		// becoming a future duplicate's "master" via a table entry nothing here actually created.
+		// A protected node must never be the one removed -- merging it away leaves that field
+		// dangling. Left unregistered in structuralTable too, so it never becomes a future
+		// duplicate's "master" either.
 		if (masterNode && masterNode.id !== node.id && protectedIds.has(node.id))
 			continue;
 
@@ -2954,55 +2865,38 @@ function isDeeperThan<N>(tree: Map<N, N>, a: N, b: N): boolean {
 
 type BlockId = string;
 
-// Discovers the program's branch/loop structure -- purely from control anchors (mu, theta, gamma,
-// break_scope, except, effect) and each one's own state predecessor -- with NO involvement from
-// ordinary value nodes at all. This is deterministic: it doesn't decide where anything reused or
-// floating gets placed (that's applyGlobalCodeMotion's own job, layered on top), it just answers
-// "where are the branches and loops, and how do they nest." Split out from applyGlobalCodeMotion
-// so the block/loop structure is available as a standalone artifact -- e.g. for inspecting a
-// program's control shape without needing a full GCM scheduling pass at all.
+// Discovers the program's branch/loop structure -- purely from control anchors and each one's own
+// state predecessor, with no involvement from ordinary value nodes. It doesn't decide where
+// anything reused/floating gets placed (applyGlobalCodeMotion's own job, layered on top), just
+// answers "where are the branches and loops, and how do they nest."
 function buildBlockTree(graph: Map<NodeId, Node>) {
-	// 1. Discover control anchors (mu, gamma, effect) and build 'rootBlocks'.
-	// BuildVSDG's PROGRAM_START seed node (the whole program's state root) gets the well-known id
-	// 'block_entry' directly, rather than an auto-numbered one like every other anchor -- Output's
-	// own buildProgram needs a fixed, known starting point to begin its traversal from.
+	// 1. Discover control anchors and build 'rootBlocks'.
+	// PROGRAM_START gets the well-known id 'block_entry' -- BuildProgram needs a fixed, known
+	// starting point to begin its traversal from.
 	const rootBlocks = new Map<NodeId, BlockId>();
 	let blockCounter = 0;
 	for (const [id, node] of graph.entries()) {
 		if (node.type === 'effect' && node.value === 'PROGRAM_START') {
 			rootBlocks.set(id, 'block_entry');
 		} else if (node.type === 'effect') {
-			// effect (call) nodes have hard sequential side-effects and a real state edge at inputs[0].
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
 		} else if (node.type === 'gamma' || node.type === 'mu' || node.type === 'theta' || node.type === 'break_scope') {
-			// gamma/mu/theta each have their own dedicated type tag now, distinct from the
-			// per-variable gammaValue/muValue/thetaValue -- so, unlike except below, no typeof-value
-			// check is needed here to tell them apart: a node literally tagged 'gamma'/'mu'/'theta'
-			// is always the real state/control anchor (its inputs[0] is genuinely a state-chain
-			// predecessor), full stop. This used to be the exact bug class found and fixed the hard
-			// way for gamma (see neverMaterialize's own comment) and would have hit theta too --
-			// thetaValue's own port 0 is its CONDITION operand, not a state predecessor at all,
-			// unlike the real state theta's port 0 (see buildLoop's own port comments) -- so a
-			// unified 'theta' tag relying on typeof-value here would have mis-scheduled a thetaValue
-			// exactly the same way. break_scope has no per-variable analog at all (there's no "break
-			// exits this" equivalent for a single value).
+			// gamma/mu/theta each have their own dedicated type tag, distinct from the per-variable
+			// gammaValue/muValue/thetaValue, so no typeof-value check is needed to tell them apart
+			// (unlike except below) -- a unified tag relying on that would mis-schedule a thetaValue,
+			// whose own port 0 is a CONDITION operand, not a state predecessor.
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
 		} else if (node.type === 'except' && typeof node.value !== 'string') {
-			// except still shares one type tag between its state and NAMED (per-variable) forms --
-			// see BuildVSDG's 'try' case, which builds a real `makeNode('except', name)` directly
-			// (not through reconcileVariables/gammaValue) -- so the typeof check still matters here.
+			// except still shares one type tag between its state and NAMED forms, so the typeof
+			// check matters here.
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
 		} else if (node.type === 'function_decl' || node.type === 'passthru' || node.type === 'class_decl') {
-			// A declaration statement, threaded sequentially into the state chain exactly like an
-			// effect (see BuildVSDG's own cases) -- needs its own block for the same reason every other
-			// state-chain link does: emitFrom's traversal only ever visits rootBlocks-anchored nodes.
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
 		}
 	}
 
-	// The reverse of rootBlocks: which node anchors a given block. Built once here (rather than
-	// separately, later, in the final packing step) so getLoopDepth can look up a block's REAL node
-	// type directly, instead of guessing it from the block id's string prefix.
+	// The reverse of rootBlocks -- built once here so getLoopDepth can look up a block's real node
+	// type directly, instead of guessing from the block id's string prefix.
 	const blockControl = new Map<BlockId, NodeId>();
 	for (const [nodeId, blockId] of rootBlocks)
 		blockControl.set(blockId, nodeId);
@@ -3010,32 +2904,24 @@ function buildBlockTree(graph: Map<NodeId, Node>) {
 	// Maps a Block ID to its immediate parent Block ID in the Dominator Tree
 	const blockTree = new Map<BlockId, BlockId>();
 
-	// The entry block has no parent -- deliberately left unset (not a self-loop) so that every
-	// walk-to-root loop below (`for (...; current; current = blockTree.get(current))`) terminates
-	// when it reaches 'block_entry'; a self-loop here made blockTree.get('block_entry') always
-	// truthy, so any such walk that reached it spun forever.
+	// The entry block has no parent -- deliberately left unset, not a self-loop, so every
+	// walk-to-root loop below terminates at 'block_entry' instead of spinning forever.
 
 	for (const [nodeId, blockId] of rootBlocks.entries()) {
 		if (!blockId)
 			continue;
 
-		// Port 0 is the real state predecessor for every control-anchor type by construction (effect,
-		// state-gamma, state-theta, and state-mu all put it there) -- see their creation sites in
-		// BuildVSDG for why this wasn't always true before they were reordered to be consistent.
+		// Port 0 is the real state predecessor for every control-anchor type by construction.
 		const incomingStateEdge = graph.get(nodeId)?.inputs[0];
 		if (incomingStateEdge)
 			// Find which block contains the node that produced our incoming state token
 			blockTree.set(blockId, rootBlocks.get(incomingStateEdge.nodeId) ?? '');
 	}
 
-	// How many loops actually enclose a block, computed from real node types and blockTree ancestry
-	// -- not (as before) a guess based on whether the block id's string happens to start with "mu".
-	// The relation: a state-mu's own block is one deeper than its blockTree parent (entering the
-	// loop); a state-theta's block is the EXIT of its own mu -- despite being a blockTree-descendant
-	// of it (the theta's real predecessor IS that mu), it runs once, after the loop, so its depth is
-	// whatever the loop's OWN parent had, not one more than it; every other block just inherits its
-	// parent's depth unchanged. This correctly generalizes to nested loops, since each mu/theta pair
-	// only ever adjusts depth relative to its own immediate parent.
+	// How many loops enclose a block: a state-mu's own block is one deeper than its blockTree
+	// parent; a state-theta's block is the EXIT of its own mu -- despite being a blockTree
+	// descendant of it, it runs once after the loop, so its depth is the loop's OWN parent's,
+	// not one more; every other block just inherits its parent's depth unchanged.
 	const loopDepthMemo = new Map<BlockId, number>();
 	function getLoopDepth(blockId?: BlockId): number {
 		if (blockId === undefined)
@@ -3068,13 +2954,10 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 	const { rootBlocks, blockControl, blockTree, getLoopDepth } = buildBlockTree(graph);
 
 	// Which function's own region a block belongs to -- walks blockTree up until hitting either
-	// 'block_entry' (the top-level program) or a function's own FUNCTION_BODY_START marker,
-	// memoized since scheduleLate calls this once per consumer edge. Deliberately NOT the
-	// function_decl node's own block: that's reachable from BOTH the function's own body AND
-	// whatever textually follows the declaration (entryNode's port-0 output has two logically
-	// different consumers -- see FUNCTION_BODY_START's own comment, in BuildVSDG), so blockTree
-	// ancestry alone can't tell "genuinely inside this function" apart from "next, outside it".
-	// The dedicated start marker is what actually disambiguates: only the body threads from IT.
+	// 'block_entry' or a function's own FUNCTION_BODY_START marker. Deliberately NOT the
+	// function_decl node's own block: that's reachable from BOTH the function's body and whatever
+	// textually follows the declaration, so blockTree ancestry alone can't tell them apart -- the
+	// dedicated start marker is what disambiguates, since only the body threads from it.
 	const regionRootMemo = new Map<BlockId, BlockId>();
 	function regionRootOf(blockId: BlockId): BlockId {
 		const cached = regionRootMemo.get(blockId);
@@ -3090,16 +2973,11 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 		return root;
 	}
 
-	// A function_decl's own block is deliberately ambiguous for regionRootOf (see its own comment
-	// just above) -- but a PARAM reading that function_decl node directly is never one of the two
-	// ambiguous cases at all: it's unconditionally inside the function, regardless of blockId
-	// sharing. Params read the function_decl node at ports >= 1 (port 0 is reserved for the state
-	// chain -- see BuildVSDG's buildFunctionBody, "port 0 = State, so params occupy port index+1"),
-	// so scheduleEarly uses THIS instead of the function_decl's own block whenever it follows one
-	// of those edges -- otherwise a value derived only from params (e.g. a CSE-shared `a * b`) gets
-	// its own earliestBlock pinned at the function_decl's block, which regionRootOf resolves to
-	// block_entry, excluding it from every real in-function consumer's own scheduleLate constraint
-	// and stranding it outside the function -- referencing parameters that don't exist there.
+	// A function_decl's own block is deliberately ambiguous for regionRootOf -- but a PARAM reading
+	// that node directly (ports >= 1, port 0 reserved for the state chain) is never one of the two
+	// ambiguous cases: it's unconditionally inside the function. scheduleEarly uses this instead of
+	// the function_decl's own block for such edges, or a value derived only from params gets pinned
+	// at a block regionRootOf resolves to block_entry, stranding it outside the function.
 	const functionBodyBlockMemo = new Map<NodeId, BlockId>();
 	function functionBodyBlockOf(functionDeclId: NodeId): BlockId {
 		const cached = functionBodyBlockMemo.get(functionDeclId);
@@ -3130,50 +3008,32 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 
 		const node = graph.get(nodeId)!;// as NodeWithBlock;
 
-		// Default to the first entry block of the program -- unless this is a 'this'/'super' node
-		// (or anything else ever stamped with scopeAnchorId), which has NO input edges at all to
-		// otherwise floor it against its own function (see scopeAnchorId's own comment, and
-		// functionBodyBlockOf's).
+		// Default to the program's first entry block -- unless this is a 'this'/'super' node (or
+		// anything stamped with scopeAnchorId), which has no input edges to floor it against its
+		// own function otherwise.
 		let earliestBlock = node.scopeAnchorId !== undefined ? functionBodyBlockOf(node.scopeAnchorId) : "block_entry";
 
 		// Recursively process all input dependencies first
 		node.inputs.forEach((edge, port) => {
 			if (!edge)
 				return;
-			// A mu's port 1 is its FEEDBACK edge -- a genuine back-edge (that's what makes it a loop):
-			// the loop body's own reassignment depends on the mu, and the mu's feedback depends right
-			// back on that reassignment. Recursing into it here would chase that cycle; memoization
-			// (visitedEarly) stops it from crashing, but whichever side gets visited first ends up
-			// computed WITHOUT the other's depth (blockIds isn't set for it yet), silently landing too
-			// shallow. The mu's own earliest position never needs this edge anyway -- only its initial
-			// value (port 0) and its scheduling-anchor edge, if any, ever determine that.
+			// A mu's port 1 is its FEEDBACK edge -- a genuine back-edge. Recursing into it here would
+			// chase that cycle; the mu's own earliest position never needs it anyway, only its
+			// initial value (port 0) and any scheduling-anchor edge.
 			if ((node.type === 'mu' || node.type === 'muValue') && port === 1)
 				return;
-			// A muValue's port 2 ties it to its owning mu's own block unconditionally -- correct
-			// for a genuinely loop-carried variable (it can't be computed before the loop it's
-			// carried by even exists), but wrong for one that's never actually reassigned in this
-			// loop at all: its own port-1 feedback is then just a trivial self-loop
-			// (node.inputs[1].nodeId === nodeId), proving it's loop-invariant, so nothing about
-			// this loop should floor its placement -- only its real value-producing edges (port 0,
-			// the initial/only value) should. Loop-invariant hoisting falls out of this for free:
-			// scheduleEarly already computes "as early as legal", so skipping this one floor lets
-			// it land wherever its own (non-loop-carried) inputs actually require.
+			// A muValue's port 2 ties it to its owning mu's block unconditionally -- correct for a
+			// genuinely loop-carried variable, but wrong for one whose port-1 feedback is just a
+			// trivial self-loop (proving it's loop-invariant) -- skipping this floor for that case is
+			// exactly what makes loop-invariant hoisting fall out of scheduleEarly for free.
 			if (node.type === 'muValue' && port === 2 && node.inputs[1]?.nodeId === nodeId)
 				return;
 			scheduleEarly(edge.nodeId);
-			// The current node must be scheduled AFTER its inputs are ready.
-			// We find the deepest block among all inputs. A param edge (see functionBodyBlockOf's
-			// own comment) uses the function's own body block instead of the function_decl's own
-			// (edge.port is the PRODUCER's own output port here -- port 0 is reserved for the state
-			// chain, so port !== 0 into a function-entry node is unambiguously a param read).
-			// Checked via `returnNodeId` (stamped unconditionally by buildFunctionBody, never
-			// cleared), not `.type === 'function_decl'`: an arrow/function EXPRESSION's own entry
-			// node has its `.type` overwritten to 'effect' right after buildFunctionBody returns
-			// (see BuildVSDG's 'arrow'/'function' case), so the type check alone silently never
-			// matched a param read inside one -- an arrow's own param-derived, GCM-hoisted pure
-			// value could float all the way out of the arrow entirely, past its own parameter's
-			// scope (found via a real ReferenceError on real code: `v.address` hoisted out of a
-			// `.map((v, i) => ...)` callback to the enclosing function's top level).
+			// The current node must be scheduled AFTER its inputs are ready -- find the deepest block
+			// among all inputs. A param edge uses the function's own body block instead of the
+			// function_decl's own. Checked via `returnNodeId`, not `.type === 'function_decl'`: an
+			// arrow/function EXPRESSION's entry node has its `.type` overwritten to 'effect', so the
+			// type check alone would silently miss a param read inside one.
 			const targetNode	= graph.get(edge.nodeId)!;
 			const edgeBlock	= targetNode.returnNodeId !== undefined && edge.port !== 0
 				? functionBodyBlockOf(edge.nodeId)
@@ -3220,48 +3080,27 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 			for (const consumerEdge of portChannels) {
 				const consumerNode = graph.get(consumerEdge.nodeId)!;
 
-				// A mu's port 1 is its FEEDBACK edge -- "the value THIS read produces for the NEXT
-				// iteration to see", a genuine back-edge (same cycle scheduleEarly already has to skip
-				// for the same reason). It doesn't constrain "must be ready by" the mu's own block at
-				// all -- treating it as an ordinary consumer could make latestBlock come out SHALLOWER
-				// than earliestBlock (a contradiction: the mu itself is scheduled at the loop header,
-				// but this node's own inputs might only be ready deeper inside the same iteration),
-				// which the walk below has no way to reconcile since it only ever walks upward.
+				// A mu's port 1 is its FEEDBACK edge, a genuine back-edge -- it doesn't constrain
+				// "must be ready by" the mu's own block, or latestBlock could come out shallower
+				// than earliestBlock, a contradiction the walk below can't reconcile.
 				if ((consumerNode.type === 'mu' || consumerNode.type === 'muValue') && consumerEdge.port === 1)
 					continue;
 
-				// The exact same structural issue, for if/else: feeding a gammaValue's trueVal (port 1)
-				// or falseVal (port 2) only means "I'm one of the two alternatives this ternary picks
-				// between", not "I must be ready by the gammaValue's own block" -- that block sits
-				// AFTER both branches, not inside either one, so treating this as an ordinary consumer
-				// could produce a latestBlock that isn't even a blockTree descendant of earliestBlock
-				// (the branch's own content is a SIBLING of the post-if continuation, not its
-				// ancestor), which the walk below has no way to reconcile either.
+				// Same structural issue for if/else: feeding a gammaValue's trueVal/falseVal only
+				// means "I'm one of the two alternatives", not "ready by the gammaValue's own block"
+				// -- that block sits AFTER both branches, not inside either one.
 				if (consumerNode.type === 'gammaValue' && consumerEdge.port !== 0)
 					continue;
 
-				// The exact same structural issue again, for a NAMED except's own tryVal (port 0) or
-				// catchVal (port 1): unlike a named gamma, except has no condition port at all (both
-				// ports are "value" ports), so BOTH are excluded here, with no `!== 0` exception.
+				// Same issue for a NAMED except's tryVal/catchVal -- unlike a named gamma, both ports
+				// here are value ports (no condition port), so both are excluded.
 				if (consumerNode.type === 'except' && typeof consumerNode.value === 'string')
 					continue;
 
-				// The exact same structural issue again, for the state theta's own port-1
-				// (condition): the theta's own block represents "after the loop has exited" --
-				// logically outside it -- but the condition it reads is physically computed and
-				// re-evaluated INSIDE the loop, every iteration. Treating this as an ordinary "must
-				// be ready by the theta's own (post-loop) block" constraint pulls a value feeding
-				// ONLY the loop test's own condition to be scheduled as if it belonged outside the
-				// loop entirely -- one loop-nesting level shallower than everything else it's also
-				// consumed by inside the loop (e.g. a body-computed reassignment the test reads
-				// directly, only possible for `do...while`, whose test runs after the body -- a
-				// `while` loop's test never reads a body-computed value, so this never surfaced
-				// there). getLoopDepth then reports the SAME depth for the theta's own (post-loop)
-				// block as for blocks genuinely inside the loop (both count as "0 loops enclosing
-				// depth-wise" from the theta's adjusted perspective), so the walk's floor check
-				// can't tell them apart either -- it silently accepts the shallower, wrong block
-				// instead of ever reaching the real, deeper floor (which the walk, going only
-				// upward from a too-shallow latestBlock, can never even reach).
+				// Same issue for the state theta's own port-1 (condition): the theta's block is
+				// "after the loop exited", logically outside it, but the condition it reads is
+				// computed INSIDE the loop every iteration -- treating this as an ordinary constraint
+				// would schedule it one loop-nesting level shallower than everything else it feeds.
 				if (consumerNode.type === 'theta' && consumerEdge.port === 1)
 					continue;
 
@@ -3273,23 +3112,16 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 
 				let consumerBlock = blockIds.get(consumerEdge.nodeId)!;
 
-				// Special case: feeding a mu's port 0 (its INITIAL, pre-loop value -- e.g. `let i = 0;` feeding i's mu) belongs to the block *before* the loop, not wherever the mu itself now lives.
-				// The pre-header is the immediate dominator sitting right outside the loop structure.
+				// A mu's port 0 (its INITIAL, pre-loop value) belongs to the block BEFORE the loop --
+				// the pre-header, the immediate dominator sitting right outside the loop structure.
 				if ((consumerNode.type === 'mu' || consumerNode.type === 'muValue') && consumerEdge.port === 0)
 					consumerBlock = blockTree.get(consumerBlock) || "block_entry";
 
-				// A consumer belonging to a DIFFERENT function's own region (see regionRootOf) isn't
-				// "must be ready by this consumer's block" the way an ordinary same-region consumer
-				// is -- it's an edge crossing a function's own call boundary (e.g. a captured
-				// variable's reassignment, later read by name after the function returns -- see
-				// BuildVSDG's 'binary' case). That consumer might run zero, one, or many times, at a
-				// point this static schedule has no way to place relative to this node's own
-				// position, so treating it as an ordinary constraint would (and did, empirically)
-				// drag the node out of the function it structurally belongs in, to sit wherever the
-				// consumer's own shallow, outer block happens to be. forcedPrint (see the same
-				// 'binary' case) is what keeps such a node from being silently dropped once its only
-				// consumer is excluded here -- this only controls WHERE it's scheduled, not whether
-				// it still needs to print.
+				// A consumer in a DIFFERENT function's own region (e.g. a captured variable's
+				// reassignment, read by name after the function returns) might run zero, one, or many
+				// times, at a point this static schedule can't place -- treating it as an ordinary
+				// constraint would (and did) drag the node out of the function it belongs in.
+				// forcedPrint keeps such a node from being dropped once its only consumer is excluded.
 				if (regionRootOf(consumerBlock) !== regionRootOf(blockIds.get(nodeId)!))
 					continue;
 
@@ -3299,40 +3131,30 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 			}
 		}
 
-		// Click's Core Sinking Choice:
-		// Walk from the latest possible block up to the earliest possible block, picking the
-		// SHALLOWEST valid block along the way (lowest execution frequency, e.g. outside loops) --
-		// "valid" meaning never shallower than earliestBlock's OWN depth (the floor). earliestBlock
-		// already encodes the deepest position this node's inputs actually require (e.g. depth 1
-		// because it reads a per-iteration mu value); going shallower than that would place the node
-		// somewhere its own dependencies aren't validly computable (e.g. hoisted past the loop that
-		// makes a mu-provided value meaningful).
+		// Click's Core Sinking Choice: walk from the latest possible block up to the earliest,
+		// picking the SHALLOWEST valid block along the way (lowest execution frequency) -- never
+		// shallower than earliestBlock's own depth, which already encodes the deepest position this
+		// node's inputs actually require.
 		//
-		// Ties matter: getLoopDepth only counts LOOP nesting, so it reports the SAME depth for every
-		// block within one loop iteration (or one un-looped chain) even though they're still
-		// meaningfully different positions. When two candidates tie, prefer whichever is closer to
-		// latestBlock (found EARLIER in this walk), not earliestBlock -- otherwise a node whose sole
-		// consumer lives right next to it (same depth, later in the chain) gets needlessly hoisted
-		// all the way back to its earliest position, landing in a DIFFERENT block than the consumer
-		// that needs it, which breaks emitLocalStatements' single-block topological sort entirely.
+		// Ties matter: getLoopDepth only counts LOOP nesting, so blocks within one loop iteration
+		// (or one un-looped chain) can tie despite being meaningfully different positions. On a tie,
+		// prefer whichever is closer to latestBlock, not earliestBlock -- otherwise a node whose sole
+		// consumer lives right next to it gets hoisted back to its earliest position, landing in a
+		// different block than the consumer that needs it.
 		//
-		// KNOWN GAP, deliberately NOT fixed here (tried and reverted -- see the tracked plan): two
-		// adjacent, same-depth declarations that are each other's own dedicated anchor (`let i = off,
-		// e = i + len;`) can have this tie-break pick the WRONG one of the two, swapping their
-		// printed order (`let e = i + len; let i = off;`, reading `i` before its own declaration --
-		// found testing real code). A version that preferred a node's own port-2 anchor on a tie
-		// fixed that case but broke dead-bookkeeping elision elsewhere (a switch's own unused
-		// `__hit`/`__match` scaffolding, normally sunk out of anything ever visited by THIS exact
-		// same "prefer closer to latest" choice, started printing instead) -- the two cases are
-		// genuinely indistinguishable from information available at this point in scheduling.
+		// KNOWN GAP, deliberately not fixed here (tried and reverted): two adjacent, same-depth
+		// declarations that are each other's own anchor (`let i = off, e = i + len;`) can have this
+		// tie-break pick the wrong one, swapping their printed order. A version preferring a node's
+		// own port-2 anchor on a tie fixed that but broke dead-bookkeeping elision elsewhere (a
+		// switch's own unused `__hit`/`__match` scaffolding) -- the two cases are indistinguishable
+		// from information available at this point in scheduling.
 		const earliestBlock	= blockIds.get(nodeId)!;
 		const floor			= getLoopDepth(earliestBlock);
 		let bestBlock: BlockId | undefined;
 		let bestDepth		= Infinity;
 
-		// The `currentBlock` guard (not just `!== earliestBlock`) is a defensive backstop: if blockTree
-		// ever has a dead end that doesn't actually pass through earliestBlock on the way to the root,
-		// this stops instead of wandering into `undefined` and spinning forever.
+		// The `currentBlock` guard is a defensive backstop against a blockTree dead end that
+		// doesn't pass through earliestBlock on the way to the root.
 		let currentBlock: BlockId | undefined = latestBlock || earliestBlock;
 		while (currentBlock !== undefined) {
 			const depth = getLoopDepth(currentBlock);
@@ -3353,9 +3175,7 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 	return { blockIds, blockControl, getLoopDepth };
 }
 
-// Wraps a reconstructed statement in `export `/`export default `, per a node's own `exported`
-// stamp (see the Node field's own comment) -- shared by 'passthru' and 'function_decl' printing,
-// the two node types `export`/`export_decl` can currently leave behind.
+// Wraps a reconstructed statement in `export `/`export default `, per a node's own `exported` stamp.
 function wrapExported(stmt: Statement, exported: 'named' | 'default' | undefined): Statement {
 	return exported === 'named' ? { type: 'export_decl', declaration: stmt } as Statement
 		: exported === 'default' ? { type: 'export', default: stmt } as Statement
