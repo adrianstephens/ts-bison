@@ -177,6 +177,15 @@ class Node {
 	// node.value still holds -- Output's own rebuildClass splices each resolved piece back in,
 	// everything else still copied through verbatim.
 	classInfo?: ClassInfo;
+	// A 'pure' object-literal node's own method/get/set properties (`{ foo() {...} }`), same shape
+	// and same reasoning as classInfo's own members (a method body needs its own independent
+	// function-scoped subgraph, entryNodeId, carrying no graph edge of its own -- see
+	// buildFunctionBody's own comment), just without a class's own heritage/computed-key/static-
+	// field concerns, so a plain array suffices instead of a whole ClassInfo. Index-aligned with
+	// the ORIGINAL s.properties array node.value still holds; undefined for a field/spread property
+	// (those already thread a real value port instead). Output's own buildExpr splices each
+	// resolved method body back in, everything else still copied through verbatim.
+	objectMembers?: (ClassMember | undefined)[];
 	constructor(public id: string, public type: string, public value?: any) {}
 	inDegree()	{ return this.inputs.length; }
 	outDegree() { return this.outputs.reduce((sum, arr) => sum + arr.length, 0); }
@@ -1769,6 +1778,22 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						const node = makeNode('unary_post', s);
 						connectValue(operandNode, 0, node, 0);
 						rebindVar(s.operand.name, node);
+					} else {
+						// A property/index target (`obj.prop++`/`arr[i]++`) mutates something outside
+						// this pass's own scope tracking -- same shape and same reasoning as the
+						// assignment-operator 'binary' case's own non-identifier branch: nothing ever
+						// reads this back through scope (there's no name to rebind), so needsTemp alone
+						// would see zero consumers on oldNode's own reader (there may be none at all,
+						// e.g. a bare `obj.prop++;` statement) and silently drop the whole mutation --
+						// oldNode's own "materialize only if my VALUE is read" rule is correct for the
+						// snapshot, but says nothing about whether the mutation ITSELF still has to run.
+						// A dedicated node, forcedPrint + threadMutation, same as that binary case
+						// (found the hard way: `obj.count++;` with no consumer for its own value
+						// silently vanished from the reconstructed source entirely).
+						const node = makeNode('unary_post', s);
+						connectValue(operandNode, 0, node, 0);
+						node.forcedPrint = true;
+						threadMutation(node);
 					}
 					return false;
 				}
@@ -1975,16 +2000,45 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				case 'object': {
 					// A plain `key: value` field (static key) or a `...x` spread property is wired into
 					// the graph, one value per port (index-matched against s.properties, same scheme as
-					// 'array's element ports -- an unhandled property just leaves its port empty, and
-					// buildExpr falls back to its original AST for that one property). Methods/get/set
-					// and computed keys are real gaps, not silently mishandled: `process(s)` above still
-					// walks them generically, so any calls nested inside still thread into the state
-					// chain, but the reconstructed object literal won't reflect a GCM-moved value for them.
-					const node = makeExprNode(s);
+					// 'array's element ports). A method/get/set property (same Method<T> shape a class's
+					// own method already is) gets its own independent function-scoped subgraph, same as a
+					// class method -- see buildClass's own comment for why entryNodeId carries no graph
+					// edge of its own -- stored on objectMembers instead of a real value port. Since that
+					// method body is then completely invisible to any GENERIC graph walk (isPureSubgraph,
+					// notably), an object literal with ANY method/get/set property is tagged 'effect'
+					// unconditionally here, exactly like a class expression already is -- not because
+					// CONSTRUCTING it has an observable effect (it doesn't, same as a class), but because
+					// its own reconstruction relies on an out-of-band reference that must never be treated
+					// as freely inlinable/duplicable the way an ordinary pure value safely is (found the
+					// hard way: isPureSubgraph, blind to objectMembers, called a method-bearing object
+					// literal "pure", so its sole consumer -- a call/new's own raw, verbatim callee
+					// shortcut -- printed the receiver's raw source text instead of resolving it through
+					// the graph, even though the receiver's own declaration had been safely inlined away
+					// -- a real ReferenceError, not cosmetic). A field-only object literal (no methods) is
+					// unaffected, still the ordinary 'floating' value it always was. A computed key is
+					// still a real gap, not silently mishandled: `process(s)` above still walks it
+					// generically, so any calls nested inside still thread into the state chain, but the
+					// reconstructed object literal won't reflect a GCM-moved value for that one property.
+					const hasMethod = s.properties.some(p => p.type === 'method' || p.type === 'get' || p.type === 'set');
+					const node = hasMethod ? makeExprNode(s, 'effect') : makeExprNode(s);
+					if (hasMethod)
+						connectEnd(node);
 					s.properties.forEach((prop, index) => {
 						if (prop.type === 'spread') {
 							recurse(prop.operand);
 							connectValue(getExprNode(prop.operand), 0, node, index);
+							return;
+						}
+						if (prop.type === 'method' || prop.type === 'get' || prop.type === 'set') {
+							if (typeof prop.key !== 'string') {
+								console.log(`not handling computed object key`);
+								return;
+							}
+							if (!prop.body) {
+								console.log(`not handling object property ${prop.type} with no body`);
+								return;
+							}
+							(node.objectMembers ??= [])[index] = { entryNodeId: buildFunctionBody(recurse, prop, prop.body).id };
 							return;
 						}
 						if (prop.type !== 'field') {
@@ -2386,6 +2440,8 @@ export class Output {
 			&& (node.value.type === 'call' || node.value.type === 'new' || node.value.type === 'yield'
 				|| node.value.type === 'tagged_template' || node.value.type === 'class' || node.value.type === 'jsx'
 				|| node.value.type === 'arrow' || node.value.type === 'function'
+				// A method/get/set-bearing object literal -- see BuildVSDG's own 'object' case for why.
+				|| node.value.type === 'object'
 				// `await x` -- see BuildVSDG's own 'unary' case for why it's tagged 'effect' at all
 				// despite sharing the plain 'unary' AST shape with pure operators like `-x`/`typeof x`.
 				|| (node.value.type === 'unary' && (node.value as Expr & { type: 'unary' }).operator === 'await'));
@@ -2435,8 +2491,26 @@ export class Output {
 		};
 	}
 
+	// Shared by buildExpr's own 'floating' case (a field-only object literal) and buildEffectExpr
+	// (a method/get/set-bearing one, see BuildVSDG's own 'object' case for why that's tagged
+	// 'effect') -- the reconstruction itself doesn't care which tag got it here, only whether
+	// objectMembers has a resolved method body for this particular property.
+	private buildObjectExpr(node: Node, expr: Expr & {type: 'object'}): Expr {
+		return {
+			...expr,
+			properties: expr.properties.map((prop, i) => {
+				if (prop.type === 'spread')
+					return { ...prop, operand: this.resolveOperand(node.id, i) };
+				const mi = node.objectMembers?.[i];
+				if (mi?.entryNodeId)
+					return { ...prop, body: this.reconstructFunctionBody(this.graph.get(mi.entryNodeId)!) as JS.Statement<TS.Type>[] };
+				return prop.type === 'field' && typeof prop.key === 'string' ? { ...prop, value: this.resolveOperand(node.id, i) } : prop;
+			}),
+		};
+	}
+
 	private buildEffectExpr(node: Node): Expr {
-		const value = node.value as (Expr & {type: 'call' | 'new' | 'yield' | 'tagged_template' | 'class' | 'jsx' | 'arrow' | 'function' | 'unary'});
+		const value = node.value as (Expr & {type: 'call' | 'new' | 'yield' | 'tagged_template' | 'class' | 'jsx' | 'arrow' | 'function' | 'unary' | 'object'});
 		if (value.type === 'arrow' || value.type === 'function')
 			// GCM never moves anything INTO or OUT OF a function/arrow body (it's an isolated
 			// sub-region, walked into its own entry/return-anchor pair -- see BuildVSDG's own case),
@@ -2449,6 +2523,11 @@ export class Output {
 		// real operand (unlike 'yield', which can be bare), at the same port 1 convention.
 		if (value.type === 'unary')
 			return { ...value, operand: this.resolveOperand(node.id, 1) };
+		// A method/get/set-bearing object literal -- see BuildVSDG's own 'object' case for why it's
+		// tagged 'effect' at all; reconstructed exactly like a field-only ('floating') one, via the
+		// same shared helper -- objectMembers is what actually needs the graph, not the tag itself.
+		if (value.type === 'object')
+			return this.buildObjectExpr(node, value);
 		if (value.type === 'yield')
 			return { ...value, operand: value.operand ? this.resolveOperand(node.id, 1) : undefined };
 		if (value.type === 'tagged_template')
@@ -2517,9 +2596,9 @@ export class Output {
 				return { type: node.type };
 
 			case 'unary_post':
-				return { ...(node.value as Expr & {type: 'unary_post'}), operand: this.resolveOperand(node.id, 0) };
+				return { ...(node.value as Expr & {type: 'unary_post'}), operand: this.resolveTarget(node.id, 0) };
 			case 'unary_post_old':
-				return this.resolveOperand(node.id, 0);
+				return this.resolveTarget(node.id, 0);
 			case 'member':
 				return JS.Member(this.resolveOperand(node.id, 0), node.value as string, node.optional);
 			case 'gammaValue':
@@ -2538,14 +2617,7 @@ export class Output {
 					case 'array':
 						return { ...expr, elements: expr.elements.map((elem, i) => elem ? this.resolveOperand(node.id, i) : elem) };
 					case 'object':
-						return {
-							...expr,
-							properties: expr.properties.map((prop, i) =>
-								prop.type === 'spread' ? { ...prop, operand: this.resolveOperand(node.id, i) }
-								: prop.type === 'field' && typeof prop.key === 'string' ? { ...prop, value: this.resolveOperand(node.id, i) }
-								: prop
-							),
-						};
+						return this.buildObjectExpr(node, expr);
 					case 'spread':
 						return { ...expr, operand: this.resolveOperand(node.id, 0) };
 					case 'binary': {
@@ -2773,6 +2845,26 @@ export class Output {
 		if (!edge)
 			throw new Error(`Missing operand edge for slot ${slot} on node ${to}`);
 		return this.resolveNode(edge.nodeId);
+	}
+
+	// A mutation TARGET (an assignment/postfix left operand that isn't a plain identifier --
+	// `obj.prop`/`arr[i]`) must always reconstruct fresh from the graph rather than go through
+	// resolveNode's ordinary "already materialized, trust the name" path: unlike a normal value
+	// read, the object/property this addresses can (and here, does) hold a DIFFERENT value once
+	// the mutation runs, so a temp cached from an earlier read of the same expression would name
+	// the wrong thing -- the actual property write would silently land on that temp instead of
+	// the real object. Only 'member'/index-shaped ('pure' with an 'index' expr) operands have this
+	// hazard; every other operand shape (identifier var, loop-carried muValue, literal, ...)
+	// resolves by name/value already, with no snapshot-substitution risk, so it keeps the normal,
+	// full resolveNode path (bypassing straight to buildExpr for those has no 'muValue' case and
+	// silently produced `null` -- found via a real crash reconstructing binary-libs/src/pe.ts).
+	resolveTarget(to: NodeId, slot: number): Expr {
+		const edge = this.graph.get(to)!.inputs[slot];
+		if (!edge)
+			throw new Error(`Missing operand edge for slot ${slot} on node ${to}`);
+		const opNode = this.graph.get(edge.nodeId)!;
+		return opNode.type === 'member' || (opNode.type === 'pure' && (opNode.value as Expr).type === 'index')
+			? this.buildExpr(opNode) : this.resolveNode(opNode.id);
 	}
 
 	resolveNode(id: NodeId): Expr {
@@ -3058,7 +3150,16 @@ export class Output {
 					// e.g. `y = (x = 1)`), so it deliberately returns just the right-hand value, not
 					// `left = right` -- exactly wrong for printing the assignment itself as a statement.
 					if (node.forcedPrint) {
-						statements.push(JS.Expression({ ...(node.value as Expr & { type: 'binary' }), left: this.resolveOperand(node.id, 0), right: this.resolveOperand(node.id, 1) }) as Statement);
+						// Only an assignment-operator 'binary' node needs its left/right rebuilt from
+						// operand edges here (buildExpr's own 'binary' case has a merge-value shortcut
+						// that's wrong for statement position). Anything else with forcedPrint (e.g. a
+						// non-identifier-target unary_post mutation) already reconstructs correctly via
+						// buildExpr, which has no such shortcut for those shapes.
+						statements.push(JS.Expression(
+							node.type === 'pure' && (node.value as Expr).type === 'binary'
+								? { ...(node.value as Expr & { type: 'binary' }), left: this.resolveTarget(node.id, 0), right: this.resolveOperand(node.id, 1) }
+								: this.buildExpr(node)
+						) as Statement);
 					} else if (this.needsTemp(node)) {
 						statements.push(JS.VarDecl('var', JS.Var(this.makeTempVar(id), this.buildExpr(node))));
 					}
@@ -3498,6 +3599,14 @@ function collectProtectedNodeIds(graph: VSDG): Set<NodeId> {
 					ids.add(m.valueNodeId);
 			}
 		}
+		// An object literal's own method/get/set properties -- same out-of-band reference shape as
+		// classInfo's own members, same reason it needs protecting (BuildVSDG's 'object' case).
+		for (const m of node.objectMembers ?? []) {
+			if (m?.keyNodeId !== undefined)
+				ids.add(m.keyNodeId);
+			if (m?.entryNodeId !== undefined)
+				ids.add(m.entryNodeId);
+		}
 	}
 	return ids;
 }
@@ -3613,7 +3722,10 @@ function getStructuralKey(node: Node): string {
 			// printed as `: undefined` after merging with an unrelated function's synthetic
 			// fall-off-the-end literal(undefined). Stringifying unambiguously distinguishes every
 			// value (including '', 0, false, null) from "no value at all" and from each other.
-			default: key += JSON.stringify(node.value);
+			// The replacer is needed for a bigint literal anywhere in node.value (even nested,
+			// e.g. inside a 'pure' node's own full AST expr) -- JSON.stringify throws outright on
+			// a raw bigint, a real crash found on real code (binary-libs/src/pe.ts).
+			default: key += JSON.stringify(node.value, (_, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
 		}
 	}
 
@@ -3642,13 +3754,20 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 		// structurally-identical ones collapses that into ONE shared, persistent instance --
 		// mutating it in one place (`result.push(...)`) leaks into every other site that reads
 		// the "same" literal, across calls and even across unrelated functions.
-		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super'].includes(node.type))
+		// 'member'/'index' (`obj.prop`/`arr[i]`) are unsafe for yet another reason: two textually
+		// identical reads of the same property share a structural key, but nothing here tracks
+		// whether an intervening mutation (an assignment, `prop++`, an arbitrary call) changed
+		// the actual value in between -- merging them would silently reuse a stale, pre-mutation
+		// value at the later read site (found the hard way: `o.count++; return o.count;` started
+		// returning the OLD count once the postfix mutation was fixed to actually write through).
+		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'this', 'super', 'member'].includes(node.type))
 			continue;
-		// 'array'/'object' can't be listed by name any more (see makeExprNode's own comment -- both
-		// now share the uniform 'pure' tag with every other ordinary value expression), so the check
-		// moves to node.value's own .type instead -- same exclusion, same reasoning, just following
-		// where the real discriminator lives now.
-		if (node.type === 'pure' && ((node.value as Expr).type === 'array' || (node.value as Expr).type === 'object'))
+		// 'array'/'object'/'index' can't be listed by name any more (see makeExprNode's own comment
+		// -- all three now share the uniform 'pure' tag with every other ordinary value expression),
+		// so the check moves to node.value's own .type instead -- same exclusion, same reasoning
+		// (array/object: fresh identity per evaluation; index (`arr[i]`): same staleness-across-a-
+		// mutation hazard as 'member', just following where the real discriminator lives now).
+		if (node.type === 'pure' && (['array', 'object', 'index'] as (Expr['type'])[]).includes((node.value as Expr).type))
 			continue;
 
 		// Generate the unique structural signature for this node

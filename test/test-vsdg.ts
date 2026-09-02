@@ -1256,6 +1256,50 @@ export async function main() {
 		}
 	`);
 
+	// The real bug this session found: `obj.prop++` (a postfix mutation on a non-identifier
+	// target) had no forced-print anchor at all, so a statement-only `o.count++;` with no reader
+	// of its own value vanished from the reconstructed source entirely. Fixing that alone then
+	// exposed a second bug: the target's own operand resolved through the ordinary "already
+	// materialized, trust the name" path, which -- once a later `o.count` read shared the same
+	// structural key -- could print the mutation against a stale COPY (`t0++`) instead of the
+	// real property, or (after CSE) have the later read return the pre-mutation value. Both fixed
+	// together: a real target now always reconstructs fresh (resolveTarget), and member/index
+	// nodes are excluded from CSE (their value isn't stable across an intervening mutation).
+	check('unary_post: member-target postfix increment prints against the real property, not a stale copy', `
+		function f(o) {
+			o.count++;
+			return o.count;
+		}
+	`, `
+		function f(o) {
+			var t0 = o.count;
+			o.count++;
+			return o.count;
+		}
+	`);
+
+	// New this session: an object literal with a method/get/set property. Its reconstruction
+	// depends on an out-of-band reference (objectMembers), not a real graph edge, so it's tagged
+	// 'effect' unconditionally (like a class expression) rather than judged "pure" -- isPureSubgraph
+	// is blind to out-of-band references, and wrongly calling this pure once silently inlined the
+	// object's own declaration away while printing its callee as raw, now-dangling source text (a
+	// real ReferenceError, not cosmetic).
+	check('object literal with a method, used twice: declaration kept, not inlined away as if pure', `
+		function f(n) {
+			const o = { m() { return n + 1; } };
+			return o.m() + o.m();
+		}
+	`, `
+		function f(n) {
+			const o = {
+				m() {
+					return n + 1;
+				}
+			};
+			return o.m() + o.m();
+		}
+	`);
+
 	if (failures) {
 		console.error(`${failures} failure(s)`);
 		process.exit(1);
