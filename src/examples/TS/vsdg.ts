@@ -207,6 +207,19 @@ class Node {
 		return undefined;
 	}
 
+	// 'effect' tags two very different things: a real effectful EXPRESSION (call/new/yield/
+	// tagged_template/class/jsx/arrow/function/method-bearing object/await-unary -- see each of
+	// their own BuildVSDG cases), whose value is always the actual AST Expr object; and an
+	// internal bookkeeping marker (MUTATION_MARKER/RETURN_ANCHOR/PROGRAM_START/EARLY_RETURN_MARKER/
+	// THROW_MARKER/BREAK_MARKER/CONTINUE_MARKER/BREAK_SCOPE_START/FUNCTION_BODY_START/a try branch's
+	// own startMarker), whose value is always a plain string tag. The object/string distinction
+	// alone is enough to tell them apart -- no marker's value is ever object-shaped, and no
+	// effectful expression's own .type is anything other than one of those listed above -- so
+	// there's nothing for a further .value.type enumeration to add.
+	isEffect(): boolean {
+		return this.type === 'effect' && !!this.value && typeof this.value === 'object';
+	}
+
 	// True when an edge into `consumer` at `port` exists in the graph but is never actually read by
 	// codegen -- so it must not be counted as a real reader when deciding whether something is reused,
 	// dead, or safe to inline, nor allowed to constrain GCM's scheduling as if it were an ordinary
@@ -2186,7 +2199,7 @@ function patternBindings(kind: JS.DeclarationKind, target: JS.BindingTarget, val
 // a member-access callee (`obj.method`) from ever materializing as a standalone temp: see its own
 // comment for why that specifically breaks (the receiver `obj` gets lost).
 function isCalleeEdge(consumer: Node, port: number): boolean {
-	if (consumer.type !== 'effect' || typeof consumer.value !== 'object' || consumer.value === null)
+	if (!consumer.isEffect())
 		return false;
 	const v = consumer.value as { type?: string; arguments?: unknown[] };
 	return (v.type === 'call' || v.type === 'new') && port === (v.arguments?.length ?? 0) + 1;
@@ -2441,19 +2454,6 @@ export class Output {
 			&& (node.neverMaterialize || !this.needsTemp(node));
 	}
 
-	// 'effect' tags two very different things: a real effectful EXPRESSION (call/new/yield/
-	// tagged_template/class/jsx/arrow/function/method-bearing object/await-unary -- see each of
-	// their own BuildVSDG cases), whose value is always the actual AST Expr object; and an
-	// internal bookkeeping marker (MUTATION_MARKER/RETURN_ANCHOR/PROGRAM_START/EARLY_RETURN_MARKER/
-	// THROW_MARKER/BREAK_MARKER/CONTINUE_MARKER/BREAK_SCOPE_START/FUNCTION_BODY_START/a try branch's
-	// own startMarker), whose value is always a plain string tag. The object/string distinction
-	// alone is enough to tell them apart -- no marker's value is ever object-shaped, and no
-	// effectful expression's own .type is anything other than one of those listed above -- so
-	// there's nothing for a further .value.type enumeration to add.
-	private isEffect(node: Node): boolean {
-		return node.type === 'effect' && !!node.value && typeof node.value === 'object';
-	}
-
 	// A destructured param prints as its own hidden temp name in the SIGNATURE too, not just the
 	// body -- see destructuredParams' own comment for why: the body's own flat var_decls
 	// (patternBindings) read the temp name, so the signature has to actually bind it under that
@@ -2671,7 +2671,7 @@ export class Output {
 				// directly. Other 'effect'
 				// nodes (mutation markers, RETURN_ANCHOR, etc.) are never resolved as a value in the
 				// first place, so isEffect's guard should always hold here.
-				if (this.isEffect(node))
+				if (node.isEffect())
 					return this.buildEffectExpr(node);
 				console.log(`not handling value node ${node.type}`);
 				return Literal(null);
@@ -3055,7 +3055,7 @@ export class Output {
 				continue;
 			}
 
-			if (this.isEffect(node)) {
+			if (node.isEffect()) {
 				// A call is safe to inline (skip its own `var tN = f();`) whenever it has EXACTLY ONE
 				// real value consumer -- not the narrower isInlinableEffect it used to be gated on,
 				// which also required that consumer to be the call's own DIRECT state-chain successor.
