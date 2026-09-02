@@ -3725,25 +3725,50 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					return owner.thisWtype!;
 				}
 
-				const byKey = new Map<string, Expr>();
+				// One source per target field name -- either a plain value expression, or (`{...x}`) a
+				// class instance to read the field back off, evaluated once into its own scratch local
+				// right here (matching real JS's own one-evaluation-per-spread semantics, same idea the
+				// Map-backed dynamic-object case above already uses) rather than re-emitting `p.operand`
+				// once per field it happens to supply. A later source for the same field name overwrites
+				// an earlier one, same "last property wins" rule real JS/TS object-literal syntax already
+				// has (`{...x, k: v}` or `{k: v, ...x}`). Only a target field this class actually declares
+				// is ever read back off a spread operand -- any of *its* own extra fields are simply not
+				// part of this shape, the same way a real JS spread's own excess properties would just
+				// never be looked at by a nominally-typed consumer.
+				interface FieldSource { expr?: Expr; spreadLocal?: Local; spreadCls?: ClassInfo }
+				const sources = new Map<string, FieldSource>();
 				for (const p of e.properties) {
+					if (p.type === 'spread') {
+						const spreadCls = ownerOf(p.operand, ctx);
+						if (!spreadCls)
+							throw `object literal for '${owner.name}': a spread operand needs a known class type`;
+						const spreadLocal = ctx.declareValue(`$spread$${closureCallTempCounter++}`, spreadCls.thisWtype!, spreadCls.thisTsType!);
+						emitAs(p.operand, ctx, spreadCls.thisWtype!);
+						ctx.emit(I.local.set(spreadLocal.index));
+						for (const f of spreadCls.fields)
+							sources.set(f.name, { spreadLocal, spreadCls });
+						continue;
+					}
 					if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
-						throw `object literal for '${owner.name}' can only have plain 'key: value' properties (no methods, spreads, or computed keys)`;
-					byKey.set(p.key, p.value);
+						throw `object literal for '${owner.name}' can only have plain 'key: value' properties or a spread (no methods or computed keys)`;
+					if (!owner.fieldIndex.has(p.key))
+						throw `object literal for '${owner.name}' has unknown property '${p.key}'`;
+					sources.set(p.key, { expr: p.value });
 				}
 				for (const f of owner.fields) {
-					const propValue = byKey.get(f.name);
-					if (!propValue) {
+					const src = sources.get(f.name);
+					if (!src) {
 						if (!f.optional)
 							throw `object literal for '${owner.name}' is missing property '${f.name}'`;
 						emitDefaultValue(f.wtype, ctx);
+					} else if (src.expr) {
+						emitAs(src.expr, ctx, f.wtype);
 					} else {
-						emitAs(propValue, ctx, f.wtype);
-						byKey.delete(f.name);
+						const idx = src.spreadCls!.fieldIndex.get(f.name)!;
+						ctx.emit(I.local.get(src.spreadLocal!.index), I.struct.get(src.spreadCls!.typeIndex, idx));
+						coerceTop(src.spreadCls!.fields[idx].wtype, ctx, f.wtype);
 					}
 				}
-				if (byKey.size)
-					throw `object literal for '${owner.name}' has unknown propert${byKey.size > 1 ? 'ies' : 'y'} '${[...byKey.keys()].join("', '")}'`;
 				ctx.emit(I.struct.new(owner.typeIndex));
 				return owner.thisWtype!;
 			}
