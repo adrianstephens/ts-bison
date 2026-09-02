@@ -13,6 +13,23 @@ type Statement		= TS.Statement;
 
 type NodeId = string;
 
+// The full vocabulary of Node.type tags. Not a true discriminated union -- most of Node's own
+// optional fields are shared across several of these (forcedPrint spans mutation/unary_post,
+// scopeAnchorId spans this/super/muValue, ...) rather than exclusive to one, and .type is mutated
+// in place at a few real sites (foldConstants folding a binary/unary into a literal; an arrow/
+// function expression's entry retagged from function_decl to effect) -- so this exists purely to
+// catch a typo'd tag and give autocomplete, not to narrow which other fields are present.
+type NodeType =
+	| 'literal' | 'var'
+	| 'mu' | 'muValue' | 'theta' | 'thetaValue'
+	| 'gamma' | 'gammaValue'
+	| 'break_scope' | 'except'
+	| 'function_decl' | 'passthru' | 'class_decl'
+	| 'effect' | 'member'
+	| 'unary_post' | 'unary_post_old'
+	| 'floating' | 'mutation'
+	| 'this' | 'super';
+
 interface Edge {
 	nodeId:	NodeId;
 	port:	number; 
@@ -87,7 +104,7 @@ class Node {
 	// Same as classInfo, for an object literal's own method/get/set properties -- index-aligned with
 	// `s.properties`, undefined for a field/spread (which already thread a real value port).
 	objectMembers?: (ClassMember | undefined)[];
-	constructor(public id: string, public type: string, public value?: any) {}
+	constructor(public id: string, public type: NodeType, public value?: any) {}
 	inDegree()	{ return this.inputs.length; }
 	outDegree() { return this.outputs.reduce((sum, arr) => sum + arr.length, 0); }
 	isUnused(port: number) { return this.outputs[port]?.length === 0; }
@@ -115,9 +132,7 @@ class Node {
 	// codegen, so it must not count as a real reader for reuse/dead/inline decisions or constrain
 	// GCM scheduling like an ordinary dependency.
 	isVestigialEdge(port: number): boolean {
-		if (this.type === 'mutation' && (this.value as Expr).type === 'binary' && port === 0
-			&& (this.value as Expr & { type: 'binary' }).operator === '='
-		)
+		if (this.type === 'mutation' && (this.value as Expr).type === 'binary' && port === 0 && (this.value as Expr & { type: 'binary' }).operator === '=')
 			return true;
 		if (this.type === 'thetaValue' && port === 0)
 			return true;
@@ -207,7 +222,7 @@ class ScopeMu extends Scope {
 	// treat anything depending on the mu as loop-invariant and float it out before the loop entirely.
 	// currentFunctionEntry is a live getter, not a captured value: a name looked up from a further
 	// nested function needs THAT function's entry, not whichever was current at construction.
-	constructor(parent: Scope, public makeNode: (type: string, varName: string) => Node, public stateAnchor: Node, public currentFunctionEntry: () => Node | undefined) {
+	constructor(parent: Scope, public makeNode: (type: NodeType, varName: string) => Node, public stateAnchor: Node, public currentFunctionEntry: () => Node | undefined) {
 		super(parent);
 	}
 	public get(name: string): Node | undefined {
@@ -294,7 +309,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// single, shared, declKind-less 'var' node so it can be read by name without a declaration.
 	const externalNodes = new Map<string, Node>();
 
-	function makeNode(type: string, value?: any) {
+	function makeNode(type: NodeType, value?: any) {
 		const id	= type + String(nextId++);
 		const node	= new Node(id, type, value);
 		graph.set(id, node);
@@ -326,7 +341,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// node; an assignment-operator binary or ++/-- unary gets 'mutation' instead, despite sharing
 	// the same AST shape -- both carry a real effect and must never be treated as an ordinary
 	// poolable value (constant-foldable/CSE-mergeable/freely inlinable) the way 'floating' is.
-	function makeExprNode(expr: Expr, type = 'floating') {
+	function makeExprNode(expr: Expr, type: NodeType = 'floating') {
 		const node = makeNode(type, expr);
 		expnodes.set(expr, node);
 		return node;
