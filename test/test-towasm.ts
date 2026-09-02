@@ -1182,14 +1182,24 @@ async function main() {
 		check('a?.[i], unannotated const, narrowed !== undefined (receiver non-null)', idxInferredNarrowed(), 102);
 	}
 
-	await checkThrows("'??' on a non-nullable left side is rejected", () => compile(`
-		class Point { x: number; constructor(x: number) { this.x = x; } }
-		export function f(): number {
-			const p = new Point(1);
-			const q = p ?? new Point(2);
-			return q.x;
-		}
-	`), /tsw/);
+	{
+		// `p ?? X` on a statically-non-nullable `p` is legal (if redundant) real JS/TS -- always `p`,
+		// `X` never evaluated. Previously threw here only as an accidental side effect of an unrelated
+		// gap (resolving `q`'s own type, `Point | Point`, needed `typeOf` to resolve an *anonymous*
+		// structurally-Point-shaped object type, which it couldn't) -- fixed by `matchObjectShapeByType`
+		// (a generic parameter's own structural bound resolving to a real interface/object shape,
+		// self-hosting `walker.ts`'s own `mapObject<N extends Record<string, any>>`'s motivating case),
+		// which incidentally also makes this construct resolve correctly now.
+		const { f } = await compile(`
+			class Point { x: number; constructor(x: number) { this.x = x; } }
+			export function f(): number {
+				const p = new Point(1);
+				const q = p ?? new Point(2);
+				return q.x;
+			}
+		`);
+		check("'??' on a non-nullable left side (legal, always the left side)", f(), 1);
+	}
 
 	{
 		// number[]: literal, indexing, .length, classic `for`

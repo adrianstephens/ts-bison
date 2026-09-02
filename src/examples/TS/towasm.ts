@@ -1847,6 +1847,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			const cls = ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
 			if (cls)
 				return ownerThisType(cls);
+		} else if (resolved.type === 'object') {
+			// Genuinely last resort -- only reached when `t` itself has no nominal name to resolve by at
+			// all (the `t.type === 'ref'` branch above already owns every case that does, including a
+			// class currently mid-construction resolving its own name -- this must never preempt that,
+			// or a structurally-identical-but-different sibling class gets matched instead of the real
+			// one, real regression found and fixed this session). A generic parameter's own structural
+			// bound (`Record<string, any>`), substituted with a real interface-typed argument, is the
+			// one case that's actually anonymous by construction (`matchObjectShapeByType`'s own comment).
+			const shapeMatch = matchObjectShapeByType(resolved);
+			if (shapeMatch)
+				return ownerThisType(shapeMatch);
 		}
 		return wasmTypeOf(t, global);
 	}
@@ -1913,6 +1924,40 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				return true;
 			const declType = fieldDeclaredType(cls, key);
 			return !declType || declType.type !== 'literal' || declType.value === value.value;
+		}));
+		return matches.length === 1 ? matches[0] : undefined;
+	}
+
+	// `matchObjectShape`'s own type-level counterpart -- used by `typeOf`'s 'object' case when a real
+	// object TYPE (not a literal expression) needs a nominal class to represent it, e.g. a generic
+	// parameter's own structural bound (`Record<string, any>`) substituted with a real interface-typed
+	// argument: `ensureClass`/`ownerFor` only preserve name identity for a `class` ref, never a plain
+	// `interface` (a bare `T.resolve` fully, structurally expands it, no exception), so by the time
+	// this is reached the interface's own name is already gone -- self-hosting `walker.ts`'s own
+	// `mapObject<N extends Record<string, any>>` hit exactly this (`local 'r' has an unsupported type`)
+	// the first time an interface-typed value, not a class, flowed through it. Same exact-field-set-
+	// then-literal-discriminant matching as the literal-expression version above, just against each
+	// candidate's own declared field *types* instead of an expression's actual property *values* --
+	// ambiguous or partial (a computed/non-string key, or a non-property member) cases return
+	// `undefined`, never a guess.
+	function matchObjectShapeByType(t: TS.ObjectType): ClassInfo | undefined {
+		const props = new Map<string, Type>();
+		for (const m of t.members) {
+			if (m.type !== 'property' || typeof m.key !== 'string')
+				return undefined;
+			props.set(m.key, m.typeAnnotation);
+		}
+		const candidates = [...classes.values()].filter(cls =>
+			cls.typeIndex !== -1 && cls.fields.length === props.size && cls.fields.every(f => props.has(f.name))
+		);
+		if (candidates.length <= 1)
+			return candidates[0];
+
+		const matches = candidates.filter(cls => [...props].every(([key, propType]) => {
+			if (propType.type !== 'literal')
+				return true;
+			const declType = fieldDeclaredType(cls, key);
+			return !declType || declType.type !== 'literal' || declType.value === propType.value;
 		}));
 		return matches.length === 1 ? matches[0] : undefined;
 	}
@@ -2064,7 +2109,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 			case 'object': {
 				const vt = indexSignatureValueType(w);
-				return vt ? ensureClass('Map', [TS.RefType('string'), vt]) : undefined;
+				if (vt)
+					return ensureClass('Map', [TS.RefType('string'), vt]);
+				// Genuinely last resort, same guard as `typeOf`'s own -- only reached once `t.type ===
+				// 'ref'` has already had its own shot above (a plain class/interface ref, including one
+				// still mid-construction resolving its own name, is *never* funneled down here: that
+				// early check returns first). A generic parameter's own structural bound substituted with
+				// a real interface-typed argument is the one case that's actually anonymous by
+				// construction (`matchObjectShapeByType`'s own comment).
+				return matchObjectShapeByType(w);
 			}
 		}
 		return undefined;
