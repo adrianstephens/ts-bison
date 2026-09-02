@@ -95,8 +95,8 @@ class Node {
 	// safely inlined: the reading function may run zero, one, or many times, so it must always
 	// re-read the variable by name, never substitute its declaration-time value.
 	capturedRead?: boolean;
-	// A 'member' node's own `?.` marker (its `.value` holds just the property name, unlike 'index',
-	// which keeps the whole expr) -- without it, `a.b?.c` silently reconstructs as `a.b.c`.
+	// A 'member' node's own `?.` marker (its `.name` holds just the property name, unlike 'index',
+	// which keeps the whole expr in `.expr`) -- without it, `a.b?.c` silently reconstructs as `a.b.c`.
 	optional?: boolean;
 	// A class anchor's own resolved pieces (heritage, each member's computed key/static value/method
 	// body) -- index-aligned with the original `body` array; rebuildClass splices these back in.
@@ -104,35 +104,39 @@ class Node {
 	// Same as classInfo, for an object literal's own method/get/set properties -- index-aligned with
 	// `s.properties`, undefined for a field/spread (which already thread a real value port).
 	objectMembers?: (ClassMember | undefined)[];
-	constructor(public id: string, public type: NodeType, public value?: any) {}
+	// The three shapes a node's own "payload" can take, replacing a single untyped `value: any` --
+	// at most one is ever set for a given node, determined by `type` (see NodeType's own comment):
+	// a real AST expression (floating/mutation/unary_post/unary_post_old/literal/some effect
+	// nodes), a raw statement (passthru/class_decl), or a plain string (a slot name for
+	// var/muValue/thetaValue/gammaValue/named-except/member's property, or an internal bookkeeping
+	// tag for most effect nodes -- both are just "this node's own name", so they share one field).
+	expr?: Expr;
+	stmt?: Statement;
+	name?: string;
+	constructor(public id: string, public type: NodeType) {}
 	inDegree()	{ return this.inputs.length; }
 	outDegree() { return this.outputs.reduce((sum, arr) => sum + arr.length, 0); }
 	isUnused(port: number) { return this.outputs[port]?.length === 0; }
 
-	// A node's real source-variable name, if it has one: a direct rebind (boundName), or a
-	// per-variable gammaValue/named-except merge (which stores it in `.value` instead).
+	// A node's real source-variable name, if it has one: a direct rebind, or a per-variable
+	// gammaValue/named-except merge -- both are set via boundName (see rebindVar and the
+	// gammaValue/named-except construction sites, which set it directly instead).
 	slotName(): string | undefined {
-		if (this.boundName !== undefined)
-			return this.boundName;
-		if (this.type === 'gammaValue')
-			return this.value;
-		if (this.type === 'except' && typeof this.value === 'string')
-			return this.value;
-		return undefined;
+		return this.boundName;
 	}
 
-	// 'effect' tags both a real effectful EXPRESSION (value is the AST Expr object) and an internal
-	// bookkeeping marker (value is a plain string tag, e.g. MUTATION_MARKER/RETURN_ANCHOR) -- the
-	// object/string distinction alone tells them apart.
+	// 'effect' tags both a real effectful EXPRESSION (expr is set) and an internal bookkeeping
+	// marker (name is set instead, e.g. MUTATION_MARKER/RETURN_ANCHOR) -- which field is set alone
+	// tells them apart.
 	isEffect(): boolean {
-		return this.type === 'effect' && !!this.value && typeof this.value === 'object';
+		return this.type === 'effect' && this.expr !== undefined;
 	}
 
 	// True when an edge into `consumer` at `port` is wired up generically but never actually read by
 	// codegen, so it must not count as a real reader for reuse/dead/inline decisions or constrain
 	// GCM scheduling like an ordinary dependency.
 	isVestigialEdge(port: number): boolean {
-		if (this.type === 'mutation' && (this.value as Expr).type === 'binary' && port === 0 && (this.value as Expr & { type: 'binary' }).operator === '=')
+		if (this.type === 'mutation' && this.expr!.type === 'binary' && port === 0 && (this.expr as Expr & { type: 'binary' }).operator === '=')
 			return true;
 		if (this.type === 'thetaValue' && port === 0)
 			return true;
@@ -153,7 +157,7 @@ class Node {
 			return true;
 		// A state-merging except's try/catch/finally tails (1/2/3) -- same reasoning. A NAMED
 		// except's own value ports (0/1) are never visited this way in the first place.
-		return this.type === 'except' && typeof this.value !== 'string' && (port === 1 || port === 2 || port === 3);
+		return this.type === 'except' && this.name === undefined && (port === 1 || port === 2 || port === 3);
 	}
 }
 
@@ -222,7 +226,7 @@ class ScopeMu extends Scope {
 	// treat anything depending on the mu as loop-invariant and float it out before the loop entirely.
 	// currentFunctionEntry is a live getter, not a captured value: a name looked up from a further
 	// nested function needs THAT function's entry, not whichever was current at construction.
-	constructor(parent: Scope, public makeNode: (type: NodeType, varName: string) => Node, public stateAnchor: Node, public currentFunctionEntry: () => Node | undefined) {
+	constructor(parent: Scope, public makeNamedNode: (type: NodeType, name: string) => Node, public stateAnchor: Node, public currentFunctionEntry: () => Node | undefined) {
 		super(parent);
 	}
 	public get(name: string): Node | undefined {
@@ -231,7 +235,7 @@ class ScopeMu extends Scope {
 			return node;
 		const old = this.parent?.get(name);
 		if (old) {
-			const mu = this.makeNode('muValue', name);
+			const mu = this.makeNamedNode('muValue', name);
 			// A captured (outer-scope) read touched inside a loop needs the same scopeAnchorId floor
 			// this/super get: without it, a value purely derived from this mu can be hoisted (loop-
 			// invariant) past the arrow/function it's lexically inside, into an enclosing scope that
@@ -309,15 +313,29 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// single, shared, declKind-less 'var' node so it can be read by name without a declaration.
 	const externalNodes = new Map<string, Node>();
 
-	function makeNode(type: NodeType, value?: any) {
+	function makeNode(type: NodeType) {
 		const id	= type + String(nextId++);
-		const node	= new Node(id, type, value);
+		const node	= new Node(id, type);
 		graph.set(id, node);
+		return node;
+	}
+	// A node whose own payload is just a name: a slot name (var/muValue/thetaValue/gammaValue/
+	// named-except/member's property) or an internal bookkeeping tag (most effect nodes) -- both
+	// are plain strings, so they share Node's own `name` field.
+	function makeNamedNode(type: NodeType, name: string) {
+		const node = makeNode(type);
+		node.name = name;
+		return node;
+	}
+	// A node whose own payload is a raw statement (passthru/class_decl) rather than an expression.
+	function makeStmtNode(type: NodeType, stmt: Statement) {
+		const node = makeNode(type);
+		node.stmt = stmt;
 		return node;
 	}
 	// Seeds the top-level (and, transitively, each function body's) state chain -- without it, any
 	// effect before the first function_decl has nothing valid to thread its first state edge from.
-	let end: Node = makeNode('effect', 'PROGRAM_START');
+	let end: Node = makeNamedNode('effect', 'PROGRAM_START');
 	const programStart = end;
 
 	// True when the path just walked never falls through to its own lexical successor (it broke,
@@ -342,7 +360,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// the same AST shape -- both carry a real effect and must never be treated as an ordinary
 	// poolable value (constant-foldable/CSE-mergeable/freely inlinable) the way 'floating' is.
 	function makeExprNode(expr: Expr, type: NodeType = 'floating') {
-		const node = makeNode(type, expr);
+		const node = makeNode(type);
+		node.expr = expr;
 		expnodes.set(expr, node);
 		return node;
 	}
@@ -358,7 +377,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 			}
 			let ext = externalNodes.get(expr.name);
 			if (!ext) {
-				ext = makeNode('var', expr.name);
+				ext = makeNamedNode('var', expr.name);
 				externalNodes.set(expr.name, ext);
 			}
 			return ext;
@@ -390,7 +409,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	function hasRealEffect(tail: Node, boundary: Node): boolean {
 		let cur = tail;
 		while (cur !== boundary) {
-			if (!(cur.type === 'effect' && cur.value === 'MUTATION_MARKER'))
+			if (!(cur.type === 'effect' && cur.name === 'MUTATION_MARKER'))
 				return true;
 			const pred = cur.inputs[0];
 			if (!pred)
@@ -407,7 +426,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// DEPTH, pulling an unconditional reassignment inside a conditional its target effect happened
 	// to be nested in -- `if (i) { g(i); } i = i + 1;` became an infinite loop.)
 	function threadMutation(node: Node) {
-		const marker = makeNode('effect', 'MUTATION_MARKER');
+		const marker = makeNamedNode('effect', 'MUTATION_MARKER');
 		connectValue(marker, 0, node, 2);
 		connectEnd(marker);
 	}
@@ -430,7 +449,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		const muEnd		= makeNode('mu');
 		if (isDoWhile)
 			muEnd.loopKind = 'do';
-		const muScope	= new ScopeMu(scope, makeNode, muEnd, () => currentFunctionEntry);
+		const muScope	= new ScopeMu(scope, makeNamedNode, muEnd, () => currentFunctionEntry);
 		scope	= muScope;
 		connectEnd(muEnd);
 
@@ -463,7 +482,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 			const node = muScope.bindings.get(name)!;
 			connectValue(node, 0, muNode, 1);		// Slot 1 = Feedback loop
 
-			const theta = makeNode('thetaValue', name);
+			const theta = makeNamedNode('thetaValue', name);
 			connectValue(testNode, 0, theta, 0);	// Slot 0 = Condition
 			connectValue(muNode, 0, theta, 1);		// Slot 1 = Value to pass out
 			connectValue(stateTheta, 0, theta, 2);	// Scheduling-only anchor, see ScopeMu's own
@@ -562,20 +581,30 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				// merge has no next-iteration read needing a real mutated variable, so a graph edge
 				// alone is just as correct. switchInternal is the other reason to force it (switch's
 				// own `hit = true;` bookkeeping).
+				// gammaValue/except are excluded from the "supersede, so clear" branch below: their
+				// own boundName is a MERGE identity, not a plain reassignment's -- one of them can
+				// itself be an operand here (e.g. a later switch case merging against an earlier
+				// case's own __hit merge), and it must keep resolving by name for any FURTHER merge
+				// chained off it, unlike a plain reassignment genuinely superseded by this one.
 				if (trueExitedViaBreak && trueVal.boundName === name && (trueVal.switchInternal || isLoopCarried(name)))
 					trueVal.forcedPrint = true;
-				else if (trueVal.boundName === name && !trueVal.declKind)
+				else if (trueVal.boundName === name && !trueVal.declKind && trueVal.type !== 'gammaValue' && trueVal.type !== 'except')
 					trueVal.boundName = undefined;
 
 				if (falseExitedViaBreak && falseVal.boundName === name && (falseVal.switchInternal || isLoopCarried(name)))
 					falseVal.forcedPrint = true;
-				else if (falseVal.boundName === name && !falseVal.declKind)
+				else if (falseVal.boundName === name && !falseVal.declKind && falseVal.type !== 'gammaValue' && falseVal.type !== 'except')
 					falseVal.boundName = undefined;
 
 				// When one side broke out, its operand still carries boundName === name -- printing
 				// the merge itself under that same name would be circular; neverMaterialize gets the
 				// same "never print by this name" outcome directly.
-				const gamma = makeNode('gammaValue', name);
+				const gamma = makeNode('gammaValue');
+				// Set directly, not via rebindVar: this merge isn't itself a fresh mutation (each
+				// branch's own value already threaded its own threadMutation), so it shouldn't get
+				// its own MUTATION_MARKER -- only slotName()'s "this node owns printing under a name"
+				// signal.
+				gamma.boundName = name;
 				if (trueExitedViaBreak || falseExitedViaBreak)
 					gamma.neverMaterialize = true;
 				connectValue(test, 0, gamma, 0); 		// Condition
@@ -596,13 +625,13 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	function buildFunctionBody(recurse: RecurseB, params: JS.Params<TS.Type> | undefined, body: Expr | Statement[]): Node {
 		const outer			= getState();
 		const entryNode		= makeNode('function_decl');
-		const returnNode	= makeNode('effect', 'RETURN_ANCHOR');
+		const returnNode	= makeNamedNode('effect', 'RETURN_ANCHOR');
 		entryNode.returnNodeId = returnNode.id;
 		connectValue(outer.end, 0, entryNode, 0);
 
 		// Gives the body its own, unambiguous region root for regionRootOf (applyGlobalCodeMotion)
 		// to find -- entryNode's own block isn't safe to use for that.
-		const bodyStart = makeNode('effect', 'FUNCTION_BODY_START');
+		const bodyStart = makeNamedNode('effect', 'FUNCTION_BODY_START');
 		connectValue(entryNode, 0, bodyStart, 0);
 
 
@@ -619,12 +648,12 @@ export function BuildVSDG(ast: Walkable): VSDG {
 			let port = 1;
 			function addParam(key: JS.BindingTarget) {
 				if (typeof key === 'string') {
-					const paramNode = makeNode('var', key);
+					const paramNode = makeNamedNode('var', key);
 					connectValue(entryNode, port++, paramNode, 0);
 					fnScope.create(key, paramNode);
 				} else {
 					const tempName = `__destructure${nextId++}`;
-					const paramNode = makeNode('var', tempName);
+					const paramNode = makeNamedNode('var', tempName);
 					connectValue(entryNode, port++, paramNode, 0);
 					fnScope.create(tempName, paramNode);
 					pendingParamPatterns.push([key, tempName]);
@@ -650,7 +679,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		if (Array.isArray(body)) {
 			for (const stmt of body)
 				recurse(stmt, 'statement');
-			connectValue(makeNode('literal', undefined), 0, returnNode, 1);
+			// Left unconnected, matching EARLY_RETURN_MARKER's own "bare `return;`" convention --
+			// reconstructFunctionBody omits the trailing statement whenever this port is unconnected.
 		} else {
 			recurse(body, 'expression');
 			connectValue(getExprNode(body), 0, returnNode, 1);
@@ -740,7 +770,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				case 'function_decl':
 					if (s.body) {
 						end = buildFunctionBody(recurse, s, s.body);
-						end.value = s;
+						end.stmt = s;
 					}
 					return false;
 
@@ -751,7 +781,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// each return prints itself, in place, with no value-merge needed here at all.
 					if (s.argument)
 						recurse(s.argument, 'expression');
-					const marker = makeNode('effect', 'EARLY_RETURN_MARKER');
+					const marker = makeNamedNode('effect', 'EARLY_RETURN_MARKER');
 					connectEnd(marker);
 					if (s.argument)
 						connectValue(getExprNode(s.argument), 0, marker, 1);
@@ -763,7 +793,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// isn't a control-flow edge to `catch`; real JS's own exception routing handles
 					// that at runtime regardless, since nothing here reorders the try body's statements.
 					recurse(s.argument, 'expression');
-					const marker = makeNode('effect', 'THROW_MARKER');
+					const marker = makeNamedNode('effect', 'THROW_MARKER');
 					connectEnd(marker);
 					connectValue(getExprNode(s.argument), 0, marker, 1);
 					exited = true;
@@ -778,7 +808,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// No target-tracking needed: just mark `exited` (so enclosing `if`s treat this
 					// branch as not falling through) and leave a marker for the literal `break;` to
 					// print here -- real JS routes it to the nearest enclosing loop/switch at runtime.
-					connectEnd(makeNode('effect', 'BREAK_MARKER'));
+					connectEnd(makeNamedNode('effect', 'BREAK_MARKER'));
 					exited = true;
 					brokeOut = true;
 					return false;
@@ -793,7 +823,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					const forUpdate = loopUpdateStack[loopUpdateStack.length - 1];
 					if (forUpdate)
 						recurse(structuredClone(forUpdate), 'expression');
-					connectEnd(makeNode('effect', 'CONTINUE_MARKER'));
+					connectEnd(makeNamedNode('effect', 'CONTINUE_MARKER'));
 					exited = true;
 					return false;
 				}
@@ -808,7 +838,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							// A dedicated wrapper node per declared variable, not an alias to the
 							// initializer's own node -- otherwise `let x = 5; let y = 5;` would bind both
 							// names to the same node, with no way to tell which name to print.
-							const varNode = makeNode('var', v.name);
+							const varNode = makeNamedNode('var', v.name);
 							if (v.init)
 								connectValue(getExprNode(v.init), 0, varNode, 0);
 							varNode.declKind = s.kind;
@@ -923,7 +953,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					discNode.declKind = 'let';
 					const suffix	= discNode.id;
 					const discName	= `__disc_${suffix}`;
-					discNode.value	= discName;
+					discNode.name	= discName;
 					// rebindVar (not a bare scope.create) threads discNode into the state chain --
 					// without it, `let __disc = ...;` is never scheduled anywhere reachable to print.
 					rebindVar(discName, discNode, true);
@@ -977,7 +1007,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						// walk so the first case's own state-gamma (if it needs one) doesn't share
 						// break_scope's own predecessor node.
 						const predecessor = end;
-						const startMarker = makeNode('effect', 'BREAK_SCOPE_START');
+						const startMarker = makeNamedNode('effect', 'BREAK_SCOPE_START');
 						connectEnd(startMarker);
 						exited		= false;
 						brokeOut	= false;
@@ -1047,7 +1077,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// and its own walk -- without one, a branch's own first statement needing a real
 					// gamma/mu/break_scope/except would share the exact same predecessor as `except`.
 					const startMarker = (pred: Node, tag: string) => {
-						const marker = makeNode('effect', tag);
+						const marker = makeNamedNode('effect', tag);
 						connectValue(pred, 0, marker, 0);
 						return marker;
 					};
@@ -1070,10 +1100,10 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					let catchParamName: string | undefined;
 					if (typeof s.handlerParam === 'string') {
 						catchParamName = s.handlerParam;
-						scope.create(catchParamName, makeNode('var', catchParamName));
+						scope.create(catchParamName, makeNamedNode('var', catchParamName));
 					} else if (s.handlerParam) {
 						catchParamName = `__destructure${nextId++}`;
-						scope.create(catchParamName, makeNode('var', catchParamName));
+						scope.create(catchParamName, makeNamedNode('var', catchParamName));
 						for (const stmt of patternBindings('let', s.handlerParam, Identifier(catchParamName)))
 							recurse(stmt, 'statement');
 					}
@@ -1108,7 +1138,10 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							if (catchVal.boundName === name)
 								catchVal.forcedPrint = true;
 
-							const namedExc = makeNode('except', name);
+							const namedExc = makeNamedNode('except', name);
+							// Also set directly (not via rebindVar, same reasoning as gammaValue's own
+							// construction): this merge isn't itself a fresh mutation.
+							namedExc.boundName = name;
 							connectValue(tryVal, 0, namedExc, 0);
 							connectValue(catchVal, 0, namedExc, 1);
 							scope.set(name, namedExc);
@@ -1175,11 +1208,11 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// earlier than the import that provides it. A type-only import binds no real
 					// runtime value, so it's skipped.
 					process(s);
-					const node = makeNode('passthru', s);
+					const node = makeStmtNode('passthru', s);
 					connectEnd(node);
 					if (!s.typeOnly) {
 						const bindImport = (name: string) => {
-							const varNode = makeNode('var', name);
+							const varNode = makeNamedNode('var', name);
 							threadMutation(varNode);
 							scope.create(name, varNode);
 						};
@@ -1205,7 +1238,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						return false;
 					}
 					process(s);
-					connectEnd(makeNode('passthru', s));
+					connectEnd(makeStmtNode('passthru', s));
 					return false;
 				}
 
@@ -1214,7 +1247,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// value-shape check to tell "resolved class" from "verbatim") makes "always needs
 					// rebuildClass" a property of the node itself. Anchored as a statement, not an
 					// 'effect' ('class' the expression uses that), since it produces no value.
-					const node = makeNode('class_decl', s);
+					const node = makeStmtNode('class_decl', s);
 					node.classInfo = buildClass(recurse, node, s);
 					connectEnd(node);
 					return false;
@@ -1223,7 +1256,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				default:	{
 					// An unreferenced declaration is otherwise an unanchored island nothing schedules.
 					process(s);
-					const node = makeNode('passthru', s);
+					const node = makeStmtNode('passthru', s);
 					connectEnd(node);
 					return false;
 				}
@@ -1237,7 +1270,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 			// twice (a nested call like `f(g())` would compile `g` to run twice).
 			switch (s.type) {
 				case 'literal':
-					expnodes.set(s, makeNode('literal', s.value));
+					makeExprNode(s, 'literal');
 					return false;
 
 				case 'identifier':
@@ -1296,12 +1329,12 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// both its identity and schedule position to this exact moment.
 					process(s);
 					const operandNode = getExprNode(s.operand);
-					const oldNode = makeNode('unary_post_old', s);
+					const oldNode = makeExprNode(s, 'unary_post_old');
 					connectValue(operandNode, 0, oldNode, 0);
 					threadMutation(oldNode);
-					expnodes.set(s, oldNode);
 					if (s.operand.type === 'identifier') {
-						const node = makeNode('unary_post', s);
+						const node = makeNode('unary_post');
+						node.expr = s;
 						connectValue(operandNode, 0, node, 0);
 						rebindVar(s.operand.name, node);
 					} else {
@@ -1309,7 +1342,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						// tracking, with no name to rebind -- oldNode's own "materialize only if read"
 						// rule covers the snapshot, but says nothing about the mutation ITSELF still
 						// needing to run, so it gets its own forced anchor too.
-						const node = makeNode('unary_post', s);
+						const node = makeNode('unary_post');
+						node.expr = s;
 						connectValue(operandNode, 0, node, 0);
 						node.forcedPrint = true;
 						threadMutation(node);
@@ -1390,7 +1424,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				case 'tagged_template': {
 					// Desugars to calling `tag` with a strings array plus each interpolated expression --
 					// effectful like an ordinary impure call. Only the interpolated `.exp`s need
-					// threading; the literal string parts carry through in node.value unchanged.
+					// threading; the literal string parts carry through in node.expr unchanged.
 					process(s);
 					const node = makeExprNode(s, 'effect');
 					connectEnd(node);
@@ -1432,10 +1466,10 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						return false;
 					// Type 'effect' (not buildFunctionBody's own default) makes isEffect recognize this
 					// as a printable value, via buildEffectExpr's own 'arrow'/'function' case (prints
-					// `.value` verbatim). expnodes.set lets a later getExprNode(s) find this node.
+					// `.expr` verbatim). expnodes.set lets a later getExprNode(s) find this node.
 					const entry = buildFunctionBody(recurse, s, s.body);
 					entry.type = 'effect';
-					entry.value = s;
+					entry.expr = s;
 					expnodes.set(s, entry);
 					// `entry`, not outer.end: evaluating a function expression (closure creation) is
 					// itself an observable, ordered event, so whatever comes next must chain from it.
@@ -1446,7 +1480,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 				case 'member': {
 					process(s);
-					const node = makeNode('member', s.property);
+					const node = makeNamedNode('member', s.property);
 					node.optional = s.optional;
 					expnodes.set(s, node);
 					connectValue(getExprNode(s.object), 0, node, 0);
@@ -1621,7 +1655,7 @@ export function BuildProgram(
 	// 'block_entry' is GCM's own well-known id for PROGRAM_START; without blockControl, it's found
 	// the same way buildBlockTree itself does -- by type and value -- so this works with no GCM at all.
 	const programStartId = blockControl?.get('block_entry')
-		?? [...graph.values()].find(n => n.type === 'effect' && n.value === 'PROGRAM_START')?.id;
+		?? [...graph.values()].find(n => n.type === 'effect' && n.name === 'PROGRAM_START')?.id;
 	if (!programStartId)
 		return [];
 	const programStart = graph.get(programStartId)!;
@@ -1717,7 +1751,7 @@ export function BuildProgram(
 		function isCalleeEdge(consumer: Node, port: number): boolean {
 			if (!consumer.isEffect())
 				return false;
-			const v = consumer.value as { type?: string; arguments?: unknown[] };
+			const v = consumer.expr as { type?: string; arguments?: unknown[] };
 			return (v.type === 'call' || v.type === 'new') && port === (v.arguments?.length ?? 0) + 1;
 		}
 
@@ -1741,7 +1775,7 @@ export function BuildProgram(
 	// resolves to `Identifier(name)`, correct only when something actually printed `name = ...;` --
 	// not guaranteed for a purely-value merge with no state anchor forcing its own block to be visited.
 	function isInlinableSlot(node: Node): boolean {
-		return ((node.type === 'mutation' && (node.value as Expr).type === 'binary') || node.type === 'gammaValue')
+		return ((node.type === 'mutation' && node.expr!.type === 'binary') || node.type === 'gammaValue')
 			&& !node.forcedPrint
 			&& (node.neverMaterialize || !needsTemp(node));
 	}
@@ -1803,11 +1837,11 @@ export function BuildProgram(
 	}
 
 	function buildEffectExpr(node: Node): Expr {
-		const value = node.value as Expr;
+		const value = node.expr!;
 		switch (value.type) {
 			case 'arrow': case 'function':
 				// GCM never moves anything into or out of a function/arrow body (an isolated
-				// sub-region, its own entry/return-anchor pair) -- node.value is still the original,
+				// sub-region, its own entry/return-anchor pair) -- node.expr is still the original,
 				// untouched AST, safe to print verbatim.
 				return value;
 			// `await x` -- always has a real operand (unlike 'yield', which can be bare).
@@ -1869,21 +1903,21 @@ export function BuildProgram(
 	function buildExpr(node: Node): Expr {
 		switch (node.type) {
 			case 'literal':
-				return Literal(node.value);
+				return node.expr!;
 
 			case 'unary_post':
-				return { ...(node.value as Expr & {type: 'unary_post'}), operand: resolveTarget(node.id, 0) };
+				return { ...(node.expr as Expr & {type: 'unary_post'}), operand: resolveTarget(node.id, 0) };
 			case 'unary_post_old':
 				return resolveTarget(node.id, 0);
 			case 'member':
-				return JS.Member(resolveOperand(node.id, 0), node.value as string, node.optional);
+				return JS.Member(resolveOperand(node.id, 0), node.name!, node.optional);
 			case 'gammaValue':
 				return buildConditional(node);
 
 			// Every ordinary, genuinely pure value-producing expression shares this one tag -- see
-			// makeExprNode's own comment -- so node.value's own .type picks the shape here.
+			// makeExprNode's own comment -- so node.expr's own .type picks the shape here.
 			case 'floating': {
-				const expr = node.value as Expr;
+				const expr = node.expr!;
 				switch (expr.type) {
 					case 'this':
 					case 'super':
@@ -1913,7 +1947,7 @@ export function BuildProgram(
 			// the value produced. Resolves via resolveTarget, not resolveOperand: a member/index
 			// target's value can genuinely differ once the mutation runs, so it must rebuild fresh.
 			case 'mutation': {
-				const expr = node.value as Expr;// & { type: 'unary' | 'binary' };
+				const expr = node.expr!;
 				switch (expr.type) {
 					case 'unary':
 						return { ...expr, operand: resolveTarget(node.id, 0) };
@@ -2034,7 +2068,7 @@ export function BuildProgram(
 			declaredNames.add(name);
 			return JS.VarDecl(node.declKind ?? 'let', JS.Var(name, undefined, node.typeAnnotation)) as Statement;
 		}
-		if ((node.type === 'mutation' && (node.value as Expr).type === 'unary') || node.type === 'unary_post') {
+		if ((node.type === 'mutation' && node.expr!.type === 'unary') || node.type === 'unary_post') {
 			// A prefix or postfix ++/-- already performs its own assignment as a side effect when
 			// evaluated -- printed as a bare expression statement, `++i;`/`i++;` is both correct and
 			// sufficient. Routing it through declareOrAssign like an ordinary reassignment would wrap
@@ -2062,7 +2096,7 @@ export function BuildProgram(
 		if (!edge)
 			throw new Error(`Missing operand edge for slot ${slot} on node ${to}`);
 		const opNode = graph.get(edge.nodeId)!;
-		return opNode.type === 'member' || (opNode.type === 'floating' && (opNode.value as Expr).type === 'index')
+		return opNode.type === 'member' || (opNode.type === 'floating' && opNode.expr!.type === 'index')
 			? buildExpr(opNode) : resolveNode(opNode.id);
 	}
 
@@ -2079,22 +2113,22 @@ export function BuildProgram(
 
 		switch (node.type) {
 			case 'literal':
-				return Literal(node.value);
+				return node.expr!;
 
 			// A local declaration left bare (see isInlinableVarDecl) never actually assigned its name --
 			// its sole reader inlines the pure initializer directly. Skipped when a forced sibling
 			// exists: some other node already resolves via Identifier(name), and inlining here too
 			// would break a merge combining them (losing buildExpr's "cond ? x : x -> x" collapse).
 			case 'var':
-				if (isInlinableVarDecl(node) && !(typeof node.value === 'string' && hasForcedSibling(node.value, node.id)))
+				if (isInlinableVarDecl(node) && !(node.name !== undefined && hasForcedSibling(node.name, node.id)))
 					return resolveOperand(id, 0);
 				// A param (no declKind) is always safe to trust by name. A genuine local declaration
 				// falls back to rebuilding the initializer inline if declaredNames doesn't confirm it
 				// was actually printed -- safe since a bare 'var' read always means THIS declaration's
 				// own initializer, never a value a later reassignment produced.
-				if (typeof node.value === 'string') {
-					if (!node.declKind || declaredNames.has(node.value))
-						return Identifier(node.value);
+				if (node.name !== undefined) {
+					if (!node.declKind || declaredNames.has(node.name))
+						return Identifier(node.name);
 					return resolveOperand(id, 0);
 				}
 				break;
@@ -2102,7 +2136,7 @@ export function BuildProgram(
 			// A muValue always corresponds to a real, mutable loop-carried variable, forced to
 			// materialize regardless of blocks -- always safe to trust by name.
 			case 'muValue':
-				return Identifier(node.value);
+				return Identifier(node.name!);
 
 			// A thetaValue's exported value IS its mu source's value unchanged -- it exists only to
 			// mark where a loop-carried variable becomes readable again after the loop.
@@ -2190,20 +2224,20 @@ export function BuildProgram(
 			if (node.type === 'effect') {
 				// A user-written break/continue: unlike every other bare 'effect' marker, this DOES
 				// need a real printed statement -- real JS routes it to the nearest enclosing loop/switch.
-				if (node.value === 'BREAK_MARKER' || node.value === 'CONTINUE_MARKER') {
-					statements.push({ type: node.value === 'BREAK_MARKER' ? 'break' : 'continue' } as Statement);
+				if (node.name === 'BREAK_MARKER' || node.name === 'CONTINUE_MARKER') {
+					statements.push({ type: node.name === 'BREAK_MARKER' ? 'break' : 'continue' } as Statement);
 					continue;
 				}
 
 				// Same idea, carrying a real value at port 1: the thrown expression.
-				if (node.value === 'THROW_MARKER') {
+				if (node.name === 'THROW_MARKER') {
 					statements.push({ type: 'throw', argument: resolveOperand(id, 1) } as Statement);
 					continue;
 				}
 
 				// Same again for `return`: port 1 is left unconnected for a bare `return;` -- this is
 				// what makes an early return, nested inside a branch, print correctly in place.
-				if (node.value === 'EARLY_RETURN_MARKER') {
+				if (node.name === 'EARLY_RETURN_MARKER') {
 					statements.push({ type: 'return', argument: node.inputs[1] ? resolveOperand(id, 1) : undefined } as Statement);
 					continue;
 				}
@@ -2259,15 +2293,15 @@ export function BuildProgram(
 					break;
 
 				case 'passthru':
-					// A genuinely codeless declaration (interface/type-alias/enum/...) -- node.value
+					// A genuinely codeless declaration (interface/type-alias/enum/...) -- node.stmt
 					// prints verbatim, always regardless of reference count, unlike an ordinary value.
-					statements.push(wrapExported(node.value as Statement, node.exported));
+					statements.push(wrapExported(node.stmt!, node.exported));
 					break;
 
 				case 'class_decl':
 					// rebuildClass splices VSDG's own resolution of heritage/keys/method-bodies back
 					// into the otherwise-verbatim class before printing.
-					statements.push(wrapExported(rebuildClass(node.value, node.classInfo!), node.exported));
+					statements.push(wrapExported(rebuildClass(node.stmt, node.classInfo!), node.exported));
 					break;
 
 				case 'function_decl':
@@ -2283,8 +2317,8 @@ export function BuildProgram(
 					// (`y = (x = 1)`), returning just the right-hand side -- wrong for a statement.
 					if (node.forcedPrint) {
 						statements.push(JS.Expression(
-							node.type === 'mutation' && (node.value as Expr).type === 'binary'
-								? { ...(node.value as Expr & { type: 'binary' }), left: resolveTarget(node.id, 0), right: resolveOperand(node.id, 1) }
+							node.type === 'mutation' && node.expr!.type === 'binary'
+								? { ...(node.expr as Expr & { type: 'binary' }), left: resolveTarget(node.id, 0), right: resolveOperand(node.id, 1) }
 								: buildExpr(node)
 						) as Statement);
 					} else if (needsTemp(node)) {
@@ -2303,7 +2337,7 @@ export function BuildProgram(
 	// local declaration -- unlike a gammaValue/named-except merge (a pure value with no state anchor).
 	function needsDirectPlacement(node: Node): boolean {
 		if (node.type === 'unary_post' || node.type === 'mutation' || (node.type === 'var' && node.declKind !== undefined))
-			return !(node.type === 'mutation' && (node.value as Expr).type === 'binary') || !isInlinableSlot(node);
+			return !(node.type === 'mutation' && node.expr!.type === 'binary') || !isInlinableSlot(node);
 		return false;
 	}
 
@@ -2412,7 +2446,7 @@ export function BuildProgram(
 			// surviving value already forced it under the same name.
 			const forceDeclare = (id: NodeId): Statement[] => {
 				const n = graph.get(id)!;
-				return n.type === 'var' && typeof n.value === 'string' && !declaredNames.has(n.value)
+				return n.type === 'var' && n.name !== undefined && !declaredNames.has(n.name)
 					? emitLocalStatements([id]) : [];
 			};
 			const cases = control.switchCases!.map(c => ({
@@ -2436,7 +2470,7 @@ export function BuildProgram(
 			];
 		}
 
-		if (control.type === 'except' && typeof control.value !== 'string') {
+		if (control.type === 'except' && control.name === undefined) {
 			// Computed, and the "before" half emitted, BEFORE try/catch/finally's own content -- same
 			// reasoning as the gamma case above.
 			const sortedIds		= localTopologicalSort(nodes);
@@ -2474,7 +2508,7 @@ export function BuildProgram(
 			const bodyStatements	= reconstructFunctionBody(control);
 			return [
 				...beforeStmts,
-				wrapExported({ ...rebuildParams(control.value as JS.FunctionDecl<any>, control), body: bodyStatements } as Statement, control.exported),
+				wrapExported({ ...rebuildParams(control.stmt as JS.FunctionDecl<any>, control), body: bodyStatements } as Statement, control.exported),
 				...emitLocalStatements(sortedIds.slice(declIndex + 1)),
 			];
 		}
@@ -2560,11 +2594,9 @@ export function BuildProgram(
 		declaredNames.push();
 		const bodyStatements	= emitChain(returnNode.inputs[0].nodeId, entryNode.id);
 
-		const returnValueNode = graph.get(returnNode.inputs[1].nodeId)!;
-		// Both "no return statement at all" and a bare `return;` fall back to the SAME synthetic
-		// literal(undefined) -- indistinguishable from an explicit `return undefined;` here, but all
-		// three are runtime-equivalent, so omitting the trailing statement is never wrong.
-		if (!(returnValueNode.type === 'literal' && returnValueNode.value === undefined))
+		// Unconnected means the body fell off its natural end with no explicit return -- see
+		// buildFunctionBody's own comment on why omitting the trailing statement is always correct.
+		if (returnNode.inputs[1])
 			bodyStatements.push({ type: 'return', argument: resolveOperand(returnNode.id, 1) } as Statement);
 		declaredNames.pop();
 		return bodyStatements;
@@ -2584,7 +2616,7 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 	// mutation into a bare literal would silently discard the effect it exists to perform.
 	if (node.type !== 'floating')
 		return false;
-	const expr = node.value as Expr;
+	const expr = node.expr!;
 	switch (expr.type) {
 		case 'binary': {
 			// Find the incoming value edges for this node
@@ -2599,11 +2631,11 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 
 			// If both inputs are constants, we can fold them!
 			if (left.type === 'literal' && right.type === 'literal') {
-				const r = calcBinary(expr.operator, left.value, right.value);
+				const r = calcBinary(expr.operator, (left.expr as Expr & { type: 'literal' }).value, (right.expr as Expr & { type: 'literal' }).value);
 				if (r !== undefined) {
 					// 1. Change this node into a pure Constant node
 					node.type = 'literal';
-					node.value = r;
+					node.expr = Literal(r);
 
 					// 2. Remove the incoming edges since it no longer computes anything
 					graph.removeInputs(node);
@@ -2619,11 +2651,11 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 
 			const operand	= graph.getNode(edge.nodeId);
 			if (operand.type === 'literal') {
-				const r = calcUnary(expr.operator, operand.value);
+				const r = calcUnary(expr.operator, (operand.expr as Expr & { type: 'literal' }).value);
 				if (r !== undefined) {
 					// 1. Change this node into a pure Constant node
 					node.type = 'literal';
-					node.value = r;
+					node.expr = Literal(r);
 
 					// 2. Remove the incoming edges since it no longer computes anything
 					graph.removeInputs(node);
@@ -2730,7 +2762,7 @@ function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): b
 	// If the condition is a known constant boolean (or truthy/falsy value)
 	if (condNode.type === 'literal') {
 		// Find the edge representing the winning path (true path, then false path)
-		const winningEdge = graph.getEdge0(node, condNode.value ? port + 1 : port + 2);
+		const winningEdge = graph.getEdge0(node, (condNode.expr as Expr & { type: 'literal' }).value ? port + 1 : port + 2);
 		if (!winningEdge)
 			return false;
 
@@ -2755,24 +2787,27 @@ function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): b
 
 function getStructuralKey(node: Node): string {
 	let key = node.type;
-	// !== undefined, not a truthy check: a literal's own value is frequently falsy (0, false, '',
-	// null) and still a real, distinct value, indistinguishable from a valueless node otherwise.
-	if (node.value !== undefined) {
-		// A 'floating' node's own real discriminator lives in node.value's own .type, not node.type
+	// Checked as three separate fields now (expr/name/stmt), not one untyped `value` -- 'member'
+	// (its own `.name` + `.optional`) never actually reaches here, since optimizeStructuralCSE's
+	// own caller excludes it before ever calling this.
+	if (node.expr !== undefined) {
+		// A 'floating' node's own real discriminator lives in node.expr's own .type, not node.type
 		// (a 'mutation' node never reaches here -- excluded before this, its only caller, runs).
-		switch (node.type === 'floating' ? (node.value as Expr).type : node.type) {
+		switch (node.type === 'floating' ? node.expr.type : node.type) {
 			case 'binary':
-			case 'unary': key += (node.value as any).operator;
+			case 'unary': key += (node.expr as any).operator;
 				break;
-			// `obj.prop` and `obj?.prop` are structurally different -- merging them would drop the
-			// short-circuit.
-			case 'member': key += node.value + (node.optional ? '?' : '');
-				break;
-			// JSON.stringify, not a bare `+=`: `key += ''` appends nothing for an empty-string
-			// literal, colliding it with a genuinely valueless node. The replacer handles a bigint
-			// anywhere in node.value -- JSON.stringify otherwise throws outright on a raw bigint.
-			default: key += JSON.stringify(node.value, (_, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
+			// JSON.stringify, not a bare `+=`: this also naturally distinguishes a literal's own
+			// falsy value (0/false/''/null) from a genuinely valueless node, since `node.expr` is
+			// the wrapper OBJECT, always defined once assigned regardless of what it wraps. The
+			// replacer handles a bigint anywhere inside it -- JSON.stringify otherwise throws
+			// outright on a raw bigint.
+			default: key += JSON.stringify(node.expr, (_, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
 		}
+	} else if (node.name !== undefined) {
+		key += node.name;
+	} else if (node.stmt !== undefined) {
+		key += JSON.stringify(node.stmt, (_, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
 	}
 
 	return key + ':' + node.inputs.map(e => e ? `${e.nodeId}:${e.port}` : '').join(',');
@@ -2794,10 +2829,10 @@ export function optimizeStructuralCSE(graph: VSDG, protectedIds: Set<NodeId>): b
 		if (['mu', 'muValue', 'theta', 'thetaValue', 'gamma', 'gammaValue', 'effect', 'member', 'mutation'].includes(node.type))
 			continue;
 		// 'array'/'object'/'index'/'this'/'super' share the uniform 'floating' tag, so the check
-		// moves to node.value's own .type -- same exclusion, same reasoning as above ('this'/'super':
+		// moves to node.expr's own .type -- same exclusion, same reasoning as above ('this'/'super':
 		// identical structural key regardless of which method they're in, but each one's real value
 		// is bound per call, so merging them conflates two different receivers).
-		if (node.type === 'floating' && (['array', 'object', 'index', 'this', 'super'] as (Expr['type'])[]).includes((node.value as Expr).type))
+		if (node.type === 'floating' && (['array', 'object', 'index', 'this', 'super'] as (Expr['type'])[]).includes(node.expr!.type))
 			continue;
 
 		// Generate the unique structural signature for this node
@@ -2890,7 +2925,7 @@ function buildBlockTree(graph: Map<NodeId, Node>) {
 	const rootBlocks = new Map<NodeId, BlockId>();
 	let blockCounter = 0;
 	for (const [id, node] of graph.entries()) {
-		if (node.type === 'effect' && node.value === 'PROGRAM_START') {
+		if (node.type === 'effect' && node.name === 'PROGRAM_START') {
 			rootBlocks.set(id, 'block_entry');
 		} else if (node.type === 'effect') {
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
@@ -2900,9 +2935,9 @@ function buildBlockTree(graph: Map<NodeId, Node>) {
 			// (unlike except below) -- a unified tag relying on that would mis-schedule a thetaValue,
 			// whose own port 0 is a CONDITION operand, not a state predecessor.
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
-		} else if (node.type === 'except' && typeof node.value !== 'string') {
-			// except still shares one type tag between its state and NAMED forms, so the typeof
-			// check matters here.
+		} else if (node.type === 'except' && node.name === undefined) {
+			// except still shares one type tag between its state and NAMED forms, so this check
+			// matters here.
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
 		} else if (node.type === 'function_decl' || node.type === 'passthru' || node.type === 'class_decl') {
 			rootBlocks.set(id, `${node.type}_${blockCounter++}`);
@@ -2979,7 +3014,7 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 			return cached;
 		const control = blockId !== 'block_entry' ? graph.get(blockControl.get(blockId)!) : undefined;
 		let root = blockId;
-		if (blockId !== 'block_entry' && !(control?.type === 'effect' && control.value === 'FUNCTION_BODY_START')) {
+		if (blockId !== 'block_entry' && !(control?.type === 'effect' && control.name === 'FUNCTION_BODY_START')) {
 			const parent = blockTree.get(blockId);
 			root = parent !== undefined ? regionRootOf(parent) : blockId;
 		}
@@ -2999,7 +3034,7 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 			return cached;
 		const bodyStart = (graph.get(functionDeclId)!.outputs[0] ?? [])
 			.map(e => graph.get(e.nodeId)!)
-			.find(n => n.type === 'effect' && n.value === 'FUNCTION_BODY_START');
+			.find(n => n.type === 'effect' && n.name === 'FUNCTION_BODY_START');
 		const block = (bodyStart && rootBlocks.get(bodyStart.id)) ?? rootBlocks.get(functionDeclId)!;
 		functionBodyBlockMemo.set(functionDeclId, block);
 		return block;
@@ -3108,7 +3143,7 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 
 				// Same issue for a NAMED except's tryVal/catchVal -- unlike a named gamma, both ports
 				// here are value ports (no condition port), so both are excluded.
-				if (consumerNode.type === 'except' && typeof consumerNode.value === 'string')
+				if (consumerNode.type === 'except' && consumerNode.name !== undefined)
 					continue;
 
 				// Same issue for the state theta's own port-1 (condition): the theta's block is
