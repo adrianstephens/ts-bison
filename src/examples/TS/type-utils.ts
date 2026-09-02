@@ -1012,12 +1012,12 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				if (stopAtRef)
 					return t;
 				if (!ALL_PRIMITIVES.has(t.name)) {
-					// A ref's own `declScope` wins over the ambient `scope` -- a cross-module name resolves where it was declared, not wherever it's referenced from
-					if (t.declScope)
-						scope = t.declScope as Scope;
+					// A ref's own `declScope` wins over the ambient `scope` for lookup -- kept local, not
+					// reassigned onto `scope` (which `uncached`'s closure shares with `resolve`'s own resolving-set bookkeeping below; reassigning it here used to leak that set onto the wrong scope).
+					const refScope = t.declScope as Scope ?? scope;
 					const parts	= t.name.split('.');
 					const name	= parts.pop()!;
-					const ns	= scope.lookupScope(parts);
+					const ns	= refScope.lookupScope(parts);
 					if (!ns)
 						return t;
 
