@@ -1988,7 +1988,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		return undefined;
 	}
 
-	function matchObjectShape(e: JS.ObjectExpr<Type>): ClassInfo | undefined {
+	function matchObjectShape(e: JS.ObjectExpr<Type>, ctx: FunctionContext): ClassInfo | undefined {
 		const props = new Map<string, Expr>();
 		for (const p of e.properties) {
 			if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
@@ -1998,7 +1998,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const candidates = [...classes.values()].filter(cls =>
 			cls.typeIndex !== -1 && cls.fields.length === props.size && cls.fields.every(f => props.has(f.name))
 		);
-		if (candidates.length <= 1)
+		// No declared interface/class anywhere has this exact field set -- a genuinely anonymous shape
+		// (e.g. `const mapSig = {a: ..., b: ...}`, never named via `interface`/`type X = ...`), same gap
+		// `ensureAnonObjectShape` already exists for at a function type's own return position. Reusing it
+		// here, keyed the same way, means an identically-shaped anonymous literal elsewhere (or after
+		// generic substitution) collapses onto the same physical struct, same as that call site already
+		// relies on.
+		if (candidates.length === 0) {
+			const resolved = T.resolve(ctx.scope, checkerTypeOf(e, ctx.scope));
+			return resolved.type === 'object' && !indexSignatureValueType(resolved) ? ensureAnonObjectShape(resolved) : undefined;
+		}
+		if (candidates.length === 1)
 			return candidates[0];
 
 		const matches = candidates.filter(cls => [...props].every(([key, value]) => {
@@ -2032,7 +2042,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const candidates = [...classes.values()].filter(cls =>
 			cls.typeIndex !== -1 && cls.fields.length === props.size && cls.fields.every(f => props.has(f.name))
 		);
-		if (candidates.length <= 1)
+		// No declared interface/class has this exact field set either -- same genuinely-anonymous-type gap
+		// `matchObjectShape`'s own expression-level counterpart falls back to `ensureAnonObjectShape` for
+		// (its own comment), reached here e.g. by a bare `const mapSig = {...}`'s own inferred var_decl type
+		// (never named via `interface`/`type X = ...`), not just an expression flowing straight through.
+		if (candidates.length === 0)
+			return indexSignatureValueType(t) ? undefined : ensureAnonObjectShape(t);
+		if (candidates.length === 1)
 			return candidates[0];
 
 		const matches = candidates.filter(cls => [...props].every(([key, propType]) => {
@@ -3813,18 +3829,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 			// A ref-kind element (`string[]`, a class array, ...) needs `REF_ANY` as the per-element target --
 			// `coerceTop`'s widen-to-`any` case boxes each one, not the bare `kind` string (only coincides with a real `WasmType` for scalar kinds).
-			// Narrow support only: `want` must already name a real object-shape type (`ensureObjectShape`,
-			// via `ensureClass`'s own fallback chain) -- a plain `type Point = { x: number; y: number };`
-			// assigned/passed/returned somewhere a concrete target type is known, never general structural
-			// inference (an object literal with no such target, or one whose declared shape doesn't
-			// nominally resolve this way, throws below). Fields push in the *shape's own declared order*
-			// (`struct.new` needs every field value up front, in that fixed order), not the literal's own
-			// written order -- looked up from the literal's properties by name instead.
+			// `want` naming a real class wins outright; otherwise `matchObjectShape` resolves it structurally
+			// -- against a declared interface/class first, falling back to a freshly synthesized anonymous
+			// shape (`ensureAnonObjectShape`) only when no declared type matches at all, e.g. a bare
+			// `const mapSig = {a: ..., b: ...}` with no `interface`/`type X = ...` anywhere. Fields push in
+			// the *shape's own declared order* (`struct.new` needs every field value up front, in that fixed
+			// order), not the literal's own written order -- looked up from the literal's properties by name.
 			case 'object': {
 				// `want` naming one class wins outright when it does; otherwise (most commonly `REF_ANY`,
 				// e.g. this literal is a generic callback's own return value, boxed as `any` per `typeOf`'s
 				// own union case) fall back to `matchObjectShape`'s own structural/discriminant match.
-				const owner = (typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined) ?? matchObjectShape(e);
+				const owner = (typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined) ?? matchObjectShape(e, ctx);
 				if (!owner)
 					throw "an object literal needs a known target type (e.g. a 'const x: Point = {...}' with a plain 'type Point = {...}' alias) -- not supported here";
 

@@ -3553,11 +3553,15 @@ async function main() {
 	}
 
 	{
-		// Narrow object-literal support: only when the literal's target type is a plain `type X = {...}`
-		// alias, resolved (`ensureObjectShape`) the same way a real class already is -- not general
-		// structural inference. Fields push in the shape's own declared order, looked up from the
-		// literal's own properties by name (real TS itself allows any written order).
-		const { fromVarDecl, reordered, shorthand, asArgument, asReturn } = await compile(`
+		// Object-literal support: `want` naming a real target type (a plain `type X = {...}` alias,
+		// resolved via `ensureObjectShape` the same way a real class already is) wins outright; a bare
+		// literal with no such target falls back to `matchObjectShape`'s own structural match against
+		// every declared type, and -- only when even that finds nothing -- a freshly synthesized
+		// anonymous shape (`ensureAnonObjectShape`) built straight from the checker's own inferred type
+		// for the literal itself, same mechanism a function type's own inline return annotation already
+		// used. Fields push in the shape's own declared order, looked up from the literal's own
+		// properties by name (real TS itself allows any written order).
+		const { fromVarDecl, reordered, shorthand, asArgument, asReturn, noTargetType } = await compile(`
 			type Point = { x: number; y: number };
 			export function fromVarDecl(): number {
 				const p: Point = { x: 3, y: 4 };
@@ -3581,19 +3585,46 @@ async function main() {
 				const p = make(3, 8);
 				return p.x + p.y;
 			}
+			export function noTargetType(): number {
+				const p = { x: 1, y: 2 };
+				return p.x + p.y;
+			}
 		`);
 		check('object literal: var_decl with a known alias target type', fromVarDecl(), 7);
 		check("object literal: properties in a different order than the alias's own", reordered(), 34);
 		check('object literal: shorthand properties', shorthand(), 11);
 		check('object literal: passed as a function argument', asArgument(), 11);
 		check('object literal: returned from a function', asReturn(), 11);
+		check('object literal: no known target type synthesizes an anonymous shape', noTargetType(), 3);
+	}
 
-		await checkThrows('object literal with no known target type is rejected', () => compile(`
-			export function f(): number {
-				const p = { x: 1, y: 2 };
-				return 0;
+	{
+		// The real motivating case (found compiling `src/examples/walker.ts`'s own `mapObject`-based
+		// `classMember`/`typeMember`): a bare, un-annotated `const mapSig = {...}` of closure-typed
+		// fields (declared local to the function, same as `walk()`'s own `mapSig`/`mapSigU`), later
+		// reused via spread (`{...mapSig, extra: ...}`) into a call whose parameter itself has no named
+		// type either -- both `mapSig`'s own var_decl type and the spread-literal's argument type need
+		// the same anonymous-shape synthesis, from two different call sites (`typeOf`'s
+		// `matchObjectShapeByType` and `case 'object'`'s own `matchObjectShape`).
+		const { run } = await compile(`
+			interface Member1 { a: number; extra: number }
+
+			function useSig(mapFns: { mapA: (x: number) => number; mapExtra: (x: number) => number }, m: Member1): number {
+				return mapFns.mapA(m.a) + mapFns.mapExtra(m.extra);
 			}
-		`), /tsw/);
+
+			function classMember(m: Member1): number {
+				const mapSig = {
+					mapA: (x: number) => x + 1,
+				};
+				return useSig({ ...mapSig, mapExtra: (x: number) => x * 2 }, m);
+			}
+
+			export function run(): number {
+				return classMember({ a: 1, extra: 5 });
+			}
+		`);
+		check('object literal: an un-annotated const spread into another anonymous-shape literal', run(), 12);
 	}
 
 	{
