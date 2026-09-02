@@ -1187,6 +1187,43 @@ export async function main() {
 		}
 	`);
 
+	// `await x` shares the exact same prefix-unary AST shape as `-x`/`typeof x` (js-parser.ts's own
+	// unaryOps list), but unlike those it's not pure -- structurally identical to 'yield' (see
+	// BuildVSDG's own 'unary' case): tagged 'effect', threaded into the state chain so it's never
+	// reordered/dropped/duplicated relative to other effects, with the same materialize-or-inline
+	// decision (real consumer count) any other effect already gets. Here, each await's own result
+	// (`a`, `b`) has exactly one real consumer (the final `+`), so both inline directly -- correctly
+	// preserving f(1)-then-f(2) order (buildExpr always reconstructs left-to-right, matching the
+	// order BuildVSDG threaded the underlying effects into the state chain). Verified via real
+	// execution too, not just this golden (assistant/verify-await.ts): sequential awaits, a reused
+	// await result, an await inside a loop, and an await whose result is an effectful callee's own
+	// object -- all match real async execution, and `async` on both the outer and nested function
+	// round-trips correctly (already-working generator-signature preservation, no separate fix
+	// needed, confirming the earlier prediction).
+	check('await: structurally identical to yield -- an effect, not a pure unary op', `
+		async function run() {
+			async function f(x) {
+				log.push("f" + x);
+				return x;
+			}
+			const log = [];
+			const a = await f(1);
+			const b = await f(2);
+			log.push(a + b);
+			return log;
+		}
+	`, `
+		async function run() {
+			async function f(x) {
+				log.push("f" + x);
+				return x;
+			}
+			const log = [];
+			log.push(await f(1) + await f(2));
+			return log;
+		}
+	`);
+
 	if (failures) {
 		console.error(`${failures} failure(s)`);
 		process.exit(1);

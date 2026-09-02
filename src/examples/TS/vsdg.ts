@@ -1652,6 +1652,22 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				}
 
 				case 'unary': {
+					// The parser gives `await x` the exact same prefix-unary AST shape as `-x`/`typeof x`
+					// (see js-parser.ts's own unaryOps list) -- but unlike those, it's not pure: it's
+					// structurally identical to 'yield' (an operand is evaluated, then the current
+					// effect sequence must include this exact point, never reordered/dropped/duplicated
+					// relative to other effects around it -- the actual suspend/resume machinery is
+					// downstream, towasm.ts's own job, same division of labor 'yield' already documents;
+					// nothing about it needs modeling here). Treating it as an ordinary value node (the
+					// unconditional path below) would let it be silently reordered or inlined away
+					// exactly like a pure computation would.
+					if (s.operator === 'await') {
+						process(s);
+						const node = makeExprNode(s, 'effect');
+						connectEnd(node);
+						connectValue(getExprNode(s.operand), 0, node, 1);
+						return false;
+					}
 					process(s);
 					const node = makeExprNode(s as Expr);
 					connectValue(getExprNode(s.operand), 0, node, 0);
@@ -2262,7 +2278,10 @@ export class Output {
 		return node.type === 'effect' && !!node.value && typeof node.value === 'object'
 			&& (node.value.type === 'call' || node.value.type === 'new' || node.value.type === 'yield'
 				|| node.value.type === 'tagged_template' || node.value.type === 'class' || node.value.type === 'jsx'
-				|| node.value.type === 'arrow' || node.value.type === 'function');
+				|| node.value.type === 'arrow' || node.value.type === 'function'
+				// `await x` -- see BuildVSDG's own 'unary' case for why it's tagged 'effect' at all
+				// despite sharing the plain 'unary' AST shape with pure operators like `-x`/`typeof x`.
+				|| (node.value.type === 'unary' && (node.value as Expr & { type: 'unary' }).operator === 'await'));
 	}
 
 	// Splices VSDG's own resolution of a class's heritage/computed-keys/static-field-values/method-
@@ -2294,7 +2313,7 @@ export class Output {
 	}
 
 	private buildEffectExpr(node: Node): Expr {
-		const value = node.value as (Expr & {type: 'call' | 'new' | 'yield' | 'tagged_template' | 'class' | 'jsx' | 'arrow' | 'function'});
+		const value = node.value as (Expr & {type: 'call' | 'new' | 'yield' | 'tagged_template' | 'class' | 'jsx' | 'arrow' | 'function' | 'unary'});
 		if (value.type === 'arrow' || value.type === 'function')
 			// GCM never moves anything INTO or OUT OF a function/arrow body (it's an isolated
 			// sub-region, walked into its own entry/return-anchor pair -- see BuildVSDG's own case),
@@ -2303,6 +2322,10 @@ export class Output {
 			// heritage/keys/method-bodies got real decomposition. Only entryNode's own SCHEDULING
 			// (this node, as a whole) is real GCM's concern here -- not what's printed for it.
 			return value;
+		// `await x` -- see BuildVSDG's own 'unary' case and isEffect's own comment. Always has a
+		// real operand (unlike 'yield', which can be bare), at the same port 1 convention.
+		if (value.type === 'unary')
+			return { ...value, operand: this.resolveOperand(node.id, 1) };
 		if (value.type === 'yield')
 			return { ...value, operand: value.operand ? this.resolveOperand(node.id, 1) : undefined };
 		if (value.type === 'tagged_template')
