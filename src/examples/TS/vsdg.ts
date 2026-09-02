@@ -1644,6 +1644,20 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					return false;
 				}
 				case 'unary_post': {
+					// The parser gives the non-null assertion (`expr!`) the exact same `unary_post` AST
+					// shape as a real, mutating postfix `++`/`--` (see ts-parser.ts's own `Rule([member,
+					// '!'], $ => UnaryPost('!', $[0]))`) -- but `!` has NO runtime effect at all, purely a
+					// compile-time type assertion, exactly like `as`/`satisfies`/`instantiation` just
+					// above: alias straight through, no new node, no old-value snapshot, no rebind. Found
+					// on real code (binary-libs/src/pe.ts): `dir.FunctionTable!` was forced through the
+					// SAME "always materialize, never lazily recompute" rule real `i++` needs (see
+					// needsTemp's own 'unary_post_old' case), producing a needless `var t8 = ...;` for a
+					// value with exactly one real consumer.
+					if (s.operator === '!') {
+						process(s);
+						expnodes.set(s, getExprNode(s.operand));
+						return false;
+					}
 					// Unlike prefix, `i++`/`i--` evaluates to the OLD value. Can't alias the expression
 					// directly to the operand's own node (the same aliasing hazard var_decl's "dedicated
 					// wrapper" comment warns about, just one level removed): that node stays reachable BY
