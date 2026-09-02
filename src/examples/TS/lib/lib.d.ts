@@ -80,11 +80,13 @@ interface PropertyDescriptorMap {
 	[key: PropertyKey]: PropertyDescriptor;
 }
 
-// `entries` only, for now -- a compiler intrinsic (see `emitObjectEntries` in towasm.ts), not real TS
-// source: what fields exist depends on the argument's own concrete type at each call site, which only
-// the compiler itself can see. Currently supports a `Map`-backed dynamic object (forwards to its own
-// real `entries()`) and a *sealed* (never-subclassed) struct-backed class/object-shape; an extended
-// class isn't supported yet (would need the receiver's real runtime type, not just its static one).
+// A compiler intrinsic, not real TS source: what fields exist depends on the argument's own concrete
+// type at each call site, which only the compiler itself can see. `entries`/`values`/`keys` currently
+// support a `Map`-backed dynamic object (forward to its own real methods) and a *sealed* (never-
+// subclassed) struct-backed class/object-shape; an extended class isn't supported yet (would need the
+// receiver's real runtime type, not just its static one). `defineProperty` only supports a plain value
+// descriptor (`{value: ...}`, real `enumerable`/`configurable`/`writable` flags accepted but with no
+// observable effect) and a literal string `key` -- see `emitObjectDefineProperty` in towasm.ts.
 interface Object {}
 declare var Object: {
 	entries<T>(x: T): [string, any][];
@@ -92,6 +94,7 @@ declare var Object: {
 	keys<T>(x: T): string[];
 	is<A, B>(a: A, b: B): boolean;
 	assign<T>(target: T, ...sources: any[]): T;
+	defineProperty<T>(target: T, key: PropertyKey, descriptor: PropertyDescriptor): T;
 };
 
 //-----------------------------------------------------------------------------
