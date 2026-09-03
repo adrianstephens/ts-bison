@@ -73,7 +73,7 @@ type INode =
 	// optional: a `?.` member access (`.name` is the property; unlike 'index', which keeps the whole
 	// expr) -- without it `a.b?.c` reconstructs as `a.b.c`.
 	| { type: 'member', name: string, optional?: boolean }
-	| { type: 'unary_post', expr: Expr }
+	| { type: 'unary_post', expr: Expr & { type: 'unary_post' } }
 	| { type: 'unary_post_old', expr: Expr }
 	| { type: 'floating', expr: Expr }
 	| { type: 'mutation', expr: Expr }
@@ -1868,7 +1868,7 @@ export function BuildProgram(
 	function buildExpr(node: Node): Expr {
 		switch (node.type) {
 			case 'unary_post':
-				return { ...(node.expr as Expr & {type: 'unary_post'}), operand: resolveTarget(node.id, 0) };
+				return { ...node.expr, operand: resolveTarget(node.id, 0) };
 			case 'unary_post_old':
 				return resolveTarget(node.id, 0);
 			case 'member':
@@ -2258,7 +2258,7 @@ export function BuildProgram(
 					if (node.forcedPrint) {
 						statements.push(JS.Expression(
 							node.type === 'mutation' && node.expr.type === 'binary'
-								? { ...(node.expr as Expr & { type: 'binary' }), left: resolveTarget(node.id, 0), right: resolveOperand(node.id, 1) }
+								? { ...node.expr, left: resolveTarget(node.id, 0), right: resolveOperand(node.id, 1) }
 								: buildExpr(node)
 						) as Statement);
 					} else if (needsTemp(node)) {
