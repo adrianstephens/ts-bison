@@ -34,21 +34,33 @@ interface ClassInfo {
 // whose expr.type is 'literal'. `.type` is genuinely mutated in place in two spots (foldConstants
 // folds a binary/unary into a literal; the arrow/function case retags a function_decl entry to
 // effect) -- both are same-payload-shape transitions, done through `retag`.
+interface SwitchCase { testNodeId?: NodeId; boundaryId: NodeId; tailId: NodeId }
+
 type INode =
 	| { type: 'gamma' }
-	| { type: 'gammaValue' }
-	| { type: 'mu' }
+	// neverMaterialize: a broken-out merge whose operand still resolves to its OWN name would print a
+	// circular `name = op0 ? name : name;` -- forces it to always resolve lazily instead.
+	| { type: 'gammaValue', neverMaterialize?: boolean }
+	// loopKind: a do-while's state mu -- the body runs before the first test, so no loop-rotation.
+	| { type: 'mu', loopKind?: 'do' }
 	| { type: 'muValue', name: string }
 	| { type: 'theta' }
 	| { type: 'thetaValue', name: string }
 	| { type: 'var', name?: string }
-	| { type: 'break_scope' }
-	| { type: 'except', name?: string }
-	| { type: 'function_decl', stmt?: Statement }
+	// switchDiscriminantId/switchCases: a `break_scope` reconstructing a real `switch` -- the
+	// discriminant node, and each case's resolved test + body span (see SwitchCase).
+	| { type: 'break_scope', switchDiscriminantId?: NodeId, switchCases?: SwitchCase[] }
+	// catchParam: the catch clause's binding name, for reconstructing `catch (e) {...}`.
+	| { type: 'except', name?: string, catchParam?: string }
+	// destructuredParams: maps a destructured param's pattern to the hidden temp its value binds to,
+	// so the printed signature and the body agree. stmt: a top-level function_decl's own source node.
+	| { type: 'function_decl', stmt?: Statement, destructuredParams?: Map<JS.BindingTarget, string> }
 	| { type: 'class_decl', stmt: Statement }
 	| { type: 'passthru', stmt: Statement }
 	| { type: 'effect', name?: string, expr?: Expr }
-	| { type: 'member', name: string }
+	// optional: a `?.` member access (`.name` is the property; unlike 'index', which keeps the whole
+	// expr) -- without it `a.b?.c` reconstructs as `a.b.c`.
+	| { type: 'member', name: string, optional?: boolean }
 	| { type: 'unary_post', expr: Expr }
 	| { type: 'unary_post_old', expr: Expr }
 	| { type: 'floating', expr: Expr }
@@ -57,11 +69,10 @@ type INode =
 
 type NodeType = INode['type'];
 
-// The edge machinery every node has, plus every optional annotation the passes stamp onto a node
-// after it's built. These are deliberately NOT partitioned per tag: most span several tags
-// (boundName/forcedPrint/switchInternal/exported/scopeAnchorId/classInfo), and some are read
-// cross-tag (returnNodeId is checked on a function_decl entry AND on the effect node the
-// arrow/function case retags it into).
+// The edge machinery every node has, plus the optional annotations the passes stamp on that span
+// several tags (or are read cross-tag: returnNodeId is checked on a function_decl entry AND on the
+// effect node the arrow/function case retags it into). Tag-local annotations live on the matching
+// INode variant instead.
 class RawNode {
 	inputs:		Edge[]		= [];	// inputs[port] = the single source edge feeding this slot
 	outputs:	Edge[][]	= [];	// outputs[port] = every downstream edge consuming this channel
@@ -69,39 +80,24 @@ class RawNode {
 	// ++/--), or a per-variable gammaValue/named-except merge -- tells Output to print it by name
 	// instead of an anonymous temp (see slotName).
 	boundName?:	string;
+	// A var_decl's declaration kind and (paired) type annotation -- threaded through every
+	// reconstruction so an explicitly-typed empty-collection literal doesn't lose its type. Read on
+	// an un-narrowed node in a few spots (declareOrAssign, reconcileVariables), hence not on 'var'.
 	declKind?:	JS.DeclarationKind;
-	// The declarator's own type annotation, threaded through every reconstruction -- otherwise an
-	// explicitly-typed empty-collection literal silently loses its type when reprinted.
 	typeAnnotation?: TS.Type;
 	// Forces a reassignment to print even with no value-consumer: one on an exited branch
 	// (break/continue/return) skips the post-branch merge entirely, so needsTemp would see it as dead.
 	forcedPrint?: boolean;
-	// A named gamma whose operand still resolves to its OWN name would print a circular
-	// `name = op0 ? name : name;` -- forces it to always resolve lazily instead.
-	neverMaterialize?: boolean;
-	// Marks a state mu as a do-while's: the body runs before the first test, so unlike `while` it
-	// needs no loop-rotation.
-	loopKind?: 'do';
-	// The catch clause's binding name, stamped on the state `except` anchor for reconstructing
-	// `catch (e) {...}`.
-	catchParam?: string;
 	// A function/class decl's RETURN_ANCHOR id -- no ordinary edge connects entry to return, and an
-	// empty body makes edge-walking alone indistinguishable from "no return node at all".
+	// empty body makes edge-walking alone indistinguishable from "no return node at all". Also read
+	// on the effect node an arrow/function expression retags its entry into.
 	returnNodeId?: NodeId;
-	// Maps a destructured param's original pattern to the hidden temp name its value is bound to --
-	// without it the printed signature keeps the pattern while the body reads a name it never binds.
-	destructuredParams?: Map<JS.BindingTarget, string>;
 	// The program's own final state-chain node id, stamped once on PROGRAM_START -- the top level
 	// has no return anchor the way a function does, so this is the walk's own starting point instead.
 	programEndId?: NodeId;
-	// Stamped on a `break_scope` reconstructing a `switch`: discriminant, each case's own resolved
-	// test, and its body's span. `__hit`/`__matchN` stay outside the printed span (boundaryId is
-	// captured after that marker) but still drive a post-switch merge when one survives fallthrough.
-	switchDiscriminantId?: NodeId;
-	switchCases?: { testNodeId?: NodeId; boundaryId: NodeId; tailId: NodeId }[];
 	// Marks switch's own internal bookkeeping (`__hit`/`__matchN`) as always resolved by name --
 	// without this it's indistinguishable from an ordinary reassignment, whose inlining legitimately
-	// depends on forcedPrint/needsTemp.
+	// depends on forcedPrint/needsTemp. Set on a gamma AND on the `hit` var/mutation.
 	switchInternal?: boolean;
 	// A 'this'/'super' node's enclosing function id -- unlike a param (a real graph edge), it has no
 	// input to float a hoisted, loop-invariant read against, so without this it can escape the
@@ -114,11 +110,9 @@ class RawNode {
 	// safely inlined: the reading function may run zero, one, or many times, so it must always
 	// re-read the variable by name, never substitute its declaration-time value.
 	capturedRead?: boolean;
-	// A 'member' node's own `?.` marker (its `.name` holds just the property name, unlike 'index',
-	// which keeps the whole expr in `.expr`) -- without it, `a.b?.c` silently reconstructs as `a.b.c`.
-	optional?: boolean;
 	// A class anchor's own resolved pieces (heritage, each member's computed key/static value/method
-	// body) -- index-aligned with the original `body` array; rebuildClass splices these back in.
+	// body) -- index-aligned with the original `body` array; rebuildClass splices these back in. Set
+	// on a class_decl statement AND on the effect node of a class expression.
 	classInfo?: ClassInfo;
 	// Same as classInfo, for an object literal's own method/get/set properties -- index-aligned with
 	// `s.properties`, undefined for a field/spread (which already thread a real value port).
@@ -132,18 +126,19 @@ class RawNode {
 	outDegree() { return this.outputs.reduce((sum, arr) => sum + arr.length, 0); }
 }
 
-// A concrete node: RawNode's edge machinery + annotations, plus one INode variant's own payload,
-// inferred from the literal passed to makeNode so `n.type` narrows the rest of `n` at the call site.
+// A concrete node: RawNode's edge machinery + annotations, plus one INode variant's own payload.
 type Node<N extends INode = INode> = RawNode & N;
+// The node for one specific tag, with that variant's own annotations -- what makeNode/retag hand back.
+type NodeOf<T extends NodeType> = Node<Extract<INode, { type: T }>>;
 
-function MakeNode<N extends INode>(id: string, inode: N): Node<N> {
-	return Object.assign(new RawNode(id), inode);
+function MakeNode<N extends INode>(id: string, inode: N): NodeOf<N['type']> {
+	return Object.assign(new RawNode(id), inode) as unknown as NodeOf<N['type']>;
 }
 
 // A same-payload-shape tag change (floating literal <- folded binary/unary; effect <- function_decl
 // entry). Mutates in place -- other nodes already hold this reference -- and re-narrows the result.
-function retag<N extends INode>(node: RawNode, inode: N): Node<N> {
-	return Object.assign(node, inode) as Node<N>;
+function retag<N extends INode>(node: RawNode, inode: N): NodeOf<N['type']> {
+	return Object.assign(node, inode) as unknown as NodeOf<N['type']>;
 }
 
 // A node's real source-variable name, if it has one -- a direct rebind or a per-variable merge,
@@ -338,7 +333,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// single, shared, declKind-less 'var' node so it can be read by name without a declaration.
 	const externalNodes = new Map<string, Node>();
 
-	function makeNode<N extends INode>(inode: N): Node<N> {
+	function makeNode<N extends INode>(inode: N): NodeOf<N['type']> {
 		const id	= inode.type + String(nextId++);
 		const node	= MakeNode(id, inode);
 		graph.set(id, node);
@@ -1794,12 +1789,12 @@ export function BuildProgram(
 	function isInlinableSlot(node: Node): boolean {
 		return ((node.type === 'mutation' && node.expr.type === 'binary') || node.type === 'gammaValue')
 			&& !node.forcedPrint
-			&& (node.neverMaterialize || !needsTemp(node));
+			&& ((node.type === 'gammaValue' && node.neverMaterialize) || !needsTemp(node));
 	}
 
 	// A destructured param prints as its own hidden temp name in the SIGNATURE too, not just the
 	// body -- see destructuredParams. A no-op when this entry has no destructured params at all.
-	function rebuildParams<T extends { params: JS.Param<any>[]; rest?: JS.Rest<any> }>(raw: T, entryNode: Node): T {
+	function rebuildParams<T extends { params: JS.Param<any>[]; rest?: JS.Rest<any> }>(raw: T, entryNode: NodeOf<'function_decl'>): T {
 		if (!entryNode.destructuredParams)
 			return raw;
 		const rebuildKey = <P extends { key: JS.BindingTarget }>(p: P): P => {
@@ -1829,7 +1824,7 @@ export function BuildProgram(
 						: withKey;
 				if (!mi.entryNodeId)
 					return withKey;
-				const entryNode = graph.get(mi.entryNodeId)!;
+				const entryNode = graph.get(mi.entryNodeId)! as NodeOf<'function_decl'>;
 				return { ...rebuildParams(withKey, entryNode), body: reconstructFunctionBody(entryNode) };
 			}),
 		};
@@ -2696,13 +2691,15 @@ function collectProtectedNodeIds(graph: VSDG): Set<NodeId> {
 			ids.add(node.returnNodeId);
 		if (node.programEndId !== undefined)
 			ids.add(node.programEndId);
-		if (node.switchDiscriminantId !== undefined)
-			ids.add(node.switchDiscriminantId);
-		for (const c of node.switchCases ?? []) {
-			if (c.testNodeId !== undefined)
-				ids.add(c.testNodeId);
-			ids.add(c.boundaryId);
-			ids.add(c.tailId);
+		if (node.type === 'break_scope') {
+			if (node.switchDiscriminantId !== undefined)
+				ids.add(node.switchDiscriminantId);
+			for (const c of node.switchCases ?? []) {
+				if (c.testNodeId !== undefined)
+					ids.add(c.testNodeId);
+				ids.add(c.boundaryId);
+				ids.add(c.tailId);
+			}
 		}
 		if (node.classInfo) {
 			if (node.classInfo.superClassNodeId !== undefined)
