@@ -46,7 +46,10 @@ type INode =
 	| { type: 'muValue', name: string }
 	| { type: 'theta' }
 	| { type: 'thetaValue', name: string }
-	| { type: 'var', name?: string }
+	// declKind + (paired) typeAnnotation: a var_decl wrapper node -- a param is a declKind-less 'var'.
+	// The annotation is threaded through every reconstruction so an explicitly-typed empty-collection
+	// literal doesn't lose its type.
+	| { type: 'var', name?: string, declKind?: JS.DeclarationKind, typeAnnotation?: TS.Type }
 	// switchDiscriminantId/switchCases: a `break_scope` reconstructing a real `switch` -- the
 	// discriminant node, and each case's resolved test + body span (see SwitchCase).
 	| { type: 'break_scope', switchDiscriminantId?: NodeId, switchCases?: SwitchCase[] }
@@ -80,11 +83,6 @@ class RawNode {
 	// ++/--), or a per-variable gammaValue/named-except merge -- tells Output to print it by name
 	// instead of an anonymous temp (see slotName).
 	boundName?:	string;
-	// A var_decl's declaration kind and (paired) type annotation -- threaded through every
-	// reconstruction so an explicitly-typed empty-collection literal doesn't lose its type. Read on
-	// an un-narrowed node in a few spots (declareOrAssign, reconcileVariables), hence not on 'var'.
-	declKind?:	JS.DeclarationKind;
-	typeAnnotation?: TS.Type;
 	// Forces a reassignment to print even with no value-consumer: one on an exited branch
 	// (break/continue/return) skips the post-branch merge entirely, so needsTemp would see it as dead.
 	forcedPrint?: boolean;
@@ -602,12 +600,12 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				// chained off it, unlike a plain reassignment genuinely superseded by this one.
 				if (trueExitedViaBreak && trueVal.boundName === name && (trueVal.switchInternal || isLoopCarried(name)))
 					trueVal.forcedPrint = true;
-				else if (trueVal.boundName === name && !trueVal.declKind && trueVal.type !== 'gammaValue' && trueVal.type !== 'except')
+				else if (trueVal.boundName === name && !(trueVal.type === 'var' && trueVal.declKind) && trueVal.type !== 'gammaValue' && trueVal.type !== 'except')
 					trueVal.boundName = undefined;
 
 				if (falseExitedViaBreak && falseVal.boundName === name && (falseVal.switchInternal || isLoopCarried(name)))
 					falseVal.forcedPrint = true;
-				else if (falseVal.boundName === name && !falseVal.declKind && falseVal.type !== 'gammaValue' && falseVal.type !== 'except')
+				else if (falseVal.boundName === name && !(falseVal.type === 'var' && falseVal.declKind) && falseVal.type !== 'gammaValue' && falseVal.type !== 'except')
 					falseVal.boundName = undefined;
 
 				// When one side broke out, its operand still carries boundName === name -- printing
@@ -1986,7 +1984,7 @@ export function BuildProgram(
 	// Emits either the FIRST declaration of a real source variable (once) or a plain reassignment
 	// (every time after) -- only a var_decl's own node ever carries a declKind.
 	function declareOrAssign(name: string, node: Node, expr: Expr): Statement {
-		if (node.declKind && !declaredNames.has(name)) {
+		if (node.type === 'var' && node.declKind && !declaredNames.has(name)) {
 			declaredNames.add(name);
 			return JS.VarDecl(node.declKind, JS.Var(name, expr, node.typeAnnotation)) as Statement;
 		}
