@@ -2043,23 +2043,16 @@ export function BuildProgram(
 			if (!node.inputs[0])
 				return JS.VarDecl(node.declKind!, JS.Var(name, undefined, node.typeAnnotation)) as Statement;
 
-			// Either the initializer is pure and doesn't need printing under x's own name, or x's
-			// value is dead outright -- an effectful dead initializer still runs (materialized
-			// separately via the ordinary isEffect path), just not attached to x.
-			if (isInlinableVarDecl(node) || !hasRealConsumer(node)) {
-				const forcedElsewhere = hasForcedSibling(name, node.id);
-				// A forced sibling that also has real consumers here needs `name` to hold the CORRECT
-				// value when read -- a bare declaration would silently replace those reads with
-				// `undefined`, so fall through to the value-bearing declaration/assignment below.
-				if (!forcedElsewhere || !hasRealConsumer(node)) {
-					// Safe to drop entirely only when nothing else still needs `x` declared; exported
-					// bindings keep it too (external code may import it by name).
-					if (!node.exported && !forcedElsewhere)
-						return undefined;
-					// `const` requires an initializer -- downgraded to `let` rather than the
-					// syntax-invalid `const x;`.
-					return JS.VarDecl(node.declKind === 'const' ? 'let' : node.declKind!, JS.Var(name, undefined, node.typeAnnotation)) as Statement;
-				}
+			const forced = hasForcedSibling(name, node.id);
+			// The initializer needn't print under x's name -- nothing reads x's value, or its sole
+			// reader recomputes the pure initializer inline (an effectful dead one still runs via the
+			// ordinary isEffect path). A forced sibling reads x by name, so then x keeps its value.
+			if (!hasRealConsumer(node) || (isInlinableVarDecl(node) && !forced)) {
+				// Keep a bare `let x;` only when the binding is still needed -- an export, or a forced
+				// sibling assigning x. (`const x;` is syntax-invalid, downgrade to `let`.)
+				return node.exported || forced
+					? JS.VarDecl(node.declKind === 'const' ? 'let' : node.declKind!, JS.Var(name, undefined, node.typeAnnotation)) as Statement
+					: undefined;
 			}
 			// The FIRST emit of a real source variable is its declaration; every emit after is a plain
 			// reassignment (`first` is captured before the add at the top).
