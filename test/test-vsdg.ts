@@ -1340,6 +1340,26 @@ export async function main() {
 		}
 	`);
 
+	// A function/arrow EXPRESSION and a top-level DECLARATION share one 'function' node tag (same
+	// entry/RETURN_ANCHOR structure) -- the expression form sets `.expr` and prints inline like an
+	// effect, the declaration form sets `.stmt` and reconstructs as a statement. `add`'s single
+	// consumer inlines the arrow verbatim (GCM never moves function bodies); `f`'s two consumers
+	// keep the real `const f = ...` declaration.
+	check('function expression: single-use arrow inlines, reused one keeps its declaration', `
+		const add = (a, b) => a + b;
+		g(add(1, 2));
+		const f = () => { h(); };
+		f();
+		f();
+	`, `
+		g(((a, b) => a + b)(1, 2));
+		const f = () => {
+			h();
+		};
+		f();
+		f();
+	`);
+
 	if (failures) {
 		console.error(`${failures} failure(s)`);
 		process.exit(1);
