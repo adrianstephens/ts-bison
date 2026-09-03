@@ -1581,6 +1581,33 @@ async function main() {
 	}
 
 	{
+		// Discriminated-union narrowing inside a `switch` case body wasn't visible to member-read codegen:
+		// `case 'm1': return m.a;` tried to build a field dispatch across the *whole* `Member1|Member2`
+		// union (since `classOf`'s own unnarrowed lookup couldn't resolve one owner), throwing "'Member2'
+		// has no field 'a'" even though real TS narrows `m` to just `Member1` inside that case. Root cause
+		// was even deeper: a real `scope.resolving` leak in `T.resolve()` (see its own fix) meant the
+		// switch's own discriminant read couldn't even resolve `m.type`'s type at all, independent of
+		// narrowing. Fixed by consulting the checker's own per-statement narrowed scope (`ctx.stmtScope`)
+		// specifically when the *unnarrowed* type is a union -- every other lookup keeps using the same
+		// baseline scope as before, so this never disturbs an unrelated generic/lib-method resolution.
+		const { fromSwitch } = await compile(`
+			interface Member1 { type: 'm1'; a: number }
+			interface Member2 { type: 'm2'; foo: boolean }
+			type Member = Member1 | Member2;
+			function classMember(m: Member): number {
+				switch (m.type) {
+					case 'm1': return m.a;
+					case 'm2': return 0;
+				}
+			}
+			export function fromSwitch(): number {
+				return classMember({ type: 'm1', a: 7 });
+			}
+		`);
+		check("discriminated union: switch(m.type)'s own case-narrowing is visible to a field read inside it", fromSwitch(), 7);
+	}
+
+	{
 		// A self-referential object-shape type now compiles and runs correctly, the same placeholder-first
 		// mechanism `ensureClass` uses (`ensureObjectShape` gained the matching `typeIndex`-before-fields
 		// ordering) -- previously this reached a genuinely unbounded recursion the moment a union member's

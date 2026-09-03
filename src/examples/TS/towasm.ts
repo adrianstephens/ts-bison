@@ -500,6 +500,18 @@ class FunctionContext {
 	// base (`ensureClassExtension`'s own comment) -- not every value of that class, only the one
 	// actually extended.
 	definePropertyTargets?: Map<string, string[] | 'dynamic'>;
+
+	// Updated by `emitStmt`'s own entry point, from each statement's own `(stmt as any).scope` checker
+	// stamp (`scopeOfStmt`'s comment) -- `scope` itself stays the one static, whole-function scope set at
+	// construction, never written through this. Consulted only by the two real union-member-dispatch
+	// fallbacks (`case 'member'`/`case 'index'`) that need a receiver's real *narrowed* type (`switch
+	// (m.type) { case 'm1': m.a ...}`) -- every other lookup still goes through `scope` directly, since a
+	// lib generic method body's own stamp reflects its unresolved template type params, not the concrete
+	// per-instantiation substitution `scope` already carries (`case 'var_decl'`'s own longstanding
+	// bypass, just above, hit this same tension first).
+	stmtScope?: Scope;
+	get typeScope(): Scope { return this.stmtScope ?? this.scope; }
+
 	// Unset for an ordinary function/method/arrow -- `case 'return'` falls back to `plainReturn` in
 	// that case. See `ReturnHandler`'s own comment for who sets this and why.
 	finallyGuards:		FinallyGuard[] = [];
@@ -1956,6 +1968,25 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		return typeOf(checkerTypeOf(unwrapAs(e), ctx.scope));
 	}
 
+	// Like `checkerTypeOf(e, ctx.scope)`, but for a receiver whose *unnarrowed* type is a real union,
+	// prefers the enclosing statement's own narrowing-aware `ctx.stmtScope` when it actually narrows that
+	// union down (`switch (m.type) { case 'm1': m.a ...}` needs `m`'s narrowed type, which only
+	// `stmtScope` has). `ctx.scope`'s own answer is the baseline and wins whenever it isn't a union --
+	// `stmtScope`'s own stamped type can otherwise diverge from it in ways that have nothing to do with
+	// narrowing (a synthetic, towasm-only identifier the checker never stamped at all resolves as bare
+	// `any`; a lib generic method/constructor body's own stamp reflects its *template*, not the concrete
+	// per-instantiation substitution `ctx.scope` has; the checker's own internal tracking can otherwise
+	// fully structurally resolve a value where `ctx.scope` keeps its clean nominal `ref`) -- none of which
+	// this needs to enumerate, since they only ever matter once a union is actually in play.
+	function narrowedTypeOf(e: Expr, ctx: FunctionContext): Type {
+		const unwrapped = unwrapAs(e);
+		const base = checkerTypeOf(unwrapped, ctx.scope);
+		if (!ctx.stmtScope || T.resolve(ctx.scope, base).type !== 'union')
+			return base;
+		const narrowed = checkerTypeOf(unwrapped, ctx.stmtScope);
+		return T.isAny(narrowed) ? base : narrowed;
+	}
+
 	// A bare object literal with no single resolvable target type at all (`case 'object'`'s own `want`
 	// doesn't name one class) -- a last-resort structural match against every reachable, struct-backed
 	// class/object-shape (same "every class ever discovered" scan `findAnyDispatchCandidates` already
@@ -2248,7 +2279,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// Field access stays `classOf`-only (arrays/scalars have no fields), but method-call dispatch is
 	// otherwise identical across real classes, array kinds, and scalar box kinds -- all handled by `ownerFor` above.
 	function ownerOf(e: Expr, ctx: FunctionContext) {
-		return ownerFor(checkerTypeOf(unwrapAs(e), ctx.scope));
+		return ownerFor(narrowedTypeOf(e, ctx));
 	}
 
 	// Populated by the "index space" pass below, before any body is built -- a class ref's `WasmType`
@@ -3655,12 +3686,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					// unknown field) is a receiver whose static type is a real union of different object
 					// shapes (`unionClassMembers`), physically boxed as `any` by `typeOf`'s own union case.
 
-					const t = T.resolve(ctx.scope, checkerTypeOf(unwrapAs(e.object), ctx.scope));
+					const t = T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx));
 					if (t.type === 'union') {
-						const owners = t.types.filter(m => !T.isNullish(m, ctx.scope)).map(m => ownerFor(m));
+						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope)).map(m => ownerFor(m));
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1)) {
 							emitAs(e.object, ctx, REF_ANY);
-							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property, T.lookupMember(t, e.property, ctx.scope));
+							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property, T.lookupMember(t, e.property, ctx.typeScope));
 							ctx.emit(I.call(info.funcIndex));
 							return info.result;
 						}
@@ -3776,9 +3807,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					// `number[]`/`boolean[]` included, via its own 'array' case, same as a genuine typed-array
 					// view), so this is exactly `case 'member'`'s own `ensureUnionFieldDispatch` shape, just
 					// always through `get(i)` rather than a field/getter (see `ensureUnionIndexDispatch`).
-					const t = T.resolve(ctx.scope, checkerTypeOf(unwrapAs(e.object), ctx.scope));
+					const t = T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx));
 					if (t.type === 'union') {
-						const owners = t.types.filter(m => !T.isNullish(m, ctx.scope)).map(m => ownerFor(m));
+						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope)).map(m => ownerFor(m));
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1 && methodSig(o, 'get', ctx))) {
 							emitAs(e.object, ctx, REF_ANY);
 							emitAs(e.property, ctx, 'i32');
@@ -4624,6 +4655,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	}
 
 	function emitStmt(s: Statement, ctx: FunctionContext): void {
+		ctx.stmtScope = (s as any).scope as Scope ?? ctx.stmtScope;
 		switch (s.type) {
 			case 'block':
 				ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
