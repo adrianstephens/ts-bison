@@ -1974,13 +1974,38 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		const m = cls.decl.body.find((m): m is JS.Field<Type> => m.type === 'field' && m.key === key);
 		if (m)
 			return m.typeAnnotation;
-		const resolved = T.resolve(global, global.type(cls.name)?.type ?? T.ANY);
-		if (resolved.type === 'object') {
+		// `cls.name` is often a composite cache key (`Field<Type>`, `FunctionExpr<any>`, ...), never a real,
+		// globally-resolvable type name -- `global.type(cls.name)` silently found nothing for any class built
+		// this way, real bug (found only once self-hosting first needed to disambiguate among several such
+		// generic-interface-shaped candidates). `cls.thisTsType` is the one field every such class already
+		// carries its own REAL resolvable type through -- a `RefType(name, typeArgs)` for a named interface
+		// (`ensureObjectShape`), or the anonymous object type itself (`ensureAnonObjectShape`) -- so this
+		// works uniformly for both, no name-based re-derivation needed at all. `resolveObjectType` (not a
+		// bare `T.resolve`/`'object'` check) since a named interface `extends`ing another (`Method<T>
+		// extends CallSig<T>`) resolves to a real intersection, not a plain object.
+		const resolved = resolveObjectType(cls.thisTsType, global);
+		if (resolved) {
 			const p = resolved.members.find(p => p.type === 'property' && p.key === key);
 			if (p?.type === 'property')
 				return p.typeAnnotation;
 		}
 		return undefined;
+	}
+
+	// The set of possible values for a field whose own declared type is a pure literal or union-of-
+	// literals (a real discriminant, e.g. a class-member's own `type: 'method'|'get'|'set'`) --
+	// `undefined` for anything else (an ordinary `string`/wider field that merely happens to hold a
+	// constant-looking value at one particular call site), meaning "no signal, doesn't rule a candidate
+	// in or out." Shared by every discriminant-matching tiebreak in this file (`matchObjectShape`/
+	// `matchObjectShapeByType`/`matchContextualUnionMember`) -- checking only `declType.type === 'literal'`
+	// (as each used to, independently) misses the common case of a *union* of literal tags (any real
+	// discriminated union with more than 2 arms sharing one field, e.g. `Method`'s own `'method'|'get'|
+	// 'set'`), silently treating a candidate that can *never* hold the value in question as an unconstrained
+	// (non-disqualifying) match instead of a definite mismatch.
+	function literalValues(t: Type): unknown[] | undefined {
+		return t.type === 'literal' ? [t.value]
+			: t.type === 'union' && t.types.every((m): m is Literal<string | number | boolean | null | JS.TemplatePart<Type>[]> => m.type === 'literal') ? t.types.map(m => m.value)
+			: undefined;
 	}
 
 	function matchObjectShape(e: JS.ObjectExpr<Type>, ctx: FunctionContext): ClassInfo | undefined {
@@ -1990,29 +2015,38 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				return undefined;
 			props.set(p.key, p.value);
 		}
+		// A literal may legitimately omit any of a candidate's own *optional* fields (real TS object-literal-
+		// against-interface semantics) -- so this isn't an exact field-SET match, it's "the literal names no
+		// field the candidate doesn't have, and every field the candidate doesn't get isn't required." The
+		// field-construction loop below (`for (const f of owner.fields)`) already fills a missing optional
+		// field with its default value; it just never used to be reached for a class with unfilled optionals,
+		// since this filter used to require an exact field-count match first.
 		const candidates = [...classes.values()].filter(cls =>
-			cls.typeIndex !== -1 && cls.fields.length === props.size && cls.fields.every(f => props.has(f.name))
+			cls.typeIndex !== -1 && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
 		);
+		if (candidates.length === 1)
+			return candidates[0];
 		// No declared interface/class anywhere has this exact field set -- a genuinely anonymous shape
 		// (e.g. `const mapSig = {a: ..., b: ...}`, never named via `interface`/`type X = ...`), same gap
 		// `ensureAnonObjectShape` already exists for at a function type's own return position. Reusing it
 		// here, keyed the same way, means an identically-shaped anonymous literal elsewhere (or after
 		// generic substitution) collapses onto the same physical struct, same as that call site already
-		// relies on.
-		if (candidates.length === 0) {
+		// relies on. Also reached when the discriminant tiebreak below rules out every name-matching
+		// candidate (`matches.length === 0`) -- see `matchObjectShapeByType`'s own identical fallback for why.
+		const fallback = () => {
 			const resolved = T.resolve(ctx.scope, checkerTypeOf(e, ctx.scope));
 			return resolved.type === 'object' && !indexSignatureValueType(resolved) ? ensureAnonObjectShape(resolved) : undefined;
-		}
-		if (candidates.length === 1)
-			return candidates[0];
+		};
+		if (candidates.length === 0)
+			return fallback();
 
 		const matches = candidates.filter(cls => [...props].every(([key, value]) => {
 			if (value.type !== 'literal')
 				return true;
-			const declType = fieldDeclaredType(cls, key);
-			return !declType || declType.type !== 'literal' || declType.value === value.value;
+			const vals = literalValues(fieldDeclaredType(cls, key) ?? T.ANY);
+			return !vals || vals.includes(value.value);
 		}));
-		return matches.length === 1 ? matches[0] : undefined;
+		return matches.length === 1 ? matches[0] : matches.length === 0 ? fallback() : undefined;
 	}
 
 	// `matchObjectShape`'s own type-level counterpart -- used by `typeOf`'s 'object' case when a real
@@ -2034,25 +2068,33 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				return undefined;
 			props.set(m.key, m.typeAnnotation);
 		}
+		// See `matchObjectShape`'s own comment -- same optional-field-omission tolerance, not an exact match.
 		const candidates = [...classes.values()].filter(cls =>
-			cls.typeIndex !== -1 && cls.fields.length === props.size && cls.fields.every(f => props.has(f.name))
+			cls.typeIndex !== -1 && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
 		);
+		if (candidates.length === 1)
+			return candidates[0];
 		// No declared interface/class has this exact field set either -- same genuinely-anonymous-type gap
 		// `matchObjectShape`'s own expression-level counterpart falls back to `ensureAnonObjectShape` for
 		// (its own comment), reached here e.g. by a bare `const mapSig = {...}`'s own inferred var_decl type
 		// (never named via `interface`/`type X = ...`), not just an expression flowing straight through.
+		// Also reached when every name-matching candidate is definitively ruled out by its own discriminant
+		// (`matches.length === 0` below) -- logically the same "nothing real represents this shape" outcome
+		// as finding zero name-matching candidates to begin with, just discovered one step later (found only
+		// once self-hosting first needed to disambiguate a shape sharing its field *names* with several
+		// unrelated classes, e.g. `{type, body}` matching both `static_block` and `FunctionExpr`/`Arrow`).
+		const fallback = () => indexSignatureValueType(t) ? undefined : ensureAnonObjectShape(t);
 		if (candidates.length === 0)
-			return indexSignatureValueType(t) ? undefined : ensureAnonObjectShape(t);
-		if (candidates.length === 1)
-			return candidates[0];
+			return fallback();
 
 		const matches = candidates.filter(cls => [...props].every(([key, propType]) => {
-			if (propType.type !== 'literal')
+			const wantVals = literalValues(propType);
+			if (!wantVals)
 				return true;
-			const declType = fieldDeclaredType(cls, key);
-			return !declType || declType.type !== 'literal' || declType.value === propType.value;
+			const gotVals = literalValues(fieldDeclaredType(cls, key) ?? T.ANY);
+			return !gotVals || gotVals.some(v => wantVals.includes(v));
 		}));
-		return matches.length === 1 ? matches[0] : undefined;
+		return matches.length === 1 ? matches[0] : matches.length === 0 ? fallback() : undefined;
 	}
 
 	// `cls.name`'s own `get(i)`/`set(i,v)` -- real index syntax dispatched generically to any class using
@@ -2171,7 +2213,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			if (direct)
 				return direct;
 		}
-		const w = T.widenLiterals(T.resolve(global, t), false, true);
+		// Widening only ever matters for a scalar/array/union/ref shape here (matching `wasmTypeOf`'s own
+		// reasoning) -- a real `'object'` shape must NOT be widened: `widenLiterals`'s own recursive object
+		// case would widen every member's own declared type too, including a discriminant field
+		// (`{type:'static_block';...}`'s own `type` member) down to plain `string`, corrupting the exact
+		// literal precision `matchObjectShapeByType`'s own discriminant tiebreak needs to tell union members
+		// apart -- a real bug this only surfaced once self-hosting first exercised an object-shaped,
+		// non-struct-backed union member (`ownerFor`'s own generic-parameter-bound `'object'` case) this way.
+		const resolvedForOwner = T.resolve(global, t);
+		const w = resolvedForOwner.type === 'object' ? resolvedForOwner : T.widenLiterals(resolvedForOwner, false, true);
 		// `obj?.method(...)`'s receiver is nullable by construction -- strip `null`/`undefined` before
 		// dispatching; there's no "owner of `null`", only "owner of the non-nullish part `?.` already guarded".
 
@@ -2213,15 +2263,96 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				return matchObjectShapeByType(w);
 			}
 			// An interface `extends`ing another (`Method<T> extends CallSig<T>`) resolves to a real
-			// intersection, not an 'object' -- flattens+resolves every part (a part can itself still be an
-			// unresolved ref, e.g. `CallSig<T>`, `T.flattenIntersection`'s own `resolveOwn` handles that)
-			// then merges them into one flat object the same way `matchObjectShapeByType` expects.
+			// intersection, not an 'object' -- `resolveObjectType` flattens+merges it into one flat object
+			// the same way `matchObjectShapeByType` expects.
 			case 'intersection': {
-				const merged = T.mergeIntersection(TS.IntersectionType(T.flattenIntersection(w, global)));
-				return merged.type === 'object' ? matchObjectShapeByType(merged) : undefined;
+				const merged = resolveObjectType(w, global);
+				return merged && matchObjectShapeByType(merged);
 			}
 		}
 		return undefined;
+	}
+
+	// Resolves any `Type` down to a real flat `ObjectType`, if possible -- a plain `'object'` already is
+	// one; an interface `extends`ing another (`Method<T> extends CallSig<T>`) resolves to a genuine
+	// `'intersection'` instead, whose own parts can still be unresolved refs (`CallSig<T>`) --
+	// `T.flattenIntersection`'s own `resolveOwn` handles that, `T.mergeIntersection` folds the flattened
+	// parts into one flat object. Shared by `ownerFor`'s own `'intersection'` case and
+	// `matchContextualUnionMember` below, so both always agree on the exact same flat shape (and so the
+	// same `T.typeKey`/struct) for a given declared type -- duplicating this merge independently in two
+	// places risks the two computing subtly different shapes for what's really the same interface.
+	function resolveObjectType(t: Type, scope: Scope): TS.ObjectType | undefined {
+		const w = T.resolve(scope, t);
+		if (w.type === 'object')
+			return w;
+		if (w.type === 'intersection') {
+			const merged = T.mergeIntersection(TS.IntersectionType(T.flattenIntersection(w, scope)));
+			return merged.type === 'object' ? merged : undefined;
+		}
+		return undefined;
+	}
+
+	// An object literal assigned against a real union target (`const m: ClassMember = {type:'field', ...}`)
+	// needs to pick the ONE union member the literal actually represents before it can be constructed --
+	// `matchObjectShape`'s own candidate scan only ever looks at already-*registered* classes (`classes`),
+	// so the very first literal of a given shape (nothing yet triggered building the interface's own
+	// "official" struct via `ownerFor`) would otherwise fall to its own `ensureAnonObjectShape` fallback and
+	// build a shape from only the literal's own written properties -- a DIFFERENT, narrower struct than
+	// what `ownerFor` independently builds for the same interface later (the exact mismatch that made
+	// `ensureUnionFieldDispatch`'s `ref.test` cascade trap at runtime, confirmed via a real repro). Uses
+	// `ctx.contextualReturn` (the same mechanism `case 'array'`'s own contextual-kind check already relies
+	// on) to see the real declared union type, then matches by the literal's own discriminant field
+	// value(s) against each member's own declared literal type -- same discriminant-matching idea
+	// `matchObjectShape`/`matchObjectShapeByType`'s own multi-candidate tiebreak already uses, just applied
+	// before ever falling back to structural-only guessing. Requires at least one literal-valued property
+	// to discriminate by and exactly one matching member -- an ambiguous or non-discriminated literal falls
+	// through to `matchObjectShape`'s own (unaffected) existing behavior.
+	function matchContextualUnionMember(e: JS.ObjectExpr<Type>, ctx: FunctionContext): ClassInfo | undefined {
+		if (!ctx.contextualReturn)
+			return undefined;
+		const props = new Map<string, Expr>();
+		for (const p of e.properties) {
+			if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
+				return undefined;
+			props.set(p.key, p.value);
+		}
+		if (!props.size)
+			return undefined;
+		// A union member (e.g. a re-exported cross-module generic alias like `JS.ClassMember<T>`) can itself
+		// resolve to a FURTHER union -- flattens all the way down to real object shapes, same recursion
+		// `flattenOwners` already needs for the equivalent dispatch-side problem. Keeps each member's own
+		// RAW (un-resolved) type alongside its expanded shape -- `raw` still names a real interface
+		// (`{ref:'Method',...}`), which `ownerFor` below can resolve by NAME once a unique match is found
+		// (the same class `flattenOwners`/`ownerFor` would independently build for the very same member on
+		// the dispatch side); using only the resolved, name-stripped shape here would risk building a
+		// SEPARATE, merely-structurally-identical anonymous class instead -- a real, confirmed mismatch
+		// (`ensureUnionFieldDispatch`'s `ref.test` cascade trapped at runtime) whichever side happened to
+		// construct its own class first.
+		const flatten = (t: Type): { raw: Type; objT: TS.ObjectType }[] => {
+			const resolved = T.resolve(ctx.scope, t);
+			if (resolved.type === 'union')
+				return resolved.types.filter(m => !T.isNullish(m, ctx.scope)).flatMap(flatten);
+			const objT = resolveObjectType(resolved, ctx.scope);
+			return objT ? [{ raw: t, objT }] : [];
+		};
+		const matches = flatten(ctx.contextualReturn).filter(({ objT }) => {
+			const fieldNames = new Set(objT.members.filter((m): m is TS.TypeMember & { type: 'property'; key: string } => m.type === 'property' && typeof m.key === 'string').map(m => m.key));
+			// The literal must name no field this member doesn't declare (an excess-property-style check --
+			// otherwise e.g. `Field`'s own `key`/`typeAnnotation` names would equally "fit" `static_block`,
+			// which declares neither); a field this member declares as a real discriminant must have this
+			// literal's own value among its possible values -- one with no such signal isn't required to
+			// "match" anything.
+			return [...props.keys()].every(k => fieldNames.has(k)) && [...props].every(([key, value]) => {
+				if (value.type !== 'literal')
+					return true;
+				const m = objT.members.find(m => m.type === 'property' && m.key === key);
+				if (m?.type !== 'property')
+					return false;
+				const vals = literalValues(m.typeAnnotation);
+				return !vals || vals.includes(value.value);
+			});
+		});
+		return matches.length === 1 ? ownerFor(matches[0].raw) ?? matchObjectShapeByType(matches[0].objT) : undefined;
 	}
 
 	// A union's own members can themselves resolve to a further union (e.g. a re-exported cross-module
@@ -3868,10 +3999,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// the *shape's own declared order* (`struct.new` needs every field value up front, in that fixed
 			// order), not the literal's own written order -- looked up from the literal's properties by name.
 			case 'object': {
-				// `want` naming one class wins outright when it does; otherwise (most commonly `REF_ANY`,
-				// e.g. this literal is a generic callback's own return value, boxed as `any` per `typeOf`'s
-				// own union case) fall back to `matchObjectShape`'s own structural/discriminant match.
-				const owner = (typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined) ?? matchObjectShape(e, ctx);
+				// `want` naming one class wins outright when it does; otherwise, a real declared union
+				// target (`ctx.contextualReturn`) discriminant-matched to one member wins next -- guarantees
+				// the exact same struct `ownerFor` would independently build for that member later, which
+				// `matchObjectShape`'s own candidate scan can't (nothing may have triggered building the
+				// interface's "official" struct yet). Only once both give up does `matchObjectShape`'s own
+				// structural/discriminant match run (most commonly for a `REF_ANY` target, e.g. this literal
+				// is a generic callback's own return value, boxed as `any` per `typeOf`'s own union case).
+				const owner = (typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined)
+					?? matchContextualUnionMember(e, ctx)
+					?? matchObjectShape(e, ctx);
 				if (!owner)
 					throw "an object literal needs a known target type (e.g. a 'const x: Point = {...}' with a plain 'type Point = {...}' alias) -- not supported here";
 
@@ -6076,9 +6213,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	function addField(info: ClassInfo, key: string, typeAnnotation?: Type, optional = false) {
 		// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as `any` rather than reject otherwise-valid source.
 		const rawWt = typeAnnotation && typeOf(typeAnnotation);
-		const wt	= rawWt === 'void' ? REF_ANY : rawWt;
+		let wt	= rawWt === 'void' ? REF_ANY : rawWt;
 		if (!wt)
 			throw `'${key}' needs an explicit number/boolean/object type`;
+		// An `optional` field's own declared type is just its bare annotation (`value?: Expr`) -- this
+		// checker tracks "optional" as a separate modifier, never folding it into an implicit `| undefined`
+		// union the way real TS does (same gap already documented for an optional *param*'s own narrowing) --
+		// so `wt` alone never reflects that the field can physically be absent. Force it nullable here
+		// regardless: a field that can be omitted must always have a real "no value" to construct with
+		// (`emitDefaultValue`, when an object literal omits it), independent of what its own annotation says.
+		// Scalar kinds (`f64`/`i32`/...) and a boxed-`any` ref already have their own zero-default in
+		// `emitDefaultValue` with no `.nullable` needed -- only a real, non-`any` object/array/closure kind
+		// needs the wrap.
+		if (optional && typeof wt === 'object' && !wt.nullable && !('ref' in wt && wt.ref === 'any'))
+			wt = nullableWtype(wt);
 		if (info.fieldIndex.has(key))
 			throw `field '${key}' redeclares an inherited field -- not supported`;
 		info.fieldIndex.set(key, info.fields.length);
@@ -6161,14 +6309,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		// Via a `RefType` (not the entry's own raw, still-generic `.type` directly) so a reference to a
 		// generic interface/alias -- bare (`TypeParam`) or explicit (`TypeParam<X>`) -- goes through
 		// `resolve`'s own type-arg substitution (each param -> its given arg, its own default, or `any`)
-		// instead of leaving the type param itself unresolved in every member's type.
-
-		let resolved = T.resolve(scope, TS.RefType(name, typeArgs));
-		if (resolved.type === 'intersection') {
-			const collectMembers = (t: Type): TS.TypeMember[] => t.type === 'object' ? t.members : t.type === 'intersection' ? t.types.flatMap(t => collectMembers(t)) : [];
-			resolved = TS.ObjectType(collectMembers(resolved));
-		}
-		if (resolved.type !== 'object')
+		// instead of leaving the type param itself unresolved in every member's type. Stamped with `scope`
+		// itself (a plain `TS.RefType` carries no scope of its own) -- this exact ref becomes `thisTsType`
+		// below, and `fieldDeclaredType`'s own later re-resolution of it needs to find `name` again from
+		// wherever it was actually declared, not wherever `global` (the entry module) happens to be.
+		const ref = TS.RefType(name, typeArgs);
+		ref.declScope = scope;
+		// `resolveObjectType` (not a hand-rolled intersection-flatten here) -- an interface `extends`ing
+		// another (`Method<T> extends CallSig<T>`) needs its own parts (`CallSig<T>` itself still an
+		// unresolved ref at this point) actually RESOLVED, not just unwrapped-if-already-an-object; a
+		// bespoke, weaker version of this same flatten used to live here, silently dropping any part that
+		// hadn't already been expanded to a plain object -- a real, previously-latent bug (`Method<Type>`
+		// built with only its own 4 directly-declared fields, missing every one of `CallSig`'s, never
+		// caught before self-hosting first built and then actually tried to construct a real `Method` value).
+		const resolved = resolveObjectType(ref, scope);
+		if (!resolved)
 			return undefined;
 		// An index-signature-shaped object (`Partial<T>`, `Record<string,V>`, ...) isn't a fixed-field
 		// struct at all -- `ownerFor`'s own caller already has a real, more appropriate fallback for this
@@ -6178,7 +6333,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		if (resolved.members.some(m => m.type !== 'property' && m.type !== 'method'))
 			return undefined;
 
-		return buildObjectShape(key, resolved.members, TS.RefType(name, typeArgs), name, !everExtended.has(name));
+		return buildObjectShape(key, resolved.members, ref, name, !everExtended.has(name));
 	}
 
 	// An anonymous inline object-type annotation (`{value: T; consumed: number}` as a return/field/param
