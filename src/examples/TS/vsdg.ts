@@ -116,6 +116,51 @@ class RawNode {
 	objectMembers?: (ClassMember | undefined)[];
 	constructor(public id: string) {}
 	outDegree() { return this.outputs.reduce((sum, arr) => sum + arr.length, 0); }
+
+	// `this` re-narrowed to the full discriminated type: RawNode itself carries no `type`/payload
+	// (those live only on the INode variant it's intersected with), so every method below that
+	// switches on `.type` needs this one "trust me" -- TS can't derive Node from RawNode on its own.
+	protected get self(): Node { return this as unknown as Node; }
+
+	// A node's real source-variable name, if it has one -- a direct rebind or a per-variable merge,
+	// both via boundName (see rebindVar and the gammaValue/named-except sites, which set it directly).
+	slotName(): string | undefined {
+		return this.boundName;
+	}
+
+	// A constant: a 'floating' node whose own expr is a literal (an original literal, or one
+	// foldConstants folded a binary/unary into in place -- same shape, no distinct tag).
+	isLiteralNode(): this is Node & { expr: Expr & { type: 'literal' } } {
+		return this.self.type === 'floating' && this.self.expr.type === 'literal';
+	}
+
+	// True when an edge into this node at `port` is wired up generically but never actually read by
+	// codegen, so it must not count as a real reader for reuse/dead/inline decisions or constrain GCM
+	// scheduling like an ordinary dependency.
+	isVestigialEdge(port: number): boolean {
+		const node = this.self;
+		switch (node.type) {
+			// The assignment-operator's own "old value" port (0) is never read by codegen (buildExpr
+			// only resolves the right-hand side for a plain `=`); threadMutation's own ordering-only
+			// marker edge (port 2) would otherwise make isPureSubgraph wrongly call it impure.
+			case 'mutation':	return port === 2 || (node.expr.type === 'binary' && port === 0 && node.expr.operator === '=');
+			// A named theta's own condition edge -- resolveNode always resolves a thetaValue through
+			// its mu source (port 1) instead.
+			case 'thetaValue':	return port === 0;
+			// Same ordering-only marker edge as 'mutation', see above.
+			case 'var':			return port === 2;
+			// A state gamma's tail ports (2/3): Output's emitChain walks these directly to find where
+			// each branch's content starts, never through resolveOperand. A switchInternal gamma's own
+			// condition (port 1) is bypassed too -- switch's own case-cascade reconstruction never reads it.
+			case 'gamma':		return port === 2 || port === 3 || (port === 1 && !!node.switchInternal);
+			// A break_scope's tail port (1) -- same reasoning as gamma's.
+			case 'break_scope': return port === 1;
+			// A state-merging except's try/catch/finally tails (1/2/3) -- same reasoning. A NAMED
+			// except's own value ports (0/1) are never visited this way in the first place.
+			case 'except':		return node.name === undefined && (port === 1 || port === 2 || port === 3);
+			default:			return false;
+		}
+	}
 }
 
 // A concrete node: RawNode's edge machinery + annotations, plus one INode variant's own payload.
@@ -125,40 +170,6 @@ type NodeOf<T extends NodeType> = Node<Extract<INode, { type: T }>>;
 
 function MakeNode<N extends INode>(id: string, inode: N): NodeOf<N['type']> {
 	return Object.assign(new RawNode(id), inode) as unknown as NodeOf<N['type']>;
-}
-
-// A node's real source-variable name, if it has one -- a direct rebind or a per-variable merge,
-// both via boundName (see rebindVar and the gammaValue/named-except sites, which set it directly).
-function slotName(node: RawNode): string | undefined {
-	return node.boundName;
-}
-
-// True when an edge into `node` at `port` is wired up generically but never actually read by
-// codegen, so it must not count as a real reader for reuse/dead/inline decisions or constrain GCM
-// scheduling like an ordinary dependency.
-function isVestigialEdge(node: Node, port: number): boolean {
-	if (node.type === 'mutation' && node.expr.type === 'binary' && port === 0 && node.expr.operator === '=')
-		return true;
-	if (node.type === 'thetaValue' && port === 0)
-		return true;
-	// threadMutation's own ordering-only marker edge (port 2) -- without this, isPureSubgraph's
-	// recursion walks into it (an 'effect' node) and wrongly calls the whole subgraph impure.
-	if ((node.type === 'var' || node.type === 'mutation') && port === 2)
-		return true;
-	// A state gamma's tail ports (2/3): Output's emitChain walks these directly to find where
-	// each branch's content starts, never through resolveOperand.
-	if (node.type === 'gamma' && (port === 2 || port === 3))
-		return true;
-	// A switchInternal gamma's own condition (port 1): switch's own case-cascade reconstruction
-	// bypasses it entirely.
-	if (node.type === 'gamma' && node.switchInternal && port === 1)
-		return true;
-	// A break_scope's tail port (1) -- same reasoning as gamma's.
-	if (node.type === 'break_scope' && port === 1)
-		return true;
-	// A state-merging except's try/catch/finally tails (1/2/3) -- same reasoning. A NAMED
-	// except's own value ports (0/1) are never visited this way in the first place.
-	return node.type === 'except' && node.name === undefined && (port === 1 || port === 2 || port === 3);
 }
 
 function connectValue(
@@ -1606,6 +1617,13 @@ class ScopedNames {
 	pop() 				{ this.stack.pop(); }
 }
 
+// Wraps a reconstructed statement in `export `/`export default `, per a node's own `exported` stamp.
+function wrapExported(stmt: Statement, exported: 'named' | 'default' | undefined): Statement {
+	return exported === 'named' ? { type: 'export_decl', declaration: stmt } as Statement
+		: exported === 'default' ? { type: 'export', default: stmt } as Statement
+		: stmt;
+}
+
 export function BuildProgram(
 	graph: Map<NodeId, Node>,
 	blockIds?: Map<NodeId, BlockId>,
@@ -1641,7 +1659,7 @@ export function BuildProgram(
 	// Zero means it's genuinely dead -- e.g. every branch unconditionally reassigns a variable before
 	// anything reads its declared value.
 	function hasRealConsumer(node: Node): boolean {
-		return (node.outputs[0] ?? []).some(e => !isVestigialEdge(graph.get(e.nodeId)!, e.port));
+		return (node.outputs[0] ?? []).some(e => !graph.get(e.nodeId)!.isVestigialEdge(e.port));
 	}
 
 	// True if `edge` is a gammaValue's own condition port (0) where both branches resolve to the
@@ -1668,7 +1686,7 @@ export function BuildProgram(
 			// -- never a real value read.
 			if ((target.type === 'mu' || target.type === 'muValue') && e.port === 1)
 				return false;
-			if (isVestigialEdge(target, e.port))
+			if (target.isVestigialEdge(e.port))
 				return false;
 			if (isCollapsingGammaValueCondition(e))
 				return false;
@@ -1692,7 +1710,7 @@ export function BuildProgram(
 		// A named theta's own condition edge is real in the graph but never read by codegen -- a
 		// while loop's test feeds every loop-carried variable's own theta condition port, so left
 		// uncounted a loop with two such variables would see the test as falsely "reused".
-		const consumers = (node.outputs[0] ?? []).filter(e => !isVestigialEdge(graph.get(e.nodeId)!, e.port) && !isCollapsingGammaValueCondition(e));
+		const consumers = (node.outputs[0] ?? []).filter(e => !graph.get(e.nodeId)!.isVestigialEdge(e.port) && !isCollapsingGammaValueCondition(e));
 		// A member-access callee (`obj.method`) must NEVER materialize as a standalone temp --
 		// extracting it loses its receiver (`var t0 = update; t0(x);` calls with `this` undefined).
 		if (node.type === 'member' && consumers.some(e => isCalleeEdge(graph.get(e.nodeId)!, e.port)))
@@ -1952,7 +1970,7 @@ export function BuildProgram(
 		// not needed for a bare literal, which costs nothing to duplicate. allowReuse (only for a
 		// literal initializer) exempts just that heuristic; needsTemp's structural checks (a mu's
 		// initial-value port needing a real mutable variable, chief among them) stay in force.
-		return !needsTemp(node, isLiteralNode(graph.get(node.inputs[0].nodeId)!));
+		return !needsTemp(node, graph.get(node.inputs[0].nodeId)!.isLiteralNode());
 	}
 
 	// Conservative, single-pass purity check over `node`'s own transitive inputs: true only if NO
@@ -1977,7 +1995,7 @@ export function BuildProgram(
 			return true;
 		// Skip vestigial edges (e.g. threadMutation's own scheduling-only marker) -- a real graph
 		// edge GCM needs, but never part of the actual value computation.
-		return node.inputs.every((e, port) => !e || isVestigialEdge(node, port) || isPureSubgraph(graph.get(e.nodeId)!, seen));
+		return node.inputs.every((e, port) => !e || node.isVestigialEdge(port) || isPureSubgraph(graph.get(e.nodeId)!, seen));
 	}
 
 	// True if some node OTHER than `excludeId` shares `name` as its own boundName and is
@@ -2056,7 +2074,7 @@ export function BuildProgram(
 		// needsTemp -- its own mutation is structurally never printed, so folding its value into a
 		// ternary elsewhere would wrongly model a "did this already happen" merge for a flag meant to
 		// stay independent at every read site.
-		const switchInternalName = node.switchInternal ? slotName(node) : undefined;
+		const switchInternalName = node.switchInternal ? node.slotName() : undefined;
 		if (switchInternalName !== undefined)
 			return Identifier(switchInternalName);
 
@@ -2093,7 +2111,7 @@ export function BuildProgram(
 		// declaredNames confirms `name`'s statement was ACTUALLY printed somewhere reachable -- without
 		// a block to schedule it, it may never have been visited at all; falls through to rebuild
 		// inline instead of trusting an undeclared identifier.
-		const name = slotName(node);
+		const name = node.slotName();
 		if (name !== undefined && !isInlinableSlot(node) && declaredNames.has(name))
 			return Identifier(name);
 
@@ -2122,7 +2140,7 @@ export function BuildProgram(
 		// inputs -- a mu's port-1 feedback edge in particular points at whatever the loop body
 		// computes from the mu itself, so following it here would be both unnecessary and cyclic.
 		const hasOrderedInputs = (node: Node) =>
-			node.type !== 'mu' && node.type !== 'muValue' && node.type !== 'theta' && node.type !== 'thetaValue' && !isLiteralNode(node)
+			node.type !== 'mu' && node.type !== 'muValue' && node.type !== 'theta' && node.type !== 'thetaValue' && !node.isLiteralNode()
 			&& (node.type !== 'var' || node.declKind !== undefined);
 
 		// Before emitting `node`, everything it depends on must be emitted first -- including
@@ -2198,7 +2216,7 @@ export function BuildProgram(
 				continue;
 			}
 
-			const name = slotName(node);
+			const name = node.slotName();
 			if (name !== undefined) {
 				// A plain reassignment or named merge is only worth printing under x's own name if
 				// genuinely reused -- a single real consumer can always resolve it lazily instead.
@@ -2218,7 +2236,7 @@ export function BuildProgram(
 
 			// A pure literal is read directly by resolveNode, never its own statement -- same as the
 			// var/mu/... group below (a 'floating' literal has no dedicated tag to list there).
-			if (isLiteralNode(node))
+			if (node.isLiteralNode())
 				continue;
 
 			switch (node.type) {
@@ -2450,7 +2468,7 @@ export function BuildProgram(
 				const testNode	= graph.get(testId)!;
 				// The test's only REAL reader (besides itself) is normally the state-theta's own
 				// condition port -- everything else pointing at it is vestigial.
-				const onlyReadByLoopExit = (testNode.outputs[0] ?? []).filter(e => !isVestigialEdge(graph.get(e.nodeId)!, e.port))
+				const onlyReadByLoopExit = (testNode.outputs[0] ?? []).filter(e => !graph.get(e.nodeId)!.isVestigialEdge(e.port))
 					.every(e => e.nodeId === thetaNode.id);
 				// Emitted before restOfBody, same CSE-registration reasoning as the gamma case above.
 				const testStatements	= onlyReadByLoopExit ? [] : emitLocalStatements([testId]);
@@ -2531,12 +2549,6 @@ export function BuildProgram(
 
 }
 
-// A constant: a 'floating' node whose own expr is a literal (an original literal, or one
-// foldConstants folded a binary/unary into in place -- same shape, no distinct tag).
-function isLiteralNode(node: Node): node is Node & { expr: Expr & { type: 'literal' } } {
-	return node.type === 'floating' && node.expr.type === 'literal';
-}
-
 function foldConstants(graph: VSDG, node: Node): boolean {
 	// 'mutation' is deliberately excluded (not just practically inert, since calcUnary has no
 	// '++'/'--' case and a real assignment's left operand is never itself a literal) -- folding a
@@ -2557,7 +2569,7 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 			const right = graph.getNode(rightEdge.nodeId);
 
 			// If both inputs are constants, we can fold them!
-			if (isLiteralNode(left) && isLiteralNode(right)) {
+			if (left.isLiteralNode() && right.isLiteralNode()) {
 				const r = calcBinary(expr.operator, left.expr.value, right.expr.value);
 				if (r !== undefined) {
 					// Fold in place into a literal (a 'floating' node with a literal expr), then
@@ -2575,7 +2587,7 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 				return false;
 
 			const operand	= graph.getNode(edge.nodeId);
-			if (isLiteralNode(operand)) {
+			if (operand.isLiteralNode()) {
 				const r = calcUnary(expr.operator, operand.expr.value);
 				if (r !== undefined) {
 					node.expr = Literal(r);
@@ -2683,7 +2695,7 @@ function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): b
 	const condNode = graph.getNode(condEdge.nodeId);
 
 	// If the condition is a known constant boolean (or truthy/falsy value)
-	if (isLiteralNode(condNode)) {
+	if (condNode.isLiteralNode()) {
 		// Find the edge representing the winning path (true path, then false path)
 		const winningEdge = node.inputs[condNode.expr.value ? port + 1 : port + 2];
 		if (!winningEdge)
@@ -3076,7 +3088,7 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 				// Likewise never actually read by codegen -- left as an ordinary constraint, this
 				// dragged the OLD value's own declaration/scheduling into wherever the assignment
 				// itself happened to live (e.g. into an if-branch it has no real reason to be inside).
-				if (isVestigialEdge(consumerNode, consumerEdge.port))
+				if (consumerNode.isVestigialEdge(consumerEdge.port))
 					continue;
 
 				let consumerBlock = blockIds.get(consumerEdge.nodeId)!;
@@ -3143,11 +3155,3 @@ export function applyGlobalCodeMotion(graph: Map<NodeId, Node>) {
 
 	return { blockIds, blockControl, getLoopDepth };
 }
-
-// Wraps a reconstructed statement in `export `/`export default `, per a node's own `exported` stamp.
-function wrapExported(stmt: Statement, exported: 'named' | 'default' | undefined): Statement {
-	return exported === 'named' ? { type: 'export_decl', declaration: stmt } as Statement
-		: exported === 'default' ? { type: 'export', default: stmt } as Statement
-		: stmt;
-}
-
