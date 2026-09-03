@@ -46,9 +46,10 @@ type INode =
 	| { type: 'muValue', name: string }
 	| { type: 'theta' }
 	| { type: 'thetaValue', name: string }
-	// declKind + (paired) typeAnnotation: a var_decl wrapper node -- a param is a declKind-less 'var'.
-	// The annotation is threaded through every reconstruction so an explicitly-typed empty-collection
-	// literal doesn't lose its type.
+	// declKind + (paired) typeAnnotation: a var_decl wrapper node -- a param is a declKind-less 'var',
+	// and isInlinableVarDecl/resolveNode/hasOrderedInputs/needsDirectPlacement all test for exactly
+	// that. The annotation is threaded through every reconstruction so an explicitly-typed
+	// empty-collection literal doesn't lose its type.
 	| { type: 'var', name?: string, declKind?: JS.DeclarationKind, typeAnnotation?: TS.Type }
 	// switchDiscriminantId/switchCases: a `break_scope` reconstructing a real `switch` -- the
 	// discriminant node, and each case's resolved test + body span (see SwitchCase).
@@ -960,9 +961,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// case test reads the same value.
 					recurse(s.discriminant, 'expression');
 					const discValue = getExprNode(s.discriminant);
-					const discNode	= makeNode({ type: 'var' });
+					const discNode	= makeNode({ type: 'var', declKind: 'let' });
 					connectValue(discValue, 0, discNode, 0);
-					discNode.declKind = 'let';
 					const suffix	= discNode.id;
 					const discName	= `__disc_${suffix}`;
 					discNode.name	= discName;
@@ -1981,17 +1981,6 @@ export function BuildProgram(
 		return Literal(null);
 	}
 
-	// Emits either the FIRST declaration of a real source variable (once) or a plain reassignment
-	// (every time after) -- only a var_decl's own node ever carries a declKind.
-	function declareOrAssign(name: string, node: Node, expr: Expr): Statement {
-		if (node.type === 'var' && node.declKind && !declaredNames.has(name)) {
-			declaredNames.add(name);
-			return JS.VarDecl(node.declKind, JS.Var(name, expr, node.typeAnnotation)) as Statement;
-		}
-		declaredNames.add(name);
-		return JS.Expression({ type: 'binary', operator: '=', left: Identifier(name), right: expr } as Expr) as Statement;
-	}
-
 	// A local declaration's initializer needs no printed value when nothing genuinely needs it under
 	// x's own name: either it's truly dead, or its one real reader can just recompute the pure
 	// initializer inline. Only safe when pure -- an effectful initializer with a real reader must
@@ -2047,44 +2036,45 @@ export function BuildProgram(
 	}
 
 	function emitNamedSlot(name: string, node: Node): Statement | undefined {
+		const first = !declaredNames.has(name);
+		declaredNames.add(name);
+
 		if (node.type === 'var') {
-			if (node.inputs[0]) {
-				// Either the initializer is pure and doesn't need printing under x's own name, or x's
-				// value is dead outright -- an effectful dead initializer still runs (materialized
-				// separately via the ordinary isEffect path), just not attached to x.
-				if (node.declKind && (isInlinableVarDecl(node) || !hasRealConsumer(node))) {
-					const forcedElsewhere = hasForcedSibling(name, node.id);
-					// A forced sibling still needs `name` to hold the CORRECT value when read -- if
-					// real consumers exist here too (isInlinableVarDecl via literal-duplication, not
-					// dead), a bare declaration would silently replace those reads' value with
-					// `undefined`, so fall back to the ordinary, value-bearing declaration instead.
-					// declaredNames deliberately NOT set before this call -- declareOrAssign needs to
-					// see it as not-yet-declared, to print `let name = ...;` not a bare reassignment.
-					if (forcedElsewhere && hasRealConsumer(node))
-						return declareOrAssign(name, node, resolveOperand(node.id, 0));
-					declaredNames.add(name);
+			if (!node.inputs[0])
+				return JS.VarDecl(node.declKind!, JS.Var(name, undefined, node.typeAnnotation)) as Statement;
+
+			// Either the initializer is pure and doesn't need printing under x's own name, or x's
+			// value is dead outright -- an effectful dead initializer still runs (materialized
+			// separately via the ordinary isEffect path), just not attached to x.
+			if (isInlinableVarDecl(node) || !hasRealConsumer(node)) {
+				const forcedElsewhere = hasForcedSibling(name, node.id);
+				// A forced sibling that also has real consumers here needs `name` to hold the CORRECT
+				// value when read -- a bare declaration would silently replace those reads with
+				// `undefined`, so fall through to the value-bearing declaration/assignment below.
+				if (!forcedElsewhere || !hasRealConsumer(node)) {
 					// Safe to drop entirely only when nothing else still needs `x` declared; exported
 					// bindings keep it too (external code may import it by name).
 					if (!node.exported && !forcedElsewhere)
 						return undefined;
 					// `const` requires an initializer -- downgraded to `let` rather than the
 					// syntax-invalid `const x;`.
-					return JS.VarDecl(node.declKind === 'const' ? 'let' : node.declKind, JS.Var(name, undefined, node.typeAnnotation)) as Statement;
+					return JS.VarDecl(node.declKind === 'const' ? 'let' : node.declKind!, JS.Var(name, undefined, node.typeAnnotation)) as Statement;
 				}
-				return declareOrAssign(name, node, resolveOperand(node.id, 0));
 			}
-			declaredNames.add(name);
-			return JS.VarDecl(node.declKind ?? 'let', JS.Var(name, undefined, node.typeAnnotation)) as Statement;
+			// The FIRST emit of a real source variable is its declaration; every emit after is a plain
+			// reassignment (`first` is captured before the add at the top).
+			const expr = resolveOperand(node.id, 0);
+			return first
+				? JS.VarDecl(node.declKind!, JS.Var(name, expr, node.typeAnnotation)) as Statement
+				: JS.Expression({ type: 'binary', operator: '=', left: Identifier(name), right: expr } as Expr) as Statement;
 		}
 		if ((node.type === 'mutation' && node.expr.type === 'unary') || node.type === 'unary_post') {
-			// A prefix or postfix ++/-- already performs its own assignment as a side effect when
-			// evaluated -- printed as a bare expression statement, `++i;`/`i++;` is both correct and
-			// sufficient. Routing it through declareOrAssign like an ordinary reassignment would wrap
-			// it in a redundant self-assignment: `i = ++i;`/`i = i++;`.
-			declaredNames.add(name);
+			// A prefix or postfix ++/-- already performs its own assignment as a side effect -- printed
+			// as a bare expression statement, `++i;`/`i++;` is both correct and sufficient. Wrapping it
+			// in a reassignment would give a redundant self-assignment: `i = ++i;`/`i = i++;`.
 			return JS.Expression(buildExpr(node)) as Statement;
 		}
-		return declareOrAssign(name, node, buildExpr(node));
+		return JS.Expression({ type: 'binary', operator: '=', left: Identifier(name), right: buildExpr(node) } as Expr) as Statement;
 	}
 
 	function resolveOperand(to: NodeId, slot: number): Expr {
