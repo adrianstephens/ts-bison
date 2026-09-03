@@ -2337,6 +2337,21 @@ export function BuildProgram(
 		return [...emitChain(node.inputs[0]?.nodeId, boundaryId), ...emitControlNode(node)];
 	}
 
+	// `control`'s own reconstruction, wrapped in the pure nodes GCM co-scheduled with it: its
+	// DEPENDENCIES emit first (so a value a branch shares with a co-scheduled slot via CSE is already
+	// registered by the time the branch resolves it), then `middle()`, then its DEPENDENTS. `middle`
+	// is a thunk so its own emitChain calls run AFTER the dependency half, never before.
+	function withCoScheduled(nodes: NodeId[], controlId: NodeId, middle: () => Statement[]): Statement[] {
+		const sortedIds	= localTopologicalSort(nodes);
+		const i			= sortedIds.indexOf(controlId);
+		// Array-literal elements evaluate left to right, so the dependency half runs before `middle()`.
+		return [
+			...emitLocalStatements(sortedIds.slice(0, i)),
+			...middle(),
+			...emitLocalStatements(sortedIds.slice(i + 1)),
+		];
+	}
+
 	// This control-anchor node's OWN contribution to its enclosing statement list -- the reconstructed
 	// if/switch/try/while/function declaration it anchors (plus whatever pure nodes GCM scheduled
 	// right alongside it), or (the default case) just those pure nodes, for an anchor with no nested
@@ -2344,116 +2359,80 @@ export function BuildProgram(
 	function emitControlNode(control: Node): Statement[] {
 		const nodes = nodesAt(control.id);
 
-		if (control.type === 'gamma') {
-			// Anything else GCM scheduled alongside the merge is split by whether it's a DEPENDENCY
-			// (must print before the if) or a DEPENDENT (prints after). The "before" half is emitted
-			// first: a value CSE shares between a branch's content and this gamma's own co-scheduled
-			// slot must already be registered by the time the branch tries to resolve it.
-			const sortedIds		= localTopologicalSort(nodes);
-			const gammaIndex	= sortedIds.indexOf(control.id);
-			const beforeStmts	= emitLocalStatements(sortedIds.slice(0, gammaIndex));
-
-			// Ports: 0 = predecessor, 1 = condition, 2 = true tail, 3 = false tail.
-			const predecessorId	= control.inputs[0].nodeId;
-			const trueStmts		= emitChain(control.inputs[2].nodeId, predecessorId);
-			// A false tail that never got anywhere past the branch point (no real content) means
-			// there's no `else` at all -- as opposed to one that's genuinely empty, which still prints
-			// `else {}` (see JS.If's own falseStmts check just below).
-			const falseStmts	= control.inputs[3].nodeId !== predecessorId ? emitChain(control.inputs[3].nodeId, predecessorId) : undefined;
-
-			return [
-				...beforeStmts,
-				JS.If(
+		if (control.type === 'gamma')
+			return withCoScheduled(nodes, control.id, () => {
+				// Ports: 0 = predecessor, 1 = condition, 2 = true tail, 3 = false tail.
+				const predecessorId	= control.inputs[0].nodeId;
+				const trueStmts		= emitChain(control.inputs[2].nodeId, predecessorId);
+				// A false tail that never got anywhere past the branch point (no real content) means
+				// there's no `else` at all -- as opposed to one that's genuinely empty, which still
+				// prints `else {}` (see JS.If's own falseStmts check).
+				const falseStmts	= control.inputs[3].nodeId !== predecessorId ? emitChain(control.inputs[3].nodeId, predecessorId) : undefined;
+				return [JS.If(
 					resolveOperand(control.id, 1),
 					JS.Block(...trueStmts as JS.Statement<any>[]),
 					falseStmts ? JS.Block(...falseStmts as JS.Statement<any>[]) : undefined
-				) as Statement,
-				...emitLocalStatements(sortedIds.slice(gammaIndex + 1)),
-			];
-		}
+				) as Statement];
+			});
 
-		if (control.type === 'break_scope') {
-			// Reconstructed as a real `switch`/`case` -- break_scope has exactly one creation site
-			// (BuildVSDG's own 'switch' case), which always stamps switchCases first. The "before"
-			// half is emitted first, same reasoning as the gamma case above.
-			const sortedIds	= localTopologicalSort(nodes);
-			const scopeIndex	= sortedIds.indexOf(control.id);
-			const beforeStmts	= emitLocalStatements(sortedIds.slice(0, scopeIndex));
+		if (control.type === 'break_scope')
+			return withCoScheduled(nodes, control.id, () => {
+				// Reconstructed as a real `switch`/`case` -- break_scope has exactly one creation site
+				// (BuildVSDG's 'switch' case), which always stamps switchCases first.
 
-			// The discriminant's (and each case test's) own GCM schedule is driven by its graph
-			// consumers, not by this print-time lookup, so it usually lands somewhere this
-			// reconstruction never otherwise visits -- needs forcing here, unless some other
-			// surviving value already forced it under the same name.
-			const forceDeclare = (id: NodeId): Statement[] => {
-				const n = graph.get(id)!;
-				return n.type === 'var' && n.name !== undefined && !declaredNames.has(n.name)
-					? emitLocalStatements([id]) : [];
-			};
-			const cases = control.switchCases!.map(c => ({
-				test:		c.testNodeId ? resolveNode(c.testNodeId) : undefined,
-				consequent:	emitChain(c.tailId, c.boundaryId) as JS.Statement<any>[],
-			}));
+				// The discriminant's (and each case test's) own GCM schedule is driven by its graph
+				// consumers, not this print-time lookup, so it usually lands somewhere this
+				// reconstruction never otherwise visits -- force it here, unless some other surviving
+				// value already forced it under the same name.
+				const forceDeclare = (id: NodeId): Statement[] => {
+					const n = graph.get(id)!;
+					return n.type === 'var' && n.name !== undefined && !declaredNames.has(n.name)
+						? emitLocalStatements([id]) : [];
+				};
+				const cases = control.switchCases!.map(c => ({
+					test:		c.testNodeId ? resolveNode(c.testNodeId) : undefined,
+					consequent:	emitChain(c.tailId, c.boundaryId) as JS.Statement<any>[],
+				}));
 
-			// Once every case's own value is elided into the post-switch merge, a case's body can end
-			// up with nothing left but its own trailing `break;` -- if EVERY case is in that shape,
-			// the whole dispatch is observably a no-op and can be dropped entirely, not just each
-			// case's reassignment. A continue/return/throw is real content and blocks this.
-			const isNoOp = (stmts: JS.Statement<any>[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
-			const switchIsNoOp = cases.every(c => isNoOp(c.consequent));
+				// Once every case's value is elided into the post-switch merge, a case body can end up
+				// with nothing but its own trailing `break;` -- if EVERY case is in that shape, the whole
+				// dispatch is observably a no-op and drops entirely. A continue/return/throw blocks this.
+				const isNoOp = (stmts: JS.Statement<any>[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
+				const switchIsNoOp = cases.every(c => isNoOp(c.consequent));
 
-			return [
-				...beforeStmts,
-				...forceDeclare(control.switchDiscriminantId!),
-				...control.switchCases!.flatMap(c => c.testNodeId ? forceDeclare(c.testNodeId) : []),
-				...(switchIsNoOp ? [] : [JS.Switch(resolveNode(control.switchDiscriminantId!), ...cases) as Statement]),
-				...emitLocalStatements(sortedIds.slice(scopeIndex + 1)),
-			];
-		}
+				return [
+					...forceDeclare(control.switchDiscriminantId!),
+					...control.switchCases!.flatMap(c => c.testNodeId ? forceDeclare(c.testNodeId) : []),
+					...(switchIsNoOp ? [] : [JS.Switch(resolveNode(control.switchDiscriminantId!), ...cases) as Statement]),
+				];
+			});
 
-		if (control.type === 'except' && control.name === undefined) {
-			// Computed, and the "before" half emitted, BEFORE try/catch/finally's own content -- same
-			// reasoning as the gamma case above.
-			const sortedIds		= localTopologicalSort(nodes);
-			const exceptIndex	= sortedIds.indexOf(control.id);
-			const beforeStmts	= emitLocalStatements(sortedIds.slice(0, exceptIndex));
-
-			// Ports: 0 = predecessor, 1 = try's own tail, 2 = catch's own tail, 3 = finally's own tail.
-			const predecessorId	= control.inputs[0].nodeId;
-			const tryStmts		= emitChain(control.inputs[1].nodeId, predecessorId);
-			const catchStmts	= emitChain(control.inputs[2].nodeId, predecessorId);
-			// finally's own tail (port 3) is anchored back on `control` itself, not `predecessorId` --
-			// its own first statement's predecessor is the except node directly (see BuildVSDG's 'try'
-			// case), not the state from before the whole try/catch.
-			const finallyEdge	= control.inputs[3];
-			const finallyStmts	= finallyEdge ? emitChain(finallyEdge.nodeId, control.id) : undefined;
-
-			return [
-				...beforeStmts,
-				{
+		if (control.type === 'except' && control.name === undefined)
+			return withCoScheduled(nodes, control.id, () => {
+				// Ports: 0 = predecessor, 1 = try's tail, 2 = catch's tail, 3 = finally's tail.
+				const predecessorId	= control.inputs[0].nodeId;
+				const tryStmts		= emitChain(control.inputs[1].nodeId, predecessorId);
+				const catchStmts	= emitChain(control.inputs[2].nodeId, predecessorId);
+				// finally's tail (port 3) is anchored back on `control` itself, not `predecessorId` --
+				// its first statement's predecessor is the except node directly (see BuildVSDG's 'try'
+				// case), not the state from before the whole try/catch.
+				const finallyEdge	= control.inputs[3];
+				const finallyStmts	= finallyEdge ? emitChain(finallyEdge.nodeId, control.id) : undefined;
+				return [{
 					type:			'try',
 					block:			tryStmts as JS.Statement<any>[],
 					handlerParam:	control.catchParam,
 					handlerBody:	catchStmts as JS.Statement<any>[],
 					finalizer:		finallyStmts as JS.Statement<any>[] | undefined,
-				} as Statement,
-				...emitLocalStatements(sortedIds.slice(exceptIndex + 1)),
-			];
-		}
+				} as Statement];
+			});
 
 		// A DECLARATION (stmt set); a function/arrow EXPRESSION (expr set) is a value, handled by
 		// emitLocalStatements instead.
-		if (control.type === 'function' && !control.expr) {
-			// Before, then body -- same reasoning as the gamma case above.
-			const sortedIds			= localTopologicalSort(nodes);
-			const declIndex			= sortedIds.indexOf(control.id);
-			const beforeStmts			= emitLocalStatements(sortedIds.slice(0, declIndex));
-			const bodyStatements	= reconstructFunctionBody(control);
-			return [
-				...beforeStmts,
-				wrapExported({ ...rebuildParams(control.stmt as JS.FunctionDecl<any>, control), body: bodyStatements } as Statement, control.exported),
-				...emitLocalStatements(sortedIds.slice(declIndex + 1)),
-			];
-		}
+		if (control.type === 'function' && !control.expr)
+			return withCoScheduled(nodes, control.id, () => [
+				wrapExported({ ...rebuildParams(control.stmt as JS.FunctionDecl<any>, control), body: reconstructFunctionBody(control) } as Statement, control.exported),
+			]);
 
 		if (control.type === 'mu') {
 			const thetaEdge	= (control.outputs[0] ?? []).find(e => graph.get(e.nodeId)!.type === 'theta');
