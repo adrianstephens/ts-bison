@@ -448,6 +448,44 @@ export function StateMachineToAST(machine: StateMachine) {
 	);
 }
 
+
+// Desugars a destructuring BindingTarget into flat var_decls reading off valueExpr (must be side-effect-free).
+// A default value (`el.default`/`prop.default`) just becomes a real `??` (`rawExpr ?? dflt`) -- reuses
+// `??`'s own codegen wholesale, including its single-evaluation-of-the-left materialization, rather than
+// hand-rolling a second copy of that logic here. `??`'s codegen also needs to tolerate a non-nullable
+// left for this to work (see its own comment) -- a default on an already-non-nullable value (an ordinary
+// array element, or a non-optional object field) is provably dead code, same as real TS itself would
+// prove, not a reason to reject it.
+export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget, valueExpr: Expr): JS.Statement<Type>[] {
+	if (typeof target === 'string')
+		return [JS.VarDecl(kind, JS.Var(target, valueExpr))];
+
+	if (target.type === 'array_pattern') {
+		const stmts = target.elements.flatMap((el, i) => {
+			if (!el)
+				return [];
+			const elemExpr: Expr = JS.Index(valueExpr, Literal(i));
+			return patternBindings(kind, el.target, el.default ? Binary('??', elemExpr, el.default) : elemExpr);
+		});
+		if (target.rest) {
+			// Real JS semantics: the rest collects the remaining elements into a genuinely new array, not
+			// a view -- `.slice(n)` (already a real `Array<T>` method) gives exactly that.
+			stmts.push(JS.VarDecl(kind, JS.Var(target.rest, JS.Call(JS.Member(valueExpr, 'slice'), [Literal(target.elements.length)]))));
+		}
+		return stmts;
+	}
+
+	if (target.rest)
+		throw "a rest property ('...') in an object destructuring pattern is not supported -- unlike array rest (a plain '.slice()'), this needs a genuinely new object type holding an arbitrary 'all fields except these' shape, which isn't modeled yet";
+	
+	return target.properties.flatMap(prop => {
+		if (typeof prop.key !== 'string')
+			throw "a computed key ('[expr]') in an object destructuring pattern is not supported";
+		const propExpr: Expr = JS.Member(valueExpr, prop.key);
+		return patternBindings(kind, prop.value, prop.default ? Binary('??', propExpr, prop.default) : propExpr);
+	});
+}
+
 //-----------------------------------------------------------------------------
 // TS to JS
 //-----------------------------------------------------------------------------

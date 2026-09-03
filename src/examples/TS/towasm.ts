@@ -7,7 +7,7 @@ import { Literal, Binary, hasMod } from '../common';
 import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink } from './checker';
 import { Walkable, walk, walkB } from './walker';
 import { Output } from './tocode';
-import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
+import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary, patternBindings } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
 import * as WAT from '../wat-parser';
 
@@ -288,7 +288,7 @@ function wasmTypeOf(t: Type, global: Scope): WasmType | undefined {
 		return Number.isInteger(t.value) ? intWasmType(t.value, t.value) : 'f64';
 
 	// Resolve each union member first so alias duplicates collapse before arrayElemKind.
-	const w = T.widenLiterals(t.type === 'union' ? T.combineTypes(t.types.map(m => T.resolve(global, m))) : T.resolve(global, t));
+	const w = T.widenLiterals(t.type === 'union' ? T.combineTypes(t.types.map(m => T.resolve(global, m))) : T.resolve(global, t), false, true);
 	if (w.type === 'array' || (w.type === 'ref' && (w.name === 'Array' || w.name === 'ReadonlyArray'))) {
 		const elemType = w.type === 'array' ? w.element : w.typeArgs![0];
 		const we = elemType.type === 'ref' && !elemType.typeArgs && (elemType.name === 'i8' || elemType.name === 'u8') ? 'i8'
@@ -653,7 +653,7 @@ class FunctionContext {
 			} else {
 				const tmpName = `#param$${i}`;
 				this.declareValue(tmpName, p.wtype, p.tsType);
-				pending.push(...patternBindings(p.key, { type: 'identifier', name: tmpName }));
+				pending.push(...patternBindings('let', p.key, { type: 'identifier', name: tmpName }));
 			}
 		});
 		return pending;
@@ -775,42 +775,6 @@ function assignsToThis(body: Statement[]): boolean {
 // For error messages only.
 function describeBinding(t: BindingTarget): string {
 	return typeof t === 'string' ? t : t.type === 'array_pattern' ? '[...]' : '{...}';
-}
-
-// Desugars a destructuring BindingTarget into flat var_decls reading off valueExpr (must be side-effect-free).
-// A default value (`el.default`/`prop.default`) just becomes a real `??` (`rawExpr ?? dflt`) -- reuses
-// `??`'s own codegen wholesale, including its single-evaluation-of-the-left materialization, rather than
-// hand-rolling a second copy of that logic here. `??`'s codegen also needs to tolerate a non-nullable
-// left for this to work (see its own comment) -- a default on an already-non-nullable value (an ordinary
-// array element, or a non-optional object field) is provably dead code, same as real TS itself would
-// prove, not a reason to reject it.
-function patternBindings(target: BindingTarget, valueExpr: Expr): JS.Statement<Type>[] {
-	if (typeof target === 'string')
-		return [JS.VarDecl('const', JS.Var(target, valueExpr))];
-
-	if (target.type === 'array_pattern') {
-		const stmts = target.elements.flatMap((el, i) => {
-			if (!el)
-				return [];
-			const elemExpr: Expr = JS.Index(valueExpr, Literal(i));
-			return patternBindings(el.target, el.default ? Binary('??', elemExpr, el.default) : elemExpr);
-		});
-		if (target.rest) {
-			// Real JS semantics: the rest collects the remaining elements into a genuinely new array, not
-			// a view -- `.slice(n)` (already a real `Array<T>` method) gives exactly that.
-			stmts.push(JS.VarDecl('const', JS.Var(target.rest, JS.Call(JS.Member(valueExpr, 'slice'), [Literal(target.elements.length)]))));
-		}
-		return stmts;
-	}
-
-	if (target.rest)
-		throw "a rest property ('...') in an object destructuring pattern is not supported -- unlike array rest (a plain '.slice()'), this needs a genuinely new object type holding an arbitrary 'all fields except these' shape, which isn't modeled yet";
-	return target.properties.flatMap(prop => {
-		if (typeof prop.key !== 'string')
-			throw "a computed key ('[expr]') in an object destructuring pattern is not supported";
-		const propExpr: Expr = JS.Member(valueExpr, prop.key);
-		return patternBindings(prop.value, prop.default ? Binary('??', propExpr, prop.default) : propExpr);
-	});
 }
 
 // ===================================================================
@@ -2207,7 +2171,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			if (direct)
 				return direct;
 		}
-		const w = T.widenLiterals(T.resolve(global, t));
+		const w = T.widenLiterals(T.resolve(global, t), false, true);
 		// `obj?.method(...)`'s receiver is nullable by construction -- strip `null`/`undefined` before
 		// dispatching; there's no "owner of `null`", only "owner of the non-nullish part `?.` already guarded".
 
@@ -2248,6 +2212,43 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				// construction (`matchObjectShapeByType`'s own comment).
 				return matchObjectShapeByType(w);
 			}
+			// An interface `extends`ing another (`Method<T> extends CallSig<T>`) resolves to a real
+			// intersection, not an 'object' -- flattens+resolves every part (a part can itself still be an
+			// unresolved ref, e.g. `CallSig<T>`, `T.flattenIntersection`'s own `resolveOwn` handles that)
+			// then merges them into one flat object the same way `matchObjectShapeByType` expects.
+			case 'intersection': {
+				const merged = T.mergeIntersection(TS.IntersectionType(T.flattenIntersection(w, global)));
+				return merged.type === 'object' ? matchObjectShapeByType(merged) : undefined;
+			}
+		}
+		return undefined;
+	}
+
+	// A union's own members can themselves resolve to a further union (e.g. a re-exported cross-module
+	// alias like `JS.ClassMember<T>` nested inside `ClassMember`'s own definition) -- `T.resolve` only
+	// ever expands the outermost type by one level, never recursing into a union's own members (every
+	// other caller in this file that needs that, e.g. `typeOf`'s own 'union' case, does the recursion
+	// itself). `ownerFor`'s own union-case only ever handles the nullable-collapse shape (stripping
+	// `null`/`undefined` down to one remaining member); a genuine multi-member union has no single owner
+	// of its own, so this flattens all the way down to concrete owners for a multi-owner dispatch caller
+	// (`case 'member'`'s own `ensureUnionFieldDispatch` fallback) instead of forcing it to see one
+	// unresolved member and give up.
+	function flattenOwners(t: Type, scope: Scope): ClassInfo[] | undefined {
+		// Tries `ownerFor(t)` directly first, on the RAW (not pre-resolved) member -- `ownerFor`'s own
+		// `t.type === 'ref'` fast path needs the real, nominal ref (a real class's own name/typeArgs/
+		// declScope) to keep its identity; pre-resolving here unconditionally would expand a real class
+		// down to its bare structural shape before `ownerFor` ever gets a chance to recognize it by name,
+		// landing on `matchObjectShapeByType`'s anonymous-shape path instead of the class's own real
+		// struct (a real regression, caught by the existing `A | B` union-of-real-classes test). Only
+		// once that direct attempt fails does resolving reveal whether `t` is itself a further, nested
+		// union (e.g. a re-exported cross-module alias like `JS.ClassMember<T>`) worth flattening.
+		const direct = ownerFor(t);
+		if (direct)
+			return [direct];
+		const resolved = T.resolve(scope, t);
+		if (resolved.type === 'union') {
+			const parts = resolved.types.filter(m => !T.isNullish(m, scope)).map(m => flattenOwners(m, scope));
+			return parts.every((p): p is ClassInfo[] => !!p) ? parts.flat() : undefined;
 		}
 		return undefined;
 	}
@@ -3688,7 +3689,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 
 					const t = T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx));
 					if (t.type === 'union') {
-						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope)).map(m => ownerFor(m));
+						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope)).flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1)) {
 							emitAs(e.object, ctx, REF_ANY);
 							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property, T.lookupMember(t, e.property, ctx.typeScope));
@@ -4673,7 +4674,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						const tmpName = `#destructure$${destructureTempCounter++}`;
 						for (const stmt of [
 							JS.VarDecl('const', JS.Var(tmpName, d.init, d.typeAnnotation)),
-							...patternBindings(d.name, { type: 'identifier', name: tmpName }),
+							...patternBindings(s.kind, d.name, { type: 'identifier', name: tmpName }),
 						])
 							emitStmt(stmt, ctx);
 						continue;
@@ -4707,7 +4708,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						if (objT.type === 'ref' && !objT.typeArgs && resolveClassAlias(objT.name)?.name === 'TypedArray') {
 							tsType = T.NUMBER;
 						} else {
-							const w = T.widenLiterals(T.resolve(global, objT));
+							const w = T.widenLiterals(T.resolve(global, objT), false, true);
 							if (w.type === 'array') {
 								tsType = w.element;
 							} else if (w.type === 'ref') {
