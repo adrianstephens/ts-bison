@@ -994,6 +994,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 	// and `widenLiterals` itself leaves a frozen leaf untouched, at any nesting depth -- including one embedded inside
 	// a container this call goes on to widen (`[1, x as const]`), which a check on `e` itself here never could reach.
 	const result = recurse(e, expected);
+	// A freshly-inferred function type (an arrow/function expression's own params reused verbatim, e.g.
+	// `T.FixSig`) can otherwise reach a consumer with a bare, never-`declScope`-stamped ref buried in one
+	// of its param annotations -- real for any nested closure literal whose own body never separately gets
+	// a full (unmuted) check pass of its own (the same class of gap `makeLibScope`'s own comment already
+	// documents for a lib method body). `scope` is the exactly-correct fallback (wherever `e` was actually
+	// written is literally this same scope), and `T.stampScope`'s own "skip if already tagged" rule makes
+	// this a safe no-op for anything a real check pass already stamped.
+	T.stampScope(result, scope);
 	return widen ? T.widenLiterals(result) : result;
 
 	function recurse(e: Expr, expected?: Type): Type {

@@ -3364,6 +3364,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			throw 'an async arrow/function expression is not supported';
 		if (hasMod(e, 'generator'))
 			throw 'a generator function expression is not supported';
+		// A closure literal written inside a non-entry module's own function body (e.g. a nested arrow
+		// whose own param annotation is never separately re-checked -- `makeLibScope`'s own "muted" comment
+		// documents the same class of gap) can reach here with its own param/return type annotations never
+		// stamped with a `declScope` at all -- the checker's real per-statement walk is what normally does
+		// that, but nothing guarantees it ran for THIS specific nested literal. `ctx.scope` is exactly the
+		// right scope regardless (wherever `e` was actually written is `ctx`'s own home module) -- a no-op
+		// for anything already stamped (`T.stampScope`'s own "skip if tagged" rule), so safe to call
+		// unconditionally right here, before any of this literal's own types are ever asked for a wtype.
+		e.params.forEach(p => p.typeAnnotation && T.stampScope(p.typeAnnotation, ctx.scope));
+		if (e.returnType)
+			T.stampScope(e.returnType, ctx.scope);
 		// A generic closure *value* (as opposed to a generic function/method called directly, already
 		// monomorphized per call site) is one physical closure that has to work across every call-site
 		// instantiation -- not true per-call specialization, but for the overwhelmingly common shape
@@ -5516,7 +5527,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			throw `'param '${describeBinding(p.key)}' needs an explicit type`;
 		// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as `any`
 		// rather than reject otherwise-valid source.
-		return { key: p.key, wtype: rawWtype === 'void' ? REF_ANY : rawWtype, tsType };
+		const boxed = rawWtype === 'void' ? REF_ANY : rawWtype;
+		// A bare `p?: T` (optional, no `=`) widens to `T | undefined` for real TS -- same nullable-slot
+		// treatment `closureFuncSigType`'s own identical comment already gives a function TYPE's own
+		// optional param, needed here too so an ordinary top-level function (not just a closure value)
+		// can actually be called with an explicit `undefined`/an omitted trailing argument
+		// (`defaultsWithImplicitUndefined`'s synthesized default) for such a param.
+		return { key: p.key, wtype: !p.default && hasMod(p, 'optional') ? nullableWtype(boxed) : boxed, tsType };
 	}
 
 	// Resolves a whole param list left to right, growing the earlier-names/scope `resolveParam` needs to
@@ -5611,10 +5628,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				if (t.type === 'ref' && !t.typeArgs)
 					everExtended.add(t.name);
 		}
-		return compileFunc(key, { ...substituteTypeParams(decl, map), typeParams: undefined }, homeModule)!;
+		return compileFunc(key, { ...substituteTypeParams(decl, map), typeParams: undefined }, homeModule, name)!;
 	}
 
-	function compileFunc(name: string, decl: FunctionDecl, homeModule = '.'): FuncInfo | undefined {
+	// `realName`: the function's own real, DECLARED name -- for a generic instantiation, `name` itself is
+	// a mangled per-instantiation cache key (`ensureGenericFunc`'s own `genericKey(...)`), never a name
+	// `global.value()` could ever find anything under. Defaults to `name` for the ordinary, non-generic
+	// case, where they're identical.
+	function compileFunc(name: string, decl: FunctionDecl, homeModule = '.', realName: string = name): FuncInfo | undefined {
 		try {
 			if (hasMod(decl, 'async'))
 				return compileAsyncFunc(name, decl, homeModule);
@@ -5640,7 +5661,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// whenever this doesn't apply (not a function-typed value, or the name isn't directly reachable
 			// this way at all -- e.g. a function only ever called indirectly through another non-entry
 			// module), unchanged from before.
-			const checkedType = global.value(name);
+			const checkedType = global.value(realName);
 			const inferredReturnType = !decl.returnType && checkedType?.type === 'function' ? checkedType.returnType : undefined;
 			const result = decl.returnType ? typeOf(decl.returnType)
 				: inferredReturnType ? typeOf(inferredReturnType)
