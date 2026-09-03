@@ -390,13 +390,17 @@ export function ownScope(t: Type, scope: Scope) {
 // inferred array/object literal's members too, not just a bare literal expression) -- not just this type's own top-level shape.
 // `frozen` leaves (see `common.ts`'s `Literal.frozen`) are left exactly as they are, at any nesting depth -- an `as const`
 // value's own literal identity survives being embedded in a container that's itself later widened (`[1, x as const]`).
-export function widenLiterals(t: Type, keepBoolean = false): Type {
-	return	(t.type === 'literal' || t.type === 'range') && t.frozen ? t
+// `ignoreFrozen`: an `as const` literal's `frozen` flag exists so the *checker* keeps its precise literal
+// type (real TS semantics) -- callers computing a *physical* runtime representation instead (e.g.
+// towasm.ts picking a value's wasm storage kind) have no such use for it: a frozen and non-frozen `'foo'`
+// still need the exact same physical representation, so those callers pass `true` to widen through it.
+export function widenLiterals(t: Type, keepBoolean = false, ignoreFrozen = false): Type {
+	return	(t.type === 'literal' || t.type === 'range') && t.frozen && !ignoreFrozen ? t
 		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(typeof t.value)
 		:	t.type === 'range' ? TS.RefType(t.base)
-		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean)))
-		:	t.type === 'array' ? TS.ArrayType(widenLiterals(t.element, keepBoolean), t.readonly)
-		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, widenLiterals(m.typeAnnotation, keepBoolean), m.modifiers) : m))
+		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean, ignoreFrozen)))
+		:	t.type === 'array' ? TS.ArrayType(widenLiterals(t.element, keepBoolean, ignoreFrozen), t.readonly)
+		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, widenLiterals(m.typeAnnotation, keepBoolean, ignoreFrozen), m.modifiers) : m))
 		:	t;
 }
 
