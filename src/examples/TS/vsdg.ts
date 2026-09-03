@@ -251,22 +251,11 @@ class ScopeMu extends Scope {
 }
 
 class VSDG extends Map<NodeId, Node> {
-	constructor() {
-		super();
-	}
-
 	getNode(id: NodeId): Node {
 		const node = this.get(id);
 		if (!node)
 			throw "missing node";
 		return node;
-	}
-
-	getEdge0(node: Node, slot: number) {
-		return node.inputs[slot];
-	}
-	getEdge(id: NodeId, slot: number) {
-		return this.getNode(id).inputs[slot];
 	}
 
 	removeInputs(node: Node) {
@@ -282,18 +271,6 @@ class VSDG extends Map<NodeId, Node> {
 	removeNode(node: Node) {
 		this.removeInputs(node);
 		this.delete(node.id);
-	}
-
-	clearDeadNodes() {
-		for (let changed = true; changed; ) {
-        	changed = false;
-			for (const node of this.values()) {
-				if (node.type !== 'effect' && node.type !== 'marker' && node.outDegree() === 0) {
-					this.removeNode(node);
-					changed = true;
-				}
-			}
-		}
 	}
 }
 
@@ -1742,10 +1719,10 @@ export function BuildProgram(
 		// True when `consumer` reads its own producer, at `port`, as a call/new's own CALLEE -- the
 		// same port convention BuildVSDG's own 'call'/'new' cases use.
 		function isCalleeEdge(consumer: Node, port: number): boolean {
-			if (consumer.type !== 'effect')
+			const v = consumer.type === 'effect' && consumer.expr;
+			if (!v || (v.type !== 'call' && v.type !== 'new'))
 				return false;
-			const v = consumer.expr as { type?: string; arguments?: unknown[] };
-			return (v.type === 'call' || v.type === 'new') && port === (v.arguments?.length ?? 0) + 1;
+			return port === v.arguments.length + 1;
 		}
 
 		// True when `consumer` reads its producer at `port` in a way that requires it addressable BY
@@ -2068,7 +2045,7 @@ export function BuildProgram(
 		if (!edge)
 			throw new Error(`Missing operand edge for slot ${slot} on node ${to}`);
 		const opNode = graph.get(edge.nodeId)!;
-		return opNode.type === 'member' || (opNode.type === 'floating' && opNode.expr!.type === 'index')
+		return opNode.type === 'member' || (opNode.type === 'floating' && opNode.expr.type === 'index')
 			? buildExpr(opNode) : resolveNode(opNode.id);
 	}
 
@@ -2553,7 +2530,7 @@ export function BuildProgram(
 	// region (own entry/RETURN_ANCHOR pair, own scope). returnNodeId is the only way to find the
 	// RETURN_ANCHOR from here -- no ordinary graph edge from entry to return survives an empty body.
 	function reconstructFunctionBody(entryNode: NodeOf<'function'>): Statement[] {
-		const returnNode		= graph.get(entryNode.returnNodeId!)!;
+		const returnNode		= graph.get(entryNode.returnNodeId)!;
 		// A fresh declaredNames frame per function body -- this function's own locals must never
 		// collide with an unrelated sibling/enclosing function's locals sharing the same name.
 		declaredNames.push();
@@ -2570,7 +2547,7 @@ export function BuildProgram(
 	// A single-expression counterpart to reconstructFunctionBody, for an INSTANCE field's own
 	// initializer (an expression body, not a statement list, so no EARLY_RETURN_MARKER involved).
 	function resolveFieldInitializer(entryNode: NodeOf<'function'>): Expr {
-		return resolveOperand(entryNode.returnNodeId!, 1);
+		return resolveOperand(entryNode.returnNodeId, 1);
 	}
 
 }
@@ -2578,7 +2555,7 @@ export function BuildProgram(
 // A constant: a 'floating' node whose own expr is a literal (an original literal, or one
 // foldConstants folded a binary/unary into in place -- same shape, no distinct tag).
 function isLiteralNode(node: Node): node is Node & { expr: Expr & { type: 'literal' } } {
-	return node.type === 'floating' && node.expr?.type === 'literal';
+	return node.type === 'floating' && node.expr.type === 'literal';
 }
 
 function foldConstants(graph: VSDG, node: Node): boolean {
@@ -2591,8 +2568,8 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 	switch (expr.type) {
 		case 'binary': {
 			// Find the incoming value edges for this node
-			const leftEdge	= graph.getEdge0(node, 0);
-			const rightEdge	= graph.getEdge0(node, 1);
+			const leftEdge	= node.inputs[0];
+			const rightEdge	= node.inputs[1];
 			if (!leftEdge || !rightEdge)
 				return false;
 
@@ -2614,7 +2591,7 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 			return false;
 		}
 		case 'unary': {
-			const edge = graph.getEdge0(node, 0);
+			const edge = node.inputs[0];
 			if (!edge)
 				return false;
 
@@ -2720,7 +2697,7 @@ function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): b
 	const port = node.type === 'gammaValue' ? 0 : 1;
 
 	// Find the edge supplying the condition
-	const condEdge = graph.getEdge0(node, port);
+	const condEdge = node.inputs[port];
 	if (!condEdge)
 		return false;
 
@@ -2729,7 +2706,7 @@ function foldDeadBranches(graph: VSDG, node: Node, protectedIds: Set<NodeId>): b
 	// If the condition is a known constant boolean (or truthy/falsy value)
 	if (isLiteralNode(condNode)) {
 		// Find the edge representing the winning path (true path, then false path)
-		const winningEdge = graph.getEdge0(node, condNode.expr.value ? port + 1 : port + 2);
+		const winningEdge = node.inputs[condNode.expr.value ? port + 1 : port + 2];
 		if (!winningEdge)
 			return false;
 
