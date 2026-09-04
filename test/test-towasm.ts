@@ -2951,6 +2951,57 @@ async function main() {
 	}
 
 	{
+		// `new C` with no explicit type arguments. Both sources of the answer already existed -- the checker
+		// solves them from the constructor's own arguments, and `ctx.contextualReturn` carries the target's
+		// declared type -- but `case 'new'` asked neither, so every one of these threw "class 'C' needs N
+		// explicit type argument(s)". The assignment cases also needed the checker to contextually type an
+		// assignment's right side by its target, or the VALUE of `(c ??= new WeakMap)` stayed
+		// `WeakMap<any,any>` and the chained `.set()` had nowhere to resolve.
+		const { fromArgs, fromAnnotation, fromAssignment, fromNullishAssign, lazyCacheRoundTrip } = await compile(`
+			class Type { constructor(public name: string) {} }
+			class Scope { cache?: WeakMap<Type, number>; constructor() {} }
+			export function fromArgs(): number {
+				const s = new Set(['a', 'b', 'a']);
+				return s.size * 10 + (s.has('b') ? 1 : 0);
+			}
+			export function fromAnnotation(): number {
+				const m: Map<Type, number> = new Map;
+				m.set(new Type('a'), 3);
+				return m.size;
+			}
+			export function fromAssignment(): number {
+				const s = new Scope();
+				const t = new Type('a');
+				s.cache = new WeakMap;
+				s.cache.set(t, 6);
+				return s.cache.get(t) ?? -1;
+			}
+			export function fromNullishAssign(): number {
+				const s = new Scope();
+				const t = new Type('a');
+				(s.cache ??= new WeakMap).set(t, 8);
+				return s.cache.get(t) ?? -1;
+			}
+			// type-utils.ts's own shape: a lazily-built per-scope cache, read back through a second lookup.
+			class Scope2 { lookup?: WeakMap<Type, Map<string, number>>; constructor() {} }
+			export function lazyCacheRoundTrip(): number {
+				const s = new Scope2();
+				const t = new Type('a');
+				const keyMap = (s.lookup ??= new WeakMap).get(t) ?? new Map<string, number>();
+				keyMap.set('x', 5);
+				s.lookup.set(t, keyMap);
+				const back = s.lookup.get(t);
+				return back === undefined ? -1 : back.get('x') ?? -1;
+			}
+		`);
+		check("generic 'new': type arguments solved from the constructor's arguments", fromArgs(), 21);
+		check("generic 'new': from the declaration's own annotation", fromAnnotation(), 1);
+		check("generic 'new': from the assignment target's type", fromAssignment(), 6);
+		check("generic 'new': from a '??=' target's type", fromNullishAssign(), 8);
+		check("generic 'new': a lazily-built nested cache round-trips", lazyCacheRoundTrip(), 5);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only

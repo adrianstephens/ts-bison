@@ -1527,7 +1527,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						rt,
 					]);
 				}
-				const rt = recurse(e.right);
+				// An assignment target's own type contextually types the value being written -- the same
+				// `expected` channel a generic call already solves its type params from, and the only thing a
+				// bare `new C` on the right has to go on (`scope.cache ??= new WeakMap`). Nullish members are
+				// stripped because they defeat inference against a `C<...>`-shaped return without adding
+				// anything: an `undefined` right side doesn't need a contextual type, and the assignability
+				// check below still judges against the full declared `lt`.
+				const assigning	= !COMPARISON_OPS.has(e.operator) && e.operator.endsWith('=');
+				const rt = recurse(e.right, assigning ? T.nonNullable(lt, scope) : undefined);
 				if (COMPARISON_OPS.has(e.operator))
 					return T.BOOLEAN;
 

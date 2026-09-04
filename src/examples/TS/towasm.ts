@@ -2028,6 +2028,36 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return T.isAny(narrowed) ? base : narrowed;
 	}
 
+	// The type arguments for a `new C(...)` that spells none out. Nothing is inferred here -- both sources
+	// already exist: the checker solves them from the constructor's own arguments (asked about
+	// `new Set(['a'])` it answers `Set<string>`), and `ctx.contextualReturn` -- the same contextual channel
+	// array/object literals already read -- carries the surrounding declaration's own declared type, which
+	// is all a no-argument `new Map` has to go on. Merged per position, an argument-solved one winning and
+	// the contextual one filling an `any`, because for some real call site each is the only one that knows.
+	// Learning nothing from either deliberately falls through to `ensureClass`'s own "needs N explicit type
+	// argument(s)" throw, rather than silently building an `any`-typed instance.
+	function newTypeArgs(name: string, explicit: Type[] | undefined, e: Expr, ctx: FunctionContext): Type[] | undefined {
+		if (explicit?.length)
+			return explicit;
+		// Through a union, because an optional field's own read type is `C<...> | undefined` -- that still
+		// contextually types a `new C` written into it.
+		const argsFor = (t: Type | undefined): Type[] | undefined =>
+			t?.type === 'union'	? t.types.map(argsFor).find(a => a)
+			:	t?.type === 'ref' && t.name === name ? t.typeArgs
+			:	undefined;
+		const solved		= argsFor(checkerTypeOf(e, ctx.scope));
+		const contextual	= argsFor(ctx.contextualReturn);
+		const merged: Type[] = [];
+		for (let i = 0; i < Math.max(solved?.length ?? 0, contextual?.length ?? 0); i++) {
+			const s = solved?.[i];
+			const pick = s && !T.isAny(s) ? s : contextual?.[i] ?? s;
+			if (!pick)
+				return explicit;
+			merged.push(pick);
+		}
+		return merged.length && !merged.every(t => T.isAny(t)) ? merged : explicit;
+	}
+
 	// A bare object literal with no single resolvable target type at all (`case 'object'`'s own `want`
 	// doesn't name one class) -- a last-resort structural match against every reachable, struct-backed
 	// class/object-shape (same "every class ever discovered" scan `findAnyDispatchCandidates` already
@@ -4394,9 +4424,19 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					const target	= emitAssignTarget(left, ctx, operator !== '=' ? 'discard' : 'none');
 					const wtype		= target.wtype;
 
+					// The target's own declared type is the value's contextual type -- the same channel
+					// `case 'var_decl'` seeds from an annotation, which a bare `new C` on the right needs to
+					// find its own type arguments (`scope.resolveCache ??= new WeakMap`).
+					const emitValue = () => {
+						const saved = ctx.contextualReturn;
+						ctx.contextualReturn = checkerTypeOf(left, ctx.scope);
+						emitAs(right, ctx, wtype);
+						ctx.contextualReturn = saved;
+					};
+
 					switch (operator) {
 						case '=':
-							emitAs(right, ctx, wtype);
+							emitValue();
 							break;
 
 						case '??=': {
@@ -4407,7 +4447,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							const leftLocal = ctx.declareLocal(`$nullish$assign$${optionalTempCounter++}`, wtype);
 							ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
 							const _old = ctx.swapOut();
-							emitAs(right, ctx, wtype);
+							emitValue();
 							const _then = ctx.swapOut();
 							ctx.emit(I.local.get(leftLocal.index));
 							ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
@@ -4632,7 +4672,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// its OWN declaring module (see `compileFunc`'s `homeScope`), so a class declared in the SAME
 				// file as the function being compiled resolves here even when the entry module itself never
 				// imports that class by name at all.
-				const cls = ensureClass(e.callee.name, e.typeArgs, ctx.scope);
+				const cls = ensureClass(e.callee.name, newTypeArgs(e.callee.name, e.typeArgs, e, ctx), ctx.scope);
 				if (!cls)
 					throw `'new' is only supported for a known class`;
 				const ctor = ensureCtor(cls, e.arguments, ctx);
