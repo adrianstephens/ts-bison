@@ -5165,6 +5165,26 @@ async function main() {
 	}
 
 	{
+		// Two more start-function non-events, both real js-parser.ts shapes: a bare type-only re-export
+		// (`export type {T} from '...'`, which binds and evaluates nothing) and an alias naming a generic
+		// declaration with explicit type arguments (`const JSBinary = Binary<Expr, binaryOps>`). Each used
+		// to fail the WHOLE module from the start function, whether or not anything read the name.
+		const { main } = await compileMulti({
+			common: `
+				export type Loc = { line: number };
+				export function pick<T>(a: T, b: T): T { return a; }
+			`,
+			mainFile: `
+				import { pick } from './common';
+				export type { Loc } from './common';
+				const pickNum = pick<number>;
+				export function main(): number { return 6; }
+			`,
+		}, 'mainFile');
+		check('multi-file: a type-only re-export and a generic-instantiation alias evaluate to nothing', main(), 6);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

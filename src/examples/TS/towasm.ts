@@ -1753,7 +1753,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// demand a physical representation for the referenced value in EVERY module that declares such an
 	// alias, whether or not anything in it ever reads the name.
 	function isAliasInit(e: Expr, scope: Scope): boolean {
+		// `const JSBinary = Binary<Expr, binaryOps>` -- naming a generic declaration with explicit type
+		// arguments is still just naming it.
+		if (e.type === 'instantiation')
+			return isAliasInit(e.expression, scope);
 		return !!classRefTarget(e, scope)
+			|| (e.type === 'identifier' && scope.decl(e.name)?.type === 'function_decl')
 			|| (e.type === 'member' && e.object.type === 'identifier' && !!scope.namespace(e.object.name));
 	}
 
@@ -8007,6 +8012,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		ctx.ownBody = ast.body!;
 		ast.body!.forEach(st => {
 			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl' || st.type === 'interface_decl' || st.type === 'import')
+				return;
+			// A bare `export {a, b}` / `export type {T} from '...'` / `export * from '...'` binds nothing and
+			// evaluates nothing -- the module's own export list is built from its `export_decl`s, not here.
+			// `export default <expr>` is excluded: that one really does have a value to evaluate.
+			if (st.type === 'export' && !st.default)
 				return;
 			if (st.type === 'var_decl') {
 				// A promoted const is already a real function; an alias (`const Scope = T.Scope`, `const I =
