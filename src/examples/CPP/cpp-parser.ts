@@ -2,7 +2,7 @@ import * as path from 'path';
 import { makeRule, Rules, List, OneOf, termOneOf, terminal, WithPrec, removeRules, ForceFork} from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
-import { Literal, Identifier } from '../common';
+import { Literal, Identifier, stampPos } from '../common';
 import * as C from './c-parser';
 
 // ===================================================================
@@ -212,7 +212,7 @@ C.IDENT.callback = (lex, ctx: CppCtx) => {
 //  Helpers
 // ===================================================================
 
-const Rule = makeRule<CppCtx>();
+const Rule = makeRule<CppCtx>(stampPos);
 
 // `A::B::` -- one or more TYPE_SCOPE'd names, each consuming its own `::`. The building block of every
 // qualified construct (types, expressions, out-of-class definitions, using-declarations).

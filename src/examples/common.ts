@@ -33,3 +33,22 @@ export function mergeMods(a?: string[], b?: string[]): string[] | undefined {
 }
 
 export function  withDefault<T extends {default?: U}, U>(p: T, def: U) { p.default = def; return p; }
+
+// ===================================================================
+//  Source location
+// ===================================================================
+// Non-enumerable so it never shows up in JSON dumps or structural comparisons; `walker.ts`'s
+// `mapObject` re-attaches it across a rewrite. Every parser installs `stampPos` as its `makeRule`
+// common action, so any shared tool can read `pos` off a node from any language.
+
+export interface Location { line: number, col: number }
+
+export function stampPos<T>(t: T, $: {pos: Location}): T {
+	return typeof t === 'object' && t !== null
+		? Object.defineProperty(t, 'pos', {value: {line: $.pos.line, col: $.pos.col}, enumerable: false, configurable: true, writable: false })
+		: t;
+}
+
+export function getPos(node: unknown): Location | undefined {
+	return (node as {pos?: Location})?.pos;
+}

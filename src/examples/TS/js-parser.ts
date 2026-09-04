@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { type RecoveryCallback, type MergeValues, type Token, type Parser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
-import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods, withDefault } from '../common';
+import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods, withDefault, stampPos } from '../common';
 
 // ===================================================================
 //  JavaScript Parser using tison
@@ -291,11 +291,9 @@ const REGEX_LITERAL = terminal('regex',
 //  Grammar
 // ===================================================================
 
-export interface Location { line: number, col: number };
+export type { Location } from '../common';
 
-export const Rule = makeRule<any>(<T>(t: T, $: any) =>
-	typeof t === 'object' ? Object.defineProperty(t, 'pos', {value: {line: $.pos.line, col: $.pos.col }, enumerable: false, configurable: true, writable: false }) : t
-);
+export const Rule = makeRule<any>(stampPos);
 
 const ASSIGN_OP = OneOf(['+=', '-=', '*=', '**=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=', '&&=', '||=', '=']);
 const UNARY_OP	= OneOf(['await', '++', '--', 'delete', 'void', 'typeof', '+', '-', '~', '!']);

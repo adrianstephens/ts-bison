@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { terminal, OneOf, List, MaybeList, Forward, Rules, makeRule, Terminal, type RecoveryCallback } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
-import { Literal, Identifier, Unary, Binary } from '../common';
+import { Literal, Identifier, Unary, Binary, stampPos } from '../common';
 
 // ===================================================================
 //  Python 3 parser using tison
@@ -370,7 +370,7 @@ function fstringParts(FTEXT: Terminal) {
 //  Grammar
 // ===================================================================
 
-const Rule = makeRule<Ctx>();
+const Rule = makeRule<Ctx>(stampPos);
 
 const AUGASSIGN = OneOf(['+=', '-=', '*=', '/=', '//=', '%=', '**=', '>>=', '<<=', '&=', '^=', '|=', '@=']);
 

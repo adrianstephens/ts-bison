@@ -2,7 +2,7 @@ import * as path from 'path';
 import { makeRule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
-import { Literal, Identifier, Unary, UnaryPost, Binary } from '../common';
+import { Literal, Identifier, Unary, UnaryPost, Binary, stampPos } from '../common';
 
 // ===================================================================
 //  C Parser Grammar using tison
@@ -225,7 +225,7 @@ export function declaratorName(d: Declarator): string {
 
 // --- Grammar Definition ---
 
-const Rule = makeRule<Ctx>();
+const Rule = makeRule<Ctx>(stampPos);
 
 const ASSIGN_OP = OneOf(['+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '&&=', '||=', '=']);
 
