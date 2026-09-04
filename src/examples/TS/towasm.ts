@@ -4923,6 +4923,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	function emitStmt(s: Stmt, ctx: FunctionContext): void {
 		ctx.stmtScope = (s as any).scope as Scope ?? ctx.stmtScope;
 		switch (s.type) {
+			case 'empty':
+				return;
+
 			case 'block':
 				ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
 				return;

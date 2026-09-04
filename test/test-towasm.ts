@@ -2881,6 +2881,28 @@ async function main() {
 	}
 
 	{
+		// An empty statement (a stray `;`) had no `case` in `emitStmt` at all, so it reached the `default:`
+		// throw -- js-parser.ts's own source is full of them.
+		const { strays, emptyLoopBody } = await compile(`
+			export function strays(): number {
+				;
+				let x = 1;
+				;;
+				x = x + 1;
+				;
+				return x;
+			}
+			export function emptyLoopBody(): number {
+				let i = 0;
+				for (i = 0; i < 3; i++);
+				return i;
+			}
+		`);
+		check('empty statement: stray semicolons in a function body', strays(), 2);
+		check('empty statement: as a for-loop body', emptyLoopBody(), 3);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only
