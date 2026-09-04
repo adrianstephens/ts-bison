@@ -5217,6 +5217,20 @@ async function main() {
 		check('multi-file: an imported class held in a module-level const', viaConst(), 3);
 	}
 
+	{
+		// A top-level const's initializer used to run TWICE: once into a start-function local nothing can
+		// see, and again in the `ensureLazyGlobal` wrapper on the first cross-function read -- so a
+		// side-effecting initializer bumped its counter twice and two different values circulated.
+		const { readX, getCount } = await compile(`
+			let count = 0;
+			function bump(): number[] { count = count + 1; return [count]; }
+			const X = bump();
+			export function readX(): number { return X[0]; }
+			export function getCount(): number { return count; }
+		`);
+		check('a top-level const initializer runs exactly once', getCount(), 1);
+		check('and every reader sees that one value', readX(), 1);
+	}
 
 	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it

@@ -8041,17 +8041,26 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			if (st.type === 'export' && !st.default)
 				return;
 			if (st.type === 'var_decl') {
-				// A promoted const is already a real function; an alias (`const Scope = T.Scope`, `const I =
-				// wasm.I`) only renames something declared elsewhere -- see `isAliasInit`. Neither leaves
-				// anything for the start function to evaluate.
-				const declarations = st.declarations.filter(d => typeof d.name !== 'string'
-					|| !(promotedConsts.has(d.name) || (d.init && isAliasInit(d.init, ctx.scope))));
-				if (!declarations.length)
-					return;
-				if (declarations.length !== st.declarations.length) {
-					emitStmt({ ...st, declarations }, ctx);
-					return;
+				// Declarator by declarator, in source order, so forcing one below never reorders it past a
+				// sibling that still emits normally.
+				for (const d of st.declarations) {
+					// A promoted const is already a real function; an alias (`const Scope = T.Scope`, `const
+					// I = wasm.I`) only renames something declared elsewhere -- see `isAliasInit`. Neither
+					// leaves anything for the start function to evaluate.
+					if (typeof d.name === 'string' && (promotedConsts.has(d.name) || (d.init && isAliasInit(d.init, ctx.scope))))
+						continue;
+					// A declarator that HAS a lazy global is already evaluated by that wrapper, which caches
+					// into the slot every other function reads. Emitting the initializer here as well ran it
+					// a SECOND time, into a start-function local nothing else can even see -- so a
+					// side-effecting initializer ran twice and two different values circulated. Force the
+					// wrapper instead: one evaluation, at module-init time, visible everywhere.
+					const lazy = typeof d.name === 'string' && d.init ? lazyGlobalFor(d.name, ctx) : undefined;
+					if (lazy)
+						ctx.emit(I.call(lazy.wrapper.funcIndex), I.drop);
+					else
+						emitStmt({ ...st, declarations: [d] }, ctx);
 				}
+				return;
 			}
 			emitStmt(st, ctx);
 		});
