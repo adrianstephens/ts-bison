@@ -3197,6 +3197,35 @@ async function main() {
 	}
 
 	{
+		// Object spread. Two things were wrong. A spread operand had to be a NOMINAL class -- an anonymous
+		// object shape (`const D: {a: number} = ...`) had no `ClassInfo` for `ownerOf` to find, though it
+		// gets the same synthesized struct an object literal targeting that shape already gets.
+		//
+		// And "last property wins" was applied statically, by name. That is only right when the later
+		// operand's property is actually THERE: spreading an optional one that happens to be absent must
+		// fall back to whatever came before it, which is the whole point of the `{...defaults, ...opts}`
+		// idiom. It used to read the null slot and trap. Each field now lowers to the same `??` chain the
+		// operator itself does, trimmed at the last source that is certain to have a value.
+		const { shapeOperand, laterAbsent, laterPresent, classOptAbsent, explicitWins } = await compile(`
+			type Full = { a: number; b: number };
+			type Part = { a?: number; b?: number };
+			const D: Full = { a: 1, b: 2 };
+			export function shapeOperand(): number { const p: Part = { b: 9 }; const m: Full = { ...D, ...p }; return m.a * 10 + m.b; }
+			export function laterAbsent(): number { const p: Part = {}; const m: Full = { ...D, ...p }; return m.a * 10 + m.b; }
+			export function laterPresent(): number { const p: Part = { a: 3, b: 4 }; const m: Full = { ...D, ...p }; return m.a * 10 + m.b; }
+			class A { constructor(public a: number, public b: number) {} }
+			class B { constructor(public b?: number) {} }
+			export function classOptAbsent(): number { const m: Full = { ...new A(1, 2), ...new B() }; return m.a * 10 + m.b; }
+			export function explicitWins(): number { const m: Full = { ...new A(1, 2), ...new B(), b: 7 }; return m.a * 10 + m.b; }
+		`);
+		check('spread: an anonymous object shape as the operand', shapeOperand(), 19);
+		check('spread: an ABSENT optional property falls back to the earlier operand', laterAbsent(), 12);
+		check('spread: a present one still wins', laterPresent(), 34);
+		check('spread: same, with class-typed operands', classOptAbsent(), 12);
+		check('spread: an explicit property beats every spread, present or not', explicitWins(), 17);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only

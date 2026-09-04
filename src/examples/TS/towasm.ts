@@ -1652,7 +1652,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			return existing;
 
 		const checkedType = declScope.value(name);
-		const wt = checkedType && typeOf(checkedType);
+		// `typeOf` has no answer for a bare anonymous object shape (only a named class, an index signature
+		// or an all-call-signature one) -- give it the same synthesized struct an object literal targeting
+		// that shape already gets, or a `const D: {a: number} = {...}` has no representation to cache into.
+		const resolved = checkedType && T.resolve(global, checkedType);
+		const wt = (checkedType && typeOf(checkedType))
+			?? (resolved?.type === 'object' ? ownerThisType2(ensureAnonObjectShape(resolved)) : undefined);
 		if (!wt || wt === 'void' || !d.init)
 			return undefined;
 		const slotName = `$lazy$${key}`;
@@ -1685,6 +1690,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// wrapper is the only correct way to READ one (it runs the initializer exactly once, on first use), the
 	// slot the only way to WRITE one. `Scope.decl` answers for an imported module; `topLevelVars` for the
 	// entry module, which `exportScope` never stamps.
+	const ownerThisType2 = (cls: ClassInfo | undefined) => cls && ownerThisType(cls);
+
 	function lazyGlobalFor(name: string, ctx: FunctionContext) {
 		const varStmt	= ctx.scope.decl(name);
 		const own		= varStmt?.type === 'var_decl'
@@ -4335,37 +4342,73 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// part of this shape, the same way a real JS spread's own excess properties would just
 				// never be looked at by a nominally-typed consumer.
 				interface FieldSource { expr?: Expr; spreadLocal?: Local; spreadCls?: ClassInfo }
-				const sources = new Map<string, FieldSource>();
+				// Every source for a field, in written order -- not just the last one. `{...D, ...opts}` is the
+				// reason: an OPTIONAL property of a later operand is only "last wins" when it's actually
+				// present at runtime, so an absent one has to fall back to whatever came before it.
+				const sources = new Map<string, FieldSource[]>();
+				const addSource = (key: string, src: FieldSource) => sources.set(key, [...(sources.get(key) ?? []), src]);
 				for (const p of e.properties) {
 					if (p.type === 'spread') {
-						const spreadCls = ownerOf(p.operand, ctx);
+						// An anonymous object shape is a perfectly good spread operand -- it just has no
+						// nominal class for `ownerOf` to find, so give it the same synthesized struct a
+						// literal targeting that shape would already get.
+						const spreadT	= T.resolve(ctx.scope, narrowedTypeOf(p.operand, ctx));
+						const spreadCls	= ownerOf(p.operand, ctx) ?? (spreadT.type === 'object' ? ensureAnonObjectShape(spreadT) : undefined);
 						if (!spreadCls)
-							throw `object literal for '${owner.name}': a spread operand needs a known class type`;
+							throw `object literal for '${owner.name}': a spread operand needs a known object type, got '${T.typeKey(spreadT)}'`;
 						const spreadLocal = ctx.declareValue(`$spread$${closureCallTempCounter++}`, spreadCls.thisWtype!, spreadCls.thisTsType!);
 						emitAs(p.operand, ctx, spreadCls.thisWtype!);
 						ctx.emit(I.local.set(spreadLocal.index));
 						for (const f of spreadCls.fields)
-							sources.set(f.name, { spreadLocal, spreadCls });
+							addSource(f.name, { spreadLocal, spreadCls });
 						continue;
 					}
 					if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
 						throw `object literal for '${owner.name}' can only have plain 'key: value' properties or a spread (no methods or computed keys)`;
 					if (!owner.fieldIndex.has(p.key))
 						throw `object literal for '${owner.name}' has unknown property '${p.key}'`;
-					sources.set(p.key, { expr: p.value });
+					addSource(p.key, { expr: p.value });
 				}
-				for (const f of owner.fields) {
-					const src = sources.get(f.name);
-					if (!src) {
-						if (!f.optional)
-							throw `object literal for '${owner.name}' is missing property '${f.name}'`;
-						emitDefaultValue(f.wtype, ctx);
-					} else if (src.expr) {
+				// A source is "certain" when it always yields a value: an explicit `k: v`, or a spread of a
+				// field that isn't optional. Everything written before the last certain source is dead.
+				const certain	= (src: FieldSource, name: string) => !!src.expr || !src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].optional;
+				const rawWtype	= (src: FieldSource, name: string) => src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].wtype;
+				const emitOne	= (src: FieldSource, f: { name: string; wtype: WasmType }) => {
+					if (src.expr) {
 						emitAs(src.expr, ctx, f.wtype);
 					} else {
 						const idx = src.spreadCls!.fieldIndex.get(f.name)!;
 						ctx.emit(I.local.get(src.spreadLocal!.index), I.struct.get(src.spreadCls!.typeIndex, idx));
 						coerceTop(src.spreadCls!.fields[idx].wtype, ctx, f.wtype);
+					}
+				};
+				// `last ?? (the one before it ?? ...)`, lowered exactly like the `??` operator itself.
+				const emitChain = (chain: FieldSource[], f: { name: string; wtype: WasmType }): void => {
+					const last = chain[chain.length - 1];
+					if (chain.length === 1 || certain(last, f.name))
+						return emitOne(last, f);
+					const srcWtype	= rawWtype(last, f.name);
+					const idx		= last.spreadCls!.fieldIndex.get(f.name)!;
+					const tmp		= ctx.declareLocal(`$spread$${f.name}$${optionalTempCounter++}`, srcWtype);
+					ctx.emit(I.local.get(last.spreadLocal!.index), I.struct.get(last.spreadCls!.typeIndex, idx));
+					ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
+					const old = ctx.swapOut();
+					emitChain(chain.slice(0, -1), f);
+					const _then = ctx.swapOut();
+					ctx.emit(I.local.get(tmp.index));
+					coerceTop(srcWtype, ctx, f.wtype);
+					ctx.emit(I.if(toValType(f.wtype), _then, ctx.swapOut(old)));
+				};
+				for (const f of owner.fields) {
+					const chain = sources.get(f.name);
+					if (!chain?.length) {
+						if (!f.optional)
+							throw `object literal for '${owner.name}' is missing property '${f.name}'`;
+						emitDefaultValue(f.wtype, ctx);
+					} else {
+						// Trim everything before the last certain source -- it can never be observed.
+						const from = chain.reduce((acc, src, i) => certain(src, f.name) ? i : acc, 0);
+						emitChain(chain.slice(from), f);
 					}
 				}
 				ctx.emit(I.struct.new(owner.typeIndex));
