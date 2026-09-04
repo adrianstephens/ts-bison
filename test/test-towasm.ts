@@ -3157,6 +3157,20 @@ async function main() {
 	}
 
 	{
+		// An object literal as a parameter default (`function f(opts = {})`, the options-bag idiom).
+		// `isReemittableDefault` -- which decides whether a default can be re-emitted at each call site --
+		// accepted a literal, an array of them, and a member chain, but not an object literal.
+		const { emptyBag, filledBag } = await compile(`
+			function withOpt(o: { a?: number } = {}): number { return o.a ?? 5; }
+			export function emptyBag(): number { return withOpt() * 10 + withOpt({ a: 2 }); }
+			function withPair(o: { a: number; b: number } = { a: 1, b: 2 }): number { return o.a * 10 + o.b; }
+			export function filledBag(): number { return withPair() * 100 + withPair({ a: 3, b: 4 }); }
+		`);
+		check('parameter default: an empty object literal', emptyBag(), 52);
+		check('parameter default: an object literal with fields', filledBag(), 1234);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only

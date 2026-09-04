@@ -5755,6 +5755,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	function isReemittableDefault(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
 		return e.type === 'literal'
 			|| (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el, earlierNames)))
+			// Same reasoning as the array case, and `{}` -- an all-defaults options bag -- is the common one.
+			|| (e.type === 'object' && e.properties.every(pr => pr.type === 'field' && typeof pr.key === 'string' && !!pr.value && isReemittableDefault(pr.value, earlierNames)))
 			|| (e.type === 'identifier' && !!earlierNames?.has(e.name))
 			|| (e.type === 'member' && !e.optional && isReemittableDefault(e.object, earlierNames));
 	}
