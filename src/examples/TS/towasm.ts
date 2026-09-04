@@ -2903,21 +2903,36 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			case 'f64':
 			case 'f32': ctx.emit(I[got](0), I[got].ne); return;
 		}
+		const t = checkerTypeOf(unwrapAs(e), ctx.scope);
+		// A string is falsy when EMPTY, so it tests its own length rather than its reference. A nullable one
+		// is falsy when null too, and `array.len` would trap there -- hence the null test first.
+		if (T.isStringLike(t, ctx.scope) && typeof got === 'object' && 'arr' in got) {
+			if (got.nullable) {
+				const tmp = ctx.declareLocal(`$strtruthy$${optionalTempCounter++}`, got);
+				ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
+				const old = ctx.swapOut();
+				ctx.emit(I.i32.const(0));
+				const _then = ctx.swapOut();
+				ctx.emit(I.local.get(tmp.index), I.ref.as_non_null, I.array.len, I.i32.const(0), I.i32.ne);
+				ctx.emit(I.if('i32', _then, ctx.swapOut(old)));
+			} else {
+				ctx.emit(I.array.len, I.i32.const(0), I.i32.ne);
+			}
+			return;
+		}
 		// A real object/array/closure reference is always truthy in JS -- only null/undefined isn't -- so
 		// `if (obj)`/`obj ? a : b` is exactly a null test, and a non-nullable one is unconditionally true
-		// (the value still has to be evaluated for its side effects, hence the `drop`). Two kinds are
-		// deliberately excluded, because for them truthiness is a property of the VALUE, not the reference:
-		// a string (`''` is falsy) and a boxed `any` (could be holding `0`/`''`).
-		const t = checkerTypeOf(unwrapAs(e), ctx.scope);
+		// (the value still has to be evaluated for its side effects, hence the `drop`). A boxed `any` stays
+		// excluded: truthiness is a property of the VALUE there (it could be holding `0` or `''`).
 		if (typeof got === 'object' && !('ref' in got && (got.ref === 'any' || got.ref === 'exn'))
-			&& !T.isAny(T.resolveOwn(t, ctx.scope)) && !T.isStringLike(t, ctx.scope)) {
+			&& !T.isAny(T.resolveOwn(t, ctx.scope))) {
 			if (got.nullable)
 				ctx.emit(I.ref.is_null, I.i32.eqz);
 			else
 				ctx.emit(I.drop, I.i32.const(1));
 			return;
 		}
-		throw 'this value cannot be used as a boolean condition';
+		throw `'${T.typeKey(t)}' (${wasmTypeKey(got)}) cannot be used as a boolean condition`;
 	}
 
 	// Shared by every optional (`?.`) lowering -- `objectExpr` must only ever be evaluated once, so this

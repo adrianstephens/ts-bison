@@ -3033,6 +3033,24 @@ async function main() {
 	}
 
 	{
+		// A string tests its own LENGTH, not its reference -- `''` is falsy. A nullable one is falsy when
+		// null too, and `array.len` would trap there, so the null test has to come first.
+		const { empty, nonEmpty, absent, present, presentEmpty } = await compile(`
+			class H { s?: string; constructor() {} }
+			export function empty(): number { const s = ''; return s ? 1 : 2; }
+			export function nonEmpty(): number { const s = 'ab'; return s ? 1 : 2; }
+			export function absent(): number { return new H().s ? 1 : 2; }
+			export function present(): number { const h = new H(); h.s = 'x'; return h.s ? 1 : 2; }
+			export function presentEmpty(): number { const h = new H(); h.s = ''; return h.s ? 1 : 2; }
+		`);
+		check("truthiness: an empty string is falsy", empty(), 2);
+		check('truthiness: a non-empty string is truthy', nonEmpty(), 1);
+		check('truthiness: an absent optional string is falsy', absent(), 2);
+		check('truthiness: a present non-empty one is truthy', present(), 1);
+		check('truthiness: a present EMPTY one is still falsy', presentEmpty(), 2);
+	}
+
+	{
 		// A scalar-typed optional field used to keep a bare `f64`/`i32` slot with a zero default, so there
 		// was no "absent" distinct from `0` -- `??=` threw outright, and an unassigned `n?: number` silently
 		// read back as `0` rather than `undefined`. It now gets the same null-boxing an optional *parameter*
