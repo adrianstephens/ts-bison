@@ -399,6 +399,13 @@ interface MethodOwner {
 	// Accessor names -- underlying decl lives under accessorKey('get'|'set', name) in methodDecls/inlineMethods.
 	getterNames?:	Set<string>;
 	setterNames?:	Set<string>;
+	// Where this class was DECLARED -- its own module's scope and canonical path. A method or constructor
+	// body compiled from another module needs both to resolve the names its own file declares (a
+	// non-exported module-level const, a sibling function): the same `homeScope`/`homeModule` pairing
+	// `compileFunc` already gives a top-level function. Absent for a lib class and for a synthesized
+	// object shape, which have no declaring module of their own.
+	declScope?:		Scope;
+	homeModule?:	string;
 }
 
 interface ClassInfo extends MethodOwner {
@@ -6705,8 +6712,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as `any` rather than reject otherwise-valid source.
 		const rawWt = typeAnnotation && typeOf(typeAnnotation);
 		let wt	= rawWt === 'void' ? REF_ANY : rawWt;
-		if (!wt)
+		if (!wt) {
+			if (process.env.DBG) console.error(`addField FAIL info=${info.name} key=${key} ann=${typeAnnotation ? typeAnnotation.type + ' ' + T.typeKey(typeAnnotation).replace(/\s+/g,' ').slice(0,120) : 'undefined'} resolved=${typeAnnotation ? T.typeKey(T.resolve(global, typeAnnotation)).replace(/\s+/g,' ').slice(0,120) : '-'}`);
 			throw `'${key}' needs an explicit number/boolean/object type`;
+		}
 		// An `optional` field's own declared type is just its bare annotation (`value?: Expr`) -- this
 		// checker tracks "optional" as a separate modifier, never folding it into an implicit `| undefined`
 		// union the way real TS does (same gap already documented for an optional *param*'s own narrowing) --
@@ -6923,6 +6932,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					return ensureClass(aliased.name, typeArgs, aliased.scope);
 				return ensureObjectShape(name, typeArgs, declScope);
 			}
+			// Read off the ORIGINAL declaration -- a generic instantiation replaces `decl` with a
+			// name-substituted copy just below, which `stmtHomeModule` has never seen.
+			const homeModule = stmtHomeModule.get(decl);
 			if (decl.typeParams?.length) {
 				const got = typeArgs?.length ?? 0;
 				if (!typeArgs || typeArgs.length !== decl.typeParams.length) {
@@ -6935,7 +6947,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// `thisTsType` is always a real reference to this class -- the ref itself must carry the real
 			// name and type arguments (`{name, typeArgs}`), not the mangled composite cache key as a bare
 			// name, or `this.length`/`this[i]` can't resolve (`T.lookupMember` silently falls back to `any`).
-			info = { name: key, typeIndex: -1, thisTsType: TS.RefType(name, typeArgs), decl, fields: [], fieldIndex: new Map(), methodDecls: new Map() };
+			info = { name: key, typeIndex: -1, thisTsType: TS.RefType(name, typeArgs), decl, fields: [], fieldIndex: new Map(), methodDecls: new Map(), declScope, homeModule };
 			classes.set(key, info);
 		}
 
@@ -7035,6 +7047,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// type). `decl` here is always parsed by ts-parser.ts though, so a real index-signature member can
 		// genuinely appear -- widened to the type that actually matches what's parsed, not narrowed by which
 		// shared interface happened to declare `body`.
+		// A field's own type resolves in the class's OWN module, not the entry's: an un-annotated field
+		// (`opts;`, `newline = '\n'`) gets its type from the constructor or its initializer, both of which
+		// may name things only that file declares -- and `T.lookupMember(thisTsType, ...)` needs the class's
+		// own name to be resolvable at all, which it isn't in an importer that only ever wrote `C.Output`.
+		const homeScope = info.declScope ?? libGlobal;
 		for (const m of decl.body as TS.ClassMember[]) {
 			try {
 				if (m.type === 'field'/* && !hasMod(m, 'static')*/) {
@@ -7046,7 +7063,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						// Neither an annotation nor an initializer (`opts;`) -- the type lives only in the
 						// constructor's own `this.opts = ...`, which `classShapes` already infers. Ask the
 						// checker for the member rather than re-deriving it from the AST here.
-						addField(info, m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, libGlobal) : T.lookupMember(info.thisTsType, m.key, libGlobal)), !m.value && hasMod(m, 'optional'));
+						addField(info, m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, homeScope) : T.lookupMember(info.thisTsType, m.key, homeScope)), !m.value && hasMod(m, 'optional'));
 
 				} else if (m.type === 'method') {
 					// A computed name can't be stored as a decl key -- and can never be called via `.name()` syntax either, so it's simply never reachable, no need to throw.
@@ -7326,7 +7343,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		};
 
 		worklist.push(withCatch(() => {
-			const ctx		= new FunctionContext(key, new Scope(libGlobal), plainReturn(thisWtype), cls);
+			// The class's OWN module (`ensureClass`'s `declScope`/`homeModule`), not the entry's -- a
+			// constructor body naming something only its own file declares (a non-exported module-level
+			// const, a sibling class) must resolve it there. Same pairing `compileFunc` gives a top-level
+			// function; `libGlobal` remains the fallback for a lib class or a synthesized shape.
+			const ctx		= new FunctionContext(key, new Scope(cls.declScope ?? libGlobal), plainReturn(thisWtype), cls, cls.homeModule);
 			ctx.widenedTypes = collectRangeWidenings(ctor.body!, ctx.scope);
 			ctx.ownBody = ctor.body!;
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
@@ -7500,7 +7521,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
 		funcs.set(key, info);
 		worklist.push(withCatch(() => {
-			const ctx	= new FunctionContext(key.replace('.', '_').replace('#', '_'), new Scope(libGlobal), plainReturn(result), owner);
+			// See `ensureCtor`'s own note -- a method body resolves against its class's declaring module too.
+			const ctx	= new FunctionContext(key.replace('.', '_').replace('#', '_'), new Scope(owner.declScope ?? libGlobal), plainReturn(result), owner, owner.homeModule);
 			if (!isStatic)
 				ctx.declareValue('this', thisWtype, owner.thisTsType);
 			if (reassignsThis) {

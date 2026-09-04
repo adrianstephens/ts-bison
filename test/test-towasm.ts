@@ -5185,6 +5185,40 @@ async function main() {
 	}
 
 	{
+		// tocode.ts's own `Output` shape, reached through an import -- the survey's largest cause. Three
+		// things had to hold at once, and each failed only cross-module: `Partial<typeof DefaultOptions>`
+		// must resolve `typeof DefaultOptions` in the module that declares it (a plain non-exported const,
+		// not a name in the importer at all); an un-annotated field's type must be looked up against the
+		// class's own scope; and the constructor body must resolve `DefaultOptions` too.
+		const { viaNamed, viaNamespace, viaConst } = await compileMulti({
+			tocode: `
+				const DefaultOptions = { newline: 'NL', indent: '  ', spaceAfterColon: true };
+				export type Options = Partial<typeof DefaultOptions>;
+				export class Output {
+					opts;
+					colon = ': ';
+					constructor(opts: Options = {}) {
+						this.opts	= {...DefaultOptions, ...opts};
+						this.colon	= this.opts.spaceAfterColon ? ': ' : ':';
+					}
+				}
+			`,
+			mainFile: `
+				import { Output } from './tocode';
+				import * as C from './tocode';
+				const shared = new Output({spaceAfterColon: false});
+				export function viaNamed(): number { return new Output({spaceAfterColon: false}).colon.length; }
+				export function viaNamespace(): number { return new C.Output({}).colon.length; }
+				export function viaConst(): number { return shared.colon.length + shared.opts.indent.length; }
+			`,
+		}, 'mainFile');
+		check('multi-file: an imported class resolves a typeof-query option bag', viaNamed(), 1);
+		check('multi-file: the same class through a namespace import keeps its defaults', viaNamespace(), 2);
+		check('multi-file: an imported class held in a module-level const', viaConst(), 3);
+	}
+
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
