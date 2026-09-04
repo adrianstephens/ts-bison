@@ -222,6 +222,10 @@ const REF_EXN:			WasmType = { ref: 'exn', nullable: true };
 // The plain scalar kind a value acts as for arithmetic/comparison dispatch -- unwraps a boxed
 // nullable primitive the same way `coerceTop` does, or passes a bare scalar through unchanged.
 // `undefined` for anything else (a real class/array/closure).
+// None of these has a declaration of its own: a readonly view is a checker-only distinction over the
+// very same physical container, which is the treatment `ownerFor` has always given `ReadonlyArray`.
+const READONLY_ALIAS: Record<string, string> = { ReadonlyArray: 'Array', ReadonlyMap: 'Map', ReadonlySet: 'Set' };
+
 function scalarKind(wtype: WasmType | undefined): WasmScalar | undefined {
 	return typeof wtype === 'string' ? (wtype !== 'void' ? wtype : undefined) : wtype && unboxedPrimitive(wtype)?.kind;
 }
@@ -1827,6 +1831,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// hands the very same expression to every call site, exactly as a direct call to the real
 			// declaration already gets it -- so the only requirement is the one the declaration path
 			// (`resolveParam`) already imposes: that the expression can be re-emitted there.
+			// Deliberately NOT passing `earlierNames`: a default reading an earlier parameter needs the
+			// `resolvedParams` that only a real declaration carries, so accepting one here just trades this
+			// honest message for an `internal:` one at whichever call site later omits the argument.
 			if (p.default && !isReemittableDefault(p.default))
 				throw `function type parameter '${describeBinding(p.key)}''s default value must be a literal (or an array literal of them), in '${sigText()}'`;
 			// `void` is real, valid TS here (real TS lets a param/field declare `void`, if uselessly) --
@@ -1916,9 +1923,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 	function typeOf(t: Type): WasmType | undefined {
 		if (t.type === 'ref' && t.typeArgs?.length) {
-			const decl = LIB_DECL_MAP.get(t.name) ?? userGenericClassDecls.get(t.name);
+			const name = READONLY_ALIAS[t.name] ?? t.name;
+			const decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
 			if (decl?.type === 'class_decl' && decl.typeParams?.length) {
-				const cls = ensureClass(t.name, t.typeArgs);
+				const cls = ensureClass(name, t.typeArgs);
 				if (cls)
 					return ownerThisType(cls);
 			}
@@ -2039,8 +2047,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// preempts it) -- a generic parameter's own structural bound (`Record<string, any>`), substituted
 		// with a real interface-typed argument, is the one case that's actually anonymous by construction
 		// (`matchObjectShapeByType`'s own comment).
-		if (resolved.type === 'object') {
-			const shapeMatch = matchObjectShapeByType(resolved);
+		// An interface `extends`ing another resolves to a real INTERSECTION rather than an 'object'
+		// (`ownerFor`'s own intersection case says the same), so a namespace-qualified ref to one --
+		// `JS.CallSig<any>`, which is `{typeParams?; returnType?; ...} & Params<any>` -- reached neither
+		// `ensureClass` (dotted name) nor the object branch below, and had no representation at all.
+		// Flattened through the shared `resolveObjectType`, so this agrees with `ownerFor` on the shape.
+		const flat = resolved.type === 'object' ? resolved : resolved.type === 'intersection' ? resolveObjectType(resolved, global) : undefined;
+		if (flat) {
+			const shapeMatch = matchObjectShapeByType(flat) ?? (resolved.type === 'intersection' ? ensureAnonObjectShape(flat) : undefined);
 			if (shapeMatch)
 				return ownerThisType(shapeMatch);
 		}
@@ -2393,11 +2407,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				return ensureClass('Array', [w.element]);
 
 			case 'ref':
-				switch (w.name) {
-					case 'Array':
-					case 'ReadonlyArray':
-						return ensureClass('Array', w.typeArgs);
-				}
+				if (READONLY_ALIAS[w.name])
+					return ensureClass(READONLY_ALIAS[w.name], w.typeArgs);
+				if (w.name === 'Array')
+					return ensureClass('Array', w.typeArgs);
 				// A plain lib class (or alias -- `resolveClassAlias`) not yet reached through the raw-`t.name`
 				// `ensureClass` try above -- e.g. a param typed `Uint8Array` with no earlier `new Uint8Array(...)`
 				// call in this compile to have lazily populated `classes` already. Safe to call unconditionally: `ensureClass` returns
@@ -2427,7 +2440,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// the same way `matchObjectShapeByType` expects.
 			case 'intersection': {
 				const merged = resolveObjectType(w, global);
-				return merged && matchObjectShapeByType(merged);
+				// Same last resort the 'object' case above uses -- synthesize the flattened shape when
+				// nothing declared matches it, or a value of such a type has no owner to read fields off.
+				return merged && (matchObjectShapeByType(merged) ?? ensureAnonObjectShape(merged));
 			}
 		}
 		return undefined;

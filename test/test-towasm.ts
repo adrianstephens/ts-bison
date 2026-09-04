@@ -3135,6 +3135,52 @@ async function main() {
 	}
 
 	{
+		// An interface that `extends` another resolves to a real INTERSECTION, not an 'object'. Reached by
+		// its bare name that never mattered -- `ensureClass` resolves the name directly. Reached by a
+		// NAMESPACE-QUALIFIED one (`NS.Sig<number>`, which is how every cross-module type in this project is
+		// written) `ensureClass` can't help, because its lookup never splits on '.', and the object-shape
+		// fallback beside it only handled a plain 'object'. So the type had no representation at all --
+		// `JS.CallSig<any>`, `T.FixSig`'s own parameter, and the survey's largest row.
+		const { viaNamespace } = await compileMulti({
+			types: `
+				export interface Base<T> { a: T }
+				export interface Sig<T> extends Base<T> { b: T }
+			`,
+			main: `
+				import * as NS from './types';
+				function use(s: NS.Sig<number>): number { return s.a + s.b; }
+				export function viaNamespace(): number {
+					const g: (s: NS.Sig<number>) => number = use;
+					return g({ a: 1, b: 2 });
+				}
+			`,
+		}, 'main');
+		check('function type: a namespace-qualified interface that extends another', viaNamespace(), 3);
+	}
+
+	{
+		// `ReadonlyMap`/`ReadonlySet` have no declarations of their own, so neither had any representation --
+		// the same position `ReadonlyArray` was already handled in, just never extended to the other two. A
+		// readonly view is a checker-only distinction over the identical physical container.
+		const { roMap, roSet, roArray } = await compile(`
+			function mapSize(m: ReadonlyMap<string, number>): number { return m.size; }
+			export function roMap(): number {
+				const m = new Map<string, number>();
+				m.set('a', 1);
+				const g: typeof mapSize = mapSize;
+				return g(m);
+			}
+			function setSize(s: ReadonlySet<string>): number { return s.size; }
+			export function roSet(): number { const g: typeof setSize = setSize; return g(new Set(['a', 'b'])); }
+			function arrLen(a: ReadonlyArray<number>): number { return a.length; }
+			export function roArray(): number { const g: typeof arrLen = arrLen; return g([1, 2, 3]); }
+		`);
+		check('ReadonlyMap resolves to Map', roMap(), 1);
+		check('ReadonlySet resolves to Set', roSet(), 2);
+		check('ReadonlyArray still resolves to Array', roArray(), 3);
+	}
+
+	{
 		// Module-level state. A top-level `const`/`let` holding anything but a wasm compile-time constant --
 		// an array, an object, a string, a `new`, a call -- was visible to NOTHING but the top level itself:
 		// any function referencing it threw "unresolved identifier". `ensureLazyGlobal` already built exactly
