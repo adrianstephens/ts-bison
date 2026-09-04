@@ -2903,6 +2903,54 @@ async function main() {
 	}
 
 	{
+		// An OPTIONAL field on a real `class_decl` never had its `optional` flag passed to `addField`, so it
+		// got a non-nullable slot and no "no value" to construct with -- which surfaced as `??=` rejecting it
+		// ("needs a nullable object-typed target"), the exact shape type-utils.ts's lazily-built `Scope`
+		// caches use. Only the `class_decl` path was affected; a structural `{c?: P}` object type already
+		// passed the flag, and so did an explicit `c: P | undefined`.
+		const { unassignedIsUndefined, lazyCreate, doesNotOverwrite, paramProperty, paramPropertyOptionalChain, allFieldsOptional } = await compile(`
+			class P { constructor(public x: number) {} }
+			class H { c?: P; n: number; constructor(n: number) { this.n = n; } }
+			export function unassignedIsUndefined(): number {
+				const h = new H(5);
+				return (h.c === undefined ? 10 : 0) + h.n;
+			}
+			export function lazyCreate(): number {
+				const h = new H(0);
+				return (h.c ??= new P(4)).x * 10 + (h.c === undefined ? 0 : 1);
+			}
+			export function doesNotOverwrite(): number {
+				const h = new H(0);
+				h.c = new P(7);
+				h.c ??= new P(4);
+				return h.c.x;
+			}
+			class Q { constructor(public a: number, public b?: P) {} }
+			export function paramProperty(): number {
+				const q = new Q(3);
+				return (q.b === undefined ? 10 : 0) + q.a;
+			}
+			export function paramPropertyOptionalChain(): number {
+				return (new Q(3).b?.x ?? 1) * 10 + (new Q(3, new P(4)).b?.x ?? 1);
+			}
+			class AllOpt { c?: P; d?: P; constructor() {} }
+			export function allFieldsOptional(): number {
+				const a = new AllOpt();
+				a.c = new P(6);
+				return a.c.x * 10 + (a.d === undefined ? 1 : 0);
+			}
+		`);
+		check('optional field: unassigned by the constructor reads back as undefined', unassignedIsUndefined(), 15);
+		check("optional field: '??=' lazily creates it", lazyCreate(), 41);
+		check("optional field: '??=' leaves an already-assigned value alone", doesNotOverwrite(), 7);
+		check('optional field: an optional constructor parameter property', paramProperty(), 13);
+		// Silently *trapped* before (a null deref) rather than throwing: `classShapes` gave the synthesized
+		// property the constructor's modifiers, so it was never optional and `?.` skipped its null check.
+		check("optional field: '?.' over an omitted parameter property", paramPropertyOptionalChain(), 14);
+		check('optional field: a class whose fields are ALL optional still materializes `this`', allFieldsOptional(), 61);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only

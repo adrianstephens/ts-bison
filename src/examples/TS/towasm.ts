@@ -6680,7 +6680,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					if (isAsm(m.value))
 						inlineDecls.push({ key: m.key, value: m.value! });
 					else if (!m.modifiers?.includes('static'))
-						addField(info, m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, libGlobal) : undefined));
+						addField(info, m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, libGlobal) : undefined), !m.value && hasMod(m, 'optional'));
 
 				} else if (m.type === 'method') {
 					// A computed name can't be stored as a decl key -- and can never be called via `.name()` syntax either, so it's simply never reachable, no need to throw.
@@ -6698,7 +6698,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
 								if (typeof p.key !== 'string')
 									throw `computed field names in '${name}' are not supported`;
-								addField(info, p.key, p.typeAnnotation ?? (p.default ? checkerTypeOf(p.default, libGlobal) : undefined));
+								addField(info, p.key, p.typeAnnotation ?? (p.default ? checkerTypeOf(p.default, libGlobal) : undefined), !p.default && hasMod(p, 'optional'));
 							}
 						}
 					}
@@ -6973,13 +6973,40 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// Defaultability is a whole-struct-type property, not per-field -- one object-typed field forces the collect-then-`struct.new` path for the whole class.
 			} else if (cls.fields.some(f => typeof f.wtype !== 'string')) {
 
-				const remaining	= new Set(cls.fields.map(f => f.name));
+				// An optional field is never *required* to be assigned -- it still needs a real value for the
+				// single `struct.new` below, so seed it with its own null default up front (`addField` already
+				// forced its wtype nullable) and leave it out of `remaining`.
+				const remaining	= new Set(cls.fields.filter(f => !f.optional).map(f => f.name));
 				const values	= new Map<string, Local>();
 				ctx.ctorFields	= values;
 				// No real local for `this` yet, but `checkerTypeOf` still needs its static type to resolve a
 				// chained read like `this.p.x` (`p` already collected) down to `p`'s own class -- same no-real-
 				// local, scope-only registration `declareCaptured` uses for closure captures.
 				ctx.scope.addValue('this', cls.thisTsType);
+
+				for (const f of cls.fields) {
+					if (f.optional) {
+						const local = ctx.declareLocal(`$field$${f.name}`, f.wtype);
+						emitDefaultValue(f.wtype, ctx);
+						ctx.emit(I.local.set(local.index));
+						values.set(f.name, local);
+					}
+				}
+
+				const materializeThis = () => {
+					for (const f of cls.fields)
+						ctx.emit(I.local.get(values.get(f.name)!.index));
+					ctx.emit(I.struct.new(cls.typeIndex));
+					const thisLocal = ctx.declareValue('this', thisWtype, cls.thisTsType);
+					ctx.ctorThis = thisLocal;
+					ctx.onReturn = ctorOnReturn;
+					ctx.ctorFields = undefined;
+					ctx.emit(I.local.set(thisLocal.index));
+				};
+				// Every field optional (or none at all): nothing will ever empty `remaining` from inside the
+				// callback below, so `this` has to exist before the body runs at all.
+				if (!remaining.size)
+					materializeThis();
 
 				emitCtorStatements(ctor, cls, ctx, (field: string, value: Expr) => {
 					// Once `this` genuinely exists (either every field was collected earlier in this same
@@ -7000,16 +7027,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					ctx.emit(I.local.set(local.index));
 					values.set(field, local);
 					remaining.delete(field);
-					if (!remaining.size) {
-						for (const f of cls.fields)
-							ctx.emit(I.local.get(values.get(f.name)!.index));
-						ctx.emit(I.struct.new(cls.typeIndex));
-						const thisLocal = ctx.declareValue('this', thisWtype, cls.thisTsType);
-						ctx.ctorThis = thisLocal;
-						ctx.onReturn = ctorOnReturn;
-						ctx.ctorFields = undefined;
-						ctx.emit(I.local.set(thisLocal.index));
-					}
+					if (!remaining.size)
+						materializeThis();
 				});
 				if (remaining.size)
 					throw `never assigns field(s) ${[...remaining].join(', ')}`;
