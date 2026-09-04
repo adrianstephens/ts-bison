@@ -1962,6 +1962,31 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return { params, result, hasRest: sigs.some(s => s.hasRest), defaults };
 	}
 
+	// The array-backed part of an intersection, when it has exactly one physical shape -- an ARRAY carrying
+	// extra properties: `TemplateStringsArray` (`ReadonlyArray<string> & {raw}`), tison's `WithTextPos<T> =
+	// T & {pos}`, `interface RegExpMatchArray extends Array<string>`. Such a value IS the array physically;
+	// the extra properties get no slot, so reading one is an honest `unknown field '...'` rather than a
+	// wrong answer, and erasing them is exactly what keeps the value assignable to a plain array parameter
+	// with no conversion, the way real TS's own subtyping already allows. Flattened over the RAW parts, not
+	// `T.flattenIntersection` -- that resolves each part first, expanding `Array<string>` into the class's
+	// own object shape and losing the very thing being looked for. Both `typeOf` and `ownerFor` route
+	// through this, so the physical type and the method/field owner can never disagree about such a value.
+	function arrayPartOf(t: Type): { part: Type; element: Type } | undefined {
+		const parts: Type[] = [];
+		const flatten = (x: Type): void => { x.type === 'intersection' ? x.types.forEach(flatten) : parts.push(x); };
+		flatten(t);
+		// Matched on the part's own written shape, never through `T.resolve`: with `Array` declared in the
+		// lib scope, resolving `Array<string>` expands it to the class's own object shape and loses the very
+		// thing being looked for.
+		const arrays = parts.flatMap(part => {
+			const element = part.type === 'array' ? part.element
+				: part.type === 'ref' && part.typeArgs?.length === 1 && (READONLY_ALIAS[part.name] ?? part.name) === 'Array' ? part.typeArgs[0]
+				: undefined;
+			return element ? [{ part, element }] : [];
+		});
+		return arrays.length && new Set(arrays.map(a => T.typeKey(a.element))).size === 1 ? arrays[0] : undefined;
+	}
+
 	// The `ClassInfo` a type REFERENCE names. A namespace-qualified ref (`T.Scope`, from an `import * as T`)
 	// resolves its leaf in the NAMESPACE's own scope -- `ensureClass`'s own lookup never splits on '.', so
 	// such a ref otherwise fell through to a structural shape-only stand-in with no constructor or methods,
@@ -2015,20 +2040,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				}
 				break;
 			}
-			/*
+			// An ARRAY carrying extra properties: `TemplateStringsArray` (`ReadonlyArray<string> & {raw}`),
+			// tison's `WithTextPos<T> = T & {pos}`, `interface RegExpMatchArray extends Array<string>`.
+			// Physically just the array -- the extra properties get no slot, so reading one is an honest
+			// `unknown field '...'` rather than a wrong answer, and erasing them here is exactly what keeps
+			// such a value assignable to a plain array parameter with no conversion, the way real TS's own
+			// subtyping already allows. `wasmTypeOf`, not `typeOf`: the object parts must not build (and
+			// register) anonymous shapes as a side effect of merely asking whether they're array-backed.
+			// Falls through to the flatten-and-merge path below when no part is array-backed at all (an
+			// interface extending another interface), or when two parts disagree on the element kind.
 			case 'intersection': {
-				const flatten	= (t: Type): Type[] => t.type === 'intersection' ? t.types.flatMap(t => flatten(t)) : [t];
-				const parts		= flatten(resolved);
-				const memberWtypes = parts.map(typeOf);
-				// A member with no representation of its own (e.g. a further-nested union hitting this same
-				// case, or a genuinely unrepresentable shape) is trivially "not the same physical type as
-				// everything else" -- still a real reason to box as `any`, not a reason to give up on the
-				// whole union. Only every member resolving to the exact same WasmType stays unboxed.
-				return memberWtypes.every(w => w !== undefined) && new Set(memberWtypes.map(w => wasmTypeKey(w!))).size === 1
-					? memberWtypes[0]
-					: REF_ANY;
+				const arr = arrayPartOf(resolved);
+				if (arr)
+					return wasmTypeOf(TS.ArrayType(arr.element), global);
+				break;
 			}
-					*/
 			case 'union': {
 				const nonNullish = resolved.types.filter(m => !T.isNullish(m, global));
 				if (nonNullish.length < resolved.types.length && nonNullish.length > 0) {
@@ -2501,6 +2527,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// intersection, not an 'object' -- `resolveObjectType` flattens+merges it into one flat object
 			// the same way `matchObjectShapeByType` expects.
 			case 'intersection': {
+				// See `arrayPartOf` -- an array carrying extra properties dispatches against `Array` itself.
+				const arr = arrayPartOf(w);
+				if (arr)
+					return ensureClass('Array', [arr.element]);
 				const merged = resolveObjectType(w, global);
 				// Same last resort the 'object' case above uses -- synthesize the flattened shape when
 				// nothing declared matches it, or a value of such a type has no owner to read fields off.

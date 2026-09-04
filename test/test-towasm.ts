@@ -5111,6 +5111,42 @@ async function main() {
 	}
 
 	{
+		// An ARRAY carrying extra properties (`arrayPartOf`) -- physically just the array, so a tag function
+		// typed against the real `TemplateStringsArray` (`extends Array<string>`, plus `raw`) works where it
+		// used to report "no representation". The cooked strings are what `case 'tagged_template'` already
+		// synthesized; this only makes the declared parameter type representable.
+		const { tagLen, firstChunk, viaAlias } = await compile(`
+			function tag(strings: TemplateStringsArray, ...values: number[]): number { return strings.length; }
+			function head(strings: TemplateStringsArray, ...values: number[]): number { return strings[0].length; }
+			function plain(strings: string[]): number { return strings.length; }
+			export function tagLen(): number { return tag\`a\${1}b\${2}c\`; }
+			export function firstChunk(): number { return head\`hello\${1}\`; }
+			// The same value handed to a plain 'string[]' parameter -- no conversion, the physical types are equal.
+			export function viaAlias(): number { const s: TemplateStringsArray = ['a', 'b'] as TemplateStringsArray; return plain(s); }
+		`);
+		check('a TemplateStringsArray tag function compiles and counts its chunks', tagLen(), 3);
+		check('a TemplateStringsArray indexes like the array it is', firstChunk(), 5);
+		check('a TemplateStringsArray is physically a plain string[]', viaAlias(), 2);
+	}
+
+	{
+		// The same shape written two other ways: an interface extending Array (the lib's own
+		// `RegExpMatchArray`/`RegExpExecArray` idiom) and an explicit intersection. Both used to have no
+		// representation at all, in a parameter position or inside a function type.
+		const { len, sum, viaClosure } = await compile(`
+			interface Tagged extends Array<number> { tag: number; }
+			type Marked = number[] & { mark: number };
+			export function len(): number { const t = [1, 2, 3] as Tagged; return t.length; }
+			export function sum(): number { const m = [4, 5] as Marked; return m[0] + m[1]; }
+			function apply(f: (m: Marked) => number, m: Marked): number { return f(m); }
+			export function viaClosure(): number { const m = [7, 8] as Marked; return apply(x => x[1], m); }
+		`);
+		check('an interface extending Array is the array', len(), 3);
+		check('an array/object intersection indexes like the array', sum(), 9);
+		check('an array/object intersection works inside a function type', viaClosure(), 8);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

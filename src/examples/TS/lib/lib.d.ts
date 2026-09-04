@@ -161,6 +161,17 @@ interface RegExpExecArray extends Array<string> {
 	0: string;
 }
 
+//-----------------------------------------------------------------------------
+//	Tagged templates
+//-----------------------------------------------------------------------------
+
+// The array a tag function's first parameter really is -- `case 'tagged_template'` synthesizes a plain
+// `string[]` of the cooked text for it. `raw` is declared so the checker reports its real type rather
+// than "no such property", but has no physical slot: reading it is an honest `unknown field 'raw'`.
+interface TemplateStringsArray extends Array<string> {
+	raw: string[];
+}
+
 interface RegExp {
 	exec(string: string): RegExpExecArray | null;
 	test(string: string): boolean;
