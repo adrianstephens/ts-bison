@@ -51,6 +51,570 @@ class PrefixAccepted {
 	constructor(public value: unknown, public consumed: number) {}
 }
 
+// ===================================================================
+//  Build Tables
+// ===================================================================
+
+// Every state must have an explicit entry for every `alwaysTerminals`/`alwaysSkip` terminal (so the
+// lexer's candidate set is byte-identical everywhere), but the entries themselves are just the default
+// 'error'/'ignore' wherever nothing more specific already won -- deterministic from the grammar alone,
+// so `deserializeTables` reapplies this instead of `serializeTables` writing it to disk.
+function fillAlwaysEntries(g: GrammarBuilder, action: Map<Terminal, ActionEntry>[]) {
+	for (const row of action) {
+		for (const term of g.alwaysTerminals) {
+			if (!row.has(term))
+				row.set(term, { kind: 'error' });
+		}
+		for (const term of g.alwaysSkip) {
+			if (!row.has(term))
+				row.set(term, { kind: 'ignore' });
+		}
+	}
+}
+
+// -- SLR(1)/LALR(1) table construction -------------------------------------
+//
+// Builds the LR(0) automaton, then (when `lalr`) computes per-state LALR(1) reduce lookaheads via
+// fixed-point propagation over it, rather than the canonical-LR(1)-then-merge approach (avoids that
+// method's state explosion). The propagation is monotone over a finite domain so it always terminates;
+// `LALR_MAX_PASSES` is just a tripwire against that invariant ever breaking.
+// `lalr: false` falls back to plain FOLLOW(lhs)-based SLR(1) lookaheads (weaker: more spurious
+// conflicts, but no correctness difference since conflicts still resolve via precedence/GLR either way).
+
+
+function buildLALR(g: GrammarBuilder, lalr = true): ParseTables {
+	if (g.hasPredicates) {
+		const bad = g.rules.find(r => r.rhs.some(s => s instanceof InternalPredicate))!;
+		throw new Error(`And()/Not() are PEG-only and have no LR equivalent (rule '${bad.lhs.name} -> ${bad.rhs.map(s => s.name).join(' ')}'); build this grammar with makePegParser() instead`);
+	}
+
+	interface LR0Item { rule: number; dot: number; }
+	const lr0Key = (i: LR0Item) => `${i.rule}:${i.dot}`;
+
+	const lr0Closure = (items: LR0Item[]): LR0Item[] => {
+		const inSet = new Set(items.map(lr0Key));
+		const queue = [...items];
+		for (const { rule, dot } of queue) {
+			const B = g.rules[rule].rhs[dot];
+			if (B instanceof NonTerminal) {
+				for (const prod of g.rules) {
+					if (prod.lhs === B) {
+						const ni	= { rule: prod.id, dot: 0 };
+						const k		= lr0Key(ni);
+						if (!inSet.has(k)) {
+							inSet.add(k);
+							queue.push(ni);
+						}
+					}
+				}
+			}
+		}
+		return queue;
+	};
+
+	const lr0Goto = (items: LR0Item[], sym: InternalSym) => {
+		return lr0Closure(items
+			.filter(i => g.rules[i.rule].rhs[i.dot] === sym)
+			.map(i => ({ rule: i.rule, dot: i.dot + 1 }))
+		);
+	};
+
+	const lr0SetKey = (items: LR0Item[]) => [...items].map(lr0Key).sort().join('|');
+
+	// Build the LR(0) automaton
+	const lr0States:	LR0Item[][] = [];
+	const lr0Trans:		Map<InternalSym, number>[] = [];
+	const lr0KeyToId	= new Map<string, number>();
+
+	const addLR0State = (items: LR0Item[]): number => {
+		const key = lr0SetKey(items);
+		if (lr0KeyToId.has(key))
+			return lr0KeyToId.get(key)!;
+		const id = lr0States.length;
+		lr0States.push(items);
+		lr0KeyToId.set(key, id);
+		return id;
+	};
+
+	addLR0State(lr0Closure([{ rule: 0, dot: 0 }]));
+
+	for (let si = 0; si < lr0States.length; si++) {
+		lr0Trans[si] = new Map();
+		const syms = new Set(lr0States[si]
+			.filter(i => i.dot < g.rules[i.rule].rhs.length)
+			.map(i => g.rules[i.rule].rhs[i.dot]));
+		for (const sym of syms) {
+			const moved = lr0Goto(lr0States[si], sym);
+			if (moved.length)
+				lr0Trans[si].set(sym, addLR0State(moved));
+		}
+	}
+
+	const numStates = lr0States.length;
+
+	// -- FOLLOW sets (SLR(1) reduce lookaheads) ------------------------
+	const follow = new Map<NonTerminal, Set<Terminal>>();
+	for (const nt of new Set(g.rules.map(r => r.lhs)))
+		follow.set(nt, new Set());
+
+	for (let changed = true; changed; ) {
+		changed = false;
+		for (const rule of g.rules) {
+			for (let i = 0; i < rule.rhs.length; i++) {
+				const sym = rule.rhs[i];
+				if (!(sym instanceof NonTerminal))
+					continue;
+				const followSym = follow.get(sym)!;
+
+				let restNullable = true;
+				for (let j = i + 1; j < rule.rhs.length; j++) {
+					const sf = g.first.get(rule.rhs[j])!;
+					for (const f of sf.terms) {
+						if (!followSym.has(f)) {
+							followSym.add(f);
+							changed = true;
+						}
+					}
+					if (!sf.nullable) {
+						restNullable = false;
+						break;
+					}
+				}
+				if (restNullable) {
+					for (const f of follow.get(rule.lhs)!) {
+						if (!followSym.has(f)) {
+							followSym.add(f);
+							changed = true;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// `lalrLA[state]` maps an LR(0) item (by `lr0Key`) to the terminals valid for reducing it in that state.
+	// Seeded from the accept item's `{EOF}` lookahead, then propagated to a fixed point:
+	//   - closure: item `A -> α.Bβ` with lookahead L gives every `B -> .γ` in the same state FIRST(β) (plus L if β is nullable).
+	//   - goto: an item's lookahead carries unchanged into the corresponding item after a shift/goto on its next symbol.
+	let lalrLA: Map<string, Set<Terminal>>[] | undefined;
+	if (lalr) {
+		lalrLA = lr0States.map(() => new Map<string, Set<Terminal>>());
+
+		const addLA = (state: number, item: LR0Item, terms: Iterable<Terminal>): boolean => {
+			const k = lr0Key(item);
+			let set = lalrLA![state].get(k);
+			if (!set)
+				lalrLA![state].set(k, set = new Set());
+			let added = false;
+			for (const t of terms) {
+				if (!set.has(t)) {
+					set.add(t);
+					added = true;
+				}
+			}
+			return added;
+		};
+
+		addLA(0, { rule: 0, dot: 0 }, [EOF]);
+
+		const LALR_MAX_PASSES = numStates * 8 + 1000;
+		let pass = 0;
+		for (let changed = true; changed; ) {
+			if (++pass > LALR_MAX_PASSES)
+				throw new Error(`LALR(1) lookahead propagation did not converge after ${LALR_MAX_PASSES} passes -- this is a table-construction bug, not a grammar problem`);
+			changed = false;
+			for (let s = 0; s < numStates; s++) {
+				for (const item of lr0States[s]) {
+					const itemLA = lalrLA[s].get(lr0Key(item));
+					if (!itemLA)
+						continue;
+					const rule = g.rules[item.rule];
+					const sym = rule.rhs[item.dot];
+					if (sym === undefined)
+						continue; // complete item -- nothing to propagate from here (handled as a reduce below)
+
+					if (sym instanceof NonTerminal) {
+						let restNullable = true;
+						const firstOfRest = new Set<Terminal>();
+						for (let j = item.dot + 1; j < rule.rhs.length; j++) {
+							const sf = g.first.get(rule.rhs[j])!;
+							for (const f of sf.terms)
+								firstOfRest.add(f);
+							if (!sf.nullable) {
+								restNullable = false;
+								break;
+							}
+						}
+						const laForClosure = restNullable ? new Set([...firstOfRest, ...itemLA]) : firstOfRest;
+						for (const prod of g.rules) {
+							if (prod.lhs === sym && addLA(s, { rule: prod.id, dot: 0 }, laForClosure))
+								changed = true;
+						}
+					}
+
+					const target = lr0Trans[s].get(sym);
+					if (target !== undefined && addLA(target, { rule: item.rule, dot: item.dot + 1 }, itemLA))
+						changed = true;
+				}
+			}
+		}
+	}
+
+	const shiftRule = Array.from({ length: numStates }, () => new Map<Terminal, InternalRule>());
+	const action	= Array.from({ length: numStates }, () => new Map<Terminal, ActionEntry>());
+	const goto		= Array.from({ length: numStates }, () => new Map<NonTerminal, number>());
+	const conflicts: ConflictReport[]	= [];
+
+	for (let s = 0; s < numStates; s++) {
+		for (const item of lr0States[s]) {
+			const r = g.rules[item.rule];
+			if (item.dot < r.rhs.length) {
+				const sym = r.rhs[item.dot];
+				if (sym instanceof Terminal && !shiftRule[s].has(sym))
+					shiftRule[s].set(sym, r);
+			}
+		}
+		for (const [sym, target] of lr0Trans[s]) {
+			if (sym instanceof Terminal)
+				setAction(g, action[s], sym, sym === EOF ? { kind: 'accept' } : { kind: 'shift', state: target }, s, shiftRule[s].get(sym)?.prec, conflicts);
+			else if (sym instanceof NonTerminal)
+				goto[s].set(sym, target);
+		}
+		for (const item of lr0States[s]) {
+			const r = g.rules[item.rule];
+			if (item.dot >= r.rhs.length && r.lhs !== ACCEPT) {
+				const lookaheads = lalr ? (lalrLA![s].get(lr0Key(item)) ?? new Set<Terminal>()) : follow.get(r.lhs)!;
+				for (const la of lookaheads)
+					setAction(g, action[s], la, { kind: 'reduce', rule: item.rule }, s, shiftRule[s].get(la)?.prec, conflicts);
+			}
+		}
+	}
+	fillAlwaysEntries(g, action);
+
+	return {
+		action,
+		goto,
+		rules:		g.rules,
+		conflicts,
+	};
+}
+
+// -- Conflict resolution (Bison rules) ---------------------------
+
+function setAction(g: GrammarBuilder,
+	row:		Map<Terminal, ActionEntry>,
+	term:		Terminal,
+	incoming:	ActionEntry,
+	state:		number,
+	shiftPrec:	PrecEntry | undefined,
+	conflicts:	ConflictReport[]
+) {
+	if (!row.has(term)) {
+		row.set(term, incoming);
+		return;
+	}
+	const existing = row.get(term)!;
+	if (
+		(existing.kind === 'shift' && incoming.kind === 'reduce') ||
+		(existing.kind === 'reduce' && incoming.kind === 'shift')
+	) {
+		const shiftEntry	= (existing.kind === 'shift'	? existing : incoming) as { kind: 'shift';	state:	number };
+		const reduceEntry	= (existing.kind === 'reduce'	? existing : incoming) as { kind: 'reduce';	rule:	number };
+		const reducePrec	= g.rules[reduceEntry.rule].prec;
+
+		if (reducePrec?.assoc === 'fork' || shiftPrec?.assoc === 'fork') {
+			row.set(term, {kind: 'conflict', entries: [shiftEntry, reduceEntry]});
+			conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR (fork)' });
+		} else if (shiftPrec !== undefined && reducePrec !== undefined) {
+			if (reducePrec.level! > shiftPrec.level!) {
+				row.set(term, reduceEntry);
+				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'reduce (reduce-rule prec > shift-rule prec)' });
+			} else if (reducePrec.level! < shiftPrec.level!) {
+				row.set(term, shiftEntry);
+				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'shift (shift-rule prec > reduce-rule prec)' });
+			} else if (shiftPrec.assoc === 'left') {
+				row.set(term, reduceEntry);
+				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'reduce (left assoc)' });
+			} else if (shiftPrec.assoc === 'right') {
+				row.set(term, shiftEntry);
+				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'shift (right assoc)' });
+			} else {
+				row.set(term, {kind: 'conflict', entries: [shiftEntry, reduceEntry]});
+				conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR' });
+			}
+		} else {
+			row.set(term, shiftEntry);
+			// Name the silently-losing reduce rule: unflagged default-shifts are the classic source of
+			// "wrong parse, no error" bugs here, and knowing which rule lost is the first debugging step.
+			const lost = g.rules[reduceEntry.rule];
+			conflicts.push({ state, term, kind: 'auto', resolution: `shift (default, no prec info; loses reduce of rule ${lost.id}: ${lost.lhs.name} -> ${lost.rhs.map(s => s.name).join(' ')})` });
+		}
+
+	} else if (existing.kind === 'reduce' && incoming.kind === 'reduce') {
+		if (g.rules[existing.rule].prec?.assoc === 'fork' || g.rules[incoming.rule].prec?.assoc === 'fork') {
+			row.set(term, {kind: 'conflict', entries: [existing, incoming]});
+			conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR (fork)' });
+		} else {
+			const winner = existing.rule < incoming.rule ? existing : incoming;
+			row.set(term, winner);
+			conflicts.push({ state, term, kind: 'reduce-reduce', resolution: `reduce by rule ${winner.rule} (earlier rule wins)` });
+		}
+	}
+	// shift-shift / accept: keep existing (shouldn't occur in valid grammars)
+}
+
+// ===================================================================
+//  Unit-rule GOTO bypass
+// ===================================================================
+// When a reduce lands on a state whose only possible move is reducing a pass-through unit rule (`A -> B`,
+// identity action), that hop is a no-op: redirecting goto(s, B) straight to goto(s, A) at table-build time
+// skips it.
+//
+// IMPORTANT: only GOTO entries are rewritten, never shift targets -- action rows double as the lexer's
+// allowed-terminal sets, which must stay byte-identical for candidate-restricted terminal callbacks
+// (regex-vs-divide, ASI, contextual keywords) to keep making the same choices. Don't extend this to shifts.
+//
+// A state qualifies only if every action is the SAME identity-unit reduce and it has no gotos of its own.
+function eliminateUnitGotos(tables: ParseTables): number {
+	// Reduce-only states and the nonterminal their unit rule forwards to.
+	const bypass = new Map<number, NonTerminal>();
+	for (let s = 0; s < tables.action.length; s++) {
+		if (tables.goto[s].size)
+			continue;
+		let ruleId = -1;
+		for (const entry of tables.action[s].values()) {
+			if (entry.kind === 'ignore' || entry.kind === 'error')
+				continue;
+			if (entry.kind !== 'reduce' || (ruleId >= 0 && ruleId !== entry.rule)) {
+				ruleId = -2;
+				break;
+			}
+			ruleId = entry.rule;
+		}
+		if (ruleId < 0)
+			continue;
+		const rule = tables.rules[ruleId];
+		// `!rule.merge`: a rule with a GLR convergence combiner must keep its reduce, since bypassing it
+		// would also skip the merge hook that fires when two fork paths converge on that reduce.
+		if (rule.action === identityAction && !rule.merge && !rule.peek && rule.rhs.length === 1 && rule.rhs[0] instanceof NonTerminal)
+			bypass.set(s, rule.lhs);
+	}
+
+	// Redirect until stable: a redirect target can itself be a bypassable state (chained unit rules).
+	// The iteration cap guards against pathological unit *cycles* (`A -> B`, `B -> A`); real chains are no deeper than the grammar's unit nesting.
+	let redirected = 0;
+	for (let changed = true, guard = 100; changed && guard--; ) {
+		changed = false;
+		for (const gotoRow of tables.goto) {
+			for (const [nt, target] of gotoRow) {
+				const lhs = bypass.get(target);
+				if (lhs && lhs !== nt) {
+					const fwd = gotoRow.get(lhs);
+					if (fwd !== undefined && fwd !== target) {
+						gotoRow.set(nt, fwd);
+						redirected++;
+						changed = true;
+					}
+				}
+			}
+		}
+	}
+	return redirected;
+}
+
+// ===================================================================
+//  Table (de)serialization
+// ===================================================================
+// `buildTables` (the LR(0)/LALR automaton construction) depends only on grammar *shape* -- which
+// terminals/nonterminals appear where, precedence, `lalr`/`optimize` -- never on the action closures
+// themselves. So a cache only needs `action`/`goto`; `rules` (which carries the live `.action` closures)
+// is regenerated for free as a side effect of reconstructing `GrammarBuilder` from the spec, which
+// callers must do anyway to get a fingerprint to validate the cache against.
+
+export const TABLE_FORMAT_VERSION = 4;
+
+// Rows are flat number arrays, not `[key, value]` pairs -- every terminal/nonterminal is already an
+// index into a namespace `deserializeTables` reconstructs from the live `GrammarBuilder`, so nothing here is ever a string: entries are effectively
+// tables of small integers, the same shape the built-in `Map`/`Terminal` objects hide.
+//
+// action row: `[...defaultEntry, ...(termIndex*2 | isException)*]` -- an instruction-set-sized grammar
+// (hundreds of terminals) has states where nearly every terminal reduces by the *same* rule (e.g. "any
+// terminal that can start another instruction"), so most of a row's entries are one repeated value.
+// Rather than writing that value out per terminal, the row leads with its single most-common entry as
+// a default (chosen by `serializeTables`, same shape as `encodeEntry` produces for any entry), then
+// lists every terminal as just its tagged index: even (`i*2`) means "use the row default", odd
+// (`i*2+1`) means an explicit entry follows, encoded the same way as the header. Genuinely dense/varied
+// rows (e.g. WAT's ~25 "start of instruction" dispatch states, one real shift target per opcode) get
+// no benefit from this -- nothing there repeats -- but cost only one extra number per entry to allow it.
+// goto row: repeated (ntIndex, state) pairs.
+
+const EntryTag = { Shift: 0, Reduce: 1, Accept: 2, Conflict: 3 } as const;
+
+export interface SerializedTables {
+	action:		number[][];
+	goto:		number[][];
+}
+
+// Deterministic index for each NonTerminal, in first-encounter order over `g.rules`. NonTerminal
+// identity (not `.name`) is what matters -- anonymous/inlined rules can share the literal name
+// 'unknown name' -- but re-running `new GrammarBuilder(spec)` from the same spec always walks rules in
+// the same order, so the indices line up again on reload.
+function indexNonTerminals(g: GrammarBuilder): Map<NonTerminal, number> {
+	const index = new Map<NonTerminal, number>();
+	const add = (nt: NonTerminal) => { if (!index.has(nt)) index.set(nt, index.size); };
+	for (const r of g.rules) {
+		add(r.lhs);
+		for (const sym of r.rhs) {
+			if (sym instanceof NonTerminal)
+				add(sym);
+		}
+	}
+	return index;
+}
+
+// Terminal identity is already stable-and-unique by `.name` (see `GrammarBuilder`'s interning), so
+// `g.terminalsByName`'s own (deterministic, insertion-ordered) iteration doubles as the index -- plus
+// EOF/ERROR, the two terminals that live outside that map.
+function terminalsByIndex(g: GrammarBuilder): Terminal[] {
+	return [...g.terminalsByName.values(), EOF, ERROR];
+}
+
+function encodeEntry(out: number[], entry: ActionEntry) {
+	switch (entry.kind) {
+		case 'shift':		out.push(EntryTag.Shift, entry.state); break;
+		case 'reduce':		out.push(EntryTag.Reduce, entry.rule); break;
+		case 'accept':		out.push(EntryTag.Accept); break;
+		case 'conflict':
+			out.push(EntryTag.Conflict, entry.entries.length);
+			for (const e of entry.entries)
+				encodeEntry(out, e);
+			break;
+		// 'error'/'ignore' never reach here -- `serializeTables` filters them out below.
+	}
+}
+
+// `cursor` is mutated in place so nested `conflict` entries can keep consuming from the same row.
+function decodeEntry(row: number[], cursor: { i: number }): ActionEntry {
+	switch (row[cursor.i++] as 0|1|2|3) {
+		case EntryTag.Shift:	return { kind: 'shift', state: row[cursor.i++] };
+		case EntryTag.Reduce:	return { kind: 'reduce', rule: row[cursor.i++] };
+		case EntryTag.Accept:	return { kind: 'accept' };
+		case EntryTag.Conflict: return { kind: 'conflict', entries: Array.from({ length: row[cursor.i++] }, () => decodeEntry(row, cursor)) };
+	}
+}
+
+// 'error'/'ignore' entries are never anything but `fillAlwaysEntries`'s own default (see its comment) --
+// skip them here, `deserializeTables` regenerates them instead of storing millions of redundant entries
+// for grammars with large `alwaysTerminals`/`alwaysSkip` sets.
+export function serializeTables(g: GrammarBuilder, tables: ParseTables): SerializedTables {
+	const termIndex	= new Map(terminalsByIndex(g).map((t, i) => [t, i]));
+	const ntIndex	= indexNonTerminals(g);
+	return {
+		action: tables.action.map(row => {
+			const real = [...row]
+				.filter(([, entry]) => entry.kind !== 'error' && entry.kind !== 'ignore')
+				.map(([term, entry]) => ({ idx: termIndex.get(term)!, entry, key: JSON.stringify(entry) }));
+			if (!real.length)
+				return [];
+
+			// Pick the entry (by structural value, not identity) that recurs most often in this row as
+			// the default -- ties broken by first-seen, which only affects which encoding is chosen,
+			// never correctness.
+			const counts = new Map<string, { entry: ActionEntry; count: number }>();
+			for (const { entry, key } of real) {
+				const found = counts.get(key);
+				if (found)
+					found.count++;
+				else
+					counts.set(key, { entry, count: 1 });
+			}
+			let [best] = counts.values();
+			for (const c of counts.values()) {
+				if (c.count > best.count)
+					best = c;
+			}
+			const defaultKey = JSON.stringify(best.entry);
+
+			const out: number[] = [];
+			encodeEntry(out, best.entry);
+			for (const { idx, entry, key } of real) {
+				if (key === defaultKey) {
+					out.push(idx * 2);
+				} else {
+					out.push(idx * 2 + 1);
+					encodeEntry(out, entry);
+				}
+			}
+			return out;
+		}),
+		goto: tables.goto.map(row => {
+			const out: number[] = [];
+			for (const [nt, state] of row)
+				out.push(ntIndex.get(nt)!, state);
+			return out;
+		}),
+	};
+}
+
+
+// `g` must come from a fresh `new GrammarBuilder(spec)` for the *same* spec the tables were serialized
+// from -- that's what supplies both the live `.action` closures (via `g.rules`) and the terminal/index
+// namespaces the serialized rows were written against. The returned `conflicts` is always `[]` (see the
+// comment on `TABLE_FORMAT_VERSION`) -- callers that want real conflict diagnostics need an uncached
+// `g.buildTables(...)`.
+export function deserializeTables(g: GrammarBuilder, s: SerializedTables): ParseTables {
+	const termByIndex	= terminalsByIndex(g);
+	const ntByIndex		= [...indexNonTerminals(g).entries()].sort((a, b) => a[1] - b[1]).map(([nt]) => nt);
+	const action = s.action.map(row => {
+		const m = new Map<Terminal, ActionEntry>();
+		if (!row.length)
+			return m;
+		const cursor = { i: 0 };
+		const defaultEntry = decodeEntry(row, cursor);
+		while (cursor.i < row.length) {
+			const tagged	= row[cursor.i++];
+			m.set(termByIndex[tagged >> 1], (tagged & 1) ? decodeEntry(row, cursor) : defaultEntry);
+		}
+		return m;
+	});
+	fillAlwaysEntries(g, action);
+	return {
+		action,
+		goto: s.goto.map(row => {
+			const m = new Map<NonTerminal, number>();
+			for (let i = 0; i < row.length; i += 2)
+				m.set(ntByIndex[row[i]], row[i + 1]);
+			return m;
+		}),
+		rules:		g.rules,
+		conflicts:	[],
+	};
+}
+
+// A plain JSON-serializable snapshot of everything that can affect `buildTables`'s output. Callers hash
+// this (e.g. sha256 of `JSON.stringify(...)`) to decide whether a cached `SerializedTables` is still
+// valid for the current grammar -- cheaper and more robust than a source-file mtime check, since it
+// also catches grammar-equivalent edits (renames, reformatting) that don't need to invalidate the cache,
+// and is naturally versioned via TABLE_FORMAT_VERSION for engine-side algorithm changes.
+export function grammarFingerprint(g: GrammarBuilder, spec: GrammarSpec<any>): unknown {
+	const ntIndex = indexNonTerminals(g);
+	const symKey = (sym: InternalSym): string =>
+		sym instanceof Terminal				? `t:${sym.name}`
+		: sym instanceof InternalPredicate	? `p:${sym.negate ? '!' : '&'}${symKey(sym.sym)}`
+		: `n:${ntIndex.get(sym)}`;
+	return {
+		version:			TABLE_FORMAT_VERSION,
+		terminals:			[...g.terminalsByName.values()].map(t => [t.name, t.pattern?.source ?? null]),
+		alwaysTerminals:	g.alwaysTerminals.map(t => t.name),
+		alwaysSkip:			g.alwaysSkip.map(t => t.name),
+		rules:				g.rules.map(r => [symKey(r.lhs), r.rhs.map(symKey), r.prec ?? null]),
+	};
+}
+
+// ===================================================================
+//  Parser
+// ===================================================================
+
 function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any, prefixMode?: boolean) {
 	const stack: StackEntry[] = [{ state: 0, value: undefined }];
 
@@ -315,565 +879,6 @@ function runGlrFork(tables: ParseTables, stream: Lexer, tok: Token, ctx: any, re
 				allowed.set(term, entry);
 		tok = stream.next(allowed);
 	}
-}
-
-// ===================================================================
-//  Unit-rule GOTO bypass
-// ===================================================================
-// When a reduce lands on a state whose only possible move is reducing a pass-through unit rule (`A -> B`,
-// identity action), that hop is a no-op: redirecting goto(s, B) straight to goto(s, A) at table-build time
-// skips it.
-//
-// IMPORTANT: only GOTO entries are rewritten, never shift targets -- action rows double as the lexer's
-// allowed-terminal sets, which must stay byte-identical for candidate-restricted terminal callbacks
-// (regex-vs-divide, ASI, contextual keywords) to keep making the same choices. Don't extend this to shifts.
-//
-// A state qualifies only if every action is the SAME identity-unit reduce and it has no gotos of its own.
-function eliminateUnitGotos(tables: ParseTables): number {
-	// Reduce-only states and the nonterminal their unit rule forwards to.
-	const bypass = new Map<number, NonTerminal>();
-	for (let s = 0; s < tables.action.length; s++) {
-		if (tables.goto[s].size)
-			continue;
-		let ruleId = -1;
-		for (const entry of tables.action[s].values()) {
-			if (entry.kind === 'ignore' || entry.kind === 'error')
-				continue;
-			if (entry.kind !== 'reduce' || (ruleId >= 0 && ruleId !== entry.rule)) {
-				ruleId = -2;
-				break;
-			}
-			ruleId = entry.rule;
-		}
-		if (ruleId < 0)
-			continue;
-		const rule = tables.rules[ruleId];
-		// `!rule.merge`: a rule with a GLR convergence combiner must keep its reduce, since bypassing it
-		// would also skip the merge hook that fires when two fork paths converge on that reduce.
-		if (rule.action === identityAction && !rule.merge && !rule.peek && rule.rhs.length === 1 && rule.rhs[0] instanceof NonTerminal)
-			bypass.set(s, rule.lhs);
-	}
-
-	// Redirect until stable: a redirect target can itself be a bypassable state (chained unit rules).
-	// The iteration cap guards against pathological unit *cycles* (`A -> B`, `B -> A`); real chains are no deeper than the grammar's unit nesting.
-	let redirected = 0;
-	for (let changed = true, guard = 100; changed && guard--; ) {
-		changed = false;
-		for (const gotoRow of tables.goto) {
-			for (const [nt, target] of gotoRow) {
-				const lhs = bypass.get(target);
-				if (lhs && lhs !== nt) {
-					const fwd = gotoRow.get(lhs);
-					if (fwd !== undefined && fwd !== target) {
-						gotoRow.set(nt, fwd);
-						redirected++;
-						changed = true;
-					}
-				}
-			}
-		}
-	}
-	return redirected;
-}
-
-// ===================================================================
-//  Table (de)serialization
-// ===================================================================
-// `buildTables` (the LR(0)/LALR automaton construction) depends only on grammar *shape* -- which
-// terminals/nonterminals appear where, precedence, `lalr`/`optimize` -- never on the action closures
-// themselves. So a cache only needs `action`/`goto`; `rules` (which carries the live `.action` closures)
-// is regenerated for free as a side effect of reconstructing `GrammarBuilder` from the spec, which
-// callers must do anyway to get a fingerprint to validate the cache against.
-
-export const TABLE_FORMAT_VERSION = 4;
-
-// Rows are flat number arrays, not `[key, value]` pairs -- every terminal/nonterminal is already an
-// index into a namespace `deserializeTables` reconstructs from the live `GrammarBuilder`, so nothing here is ever a string: entries are effectively
-// tables of small integers, the same shape the built-in `Map`/`Terminal` objects hide.
-//
-// action row: `[...defaultEntry, ...(termIndex*2 | isException)*]` -- an instruction-set-sized grammar
-// (hundreds of terminals) has states where nearly every terminal reduces by the *same* rule (e.g. "any
-// terminal that can start another instruction"), so most of a row's entries are one repeated value.
-// Rather than writing that value out per terminal, the row leads with its single most-common entry as
-// a default (chosen by `serializeTables`, same shape as `encodeEntry` produces for any entry), then
-// lists every terminal as just its tagged index: even (`i*2`) means "use the row default", odd
-// (`i*2+1`) means an explicit entry follows, encoded the same way as the header. Genuinely dense/varied
-// rows (e.g. WAT's ~25 "start of instruction" dispatch states, one real shift target per opcode) get
-// no benefit from this -- nothing there repeats -- but cost only one extra number per entry to allow it.
-// goto row: repeated (ntIndex, state) pairs.
-
-const EntryTag = { Shift: 0, Reduce: 1, Accept: 2, Conflict: 3 } as const;
-
-export interface SerializedTables {
-	action:		number[][];
-	goto:		number[][];
-}
-
-// Deterministic index for each NonTerminal, in first-encounter order over `g.rules`. NonTerminal
-// identity (not `.name`) is what matters -- anonymous/inlined rules can share the literal name
-// 'unknown name' -- but re-running `new GrammarBuilder(spec)` from the same spec always walks rules in
-// the same order, so the indices line up again on reload.
-function indexNonTerminals(g: GrammarBuilder): Map<NonTerminal, number> {
-	const index = new Map<NonTerminal, number>();
-	const add = (nt: NonTerminal) => { if (!index.has(nt)) index.set(nt, index.size); };
-	for (const r of g.rules) {
-		add(r.lhs);
-		for (const sym of r.rhs) {
-			if (sym instanceof NonTerminal)
-				add(sym);
-		}
-	}
-	return index;
-}
-
-// Terminal identity is already stable-and-unique by `.name` (see `GrammarBuilder`'s interning), so
-// `g.terminalsByName`'s own (deterministic, insertion-ordered) iteration doubles as the index -- plus
-// EOF/ERROR, the two terminals that live outside that map.
-function terminalsByIndex(g: GrammarBuilder): Terminal[] {
-	return [...g.terminalsByName.values(), EOF, ERROR];
-}
-
-function encodeEntry(out: number[], entry: ActionEntry) {
-	switch (entry.kind) {
-		case 'shift':		out.push(EntryTag.Shift, entry.state); break;
-		case 'reduce':		out.push(EntryTag.Reduce, entry.rule); break;
-		case 'accept':		out.push(EntryTag.Accept); break;
-		case 'conflict':
-			out.push(EntryTag.Conflict, entry.entries.length);
-			for (const e of entry.entries)
-				encodeEntry(out, e);
-			break;
-		// 'error'/'ignore' never reach here -- `serializeTables` filters them out below.
-	}
-}
-
-// `cursor` is mutated in place so nested `conflict` entries can keep consuming from the same row.
-function decodeEntry(row: number[], cursor: { i: number }): ActionEntry {
-	switch (row[cursor.i++] as 0|1|2|3) {
-		case EntryTag.Shift:	return { kind: 'shift', state: row[cursor.i++] };
-		case EntryTag.Reduce:	return { kind: 'reduce', rule: row[cursor.i++] };
-		case EntryTag.Accept:	return { kind: 'accept' };
-		case EntryTag.Conflict: return { kind: 'conflict', entries: Array.from({ length: row[cursor.i++] }, () => decodeEntry(row, cursor)) };
-	}
-}
-
-// 'error'/'ignore' entries are never anything but `fillAlwaysEntries`'s own default (see its comment) --
-// skip them here, `deserializeTables` regenerates them instead of storing millions of redundant entries
-// for grammars with large `alwaysTerminals`/`alwaysSkip` sets.
-export function serializeTables(g: GrammarBuilder, tables: ParseTables): SerializedTables {
-	const termIndex	= new Map(terminalsByIndex(g).map((t, i) => [t, i]));
-	const ntIndex	= indexNonTerminals(g);
-	return {
-		action: tables.action.map(row => {
-			const real = [...row]
-				.filter(([, entry]) => entry.kind !== 'error' && entry.kind !== 'ignore')
-				.map(([term, entry]) => ({ idx: termIndex.get(term)!, entry, key: JSON.stringify(entry) }));
-			if (!real.length)
-				return [];
-
-			// Pick the entry (by structural value, not identity) that recurs most often in this row as
-			// the default -- ties broken by first-seen, which only affects which encoding is chosen,
-			// never correctness.
-			const counts = new Map<string, { entry: ActionEntry; count: number }>();
-			for (const { entry, key } of real) {
-				const found = counts.get(key);
-				if (found)
-					found.count++;
-				else
-					counts.set(key, { entry, count: 1 });
-			}
-			let [best] = counts.values();
-			for (const c of counts.values()) {
-				if (c.count > best.count)
-					best = c;
-			}
-			const defaultKey = JSON.stringify(best.entry);
-
-			const out: number[] = [];
-			encodeEntry(out, best.entry);
-			for (const { idx, entry, key } of real) {
-				if (key === defaultKey) {
-					out.push(idx * 2);
-				} else {
-					out.push(idx * 2 + 1);
-					encodeEntry(out, entry);
-				}
-			}
-			return out;
-		}),
-		goto: tables.goto.map(row => {
-			const out: number[] = [];
-			for (const [nt, state] of row)
-				out.push(ntIndex.get(nt)!, state);
-			return out;
-		}),
-	};
-}
-
-// Every state must have an explicit entry for every `alwaysTerminals`/`alwaysSkip` terminal (so the
-// lexer's candidate set is byte-identical everywhere), but the entries themselves are just the default
-// 'error'/'ignore' wherever nothing more specific already won -- deterministic from the grammar alone,
-// so `deserializeTables` reapplies this instead of `serializeTables` writing it to disk.
-function fillAlwaysEntries(g: GrammarBuilder, action: Map<Terminal, ActionEntry>[]) {
-	for (const row of action) {
-		for (const term of g.alwaysTerminals) {
-			if (!row.has(term))
-				row.set(term, { kind: 'error' });
-		}
-		for (const term of g.alwaysSkip) {
-			if (!row.has(term))
-				row.set(term, { kind: 'ignore' });
-		}
-	}
-}
-
-// `g` must come from a fresh `new GrammarBuilder(spec)` for the *same* spec the tables were serialized
-// from -- that's what supplies both the live `.action` closures (via `g.rules`) and the terminal/index
-// namespaces the serialized rows were written against. The returned `conflicts` is always `[]` (see the
-// comment on `TABLE_FORMAT_VERSION`) -- callers that want real conflict diagnostics need an uncached
-// `g.buildTables(...)`.
-export function deserializeTables(g: GrammarBuilder, s: SerializedTables): ParseTables {
-	const termByIndex	= terminalsByIndex(g);
-	const ntByIndex		= [...indexNonTerminals(g).entries()].sort((a, b) => a[1] - b[1]).map(([nt]) => nt);
-	const action = s.action.map(row => {
-		const m = new Map<Terminal, ActionEntry>();
-		if (!row.length)
-			return m;
-		const cursor = { i: 0 };
-		const defaultEntry = decodeEntry(row, cursor);
-		while (cursor.i < row.length) {
-			const tagged	= row[cursor.i++];
-			const term		= termByIndex[tagged >> 1];
-			m.set(term, (tagged & 1) ? decodeEntry(row, cursor) : defaultEntry);
-		}
-		return m;
-	});
-	fillAlwaysEntries(g, action);
-	return {
-		action,
-		goto: s.goto.map(row => {
-			const m = new Map<NonTerminal, number>();
-			for (let i = 0; i < row.length; i += 2)
-				m.set(ntByIndex[row[i]], row[i + 1]);
-			return m;
-		}),
-		rules:		g.rules,
-		conflicts:	[],
-	};
-}
-
-// A plain JSON-serializable snapshot of everything that can affect `buildTables`'s output. Callers hash
-// this (e.g. sha256 of `JSON.stringify(...)`) to decide whether a cached `SerializedTables` is still
-// valid for the current grammar -- cheaper and more robust than a source-file mtime check, since it
-// also catches grammar-equivalent edits (renames, reformatting) that don't need to invalidate the cache,
-// and is naturally versioned via TABLE_FORMAT_VERSION for engine-side algorithm changes.
-export function grammarFingerprint(g: GrammarBuilder, spec: GrammarSpec<any>): unknown {
-	const ntIndex = indexNonTerminals(g);
-	const symKey = (sym: InternalSym): string =>
-		sym instanceof Terminal				? `t:${sym.name}`
-		: sym instanceof InternalPredicate	? `p:${sym.negate ? '!' : '&'}${symKey(sym.sym)}`
-		: `n:${ntIndex.get(sym)}`;
-	return {
-		version:			TABLE_FORMAT_VERSION,
-		terminals:			[...g.terminalsByName.values()].map(t => [t.name, t.pattern?.source ?? null]),
-		alwaysTerminals:	g.alwaysTerminals.map(t => t.name),
-		alwaysSkip:			g.alwaysSkip.map(t => t.name),
-		rules:				g.rules.map(r => [symKey(r.lhs), r.rhs.map(symKey), r.prec ?? null]),
-	};
-}
-
-// ===================================================================
-//  Build Tables
-// ===================================================================
-
-// -- SLR(1)/LALR(1) table construction -------------------------------------
-//
-// Builds the LR(0) automaton, then (when `lalr`) computes per-state LALR(1) reduce lookaheads via
-// fixed-point propagation over it, rather than the canonical-LR(1)-then-merge approach (avoids that
-// method's state explosion). The propagation is monotone over a finite domain so it always terminates;
-// `LALR_MAX_PASSES` is just a tripwire against that invariant ever breaking.
-// `lalr: false` falls back to plain FOLLOW(lhs)-based SLR(1) lookaheads (weaker: more spurious
-// conflicts, but no correctness difference since conflicts still resolve via precedence/GLR either way).
-
-function buildLALR(g: GrammarBuilder, lalr = true): ParseTables {
-	if (g.hasPredicates) {
-		const bad = g.rules.find(r => r.rhs.some(s => s instanceof InternalPredicate))!;
-		throw new Error(`And()/Not() are PEG-only and have no LR equivalent (rule '${bad.lhs.name} -> ${bad.rhs.map(s => s.name).join(' ')}'); build this grammar with makePegParser() instead`);
-	}
-
-	interface LR0Item { rule: number; dot: number; }
-	const lr0Key = (i: LR0Item) => `${i.rule}:${i.dot}`;
-
-	const lr0Closure = (items: LR0Item[]): LR0Item[] => {
-		const inSet = new Set(items.map(lr0Key));
-		const queue = [...items];
-		for (const { rule, dot } of queue) {
-			const B = g.rules[rule].rhs[dot];
-			if (B instanceof NonTerminal) {
-				for (const prod of g.rules) {
-					if (prod.lhs === B) {
-						const ni	= { rule: prod.id, dot: 0 };
-						const k		= lr0Key(ni);
-						if (!inSet.has(k)) {
-							inSet.add(k);
-							queue.push(ni);
-						}
-					}
-				}
-			}
-		}
-		return queue;
-	};
-
-	const lr0Goto = (items: LR0Item[], sym: InternalSym) => {
-		const moved = items
-			.filter(i => g.rules[i.rule].rhs[i.dot] === sym)
-			.map(i => ({ rule: i.rule, dot: i.dot + 1 }));
-		return lr0Closure(moved);
-	};
-
-	const lr0SetKey = (items: LR0Item[]) => [...items].map(lr0Key).sort().join('|');
-
-	// Build the LR(0) automaton
-	const lr0States:	LR0Item[][] = [];
-	const lr0Trans:		Map<InternalSym, number>[] = [];
-	const lr0KeyToId	= new Map<string, number>();
-
-	const addLR0State = (items: LR0Item[]): number => {
-		const key = lr0SetKey(items);
-		if (lr0KeyToId.has(key))
-			return lr0KeyToId.get(key)!;
-		const id = lr0States.length;
-		lr0States.push(items);
-		lr0KeyToId.set(key, id);
-		return id;
-	};
-
-	addLR0State(lr0Closure([{ rule: 0, dot: 0 }]));
-
-	for (let si = 0; si < lr0States.length; si++) {
-		lr0Trans[si] = new Map();
-		const syms = new Set(lr0States[si]
-			.filter(i => i.dot < g.rules[i.rule].rhs.length)
-			.map(i => g.rules[i.rule].rhs[i.dot]));
-		for (const sym of syms) {
-			const moved = lr0Goto(lr0States[si], sym);
-			if (moved.length)
-				lr0Trans[si].set(sym, addLR0State(moved));
-		}
-	}
-
-	const numStates = lr0States.length;
-
-	// -- FOLLOW sets (SLR(1) reduce lookaheads) ------------------------
-	const follow = new Map<NonTerminal, Set<Terminal>>();
-	for (const nt of new Set(g.rules.map(r => r.lhs)))
-		follow.set(nt, new Set());
-
-	for (let changed = true; changed; ) {
-		changed = false;
-		for (const rule of g.rules) {
-			for (let i = 0; i < rule.rhs.length; i++) {
-				const sym = rule.rhs[i];
-				if (!(sym instanceof NonTerminal))
-					continue;
-				const followSym = follow.get(sym)!;
-
-				let restNullable = true;
-				for (let j = i + 1; j < rule.rhs.length; j++) {
-					const sf = g.first.get(rule.rhs[j])!;
-					for (const f of sf.terms) {
-						if (!followSym.has(f)) {
-							followSym.add(f);
-							changed = true;
-						}
-					}
-					if (!sf.nullable) {
-						restNullable = false;
-						break;
-					}
-				}
-				if (restNullable) {
-					for (const f of follow.get(rule.lhs)!) {
-						if (!followSym.has(f)) {
-							followSym.add(f);
-							changed = true;
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// `lalrLA[state]` maps an LR(0) item (by `lr0Key`) to the terminals valid for reducing it in that state.
-	// Seeded from the accept item's `{EOF}` lookahead, then propagated to a fixed point:
-	//   - closure: item `A -> α.Bβ` with lookahead L gives every `B -> .γ` in the same state FIRST(β) (plus L if β is nullable).
-	//   - goto: an item's lookahead carries unchanged into the corresponding item after a shift/goto on its next symbol.
-	let lalrLA: Map<string, Set<Terminal>>[] | undefined;
-	if (lalr) {
-		lalrLA = lr0States.map(() => new Map<string, Set<Terminal>>());
-
-		const addLA = (state: number, item: LR0Item, terms: Iterable<Terminal>): boolean => {
-			const k = lr0Key(item);
-			let set = lalrLA![state].get(k);
-			if (!set)
-				lalrLA![state].set(k, set = new Set());
-			let added = false;
-			for (const t of terms) {
-				if (!set.has(t)) {
-					set.add(t);
-					added = true;
-				}
-			}
-			return added;
-		};
-
-		addLA(0, { rule: 0, dot: 0 }, [EOF]);
-
-		const LALR_MAX_PASSES = numStates * 8 + 1000;
-		let pass = 0;
-		for (let changed = true; changed; ) {
-			if (++pass > LALR_MAX_PASSES)
-				throw new Error(`LALR(1) lookahead propagation did not converge after ${LALR_MAX_PASSES} passes -- this is a table-construction bug, not a grammar problem`);
-			changed = false;
-			for (let s = 0; s < numStates; s++) {
-				for (const item of lr0States[s]) {
-					const itemLA = lalrLA[s].get(lr0Key(item));
-					if (!itemLA)
-						continue;
-					const rule = g.rules[item.rule];
-					const sym = rule.rhs[item.dot];
-					if (sym === undefined)
-						continue; // complete item -- nothing to propagate from here (handled as a reduce below)
-
-					if (sym instanceof NonTerminal) {
-						let restNullable = true;
-						const firstOfRest = new Set<Terminal>();
-						for (let j = item.dot + 1; j < rule.rhs.length; j++) {
-							const sf = g.first.get(rule.rhs[j])!;
-							for (const f of sf.terms)
-								firstOfRest.add(f);
-							if (!sf.nullable) {
-								restNullable = false;
-								break;
-							}
-						}
-						const laForClosure = restNullable ? new Set([...firstOfRest, ...itemLA]) : firstOfRest;
-						for (const prod of g.rules) {
-							if (prod.lhs === sym && addLA(s, { rule: prod.id, dot: 0 }, laForClosure))
-								changed = true;
-						}
-					}
-
-					const target = lr0Trans[s].get(sym);
-					if (target !== undefined && addLA(target, { rule: item.rule, dot: item.dot + 1 }, itemLA))
-						changed = true;
-				}
-			}
-		}
-	}
-
-	const shiftRule = Array.from({ length: numStates }, () => new Map<Terminal, InternalRule>());
-	const action	= Array.from({ length: numStates }, () => new Map<Terminal, ActionEntry>());
-	const goto		= Array.from({ length: numStates }, () => new Map<NonTerminal, number>());
-	const conflicts: ConflictReport[]	= [];
-
-	for (let s = 0; s < numStates; s++) {
-		for (const item of lr0States[s]) {
-			const r = g.rules[item.rule];
-			if (item.dot < r.rhs.length) {
-				const sym = r.rhs[item.dot];
-				if (sym instanceof Terminal && !shiftRule[s].has(sym))
-					shiftRule[s].set(sym, r);
-			}
-		}
-		for (const [sym, target] of lr0Trans[s]) {
-			if (sym instanceof Terminal)
-				setAction(g, action[s], sym, sym === EOF ? { kind: 'accept' } : { kind: 'shift', state: target }, s, shiftRule[s].get(sym)?.prec, conflicts);
-			else if (sym instanceof NonTerminal)
-				goto[s].set(sym, target);
-		}
-		for (const item of lr0States[s]) {
-			const r = g.rules[item.rule];
-			if (item.dot >= r.rhs.length && r.lhs !== ACCEPT) {
-				const lookaheads = lalr ? (lalrLA![s].get(lr0Key(item)) ?? new Set<Terminal>()) : follow.get(r.lhs)!;
-				for (const la of lookaheads)
-					setAction(g, action[s], la, { kind: 'reduce', rule: item.rule }, s, shiftRule[s].get(la)?.prec, conflicts);
-			}
-		}
-	}
-	fillAlwaysEntries(g, action);
-
-	return {
-		action,
-		goto,
-		rules:		g.rules,
-		conflicts,
-	};
-}
-
-// -- Conflict resolution (Bison rules) ---------------------------
-
-function setAction(g: GrammarBuilder,
-	row:		Map<Terminal, ActionEntry>,
-	term:		Terminal,
-	incoming:	ActionEntry,
-	state:		number,
-	shiftPrec:	PrecEntry | undefined,
-	conflicts:	ConflictReport[]
-) {
-	if (!row.has(term)) {
-		row.set(term, incoming);
-		return;
-	}
-	const existing = row.get(term)!;
-	if (
-		(existing.kind === 'shift' && incoming.kind === 'reduce') ||
-		(existing.kind === 'reduce' && incoming.kind === 'shift')
-	) {
-		const shiftEntry	= (existing.kind === 'shift'	? existing : incoming) as { kind: 'shift';	state:	number };
-		const reduceEntry	= (existing.kind === 'reduce'	? existing : incoming) as { kind: 'reduce';	rule:	number };
-		const reducePrec	= g.rules[reduceEntry.rule].prec;
-
-		if (reducePrec?.assoc === 'fork' || shiftPrec?.assoc === 'fork') {
-			row.set(term, {kind: 'conflict', entries: [shiftEntry, reduceEntry]});
-			conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR (fork)' });
-		} else if (shiftPrec !== undefined && reducePrec !== undefined) {
-			if (reducePrec.level! > shiftPrec.level!) {
-				row.set(term, reduceEntry);
-				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'reduce (reduce-rule prec > shift-rule prec)' });
-			} else if (reducePrec.level! < shiftPrec.level!) {
-				row.set(term, shiftEntry);
-				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'shift (shift-rule prec > reduce-rule prec)' });
-			} else if (shiftPrec.assoc === 'left') {
-				row.set(term, reduceEntry);
-				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'reduce (left assoc)' });
-			} else if (shiftPrec.assoc === 'right') {
-				row.set(term, shiftEntry);
-				conflicts.push({ state, term, kind: 'shift-reduce', resolution: 'shift (right assoc)' });
-			} else {
-				row.set(term, {kind: 'conflict', entries: [shiftEntry, reduceEntry]});
-				conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR' });
-			}
-		} else {
-			row.set(term, shiftEntry);
-			// Name the silently-losing reduce rule: unflagged default-shifts are the classic source of
-			// "wrong parse, no error" bugs here, and knowing which rule lost is the first debugging step.
-			const lost = g.rules[reduceEntry.rule];
-			conflicts.push({ state, term, kind: 'auto', resolution: `shift (default, no prec info; loses reduce of rule ${lost.id}: ${lost.lhs.name} -> ${lost.rhs.map(s => s.name).join(' ')})` });
-		}
-
-	} else if (existing.kind === 'reduce' && incoming.kind === 'reduce') {
-		if (g.rules[existing.rule].prec?.assoc === 'fork' || g.rules[incoming.rule].prec?.assoc === 'fork') {
-			row.set(term, {kind: 'conflict', entries: [existing, incoming]});
-			conflicts.push({ state, term, kind: 'conflict', resolution: 'use GLR (fork)' });
-		} else {
-			const winner = existing.rule < incoming.rule ? existing : incoming;
-			row.set(term, winner);
-			conflicts.push({ state, term, kind: 'reduce-reduce', resolution: `reduce by rule ${winner.rule} (earlier rule wins)` });
-		}
-	}
-	// shift-shift / accept: keep existing (shouldn't occur in valid grammars)
 }
 
 // ===================================================================

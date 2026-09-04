@@ -26,53 +26,6 @@ import {
 	type ActionEntry, type GrammarSpec, type InternalRule, type InternalSym, type TextPos, type Token, type Parser,
 } from './tison';
 
-export interface PegOptions {
-	// How a terminal is matched at a position.
-	//   'maxmunch' (default) -- lex one token from *all* the grammar's terminals, longest match wins, then
-	//     check it's the terminal wanted. Identical tokenization to the LR back end (so keyword-vs-identifier
-	//     resolves the same way), minus its state-restricted narrowing of the candidate set.
-	//   'direct' -- try only the wanted terminal's own pattern, true scannerless PEG. Ordered choice then
-	//     decides what a piece of text is, so `Not(KEYWORD)` guards replace maximal munch.
-	lex?:		'maxmunch' | 'direct';
-	memo?:		boolean;	// default true: packrat memoization, linear time at the cost of holding every (rule, position) result
-	maxDepth?:	number;		// default 2000: recursion-depth tripwire, so a runaway grammar throws instead of blowing the JS stack
-}
-
-export interface PegParser<T, C = any> extends Parser<T, C> {
-	grammar: GrammarBuilder;
-}
-
-// A position in the input, plus the last token consumed to reach it (`Terminal.lex` callbacks read it as
-// `lex.prev`). Positions are values here, never mutated -- backtracking is just keeping the older one.
-interface Pos extends TextPos {
-	prev?: Token;
-}
-interface Match {
-	value:	unknown;
-	pos:	Pos;
-	start:	TextPos;	// where the *consumed* text begins -- past any skipped whitespace, unlike `pos` on entry
-}
-
-const NO_PREC = Number.POSITIVE_INFINITY;
-
-// A rule with no usable precedence always applies, at any minimum level -- it's a primary/base
-// alternative, not an operator. `forceFork` is an LR conflict annotation, not a real level, so it counts
-// as "no precedence" too rather than pinning the rule to level 0.
-function levelOf(r: InternalRule) {
-	return r.prec && r.prec.assoc !== 'fork' ? r.prec.level ?? 0 : NO_PREC;
-}
-
-// The minimum precedence level for a *trailing* self-reference (`A -> A '+' A`, `A -> '-' A`): one above
-// this rule's own level for a left-associative operator, so a same-level operator can't be swallowed by
-// the right operand and has to be picked up by the next round of seed growing instead; equal for a
-// right-associative one, so it can. Undefined when the rule doesn't end in a self-reference at all.
-function trailingMinPrec(r: InternalRule) {
-	const level = levelOf(r);
-	return level !== NO_PREC && r.rhs.length > 1 && r.rhs[r.rhs.length - 1] === r.lhs
-		? level + (r.prec!.assoc === 'right' ? 0 : 1)
-		: undefined;
-}
-
 // ===================================================================
 //  Static grammar analysis
 // ===================================================================
@@ -218,15 +171,13 @@ function analyse(g: GrammarBuilder): Analysis {
 			alts.set(nt, [...list.filter(r => r.rhs.length || r.peek !== undefined), ...empty]);
 	}
 
-	const isNullable		= nullableSyms(g);
-	const { edges, indirect }	= leftCorners(g, isNullable);
+	const { edges, indirect }	= leftCorners(g, nullableSyms(g));
 
 	for (const comp of stronglyConnected([...alts.keys()], edges)) {
 		if (comp.length > 1) {
 			problems.push(`error: indirect left recursion between ${comp.map(n => describe(n, alts)).join(' and ')}: PEG only supports the direct 'A -> A ...' form -- rewrite the cycle so one of them consumes input first`);
 		} else if (indirect.has(comp[0])) {
-			const r = indirect.get(comp[0])!;
-			problems.push(`error: left recursion past a nullable prefix in '${ruleText(r)}': PEG only supports the direct 'A -> A ...' form, where the recursive symbol is first`);
+			problems.push(`error: left recursion past a nullable prefix in '${ruleText(indirect.get(comp[0])!)}': PEG only supports the direct 'A -> A ...' form, where the recursive symbol is first`);
 		}
 	}
 
@@ -272,6 +223,36 @@ export function pegDiagnostics(spec: GrammarSpec<any>): string[] {
 //  Parser
 // ===================================================================
 
+export interface PegOptions {
+	// How a terminal is matched at a position.
+	//   'maxmunch' (default) -- lex one token from *all* the grammar's terminals, longest match wins, then
+	//     check it's the terminal wanted. Identical tokenization to the LR back end (so keyword-vs-identifier
+	//     resolves the same way), minus its state-restricted narrowing of the candidate set.
+	//   'direct' -- try only the wanted terminal's own pattern, true scannerless PEG. Ordered choice then
+	//     decides what a piece of text is, so `Not(KEYWORD)` guards replace maximal munch.
+	lex?:		'maxmunch' | 'direct';
+	memo?:		boolean;	// default true: packrat memoization, linear time at the cost of holding every (rule, position) result
+	maxDepth?:	number;		// default 2000: recursion-depth tripwire, so a runaway grammar throws instead of blowing the JS stack
+}
+
+export interface PegParser<T, C = any> extends Parser<T, C> {
+	grammar: GrammarBuilder;
+}
+
+// A position in the input, plus the last token consumed to reach it (`Terminal.lex` callbacks read it as
+// `lex.prev`). Positions are values here, never mutated -- backtracking is just keeping the older one.
+interface Pos extends TextPos {
+	prev?: Token;
+}
+interface Match {
+	value:	unknown;
+	pos:	Pos;
+	start:	TextPos;	// where the *consumed* text begins -- past any skipped whitespace, unlike `pos` on entry
+}
+
+const NO_PREC = Number.POSITIVE_INFINITY;
+
+
 export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOptions = {}): PegParser<T, C> {
 	const g			= new GrammarBuilder(spec);
 	const analysis	= analyse(g);
@@ -316,12 +297,30 @@ export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOpti
 		},
 	};
 
+	// A rule with no usable precedence always applies, at any minimum level -- it's a primary/base
+	// alternative, not an operator. `forceFork` is an LR conflict annotation, not a real level, so it counts
+	// as "no precedence" too rather than pinning the rule to level 0.
+	function levelOf(r: InternalRule) {
+		return r.prec && r.prec.assoc !== 'fork' ? r.prec.level ?? 0 : NO_PREC;
+	}
+
+	// The minimum precedence level for a *trailing* self-reference (`A -> A '+' A`, `A -> '-' A`): one above
+	// this rule's own level for a left-associative operator, so a same-level operator can't be swallowed by
+	// the right operand and has to be picked up by the next round of seed growing instead; equal for a
+	// right-associative one, so it can. Undefined when the rule doesn't end in a self-reference at all.
+	function trailingMinPrec(r: InternalRule) {
+		const level = levelOf(r);
+		return level !== NO_PREC && r.rhs.length > 1 && r.rhs[r.rhs.length - 1] === r.lhs
+			? level + (r.prec!.assoc === 'right' ? 0 : 1)
+			: undefined;
+	}
+
 	function run(input: string, ctx: any, prefix: boolean): Match {
 		// Two derivations reaching the same offset can still lex differently from there if a `Terminal.lex`
 		// callback reads `lex.prev`, so the preceding token is part of every memo key, not just the offset.
 		const prevKey	= (p: Pos) => p.prev ? `${p.prev.type.name}@${p.prev.pos.offset}` : '';
 		const tokens	= new Map<string, { tok: Token; after: Pos }>();
-		const memo		= new Map<string, Match | null>();
+		const memo		= new Map<string, Match | undefined>();
 		const active	= new Set<string>();
 		let failOffset	= -1;
 		let failPos: TextPos = { offset: 0, line: 1, col: 1 };
@@ -354,7 +353,7 @@ export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOpti
 			return hit;
 		};
 
-		function matchTerminal(t: Terminal, pos: Pos): Match | null {
+		function matchTerminal(t: Terminal, pos: Pos): Match | undefined {
 			const { tok, after } = maxMunch
 				? lex(allTerms, pos, `*${pos.offset}|${prevKey(pos)}`)
 				: lex(mapFor(t), pos, `${t.name}|${pos.offset}|${prevKey(pos)}`);
@@ -365,12 +364,11 @@ export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOpti
 				return { value: tok.value, pos: after, start: tok.pos };
 
 			recordFail(tok.pos, t.name);
-			return null;
 		}
 
 		// `values` is the enclosing sequence's values so far, which a mid-rule action nonterminal needs to
 		// look back into (`peek`); every other symbol ignores it.
-		function matchSym(sym: InternalSym, pos: Pos, values: unknown[], minPrec: number): Match | null {
+		function matchSym(sym: InternalSym, pos: Pos, values: unknown[], minPrec: number): Match | undefined {
 			if (sym instanceof Terminal)
 				return matchTerminal(sym, pos);
 
@@ -390,20 +388,18 @@ export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOpti
 				if (!m)
 					return { value: undefined, pos, start: getTextPos(pos) };
 				recordFail(m.start, sym.name);
-				return null;
+				return;
 			}
 
 			const mid = anon.get(sym);
-			if (mid) {
-				const peek = mid.peek ?? 0;
-				return { value: mid.action(Object.assign(values.slice(values.length - peek), { pos: getTextPos(pos) }), ctx), pos, start: getTextPos(pos) };
-			}
-			return matchNonTerminal(sym, pos, minPrec);
+			return mid
+				? { value: mid.action(Object.assign(values.slice(values.length - (mid.peek ?? 0)), { pos: getTextPos(pos) }), ctx), pos, start: getTextPos(pos) }
+				: matchNonTerminal(sym, pos, minPrec);
 		}
 
 		// `values`/`from` let the seed-growing loop below re-enter an alternative with its leading
 		// self-reference already bound, instead of re-parsing it (which is what would recurse forever).
-		function matchAlt(r: InternalRule, pos: Pos, values: unknown[], from: number, start: TextPos | undefined): Match | null {
+		function matchAlt(r: InternalRule, pos: Pos, values: unknown[], from: number, start: TextPos | undefined): Match | undefined {
 			const tailMin	= trailingMinPrec(r);
 			const last		= r.rhs.length - 1;
 			let cur			= pos;
@@ -412,7 +408,7 @@ export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOpti
 				const sym = r.rhs[i];
 				const m = matchSym(sym, cur, values, i === last && tailMin !== undefined && sym === r.lhs ? tailMin : 0);
 				if (!m)
-					return null;
+					return;
 				// The rule's own start is the first symbol that actually consumed something; a leading
 				// predicate or nullable nonterminal would otherwise pin it to before the skipped whitespace.
 				if (start === undefined && m.pos.offset > cur.offset)
@@ -424,7 +420,7 @@ export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOpti
 			return { value: r.action(Object.assign(values, { pos: start }), ctx), pos: cur, start };
 		}
 
-		function matchNonTerminal(nt: NonTerminal, pos: Pos, minPrec: number): Match | null {
+		function matchNonTerminal(nt: NonTerminal, pos: Pos, minPrec: number): Match | undefined {
 			const key = `${ntId.get(nt)}|${minPrec}|${pos.offset}|${prevKey(pos)}`;
 			if (useMemo && memo.has(key))
 				return memo.get(key)!;
@@ -449,7 +445,7 @@ export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOpti
 			}
 		}
 
-		function matchAlts(nt: NonTerminal, pos: Pos, minPrec: number): Match | null {
+		function matchAlts(nt: NonTerminal, pos: Pos, minPrec: number): Match | undefined {
 			const lr = direct.get(nt)!;
 
 			// Ordinary ordered choice: first alternative that matches wins, outright.
@@ -461,46 +457,44 @@ export function makePegParser<T, C = any>(spec: GrammarSpec<T>, options: PegOpti
 					if (m)
 						return m;
 				}
-				return null;
+				return;
 			}
 
 			// Left recursion, as precedence climbing: match a non-recursive alternative for the seed, then
 			// repeatedly re-offer it as the leading symbol of a recursive alternative for as long as one
 			// extends it. `minPrec` gates which operators may apply, so `3 * 4 + 5` groups as `(3 * 4) + 5`
 			// even though both alternatives are equally applicable to the bare seed `3`.
-			let seed: Match | null = null;
+			let seed: Match | undefined;
 			for (const r of base.get(nt)!) {
 				if (levelOf(r) < minPrec)
 					continue;
 				if ((seed = matchAlt(r, pos, [], 0, undefined)))
 					break;
 			}
-			if (!seed)
-				return null;
-
-			for (let floor = minPrec, growing = true; growing;) {
-				growing = false;
-				for (const r of lr) {
-					const level = levelOf(r);
-					if (level < floor)
-						continue;
-					const m = matchAlt(r, seed.pos, [seed.value], 1, seed.start);
-					// A recursive alternative that matched without consuming anything (all-nullable tail)
-					// would otherwise grow the seed forever without ever moving.
-					if (m && m.pos.offset > seed.pos.offset) {
-						seed	= m;
-						growing	= true;
-						if (r.prec?.assoc === 'nonassoc')
-							floor = Math.max(floor, level + 1);
-						break;
+			if (seed) {
+				for (let floor = minPrec, growing = true; growing;) {
+					growing = false;
+					for (const r of lr) {
+						const level = levelOf(r);
+						if (level < floor)
+							continue;
+						const m = matchAlt(r, seed.pos, [seed.value], 1, seed.start);
+						// A recursive alternative that matched without consuming anything (all-nullable tail)
+						// would otherwise grow the seed forever without ever moving.
+						if (m && m.pos.offset > seed.pos.offset) {
+							seed	= m;
+							growing	= true;
+							if (r.prec?.assoc === 'nonassoc')
+								floor = Math.max(floor, level + 1);
+							break;
+						}
 					}
 				}
 			}
 			return seed;
 		}
 
-		const startPos: Pos = { offset: 0, line: 1, col: 1 };
-		const m = matchNonTerminal(g.startSymbol, startPos, 0);
+		const m = matchNonTerminal(g.startSymbol, { offset: 0, line: 1, col: 1 }, 0);
 
 		if (m && !prefix) {
 			const { tok } = lex(skipOnly, m.pos, `$${m.pos.offset}|${prevKey(m.pos)}`);

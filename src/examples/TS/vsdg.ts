@@ -4,6 +4,7 @@ import * as TS from './ts-parser';
 import { Identifier, Literal, Binary } from '../common';
 import { Walkable, walkB, calcUnary, calcBinary, RecurseB, isJsStatement, isTsDeclaration } from './walker';
 import { patternBindings as buildPatternBindings } from './transform';
+import { tocode } from './type-utils';
 
 const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
 type Expr			= TS.Expr;
@@ -396,7 +397,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		}
 		const node = expnodes.get(expr);
 		if (!node)
-			throw new Error(`missing node for ${JSON.stringify(expr)}`);
+			throw new Error(`missing node for ${tocode.expr(expr)}`);
 		return node;
 	}
 	function getState(): State {
@@ -2666,12 +2667,12 @@ function getStructuralKey(node: Node): string {
 			// the wrapper OBJECT, always defined once assigned regardless of what it wraps. The
 			// replacer handles a bigint anywhere inside it -- JSON.stringify otherwise throws
 			// outright on a raw bigint.
-			default: key += JSON.stringify(node.expr, (_, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
+			default: key += tocode.expr(node.expr);
 		}
 	} else if ('name' in node) {
 		key += node.name;
 	} else if ('stmt' in node) {
-		key += JSON.stringify(node.stmt, (_, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
+		key += node.stmt ? tocode.statement(node.stmt) : '';
 	}
 
 	return key + ':' + node.inputs.map(e => e ? `${e.nodeId}:${e.port}` : '').join(',');
