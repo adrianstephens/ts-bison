@@ -110,3 +110,29 @@ export function  Throw<E>(argument?: E): Throw<E> { return { type: 'throw', argu
 // Python `except*` star, a C++ by-reference flag.
 export interface Handler<S, P = unknown>	{ param?: P; body: S[] }
 export interface Try<S, P = unknown>		{ type: 'try'; body: S[]; handlers: Handler<S, P>[]; finalizer?: S[] }
+
+// ===================================================================
+//  Body access
+// ===================================================================
+// A statement slot holds different things in different languages: js-parser and c-parser put ONE
+// statement there (a `block` when the source braced it), py-parser an array. These read and write it
+// uniformly, so a pass spanning all three doesn't need the representations themselves to match.
+
+function isArray<S>(x: S | readonly S[]): x is readonly S[] { return Array.isArray(x); }
+
+export function bodyOf<S extends {type: string}>(slot: S | readonly S[] | undefined): readonly S[] {
+	if (!slot)
+		return [];
+	if (isArray(slot))
+		return slot;
+	const block = slot as S & {body?: readonly S[]};
+	return block.type === 'block' && block.body ? block.body : [slot];
+}
+
+// Writes a rewritten body back into a single-statement slot. Wrapping in a block is the SAFE default
+// and the reason this exists: a bare slot can't legally hold a declaration (`if (x) let y = 1;` isn't
+// valid JS), so a pass that inserts one must produce a block. A caller that knows its own language's
+// declaration tags can pass `canBeBare` to keep the un-braced form where that's still correct.
+export function withBody<S extends {type: string}>(stmts: readonly S[], block: (body: readonly S[]) => S, canBeBare?: (stmt: S) => boolean): S {
+	return stmts.length === 1 && canBeBare?.(stmts[0]) ? stmts[0] : block(stmts);
+}

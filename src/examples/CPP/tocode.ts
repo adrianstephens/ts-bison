@@ -357,7 +357,8 @@ export class Output {
 			case 'using_namespace':
 			case 'using_decl':
 			case 'using_alias':			return this.definition(s as unknown as Definition);
-			default:					return isExpr(s) ? this.expr(s) + ';' : (() => { throw new Error(`Unknown statement: ${(s as any).type}`); })();
+			case 'expression':			return this.expr(s.expression) + ';';
+			default:					throw new Error(`Unknown statement: ${(s as any).type}`);
 		}
 	}
 

@@ -197,7 +197,9 @@ export type Statement<D = Declarator, X = never> =
 	| { type: 'goto'; label: string }
 	| { type: 'labeled'; label: string; body: Statement<D, X> }
 	| { type: 'empty' }
-	| Expr;
+	// An expression used as a statement gets a real wrapper node, like js-parser's and py-parser's --
+	// inlining bare `Expr` into this union made "is this a statement or an expression" undecidable.
+	| Common.ExprStmt<Expr>;
 
 export type Expr =
 	| Identifier
@@ -500,7 +502,7 @@ statement = Rules<Statement>(self => [
 	Rule(['goto', IDENT, ';'], 									$ => ({ type: 'goto', label: $[1] })),
 	Rule([IDENT, ':', self], 									$ => ({ type: 'labeled', label: $[0], body: $[2] })),
 	Rule([';'],													_ => ({ type: 'empty' } as const)),
-	Rule([expression, ';'], 									$ => $[0]),
+	Rule([expression, ';'], 									$ => ({ type: 'expression', expression: $[0] } as const)),
 ]),
 
 compound_statement = Rules<Block>(

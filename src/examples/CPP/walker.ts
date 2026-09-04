@@ -31,7 +31,7 @@ export function guard<R>(types: string[]) {
 }
 
 const definitionTags	= ['declaration', 'typedef', 'function_def', 'namespace', 'linkage', 'using_namespace', 'using_decl', 'using_alias', 'template', 'static_assert', 'method_def', 'constructor_def', 'destructor_def', 'operator_def', 'static_member_def'];
-const statementOnlyTags = ['block', 'if', 'while', 'do_while', 'for', 'switch', 'case', 'default', 'break', 'continue', 'return', 'goto', 'labeled', 'empty', 'throw', 'try', 'range_for'];
+const statementOnlyTags = ['block', 'expression', 'if', 'while', 'do_while', 'for', 'switch', 'case', 'default', 'break', 'continue', 'return', 'goto', 'labeled', 'empty', 'throw', 'try', 'range_for'];
 const exprTags			= ['identifier', 'literal', 'char_literal', 'unary', 'unary_post', 'binary', 'conditional', 'index', 'member', 'pointer_member', 'call', 'cast', 'sizeof_type', 'this', 'null_literal', 'qualified', 'new', 'delete', 'spread', 'sizeof_pack', 'cpp_cast', 'typeid', 'alignof', 'functional_cast', 'lambda'];
 const classMemberTags	= ['struct_member', 'member_typedef', 'access_label', 'constructor', 'destructor', 'method', 'conversion', 'using_decl', 'using_alias', 'member_template'];
 const declaratorTags	= ['identifier', 'pointer', 'array', 'function', 'reference', 'rvalue_reference'];
@@ -264,8 +264,9 @@ export function walk<T extends Walkable>(ast: T,
 			case 'using_alias':			return mapObject(s, {target: typeName});
 			case 'using_namespace':
 			case 'using_decl':			return s;
+			case 'expression':			return mapObject(s, {expression: mapExpressionA});
 			// break / continue / goto / empty -- no nested AST.
-			default:					return isExpr(s) ? expression(s) as Statement : s;
+			default:					return s;
 		}
 	};
 
@@ -456,7 +457,8 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 			case 'range_for':			return walkDeclSpec(s.specifiers) || walkDeclarator(s.declarator) || walkExpression(s.range) || walkStatement(s.body);
 			case 'static_assert':		return walkExpression(s.condition);
 			case 'using_alias':			return walkTypeName(s.target);
-			default:					return isExpr(s) && expression(s);
+			case 'expression':			return walkExpression(s.expression);
+			default:					return false;
 		}
 	};
 
