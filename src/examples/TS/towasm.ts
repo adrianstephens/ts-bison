@@ -2847,8 +2847,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			case 'i64':
 			case 'f64':
 			case 'f32': ctx.emit(I[got](0), I[got].ne); return;
-			default: throw 'this value cannot be used as a boolean condition';
 		}
+		// A real object/array/closure reference is always truthy in JS -- only null/undefined isn't -- so
+		// `if (obj)`/`obj ? a : b` is exactly a null test, and a non-nullable one is unconditionally true
+		// (the value still has to be evaluated for its side effects, hence the `drop`). Two kinds are
+		// deliberately excluded, because for them truthiness is a property of the VALUE, not the reference:
+		// a string (`''` is falsy) and a boxed `any` (could be holding `0`/`''`).
+		const t = checkerTypeOf(unwrapAs(e), ctx.scope);
+		if (typeof got === 'object' && !('ref' in got && (got.ref === 'any' || got.ref === 'exn'))
+			&& !T.isAny(T.resolveOwn(t, ctx.scope)) && !T.isStringLike(t, ctx.scope)) {
+			if (got.nullable)
+				ctx.emit(I.ref.is_null, I.i32.eqz);
+			else
+				ctx.emit(I.drop, I.i32.const(1));
+			return;
+		}
+		throw 'this value cannot be used as a boolean condition';
 	}
 
 	// Shared by every optional (`?.`) lowering -- `objectExpr` must only ever be evaluated once, so this

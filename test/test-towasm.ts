@@ -3002,6 +3002,37 @@ async function main() {
 	}
 
 	{
+		// An object reference as a bare condition (`if (obj)`, `obj ? a : b`) threw "this value cannot be
+		// used as a boolean condition" -- `emitTruthy` only ever handled scalar kinds. A real reference is
+		// always truthy in JS, so this is exactly a null test. A string (`''` is falsy) and a boxed `any`
+		// (could hold `0`) are deliberately still rejected: for those, truthiness is a property of the
+		// value rather than of the reference.
+		const { absent, present, localNarrowing, nonNullable, emptyArray, sideEffect } = await compile(`
+			class P { constructor(public x: number) {} }
+			class H { c?: P; constructor() {} }
+			export function absent(): number  { return new H().c ? 1 : 2; }
+			export function present(): number { const h = new H(); h.c = new P(9); return h.c ? 1 : 2; }
+			export function localNarrowing(): number {
+				let m: P | undefined = undefined;
+				const before = m ? 1 : 2;
+				m = new P(1);
+				return before * 10 + (m ? 1 : 2);
+			}
+			export function nonNullable(): number { return new P(3) ? 1 : 2; }
+			export function emptyArray(): number { const a: number[] = []; return a ? 1 : 2; }
+			let n = 0;
+			function mk(): P { n = n + 5; return new P(1); }
+			export function sideEffect(): number { const r = mk() ? 1 : 2; return r * 10 + n; }
+		`);
+		check('truthiness: an absent optional object field is falsy', absent(), 2);
+		check('truthiness: a present one is truthy', present(), 1);
+		check('truthiness: a nullable local, before and after assignment', localNarrowing(), 21);
+		check('truthiness: a non-nullable reference is unconditionally true', nonNullable(), 1);
+		check('truthiness: an EMPTY array is truthy (unlike an empty string)', emptyArray(), 1);
+		check('truthiness: a discarded non-nullable receiver still runs its side effects', sideEffect(), 15);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only
