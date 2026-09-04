@@ -15,7 +15,7 @@ export type Err = (sev: SEVERITY, pos: JS.Location) => (strings: TemplateStrings
 
 type Type		= TS.Type;
 type Expr		= TS.Expr;
-type Statement	= TS.Statement;
+type Stmt		= TS.Stmt;
 type Scope		= T.Scope;
 const Scope		= T.Scope;
 
@@ -55,7 +55,7 @@ const TYPED_ARRAY_RANGES = new Map<string, T.NumRange>([
 
 // A body with zero `return`s normally infers `void` -- but if every path ends in `throw`, real TS infers `never`
 // instead, which (unlike `void`) is assignable to any declared return type. Not a full CFG.
-function alwaysThrows(stmt: Statement | undefined): boolean {
+function alwaysThrows(stmt: Stmt | undefined): boolean {
 	if (!stmt)
 		return false;
 	switch (stmt.type) {
@@ -68,7 +68,7 @@ function alwaysThrows(stmt: Statement | undefined): boolean {
 }
 
 // Conservative "this statement never falls through" -- powers guard-clause narrowing
-function alwaysExits(stmt: Statement): boolean {
+function alwaysExits(stmt: Stmt): boolean {
 	switch (stmt.type) {
 		case 'return':
 		case 'throw':
@@ -85,7 +85,7 @@ function alwaysExits(stmt: Statement): boolean {
 }
 
 // Conservative "this statement never falls through" -- powers guard-clause narrowing
-function alwaysReturns(stmt: JS.Statement<any> | undefined): boolean {
+function alwaysReturns(stmt: JS.Stmt<any> | undefined): boolean {
 	if (!stmt)
 		return false;
 	switch (stmt.type) {
@@ -697,7 +697,7 @@ function checkExcessProps(lit: Expr, target: Type, pos: JS.Location, targetScope
 
 // ---- declaration hoisting / namespace resolution ------------------------------------------
 
-function hoist(stmts: Statement[], scope: Scope) {
+function hoist(stmts: Stmt[], scope: Scope) {
 	const fnGroups = new Map<string, JS.FunctionDecl<any>[]>();
 
 	// `interface`/`type` declarations get their own pass first: a `declare var X: Y` resolves `Y` eagerly below, so every
@@ -851,7 +851,7 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 
 // Resolves what a `namespace X { ... }` block or module body exposes, as a genuine `Scope` (not a flattened `Type`) since `NS.Foo` can appear
 // in a type position too. `isAlias` marks `export = X` (`.d.ts`-only), where the whole namespace collapses to `X`'s own value.
-export function exportScope(body: Statement[], parent: Scope): { scope: Scope; value: Type; isAlias: boolean } {
+export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; value: Type; isAlias: boolean } {
 	// `hoist` + `hoistVars` (not full `checkBlock`): only top-level declaration *types* are needed, not a full check of a body checked separately.
 	const inner = new Scope(parent);
 	hoist(body, inner);
@@ -1288,7 +1288,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						if (resolveParam && typeof resolveParam.key === 'string') {
 							const resolveName = resolveParam.key;
 							const resolvedTypes: Type[] = [];
-							walkB(executor.body as JS.Statement<any>[] | Expr, undefined, (x, process) => {
+							walkB(executor.body as JS.Stmt<any>[] | Expr, undefined, (x, process) => {
 								if (x.type === 'call' && x.callee.type === 'identifier' && x.callee.name === resolveName) {
 									const arg = x.arguments[0];
 									resolvedTypes.push(arg && arg.type !== 'spread' ? recurse(arg) : T.UNDEFINED);
@@ -1686,7 +1686,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 
 // ---- functions / classes / statements -------------------------------------------------------
 
-function checkFunctionBody(fn: TS.CallSig, body: JS.Statement<any>[] | Expr | undefined, scope: Scope, async: boolean, skipReturn?: boolean, generator?: boolean, err?: Err) {
+function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefined, scope: Scope, async: boolean, skipReturn?: boolean, generator?: boolean, err?: Err) {
 	if (!body)
 		return;
 
@@ -1779,7 +1779,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Statement<any>[] | Expr | un
 
 	if (Array.isArray(body)) {
 		if (expected) {
-			checkBlock(body, inner, (s: Statement, scope: Scope): void => {
+			checkBlock(body, inner, (s: Stmt, scope: Scope): void => {
 				if (s.type === 'return' && s.argument) {
 					const argument = s.argument;
 					const t = typeOf(argument, scope, false, expected, undefined, err);
@@ -1795,9 +1795,9 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Statement<any>[] | Expr | un
 			checkBlock(body, inner, undefined, undefined, err, noStamp);
 
 		} else {
-			const	returns: {s: (Statement & {type: 'return'}), type?: Type}[] = [];
+			const	returns: {s: (Stmt & {type: 'return'}), type?: Type}[] = [];
 			const	yields = generator ? [] as Type[] : undefined;
-			checkBlock(body, inner, (s: Statement, scope: Scope): void => {
+			checkBlock(body, inner, (s: Stmt, scope: Scope): void => {
 				if (s.type === 'return')
 					returns.push({s, type: s.argument && typeOf(s.argument, scope, true, undefined, undefined, err)});
 			}, yields, err, noStamp);
@@ -1898,7 +1898,7 @@ function checkClassMembers(name: string | undefined, body: TS.ClassMember[], ins
 // so a right-hand side that reads back the narrowed test subject -- `arg = new Stream(arg)` --
 // gets re-evaluated with that branch's narrowing in effect, not the pre-`if` scope) so the
 // post-if type can merge the branches.
-function assignRights(st: Statement, scope: Scope, name?: string): { name: string; rights: { expr: Expr; scope: Scope }[] } | undefined {
+function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; rights: { expr: Expr; scope: Scope }[] } | undefined {
 	if (st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '=' && st.expression.left.type === 'identifier' && (!name || st.expression.left.name === name))
 		return { name: st.expression.left.name, rights: [{ expr: st.expression.right, scope }] };
 
@@ -1926,7 +1926,7 @@ function assignRights(st: Statement, scope: Scope, name?: string): { name: strin
 // Every other caller (real user-program checks, `static_block`, the top-level `makeLibScope`/
 // `transform.ts` calls) leaves it `undefined`, so `checkStmt`'s `(stmt as any).scope ??=` stamp fires
 // exactly as it always has for them.
-export function checkBlock(stmts: Statement[], scope: Scope, onReturn?: (s: Statement, scope: Scope)=>void, yieldCollector?: Type[], err?: Err, noStamp?: boolean) {
+export function checkBlock(stmts: Stmt[], scope: Scope, onReturn?: (s: Stmt, scope: Scope)=>void, yieldCollector?: Type[], err?: Err, noStamp?: boolean) {
 	hoist(stmts, scope);
 
 	for (const s of stmts) {
@@ -1956,7 +1956,7 @@ export function checkBlock(stmts: Statement[], scope: Scope, onReturn?: (s: Stat
 }
 
 
-function checkStmt(stmt: Statement, scope: Scope, onReturn?: (s: Statement, scope: Scope)=>void, yieldCollector?: Type[], err?: Err, noStamp?: boolean): void {
+function checkStmt(stmt: Stmt, scope: Scope, onReturn?: (s: Stmt, scope: Scope)=>void, yieldCollector?: Type[], err?: Err, noStamp?: boolean): void {
 	// The real (post-narrowing, where applicable) `Scope` this statement was type-checked under --
 	// stamped directly on the node (like `pos`, `CallSig.scope`), not tracked as checker state, so a
 	// consumer with no narrowing-aware scope of its own (towasm.ts's codegen, whose own scope tracking
@@ -1974,8 +1974,8 @@ function checkStmt(stmt: Statement, scope: Scope, onReturn?: (s: Statement, scop
 		(stmt as any).scope ??= scope;
 
 	const typeOf1		= (e: Expr, scope: Scope, expected?: Type)	=> typeOf(e, scope, true, expected, yieldCollector, err);
-	const checkBlock1	= (stmts: Statement[], scope: Scope)		=> checkBlock(stmts, scope, onReturn, yieldCollector, err, noStamp);
-	const checkStmt1	= (stmt: Statement, scope: Scope)			=> checkStmt(stmt, scope, onReturn, yieldCollector, err, noStamp);
+	const checkBlock1	= (stmts: Stmt[], scope: Scope)		=> checkBlock(stmts, scope, onReturn, yieldCollector, err, noStamp);
+	const checkStmt1	= (stmt: Stmt, scope: Scope)			=> checkStmt(stmt, scope, onReturn, yieldCollector, err, noStamp);
 
 	switch (stmt.type) {
 		case 'var_decl': {
@@ -2145,7 +2145,7 @@ function checkStmt(stmt: Statement, scope: Scope, onReturn?: (s: Statement, scop
 	}
 }
 
-export function inferReturn(fnj: JS.CallSig<any>, body: JS.Statement<any>[], outer: Scope): Type {
+export function inferReturn(fnj: JS.CallSig<any>, body: JS.Stmt<any>[], outer: Scope): Type {
 	if (fnj.returnType)
 		return fnj.returnType;
 	const sig = { ...fnj } as TS.CallSig;

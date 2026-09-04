@@ -177,25 +177,25 @@ export interface FunctionDef<D = Declarator, X = never>		{ type: 'function_def';
 export type Definition<D = Declarator, X = never>				= Declaration<D, X> | TypedefDecl<D, X> | FunctionDef<D, X>;
 export interface TranslationUnit<D = Declarator, X = never>	{ type: 'translation_unit'; body: Definition<D, X>[]; }
 
-export interface Block<D = Declarator, X = never>				{ type: 'block'; body: Statement<D, X>[]; }
+export interface Block<D = Declarator, X = never>				{ type: 'block'; body: Stmt<D, X>[]; }
 export interface ForClauses<D = Declarator, X = never>			{ init: Expr | Declaration<D, X> | TypedefDecl<D, X> | undefined; test?: Expr; update?: Expr; }
 
-export type Statement<D = Declarator, X = never> =
+export type Stmt<D = Declarator, X = never> =
 	| Block<D, X>
 	| Declaration<D, X>
 	| TypedefDecl<D, X>
-	| Common.If<Expr, Statement<D, X>>
-	| Common.While<Expr, Statement<D, X>>
-	| Common.DoWhile<Expr, Statement<D, X>>
-	| { type: 'for'; body: Statement<D, X> } & ForClauses<D, X>
-	| { type: 'switch'; discriminant: Expr; body: Statement<D, X> }
-	| { type: 'case'; test: Expr; body: Statement<D, X> }
-	| { type: 'default'; body: Statement<D, X> }
+	| Common.If<Expr, Stmt<D, X>>
+	| Common.While<Expr, Stmt<D, X>>
+	| Common.DoWhile<Expr, Stmt<D, X>>
+	| { type: 'for'; body: Stmt<D, X> } & ForClauses<D, X>
+	| { type: 'switch'; discriminant: Expr; body: Stmt<D, X> }
+	| { type: 'case'; test: Expr; body: Stmt<D, X> }
+	| { type: 'default'; body: Stmt<D, X> }
 	| { type: 'break' }
 	| { type: 'continue' }
 	| Common.Return<Expr>
 	| { type: 'goto'; label: string }
-	| Common.Labeled<Statement<D, X>>
+	| Common.Labeled<Stmt<D, X>>
 	| { type: 'empty' }
 	// An expression used as a statement gets a real wrapper node, like js-parser's and py-parser's --
 	// inlining bare `Expr` into this union made "is this a statement or an expression" undecidable.
@@ -484,7 +484,7 @@ for_statement = Rules<ForClauses>(
 
 // statement -> compound_statement stays a string: cheapest cut in the statement <-> compound_statement <-> statement_list cycle
 // (it's 1 of statement's 13 alternatives, vs. 2 uses on statement_list's side).
-statement = Rules<Statement>(self => [
+statement = Rules<Stmt>(self => [
 	Forward<Block>(()=>compound_statement),
 	declaration,
 	Rule(['if', '(', expression, ')', self], 					$ => ({ type: 'if', test: $[2], consequent: $[4] })),
@@ -533,7 +533,7 @@ const parser = makeCachedParser({
 	precedence: PREC,
 	start: translation_unit,
 	rules: {translation_unit}
-}, path.join(__dirname, '../../../.tables-cache/c-parser.json.gz'));
+}, {}, path.join(__dirname, '../../../.tables-cache/c-parser.json.gz'));
 
 export const cParser = {
 	...parser,

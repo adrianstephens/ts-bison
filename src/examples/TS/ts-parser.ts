@@ -110,8 +110,8 @@ interface EnumDecl { type: 'enum_decl'; name: string; const?: boolean; members: 
 interface ModuleDecl { type: 'module_decl'; name: string; body: Declaration[]; ambient?: boolean }
 function  ModuleDecl(name: string, body: Declaration[]): ModuleDecl { return { type: 'module_decl', name, body}; }
 
-interface NamespaceDecl { type: 'namespace_decl'; name: string; body: Statement[]; ambient?: boolean }
-function  NamespaceDecl(name: string, body: Statement[], ambient?: boolean): NamespaceDecl { return { type: 'namespace_decl', name, body, ambient }; }
+interface NamespaceDecl { type: 'namespace_decl'; name: string; body: Stmt[]; ambient?: boolean }
+function  NamespaceDecl(name: string, body: Stmt[], ambient?: boolean): NamespaceDecl { return { type: 'namespace_decl', name, body, ambient }; }
 
 export type MaybeAmbient = JS.Declaration<Type> | EnumDecl | NamespaceDecl | ModuleDecl
 export type Declaration	= MaybeAmbient
@@ -129,8 +129,8 @@ export type ClassMember		= JS.ClassMember<Type>	| { type: 'index_signature'; par
 // `Declaration` goes in through js-parser's `X` seam rather than being unioned on the outside: that
 // way a TS-only declaration is legal in every NESTED statement position too (a block, an if branch, a
 // loop body), which is what it actually is -- `while (x) { type A = B; }` is real TypeScript.
-export type Statement = JS.Statement<Type, Declaration>;
-export interface Program { type: 'program'; body: Statement[]; scope?: unknown }
+export type Stmt = JS.Stmt<Type, Declaration>;
+export interface Program { type: 'program'; body: Stmt[]; scope?: unknown }
 
 // ===================================================================
 //  terminals
@@ -627,7 +627,7 @@ JS.import_declaration.push(
 	Rule([TYPE, IDENT, '=', dotted_path, ';'],						$ => ({ type: 'import', default: $[1], source: $[3], typeOnly: true } as const)),
 );
 
-(JS.export_declaration as unknown as Rules<Statement>).push(
+(JS.export_declaration as unknown as Rules<Stmt>).push(
 	Rule([TYPE, JS.named_exports, ';'],					$ => ({ type: 'export', specifiers: $[1], typeOnly: true } as const)),
 	Rule([TYPE, JS.named_exports, 'from', STR, ';'],	$ => ({ type: 'export', specifiers: $[1], source: unquoteString($[3]), typeOnly: true } as const)),
 	Rule([TYPE, '*', 'from', STR, ';'],					$ => ({ type: 'export', source: unquoteString($[3]), typeOnly: true } as const)),
@@ -644,7 +644,7 @@ JS.import_declaration.push(
 	Rule(['default', fake_ambient],						$ => ({ type: 'export', default: $[1] as JS.Declaration<any> } as const)),
 );
 
-(JS.statement as unknown as Rules<Statement>).push(
+(JS.statement as unknown as Rules<Stmt>).push(
 	interface_declaration,
 	type_alias_declaration,
 	enum_declaration,
@@ -862,8 +862,6 @@ JS.relational_expression_noin.push(
 export function make() {
 	return makeCachedParser({
 		skip:		JS.skip,
-		recover:	JS.recover,
-		merge:		JS.merge,
 		start:		JS.program as Rules<Program>,
 		// these are only needed for debugging
 		rules: {
@@ -892,7 +890,11 @@ export function make() {
 			class_member_modifier_list,
 			implements_clause,
 		}
-	}, path.join(__dirname, '../../../.tables-cache/ts-parser.json.gz'));
+	}, {
+		recover:	JS.recover,
+		merge:		JS.merge,
+	},
+	path.join(__dirname, '../../../.tables-cache/ts-parser.json.gz'));
 }
 
 const parser = make();

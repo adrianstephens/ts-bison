@@ -1,5 +1,5 @@
 import * as path from 'path';
-import { type RecoveryCallback, type MergeValues, type Token, type Parser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
+import { type RecoveryCallback, type MergeValues, type Token, type LALRParser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods, withDefault, stampPos } from '../common';
 import * as Common from '../common';
@@ -75,14 +75,14 @@ export interface KeyMods<T>	{ key: Key<T>, modifiers?: string[] };
 export type      Spread<T>	= Common.Spread<Expr<T>>;
 export function  Spread<T>(operand: Expr<T>): Spread<T> { return { type: 'spread', operand }; }
 
-export interface FunctionExpr<T> extends CallSig<T> { type: 'function'; name?: string; body?: Statement<T>[]; modifiers?: string[] }
-export function  FunctionExpr<T>(sig: CallSig<T>, body: Statement<T>[], more?: Partial<FunctionExpr<T>>): FunctionExpr<T> { return { type: 'function', body, ...sig, ...more}; }
+export interface FunctionExpr<T> extends CallSig<T> { type: 'function'; name?: string; body?: Stmt<T>[]; modifiers?: string[] }
+export function  FunctionExpr<T>(sig: CallSig<T>, body: Stmt<T>[], more?: Partial<FunctionExpr<T>>): FunctionExpr<T> { return { type: 'function', body, ...sig, ...more}; }
 
-export interface Arrow<T> extends CallSig<T> { type: 'arrow'; body: Expr | Statement<T>[]; modifiers?: string[] }
-export function  Arrow<T>(sig: CallSig<T>, body: Expr | Statement<T>[], more?: Partial<Arrow<T>>): Arrow<T> { return { body, ...sig, ...more, type: 'arrow'}; }
+export interface Arrow<T> extends CallSig<T> { type: 'arrow'; body: Expr | Stmt<T>[]; modifiers?: string[] }
+export function  Arrow<T>(sig: CallSig<T>, body: Expr | Stmt<T>[], more?: Partial<Arrow<T>>): Arrow<T> { return { body, ...sig, ...more, type: 'arrow'}; }
 
-export interface Method<T> extends CallSig<T> { type: 'method' | 'get' | 'set'; key: Key<T>; body?: Statement<T>[], modifiers?: string[] }
-export function  Method<T>(type: 'method' | 'get' | 'set', key: Key<T>, sig: CallSig<T>, body?: Statement<T>[], modifiers?: string[]): Method<T> { return { type, key, body, modifiers, ...sig }; }
+export interface Method<T> extends CallSig<T> { type: 'method' | 'get' | 'set'; key: Key<T>; body?: Stmt<T>[], modifiers?: string[] }
+export function  Method<T>(type: 'method' | 'get' | 'set', key: Key<T>, sig: CallSig<T>, body?: Stmt<T>[], modifiers?: string[]): Method<T> { return { type, key, body, modifiers, ...sig }; }
 export interface Field<T> { type: 'field'; key: Key<T>; value?: Expr; typeAnnotation?: T; modifiers?: string[] }
 export function  Field<T>(key: Key<T>, value?: Expr<T>, typeAnnotation?: T, modifiers?: string[]): Field<T> { return { type: 'field', key, value, typeAnnotation, modifiers }; }
 
@@ -90,7 +90,7 @@ export type ObjectProperty<T> = Method<T> | Field<T> | Spread<T>;
 export interface ObjectExpr<T>	{ type: 'object'; properties: readonly ObjectProperty<T>[] }
 export function  ObjectExpr<T>(properties: readonly ObjectProperty<T>[]): ObjectExpr<T> { return {type: 'object', properties }; }
 
-export type ClassMember<T>	= Method<T> | Field<T> | { type: 'static_block'; body: Statement<T>[] }
+export type ClassMember<T>	= Method<T> | Field<T> | { type: 'static_block'; body: Stmt<T>[] }
 export interface Class<T = unknown, M = ClassMember<T>> { name?: string; superClass?: Expr<T>; body: M[]; typeParams?: TypeParam<T>[]; implements?: T[]; abstract?: boolean; decorators?: Expr[] };
 
 export interface Call<T = unknown> extends Common.Call<Expr<T>> { optional?: boolean; typeArgs?: T[] }
@@ -146,8 +146,8 @@ export function ExprToDottedName(e: Expr): string {
 		:	'??';
 }
 
-export interface FunctionDecl<T>	extends CallSig<T> { type: 'function_decl'; name: string; body?: Statement<T>[]; modifiers?: string[]; ambient?: boolean };
-export function  FunctionDecl<T>(name: string, sig: CallSig<T>, body?: Statement<T>[], more?: Partial<FunctionDecl<T>>): FunctionDecl<T> { return { type: 'function_decl', name, body, ...sig, ...more}; }
+export interface FunctionDecl<T>	extends CallSig<T> { type: 'function_decl'; name: string; body?: Stmt<T>[]; modifiers?: string[]; ambient?: boolean };
+export function  FunctionDecl<T>(name: string, sig: CallSig<T>, body?: Stmt<T>[], more?: Partial<FunctionDecl<T>>): FunctionDecl<T> { return { type: 'function_decl', name, body, ...sig, ...more}; }
 
 export interface ClassDecl<T> extends Class<T> { type: 'class_decl'; name: string; ambient?: boolean; }
 
@@ -171,7 +171,7 @@ export interface Export<T>			{ type: 'export'; specifiers?: ExportSpecifier[]; s
 export function Expression<T>(expression: Expr<T>) { return { type: 'expression', expression } as const; }
 
 export type ForInit<T> = Expr<T> | VarDecl<T>;
-export interface SwitchCase<T, S = Statement<T>> { test?: Expr<T>; consequent: S[]; }
+export interface SwitchCase<T, S = Stmt<T>> { test?: Expr<T>; consequent: S[]; }
 export function SwitchCase<T, S>(test: Expr<T>, ...consequent: S[]) : SwitchCase<T, S> { return { test, consequent }; }
 export function Switch<S>(discriminant: Expr, ...cases: SwitchCase<any, S>[]) { return { type: 'switch' as const, discriminant, cases }; }
 // The shared statement constructors, re-exported so a consumer building JS statements reaches for
@@ -194,30 +194,30 @@ export function DoWhile<S>(body: S, test: Expr) { return {type: 'do_while' as co
 // own body, a class method's) stay `Statement<T>`. Threading `X` that far would drag it through
 // `Expr<T>` as well, since a function EXPRESSION is an expression -- far more surface than the
 // nesting these consumers actually build.
-export type Statement<T, X = never> = Declaration<T>
+export type Stmt<T, X = never> = Declaration<T>
 	| X
-	| Common.Block<Statement<T, X>>
+	| Common.Block<Stmt<T, X>>
 	| Common.ExprStmt<Expr>
 	| { type: 'empty' }
-	| Common.If<Expr, Statement<T, X>>
-	| Common.DoWhile<Expr, Statement<T, X>>
-	| Common.While<Expr, Statement<T, X>>
-	| { type: 'for'; kind: 'normal'; init?: ForInit<T>; test?: Expr; update?: Expr; body: Statement<T, X> }
-	| { type: 'for'; kind: 'in' | 'of' | 'of await'; init: ForInit<T>; right: Expr; body: Statement<T, X> }
+	| Common.If<Expr, Stmt<T, X>>
+	| Common.DoWhile<Expr, Stmt<T, X>>
+	| Common.While<Expr, Stmt<T, X>>
+	| { type: 'for'; kind: 'normal'; init?: ForInit<T>; test?: Expr; update?: Expr; body: Stmt<T, X> }
+	| { type: 'for'; kind: 'in' | 'of' | 'of await'; init: ForInit<T>; right: Expr; body: Stmt<T, X> }
 	| { type: 'continue'; label?: string }
 	| { type: 'break'; label?: string }
 	| Common.Return<Expr>
-	| { type: 'with'; argument: Expr; body: Statement<T, X> }
-	| Common.Labeled<Statement<T, X>>
-	| { type: 'switch'; discriminant: Expr; cases: SwitchCase<T, Statement<T, X>>[] }
+	| { type: 'with'; argument: Expr; body: Stmt<T, X> }
+	| Common.Labeled<Stmt<T, X>>
+	| { type: 'switch'; discriminant: Expr; cases: SwitchCase<T, Stmt<T, X>>[] }
 	| (Common.Throw<Expr> & { argument: Expr })
-	| Common.Try<Statement<T, X>, BindingTarget>
+	| Common.Try<Stmt<T, X>, BindingTarget>
 	| { type: 'debugger' }
 	| Export<T>
 	| ExportDecl<T>
 	| Import
 
-export interface Program<T = any> { type: 'program'; body: Statement<T>[]; }
+export interface Program<T = any> { type: 'program'; body: Stmt<T>[]; }
 
 
 // ===================================================================
@@ -359,7 +359,7 @@ const expression = Rules<Expr>(self => [
 ]);
 
 
-export const statement_list = List(Forward<Statement<any>>(() => statement));
+export const statement_list = List(Forward<Stmt<any>>(() => statement));
 export const function_body = Rules(
 	Rule([], 			_ => []),
 	statement_list
@@ -786,7 +786,7 @@ const conditional_expression_noin = Rules(
 
 // The concise (non-block) form must not start with `{`: real JS always treats `x => { ... }` as a block, never an implicit object-literal return.
 // `_nobrace` avoids the resulting ambiguity with a bare object-literal expression body, same technique `expression_statement` uses.
-export const arrow_body = Rules<Expr | Statement<any>[]>(
+export const arrow_body = Rules<Expr | Stmt<any>[]>(
 	Rule(['{', function_body, '}'], 											$ => $[1]),
 	Forward<Expr>(() => assignment_expression_nobrace),
 );
@@ -988,7 +988,7 @@ const variable_statement = Rules(
 
 // Deliberately not collapsed to `'{' function_body '}'` like arrow/try/catch/finally: a statement block's `{` is reachable right after `IDENT ':'`, where a TS
 // typed-arrow object-type-literal shares the state -- the empty block must stay a *shift* of `}` there, or `foo: {}` (a labelled empty block) stops parsing.
-const block = Rules<Statement<any>>(
+const block = Rules<Stmt<any>>(
 	Rule(['{', '}'],											_ => ({ type: 'block', body: [] } as const)),
 	Rule(['{', statement_list, '}'],							$ => ({ type: 'block', body: $[1] } as const)),
 );
@@ -1015,7 +1015,7 @@ const case_clause = Rules<SwitchCase<any>>(
 	Rule(['default', ':', statement_list], 			$ => ({ consequent: $[2] } as const)),
 );
 
-export const catch_ = Rules<{ param?: BindingTarget; body: Statement<any>[] }>(
+export const catch_ = Rules<{ param?: BindingTarget; body: Stmt<any>[] }>(
 	Rule(['catch', '(', optional_binding_name, ')', '{', function_body, '}'],	$ => ({ param: $[2].key, body: $[5] } as const)),
 	// A destructured catch parameter -- no `forceFork` needed, same reasoning as `variable_declaration`'s own pattern alternative: `catch`'s `(`
 	// is never also reachable as a plain expression, so there's no ambiguity to resolve.
@@ -1029,7 +1029,7 @@ const try_block = Rules(
 	Rule(['try', '{', function_body, '}'],		$ => $[2]),
 );
 
-export const statement = Rules<Statement<any>>(self => [
+export const statement = Rules<Stmt<any>>(self => [
 	block,
 	variable_statement,
 	Rule([';'], 								_ => ({ type: 'empty' } as const)),
@@ -1089,7 +1089,7 @@ const import_attributes = Rules<{ key: string; value: string }[]>(
 	Rule(['with', '{', '}'], 									_ => []),
 	Rule(['with', '{', List(import_attribute, ',', true), '}'],	$ => $[2]),
 );
-export const import_declaration = Rules<Statement<any>>(
+export const import_declaration = Rules<Stmt<any>>(
 	Rule([STR, Maybe(import_attributes), ';'], 											$ => ({ type: 'import', source: unquoteString($[0]), attributes: $[1] } as const)),
 	Rule([IDENT, 'from', STR, Maybe(import_attributes), ';'], 							$ => ({ type: 'import', default: $[0], source: unquoteString($[2]), attributes: $[3] } as const)),
 	Rule(['*', 'as', IDENT, 'from', STR, Maybe(import_attributes), ';'], 				$ => ({ type: 'import', namespace: $[2], source: unquoteString($[4]), attributes: $[5] } as const)),
@@ -1108,7 +1108,7 @@ export const named_exports = Rules(
 	Rule(['{', '}'],										_ => []),
 	Rule(['{', List(export_specifier, ',', true), '}'],		$ => $[1]),
 );
-export const export_declaration = Rules<Statement<any>>(
+export const export_declaration = Rules<Stmt<any>>(
 	Rule([named_exports, ';'], 						$ => ({ type: 'export', specifiers: $[0] })),
 	Rule([named_exports, 'from', STR, ';'], 		$ => ({ type: 'export', specifiers: $[0], source: unquoteString($[2]) })),
 	Rule(['*', 'from', STR, ';'], 					$ => ({ type: 'export', source: unquoteString($[2]) })),
@@ -1165,13 +1165,13 @@ export const skip = [WS, /\/\/[^\n]*\n?/, /\/\*[^]*?\*\//, /^#![^\n]*\n?/];
 // every decorated member/parameter with a type annotation would fail (found via the official corpus: a
 // decorated field/param with a type behaves identically to an *undecorated* one otherwise, so this was
 // invisible to every earlier canary test, only surfacing once real annotated TS code hit the parser).
-function lazyParser<T>(start: () => Rules<T>, skip: TermLike[]): Parser<T> {
-	let built: Parser<T> | undefined;
+function lazyParser<T>(start: () => Rules<T>, skip: TermLike[]): LALRParser<T> {
+	let built: LALRParser<T> | undefined;
 	// `recover`/`merge` are declared later in this module (line ~1200+) but only read here inside `get`, which never runs until the first real `.parse`/`.parsePrefix` call
 	// -- well after module load finishes, so the forward reference is safe. Without them, ASI silently didn't work inside e.g. a decorated class
 	// member (`class C { @dec y: any }`, no trailing `;`, as the class body's last member) -- this sub-parser
 	// has no recovery callback at all, so it required an explicit terminator the outer parser never needs.
-	const get = () => built ??= makeParser({ start: start(), skip, recover, merge });
+	const get = () => built ??= makeParser({ start: start(), skip }, { recover, merge });
 	return {
 		get tables() { return get().tables; },
 		parse: (input, ctx) => get().parse(input, ctx),
@@ -1252,12 +1252,14 @@ export const rules = {
 export function make() {
 	return makeCachedParser({
 		skip,
-		recover,
-		merge,
 		start: program,
 		// these are only needed for debugging
 		rules
-	}, path.join(__dirname, '../../../.tables-cache/js-parser.json.gz'));
+	}, {
+		recover,
+		merge,
+	},
+	path.join(__dirname, '../../../.tables-cache/js-parser.json.gz'));
 }
 
 export const parser = make();

@@ -1,7 +1,8 @@
-// peg.ts -- a PEG (parsing expression grammar) back end for the *same* grammar values `makeParser` takes.
-//
-// `makeParser` reads a `GrammarSpec` as an ambiguous CFG and builds LR tables; `makePegParser` reads the
-// identical spec as a parsing expression grammar and returns a packrat recursive-descent parser instead:
+// ===================================================================
+// PEG (parsing expression grammar) back end
+// ===================================================================
+
+// `makePegParser` reads the spec as a parsing expression grammar and returns a packrat recursive-descent parser:
 // a nonterminal's alternatives become an *ordered* choice (first one that matches wins, no backtracking
 // into it afterwards), so nothing is ever ambiguous and there are no conflicts to resolve.
 //
@@ -19,12 +20,10 @@
 //     failure has already run its actions. Keep actions free of side effects on anything but their own
 //     return value (mutating `ctx` from an action is safe under LR, but not here).
 //   - `$.pos` is the *start* of the matched text, not the LR back end's following-token position.
-//   - `spec.recover`/`merge`/`forkCtx`/`lalr`/`optimize` are LR-only and ignored.
 
 import {
-	GrammarBuilder, NonTerminal, InternalPredicate, Terminal, EOF, ERROR,
-	nextToken, getTextPos,
-	type ActionEntry, type GrammarSpec, type InternalRule, type InternalSym, type TextPos, type Token,
+	GrammarBuilder, NonTerminal, InternalPredicate, Terminal, EOF, ERROR, nextToken, getTextPos,
+	type ActionEntry, type GrammarSpec, type InternalRule, type InternalSym, type TextPos, type Token, type Parser,
 } from './tison';
 
 export interface PegOptions {
@@ -39,11 +38,7 @@ export interface PegOptions {
 	maxDepth?:	number;		// default 2000: recursion-depth tripwire, so a runaway grammar throws instead of blowing the JS stack
 }
 
-export interface PegParser<T, C = any> {
-	parse(input: string, ctx?: C): T;
-	// Succeeds on a leading prefix of `input` forming one complete derivation of `start`, instead of
-	// requiring all of `input` to be consumed -- the counterpart of `Parser.parsePrefix`.
-	parsePrefix(input: string, ctx?: C): { value: T; consumed: number };
+export interface PegParser<T, C = any> extends Parser<T, C> {
 	grammar: GrammarBuilder;
 }
 

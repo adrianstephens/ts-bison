@@ -9,7 +9,7 @@ import { Output } from './tocode';
 
 type Location		= JS.Location;
 type Expr			= JS.Expr;
-type Statement		= TS.Statement;
+type Stmt			= TS.Stmt;
 type BindingTarget	= JS.BindingTarget;
 type Type			= TS.Type;
 type Scope			= T.Scope;
@@ -152,8 +152,8 @@ export function foldConstants<T extends Walkable>(ast: T) {
 // analysis -- conservative, but simple and correct: a local that never actually crosses a suspend
 // point just costs an unused frame field). A destructured declarator ('const {a,b} = x') is skipped
 // here -- real, but narrower and deferred; only a plain 'let x = ...'/'const x = ...' is hoisted.
-export function collectHoistedLocals(body: Statement[]): Map<string, { stmt: Statement; decl: JS.Var<Type> }> {
-	const decls = new Map<string, { stmt: Statement; decl: JS.Var<Type> }>();
+export function collectHoistedLocals(body: Stmt[]): Map<string, { stmt: Stmt; decl: JS.Var<Type> }> {
+	const decls = new Map<string, { stmt: Stmt; decl: JS.Var<Type> }>();
 	walkB(body,
 		(s, process) => {
 			if (s.type === 'var_decl') {
@@ -192,7 +192,7 @@ export type SegmentNext =
 
 export interface StateMachineSegment {
 	id:			number;
-	stmts:		Statement[];
+	stmts:		Stmt[];
 	next:		SegmentNext;
 }
 
@@ -211,13 +211,13 @@ export interface StateMachine {
 // suspend point embedded in a larger expression, or nested inside a 'switch'/'try') with a clear
 // error rather than silently mishandling it.
 
-export function BuildStateMachine(stmts: Statement[]) {
+export function BuildStateMachine(stmts: Stmt[]) {
 	const segments = [] as (StateMachineSegment | undefined)[];
 
 	function reserve(): number {
 		return segments.push(undefined) - 1;
 	}
-	function define(id: number, stmts: Statement[], next: SegmentNext) {
+	function define(id: number, stmts: Stmt[], next: SegmentNext) {
 		segments[id] = { id, stmts, next };
 	}
 
@@ -231,7 +231,7 @@ export function BuildStateMachine(stmts: Statement[]) {
 	// - a bare 'yield x;'/'await p;'
 	// - expression statement, 'return await p;'
 	// - a single-declarator 'const v = yield x;'/'= await p;'.
-	function suspendBoundary(stmt: Statement): SuspendBoundary | undefined {
+	function suspendBoundary(stmt: Stmt): SuspendBoundary | undefined {
 		if (stmt.type === 'expression')
 			return suspendExpr(stmt.expression);
 		if (stmt.type === 'return' && stmt.argument) {
@@ -251,7 +251,7 @@ export function BuildStateMachine(stmts: Statement[]) {
 	}
 
 	// Stops at a nested closure boundary (a yield/await inside it belongs to *that* function, not this one)
-	function containsSuspend(stmt: Statement): boolean {
+	function containsSuspend(stmt: Stmt): boolean {
 		return walkB(stmt,
 			undefined,
 			(e, process) => suspendExpr(e as Expr) ? true : (e.type === 'arrow' || e.type === 'function') ? false : process(e)
@@ -261,7 +261,7 @@ export function BuildStateMachine(stmts: Statement[]) {
 	// A bare (unlabeled -- labeled break/continue is unsupported everywhere else in towasm.ts too) break
 	// or continue that would target the loop/switch containing `stmts` directly, not a nested one (which
 	// establishes its own break/continue scope, same reasoning `case 'switch'`'s own scoping needs).
-	function containsOwnBreakOrContinue(stmts: Statement|Statement[]): boolean {
+	function containsOwnBreakOrContinue(stmts: Stmt|Stmt[]): boolean {
 		return walkB(stmts,
 			(s, process) => {
 				if (s.type === 'break' || s.type === 'continue')
@@ -274,16 +274,16 @@ export function BuildStateMachine(stmts: Statement[]) {
 		);
 	}
 
-	function bodyStmtsOf(stmt: Statement): Statement[] {
+	function bodyStmtsOf(stmt: Stmt): Stmt[] {
 		return stmt.type === 'block' ? stmt.body : [stmt];
 	}
 
 	// Flattens `stmts`, returning the id of its own entry segment. `contId`: where control goes once `stmts` completes normally (falls off its own end)
 	// -- always a real, already-known id (the whole point of processing backward below: by the time a statement is handled, everything textually after
 	// it is already built, so its own "what happens next" is always a concrete target, never a forward reference needing a later patch-up).
-	function recurse(stmts: Statement[], contId: number): number {
+	function recurse(stmts: Stmt[], contId: number): number {
 		let cont = contId;
-		let trailing: Statement[] = [];	// ordinary statements seen so far, nearest-to-`cont` first
+		let trailing: Stmt[] = [];	// ordinary statements seen so far, nearest-to-`cont` first
 		const flush = (): number => {
 			if (trailing.length === 0)
 				return cont;
@@ -343,13 +343,13 @@ export function BuildStateMachine(stmts: Statement[]) {
 						const bodyEntry = recurse(bodyStmtsOf(stmt.body), updateId);
 						switch (stmt.kind) {
 							case 'normal':
-								define(updateId, stmt.update ? [{ type: 'expression', expression: stmt.update } as Statement] : [], { type: 'goto', target: cont });
+								define(updateId, stmt.update ? [{ type: 'expression', expression: stmt.update } as Stmt] : [], { type: 'goto', target: cont });
 								define(cont, [], stmt.test ? { type: 'branch', test: stmt.test, then: bodyEntry, else: cont0 } : { type: 'goto', target: bodyEntry });
 								break;
 						}
 						if (stmt.init) {
 							const cont2 = reserve();
-							define(cont2, [stmt.init.type === 'var_decl' ? stmt.init : { type: 'expression', expression: stmt.init } as Statement], { type: 'goto', target: cont });
+							define(cont2, [stmt.init.type === 'var_decl' ? stmt.init : { type: 'expression', expression: stmt.init } as Stmt], { type: 'goto', target: cont });
 							cont = cont2;
 						}
 						break;
@@ -386,7 +386,7 @@ export function BuildStateMachine(stmts: Statement[]) {
 // as `state = resumeId; return yield/await x;` since that's the clearest way to show "control
 // leaves here and re-enters at resumeId" as source text.
 export function StateMachineToAST(machine: StateMachine) {
-	type S = Statement;
+	type S = Stmt;
 	const state		= Identifier('state');
 	const setState	= (v: number): S => ({type: 'expression', expression: JS.JSBinary('=', state, Literal(v))});
 	const cont: S	= {type: 'continue'};
@@ -455,7 +455,7 @@ export function StateMachineToAST(machine: StateMachine) {
 // left for this to work (see its own comment) -- a default on an already-non-nullable value (an ordinary
 // array element, or a non-optional object field) is provably dead code, same as real TS itself would
 // prove, not a reason to reject it.
-export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget, valueExpr: Expr): JS.Statement<Type>[] {
+export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget, valueExpr: Expr): JS.Stmt<Type>[] {
 	if (typeof target === 'string')
 		return [JS.VarDecl(kind, JS.Var(target, valueExpr))];
 
@@ -545,7 +545,7 @@ export function TStoJS(ast: TS.Program) {
 							if (m.key === 'constructor') {
 								// A parameter-property modifier is anything but the unrelated `'optional'` tag
 								// that can now also live in `modifiers` (see `Param`'s own comment).
-								const prelude: JS.Statement<any>[] = m.params
+								const prelude: JS.Stmt<any>[] = m.params
 									.filter((p) => p.modifiers?.some(x => x !== 'optional'))
 									.map(p => ({
 										type: 'expression',
@@ -989,7 +989,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 
 	// ---- Gathering every top-level declaration, and seeding `reachable` with the explicit exports ----
 
-	type Owner = TS.Statement | JS.Var<any>;
+	type Owner = TS.Stmt | JS.Var<any>;
 	class Owners extends Map<string, Owner[]> {
 		exported	= false;
 		add(name: string, owner: Owner) {
@@ -1013,7 +1013,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 	// emitter handles this). Names tracked separately so they can be seeded into `reachable`, below -- a
 	// synthesized base is always wanted whenever its class is, but nothing else ever references it by name for
 	// the normal reachability walk to find on its own.
-	const syntheticBases: TS.Statement[] = [];
+	const syntheticBases: TS.Stmt[] = [];
 
 	// Cheap, non-recursive scan of every top-level name -- seeded before any stripping starts, so a
 	// synthesized base name can't collide with a real declaration the single pass below hasn't reached yet.
@@ -1237,7 +1237,7 @@ export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOption
 		}
 	})!;
 
-	const collectDeclRefs = (owner: TS.Statement|Expr|Type, refs: Set<string>) => walk(owner,
+	const collectDeclRefs = (owner: TS.Stmt|Expr|Type, refs: Set<string>) => walk(owner,
 		undefined,
 		(e, process) => {
 			if (e.type === 'identifier')

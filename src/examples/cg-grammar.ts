@@ -1902,4 +1902,4 @@ const compilation_unit = Rules(self => [
 export const parser = makeCachedParser({
 	start: compilation_unit,
 	skip: [/\s+/]
-}, path.join(__dirname, '../../.tables-cache/cg-grammar.json.gz'));
+}, {}, path.join(__dirname, '../../.tables-cache/cg-grammar.json.gz'));

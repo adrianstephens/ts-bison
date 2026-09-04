@@ -24,13 +24,13 @@ export const isType = (node: any): node is Type => typeTags(node) && !('properti
 export const isTsDeclaration	= guard<TS.Declaration>(['type_alias_decl', 'interface_decl', 'enum_decl', 'namespace_decl']);
 // Tests JS statement tags but asserts the wide `TS.Statement`: since js-parser's `X` seam every JS
 // statement IS one, and asserting the narrow type is what used to force casts at the call sites.
-export const isJsStatement		= guard<TS.Statement>(stmts);
+export const isJsStatement		= guard<TS.Stmt>(stmts);
 
-type Type		= TS.Type;
-type Expr		= TS.Expr;
-type Statement	= TS.Statement;
-export type Walkable0 = Statement | Expr | Type;
-export type Walkable = Statement | Expr | Type | TS.Program | Statement[];
+type Type	= TS.Type;
+type Expr	= TS.Expr;
+type Stmt	= TS.Stmt;
+export type Walkable0 = Stmt | Expr | Type;
+export type Walkable = Stmt | Expr | Type | TS.Program | Stmt[];
 
 //-----------------------------------------------------------------------------
 // Constant folding
@@ -97,13 +97,11 @@ export function calcBinary(op: JS.binaryOps, a: any, b: any) {
 // walk
 //-----------------------------------------------------------------------------
 
-// Lets a hook recurse into a child of another domain (e.g. an expression from onStatement),
-// using the same shape-based dispatch `walk()` itself uses at its own entry point.
 type Recurse		= W.Recurse<Walkable0>;
 type OnAST<U>		= W.OnAST<U, Recurse>;
 
 export function walk<T extends Walkable>(ast: T,
-	onStatement?:	OnAST<TS.Statement>,
+	onStatement?:	OnAST<TS.Stmt>,
 	onExpression?:	OnAST<Expr>,
 	onType?:		OnAST<Type>,
 	onTypeMember?:	OnAST<TS.TypeMember>,
@@ -113,7 +111,7 @@ export function walk<T extends Walkable>(ast: T,
 	// The bodies still reached through a `CallSig` (a function/method/arrow body) keep js-parser's own
 	// narrow `Statement<T>` -- see the `X` seam comment there. Every NESTED statement slot uses
 	// `mapStatement` directly now and needs no cast.
-	const mapStatementC	= (stmt: TS.Statement) => mapStatement(stmt) as JS.Statement<any> | undefined;
+	const mapStatementC	= (stmt: TS.Stmt) => mapStatement(stmt) as JS.Stmt<any> | undefined;
 	const mapTypeU		= (type: any): any => mapType(type as Type);
 
 	const mapKey = (key: JS.Key): JS.Key =>
@@ -340,7 +338,7 @@ export function walk<T extends Walkable>(ast: T,
 		}
 	};
 
-	const statement = (stmt: TS.Statement): TS.Statement => {
+	const statement = (stmt: TS.Stmt): TS.Stmt => {
 		switch (stmt.type) {
 			case 'block':		return mapObject(stmt, {
 				body:			mapArrayA(mapStatement)
@@ -463,11 +461,11 @@ export function walk<T extends Walkable>(ast: T,
 // expression) skip the shape-based guess below -- needed because some tags genuinely can't be
 // told apart by shape alone (a 'literal' node is IDENTICAL, field for field, whether it's a
 // type-level literal type or an expression-level literal value; see `recurse`'s own comment).
-export type RecurseB	= (x: TS.Statement | Expr | Type | undefined, kind?: 'expression' | 'statement' | 'type') => boolean;
+export type RecurseB	= (x: TS.Stmt | Expr | Type | undefined, kind?: 'expression' | 'statement' | 'type') => boolean;
 type OnASTB<U>		= W.OnASTB<U, RecurseB>;
 
 export function walkB<T extends Walkable>(ast: T,
-	onStatement?:	OnASTB<TS.Statement>,
+	onStatement?:	OnASTB<TS.Stmt>,
 	onExpression?:	OnASTB<JS.Expr>,
 	onType?:		OnASTB<Type>,
 	onTypeMember?:	OnASTB<TS.TypeMember|TS.ClassMember>,
@@ -579,7 +577,7 @@ export function walkB<T extends Walkable>(ast: T,
 		}
 	};
 
-	const statement = (stmt: TS.Statement): boolean => {
+	const statement = (stmt: TS.Stmt): boolean => {
 		switch (stmt.type) {
 			case 'block':				return stmt.body.some(walkStatement);
 			case 'var_decl':			return stmt.declarations.some(walkVarDeclarator);
@@ -621,7 +619,7 @@ export function walkB<T extends Walkable>(ast: T,
 		if (kind === 'expression')
 			return walkExpression(x as JS.Expr);
 		if (kind === 'statement')
-			return walkStatement(x as TS.Statement);
+			return walkStatement(x as TS.Stmt);
 		if (kind === 'type' || isType(x))
 			return walkType(x as Type);
 		if (isJsStatement(x) || isTsDeclaration(x))

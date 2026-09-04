@@ -43,7 +43,7 @@ async function tryLoadFile(full: string): Promise<string | undefined> {
 }
 
 export interface LoadedModule {
-	body:		TS.Statement[];
+	body:		TS.Stmt[];
 	canonical:	string;	// relative import *inside* that module must resolve relative to where the module really lives
 }
 
@@ -161,7 +161,7 @@ class NodeModules {
 
 	// Ambient `declare module 'X' { ... }` blocks are self-contained (no real file of their own),
 	// so there's nothing more meaningful than the module's own name to use as their canonical specifier.
-	protected registerDeclaredModules(body: TS.Statement[]) {
+	protected registerDeclaredModules(body: TS.Stmt[]) {
 		for (const s of body) {
 			if (s.type === 'module_decl' && s.ambient)
 				this.imported.set(s.name, { body: s.body, canonical: s.name });
@@ -181,7 +181,7 @@ class NodeModules {
 	// Parses `code` (the file reached via `canonical`) and folds in every file its own `/// <reference .../>` directives
 	// reach, transitively. A plain `seen` guard, not `ts-codegen.ts`'s full concurrent-cycle machinery -- `.d.ts` reference
 	// cycles are vanishingly rare in practice, unlike real import cycles.
-	private async withReferences(code: string, canonical: string, seen: Set<string>): Promise<TS.Statement[]> {
+	private async withReferences(code: string, canonical: string, seen: Set<string>): Promise<TS.Stmt[]> {
 		seen.add(canonical);
 		try {
 			const body = TS.parse(code).body;
@@ -305,13 +305,13 @@ export class ModuleLoader {
 // only ever carries *types*, never a callee's actual AST body to compile. Only plain `import` is walked
 // (matching every real import in this monorepo's own self-hosting target files) -- a re-exporting
 // `export ... from` isn't resolved here, a real, narrower, separate gap if one is ever found in practice.
-export async function collectModules(entryBody: TS.Statement[], loader: ModuleLoader) {
-	const modules = new Map<string, TS.Statement[]>();
+export async function collectModules(entryBody: TS.Stmt[], loader: ModuleLoader) {
+	const modules = new Map<string, TS.Stmt[]>();
 	const namespaceImports = new Map<string, Map<string, string>>();
 	const namedImports = new Map<string, Map<string, { module: string; name: string }>>();
 	const seen = new Set<string>(['.']);
 
-	async function walk(canonical: string, body: TS.Statement[]) {
+	async function walk(canonical: string, body: TS.Stmt[]) {
 		for (const s of body) {
 			if (s.type !== 'import')
 				continue;

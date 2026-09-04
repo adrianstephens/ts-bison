@@ -137,10 +137,10 @@ export interface OutOfClassDtor			{ type: 'destructor_def'; scope: string[]; nam
 export interface OperatorDef			extends C.ParamList<ParamDecl> { type: 'operator_def'; specifiers: DeclarationSpec; scope?: string[]; operator: string; tail: MethodTail; }
 export interface StaticMemberDef		{ type: 'static_member_def'; specifiers: DeclarationSpec; pointer?: C.Levels; scope: string[]; name: string; initializer?: C.Expr; ctorArgs?: C.Expr[]; }
 
-export type Statement = C.Statement<Declarator, TypeSpecifierExt>
+export type Stmt = C.Stmt<Declarator, TypeSpecifierExt>
 	| { type: 'throw'; argument?: C.Expr }
 	| { type: 'try'; body: C.Block<Declarator, TypeSpecifierExt>; handlers: CatchClause[] }
-	| { type: 'range_for'; specifiers: DeclarationSpec; declarator: Declarator; range: C.Expr; body: Statement }
+	| { type: 'range_for'; specifiers: DeclarationSpec; declarator: Declarator; range: C.Expr; body: Stmt }
 	| StaticAssert
 	| UsingDirective
 	| UsingAlias
@@ -1163,15 +1163,15 @@ const catch_clause = Rules<CatchClause>(
 );
 const catch_clause_list = List(catch_clause);
 
-const try_statement = Rules<Statement>(
+const try_statement = Rules<Stmt>(
 	Rule(['try', C.compound_statement, catch_clause_list], $ => ({ type: 'try', body: $[1], handlers: $[2] } as const)),
 );
-const throw_statement = Rules<Statement>(
+const throw_statement = Rules<Stmt>(
 	Rule(['throw', C.expression, ';'],	$ => ({ type: 'throw', argument: $[1] } as const)),
 	Rule(['throw', ';'],				_ => ({ type: 'throw' } as const)),
 );
 
-const statement = C.statement as unknown as Rules<Statement>;
+const statement = C.statement as unknown as Rules<Stmt>;
 statement.push(
 	try_statement,
 	throw_statement,
@@ -1214,6 +1214,7 @@ export const parser = makeCachedParser({
 	precedence: C.PREC,
 	start: C.translation_unit,
 	rules: { translation_unit: C.translation_unit },
+}, {
 	// each GLR branch mutates its own ctx (typedef registration, templateDepth); a dying branch's
 	// mutations no longer leak into the survivor
 	forkCtx: (ctx: CppCtx) => ({...ctx, typedefNames: new Set(ctx.typedefNames)}),

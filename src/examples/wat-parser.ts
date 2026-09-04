@@ -793,7 +793,7 @@ export const parser = makeCachedParser({
 		Rule(['(', 'module', maybe_id, MaybeList(module_field), ')'],	($, ctx) => ({ id: $[2], fields: definedFields($[3], ctx) })),
 		Rule([MaybeList(module_field)],									($, ctx) => ({ fields: definedFields($[0], ctx) })),
 	)
-}, path.join(__dirname, '../../.tables-cache/wat-parser.json.gz'));
+}, {}, path.join(__dirname, '../../.tables-cache/wat-parser.json.gz'));
 
 export function parseWat(src: string, defines?: Record<string, string|number>): Module {
 	return parser.parse(src, new ParseCtx(defines));
@@ -820,7 +820,7 @@ const asmBodyParser = makeCachedParser({
 	start: Rules<ParsedAsmBody>(
 		Rule([MaybeList(instr)], $ => collectAsmItems($[0])),
 	)
-}, path.join(__dirname, '../../.tables-cache/wat-parser-asm.json.gz'));
+}, {}, path.join(__dirname, '../../.tables-cache/wat-parser-asm.json.gz'));
 
 export function parseAsmBody(src: string, defines?: Record<string, string|number>) {
 	return asmBodyParser.parse(src, new ParseCtx(defines));

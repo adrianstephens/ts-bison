@@ -3,7 +3,7 @@ import * as CPP from './cpp-parser';
 import { isTranslationUnit, isDefinition, isStatementOnly, isExpr, isClassMember, isDeclarator, isPackParameter } from './walker';
 
 type Definition			= CPP.Definition;
-type Statement			= CPP.Statement;
+type Stmt				= CPP.Stmt;
 type Expr				= CPP.Expr;
 type ClassMember		= CPP.ClassMember;
 type Declarator			= CPP.Declarator;
@@ -103,7 +103,7 @@ export class Output {
 		this.comma		= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: C.TranslationUnit | Definition | Statement | Expr | ClassMember): string {
+	toCode(ast: C.TranslationUnit | Definition | Stmt | Expr | ClassMember): string {
 		if (isTranslationUnit(ast))
 			return ast.body.map(d => this.definition(d)).join(this.opts.newline);
 		if (isClassMember(ast))
@@ -111,7 +111,7 @@ export class Output {
 		if (isDefinition(ast) && !isStatementOnly(ast))
 			return this.definition(ast as Definition);
 		if (isStatementOnly(ast) || isDefinition(ast))
-			return this.statement(ast as Statement);
+			return this.statement(ast as Stmt);
 		return this.expr(ast as Expr);
 	}
 
@@ -140,7 +140,7 @@ export class Output {
 	curlyBlock(defs: Definition[]): string {
 		return this.curlyIndented(() => defs.map(d => this.definition(d)).join(this.newline));
 	}
-	dependentCode(s: Statement): string {
+	dependentCode(s: Stmt): string {
 		if (s.type !== 'block')
 			return this.indented(() => this.newline + this.statement(s));
 		return this.block(s);
@@ -329,7 +329,7 @@ export class Output {
 		return isExpr(i) ? this.expr(i as Expr) : this.declarationLike(i, false);
 	}
 
-	statement(s: Statement): string {
+	statement(s: Stmt): string {
 		switch (s.type) {
 			case 'declaration':
 			case 'typedef':				return this.declarationLike(s);

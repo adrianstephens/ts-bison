@@ -34,7 +34,7 @@ export const isStmt		= guard<PY.Stmt>(stmtTags);
 type Expr = PY.Expr;
 type Stmt = PY.Stmt;
 export type Walkable0 = Stmt | Expr;
-export type Walkable = Walkable0 | Stmt[];
+export type Walkable = Walkable0 | PY.Module | Stmt[];
 
 // ===================================================================
 //  Constant folding

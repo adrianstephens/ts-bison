@@ -886,9 +886,10 @@ export const rules = {
 
 export const parser = makeCachedParser({
 	skip,
-	recover,
 	start: file_input,
 	rules,
+}, {
+	recover,
 }, path.join(__dirname, '../../../.tables-cache/py-parser.json.gz'));
 
 export function parse(code: string): Module {

@@ -1,4 +1,10 @@
 
+export function  withDefault<T extends {default?: U}, U>(p: T, def: U) { p.default = def; return p; }
+
+// ===================================================================
+//  modifiers
+// ===================================================================
+
 export function hasMod(e: {modifiers?: string[]}, m: string) {
     return e.modifiers?.includes(m) ?? false;
 }
@@ -14,8 +20,6 @@ export function mergeMods(a?: string[], b?: string[]): string[] | undefined {
     if (a || b)
         return [...(a ?? []), ...(b ?? [])];
 }
-
-export function  withDefault<T extends {default?: U}, U>(p: T, def: U) { p.default = def; return p; }
 
 // ===================================================================
 //  Source location
@@ -39,15 +43,7 @@ export function getPos(node: unknown): Location | undefined {
 // ===================================================================
 //  Shared expression shapes
 // ===================================================================
-// The concepts all three parser families have in common, spelled once. Each is generic in its
-// expression type `E` (and, where a language needs a richer payload, in that too) so a parser can
-// alias or extend it rather than restate it -- the same seam `Unary`/`Binary` above already use.
-//
-// Naming follows js-parser.ts wherever the shapes already agreed, purely because its consumers
-// (checker/towasm/vsdg/transform) are by far the largest body of code reading these fields. Two
-// deliberate departures: `Index.index` (js-parser called it `property`, the same name `Member` uses
-// for a plain string -- confusing when it holds an expression), and `Sequence.elements` (py-parser
-// called it `elts`).
+// Each is generic in its expression type `E` (and, where a language needs a richer payload, in that too)
 
 // `frozen`: TS.Type-context only (this interface is shared with JS.Expr's own literal AST nodes, which never set it) --
 // marks a literal produced by an `as`/`as const` assertion, so `type-utils.ts`'s `widenLiterals` leaves it exactly as
@@ -69,8 +65,7 @@ export function  Binary<E, const O>(operator: O, left: E, right: E): Binary<E, O
 export interface Call<E, A = E>		{ type: 'call'; callee: E; arguments: A[] }
 export function  Call<E, A>(callee: E, args: A[]): Call<E, A> { return { type: 'call', callee, arguments: args }; }
 
-// `.`-style access by a fixed name. C's `->` stays a separate `pointer_member` node: it dereferences,
-// so it isn't the same operation, only the same syntax shape.
+// `.`-style access by a fixed name. C's `->` stays a separate `pointer_member` node: it dereferences, so it isn't the same operation, only the same syntax shape.
 export interface Member<E>			{ type: 'member'; object: E; property: string }
 export function  Member<E>(object: E, property: string): Member<E> { return { type: 'member', object, property }; }
 
@@ -111,18 +106,15 @@ export function  Throw<E>(argument?: E): Throw<E> { return { type: 'throw', argu
 export interface Block<S>			{ type: 'block'; body: S[] }
 export function  Block<S>(...body: S[]): Block<S> { return { type: 'block', body }; }
 
-// A `catch` / `except` clause. `param` is whatever the language binds (a JS binding target, a
-// Python or C++ name); each parser intersects its own extras onto it -- an exception `type`, a
-// Python `except*` star, a C++ by-reference flag.
-// The control-flow statements. `B` is the BODY slot -- one statement in js-parser and c-parser (a
-// `Block` when the source delimited it), a statement list in py-parser. The languages genuinely
-// differ there, so it stays a type parameter rather than being forced into one representation;
-// `bodyOf` reads any of them. `E` is the expression type, as everywhere above.
+// The control-flow statements. `B` is the BODY slot -- one statement in js-parser and c-parser (a `Block` when the source delimited it), a statement list in py-parser.
+// The languages genuinely differ there, so it stays a type parameter rather than being forced into one representation;
 export interface If<E, B>			{ type: 'if'; test: E; consequent: B; alternate?: B }
 export interface While<E, B>		{ type: 'while'; test: E; body: B }
 export interface DoWhile<E, B>		{ type: 'do_while'; body: B; test: E }
 export interface Labeled<B>			{ type: 'labeled'; label: string; body: B }
 
+// A `catch` / `except` clause. `param` is whatever the language binds (a JS binding target, a Python or C++ name); each parser intersects its own extras onto it
+// -- an exception `type`, a Python `except*` star, a C++ by-reference flag.
 export interface Handler<S, P = unknown>	{ param?: P; body: S[] }
 export interface Try<S, P = unknown>		{ type: 'try'; body: S[]; handlers: Handler<S, P>[]; finalizer?: S[] }
 

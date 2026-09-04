@@ -7,7 +7,7 @@ import { patternBindings as buildPatternBindings } from './transform';
 
 const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
 type Expr			= TS.Expr;
-type Statement		= TS.Statement;
+type Stmt			= TS.Stmt;
 
 type NodeId = string;
 
@@ -67,9 +67,9 @@ type INode =
 	// function/arrow EXPRESSION (expr set, prints inline like an effect). returnNodeId is the only way
 	// to reach the RETURN_ANCHOR (no ordinary edge connects entry to return). destructuredParams maps
 	// a destructured param's pattern to the hidden temp its value binds to, so signature and body agree.
-	| { type: 'function', stmt?: Statement, expr?: Expr, returnNodeId: NodeId, destructuredParams?: Map<JS.BindingTarget, string> }
-	| { type: 'class_decl', stmt: Statement }
-	| { type: 'passthru', stmt: Statement }
+	| { type: 'function', stmt?: Stmt, expr?: Expr, returnNodeId: NodeId, destructuredParams?: Map<JS.BindingTarget, string> }
+	| { type: 'class_decl', stmt: Stmt }
+	| { type: 'passthru', stmt: Stmt }
 	| { type: 'marker', name: MarkerName }
 	| { type: 'effect', expr: Expr }
 	// optional: a `?.` member access (`.name` is the property; unlike 'index', which keeps the whole
@@ -339,7 +339,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		return makeNode({ type, name } as Extract<INode, { type: T }>);
 	}
 	// A node whose own payload is a raw statement (passthru/class_decl/a function declaration).
-	function makeStmtNode<T extends NodeType>(type: T, stmt: Statement) {
+	function makeStmtNode<T extends NodeType>(type: T, stmt: Stmt) {
 		return makeNode({ type, stmt } as Extract<INode, { type: T }>);
 	}
 	// An internal bookkeeping / state-chain anchor node.
@@ -456,7 +456,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 	// Shared by 'while' and 'do_while': same mu/theta machinery, differing only in whether the test
 	// is read before the body (while) or after it (do_while -- the body always runs once first).
-	function buildLoop(recurse: RecurseB, test: Expr, body: Statement, isDoWhile: boolean, forUpdate?: Expr) {
+	function buildLoop(recurse: RecurseB, test: Expr, body: Stmt, isDoWhile: boolean, forUpdate?: Expr) {
 		const preLoop	= getState();
 		const muEnd		= makeNode({ type: 'mu' });
 		if (isDoWhile)
@@ -634,7 +634,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// entry/return machinery a top-level function_decl gets. entryNode is connected into the outer
 	// state chain not because the body runs at this point (it doesn't, except a static block) but so
 	// applyGlobalCodeMotion's own region-boundary logic nests it under the right enclosing region.
-	function buildFunctionBody(recurse: RecurseB, params: JS.Params<TS.Type> | undefined, body: Expr | Statement[]) {
+	function buildFunctionBody(recurse: RecurseB, params: JS.Params<TS.Type> | undefined, body: Expr | Stmt[]) {
 		const outer			= getState();
 		const returnNode	= makeMarker('RETURN_ANCHOR');
 		const entryNode		= makeNode({ type: 'function', returnNodeId: returnNode.id });
@@ -865,7 +865,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							// directly), then desugar the pattern off that temp -- a nested pattern is
 							// handled for free by re-entering this same case for each flattened result.
 							const tempName = `__destructure${nextId++}`;
-							recurse(JS.VarDecl<TS.Type>(s.kind, JS.Var<TS.Type>(tempName, v.init)) as Statement, 'statement');
+							recurse(JS.VarDecl<TS.Type>(s.kind, JS.Var<TS.Type>(tempName, v.init)) as Stmt, 'statement');
 							for (const stmt of patternBindings(s.kind, v.name, Identifier(tempName)))
 								recurse(stmt, 'statement');
 						} else {
@@ -927,9 +927,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						)), 'statement');
 
 						const value = JS.Member<TS.Type>(Identifier(resultName), 'value');
-						buildLoop(recurse, Literal(true), JS.Block<Statement>(
+						buildLoop(recurse, Literal(true), JS.Block<Stmt>(
 							JS.VarDecl<TS.Type>('const', JS.Var<TS.Type>(resultName, JS.Call<TS.Type>(JS.Member<TS.Type>(Identifier(iterName), 'next'), []))),
-							JS.If<Statement>(JS.Member<TS.Type>(Identifier(resultName), 'done'), { type: 'break' }),
+							JS.If<Stmt>(JS.Member<TS.Type>(Identifier(resultName), 'done'), { type: 'break' }),
 							(s.init.type === 'var_decl'
 								? JS.VarDecl<TS.Type>(s.init.kind, JS.Var<TS.Type>(s.init.declarations[0].name, value))
 								: JS.Expression<TS.Type>(JS.JSBinary('=', s.init, value))),
@@ -1581,7 +1581,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 // value multiple times). Reuses transform.ts's own version (shared with towasm.ts) rather than a
 // second copy; wrapped in try/catch since it hard-throws on two gaps (object rest, computed key)
 // this file otherwise degrades gracefully on -- accepted since both are already rare.
-function patternBindings(kind: JS.DeclarationKind, target: JS.BindingTarget, valueExpr: Expr): Statement[] {
+function patternBindings(kind: JS.DeclarationKind, target: JS.BindingTarget, valueExpr: Expr): Stmt[] {
 	try {
 		return buildPatternBindings(kind, target, valueExpr);
 	} catch (e) {
@@ -1610,9 +1610,9 @@ class ScopedNames {
 }
 
 // Wraps a reconstructed statement in `export `/`export default `, per a node's own `exported` stamp.
-function wrapExported(stmt: Statement, exported: 'named' | 'default' | undefined): Statement {
-	return exported === 'named' ? { type: 'export_decl', declaration: stmt } as Statement
-		: exported === 'default' ? { type: 'export', default: stmt } as Statement
+function wrapExported(stmt: Stmt, exported: 'named' | 'default' | undefined): Stmt {
+	return exported === 'named' ? { type: 'export_decl', declaration: stmt } as Stmt
+		: exported === 'default' ? { type: 'export', default: stmt } as Stmt
 		: stmt;
 }
 
@@ -1767,7 +1767,7 @@ export function BuildProgram(
 	// Reconstructs a 'function'-anchored subgraph's own body -- its own fully independent
 	// region (own entry/RETURN_ANCHOR pair, own scope). returnNodeId is the only way to find the
 	// RETURN_ANCHOR from here -- no ordinary graph edge from entry to return survives an empty body.
-	function rebuildFunctionBody(entryNode: NodeOf<'function'>): Statement[] {
+	function rebuildFunctionBody(entryNode: NodeOf<'function'>): Stmt[] {
 		const returnNode		= graph.get(entryNode.returnNodeId)!;
 		// A fresh declaredNames frame per function body -- this function's own locals must never
 		// collide with an unrelated sibling/enclosing function's locals sharing the same name.
@@ -1820,7 +1820,7 @@ export function BuildProgram(
 					return { ...prop, operand: resolveOperand(node.id, i) };
 				const mi = node.classInfo?.members[i];
 				if (mi?.entryNodeId)
-					return { ...prop, body: rebuildFunctionBody(graph.get(mi.entryNodeId)! as NodeOf<'function'>) as JS.Statement<TS.Type>[] };
+					return { ...prop, body: rebuildFunctionBody(graph.get(mi.entryNodeId)! as NodeOf<'function'>) as JS.Stmt<TS.Type>[] };
 				return prop.type === 'field' && typeof prop.key === 'string' ? { ...prop, value: resolveOperand(node.id, i) } : prop;
 			}),
 		};
@@ -1979,7 +1979,7 @@ export function BuildProgram(
 		return false;
 	}
 
-	function emitNamedSlot(name: string, node: Node): Statement | undefined {
+	function emitNamedSlot(name: string, node: Node): Stmt | undefined {
 		const first = !declaredNames.has(name);
 		declaredNames.add(name);
 
@@ -2147,8 +2147,8 @@ export function BuildProgram(
 		return sorted;
 	}
 
-	function emitLocalStatements(ids: NodeId[]): Statement[] {
-		const statements: Statement[] = [];
+	function emitLocalStatements(ids: NodeId[]): Stmt[] {
+		const statements: Stmt[] = [];
 
 		for (const id of localTopologicalSort(ids)) {
 			const node = graph.get(id)!;
@@ -2312,7 +2312,7 @@ export function BuildProgram(
 	// this node's own contribution AFTER recursing, so output comes out forward. A backward walk from
 	// a known endpoint has no ambiguity, unlike a forward walk (several simultaneous forward
 	// consumers of the same state token -- each branch's entry AND the eventual merge -- would tie).
-	function emitChain(fromId: NodeId | undefined, boundaryId: NodeId): Statement[] {
+	function emitChain(fromId: NodeId | undefined, boundaryId: NodeId): Stmt[] {
 		if (fromId === undefined || fromId === boundaryId)
 			return [];
 		const node = graph.get(fromId)!;
@@ -2327,7 +2327,7 @@ export function BuildProgram(
 	// DEPENDENCIES emit first (so a value a branch shares with a co-scheduled slot via CSE is already
 	// registered by the time the branch resolves it), then `middle()`, then its DEPENDENTS. `middle`
 	// is a thunk so its own emitChain calls run AFTER the dependency half, never before.
-	function withCoScheduled(nodes: NodeId[], controlId: NodeId, middle: () => Statement[]): Statement[] {
+	function withCoScheduled(nodes: NodeId[], controlId: NodeId, middle: () => Stmt[]): Stmt[] {
 		const sortedIds	= localTopologicalSort(nodes);
 		const i			= sortedIds.indexOf(controlId);
 		// Array-literal elements evaluate left to right, so the dependency half runs before `middle()`.
@@ -2342,7 +2342,7 @@ export function BuildProgram(
 	// if/switch/try/while/function declaration it anchors (plus whatever pure nodes GCM scheduled
 	// right alongside it), or (the default case) just those pure nodes, for an anchor with no nested
 	// structure of its own (an ordinary call, a declaration, PROGRAM_START, ...).
-	function emitControlNode(control: Node): Statement[] {
+	function emitControlNode(control: Node): Stmt[] {
 		const nodes = nodesAt(control.id);
 
 		if (control.type === 'gamma')
@@ -2370,7 +2370,7 @@ export function BuildProgram(
 				// consumers, not this print-time lookup, so it usually lands somewhere this
 				// reconstruction never otherwise visits -- force it here, unless some other surviving
 				// value already forced it under the same name.
-				const forceDeclare = (id: NodeId): Statement[] => {
+				const forceDeclare = (id: NodeId): Stmt[] => {
 					const n = graph.get(id)!;
 					return n.type === 'var' && n.name !== undefined && !declaredNames.has(n.name)
 						? emitLocalStatements([id]) : [];
@@ -2383,7 +2383,7 @@ export function BuildProgram(
 				// Once every case's value is elided into the post-switch merge, a case body can end up
 				// with nothing but its own trailing `break;` -- if EVERY case is in that shape, the whole
 				// dispatch is observably a no-op and drops entirely. A continue/return/throw blocks this.
-				const isNoOp = (stmts: Statement[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
+				const isNoOp = (stmts: Stmt[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
 				const switchIsNoOp = cases.every(c => isNoOp(c.consequent));
 
 				return [
@@ -2416,7 +2416,7 @@ export function BuildProgram(
 		// emitLocalStatements instead.
 		if (control.type === 'function' && !control.expr)
 			return withCoScheduled(nodes, control.id, () => [
-				wrapExported({ ...rebuildParams(control.stmt as JS.FunctionDecl<any>, control), body: rebuildFunctionBody(control) } as Statement, control.exported),
+				wrapExported({ ...rebuildParams(control.stmt as JS.FunctionDecl<any>, control), body: rebuildFunctionBody(control) } as Stmt, control.exported),
 			]);
 
 		if (control.type === 'mu') {
@@ -2428,7 +2428,7 @@ export function BuildProgram(
 			// continues from the body's own entry, via port 1 (the feedback input).
 			const ownIds		= nodes.filter(id => id !== control.id);
 
-			const statements: Statement[] = [];
+			const statements: Stmt[] = [];
 
 			if (thetaNode) {
 				const testId	= thetaNode.inputs[1].nodeId;
@@ -2460,7 +2460,7 @@ export function BuildProgram(
 					statements.push(JS.While(Literal(true), JS.Block(
 						...testStatements,
 						...(condExpr.type === 'literal' && condExpr.value === true ? [] : [JS.If({ type: 'unary', operator: '!', operand: condExpr },
-							JS.Block<Statement>({ type: 'break' })
+							JS.Block<Stmt>({ type: 'break' })
 						)]),
 						...restStatements,
 						...restOfBody

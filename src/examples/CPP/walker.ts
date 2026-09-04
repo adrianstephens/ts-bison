@@ -4,7 +4,7 @@ import * as W from '../walker';
 import {mapObject, mapArray, mapArrayA, mapDefined, makeProcess, makeProcessB} from '../walker';
 
 type Definition			= CPP.Definition;
-type Statement			= CPP.Statement;
+type Stmt				= CPP.Stmt;
 type Expr				= CPP.Expr;
 type ClassMember		= CPP.ClassMember;
 type Declarator			= CPP.Declarator;
@@ -39,7 +39,7 @@ const packParamTags	= ['parameter']; // both ParameterDecl and PackParameter use
 
 export const isTranslationUnit	= guard<C.TranslationUnit>(['translation_unit']);
 export const isDefinition		= guard<Definition>(definitionTags);
-export const isStatementOnly	= guard<Statement>(statementOnlyTags);
+export const isStatementOnly	= guard<Stmt>(statementOnlyTags);
 export const isExpr				= guard<Expr>(exprTags);
 export const isClassMember		= guard<ClassMember>(classMemberTags);
 export const isDeclarator		= guard<Declarator | AbstractDeclarator>(declaratorTags);
@@ -49,15 +49,15 @@ export const isPackParameter	= (p: ParamDecl): p is CPP.PackParameter => !!packP
 // walk
 //-----------------------------------------------------------------------------
 
-export type Walkable0 = Definition | Statement | Expr | ClassMember;
-export type Walkable = C.TranslationUnit | Definition | Statement | Expr | ClassMember | Statement[] | Definition[] | ClassMember[];
+export type Walkable0 = Definition | Stmt | Expr | ClassMember;
+export type Walkable = C.TranslationUnit | Definition | Stmt | Expr | ClassMember | Stmt[] | Definition[] | ClassMember[];
 
 type Recurse		= W.Recurse<Walkable0>;
 type OnAST<U>		= W.OnAST<U, Recurse>;
 
 export function walk<T extends Walkable>(ast: T,
 	onDefinition?:	OnAST<Definition>,
-	onStatement?:	OnAST<Statement>,
+	onStatement?:	OnAST<Stmt>,
 	onExpression?:	OnAST<Expr>,
 	onClassMember?:	OnAST<ClassMember>,
 ): T | undefined {
@@ -234,7 +234,7 @@ export function walk<T extends Walkable>(ast: T,
 	const methodTail = (t: CPP.MethodTail): CPP.MethodTail => mapObject(t, {body});
 	const ctorTail = (t: CPP.CtorTail): CPP.CtorTail => mapObject(t, {initializerList: mapArray(memberInitializer), body});
 
-	const statementExtra = (s: Statement): Statement => {
+	const statementExtra = (s: Stmt): Stmt => {
 		switch (s.type) {
 			case 'declaration':
 			case 'typedef':				return declarationLike(s);
@@ -322,7 +322,7 @@ export function walk<T extends Walkable>(ast: T,
 			return mapArray(mapClassMember)(ast as ClassMember[]) as T;
 		if (isDefinition(first) && !isStatementOnly(first))
 			return mapArray(mapDefinition)(ast as Definition[]) as T;
-		return mapArray(mapStatement)(ast as Statement[]) as T;
+		return mapArray(mapStatement)(ast as Stmt[]) as T;
 	}
 	recurse(ast);
 }
@@ -334,9 +334,9 @@ export function walk<T extends Walkable>(ast: T,
 type RecurseB		= W.RecurseB<Walkable>
 type OnASTB<U>		= W.OnASTB<U, RecurseB>;
 
-export function walkB<T extends C.TranslationUnit | Definition | Statement | Expr | ClassMember | Statement[] | Definition[] | ClassMember[]>(ast: T,
+export function walkB<T extends C.TranslationUnit | Definition | Stmt | Expr | ClassMember | Stmt[] | Definition[] | ClassMember[]>(ast: T,
 	onDefinition?:	OnASTB<Definition>,
-	onStatement?:	OnASTB<Statement>,
+	onStatement?:	OnASTB<Stmt>,
 	onExpression?:	OnASTB<Expr>,
 	onClassMember?:	OnASTB<ClassMember>,
 ): boolean {
@@ -436,7 +436,7 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 		}
 	};
 
-	const statement = (s: Statement): boolean => {
+	const statement = (s: Stmt): boolean => {
 		switch (s.type) {
 			case 'declaration':
 			case 'typedef':				return declarationLike(s);
@@ -499,7 +499,7 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 			return (ast as ClassMember[]).some(walkClassMember);
 		if (isDefinition(first) && !isStatementOnly(first))
 			return (ast as Definition[]).some(walkDefinition);
-		return (ast as Statement[]).some(walkStatement);
+		return (ast as Stmt[]).some(walkStatement);
 	}
 	if (isTranslationUnit(ast))
 		return ast.body.some(walkDefinition);

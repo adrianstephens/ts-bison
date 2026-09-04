@@ -5,7 +5,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as zlib from 'zlib';
-import { GrammarBuilder, makeParser, grammarFingerprint, serializeTables, deserializeTables, type GrammarSpec, type Parser, type SerializedTables } from './tison';
+import { GrammarBuilder, makeParser, type GrammarSpec, type Parser } from './tison';
+import { LALROptions, grammarFingerprint, serializeTables, deserializeTables, type SerializedTables } from './lalr';
 
 interface CacheFile {
 	fingerprint: string;
@@ -23,7 +24,7 @@ function hash(value: unknown): string {
 
 // `cachePath` should be specific to the grammar it's caching (one file per `makeCachedParser` call
 // site) -- there's no namespacing beyond the fingerprint check.
-export function makeCachedParser<T>(spec: GrammarSpec<T>, cachePath: string, gz = true): Parser<T> {
+export function makeCachedParser<T>(spec: GrammarSpec<T>, options: LALROptions, cachePath: string, gz = true): Parser<T> {
 	const g				= new GrammarBuilder(spec);
 	const fingerprint	= hash(grammarFingerprint(g, spec));
 
@@ -36,14 +37,14 @@ export function makeCachedParser<T>(spec: GrammarSpec<T>, cachePath: string, gz 
 
 	if (cached?.fingerprint === fingerprint) {
 		try {
-			return makeParser(spec, { g, tables: deserializeTables(g, cached.tables) });
+			return makeParser(spec, { prebuiltBuilder: g, prebuiltTables: deserializeTables(g, cached.tables) });
 		} catch {
 			// stale/corrupt cache content despite a matching fingerprint (e.g. hand-edited) -- rebuild
 		}
 	}
 
 	// No `tables` given: makeParser builds and (unless `spec.optimize === false`) optimizes them itself.
-	const parser = makeParser(spec, { g });
+	const parser = makeParser(spec, { prebuiltBuilder: g });
 	try {
 		const json = JSON.stringify({ fingerprint, tables: serializeTables(g, parser.tables) });
 		fs.mkdirSync(path.dirname(cachePath), { recursive: true });

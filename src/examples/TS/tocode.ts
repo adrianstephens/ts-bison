@@ -135,11 +135,11 @@ export class Output {
 		this.comma		= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: JS.Program<unknown> | TS.Program | TS.Statement | Type | Expr | TS.Statement[]) {
+	toCode(ast: JS.Program<unknown> | TS.Program | TS.Stmt | Type | Expr | TS.Stmt[]) {
 		if (Array.isArray(ast))
 			return ast.map(s => this.statement(s)).join(this.opts.newline);
 		if (isProgram(ast))
-			return ast.body.map(s => this.statement(s as TS.Statement)).join(this.opts.newline);
+			return ast.body.map(s => this.statement(s as TS.Stmt)).join(this.opts.newline);
 		if (isType(ast))
 			return this.type(ast);
 		if (isJsStatement(ast) || isTsDeclaration(ast))
@@ -381,10 +381,10 @@ export class Output {
 	//  Statements
 	// ===================================================================
 
-	indentBlock(stmts: TS.Statement[]): string {
+	indentBlock(stmts: TS.Stmt[]): string {
 		return this.curlyIndented(() => stmts.map(s => this.statement(s)).join(this.newline));
 	}
-	dependentCode(stmt: TS.Statement): string {
+	dependentCode(stmt: TS.Stmt): string {
 		if (stmt.type !== 'block')
 			return this.indented(()=> this.newline + this.statement(stmt));
 		return this.indentBlock(stmt.body);
@@ -398,7 +398,7 @@ export class Output {
 		).join(this.comma);
 	}
 
-	statement(stmt: TS.Statement): string {
+	statement(stmt: TS.Stmt): string {
 		switch (stmt.type) {
 			case 'type_alias_decl':
 				return 'type ' + stmt.name

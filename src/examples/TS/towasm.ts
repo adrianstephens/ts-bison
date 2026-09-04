@@ -125,7 +125,7 @@ import * as WAT from '../wat-parser';
 
 type Expr			= TS.Expr;
 type Type			= TS.Type;
-type Statement		= TS.Statement;
+type Stmt			= TS.Stmt;
 type BindingTarget	= JS.BindingTarget;
 type FunctionDecl	= JS.FunctionDecl<Type>;
 type MethodMember	= JS.Method<Type>;
@@ -180,7 +180,7 @@ for (const d of LIB_DECLS) {
 // `source` matching an *ambient* `module_decl` (not a filename) discriminates a host import from an ordinary intra-lib one (e.g. regexp.ts's `import { StringParser } from './string'`).
 interface HostImport { source: string; name: string; params: Type[]; returnType?: Type }
 const LIB_HOST_IMPORTS: HostImport[] = (() => {
-	const ambientModules = new Map(LIB_AST.filter((n): n is Extract<TS.Statement, { type: 'module_decl' }> => n.type === 'module_decl' && !!n.ambient).map(n => [n.name, n]));
+	const ambientModules = new Map(LIB_AST.filter((n): n is Extract<TS.Stmt, { type: 'module_decl' }> => n.type === 'module_decl' && !!n.ambient).map(n => [n.name, n]));
 	return LIB_AST.filter((n): n is JS.Import => n.type === 'import' && ambientModules.has(n.source)).flatMap(imp => (imp.specifiers ?? []).flatMap(s => {
 		const decl = ambientModules.get(imp.source)!.body.find(d => d.type === 'function_decl' && d.name === s.imported);
 		return decl?.type === 'function_decl' ? [{ source: imp.source, name: s.local, params: decl.params.map(p => p.typeAnnotation!), returnType: decl.returnType }] : [];
@@ -512,7 +512,7 @@ class FunctionContext {
 	// same boundary `ownBoundNames`/`collectFreeVars` already use) -- set once, right after construction,
 	// alongside `widenedTypes`. Consulted only by `ensureForwardCell`, to find a sibling `const`/`let`
 	// declared LATER in this same body that an EARLIER closure literal needs to forward-reference.
-	ownBody?:			Statement[];
+	ownBody?:			Stmt[];
 
 	// Updated by `emitStmt`'s own entry point, from each statement's own `(stmt as any).scope` checker
 	// stamp (`scopeOfStmt`'s comment) -- `scope` itself stays the one static, whole-function scope set at
@@ -671,8 +671,8 @@ class FunctionContext {
 	// `tsTypes` -- the caller already resolved each param's effective `Type` (annotation, or inferred
 	// from a default) via `paramType`, to pick `wtypes` in the first place; reused here rather than
 	// re-deriving it a second time (which would also need a `checker` this top-level class doesn't have).
-	declareParams(params: ResolvedParam[]): JS.Statement<Type>[] {
-		const pending: JS.Statement<Type>[] = [];
+	declareParams(params: ResolvedParam[]): JS.Stmt<Type>[] {
+		const pending: JS.Stmt<Type>[] = [];
 		params.forEach((p, i) => {
 			if (typeof p.key === 'string') {
 				this.declareValue(p.key, p.wtype, p.tsType);
@@ -793,7 +793,7 @@ function exprMentionsName(name: string, e: Expr): boolean {
 
 // Whether `body` assigns to `this` anywhere -- real TS never allows this, so it has exactly one meaning
 // here: "this method replaces its own receiver's physical value" (a wasm-GC array/struct can't resize in place). Detected structurally -- any method on any class doing this gets the same treatment, not a hardcoded list.
-function assignsToThis(body: Statement[]): boolean {
+function assignsToThis(body: Stmt[]): boolean {
 	return walkB(body, undefined, (e, process) => e.type === 'binary' && e.operator === '=' && e.left.type === 'this' ? true : process(e));
 }
 
@@ -813,7 +813,7 @@ function paramNames(params: JS.Param<Type>[], rest?: JS.Rest<Type>): string[] {
 }
 
 // Every name body binds directly (own params + var_decls), not descending into nested arrow/function bodies.
-function ownBoundNames(names: string[], body: Statement[] | Expr, selfName?: string): Set<string> {
+function ownBoundNames(names: string[], body: Stmt[] | Expr, selfName?: string): Set<string> {
 	const bound = new Set(names);
 	if (selfName)
 		bound.add(selfName);
@@ -842,7 +842,7 @@ function ownBoundNames(names: string[], body: Statement[] | Expr, selfName?: str
 
 // Recursively collects free variables into `free`. A nested closure's bound names merge into `bound`
 // before recursing, so a level-2 capture of a level-0 variable transitively appears in level-1's set.
-function collectFreeVars(bound: Set<string>, body: Statement[] | Expr, free: Set<string>) {
+function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<string>) {
 	walkB(body,
 		(s, process) => {
 			// Mirrors the `arrow`/`function` expression handling below, but for a nested function
@@ -1233,7 +1233,7 @@ interface LocalField { index: number; wtype: WasmType; tsType: Type }
 // Known limitation: does not scan reassignments made from inside a nested closure body (mirrors
 // ownBoundNames/collectFreeVars's own closure-boundary stop, needed there for correctness) -- a
 // captured `let` mutated only via a closure write keeps today's (possibly too-narrow) behavior.
-function collectRangeWidenings(body: Statement[], scope: Scope): Map<JS.Var<Type>, Type> {
+function collectRangeWidenings(body: Stmt[], scope: Scope): Map<JS.Var<Type>, Type> {
 	interface OpenTarget { d: JS.Var<Type>; range?: T.NumRange; touched: boolean }
 	const open: OpenTarget[] = [];
 	const result = new Map<JS.Var<Type>, Type>();
@@ -1336,7 +1336,7 @@ function isDefinePropertyCall(e: Expr): e is JS.Call<Type> & { callee: JS.Member
 // compiling, to decide (conservatively, across every one of its own type arguments at once, not
 // which specific one) whether `everExtended` needs poking *now*, before any of them could possibly
 // get `ensureClass`'d and their own struct type finalized first (`ensureGenericFunc`'s own comment).
-function containsDefineProperty(body: Statement[]): boolean {
+function containsDefineProperty(body: Stmt[]): boolean {
 	return walkB(body, undefined, (e, process) => isDefinePropertyCall(e) || process(e));
 }
 
@@ -1346,7 +1346,7 @@ function containsDefineProperty(body: Statement[]): boolean {
 // literal keys ever defineProperty'd onto each -- `'dynamic'` once any one of them isn't a compile-
 // time-literal string, since a non-enumerable key set can't be given real, individually-named fields
 // at all (`ensureClassExtension`'s own comment).
-function collectDefinePropertyTargets(body: Statement[]): Map<string, string[] | 'dynamic'> {
+function collectDefinePropertyTargets(body: Stmt[]): Map<string, string[] | 'dynamic'> {
 	const targets = new Map<string, string[] | 'dynamic'>();
 	walkB(body, undefined, (e, process) => {
 		if (isDefinePropertyCall(e)) {
@@ -1411,7 +1411,7 @@ export function makeLibScope(): Scope {
 // Only top-level *functions* are seeded/resolved across modules this way today -- a cross-module class or
 // scalar global reference is still unsupported (throws a clear, unrelated error), a real, separate,
 // not-yet-attempted follow-on.
-export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>, namespaceImports?: Map<string, Map<string, string>>, namedImports?: Map<string, Map<string, { module: string; name: string }>>): wasm.WasmModule {
+export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, namespaceImports?: Map<string, Map<string, string>>, namedImports?: Map<string, Map<string, { module: string; name: string }>>): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new TSWError('ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
@@ -1439,7 +1439,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// (zero behavior change from before multi-file support existed); a non-entry module's top-level
 	// functions are stored under `homeKey(canonical, name)` instead, so a same-named function in two
 	// different files never collides in this (or `funcs`') shared cache.
-	const moduleBodies			= new Map<string, TS.Statement[]>([['.', ast.body], ...(modules ?? [])]);
+	const moduleBodies			= new Map<string, TS.Stmt[]>([['.', ast.body], ...(modules ?? [])]);
 	const namespaceImportsByModule = namespaceImports ?? new Map<string, Map<string, string>>();
 	const namedImportsByModule = namedImports ?? new Map<string, Map<string, { module: string; name: string }>>();
 	// Recovers a top-level statement's own home module string -- `Scope.decl(name)` (via `declScope`) gives
@@ -1448,7 +1448,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// registration at all, so a consumer needing to compile ITS OWN cross-module references correctly
 	// (`ensureLazyGlobal`'s own `FunctionContext.homeModule`) has no other way to recover which module it
 	// came from. Populated once, below, in the same pass that already visits every module's own statements.
-	const stmtHomeModule		= new Map<TS.Statement, string>();
+	const stmtHomeModule		= new Map<TS.Stmt, string>();
 
 	function homeKey(homeModule: string, name: string) {
 		return homeModule === '.' ? name : homeModule + '\0' + name;
@@ -3446,7 +3446,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	// to `selfName` from inside the body resolve to a direct `call` (see `ctx.selfCall`), since a
 	// self-*capture* is impossible -- the struct can't be a field of itself before it exists.
 	function emitClosureLiteral(
-		e: TS.CallSig & {type: string, name?: string, modifiers?: string[], body?: Statement[] | Expr },
+		e: TS.CallSig & {type: string, name?: string, modifiers?: string[], body?: Stmt[] | Expr },
 		ctx: FunctionContext,
 		allowSelfCall: boolean,
 		want?: WasmType,
@@ -4194,7 +4194,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 										arguments: [{ type: 'identifier', name: kName }, { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: spreadName }, property: 'get' }, arguments: [{ type: 'identifier', name: kName }] }],
 									},
 								}),
-							} as Statement, ctx);
+							} as Stmt, ctx);
 							continue;
 						}
 						if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
@@ -4920,7 +4920,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		};
 	}
 
-	function emitStmt(s: Statement, ctx: FunctionContext): void {
+	function emitStmt(s: Stmt, ctx: FunctionContext): void {
 		ctx.stmtScope = (s as any).scope as Scope ?? ctx.stmtScope;
 		switch (s.type) {
 			case 'block':
@@ -5204,13 +5204,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						const arrId: Expr = { type: 'identifier', name: `#for${n}$arr` };
 						const idxId: Expr = { type: 'identifier', name: `#for${n}$i` };
 
-						emitStmt(JS.Block<Statement>(
+						emitStmt(JS.Block<Stmt>(
 							JS.VarDecl('const', JS.Var(arrId.name, s.right)),
 							JS.For(
 								JS.VarDecl('let', JS.Var(idxId.name, Literal(0))),
 								JS.JSBinary('<', idxId, JS.Member(arrId, 'length')),
 								JS.JSUnary('++', idxId),
-								JS.Block<Statement>(
+								JS.Block<Stmt>(
 									JS.VarDecl(s.init.kind, JS.Var(v.name, JS.Index(arrId, idxId), v.typeAnnotation)),
 									s.body
 								),
@@ -7549,7 +7549,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	const reached	= new Set<string>();
 	const pending: string[] = [];
 
-	const collectNames = (node: TS.Statement | TS.Statement[]) => walk(node, undefined, (e, process) => {
+	const collectNames = (node: TS.Stmt | TS.Stmt[]) => walk(node, undefined, (e, process) => {
 		if (e.type === 'identifier')
 			pending.push(e.name);
 		return process(e);

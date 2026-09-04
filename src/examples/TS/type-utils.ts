@@ -2014,7 +2014,7 @@ export class Scope {
 	// consumer resolve via the same scope-chain/`declScope` mechanism already used for types, instead of a
 	// separate name-mangling scheme (e.g. towasm.ts's own `homeModule`/`homeKey`) reinventing module-scoped
 	// lookup on the side.
-	private decls?:			Map<string, TS.Statement>;
+	private decls?:			Map<string, TS.Stmt>;
 
 	//caches
 	resolving?:				Set<Type>;
@@ -2032,7 +2032,7 @@ export class Scope {
 	declared(name: string): Type | undefined		{ return this.values.get(name) ?? this.parent?.declared(name); }
 	alias(name: string): Expr | undefined			{ return this.aliases?.get(name) ?? (this.values.has(name) ? undefined : this.parent?.alias(name)); }
 	namespace(name: string): Scope | undefined		{ return this.namespaces?.get(name) ?? this.parent?.namespace(name); }
-	decl(name: string): TS.Statement | undefined	{ return this.decls?.get(name) ?? this.parent?.decl(name); }
+	decl(name: string): TS.Stmt | undefined	{ return this.decls?.get(name) ?? this.parent?.decl(name); }
 
 	// Reverse of a normal ref lookup: a resolved structural type may happen to be *exactly* some declared class/
 	// interface/alias's own registered shape (e.g. `infer R` binding to a class reference's instance type, reached
@@ -2080,7 +2080,7 @@ export class Scope {
 	addNarrowing(name: string, t: Type)				{ (this.narrowings ??= new Map()).set(name, t); }
 	addAlias(d: JS.Var<any>)						{ (this.aliases ??= new Map()).set(d.name, d.init); }
 	addNamespace(name: string, s: Scope)			{ (this.namespaces ??= new Map()).set(name, s); }
-	addDecl(name: string, stmt: TS.Statement)		{ (this.decls ??= new Map()).set(name, stmt); }
+	addDecl(name: string, stmt: TS.Stmt)		{ (this.decls ??= new Map()).set(name, stmt); }
 
 	mergeType(name: string, type: Type, typeParams: TS.TypeParam[] | undefined) {
 		return this.mergeTypeEntry(name, {type, typeParams});
