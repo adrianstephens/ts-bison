@@ -456,7 +456,7 @@ export class Output {
 						: this.expr(init)
 					))
 					+ (stmt.kind === 'normal'
-						? '; ' + maybe(stmt.test, test => this.expr(test)) + this.colon + maybe(stmt.update, update => this.expr(update))
+						? '; ' + maybe(stmt.test, test => this.expr(test)) + '; ' + maybe(stmt.update, update => this.expr(update))
 						: ' ' + (stmt.kind === 'of await' ? 'of' : stmt.kind) + ' ' + this.expr(stmt.right)
 					)
 				 ) + ' ' + this.dependentCode(stmt.body);
@@ -552,8 +552,8 @@ export class Output {
 			+ 	optional(hasMod(member, 'optional'))
 			+ 	this.typeParams(member.typeParams as TS.TypeParam[])
 			+ 	this.paramList(member.params, member.rest)
-			+ 	this.typeAnnotation(member.returnType as Type)
-			+ 	maybe(member.body, body => this.indentBlock(body));
+			+ 	(member.key === 'constructor' ? '' : this.typeAnnotation(member.returnType as Type))
+			+ 	' ' + maybe(member.body, body => this.indentBlock(body));
 	}
 
 	classMember(member: TS.ClassMember): string {

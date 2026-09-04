@@ -24,8 +24,8 @@ function compile(src: string): string {
 	const prog		= TS.parse(src);
 	const graph		= BuildVSDG(prog.body);
 	Optimize(graph);
-	const { blockIds, blockControl, getLoopDepth } = applyGlobalCodeMotion(graph);
-	const stmts		= BuildProgram(graph, blockIds, blockControl, getLoopDepth);
+	const { blocks, blockIds } = applyGlobalCodeMotion(graph);
+	const stmts		= BuildProgram(graph, blocks, blockIds);
 	return printer.toCode(stmts as any).trim();
 }
 

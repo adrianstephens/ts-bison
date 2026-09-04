@@ -2778,50 +2778,41 @@ function isDeeperThan<N>(tree: Map<N, N>, a: N, b: N): boolean {
 
 type BlockId = string;
 
-// Discovers the program's branch/loop structure -- purely from control anchors and each one's own
-// state predecessor, with no involvement from ordinary value nodes. It doesn't decide where
-// anything reused/floating gets placed (applyGlobalCodeMotion's own job, layered on top), just
-// answers "where are the branches and loops, and how do they nest."
+// Discovers the program's branch/loop structure -- purely from control anchors and each one's own state predecessor, with no involvement from ordinary value nodes.
+// It doesn't decide where anything reused/floating gets placed (applyGlobalCodeMotion's own job, layered on top), just answers "where are the branches and loops, and how do they nest."
+
 class BlockTree {
-	roots: Map<NodeId, BlockId>;
+	roots	= new Map<NodeId, BlockId>();
 	control = new Map<BlockId, NodeId>();	// The reverse of rootBlocks
 	tree	= new Map<BlockId, BlockId>();	// Maps a Block ID to its immediate parent Block ID in the Dominator Tree
 	loopDepthMemo = new Map<BlockId, number>();
 
 	constructor(public graph: VSDG) {
-		// 1. Discover control anchors and build 'rootBlocks'.
-		// PROGRAM_START gets the well-known id 'block_entry' -- BuildProgram needs a fixed, known
-		// starting point to begin its traversal from.
+		// PROGRAM_START gets the well-known id 'block_entry' -- BuildProgram needs a fixed, known starting point to begin its traversal from.
 		let blockCounter = 0;
-		const roots = new Map<NodeId, BlockId>();
 		for (const [id, node] of graph.entries()) {
 			switch (node.type) {
 				case 'marker':
-					roots.set(id, node.name === 'PROGRAM_START' ? 'block_entry' : `${node.type}_${blockCounter++}`);
-					break;
+					if (node.name === 'PROGRAM_START') {
+						this.roots.set(id, 'block_entry');
+						break;
+					}
+					//fallthrough
 				case 'effect':
 				case 'function': case 'passthru': case 'class_decl':
 				case 'gamma': case 'mu': case 'theta': case 'break_scope':
 				case 'except':
-					roots.set(id, `${node.type}_${blockCounter++}`);
+					this.roots.set(id, `${node.type}_${blockCounter++}`);
 					break;
 			}
 		}
-		this.roots = roots;
 
-		// The reverse of rootBlocks -- built once here so getLoopDepth can look up a block's real node type directly, instead of guessing from the block id's string prefix
-		for (const [nodeId, blockId] of roots)
+		for (const [nodeId, blockId] of this.roots) {
 			this.control.set(blockId, nodeId);
-
-		// The entry block has no parent -- deliberately left unset, not a self-loop, so every walk-to-root loop below terminates at 'block_entry' instead of spinning forever
-		for (const [nodeId, blockId] of roots.entries()) {
-			if (blockId) {
-				// Port 0 is the real state predecessor for every control-anchor type by construction.
-				const incomingStateEdge = graph.get(nodeId)?.inputs[0];
-				if (incomingStateEdge)
-					// Find which block contains the node that produced our incoming state token
-					this.tree.set(blockId, roots.get(incomingStateEdge.nodeId) ?? '');
-			}
+			const incomingStateEdge = graph.get(nodeId)?.inputs[0];
+			if (incomingStateEdge)
+				// Find which block contains the node that produced our incoming state token
+				this.tree.set(blockId, this.roots.get(incomingStateEdge.nodeId) ?? '');
 		}
 	}
 	// How many loops enclose a block: a state-mu's own block is one deeper than its blockTree
@@ -2899,7 +2890,7 @@ export function applyGlobalCodeMotion(graph: VSDG) {
 		return block;
 	}
 
-	// 2. Phase 1: Push everything as early as possible
+	// Phase 1: Push everything as early as possible
 	const visitedEarly = new Set<NodeId>();
 
 	function scheduleEarly(nodeId: NodeId) {
@@ -2955,7 +2946,7 @@ export function applyGlobalCodeMotion(graph: VSDG) {
 	for (const nodeId of graph.keys())
 		scheduleEarly(nodeId);
 
-	// 3. Phase 2: Pull things down to save execution costs
+	// Phase 2: Pull things down to save execution costs
 	const visitedLate = new Set<NodeId>();
 
 	function scheduleLate(nodeId: NodeId) {
@@ -3038,30 +3029,23 @@ export function applyGlobalCodeMotion(graph: VSDG) {
 			}
 		}
 
-		// Click's Core Sinking Choice: walk from the latest possible block up to the earliest,
-		// picking the SHALLOWEST valid block along the way (lowest execution frequency) -- never
-		// shallower than earliestBlock's own depth, which already encodes the deepest position this
-		// node's inputs actually require.
+		// Click's Core Sinking Choice: walk from the latest possible block up to the earliest, picking the SHALLOWEST valid block along the way (lowest execution frequency)
+		// -- never shallower than earliestBlock's own depth, which already encodes the deepest position this node's inputs actually require.
 		//
-		// Ties matter: getLoopDepth only counts LOOP nesting, so blocks within one loop iteration
-		// (or one un-looped chain) can tie despite being meaningfully different positions. On a tie,
-		// prefer whichever is closer to latestBlock, not earliestBlock -- otherwise a node whose sole
-		// consumer lives right next to it gets hoisted back to its earliest position, landing in a
-		// different block than the consumer that needs it.
+		// Ties matter: getLoopDepth only counts LOOP nesting, so blocks within one loop iteration (or one un-looped chain) can tie despite being meaningfully different positions.
+		// On a tie, prefer whichever is closer to latestBlock, not earliestBlock -- otherwise a node whose sole consumer lives right next to it gets hoisted back to its earliest
+		// position, landing in a different block than the consumer that needs it.
 		//
-		// KNOWN GAP, deliberately not fixed here (tried and reverted): two adjacent, same-depth
-		// declarations that are each other's own anchor (`let i = off, e = i + len;`) can have this
-		// tie-break pick the wrong one, swapping their printed order. A version preferring a node's
-		// own port-2 anchor on a tie fixed that but broke dead-bookkeeping elision elsewhere (a
-		// switch's own unused `__hit`/`__match` scaffolding) -- the two cases are indistinguishable
-		// from information available at this point in scheduling.
+		// KNOWN GAP, deliberately not fixed here (tried and reverted):
+		// two adjacent, same-depth declarations that are each other's own anchor (`let i = off, e = i + len;`) can have this tie-break pick the wrong one, swapping their printed order.
+		// A version preferring a node's own port-2 anchor on a tie fixed that but broke dead-bookkeeping elision elsewhere (a switch's own unused `__hit`/`__match` scaffolding)
+		// -- the two cases are indistinguishable from information available at this point in scheduling.
 		const earliestBlock	= blockIds.get(nodeId)!;
 		const floor			= blocks.getLoopDepth(earliestBlock);
 		let bestBlock: BlockId | undefined;
 		let bestDepth		= Infinity;
 
-		// The `currentBlock` guard is a defensive backstop against a blockTree dead end that
-		// doesn't pass through earliestBlock on the way to the root.
+		// The `currentBlock` guard is a defensive backstop against a blockTree dead end that doesn't pass through earliestBlock on the way to the root.
 		let currentBlock: BlockId | undefined = latestBlock || earliestBlock;
 		while (currentBlock !== undefined) {
 			const depth = blocks.getLoopDepth(currentBlock);
