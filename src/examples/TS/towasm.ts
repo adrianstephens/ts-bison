@@ -410,14 +410,21 @@ interface ClassInfo extends MethodOwner {
 	superClass?:	ClassInfo;
 }
 
-interface Local			{ wtype: WasmType, index: number; }
+// `cellInner`: set only for a name `ensureForwardCell` had to promote into a shared, heap-allocated
+// "cell" (a real closure/local forward-referenced by an EARLIER sibling closure in the same block,
+// e.g. walker.ts's own `mapStatementC` capturing `mapStatement`, declared several statements later) --
+// `wtype` itself is then the *cell's* own physical type (what this storage slot really, physically
+// is), and `cellInner` is the logical value's own real type once unboxed. Left `undefined` for the
+// overwhelmingly common case (an ordinary local/capture, never forward-referenced), where `wtype`
+// alone is the whole story, exactly as before.
+interface Local			{ wtype: WasmType, index: number; cellInner?: WasmType; }
 type Global				= Local & {init: Expr, mut: boolean}
 interface ResolvedParam { key: BindingTarget; wtype: WasmType; tsType: Type }
 
 interface ClosureEnv {
 	envLocal:		Local;
 	envTypeIndex:	number;
-	fields:			Map<string, { index: number; wtype: WasmType }>
+	fields:			Map<string, { index: number; wtype: WasmType; cellInner?: WasmType }>
 };
 
 // Pushed by `case 'try'` while compiling a `try`/`catch` that has a `finally` -- `emitBreak`/
@@ -500,6 +507,12 @@ class FunctionContext {
 	// base (`ensureClassExtension`'s own comment) -- not every value of that class, only the one
 	// actually extended.
 	definePropertyTargets?: Map<string, string[] | 'dynamic'>;
+
+	// This function's own top-level statement list (not descending into a nested closure's own body,
+	// same boundary `ownBoundNames`/`collectFreeVars` already use) -- set once, right after construction,
+	// alongside `widenedTypes`. Consulted only by `ensureForwardCell`, to find a sibling `const`/`let`
+	// declared LATER in this same body that an EARLIER closure literal needs to forward-reference.
+	ownBody?:			Statement[];
 
 	// Updated by `emitStmt`'s own entry point, from each statement's own `(stmt as any).scope` checker
 	// stamp (`scopeOfStmt`'s comment) -- `scope` itself stays the one static, whole-function scope set at
@@ -637,8 +650,21 @@ class FunctionContext {
 		return this.lookup(name) !== undefined || !!this.closureEnv?.fields.has(name);
 	}
 
-	// The WasmType a name has in ctx -- real local or closureEnv field.
+	// The WasmType a name's real, logical VALUE has -- real local/closureEnv field, or (see `Local`'s own
+	// comment) a forward-cell's own inner type once unboxed. This is what any ordinary consumer of a
+	// name's type wants (e.g. deciding how to *call* it) -- `rawWtype`, below, is the one exception.
 	resolvedWtype(name: string): WasmType | undefined {
+		const captured = this.closureEnv?.fields.get(name);
+		if (captured)
+			return captured.cellInner ?? captured.wtype;
+		const local = this.lookup(name);
+		return local?.cellInner ?? local?.wtype;
+	}
+	// The WasmType a name's own physical STORAGE slot has -- a forward-cell's own boxed type, never
+	// unboxed. Only ever needed by `emitClosureLiteral`'s own env-capture step: capturing a forward-
+	// cell's real (shared, mutable) storage into an outer closure's env is the one place that needs the
+	// cell ITSELF, not the value it currently (or eventually) holds.
+	rawWtype(name: string): WasmType | undefined {
 		return this.closureEnv?.fields.get(name)?.wtype ?? this.lookup(name)?.wtype;
 	}
 	// Destructured params get a hidden #param$<i> local; returns var_decl stmts to bind the real names.
@@ -1519,6 +1545,52 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		return { typeIndex: ensureBoxType(base), nullable: true, primKind: base };
 	}
 
+	// A real, shared, mutable one-field struct wrapping `wt` (nullable, so it can start empty) -- used
+	// only by `ensureForwardCell` for a name forward-referenced by an earlier sibling closure. Unlike
+	// `ensureBoxType` (an immutable, unboxes-a-scalar-into-`anyref` box), this cell's own field is `mut`
+	// and can hold any wtype (including an already-reference-typed one, e.g. a closure) -- what makes it
+	// a real shared cell is that both the enclosing function's own later write (its var_decl) and every
+	// closure that captured a reference to this same struct instance see the identical storage.
+	// Memoized by `registerType`'s own structural key, same as any other type here -- one physical cell
+	// type per distinct inner wtype, regardless of how many different forward-referenced names share it.
+	function ensureCellType(wt: WasmType): number {
+		return registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: toValType(nullableWtype(wt)), mut: true }] } });
+	}
+
+	// A closure referencing a SIBLING const/let declared LATER in the same enclosing block (mutually-
+	// recursive local closures -- e.g. walker.ts's own `mapStatementC` capturing `mapStatement`) has no
+	// local for that name yet when `emitClosureLiteral`'s own free-var check runs. Real JS/TS allows
+	// this (the reference is only ever actually read once the closure is CALLED, well after every
+	// sibling has initialized) -- but the ordinary "copy the CURRENT value into this closure's own env
+	// struct at CREATION time" capture (`emitRawSlot`) has no value to copy yet. Generates the missing
+	// local right here, on demand (not a whole-block pre-scan), as a real `ensureCellType` cell instead
+	// of a plain local: both this closure's own capture (holding a reference to the cell) and the name's
+	// own real var_decl (writing into the cell once it runs, `case 'var_decl'`'s own check) end up
+	// sharing the exact same storage, so the value becomes visible the moment it's actually assigned --
+	// correct regardless of which order the two statements happen to compile in.
+	// `ctx.scope` (towasm's own, incrementally-built scope -- unlike the checker's, which already knows
+	// every sibling regardless of order) hasn't seen `name` yet either at this point, so its own real
+	// type is found the same way `ownBoundNames`/`collectFreeVars` already scope a forward search: a
+	// shallow scan of `ctx.ownBody`'s own top-level `var_decl`s (never descending into a nested closure --
+	// a DIFFERENT function's own locals are never this function's siblings). Only a plain, single-name
+	// declarator is handled (a destructured forward reference is a separate, rarer case, not attempted).
+	// Returns `undefined` (leaving the existing "unresolved identifier" throw to fire) for a name that
+	// isn't a sibling declaration at all -- a genuinely unresolvable name, not a forward reference.
+	function ensureForwardCell(ctx: FunctionContext, name: string): Local | undefined {
+		const d = ctx.ownBody?.flatMap(s => s.type === 'var_decl' ? s.declarations : []).find(d => d.name === name);
+		if (!d)
+			return undefined;
+		const tsType = d.typeAnnotation ?? (d.init && checkerTypeOf(d.init, ctx.scope));
+		const wt = tsType && typeOf(tsType);
+		if (!wt)
+			return undefined;
+		const cellTypeIndex = ensureCellType(wt);
+		const local = ctx.declareValue(name, { typeIndex: cellTypeIndex, nullable: false }, tsType);
+		local.cellInner = wt;
+		ctx.emit(I.struct.new_default(cellTypeIndex), I.local.set(local.index));
+		return local;
+	}
+
 	function toResults(result: WasmType): wasm.ValType[] {
 		return result === 'void' ? [] : [toValType(result)];
 	}
@@ -1905,14 +1977,19 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			const cls = ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
 			if (cls)
 				return ownerThisType(cls);
-		} else if (resolved.type === 'object') {
-			// Genuinely last resort -- only reached when `t` itself has no nominal name to resolve by at
-			// all (the `t.type === 'ref'` branch above already owns every case that does, including a
-			// class currently mid-construction resolving its own name -- this must never preempt that,
-			// or a structurally-identical-but-different sibling class gets matched instead of the real
-			// one, real regression found and fixed this session). A generic parameter's own structural
-			// bound (`Record<string, any>`), substituted with a real interface-typed argument, is the
-			// one case that's actually anonymous by construction (`matchObjectShapeByType`'s own comment).
+		}
+		// Tried regardless of whether `t` itself is a `ref` (not an `else if`) -- `ensureClass` only ever
+		// resolves a BARE name (`scope.type(name)`'s own lookup never splits on '.'), so a namespace-
+		// qualified ref (`TS.TypeParam`, from `import * as TS from '...'`) that already resolves down to a
+		// plain 'object' shape would otherwise never reach this fallback at all, real gap only surfaced
+		// once self-hosting first needed a dotted ref that resolves straight to an object (not a union,
+		// which already goes through this file's own separate 'union' case above). Otherwise unchanged:
+		// still only reached when `ensureClass` had no nominal name to resolve by, including a class
+		// currently mid-construction resolving its own name (that already returned above, so this never
+		// preempts it) -- a generic parameter's own structural bound (`Record<string, any>`), substituted
+		// with a real interface-typed argument, is the one case that's actually anonymous by construction
+		// (`matchObjectShapeByType`'s own comment).
+		if (resolved.type === 'object') {
 			const shapeMatch = matchObjectShapeByType(resolved);
 			if (shapeMatch)
 				return ownerThisType(shapeMatch);
@@ -3348,6 +3425,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		}
 	}
 
+	// Reads `name`'s own physical storage slot (captured field or real local) exactly as-is -- never
+	// unboxing a forward-cell, unlike the ordinary identifier-read case (`case 'identifier'`). The one
+	// caller that needs this: `emitClosureLiteral`'s own env-capture step, which must capture a forward-
+	// cell's real, shared storage itself (so a later write through it, from wherever the name's own
+	// var_decl actually runs, stays visible), never a snapshot of whatever it holds right now.
+	function emitRawSlot(ctx: FunctionContext, name: string): void {
+		const captured = ctx.closureEnv?.fields.get(name);
+		if (captured) {
+			ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index), I.struct.get(ctx.closureEnv!.envTypeIndex, captured.index));
+			return;
+		}
+		ctx.emit(I.local.get(ctx.lookup(name)!.index));
+	}
+
 	// Shared by `case 'arrow'`/`case 'function'` (an expression, `allowSelfCall: false`) and `case
 	// 'function_decl'` (a statement nested in another function's body, `allowSelfCall: true`) --
 	// builds the `{code, env}` closure struct and leaves it on the stack, returning its `{closure}`
@@ -3458,7 +3549,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// e.g. `extra !== undefined`, threw here unconditionally before this).
 			if (name === 'undefined' || name === 'NaN' || name === 'Infinity')
 				continue;
-			if (!ctx.resolvesName(name) && !resolvesGlobally(ctx.homeModule, name))
+			if (!ctx.resolvesName(name) && !resolvesGlobally(ctx.homeModule, name) && !ensureForwardCell(ctx, name))
 				throw `unresolved identifier '${name}'`;
 		}
 
@@ -3469,12 +3560,18 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		// from any other function's body, regardless of this closure's own lexical nesting.
 		const envBase		= ensureEnvBase();
 		const capturedNames = [...free].filter(name => ctx.resolvesName(name));
-		const fields		= capturedNames.length ? new Map<string, { index: number; wtype: WasmType }>() : undefined;
+		const fields		= capturedNames.length ? new Map<string, { index: number; wtype: WasmType; cellInner?: WasmType }>() : undefined;
 		let envTypeIndex	= envBase;
 		if (fields) {
+			// `rawWtype` (not `resolvedWtype`) -- a forward-cell's own real, physical storage type is
+			// exactly what needs capturing here (the SHARED, mutable cell itself, so a later write
+			// through it -- from wherever its own var_decl actually runs -- stays visible to this
+			// capture); `cellInner`, copied alongside, lets every READ of this captured field later know
+			// to unbox it back to the logical value (`case 'identifier'`'s own read path).
 			envTypeIndex = addType({ final: true, supertypes: [envBase], type: { kind: 'struct', fields: capturedNames.map((name, i) => {
-				const wt = ctx.resolvedWtype(name)!;
-				fields.set(name, { index: i, wtype: wt });
+				const wt = ctx.rawWtype(name)!;
+				const cellInner = ctx.closureEnv?.fields.get(name)?.cellInner ?? ctx.lookup(name)?.cellInner;
+				fields.set(name, { index: i, wtype: wt, cellInner });
 				return { type: toValType(wt), mut: true };
 			}) } });
 		}
@@ -3504,8 +3601,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				if (tsType)
 					fnCtx.declareCaptured(name, tsType);
 			}
-			if (Array.isArray(body))
+			if (Array.isArray(body)) {
 				fnCtx.widenedTypes = collectRangeWidenings(body, fnCtx.scope);
+				fnCtx.ownBody = body;
+			}
 			pending.forEach(st => emitStmt(st, fnCtx));
 			if (Array.isArray(body)) {
 				body.forEach(st => emitStmt(st, fnCtx));
@@ -3517,10 +3616,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		}));
 
 		// Creation site: `struct.new` pops fields in declaration order (`ensureClosureType`'s `[code,
-		// env]`), so the code pointer goes on the stack before the env struct. Each captured value is read via the identifier-read case above, so a capture-of-a-capture resolves like a plain local.
+		// env]`), so the code pointer goes on the stack before the env struct. Each captured value is
+		// read raw (`emitRawSlot`, not the ordinary identifier-read case) -- a forward-cell must be
+		// captured as the cell itself (see `rawWtype`'s own comment just above), never unboxed here; a
+		// capture-of-a-capture (an ordinary, non-cell name) resolves identically either way.
 		ctx.emit(I.ref.func(funcIndex));
-		for (const name of capturedNames)
-			emitExpr(name === 'this' ? { type: 'this' } : { type: 'identifier', name }, ctx);
+		for (const name of capturedNames) {
+			if (name === 'this')
+				emitExpr({ type: 'this' }, ctx);
+			else
+				emitRawSlot(ctx, name);
+		}
 		ctx.emit(fields ? I.struct.new(envTypeIndex) : I.struct.new_default(envBase));
 		ctx.emit(I.struct.new(structTypeIndex));
 		return { closure: sig };
@@ -3755,11 +3861,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				const captured = ctx.closureEnv?.fields.get(name);
 				if (captured) {
 					ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index), I.struct.get(ctx.closureEnv!.envTypeIndex, captured.index));
+					// A forward-cell's captured field holds the cell itself (`emitRawSlot`'s own comment) --
+					// unbox it back to the real, logical value here, the one place an ordinary read of this
+					// name (as opposed to `emitClosureLiteral`'s own raw capture) actually wants.
+					if (captured.cellInner) {
+						ctx.emit(I.struct.get((captured.wtype as { typeIndex: number }).typeIndex, 0));
+						return captured.cellInner;
+					}
 					return captured.wtype;
 				}
 				const local = ctx.lookup(name);
 				if (local) {
 					ctx.emit(I.local.get(local.index));
+					if (local.cellInner) {
+						ctx.emit(I.struct.get((local.wtype as { typeIndex: number }).typeIndex, 0));
+						return local.cellInner;
+					}
 					return local.wtype;
 				}
 
@@ -4936,8 +5053,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						emitAs(d.init, ctx, wtype);
 						ctx.emit(I.struct.set(ctx.closureEnv!.envTypeIndex, hoisted.index));
 					} else {
+						// An EARLIER sibling closure may already have forward-referenced this exact name
+						// (`ensureForwardCell`, from `emitClosureLiteral`'s own free-var check) -- but so may
+						// `d.init` ITSELF, compiled next (a self-recursive arrow, e.g. walker.ts's own
+						// `mapBindingTarget`, calling its own not-yet-declared name from inside its own body).
+						// Either way a plain `declareValue` after the fact would silently shadow the cell with
+						// a second, independent local, leaving whatever captured it forever empty -- so the
+						// check for an existing cell has to happen AFTER `d.init` compiles, not before, and
+						// the value goes through a scratch local first (`struct.set` needs the cell's own ref
+						// pushed before the value, but the value is what's already on the stack at this point).
 						emitAs(d.init, ctx, wtype);
-						ctx.emit(I.local.set(ctx.declareValue(d.name, wtype, tsType).index));
+						const forwardCell = ctx.lookup(d.name);
+						if (forwardCell?.cellInner) {
+							const scratch = ctx.temp(`$fwd$${d.name}`, wtype);
+							ctx.emit(I.local.set(scratch), I.local.get(forwardCell.index), I.local.get(scratch));
+							ctx.emit(I.struct.set((forwardCell.wtype as { typeIndex: number }).typeIndex, 0));
+						} else {
+							ctx.emit(I.local.set(ctx.declareValue(d.name, wtype, tsType).index));
+						}
 					}
 					ctx.contextualReturn = savedContextualReturn;
 				}
@@ -5690,6 +5823,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				const ctx	= new FunctionContext(name, new Scope(homeScope ?? libGlobal), plainReturn(result), undefined, homeModule);
 				ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 				ctx.definePropertyTargets = collectDefinePropertyTargets(decl.body!);
+				ctx.ownBody = decl.body!;
 				ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 				decl.body!.forEach(st => emitStmt(st, ctx));
 				emitTrailingUnreachable(ctx, result);
@@ -6824,6 +6958,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 		worklist.push(withCatch(() => {
 			const ctx		= new FunctionContext(key, new Scope(libGlobal), plainReturn(thisWtype), cls);
 			ctx.widenedTypes = collectRangeWidenings(ctor.body!, ctx.scope);
+			ctx.ownBody = ctor.body!;
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 			// This constructor supplies `this` directly via its own return value (`ctorReturnsValue`)
 			// `cls`'s own `thisWtype`/`typeIndex` already say so; ordinary statement compilation does the right thing once `ctx.ctorThis` is unset.
@@ -6998,6 +7133,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				};
 			}
 			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
+			ctx.ownBody = decl.body!;
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 			decl.body!.forEach(st => emitStmt(st, ctx));
 			emitTrailingUnreachable(ctx, result);
@@ -7471,6 +7607,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 	worklist.push(withCatch(() => {
 		const ctx	= new FunctionContext('__toplevel', new Scope(libGlobal), plainReturn('void'), undefined);
 		ctx.widenedTypes = collectRangeWidenings(ast.body!, ctx.scope);
+		ctx.ownBody = ast.body!;
 		ast.body!.forEach(st => {
 			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl' || st.type === 'interface_decl' || st.type === 'import')
 				return;
