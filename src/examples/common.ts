@@ -1,20 +1,3 @@
-// `frozen`: TS.Type-context only (this interface is shared with JS.Expr's own literal AST nodes, which never set it) --
-// marks a literal produced by an `as`/`as const` assertion, so `type-utils.ts`'s `widenLiterals` leaves it exactly as
-// asserted even once it's nested inside a container (an array/object/union) that's itself later widened.
-export interface Literal<T> { type: 'literal'; value: T; frozen?: boolean }
-export function  Literal<T>(value: T): Literal<T> { return { type: 'literal', value }; }
-
-export interface Identifier {type: 'identifier', name: string}
-export function  Identifier(name: string) { return {type: 'identifier', name} as const; }
-
-export interface Unary<E, O>		{ type: 'unary'; operator: O; operand: E };
-export function  Unary<E, const O>(operator: O, operand: E): Unary<E, O> { return { type: 'unary', operator, operand}; }
-export interface UnaryPost<E, O>	{ type: 'unary_post'; operator: O, operand: E }
-export function  UnaryPost<E, const O>(operator: O, operand: E): UnaryPost<E, O> { return { type: 'unary_post', operator, operand}; }
-
-export interface Binary<E, O>       { type: 'binary'; operator: O; left: E; right: E }
-export function  Binary<E, const O>(operator: O, left: E, right: E): Binary<E, O> { return { type: 'binary', operator, left, right}; }
-
 
 export function hasMod(e: {modifiers?: string[]}, m: string) {
     return e.modifiers?.includes(m) ?? false;
@@ -66,6 +49,23 @@ export function getPos(node: unknown): Location | undefined {
 // for a plain string -- confusing when it holds an expression), and `Sequence.elements` (py-parser
 // called it `elts`).
 
+// `frozen`: TS.Type-context only (this interface is shared with JS.Expr's own literal AST nodes, which never set it) --
+// marks a literal produced by an `as`/`as const` assertion, so `type-utils.ts`'s `widenLiterals` leaves it exactly as
+// asserted even once it's nested inside a container (an array/object/union) that's itself later widened.
+export interface Literal<T> { type: 'literal'; value: T; frozen?: boolean }
+export function  Literal<T>(value: T): Literal<T> { return { type: 'literal', value }; }
+
+export interface Identifier {type: 'identifier', name: string}
+export function  Identifier(name: string) { return {type: 'identifier', name} as const; }
+
+export interface Unary<E, O>		{ type: 'unary'; operator: O; operand: E };
+export function  Unary<E, const O>(operator: O, operand: E): Unary<E, O> { return { type: 'unary', operator, operand}; }
+export interface UnaryPost<E, O>	{ type: 'unary_post'; operator: O, operand: E }
+export function  UnaryPost<E, const O>(operator: O, operand: E): UnaryPost<E, O> { return { type: 'unary_post', operator, operand}; }
+
+export interface Binary<E, O>       { type: 'binary'; operator: O; left: E; right: E }
+export function  Binary<E, const O>(operator: O, left: E, right: E): Binary<E, O> { return { type: 'binary', operator, left, right}; }
+
 export interface Call<E, A = E>		{ type: 'call'; callee: E; arguments: A[] }
 export function  Call<E, A>(callee: E, args: A[]): Call<E, A> { return { type: 'call', callee, arguments: args }; }
 
@@ -104,6 +104,12 @@ export function  Return<E>(argument?: E): Return<E> { return { type: 'return', a
 // narrows it back to required in its own union.
 export interface Throw<E>			{ type: 'throw'; argument?: E }
 export function  Throw<E>(argument?: E): Throw<E> { return { type: 'throw', argument }; }
+
+// The braced statement group. js-parser and c-parser both have one; py-parser doesn't (its slots are
+// already arrays). Generic in the statement type rather than in a dialect's type-annotation type, so
+// a pass holding a WIDER statement union than the parser's own can still build one.
+export interface Block<S>			{ type: 'block'; body: S[] }
+export function  Block<S>(...body: S[]): Block<S> { return { type: 'block', body }; }
 
 // A `catch` / `except` clause. `param` is whatever the language binds (a JS binding target, a
 // Python or C++ name); each parser intersects its own extras onto it -- an exception `type`, a

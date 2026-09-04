@@ -22,7 +22,9 @@ const typeTags = guard<Type>(['ref', 'literal', 'range', 'template_literal', 'th
 // the tag alone can't tell an object-type literal from an object-literal expression -- a field-level tiebreak can.
 export const isType = (node: any): node is Type => typeTags(node) && !('properties' in node || 'elements' in node || 'body' in node);
 export const isTsDeclaration	= guard<TS.Declaration>(['type_alias_decl', 'interface_decl', 'enum_decl', 'namespace_decl']);
-export const isJsStatement		= guard<JS.Statement<any>>(stmts);
+// Tests JS statement tags but asserts the wide `TS.Statement`: since js-parser's `X` seam every JS
+// statement IS one, and asserting the narrow type is what used to force casts at the call sites.
+export const isJsStatement		= guard<TS.Statement>(stmts);
 
 type Type		= TS.Type;
 type Expr		= TS.Expr;
@@ -108,6 +110,9 @@ export function walk<T extends Walkable>(ast: T,
 	onClassMember?:	OnAST<TS.ClassMember>
 ): T | undefined {
 
+	// The bodies still reached through a `CallSig` (a function/method/arrow body) keep js-parser's own
+	// narrow `Statement<T>` -- see the `X` seam comment there. Every NESTED statement slot uses
+	// `mapStatement` directly now and needs no cast.
 	const mapStatementC	= (stmt: TS.Statement) => mapStatement(stmt) as JS.Statement<any> | undefined;
 	const mapTypeU		= (type: any): any => mapType(type as Type);
 
@@ -338,7 +343,7 @@ export function walk<T extends Walkable>(ast: T,
 	const statement = (stmt: TS.Statement): TS.Statement => {
 		switch (stmt.type) {
 			case 'block':		return mapObject(stmt, {
-				body:			mapArrayA(mapStatementC)
+				body:			mapArrayA(mapStatement)
 			});
 			case 'var_decl': 	return mapObject(stmt, {
 				declarations: 	mapArray(mapVarDeclarator)
@@ -349,7 +354,7 @@ export function walk<T extends Walkable>(ast: T,
 			case 'if':			return mapObject(stmt, {
 				test:			mapExpressionA,
 				consequent: 	mapStatementA,
-				alternate:		mapStatementC
+				alternate:		mapStatement
 			});
 			case 'do_while':
 			case 'while':		return mapObject(stmt, {
@@ -379,12 +384,12 @@ export function walk<T extends Walkable>(ast: T,
 			});
 			case 'switch':		return mapObject(stmt, {
 				discriminant:	mapExpressionA,
-				cases:			mapArrayA(c => mapObject(c, {consequent: mapArrayA(mapStatementC)}))
+				cases:			mapArrayA(c => mapObject(c, {consequent: mapArrayA(mapStatement)}))
 			});
 			case 'try':			return mapObject(stmt, {
-				body:			mapArrayA(mapStatementC),
-				handlers:		mapArrayA(h => mapObject(h, {body: mapArrayA(mapStatementC)})),
-				finalizer:		mapArrayA(mapStatementC)
+				body:			mapArrayA(mapStatement),
+				handlers:		mapArrayA(h => mapObject(h, {body: mapArrayA(mapStatement)})),
+				finalizer:		mapArrayA(mapStatement)
 			});
 			case 'function_decl':	return mapObject(stmt, {...mapSigU,
 				body:			mapArrayA(mapStatementC),
@@ -492,7 +497,7 @@ export function walkB<T extends Walkable>(ast: T,
 		switch (p.type) {
 		 	case 'spread':				return walkExpression(p.operand);
 			case 'field':				return walkKey(p.key) || walkExpression(p.value);
-			default:					return walkKey(p.key) || walkSig(p as TS.CallSig) || p.body!.some(walkStatementU);
+			default:					return walkKey(p.key) || walkSig(p as TS.CallSig) || p.body!.some(walkStatement);
 		}
 	};
 
@@ -549,7 +554,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'literal':				return Array.isArray(e.value) && e.value.some(i => i.exp && walkExpression(i.exp));
 			case 'array':				return e.elements.some(walkExpression);
 			case 'object':				return e.properties.some(objectProperty);
-			case 'function': 			return walkSig(e as TS.CallSig) || (!!e.body && e.body.some(walkStatementU));
+			case 'function': 			return walkSig(e as TS.CallSig) || (!!e.body && e.body.some(walkStatement));
 			case 'member':				return walkExpression(e.object);
 			case 'index':				return walkExpression(e.object) || walkExpression(e.index);
 			case 'call':
@@ -561,7 +566,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'conditional':			return walkExpression(e.test) || walkExpression(e.consequent) || walkExpression(e.alternate);
 			case 'sequence':			return e.expressions.some(walkExpression);
 			case 'tagged_template':		return walkExpression(e.tag) || e.quasi.some(p => walkExpression(p.exp));
-			case 'arrow':				return walkSig(e as TS.CallSig) || (Array.isArray(e.body) ? e.body.some(walkStatementU) : walkExpression(e.body));
+			case 'arrow':				return walkSig(e as TS.CallSig) || (Array.isArray(e.body) ? e.body.some(walkStatement) : walkExpression(e.body));
 			case 'yield':				return walkExpression(e.operand);
 			case 'class':				return walkExpression(e.superClass) || (e.body as TS.ClassMember[]).some(walkClassMember) || !!e.implements?.some(t => walkType(t as Type));
 			case 'instantiation':		return walkExpression(e.expression) || e.typeArgs.some(t => walkType(t as Type));
@@ -593,7 +598,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'switch':				return walkExpression(stmt.discriminant)
 				|| stmt.cases.some(c => walkExpression(c.test) || c.consequent.some(walkStatement));
 			case 'try':					return stmt.body.some(walkStatement) || stmt.handlers.some(h => h.body.some(walkStatement)) || !!stmt.finalizer?.some(walkStatement);
-			case 'function_decl':		return walkSig(stmt) || !!stmt.body?.some(walkStatementU);
+			case 'function_decl':		return walkSig(stmt) || !!stmt.body?.some(walkStatement);
 			case 'export':				return !!stmt.default && (isJsStatement(stmt.default) ? walkStatement(stmt.default) : walkExpression(stmt.default as JS.Expr));
 			case 'export_decl':			return walkStatement(stmt.declaration);
 			case 'class_decl':			return walkExpression(stmt.superClass)
@@ -630,7 +635,6 @@ export function walkB<T extends Walkable>(ast: T,
 	const walkClassMember 	= makeProcessB(classMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, recurse, true);
 	const walkType			= makeProcessB(type, onType, recurse);
 
-	const walkStatementU	= (stmt: JS.Statement<any>) => walkStatement(stmt as TS.Statement);
 
 	if (Array.isArray(ast))
 		return ast.some(walkStatement);

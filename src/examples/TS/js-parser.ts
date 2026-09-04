@@ -2,7 +2,7 @@ import * as path from 'path';
 import { type RecoveryCallback, type MergeValues, type Token, type Parser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods, withDefault, stampPos } from '../common';
-import type * as Common from '../common';
+import * as Common from '../common';
 
 // ===================================================================
 //  JavaScript Parser using tison
@@ -173,30 +173,45 @@ export function Expression<T>(expression: Expr<T>) { return { type: 'expression'
 export type ForInit<T> = Expr<T> | VarDecl<T>;
 export interface SwitchCase<T, S = Statement<T>> { test?: Expr<T>; consequent: S[]; }
 export function SwitchCase<T, S>(test: Expr<T>, ...consequent: S[]) : SwitchCase<T, S> { return { test, consequent }; }
-export function Switch<T>(discriminant: Expr, ...cases: SwitchCase<T>[]): Statement<T> { return { type: 'switch', discriminant, cases }; }
-export function Block<T>(...body: Statement<T>[]): { type: 'block'; body: Statement<T>[] } { return { type: 'block', body }; }
-export function For<T>(init: ForInit<T>|undefined, test: Expr|undefined, update: Expr|undefined, body: Statement<T>): Statement<T> { return { type: 'for', kind: 'normal', init, test, update, body }; }
-export function If<T>(test: Expr, consequent: Statement<T>, alternate?: Statement<T>): Statement<T> { return {type: 'if', test, consequent, alternate }; }
-export function While<T>(test: Expr, body: Statement<T>): Statement<T> { return {type: 'while', test, body }; }
-export function DoWhile<T>(body: Statement<T>, test: Expr<T>): Statement<T> { return {type: 'do_while', body, test }; }
+export function Switch<S>(discriminant: Expr, ...cases: SwitchCase<any, S>[]) { return { type: 'switch' as const, discriminant, cases }; }
+// The shared statement constructors, re-exported so a consumer building JS statements reaches for
+// `JS.Block`/`JS.Return` rather than importing common.ts alongside js-parser.
+export const    Block   = Common.Block;
+export const    Return  = Common.Return;
+export const    Throw   = Common.Throw;
+export const    ExprStmt = Common.ExprStmt;
+export function For<S>(init: ForInit<any>|undefined, test: Expr|undefined, update: Expr|undefined, body: S) { return { type: 'for' as const, kind: 'normal' as const, init, test, update, body }; }
+export function If<S>(test: Expr, consequent: S, alternate?: S) { return {type: 'if' as const, test, consequent, alternate }; }
+export function While<S>(test: Expr, body: S) { return {type: 'while' as const, test, body }; }
+export function DoWhile<S>(body: S, test: Expr) { return {type: 'do_while' as const, body, test }; }
 
-export type Statement<T> = Declaration<T>
-	| { type: 'block'; body: Statement<T>[] }
+// `X`: the statement extension seam -- defaults to `never` (plain JS), ts-parser instantiates it with
+// its own `Declaration` so a TS-only declaration (`type A = B`, `interface`, `enum`, `namespace`) can
+// appear in every NESTED statement position -- a block, an if branch, a loop body, a switch case, a
+// try -- without a cast. Mirrors c-parser.ts's own `Statement<D, X>` seam.
+//
+// Residual narrowness, deliberate: the bodies reached through `Declaration<T>` (a `function_decl`'s
+// own body, a class method's) stay `Statement<T>`. Threading `X` that far would drag it through
+// `Expr<T>` as well, since a function EXPRESSION is an expression -- far more surface than the
+// nesting these consumers actually build.
+export type Statement<T, X = never> = Declaration<T>
+	| X
+	| Common.Block<Statement<T, X>>
 	| Common.ExprStmt<Expr>
 	| { type: 'empty' }
-	| { type: 'if'; test: Expr; consequent: Statement<T>; alternate?: Statement<T> }
-	| { type: 'do_while'; body: Statement<T>; test: Expr<T> }
-	| { type: 'while'; test: Expr; body: Statement<T> }
-	| { type: 'for'; kind: 'normal'; init?: ForInit<T>; test?: Expr; update?: Expr; body: Statement<T> }
-	| { type: 'for'; kind: 'in' | 'of' | 'of await'; init: ForInit<T>; right: Expr; body: Statement<T> }
+	| { type: 'if'; test: Expr; consequent: Statement<T, X>; alternate?: Statement<T, X> }
+	| { type: 'do_while'; body: Statement<T, X>; test: Expr<T> }
+	| { type: 'while'; test: Expr; body: Statement<T, X> }
+	| { type: 'for'; kind: 'normal'; init?: ForInit<T>; test?: Expr; update?: Expr; body: Statement<T, X> }
+	| { type: 'for'; kind: 'in' | 'of' | 'of await'; init: ForInit<T>; right: Expr; body: Statement<T, X> }
 	| { type: 'continue'; label?: string }
 	| { type: 'break'; label?: string }
 	| Common.Return<Expr>
-	| { type: 'with'; argument: Expr; body: Statement<T> }
-	| { type: 'labeled'; label: string; body: Statement<T> }
-	| { type: 'switch'; discriminant: Expr; cases: SwitchCase<T>[] }
+	| { type: 'with'; argument: Expr; body: Statement<T, X> }
+	| { type: 'labeled'; label: string; body: Statement<T, X> }
+	| { type: 'switch'; discriminant: Expr; cases: SwitchCase<T, Statement<T, X>>[] }
 	| (Common.Throw<Expr> & { argument: Expr })
-	| Common.Try<Statement<T>, BindingTarget>
+	| Common.Try<Statement<T, X>, BindingTarget>
 	| { type: 'debugger' }
 	| Export<T>
 	| ExportDecl<T>

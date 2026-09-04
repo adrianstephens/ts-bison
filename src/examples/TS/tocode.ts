@@ -381,10 +381,10 @@ export class Output {
 	//  Statements
 	// ===================================================================
 
-	indentBlock(stmts: (TS.Statement|JS.Statement<any>)[]): string {
+	indentBlock(stmts: TS.Statement[]): string {
 		return this.curlyIndented(() => stmts.map(s => this.statement(s)).join(this.newline));
 	}
-	dependentCode(stmt: JS.Statement<any>): string {
+	dependentCode(stmt: TS.Statement): string {
 		if (stmt.type !== 'block')
 			return this.indented(()=> this.newline + this.statement(stmt));
 		return this.indentBlock(stmt.body);

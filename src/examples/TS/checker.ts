@@ -55,7 +55,7 @@ const TYPED_ARRAY_RANGES = new Map<string, T.NumRange>([
 
 // A body with zero `return`s normally infers `void` -- but if every path ends in `throw`, real TS infers `never`
 // instead, which (unlike `void`) is assignable to any declared return type. Not a full CFG.
-function alwaysThrows(stmt: JS.Statement<any> | undefined): boolean {
+function alwaysThrows(stmt: Statement | undefined): boolean {
 	if (!stmt)
 		return false;
 	switch (stmt.type) {
@@ -68,7 +68,7 @@ function alwaysThrows(stmt: JS.Statement<any> | undefined): boolean {
 }
 
 // Conservative "this statement never falls through" -- powers guard-clause narrowing
-function alwaysExits(stmt: JS.Statement<any>): boolean {
+function alwaysExits(stmt: Statement): boolean {
 	switch (stmt.type) {
 		case 'return':
 		case 'throw':

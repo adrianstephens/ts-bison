@@ -386,7 +386,7 @@ export function BuildStateMachine(stmts: Statement[]) {
 // as `state = resumeId; return yield/await x;` since that's the clearest way to show "control
 // leaves here and re-enters at resumeId" as source text.
 export function StateMachineToAST(machine: StateMachine) {
-	type S = JS.Statement<Type>;
+	type S = Statement;
 	const state		= Identifier('state');
 	const setState	= (v: number): S => ({type: 'expression', expression: JS.JSBinary('=', state, Literal(v))});
 	const cont: S	= {type: 'continue'};
@@ -399,14 +399,14 @@ export function StateMachineToAST(machine: StateMachine) {
 			resultVars.set(seg.next.resumeId, seg.next.resultVar);
 	const resumeValue = Identifier('$resume');
 
-	return JS.Block(
-		JS.VarDecl('let', JS.Var('state', Literal(machine.entryId))) as S,
-		{ type: 'while', test: Literal(true), body: JS.Block(JS.Switch(state, ...machine.segments.map((seg, k) => {
+	return JS.Block<S>(
+		JS.VarDecl<Type>('let', JS.Var<Type>('state', Literal(machine.entryId))),
+		JS.While(Literal(true), JS.Block<S>(JS.Switch<S>(state, ...machine.segments.map((seg, k) => {
 			const stmts: S[] = [];
 			const resultVar = resultVars.get(k);
 			if (resultVar)
-				stmts.push(JS.VarDecl('let', JS.Var(resultVar, resumeValue)) as S);
-			stmts.push(...seg.stmts as S[]);
+				stmts.push(JS.VarDecl<Type>('let', JS.Var<Type>(resultVar, resumeValue)));
+			stmts.push(...seg.stmts);
 
 			const next = seg.next;
 			switch (next.type) {
@@ -419,11 +419,10 @@ export function StateMachineToAST(machine: StateMachine) {
 
 				case 'branch':
 					stmts.push(
-						JS.If(next.test, JS.Block(
-							setState(next.then)
-						) as S, JS.Block(
-							setState(next.else)
-						) as S) as S,
+						JS.If<S>(next.test,
+							JS.Block<S>(setState(next.then)),
+							JS.Block<S>(setState(next.else))
+						),
 						cont
 					);
 					break;
@@ -432,19 +431,19 @@ export function StateMachineToAST(machine: StateMachine) {
 					if (next.delegate)
 						throw new Error("'yield*' delegation is not supported");
 					stmts.push(setState(next.resumeId));
-					stmts.push({ type: 'return', argument: next.kind === 'yield'
-						? { type: 'yield', operand: next.operand, delegate: next.delegate } as Expr
+					stmts.push(JS.Return(next.kind === 'yield'
+						? { type: 'yield', operand: next.operand, delegate: next.delegate }
 						: JS.JSUnary('await', next.operand!)
-					} as S);
+					));
 					break;
 				}
 
 				case 'complete':
-					stmts.push({ type: 'return' } as S);
+					stmts.push(JS.Return());
 					break;
 			}
 			return JS.SwitchCase(Literal(k), ...stmts);
-		})) as S) } as S,
+		}))))
 	);
 }
 

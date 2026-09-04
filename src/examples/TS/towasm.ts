@@ -5204,13 +5204,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						const arrId: Expr = { type: 'identifier', name: `#for${n}$arr` };
 						const idxId: Expr = { type: 'identifier', name: `#for${n}$i` };
 
-						emitStmt(JS.Block(
+						emitStmt(JS.Block<Statement>(
 							JS.VarDecl('const', JS.Var(arrId.name, s.right)),
 							JS.For(
 								JS.VarDecl('let', JS.Var(idxId.name, Literal(0))),
 								JS.JSBinary('<', idxId, JS.Member(arrId, 'length')),
 								JS.JSUnary('++', idxId),
-								JS.Block(
+								JS.Block<Statement>(
 									JS.VarDecl(s.init.kind, JS.Var(v.name, JS.Index(arrId, idxId), v.typeAnnotation)),
 									s.body
 								),

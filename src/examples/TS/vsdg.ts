@@ -927,12 +927,12 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						)), 'statement');
 
 						const value = JS.Member<TS.Type>(Identifier(resultName), 'value');
-						buildLoop(recurse, Literal(true), JS.Block<TS.Type>(
+						buildLoop(recurse, Literal(true), JS.Block<Statement>(
 							JS.VarDecl<TS.Type>('const', JS.Var<TS.Type>(resultName, JS.Call<TS.Type>(JS.Member<TS.Type>(Identifier(iterName), 'next'), []))),
-							{ type: 'if', test: JS.Member<TS.Type>(Identifier(resultName), 'done'), consequent: { type: 'break' } } as JS.Statement<TS.Type>,
+							JS.If<Statement>(JS.Member<TS.Type>(Identifier(resultName), 'done'), { type: 'break' }),
 							(s.init.type === 'var_decl'
 								? JS.VarDecl<TS.Type>(s.init.kind, JS.Var<TS.Type>(s.init.declarations[0].name, value))
-								: JS.Expression<TS.Type>({ type: 'binary', operator: '=', left: s.init, right: value } as Expr)) as JS.Statement<TS.Type>,
+								: JS.Expression<TS.Type>(JS.JSBinary('=', s.init, value))),
 							s.body
 						), false);
 						return false;
@@ -2356,8 +2356,8 @@ export function BuildProgram(
 				const falseStmts	= control.inputs[3].nodeId !== predecessorId ? emitChain(control.inputs[3].nodeId, predecessorId) : undefined;
 				return [JS.If(
 					resolveOperand(control.id, 1),
-					JS.Block(...trueStmts as JS.Statement<any>[]),
-					falseStmts ? JS.Block(...falseStmts as JS.Statement<any>[]) : undefined
+					JS.Block(...trueStmts),
+					falseStmts ? JS.Block(...falseStmts) : undefined
 				)];
 			});
 
@@ -2377,13 +2377,13 @@ export function BuildProgram(
 				};
 				const cases = control.switchCases!.map(c => ({
 					test:		c.testNodeId ? resolveNode(c.testNodeId) : undefined,
-					consequent:	emitChain(c.tailId, c.boundaryId) as JS.Statement<any>[],
+					consequent:	emitChain(c.tailId, c.boundaryId),
 				}));
 
 				// Once every case's value is elided into the post-switch merge, a case body can end up
 				// with nothing but its own trailing `break;` -- if EVERY case is in that shape, the whole
 				// dispatch is observably a no-op and drops entirely. A continue/return/throw blocks this.
-				const isNoOp = (stmts: JS.Statement<any>[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
+				const isNoOp = (stmts: Statement[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
 				const switchIsNoOp = cases.every(c => isNoOp(c.consequent));
 
 				return [
@@ -2406,9 +2406,9 @@ export function BuildProgram(
 				const finallyStmts	= finallyEdge ? emitChain(finallyEdge.nodeId, control.id) : undefined;
 				return [{
 					type:			'try',
-					body:			tryStmts as JS.Statement<any>[],
-					handlers:		[{param: control.catchParam, body: catchStmts as JS.Statement<any>[]}],
-					finalizer:		finallyStmts as JS.Statement<any>[] | undefined,
+					body:			tryStmts,
+					handlers:		[{param: control.catchParam, body: catchStmts}],
+					finalizer:		finallyStmts,
 				}];
 			});
 
@@ -2446,9 +2446,9 @@ export function BuildProgram(
 					// No rotation needed: the body already runs before the test in do-while's own
 					// native semantics (the mu's INITIAL value is what the body sees on its first pass).
 					statements.push(JS.DoWhile(JS.Block(
-						...restOfBody as JS.Statement<any>[],
-						...restStatements as JS.Statement<any>[],
-						...testStatements as JS.Statement<any>[]
+						...restOfBody,
+						...restStatements,
+						...testStatements
 					), resolveOperand(thetaNode.id, 1)));
 				} else {
 					// LOOP ROTATION: the condition needs values that only exist once already inside the
@@ -2458,12 +2458,12 @@ export function BuildProgram(
 					// provably dead, so it's dropped instead of printed as inert clutter.
 					const condExpr = resolveOperand(thetaNode.id, 1);
 					statements.push(JS.While(Literal(true), JS.Block(
-						...testStatements as JS.Statement<any>[],
+						...testStatements,
 						...(condExpr.type === 'literal' && condExpr.value === true ? [] : [JS.If({ type: 'unary', operator: '!', operand: condExpr },
-							JS.Block({ type: 'break' } as JS.Statement<any>)
-						) as JS.Statement<any>]),
-						...restStatements as JS.Statement<any>[],
-						...restOfBody as JS.Statement<any>[]
+							JS.Block<Statement>({ type: 'break' })
+						)]),
+						...restStatements,
+						...restOfBody
 					)));
 				}
 			} else {
@@ -2473,7 +2473,7 @@ export function BuildProgram(
 				const restStatements = emitLocalStatements(ownIds);
 				const restOfBody = emitChain(control.inputs[1].nodeId, control.id);
 				statements.push(JS.While(Literal(true),
-					JS.Block(...restStatements as JS.Statement<any>[], ...restOfBody as JS.Statement<any>[])
+					JS.Block(...restStatements, ...restOfBody)
 				));
 			}
 
