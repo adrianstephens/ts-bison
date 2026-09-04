@@ -1533,9 +1533,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// stripped because they defeat inference against a `C<...>`-shaped return without adding
 				// anything: an `undefined` right side doesn't need a contextual type, and the assignability
 				// check below still judges against the full declared `lt`.
-				const assigning	= !COMPARISON_OPS.has(e.operator) && e.operator.endsWith('=');
-				const rt = recurse(e.right, assigning ? T.nonNullable(lt, scope) : undefined);
-				if (COMPARISON_OPS.has(e.operator))
+				const comparison	= COMPARISON_OPS.has(e.operator);
+				const rt = recurse(e.right, !comparison && e.operator.endsWith('=') ? T.nonNullable(lt, scope) : undefined);
+				if (comparison)
 					return T.BOOLEAN;
 
 				if (e.operator.endsWith('=')) {
