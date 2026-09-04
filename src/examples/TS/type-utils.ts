@@ -28,8 +28,10 @@ const OPAQUE_GAP	= new Set(['keyof', 'indexed_access', 'conditional', 'infer', '
 
 const BOXED_PRIMITIVE: Record<string, string> = { string: 'String', number: 'Number', boolean: 'Boolean', bigint: 'BigInt', symbol: 'Symbol' };
 
-const tocode = new Output({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
+export const tocode = new Output({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
 export function typeKey(t: Type) { return tocode.type(t); }
+export function exprKey(e: Expr) { return tocode.expr(e); }
+export function stmtKey(s: TS.Stmt) { return tocode.statement(s); }
 
 export const NUMBER		= TS.RefType('number');
 export const STRING		= TS.RefType('string');
@@ -556,13 +558,30 @@ function containsInfer(t: Type): boolean {
 	return walkB(t, undefined, undefined, (x, process) => x.type === 'infer' || process(x));
 }
 
+// An un-annotated parameter's type, inferred from its default. Widened, matching both real TS
+// (`function f(scale = 10)` declares `scale: number`, not `10`) and towasm's own declaration-side
+// `resolveParam`, which infers the same parameter through `checkerTypeOf` -- the two have to agree, or
+// a function TYPE built from a declaration lowers to a different physical signature than the
+// declaration itself does.
+function widenedDefaultType(d: JS.Expr<any> | undefined): Type | undefined {
+	const t = d && literalTypeOf(d);
+	if (!t)
+		return undefined;
+	// `literalTypeOf` types an integer literal as the wasm pseudo-type `i32` (`declare type i32 = number`),
+	// a storage refinement `widenLiterals` has no reason to touch. In a signature the declared type is
+	// plainly `number`, which is also what the declaration side infers -- same collapse `combineTypes`
+	// already does when deduplicating union members.
+	const w = widenLiterals(t);
+	return w.type === 'ref' && !w.typeArgs && WASM_PSEUDO_TYPES.has(w.name) ? NUMBER : w;
+}
+
 // JS.ParamList to TS.ParamList; a defaulted parameter counts as optional
 export function FixParams(params: JS.Params<any>): TS.Params {
 	return {
 		params: params.params.filter(p => p.key !== 'this').map((p): TS.Param => ({
 			key:			typeof p.key === 'string' ? p.key : '_',
 			modifiers:		hasMod(p, 'optional') || !!p.default ? ['optional'] : [],
-			typeAnnotation: p.typeAnnotation as Type ?? literalTypeOf(p.default),
+			typeAnnotation: p.typeAnnotation as Type ?? widenedDefaultType(p.default),
 			default:		p.default
 		})),
 		rest: params.rest as JS.Rest<Type>

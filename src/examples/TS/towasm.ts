@@ -1787,22 +1787,31 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			const map = new Map(func.typeParams.map(p => [p.name, p.constraint ?? T.ANY]));
 			func = { ...func, typeParams: undefined, params: func.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p), returnType: func.returnType && T.substituteType(func.returnType, map) };
 		}
+		// Naming the whole signature, not just the parameter: one of these reaches a caller from some
+		// enclosing declaration's own type, and the parameter name alone rarely says which.
+		const sigText = () => T.typeKey({ type: 'function', ...sig } as Type);
 		const params = func.params.map(p => {
-			if (p.default)
-				throw `function type parameter '${describeBinding(p.key)}' cannot have a default value`;
+			// A default is NOT a reason to reject a function type. `defaultsWithImplicitUndefined` below
+			// hands the very same expression to every call site, exactly as a direct call to the real
+			// declaration already gets it -- so the only requirement is the one the declaration path
+			// (`resolveParam`) already imposes: that the expression can be re-emitted there.
+			if (p.default && !isReemittableDefault(p.default))
+				throw `function type parameter '${describeBinding(p.key)}''s default value must be a literal (or an array literal of them), in '${sigText()}'`;
 			// `void` is real, valid TS here (real TS lets a param/field declare `void`, if uselessly) --
 			// there's just no wasm value it can itself represent, so box it as `any` like any other
 			// "no meaningful value" position instead of rejecting otherwise-valid source.
 			const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
 			const boxed = wt === 'void' ? REF_ANY : wt;
 			if (!boxed)
-				throw `function type parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
+				throw `function type parameter '${describeBinding(p.key)}': '${p.typeAnnotation ? T.typeKey(p.typeAnnotation) : '<no annotation>'}' has no representation, in '${sigText()}'`;
 			// A bare `p?: T` (optional, no `=`) widens to `T | undefined` for real TS -- give it a
 			// nullable physical slot so an omitted trailing arg's synthesized implicit-`undefined`
 			// default (`defaultsWithImplicitUndefined`, below) is a valid value through `call_ref`.
-			// `p.default` above already rejects a real `= value` default (needs a source expression a
-			// bare function TYPE has no room to write), unaffected by this.
-			return hasMod(p, 'optional') ? nullableWtype(boxed) : boxed;
+			// A defaulted one is the opposite and keeps its plain type: the call site fills the declared
+			// default in, so the slot always holds a real value. Same rule `resolveParam` uses for a real
+			// function declaration -- and it has to be the same, or the two physical signatures disagree.
+			// (The checker marks a defaulted param `optional` too, hence testing `p.default` first.)
+			return !p.default && hasMod(p, 'optional') ? nullableWtype(boxed) : boxed;
 		});
 		const defaults = defaultsWithImplicitUndefined(func.params);
 		let hasRest = false;
@@ -1898,7 +1907,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					if (sigs.every((s): s is Required<FuncSig> => !!s)) {
 						const merged = mergeOverloadSigs(sigs);
 						if (merged) {
-							const key = `(${merged.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(merged.result)}${merged.hasRest ? '...' : ''}${merged.defaults.map(d => d ? '?' : '.').join('')}`;
+							const key = `(${merged.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(merged.result)}${merged.hasRest ? '...' : ''}${merged.defaults.map(d => d ? `?${T.exprKey(d)}` : '.').join('')}`;
 							let wt = closureWasmTypes.get(key);
 							if (!wt)
 								closureWasmTypes.set(key, wt = { closure: merged });
@@ -1954,19 +1963,28 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				}
 				break;
 			}
+			// A type predicate (`t is Foo`) is a checking-time refinement with no representation of its
+			// own: as a plain value it IS a boolean, and an `asserts` one yields nothing at all. Exactly
+			// the reduction the checker already applies at a call site whose result is used as a value.
+			case 'predicate':
+				return resolved.asserts ? 'void' : typeOf(T.BOOLEAN);
+
 			case 'function': {
 				// Builds (and memoizes) the `{closure: FuncSig}` `WasmType` for a TS function type
 				const parts = closureSigParts(resolved);
 				if (!parts)
-					throw 'a function type has an unsupported return type';
+					throw `a function type has an unsupported return type: '${resolved.returnType ? T.typeKey(resolved.returnType) : 'void'}' in '${T.typeKey(resolved)}'`;
 				const { params, result, hasRest, defaults } = parts;
 				// `hasRest` folded into the memoization key too -- see `funcSigEq`'s own comment on why it's part
 				// of a closure's real type identity, not just incidental metadata. Which *positions* are
 				// omittable is folded in too (`defaults.map(...)`) -- two closure types can share an identical
 				// physical `WasmType` signature (a genuinely-nullable-but-required param and a truly optional
 				// one both widen to the same nullable wtype) while differing on whether a call site may omit
-				// the argument, so the physical signature alone isn't a safe cache key here.
-				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${hasRest ? '...' : ''}${defaults.map(d => d ? '?' : '.').join('')}`;
+				// the argument, so the physical signature alone isn't a safe cache key here. Each default's
+				// own TEXT is part of it as well, not just that a position has one: a call site synthesizes
+				// the omitted argument FROM this memoized signature, so `(a, by = 10)` and `(a, by = 10.5)`
+				// sharing an entry would silently hand one function the other's default.
+				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${hasRest ? '...' : ''}${defaults.map(d => d ? `?${T.exprKey(d)}` : '.').join('')}`;
 				let wt = closureWasmTypes.get(key);
 				if (!wt)
 					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest, defaults } });

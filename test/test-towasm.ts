@@ -3069,6 +3069,54 @@ async function main() {
 	}
 
 	{
+		// Function TYPES (`closureSigParts`) rejected two shapes that a function DECLARATION already
+		// handles, which between them blocked most of checker.ts in the self-hosting survey.
+		//
+		// A type predicate (`t is Foo`) had no physical representation at all -- as a plain value it IS a
+		// boolean, and an `asserts` one yields nothing, exactly the reduction the checker already applies
+		// to a predicate call used as a value.
+		//
+		// A defaulted parameter was rejected outright, on the theory that a bare function type has no room
+		// to write the default. But when the type comes FROM a declaration (`typeof f`, a method's own
+		// type) the default is right there on it, and the call site fills it in the same way a direct call
+		// does. The physical slot therefore keeps its plain type rather than going nullable -- the rule
+		// `resolveParam` already uses -- because the two signatures have to agree.
+		const { predicateValue, predicateParam, assertsPredicate, boolDefault, strDefault, floatDefault, intDefault } = await compile(`
+			class A { constructor(public x: number) {} }
+			function isBig(a: A): a is A { return a.x > 5; }
+			export function predicateValue(): number {
+				const p: (a: A) => a is A = isBig;
+				return (p(new A(9)) ? 10 : 0) + (p(new A(1)) ? 1 : 0);
+			}
+			function applyPred(g: (a: A) => a is A, a: A): number { return g(a) ? 1 : 0; }
+			export function predicateParam(): number { return applyPred(isBig, new A(9)) * 10 + applyPred(isBig, new A(2)); }
+			function check(a: A): asserts a is A { }
+			export function assertsPredicate(): number {
+				const p: (a: A) => asserts a is A = check;
+				p(new A(1));
+				return 7;
+			}
+			function tag(s: string, upper = false): number { return s.length + (upper ? 100 : 0); }
+			export function boolDefault(): number { const g: typeof tag = tag; return g('abc') * 1000 + g('abc', true); }
+			function join(a: string, sep = ','): number { return a.length + sep.length * 10; }
+			export function strDefault(): number { const g: typeof join = join; return g('abc') * 100 + g('abc', '--'); }
+			function scaleF(a: number, by = 10.5): number { return a * by; }
+			export function floatDefault(): number { const g: typeof scaleF = scaleF; return g(2) * 100 + g(2, 2); }
+			// An INTEGER default specifically: the checker types the literal as the wasm pseudo-type 'i32',
+			// which has to collapse back to 'number' or the type and the declaration disagree physically.
+			function scaleI(a: number, by = 10): number { return a * by; }
+			export function intDefault(): number { const g: typeof scaleI = scaleI; return g(2) * 100 + g(2, 2); }
+		`);
+		check('function type: a type predicate return, through a variable', predicateValue(), 10);
+		check('function type: a type predicate return, through a parameter', predicateParam(), 10);
+		check("function type: an 'asserts' predicate return", assertsPredicate(), 7);
+		check('function type: a boolean-defaulted parameter', boolDefault(), 3103);
+		check('function type: a string-defaulted parameter', strDefault(), 1323);
+		check('function type: a float-defaulted parameter', floatDefault(), 2104);
+		check('function type: an integer-defaulted parameter agrees with the declaration', intDefault(), 2004);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only
