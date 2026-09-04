@@ -1,0 +1,5 @@
+{
+	"files": 11949,
+	"failed": 1565,
+	"note": "corpus files that fail to PARSE (no checker); lower is better"
+}
