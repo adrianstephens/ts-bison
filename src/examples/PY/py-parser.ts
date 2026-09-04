@@ -2,6 +2,7 @@ import * as path from 'path';
 import { terminal, OneOf, List, MaybeList, Forward, Rules, makeRule, Terminal, type RecoveryCallback } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { Literal, Identifier, Unary, Binary, stampPos } from '../common';
+import type * as Common from '../common';
 
 // ===================================================================
 //  Python 3 parser using tison
@@ -212,17 +213,18 @@ export type compareOps	= '<' | '>' | '<=' | '>=' | '==' | '!=' | '<>' | 'in' | '
 export interface Imaginary	{ type: 'imaginary'; value: number }
 export interface Ellipsis	{ type: 'ellipsis' }
 export interface Compare		{ type: 'compare'; left: Expr; ops: compareOps[]; comparators: Expr[] }
-export interface IfExp		{ type: 'ifexp'; test: Expr; body: Expr; orelse: Expr }
+export type      Conditional	= Common.Conditional<Expr>;
 export interface Lambda		{ type: 'lambda'; params: Param[]; body: Expr }
 export interface NamedExpr	{ type: 'namedexpr'; target: string; value: Expr }
-export interface Starred	{ type: 'starred'; value: Expr }
-export interface Attribute	{ type: 'attr'; value: Expr; attr: string }
-export interface Subscript	{ type: 'subscript'; value: Expr; slice: Expr }
+export type      Spread		= Common.Spread<Expr>;
+export type      Member		= Common.Member<Expr>;
+// `index` holds the whole `[...]` payload: a plain expression, a `SliceExpr`, or a `tuple` of either.
+export type      Index		= Common.Index<Expr>;
 export interface SliceExpr	{ type: 'slice'; lower?: Expr; upper?: Expr; step?: Expr }
-export interface Call		{ type: 'call'; func: Expr; args: Arg[] }
-export interface Tuple		{ type: 'tuple'; elts: Expr[] }
-export interface ListLit	{ type: 'list'; elts: Expr[] }
-export interface SetLit		{ type: 'set'; elts: Expr[] }
+export type      Call		= Common.Call<Expr, Arg>;
+export type      Tuple		= Common.Sequence<Expr, 'tuple'>;
+export type      ListLit	= Common.Sequence<Expr, 'list'>;
+export type      SetLit		= Common.Sequence<Expr, 'set'>;
 export interface DictLit	{ type: 'dict'; keys: (Expr | null)[]; values: Expr[] }
 export interface Comprehension	{ type: 'for'; target: Expr; iter: Expr; is_async: boolean }
 export interface CompIf			{ type: 'if'; test: Expr }
@@ -249,8 +251,8 @@ export type Expr =
 	| Imaginary | Ellipsis
 	| Unary<Expr, unaryOps>
 	| Binary<Expr, binaryOps>
-	| Compare | IfExp | Lambda | NamedExpr
-	| Starred | Attribute | Subscript | SliceExpr | Call | Tuple | ListLit | SetLit | DictLit
+	| Compare | Conditional | Lambda | NamedExpr
+	| Spread | Member | Index | SliceExpr | Call | Tuple | ListLit | SetLit | DictLit
 	| GeneratorExp | ListComp | SetComp | DictComp | Await | YieldExpr | FStringLit;
 
 export interface Arg { kind: 'pos' | 'kw' | 'star' | 'dstar'; name?: string; value: Expr }
@@ -260,13 +262,13 @@ export interface Param { name?: string; annotation?: Expr; default?: Expr; kind?
 export interface Alias { name: string; asname?: string }
 
 export type Stmt =
-	| { type: 'expr'; value: Expr }
+	| Common.ExprStmt<Expr>
 	| { type: 'assign'; targets: Expr[]; value: Expr }
 	| { type: 'augassign'; target: Expr; op: string; value: Expr }
 	| { type: 'annassign'; target: Expr; annotation: Expr; value?: Expr }
-	| { type: 'return'; value?: Expr }
+	| Common.Return<Expr>
 	| { type: 'pass' } | { type: 'break' } | { type: 'continue' }
-	| { type: 'raise'; exc?: Expr; cause?: Expr }
+	| Common.Throw<Expr> & { cause?: Expr }
 	| { type: 'global'; names: string[] } | { type: 'nonlocal'; names: string[] }
 	| { type: 'del'; targets: Expr }
 	| { type: 'assert'; test: Expr; msg?: Expr }
@@ -328,7 +330,7 @@ function pyString(parts: string[]): Literal<string> {
 	}).join(''));
 }
 
-const tupleOrSingle = (c: CommaList): Expr => c.items.length === 1 && !c.trailing ? c.items[0] : { type: 'tuple', elts: c.items };
+const tupleOrSingle = (c: CommaList): Expr => c.items.length === 1 && !c.trailing ? c.items[0] : { type: 'tuple', elements: c.items };
 
 // A generic `a (, a)* [,]` comma list that records whether a trailing comma was present (so a
 // single element with no comma stays itself rather than becoming a 1-tuple).
@@ -438,16 +440,16 @@ atom = Rules<Expr>(
 	Rule([NUMBER],					$ => pyNumber($[0])),
 	Rule([string_list],				$ => pyString($[0])),
 	Rule(['...'],					() => ({ type: 'ellipsis' } as const)),
-	Rule([oparen, cparen],			() => ({ type: 'tuple', elts: [] })),
+	Rule([oparen, cparen],			() => ({ type: 'tuple', elements: [] })),
 	Rule([oparen, fwd_yield, cparen],			$ => $[1]),
 	Rule([oparen, fwd_testlist_comp, cparen],	$ => {
 		const { comp, list } = $[1];
 		return comp ? { type: 'genexp', elt: list.items[0], gens: comp } : tupleOrSingle(list);
 	}),
-	Rule([obrack, cbrack],			() => ({ type: 'list', elts: [] })),
+	Rule([obrack, cbrack],			() => ({ type: 'list', elements: [] })),
 	Rule([obrack, fwd_testlist_comp, cbrack],	$ => {
 		const { comp, list } = $[1];
-		return comp ? { type: 'listcomp', elt: list.items[0], gens: comp } : { type: 'list', elts: list.items };
+		return comp ? { type: 'listcomp', elt: list.items[0], gens: comp } : { type: 'list', elements: list.items };
 	}),
 	Rule([obrace, cbrace],			() => ({ type: 'dict', keys: [], values: [] })),
 	Rule([obrace, fwd_dictorset, cbrace],		$ => $[1]),
@@ -467,10 +469,10 @@ atom = Rules<Expr>(
 // trailers: call / subscript / attribute, left-recursive
 atom_expr = Rules<Expr>(self => [
 	atom,
-	Rule([self, oparen, cparen],					$ => ({ type: 'call', func: $[0], args: [] })),
-	Rule([self, oparen, fwd_arglist, cparen],		$ => ({ type: 'call', func: $[0], args: $[2] })),
-	Rule([self, obrack, fwd_subscriptlist, cbrack],	$ => ({ type: 'subscript', value: $[0], slice: $[2] })),
-	Rule([self, '.', NAME],							$ => ({ type: 'attr', value: $[0], attr: $[2] })),
+	Rule([self, oparen, cparen],					$ => ({ type: 'call', callee: $[0], arguments: [] })),
+	Rule([self, oparen, fwd_arglist, cparen],		$ => ({ type: 'call', callee: $[0], arguments: $[2] })),
+	Rule([self, obrack, fwd_subscriptlist, cbrack],	$ => ({ type: 'index', object: $[0], index: $[2] })),
+	Rule([self, '.', NAME],							$ => ({ type: 'member', object: $[0], property: $[2] })),
 ]),
 await_expr = Rules<Expr>(
 	atom_expr,
@@ -535,7 +537,7 @@ or_test = Rules<Expr>(self => [
 
 test = Rules<Expr>(self => [
 	or_test,
-	Rule([or_test, 'if', or_test, ELSE, self],	$ => ({ type: 'ifexp', test: $[2], body: $[0], orelse: $[4] })),
+	Rule([or_test, 'if', or_test, ELSE, self],	$ => ({ type: 'conditional', test: $[2], consequent: $[0], alternate: $[4] })),
 	lambdef,
 ]),
 
@@ -545,7 +547,7 @@ namedexpr_test = Rules<Expr>(
 ),
 
 star_expr = Rules<Expr>(
-	Rule(['*', expr_bitor],			$ => ({ type: 'starred', value: $[1] })),
+	Rule(['*', expr_bitor],			$ => ({ type: 'spread', operand: $[1] })),
 ),
 
 // yield / yield from -- only valid inside parens or as an expression statement / assignment RHS.
@@ -616,7 +618,7 @@ dictorsetmaker = Rules<Expr>(
 		return { type: 'dict', keys: entries.map(e => e.key), values: entries.map(e => e.value) };
 	}),
 	Rule([tse_item, fwd_comp_for],	$ => ({ type: 'setcomp', elt: $[0], gens: $[1] })),
-	Rule([tse_item, set_more],		$ => ({ type: 'set', elts: [$[0], ...$[1]] })),
+	Rule([tse_item, set_more],		$ => ({ type: 'set', elements: [$[0], ...$[1]] })),
 ),
 
 // --- call arguments ---
@@ -653,7 +655,7 @@ subscript = Rules<Expr>(
 ),
 subscriptlist = Rules<Expr>(
 	Rule([subscript],						$ => $[0]),
-	Rule([commaList(subscript as Rules<Expr>)],	$ => ({ type: 'tuple', elts: $[0].items })),
+	Rule([commaList(subscript as Rules<Expr>)],	$ => ({ type: 'tuple', elements: $[0].items })),
 ),
 
 // ===================================================================
@@ -715,8 +717,8 @@ assign_rhs = Rules<AssignRhs>(self => [
 assign_rhs_v = Rules<Expr>(Rule([fwd_yield], $ => $[0]), Rule([fwd_testlist], $ => $[0])),
 
 small_stmt = Rules<Stmt>(
-	Rule([testlist_star_expr],								$ => ({ type: 'expr', value: $[0] })),
-	Rule([fwd_yield],										$ => ({ type: 'expr', value: $[0] })),
+	Rule([testlist_star_expr],								$ => ({ type: 'expression', expression: $[0] })),
+	Rule([fwd_yield],										$ => ({ type: 'expression', expression: $[0] })),
 	Rule([testlist_star_expr, AUGASSIGN, assign_rhs_v],		$ => ({ type: 'augassign', target: $[0], op: $[1] as string, value: $[2] })),
 	Rule([testlist_star_expr, ':', test],					$ => ({ type: 'annassign', target: $[0], annotation: $[2] })),
 	Rule([testlist_star_expr, ':', test, '=', test],		$ => ({ type: 'annassign', target: $[0], annotation: $[2], value: $[4] })),
@@ -725,10 +727,10 @@ small_stmt = Rules<Stmt>(
 	Rule(['break'],											() => ({ type: 'break' })),
 	Rule(['continue'],										() => ({ type: 'continue' })),
 	Rule(['return'],										() => ({ type: 'return' })),
-	Rule(['return', testlist_star_expr],					$ => ({ type: 'return', value: $[1] })),
-	Rule(['raise'],											() => ({ type: 'raise' })),
-	Rule(['raise', test],									$ => ({ type: 'raise', exc: $[1] })),
-	Rule(['raise', test, 'from', test],						$ => ({ type: 'raise', exc: $[1], cause: $[3] })),
+	Rule(['return', testlist_star_expr],					$ => ({ type: 'return', argument: $[1] })),
+	Rule(['raise'],											() => ({ type: 'throw' })),
+	Rule(['raise', test],									$ => ({ type: 'throw', argument: $[1] })),
+	Rule(['raise', test, 'from', test],						$ => ({ type: 'throw', argument: $[1], cause: $[3] })),
 	Rule(['global', name_list],								$ => ({ type: 'global', names: $[1] })),
 	Rule(['nonlocal', name_list],							$ => ({ type: 'nonlocal', names: $[1] })),
 	Rule(['del', exprlist],									$ => ({ type: 'del', targets: $[1] })),

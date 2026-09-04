@@ -52,3 +52,55 @@ export function stampPos<T>(t: T, $: {pos: Location}): T {
 export function getPos(node: unknown): Location | undefined {
 	return (node as {pos?: Location})?.pos;
 }
+
+// ===================================================================
+//  Shared expression shapes
+// ===================================================================
+// The concepts all three parser families have in common, spelled once. Each is generic in its
+// expression type `E` (and, where a language needs a richer payload, in that too) so a parser can
+// alias or extend it rather than restate it -- the same seam `Unary`/`Binary` above already use.
+//
+// Naming follows js-parser.ts wherever the shapes already agreed, purely because its consumers
+// (checker/towasm/vsdg/transform) are by far the largest body of code reading these fields. Two
+// deliberate departures: `Index.index` (js-parser called it `property`, the same name `Member` uses
+// for a plain string -- confusing when it holds an expression), and `Sequence.elements` (py-parser
+// called it `elts`).
+
+export interface Call<E, A = E>		{ type: 'call'; callee: E; arguments: A[] }
+export function  Call<E, A>(callee: E, args: A[]): Call<E, A> { return { type: 'call', callee, arguments: args }; }
+
+// `.`-style access by a fixed name. C's `->` stays a separate `pointer_member` node: it dereferences,
+// so it isn't the same operation, only the same syntax shape.
+export interface Member<E>			{ type: 'member'; object: E; property: string }
+export function  Member<E>(object: E, property: string): Member<E> { return { type: 'member', object, property }; }
+
+export interface Index<E>			{ type: 'index'; object: E; index: E }
+export function  Index<E>(object: E, index: E): Index<E> { return { type: 'index', object, index }; }
+
+export interface Conditional<E>		{ type: 'conditional'; test: E; consequent: E; alternate: E }
+export function  Conditional<E>(test: E, consequent: E, alternate: E): Conditional<E> { return { type: 'conditional', test, consequent, alternate }; }
+
+// `...x` / `*x` -- JS spread, Python starred, C++ pack expansion.
+export interface Spread<E>			{ type: 'spread'; operand: E }
+export function  Spread<E>(operand: E): Spread<E> { return { type: 'spread', operand }; }
+
+// A comma/bracket-delimited run of elements. The tag stays per-language (`array`, `list`, `tuple`,
+// `set`, `initializer_list` are genuinely different constructors); only the field name is shared, so
+// one pass can read the elements of any of them.
+export interface Sequence<E, K extends string>	{ type: K; elements: readonly E[] }
+export function  Sequence<E, const K extends string>(type: K, elements: readonly E[]): Sequence<E, K> { return { type, elements }; }
+
+// ===================================================================
+//  Shared statement shapes
+// ===================================================================
+
+export interface ExprStmt<E>		{ type: 'expression'; expression: E }
+export function  ExprStmt<E>(expression: E): ExprStmt<E> { return { type: 'expression', expression }; }
+
+export interface Return<E>			{ type: 'return'; argument?: E }
+export function  Return<E>(argument?: E): Return<E> { return { type: 'return', argument }; }
+
+// `argument` is optional because Python's bare `raise` re-raises the active exception; js-parser
+// narrows it back to required in its own union.
+export interface Throw<E>			{ type: 'throw'; argument?: E }
+export function  Throw<E>(argument?: E): Throw<E> { return { type: 'throw', argument }; }

@@ -23,8 +23,21 @@ const LAMBDA = 1, TERNARY = 2, OR = 3, AND = 4, NOT = 5, COMPARE = 6, BOR = 7;
 const BXOR = 8, BAND = 9, SHIFT = 10, ADD = 11, MUL = 12, UNARY = 13, POW = 14, AWAIT = 15, POSTFIX = 16, ATOM = 17;
 
 const BINARY_PREC: Record<string, number> = {
-	or: OR, and: AND, '|': BOR, '^': BXOR, '&': BAND, '<<': SHIFT, '>>': SHIFT,
-	'+': ADD, '-': ADD, '*': MUL, '/': MUL, '//': MUL, '%': MUL, '@': MUL, '**': POW,
+	or: 	OR,
+	and: 	AND,
+	'|': 	BOR,
+	'^': 	BXOR,
+	'&': 	BAND,
+	'<<': 	SHIFT,
+	'>>': 	SHIFT,
+	'+': 	ADD,
+	'-': 	ADD,
+	'*': 	MUL,
+	'/': 	MUL,
+	'//': 	MUL,
+	'%': 	MUL,
+	'@': 	MUL,
+	'**': 	POW,
 };
 
 function exprPrecedence(e: Expr): number {
@@ -32,15 +45,15 @@ function exprPrecedence(e: Expr): number {
 		case 'lambda':
 		case 'namedexpr':
 		case 'yield':			return LAMBDA;
-		case 'ifexp':			return TERNARY;
+		case 'conditional':		return TERNARY;
 		case 'binary':			return BINARY_PREC[e.operator] ?? ATOM;
 		case 'compare':			return COMPARE;
 		case 'unary':			return e.operator === 'not' ? NOT : UNARY;
-		case 'starred':			return UNARY;
+		case 'spread':			return UNARY;
 		case 'await':			return AWAIT;
 		case 'call':
-		case 'attr':
-		case 'subscript':		return POSTFIX;
+		case 'member':
+		case 'index':			return POSTFIX;
 		default:				return ATOM;	// identifier / literal / imaginary / ellipsis / tuple / list / set / dict / comprehensions / fstring
 	}
 }
@@ -123,15 +136,15 @@ export class Output {
 
 	statement(s: Stmt): string {
 		switch (s.type) {
-			case 'expr':			return this.exprList(s.value);
+			case 'expression':		return this.exprList(s.expression);
 			case 'assign':			return s.targets.map(t => this.exprList(t) + ' = ').join('') + this.exprList(s.value);
 			case 'augassign':		return this.exprList(s.target) + ' ' + s.op + ' ' + this.exprList(s.value);
 			case 'annassign':		return this.expr(s.target) + ': ' + this.expr(s.annotation) + maybe(s.value, v => ' = ' + this.exprList(v));
-			case 'return':			return 'return' + maybe(s.value, v => ' ' + this.exprList(v));
+			case 'return':			return 'return' + maybe(s.argument, v => ' ' + this.exprList(v));
 			case 'pass':			return 'pass';
 			case 'break':			return 'break';
 			case 'continue':		return 'continue';
-			case 'raise':			return 'raise' + maybe(s.exc, e => ' ' + this.expr(e) + maybe(s.cause, c => ' from ' + this.expr(c)));
+			case 'throw':			return 'raise' + maybe(s.argument, e => ' ' + this.expr(e) + maybe(s.cause, c => ' from ' + this.expr(c)));
 			case 'global':			return 'global ' + s.names.join(this.comma);
 			case 'nonlocal':		return 'nonlocal ' + s.names.join(this.comma);
 			case 'del':				return 'del ' + this.exprList(s.targets);
@@ -198,7 +211,7 @@ export class Output {
 		if (e.type === 'slice')
 			return maybe(e.lower, l => this.expr(l)) + ':' + maybe(e.upper, u => this.expr(u)) + maybe(e.step, s => ':' + this.expr(s));
 		if (e.type === 'tuple')
-			return e.elts.map(x => this.sliceStr(x)).join(this.comma);
+			return e.elements.map(x => this.sliceStr(x)).join(this.comma);
 		return this.expr(e);
 	}
 
@@ -219,8 +232,8 @@ export class Output {
 	// `for` targets, expression statements.
 	private exprList(e: Expr): string {
 		if (e.type === 'tuple')
-			return e.elts.length === 0 ? '()'
-				: e.elts.map(x => this.expr(x, TERNARY)).join(this.comma) + (e.elts.length === 1 ? ',' : '');
+			return e.elements.length === 0 ? '()'
+				: e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + (e.elements.length === 1 ? ',' : '');
 		return this.expr(e);
 	}
 
@@ -250,18 +263,18 @@ export class Output {
 			}
 			case 'compare':			return this.expr(e.left, BOR)
 				+ e.ops.map((o, i) => ' ' + o + ' ' + this.expr(e.comparators[i], BOR)).join('');
-			case 'ifexp':			return this.expr(e.body, OR) + ' if ' + this.expr(e.test, OR) + ' else ' + this.expr(e.orelse, TERNARY);
+			case 'conditional':		return this.expr(e.consequent, OR) + ' if ' + this.expr(e.test, OR) + ' else ' + this.expr(e.alternate, TERNARY);
 			case 'lambda':			return 'lambda' + (e.params.length ? ' ' + this.params(e.params, true) : '') + ': ' + this.expr(e.body, LAMBDA);
 			case 'namedexpr':		return e.target + ' := ' + this.expr(e.value, TERNARY);
-			case 'starred':			return '*' + this.expr(e.value, UNARY);
-			case 'attr':			return this.expr(e.value, POSTFIX) + '.' + e.attr;
-			case 'subscript':		return this.expr(e.value, POSTFIX) + '[' + this.sliceStr(e.slice) + ']';
+			case 'spread':			return '*' + this.expr(e.operand, UNARY);
+			case 'member':			return this.expr(e.object, POSTFIX) + '.' + e.property;
+			case 'index':			return this.expr(e.object, POSTFIX) + '[' + this.sliceStr(e.index) + ']';
 			case 'slice':			return this.sliceStr(e);	// only reached if a bare slice is printed on its own
-			case 'call':			return this.expr(e.func, POSTFIX) + '(' + e.args.map(a => this.arg(a)).join(this.comma) + ')';
-			case 'tuple':			return e.elts.length === 0 ? '()'
-				: '(' + e.elts.map(x => this.expr(x, TERNARY)).join(this.comma) + (e.elts.length === 1 ? ',' : '') + ')';
-			case 'list':			return '[' + e.elts.map(x => this.expr(x, TERNARY)).join(this.comma) + ']';
-			case 'set':				return e.elts.length === 0 ? 'set()' : '{' + e.elts.map(x => this.expr(x, TERNARY)).join(this.comma) + '}';
+			case 'call':			return this.expr(e.callee, POSTFIX) + '(' + e.arguments.map(a => this.arg(a)).join(this.comma) + ')';
+			case 'tuple':			return e.elements.length === 0 ? '()'
+				: '(' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + (e.elements.length === 1 ? ',' : '') + ')';
+			case 'list':			return '[' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + ']';
+			case 'set':				return e.elements.length === 0 ? 'set()' : '{' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + '}';
 			case 'dict':			return '{' + e.keys.map((k, i) => k === null
 				? '**' + this.expr(e.values[i], OR)
 				: this.expr(k, TERNARY) + ': ' + this.expr(e.values[i], TERNARY)).join(this.comma) + '}';

@@ -15,12 +15,12 @@ export function guard<R>(types: string[]) {
 }
 
 const exprTags = [
-	'identifier', 'literal', 'imaginary', 'ellipsis', 'unary', 'binary', 'compare', 'ifexp', 'lambda',
-	'namedexpr', 'starred', 'attr', 'subscript', 'slice', 'call', 'tuple', 'list', 'set', 'dict',
+	'identifier', 'literal', 'imaginary', 'ellipsis', 'unary', 'binary', 'compare', 'conditional', 'lambda',
+	'namedexpr', 'spread', 'member', 'index', 'slice', 'call', 'tuple', 'list', 'set', 'dict',
 	'genexp', 'listcomp', 'setcomp', 'dictcomp', 'await', 'yield', 'fstring',
 ];
 const stmtTags = [
-	'expr', 'assign', 'augassign', 'annassign', 'return', 'pass', 'break', 'continue', 'raise',
+	'expression', 'assign', 'augassign', 'annassign', 'return', 'pass', 'break', 'continue', 'throw',
 	'global', 'nonlocal', 'del', 'assert', 'import', 'importfrom', 'if', 'while', 'for', 'with',
 	'try', 'funcdef', 'classdef',
 ];
@@ -126,20 +126,20 @@ export function walk<T extends Walkable>(ast: T,
 	const expression = (e: Expr): Expr => {
 		switch (e.type) {
 			case 'unary':				return mapObject(e, {operand: mapExpressionA});
-			case 'starred':
+			case 'spread':				return mapObject(e, {operand: mapExpressionA});
 			case 'await':				return mapObject(e, {value: mapExpressionA});
 			case 'binary':				return mapObject(e, {left: mapExpressionA, right: mapExpressionA});
 			case 'compare':				return mapObject(e, {left: mapExpressionA, comparators: mapArrayA(mapExpressionA)});
-			case 'ifexp':				return mapObject(e, {test: mapExpressionA, body: mapExpressionA, orelse: mapExpressionA});
+			case 'conditional':			return mapObject(e, {test: mapExpressionA, consequent: mapExpressionA, alternate: mapExpressionA});
 			case 'lambda':				return mapObject(e, {params: mapArrayA(param), body: mapExpressionA});
 			case 'namedexpr':			return mapObject(e, {value: mapExpressionA});
-			case 'attr':				return mapObject(e, {value: mapExpressionA});
-			case 'subscript':			return mapObject(e, {value: mapExpressionA, slice: mapExpressionA});
+			case 'member':				return mapObject(e, {object: mapExpressionA});
+			case 'index':				return mapObject(e, {object: mapExpressionA, index: mapExpressionA});
 			case 'slice':				return mapObject(e, {lower: mapExpression, upper: mapExpression, step: mapExpression});
-			case 'call':				return mapObject(e, {func: mapExpressionA, args: mapArrayA(arg)});
+			case 'call':				return mapObject(e, {callee: mapExpressionA, arguments: mapArrayA(arg)});
 			case 'tuple':
 			case 'list':
-			case 'set':					return mapObject(e, {elts: mapArrayA(mapExpressionA)});
+			case 'set':					return mapObject(e, {elements: mapArrayA(mapExpressionA)});
 			case 'dict':				return mapObject(e, {
 				keys:	ks => ks.map(k => k === null ? null : mapExpressionA(k)),
 				values:	mapArrayA(mapExpressionA),
@@ -157,12 +157,12 @@ export function walk<T extends Walkable>(ast: T,
 
 	const statement = (s: Stmt): Stmt => {
 		switch (s.type) {
-			case 'expr':				return mapObject(s, {value: mapExpressionA});
+			case 'expression':			return mapObject(s, {expression: mapExpressionA});
 			case 'assign':				return mapObject(s, {targets: mapArrayA(mapExpressionA), value: mapExpressionA});
 			case 'augassign':			return mapObject(s, {target: mapExpressionA, value: mapExpressionA});
 			case 'annassign':			return mapObject(s, {target: mapExpressionA, annotation: mapExpressionA, value: mapExpression});
-			case 'return':				return mapObject(s, {value: mapExpression});
-			case 'raise':				return mapObject(s, {exc: mapExpression, cause: mapExpression});
+			case 'return':				return mapObject(s, {argument: mapExpression});
+			case 'throw':				return mapObject(s, {argument: mapExpression, cause: mapExpression});
 			case 'del':					return mapObject(s, {targets: mapExpressionA});
 			case 'assert':				return mapObject(s, {test: mapExpressionA, msg: mapExpression});
 			case 'if':
@@ -218,20 +218,20 @@ export function walkB<T extends Walkable>(ast: T,
 	const expression = (e: Expr): boolean => {
 		switch (e.type) {
 			case 'unary':				return walkExpression(e.operand);
-			case 'starred':
+			case 'spread':				return walkExpression(e.operand);
 			case 'await':				return walkExpression(e.value);
 			case 'binary':				return walkExpression(e.left) || walkExpression(e.right);
 			case 'compare':				return walkExpression(e.left) || e.comparators.some(walkExpression);
-			case 'ifexp':				return walkExpression(e.test) || walkExpression(e.body) || walkExpression(e.orelse);
+			case 'conditional':			return walkExpression(e.test) || walkExpression(e.consequent) || walkExpression(e.alternate);
 			case 'lambda':				return e.params.some(param) || walkExpression(e.body);
-			case 'namedexpr':
-			case 'attr':				return walkExpression(e.value);
-			case 'subscript':			return walkExpression(e.value) || walkExpression(e.slice);
+			case 'namedexpr':			return walkExpression(e.value);
+			case 'member':				return walkExpression(e.object);
+			case 'index':				return walkExpression(e.object) || walkExpression(e.index);
 			case 'slice':				return walkExpression(e.lower) || walkExpression(e.upper) || walkExpression(e.step);
-			case 'call':				return walkExpression(e.func) || e.args.some(arg);
+			case 'call':				return walkExpression(e.callee) || e.arguments.some(arg);
 			case 'tuple':
 			case 'list':
-			case 'set':					return e.elts.some(walkExpression);
+			case 'set':					return e.elements.some(walkExpression);
 			case 'dict':				return e.keys.some(k => k !== null && walkExpression(k)) || e.values.some(walkExpression);
 			case 'genexp':
 			case 'listcomp':
@@ -245,12 +245,12 @@ export function walkB<T extends Walkable>(ast: T,
 
 	const statement = (s: Stmt): boolean => {
 		switch (s.type) {
-			case 'expr':				return walkExpression(s.value);
+			case 'expression':			return walkExpression(s.expression);
 			case 'assign':				return s.targets.some(walkExpression) || walkExpression(s.value);
 			case 'augassign':			return walkExpression(s.target) || walkExpression(s.value);
 			case 'annassign':			return walkExpression(s.target) || walkExpression(s.annotation) || walkExpression(s.value);
-			case 'return':				return walkExpression(s.value);
-			case 'raise':				return walkExpression(s.exc) || walkExpression(s.cause);
+			case 'return':				return walkExpression(s.argument);
+			case 'throw':				return walkExpression(s.argument) || walkExpression(s.cause);
 			case 'del':					return walkExpression(s.targets);
 			case 'assert':				return walkExpression(s.test) || walkExpression(s.msg);
 			case 'if':
