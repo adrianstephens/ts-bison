@@ -2,6 +2,7 @@ import * as path from 'path';
 import { type RecoveryCallback, type MergeValues, type Token, type Parser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods, withDefault, stampPos } from '../common';
+import type * as Common from '../common';
 
 // ===================================================================
 //  JavaScript Parser using tison
@@ -41,7 +42,7 @@ export interface ArrayPatternElement		{ target: BindingTarget; default?: Expr; }
 export interface ArrayPattern 				{ type: 'array_pattern'; elements: (ArrayPatternElement | undefined)[]; rest?: BindingTarget; }
 export function  ArrayPattern(elements: (ArrayPatternElement | undefined)[], rest?: BindingTarget): ArrayPattern { return { type: 'array_pattern', elements, rest }; }
 
-export interface ArrayLit<T>				{ type: 'array'; elements: readonly (Expr<T> | undefined)[] }
+export type      ArrayLit<T>				= Common.Sequence<Expr<T> | undefined, 'array'>;
 export function  ArrayLit<T>(elements: readonly (Expr<T> | undefined)[]): ArrayLit<T>	{ return { type: 'array', elements}; }
 
 export interface TypeParam<T> 				{ name: string; constraint?: T; default?: T; const?: boolean; }
@@ -71,7 +72,7 @@ export function CallSig<T>(...args: CallSigParams<T>) : CallSig<T> {
 }
 
 export interface KeyMods<T>	{ key: Key<T>, modifiers?: string[] };
-export interface Spread<T>	{ type: 'spread'; operand: Expr<T> }
+export type      Spread<T>	= Common.Spread<Expr<T>>;
 export function  Spread<T>(operand: Expr<T>): Spread<T> { return { type: 'spread', operand }; }
 
 export interface FunctionExpr<T> extends CallSig<T> { type: 'function'; name?: string; body?: Statement<T>[]; modifiers?: string[] }
@@ -92,12 +93,12 @@ export function  ObjectExpr<T>(properties: readonly ObjectProperty<T>[]): Object
 export type ClassMember<T>	= Method<T> | Field<T> | { type: 'static_block'; body: Statement<T>[] }
 export interface Class<T = unknown, M = ClassMember<T>> { name?: string; superClass?: Expr<T>; body: M[]; typeParams?: TypeParam<T>[]; implements?: T[]; abstract?: boolean; decorators?: Expr[] };
 
-export interface Call<T = unknown> { type: 'call';	callee: Expr<T>; arguments: Expr<T>[]; optional?: boolean; typeArgs?: T[] }
+export interface Call<T = unknown> extends Common.Call<Expr<T>> { optional?: boolean; typeArgs?: T[] }
 export function  Call<T>(callee: Expr<T>, args: Expr<T>[], optional?: boolean, typeArgs?: T[]): Call<T> { return {type: 'call', callee, arguments: args, optional, typeArgs}; }
-export interface Member<T> { type: 'member'; object: Expr<T>; property: string; optional?: boolean }
+export interface Member<T> extends Common.Member<Expr<T>> { optional?: boolean }
 export function  Member<T>(object: Expr<T>, property: string, optional?: boolean) : Member<T> { return { type: 'member', object, property, optional }; }
-export interface Index<T> { type: 'index';	object: Expr<T>; property: Expr<T>; optional?: boolean }
-export function  Index<T>(object: Expr<T>, property: Expr<T>, optional?: boolean): Index<T> { return { type: 'index', object, property, optional }; }
+export interface Index<T> extends Common.Index<Expr<T>> { optional?: boolean }
+export function  Index<T>(object: Expr<T>, index: Expr<T>, optional?: boolean): Index<T> { return { type: 'index', object, index, optional }; }
 
 // for JSX
 export interface Attribute<T>	{ name?: string; value?: Expr<T> }
@@ -115,7 +116,7 @@ export type Expr<T = any> =
 	| ObjectExpr<T>
 	| Spread<T>
 	| Call<T>
-	| { type: 'conditional'; test: Expr<T>; consequent: Expr<T>; alternate: Expr<T> }
+	| Common.Conditional<Expr<T>>
 	| { type: 'this' }
 	| { type: 'super' }
 	| Member<T>
@@ -181,7 +182,7 @@ export function DoWhile<T>(body: Statement<T>, test: Expr<T>): Statement<T> { re
 
 export type Statement<T> = Declaration<T>
 	| { type: 'block'; body: Statement<T>[] }
-	| { type: 'expression'; expression: Expr }
+	| Common.ExprStmt<Expr>
 	| { type: 'empty' }
 	| { type: 'if'; test: Expr; consequent: Statement<T>; alternate?: Statement<T> }
 	| { type: 'do_while'; body: Statement<T>; test: Expr<T> }
@@ -190,12 +191,12 @@ export type Statement<T> = Declaration<T>
 	| { type: 'for'; kind: 'in' | 'of' | 'of await'; init: ForInit<T>; right: Expr; body: Statement<T> }
 	| { type: 'continue'; label?: string }
 	| { type: 'break'; label?: string }
-	| { type: 'return'; argument?: Expr }
+	| Common.Return<Expr>
 	| { type: 'with'; argument: Expr; body: Statement<T> }
 	| { type: 'labeled'; label: string; body: Statement<T> }
 	| { type: 'switch'; discriminant: Expr; cases: SwitchCase<T>[] }
-	| { type: 'throw'; argument: Expr }
-	| { type: 'try'; block: Statement<T>[]; handlerParam?: BindingTarget; handlerBody?: Statement<T>[]; finalizer?: Statement<T>[] }
+	| (Common.Throw<Expr> & { argument: Expr })
+	| Common.Try<Statement<T>, BindingTarget>
 	| { type: 'debugger' }
 	| Export<T>
 	| ExportDecl<T>
@@ -1042,9 +1043,9 @@ export const statement = Rules<Statement<any>>(self => [
 	Rule(['switch', '(', expression, ')', '{', List(case_clause), '}'],					$ => ({ type: 'switch', discriminant: $[2], cases: $[5] } as const)),
 
 	Rule(['throw', expression, ';'],		$ => ({ type: 'throw', argument: $[1] } as const)),
-	Rule([try_block, catch_], 				$ => ({ type: 'try', block: $[0], handlerParam: $[1].param, handlerBody: $[1].body } as const)),
-	Rule([try_block, finally_], 			$ => ({ type: 'try', block: $[0], finalizer: $[1] } as const)),
-	Rule([try_block, catch_, finally_], 	$ => ({ type: 'try', block: $[0], handlerParam: $[1].param, handlerBody: $[1].body, finalizer: $[2] } as const)),
+	Rule([try_block, catch_], 				$ => ({ type: 'try', body: $[0], handlers: [$[1]] } as const)),
+	Rule([try_block, finally_], 			$ => ({ type: 'try', body: $[0], handlers: [], finalizer: $[1] } as const)),
+	Rule([try_block, catch_, finally_], 	$ => ({ type: 'try', body: $[0], handlers: [$[1]], finalizer: $[2] } as const)),
 
 	function_declaration,
 	class_declaration,

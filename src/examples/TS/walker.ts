@@ -276,7 +276,7 @@ export function walk<T extends Walkable>(ast: T,
 			});
 			case 'index':		return mapObject(expr, {
 				object:		mapExpressionA,
-				property:	mapExpressionA
+				index:	mapExpressionA
 			});
 			case 'call':
 			case 'new':			return mapObject(expr, {
@@ -382,8 +382,8 @@ export function walk<T extends Walkable>(ast: T,
 				cases:			mapArrayA(c => mapObject(c, {consequent: mapArrayA(mapStatementC)}))
 			});
 			case 'try':			return mapObject(stmt, {
-				block:			mapArrayA(mapStatementC),
-				handlerBody:	mapArrayA(mapStatementC),
+				body:			mapArrayA(mapStatementC),
+				handlers:		mapArrayA(h => mapObject(h, {body: mapArrayA(mapStatementC)})),
 				finalizer:		mapArrayA(mapStatementC)
 			});
 			case 'function_decl':	return mapObject(stmt, {...mapSigU,
@@ -551,7 +551,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'object':				return e.properties.some(objectProperty);
 			case 'function': 			return walkSig(e as TS.CallSig) || (!!e.body && e.body.some(walkStatementU));
 			case 'member':				return walkExpression(e.object);
-			case 'index':				return walkExpression(e.object) || walkExpression(e.property);
+			case 'index':				return walkExpression(e.object) || walkExpression(e.index);
 			case 'call':
 			case 'new':					return walkExpression(e.callee) || e.arguments.some(walkExpression) || (!!e.typeArgs && (e.typeArgs as Type[]).some(walkType));
 			case 'spread':
@@ -592,7 +592,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'labeled':				return walkStatement(stmt.body);
 			case 'switch':				return walkExpression(stmt.discriminant)
 				|| stmt.cases.some(c => walkExpression(c.test) || c.consequent.some(walkStatement));
-			case 'try':					return stmt.block.some(walkStatement) || !!stmt.handlerBody?.some(walkStatement) || !!stmt.finalizer?.some(walkStatement);
+			case 'try':					return stmt.body.some(walkStatement) || stmt.handlers.some(h => h.body.some(walkStatement)) || !!stmt.finalizer?.some(walkStatement);
 			case 'function_decl':		return walkSig(stmt) || !!stmt.body?.some(walkStatementU);
 			case 'export':				return !!stmt.default && (isJsStatement(stmt.default) ? walkStatement(stmt.default) : walkExpression(stmt.default as JS.Expr));
 			case 'export_decl':			return walkStatement(stmt.declaration);

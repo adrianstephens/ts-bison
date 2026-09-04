@@ -169,7 +169,7 @@ export function walk<T extends Walkable>(ast: T,
 			case 'while':				return mapObject(s, {test: mapExpressionA, body: mapStmts, orelse: mapStmts});
 			case 'for':					return mapObject(s, {target: mapExpressionA, iter: mapExpressionA, body: mapStmts, orelse: mapStmts});
 			case 'with':				return mapObject(s, {items: mapArrayA(withItem), body: mapStmts});
-			case 'try':					return mapObject(s, {body: mapStmts, handlers: mapArrayA(handler), orelse: mapStmts, finalbody: mapStmts});
+			case 'try':					return mapObject(s, {body: mapStmts, handlers: mapArrayA(handler), orelse: mapStmts, finalizer: mapStmts});
 			case 'funcdef':				return mapObject(s, {
 				params:		mapArrayA(param),
 				returns:	mapExpression,
@@ -257,7 +257,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'while':				return walkExpression(s.test) || s.body.some(walkStatement) || s.orelse.some(walkStatement);
 			case 'for':					return walkExpression(s.target) || walkExpression(s.iter) || s.body.some(walkStatement) || s.orelse.some(walkStatement);
 			case 'with':				return s.items.some(withItem) || s.body.some(walkStatement);
-			case 'try':					return s.body.some(walkStatement) || s.handlers.some(handler) || s.orelse.some(walkStatement) || s.finalbody.some(walkStatement);
+			case 'try':					return s.body.some(walkStatement) || s.handlers.some(handler) || s.orelse.some(walkStatement) || s.finalizer.some(walkStatement);
 			case 'funcdef':				return s.params.some(param) || walkExpression(s.returns) || s.decorators.some(walkExpression) || s.body.some(walkStatement);
 			case 'classdef':			return s.bases.some(arg) || s.decorators.some(walkExpression) || s.body.some(walkStatement);
 			default:					return false;

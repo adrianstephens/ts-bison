@@ -62,7 +62,7 @@ function alwaysThrows(stmt: JS.Statement<any> | undefined): boolean {
 		case 'throw':	return true;
 		case 'block':	return stmt.body.length > 0 && alwaysThrows(stmt.body[stmt.body.length - 1]);
 		case 'if':		return !!stmt.alternate && alwaysThrows(stmt.consequent) && alwaysThrows(stmt.alternate);
-		case 'try':		return (!stmt.handlerBody || alwaysThrows(stmt.handlerBody[stmt.handlerBody.length - 1])) && alwaysThrows(stmt.block[stmt.block.length - 1]);
+		case 'try':		return stmt.handlers.every(h => alwaysThrows(h.body[h.body.length - 1])) && alwaysThrows(stmt.body[stmt.body.length - 1]);
 		default:		return false;
 	}
 }
@@ -1206,13 +1206,13 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// would ever match at all, since `T.resolve` never collapses a union on its own, and every
 				// one would silently fall through to the bare `T.ANY` at the end.
 				const objT = T.resolve(scope, T.nonNullable(rawObjT, scope, chained));
-				recurse(e.property);
+				recurse(e.index);
 				if (objT.type === 'array')
 					return T.optional(objT.element, chained);
-				if (objT.type === 'tuple' && T.isLiteral(e.property, 'number')) {
-					const el = objT.elements[e.property.value];
+				if (objT.type === 'tuple' && T.isLiteral(e.index, 'number')) {
+					const el = objT.elements[e.index.value];
 					if (err && !el)
-						err(SEVERITY.ERROR, pos)`Tuple type '${objT}' has no element at index ${e.property.value}`;
+						err(SEVERITY.ERROR, pos)`Tuple type '${objT}' has no element at index ${e.index.value}`;
 					const t = el && T.tupleElementType(el);
 					return t ? T.optional(t, chained) : T.ANY;
 				}
@@ -1223,18 +1223,18 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// Not a fallback from something more precise -- for a computed/non-literal numeric key there's
 				// no possible *named* property to prefer over it, so this is the only thing that can type
 				// `obj[i]` against an object-shaped (or intersection) type at all.
-				if (!T.isLiteral(e.property, 'string')) {
+				if (!T.isLiteral(e.index, 'string')) {
 					const idxT = T.indexSignatureOf(objT, scope);
 					if (idxT)
 						return T.optional(idxT, chained);
 				}
-				if (T.isLiteral(e.property, 'string')) {
-					const t = T.lookupMember(objT, e.property.value, scope);
+				if (T.isLiteral(e.index, 'string')) {
+					const t = T.lookupMember(objT, e.index.value, scope);
 					if (err && !t && T.sealed(objT, scope))
-						err(SEVERITY.ERROR, pos)`Property '${e.property.value}' does not exist on type '${objT}'`;
+						err(SEVERITY.ERROR, pos)`Property '${e.index.value}' does not exist on type '${objT}'`;
 					if (!t)
 						return T.ANY;
-					return T.optional(t, chained || T.memberOptional(objT, e.property.value, scope));
+					return T.optional(t, chained || T.memberOptional(objT, e.index.value, scope));
 				}
 				return T.ANY;
 			}
@@ -2093,16 +2093,16 @@ function checkStmt(stmt: Statement, scope: Scope, onReturn?: (s: Statement, scop
 			break;
 
 		case 'try':
-			checkBlock1(stmt.block, new Scope(scope));
-			if (stmt.handlerBody) {
+			checkBlock1(stmt.body, new Scope(scope));
+			for (const h of stmt.handlers) {
 				const inner = new Scope(scope);
-				if (stmt.handlerParam) {
-					if (typeof stmt.handlerParam === 'string')
-						inner.addValue(stmt.handlerParam, T.ANY);
+				if (h.param) {
+					if (typeof h.param === 'string')
+						inner.addValue(h.param, T.ANY);
 					else
-						T.bindingNames(stmt.handlerParam).forEach(n => inner.addValue(n, T.ANY));
+						T.bindingNames(h.param).forEach(n => inner.addValue(n, T.ANY));
 				}
-				checkBlock1(stmt.handlerBody, inner);
+				checkBlock1(h.body, inner);
 			}
 			if (stmt.finalizer)
 				checkBlock1(stmt.finalizer, new Scope(scope));

@@ -104,3 +104,9 @@ export function  Return<E>(argument?: E): Return<E> { return { type: 'return', a
 // narrows it back to required in its own union.
 export interface Throw<E>			{ type: 'throw'; argument?: E }
 export function  Throw<E>(argument?: E): Throw<E> { return { type: 'throw', argument }; }
+
+// A `catch` / `except` clause. `param` is whatever the language binds (a JS binding target, a
+// Python or C++ name); each parser intersects its own extras onto it -- an exception `type`, a
+// Python `except*` star, a C++ by-reference flag.
+export interface Handler<S, P = unknown>	{ param?: P; body: S[] }
+export interface Try<S, P = unknown>		{ type: 'try'; body: S[]; handlers: Handler<S, P>[]; finalizer?: S[] }

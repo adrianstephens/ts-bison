@@ -278,12 +278,14 @@ export type Stmt =
 	| { type: 'while'; test: Expr; body: Stmt[]; orelse: Stmt[] }
 	| { type: 'for'; target: Expr; iter: Expr; body: Stmt[]; orelse: Stmt[]; is_async: boolean }
 	| { type: 'with'; items: WithItem[]; body: Stmt[]; is_async: boolean }
-	| { type: 'try'; body: Stmt[]; handlers: ExceptHandler[]; orelse: Stmt[]; finalbody: Stmt[] }
+	| TryStmt
 	| { type: 'funcdef'; name: string; params: Param[]; returns?: Expr; body: Stmt[]; decorators: Expr[]; is_async: boolean }
 	| { type: 'classdef'; name: string; bases: Arg[]; body: Stmt[]; decorators: Expr[] };
 
 export interface WithItem { context: Expr; optional_vars?: Expr }
-export interface ExceptHandler { star: boolean; type?: Expr; name?: string; body: Stmt[] }
+export interface ExceptHandler extends Common.Handler<Stmt, string> { star: boolean; type?: Expr }
+// `orelse` is the `else:` clause -- Python-only, so `Try` is extended rather than aliased.
+export interface TryStmt extends Common.Try<Stmt, string> { handlers: ExceptHandler[]; orelse: Stmt[]; finalizer: Stmt[] }
 
 export interface Module { type: 'module'; body: Stmt[] }
 
@@ -786,9 +788,9 @@ for_stmt = Rules<Stmt>(
 except_clause = Rules<ExceptHandler>(
 	Rule([EXCEPT, ':', suite],					$ => ({ star: false, body: $[2] })),
 	Rule([EXCEPT, test, ':', suite],				$ => ({ star: false, type: $[1], body: $[3] })),
-	Rule([EXCEPT, test, 'as', NAME, ':', suite],	$ => ({ star: false, type: $[1], name: $[3], body: $[5] })),
+	Rule([EXCEPT, test, 'as', NAME, ':', suite],	$ => ({ star: false, type: $[1], param: $[3], body: $[5] })),
 	Rule([EXCEPT, '*', test, ':', suite],			$ => ({ star: true, type: $[2], body: $[4] })),
-	Rule([EXCEPT, '*', test, 'as', NAME, ':', suite],	$ => ({ star: true, type: $[2], name: $[4], body: $[6] })),
+	Rule([EXCEPT, '*', test, 'as', NAME, ':', suite],	$ => ({ star: true, type: $[2], param: $[4], body: $[6] })),
 ),
 except_clauses = List<ExceptHandler>(except_clause),
 finally_opt = Rules<Stmt[]>(
@@ -796,8 +798,8 @@ finally_opt = Rules<Stmt[]>(
 	Rule([FINALLY, ':', suite],		$ => $[2]),
 ),
 try_stmt = Rules<Stmt>(
-	Rule(['try', ':', suite, except_clauses, else_opt, finally_opt],	$ => ({ type: 'try', body: $[2], handlers: $[3], orelse: $[4], finalbody: $[5] })),
-	Rule(['try', ':', suite, FINALLY, ':', suite],					$ => ({ type: 'try', body: $[2], handlers: [], orelse: [], finalbody: $[5] })),
+	Rule(['try', ':', suite, except_clauses, else_opt, finally_opt],	$ => ({ type: 'try', body: $[2], handlers: $[3], orelse: $[4], finalizer: $[5] })),
+	Rule(['try', ':', suite, FINALLY, ':', suite],					$ => ({ type: 'try', body: $[2], handlers: [], orelse: [], finalizer: $[5] })),
 ),
 
 with_item = Rules<WithItem>(

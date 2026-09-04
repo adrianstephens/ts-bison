@@ -1074,7 +1074,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// A bare `try { } finally { }` (no catch) isn't attempted here -- there's no
 					// value to merge in that shape (nothing diverges, since only one path exists),
 					// which is a genuinely different, simpler case this doesn't cover yet.
-					if (!s.handlerBody) {
+					const handler = s.handlers[0];
+					if (!handler) {
 						console.log(`not handling try without catch`);
 						return process(s);
 					}
@@ -1095,7 +1096,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					setState(new Scope(parent.scope), startMarker(parent.end, 'TRY_START'));
 
 					scope = new Scope(scope);
-					for (const stmt of s.block)
+					for (const stmt of s.body)
 						recurse(stmt, 'statement');
 					scope = scope.closeAndFlush()!;
 					const tryState		= getState();
@@ -1105,16 +1106,16 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// For a destructured catch param, catchParamName is the hidden temp that actually
 					// prints in `catch (<here>)`, with the real pattern desugared right after.
 					let catchParamName: string | undefined;
-					if (typeof s.handlerParam === 'string') {
-						catchParamName = s.handlerParam;
+					if (typeof handler.param === 'string') {
+						catchParamName = handler.param;
 						scope.create(catchParamName, makeNamedNode('var', catchParamName));
-					} else if (s.handlerParam) {
+					} else if (handler.param) {
 						catchParamName = `__destructure${nextId++}`;
 						scope.create(catchParamName, makeNamedNode('var', catchParamName));
-						for (const stmt of patternBindings('let', s.handlerParam, Identifier(catchParamName)))
+						for (const stmt of patternBindings('let', handler.param, Identifier(catchParamName)))
 							recurse(stmt, 'statement');
 					}
-					for (const stmt of s.handlerBody)
+					for (const stmt of handler.body)
 						recurse(stmt, 'statement');
 					scope = scope.closeAndFlush()!;
 					const catchState	= getState();
@@ -1467,7 +1468,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					process(s);
 					const node = makeExprNode(s);
 					connectValue(getExprNode(s.object), 0, node, 0);
-					connectValue(getExprNode(s.property), 0, node, 1);
+					connectValue(getExprNode(s.index), 0, node, 1);
 					return false;
 				}
 				case 'conditional': {
@@ -1909,7 +1910,7 @@ export function BuildProgram(
 					case 'spread':		return { ...expr, operand: resolveOperand(node.id, 0) };
 					case 'binary':		return { ...expr, left: resolveOperand(node.id, 0), right: resolveOperand(node.id, 1) };
 					case 'conditional':	return buildConditional(node);
-					case 'index':		return { ...expr, object: resolveOperand(node.id, 0), property: resolveOperand(node.id, 1) };
+					case 'index':		return { ...expr, object: resolveOperand(node.id, 0), index: resolveOperand(node.id, 1) };
 					case 'call':		return { ...expr, arguments: expr.arguments.map((_, i) => resolveOperand(node.id, i + 1)) };
 				}
 				break;
@@ -2405,9 +2406,8 @@ export function BuildProgram(
 				const finallyStmts	= finallyEdge ? emitChain(finallyEdge.nodeId, control.id) : undefined;
 				return [{
 					type:			'try',
-					block:			tryStmts as JS.Statement<any>[],
-					handlerParam:	control.catchParam,
-					handlerBody:	catchStmts as JS.Statement<any>[],
+					body:			tryStmts as JS.Statement<any>[],
+					handlers:		[{param: control.catchParam, body: catchStmts as JS.Statement<any>[]}],
 					finalizer:		finallyStmts as JS.Statement<any>[] | undefined,
 				}];
 			});

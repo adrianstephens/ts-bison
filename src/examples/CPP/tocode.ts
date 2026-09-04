@@ -350,7 +350,7 @@ export class Output {
 			// cpp
 			case 'throw':				return 'throw' + maybe(s.argument, a => ' ' + this.expr(a)) + ';';
 			case 'try':					return 'try ' + this.block(s.body) + s.handlers.map(h =>
-				' catch (' + maybe(h.paramType, t => this.typeName(t)) + poss(h.byRef, '&') + maybe(h.paramName, n => (h.paramType ? ' ' : '') + n) + ') ' + this.block(h.body)
+				' catch (' + maybe(h.type, t => this.typeName(t)) + poss(h.byRef, '&') + maybe(h.param, n => (h.type ? ' ' : '') + n) + ') ' + this.block(h.body)
 			).join('');
 			case 'range_for':			return 'for (' + this.declSpec(s.specifiers) + ' ' + this.declStr(s.declarator) + ' : ' + this.expr(s.range) + ') ' + this.dependentCode(s.body);
 			case 'static_assert':

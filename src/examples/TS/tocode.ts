@@ -485,8 +485,8 @@ export class Output {
 				return 'throw ' + this.expr(stmt.argument) + ';';
 
 			case 'try':
-				return 'try ' + this.indentBlock(stmt.block)
-					+ maybe(stmt.handlerBody, body => ' catch' + maybe(stmt.handlerParam, param => ' (' + this.bindingTarget(param) + ')') + ' ' + this.indentBlock(body))
+				return 'try ' + this.indentBlock(stmt.body)
+					+ stmt.handlers.map(h => ' catch' + maybe(h.param, param => ' (' + this.bindingTarget(param) + ')') + ' ' + this.indentBlock(h.body)).join('')
 					+ maybe(stmt.finalizer, final => ' finally ' + this.indentBlock(final));
 
 			case 'debugger':
@@ -662,7 +662,7 @@ export class Output {
 
 			case 'index':
 				// `property` uses the full `expression` production (allows comma) per the grammar's `'[' expression ']'` -- no wrapping needed.
-				return this.expr(expr.object, 18) + poss(expr.optional, '?.') + '[' + this.expr(expr.property) + ']';
+				return this.expr(expr.object, 18) + poss(expr.optional, '?.') + '[' + this.expr(expr.index) + ']';
 
 			case 'call':
 				return this.expr(expr.callee, 18)

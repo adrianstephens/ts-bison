@@ -3372,7 +3372,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 				const obj = ctx.temp(scratchName('$obj', objWtype), objWtype);
 				emitAs(target.object, ctx, objWtype);
 				ctx.emit(I.local.set(obj));
-				emitAs(target.property, ctx, getSig.params[0]);
+				emitAs(target.index, ctx, getSig.params[0]);
 				const indexName = scratchName('$index', getSig.params[0]);
 				ctx.emit(I.local.set(ctx.temp(indexName, getSig.params[0])));
 				const idxExpr: Expr = { type: 'identifier', name: indexName };
@@ -3409,7 +3409,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			const objWtype	= emitExpr(target.object, ctx);
 			const obj		= ctx.temp(scratchName('$obj', objWtype), objWtype);
 			ctx.emit(I.local.set(obj));
-			emitAs(target.property, ctx, 'i32');
+			emitAs(target.index, ctx, 'i32');
 			// Always `i32` (an array index, never anything else) -- unlike `$obj`/`$new`/`$old` here, this one genuinely can't collide across two index writes in the same function, no qualification needed.
 			const idx		= ctx.temp('$index', 'i32');
 			ctx.emit(I.local.set(idx));
@@ -4051,12 +4051,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 							// Receiver pushed directly, skipping `emitMethodCall`'s own receiver-push -- needs an
 							// explicit `ref.as_non_null` here, always sound since `readCore` only runs in the proven-non-null arm.
 							ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
-							coerceTop(emitMethodCall(cls, 'get', [e.property], ctx), ctx, resultWtype);
+							coerceTop(emitMethodCall(cls, 'get', [e.index], ctx), ctx, resultWtype);
 						});
 					}
 					// `emitAs`, not a raw `emitExpr` -- `e.object` may itself be boxed `anyref` (`a[i][j]`), same reasoning as the field-read cast above.
 					emitAs(e.object, ctx, cls.thisWtype!);
-					return emitMethodCall(cls, 'get', [e.property], ctx);
+					return emitMethodCall(cls, 'get', [e.index], ctx);
 				}
 				const kind = objectArrayKind(e.object, ctx);
 				if (!kind || kind === 'i16' || kind === 'i8') {
@@ -4072,7 +4072,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope)).map(m => ownerFor(m));
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1 && methodSig(o, 'get', ctx))) {
 							emitAs(e.object, ctx, REF_ANY);
-							emitAs(e.property, ctx, 'i32');
+							emitAs(e.index, ctx, 'i32');
 							const info = ensureUnionIndexDispatch(owners as ClassInfo[]);
 							ctx.emit(I.call(info.funcIndex));
 							return info.result;
@@ -4093,13 +4093,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					const resultWtype = nullableWtype(elemWtype);
 					return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
 						ctx.emit(I.local.get(objLocal));
-						emitAs(e.property, ctx, 'i32');
+						emitAs(e.index, ctx, 'i32');
 						ctx.emit(I.array.get(ensureArrayType(kind)));
 						coerceTop(elemWtype, ctx, resultWtype);
 					});
 				}
 				emitAs(e.object, ctx, ARR_WTYPE[kind]);
-				emitAs(e.property, ctx, 'i32');
+				emitAs(e.index, ctx, 'i32');
 				ctx.emit(I.array.get(ensureArrayType(kind)));
 				return elemWtype;
 			}
@@ -4320,7 +4320,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					if (!cls?.methodDecls.get('delete'))
 						throw "'delete' is only supported over a dynamic object (a structural '{[k: string]: V}'-typed value)";
 					emitAs(e.operand.object, ctx, cls.thisWtype!);
-					return emitMethodCall(cls, 'delete', [e.operand.property], ctx);
+					return emitMethodCall(cls, 'delete', [e.operand.index], ctx);
 				}
 
 				const info = operandInfo(e.operand, ctx);
@@ -5396,14 +5396,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 			// falls through to its own end -- `unreachable` closes that dead edge; without it the
 			// validator still checks `$catchLand`'s declared (anyref) result against what `try_table`'s
 			// own fallthrough would produce there (nothing) and rejects the module.
+			// JS's grammar allows at most one `catch`, so `handlers` is only ever empty or a single clause here.
 			case 'try':
-				if (!s.handlerBody && !s.finalizer)
+				if (!s.handlers.length && !s.finalizer)
 					throw "'try' needs a 'catch' or 'finally'";
 
 				if (!s.finalizer) {
 					const saved			= ctx.swapOut();
 					ctx.enterLabel(3);
-					ctx.inScope(() => s.block.forEach(st => emitStmt(st, ctx)));
+					ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
 					
 					ctx.emit(I.br(2));	//ctx.depth - $after
 					ctx.exitLabel();
@@ -5413,14 +5414,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					ctx.emit(I.block(toValType(REF_ANY), ctx.swapOut()));
 
 					ctx.inScope(() => {
-						if (s.handlerParam) {
-							if (typeof s.handlerParam !== 'string')
+						if (s.handlers[0].param) {
+							if (typeof s.handlers[0].param !== 'string')
 								throw "a destructured catch parameter ('catch ({...})'/'catch ([...])') is not supported";
-							ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
+							ctx.emit(I.local.set(ctx.declareValue(s.handlers[0].param, REF_ANY, T.ANY).index));
 						} else {
 							ctx.emit(I.drop);
 						}
-						s.handlerBody!.forEach(st => emitStmt(st, ctx));
+						s.handlers[0].body.forEach(st => emitStmt(st, ctx));
 					});
 
 					ctx.exitLabel();
@@ -5489,11 +5490,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						},
 					};
 
-					if (s.handlerBody) {
+					if (s.handlers.length) {
 						// A's own exceptions: our single project-wide tag is the only thing this compiler ever throws, so the ordinary tag-catch below already covers 'try' exhaustively --
 						// no 'catch_all_ref' needed on *this* try_table (unlike the one below, for B).
 						ctx.enterLabel(2);			// $catchLand, try_table (A)'s own implicit level
-						ctx.inScope(() => s.block.forEach(st => emitStmt(st, ctx)));
+						ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
 						ctx.emit(I.br(ctx.depth - afterDepth));
 						ctx.exitLabel();
 						ctx.emit(I.try_table(undefined, [wasm.Catch.tag(ensureExceptionTag(), 0)], ctx.swapOut()));
@@ -5506,10 +5507,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 						// unless declared as real params (none of these are), so try_table (B) itself must
 						// start from a clean slate, not reach back for a value produced before it began.
 						ctx.openScope();
-							if (s.handlerParam) {
-								if (typeof s.handlerParam !== 'string')
+							if (s.handlers[0].param) {
+								if (typeof s.handlers[0].param !== 'string')
 									throw "a destructured catch parameter ('catch ({...})'/'catch ([...])') is not supported";
-								ctx.emit(I.local.set(ctx.declareValue(s.handlerParam, REF_ANY, T.ANY).index));
+								ctx.emit(I.local.set(ctx.declareValue(s.handlers[0].param, REF_ANY, T.ANY).index));
 							} else {
 								ctx.emit(I.drop);
 							}
@@ -5518,7 +5519,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 							// guarantees every exception B might throw is caught before 'finally' needs to run.
 							const catchHandlerSaved = ctx.swapOut();
 							ctx.enterLabel();			// try_table (B)'s own implicit level
-							s.handlerBody.forEach(st => emitStmt(st, ctx));
+							s.handlers[0].body.forEach(st => emitStmt(st, ctx));
 						ctx.closeScope();
 
 						ctx.emit(I.br(ctx.depth - afterDepth));
@@ -5528,7 +5529,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Statement[]>,
 					} else {
 						// No 'catch' clause -- 'finally' alone needs only the safety net around A itself.
 						ctx.enterLabel();			// try_table's own implicit level
-						ctx.inScope(() => s.block.forEach(st => emitStmt(st, ctx)));
+						ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
 						ctx.emit(I.br(ctx.depth - afterDepth));
 						ctx.exitLabel();
 						ctx.emit(I.try_table(undefined, [wasm.Catch.allRef(ctx.depth - catchAllDepth)], ctx.swapOut()));

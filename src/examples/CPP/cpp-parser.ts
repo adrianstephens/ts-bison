@@ -115,7 +115,7 @@ export type Expr = C.Expr
 // also gates the shared IDENT callback into C++ mode, so TYPE_SCOPE reclassification never fires for plain cParser.
 export interface CppCtx extends C.Ctx { templateDepth: number; }
 
-export interface CatchClause			{ paramType?: TypeName; paramName?: string; byRef?: boolean; body: C.Block<Declarator, TypeSpecifierExt>; }
+export interface CatchClause			{ type?: TypeName; param?: string; byRef?: boolean; body: C.Block<Declarator, TypeSpecifierExt>; }
 export interface UsingDirective			{ type: 'using_namespace'; name: string; }
 export interface UsingAlias				{ type: 'using_alias'; name: string; target: TypeName; }
 export interface NamespaceDecl			{ type: 'namespace'; name?: string; inline?: boolean; body: Definition[]; }
@@ -1154,11 +1154,11 @@ struct_declaration.push(
 // ===================================================================
 
 const catch_clause = Rules<CatchClause>(
-	Rule(['catch', '(', C.specifier_qualifier_list, C.IDENT, ')', C.compound_statement],			$ => ({ paramType: { specifiers: $[2] }, paramName: $[3], body: $[5] } as const)),
-	Rule(['catch', '(', C.specifier_qualifier_list, '&', C.IDENT, ')', C.compound_statement],		$ => ({ paramType: { specifiers: $[2] }, paramName: $[4], byRef: true, body: $[6] } as const)),
-	Rule(['catch', '(', C.specifier_qualifier_list, '&&', C.IDENT, ')', C.compound_statement],		$ => ({ paramType: { specifiers: $[2] }, paramName: $[4], byRef: true, body: $[6] } as const)),
-	Rule(['catch', '(', C.specifier_qualifier_list, ')', C.compound_statement],						$ => ({ paramType: { specifiers: $[2] }, body: $[4] } as const)),
-	Rule(['catch', '(', C.specifier_qualifier_list, '&', ')', C.compound_statement],				$ => ({ paramType: { specifiers: $[2] }, byRef: true, body: $[5] } as const)),
+	Rule(['catch', '(', C.specifier_qualifier_list, C.IDENT, ')', C.compound_statement],			$ => ({ type: { specifiers: $[2] }, param: $[3], body: $[5] } as const)),
+	Rule(['catch', '(', C.specifier_qualifier_list, '&', C.IDENT, ')', C.compound_statement],		$ => ({ type: { specifiers: $[2] }, param: $[4], byRef: true, body: $[6] } as const)),
+	Rule(['catch', '(', C.specifier_qualifier_list, '&&', C.IDENT, ')', C.compound_statement],		$ => ({ type: { specifiers: $[2] }, param: $[4], byRef: true, body: $[6] } as const)),
+	Rule(['catch', '(', C.specifier_qualifier_list, ')', C.compound_statement],						$ => ({ type: { specifiers: $[2] }, body: $[4] } as const)),
+	Rule(['catch', '(', C.specifier_qualifier_list, '&', ')', C.compound_statement],				$ => ({ type: { specifiers: $[2] }, byRef: true, body: $[5] } as const)),
 	Rule(['catch', '(', '...', ')', C.compound_statement],											$ => ({ body: $[4] } as const)),
 );
 const catch_clause_list = List(catch_clause);

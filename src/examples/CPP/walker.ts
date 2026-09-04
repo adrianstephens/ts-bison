@@ -138,7 +138,7 @@ export function walk<T extends Walkable>(ast: T,
 	});
 	const baseSpecifier = (b: CPP.BaseSpecifier): CPP.BaseSpecifier => mapObject(b, {args: mapArray(templateArg)});
 
-	const catchClause = (c: CPP.CatchClause): CPP.CatchClause => mapObject(c, {paramType: typeName, body});
+	const catchClause = (c: CPP.CatchClause): CPP.CatchClause => mapObject(c, {type: typeName, body});
 
 	// A struct/class member's own declarators, and cpp's DeclaratorField (declarator + optional initializer).
 	const structDeclarator = (d: CPP.StructDeclarator): CPP.StructDeclarator =>
@@ -374,7 +374,7 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 	const walkTemplateArg		= (a: CPP.TemplateArg): boolean => isExpr(a.value) ? walkExpression(a.value) : walkTypeName(a.value);
 	const walkTemplateParam		= (p: CPP.TemplateParam): boolean => walkDeclSpec(p.nonType) || (!!p.default && (isExpr(p.default) ? walkExpression(p.default) : walkTypeName(p.default)));
 	const walkBaseSpecifier		= (b: CPP.BaseSpecifier): boolean => !!b.args?.some(walkTemplateArg);
-	const walkCatchClause		= (c: CPP.CatchClause): boolean => walkTypeName(c.paramType) || c.body.body.some(walkStatement);
+	const walkCatchClause		= (c: CPP.CatchClause): boolean => walkTypeName(c.type) || c.body.body.some(walkStatement);
 	const walkMemberInitializer	= (m: CPP.MemberInitializer): boolean => m.arguments.some(walkExpression);
 	const walkBlock				= (b?: Block): boolean => !!b && b.body.some(walkStatement);
 	const walkMethodOrCtorTail	= (t: CPP.MethodTail | CPP.CtorTail): boolean =>

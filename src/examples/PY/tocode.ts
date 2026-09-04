@@ -161,9 +161,9 @@ export class Output {
 				+ this.suite(s.body);
 			case 'try':				return 'try' + this.suite(s.body)
 				+ s.handlers.map(h => this.newline + 'except' + (h.star ? '*' : '')
-					+ maybe(h.type, t => ' ' + this.expr(t)) + maybe(h.name, n => ' as ' + n) + this.suite(h.body)).join('')
+					+ maybe(h.type, t => ' ' + this.expr(t)) + maybe(h.param, n => ' as ' + n) + this.suite(h.body)).join('')
 				+ this.elseClause(s.orelse)
-				+ (s.finalbody.length ? this.newline + 'finally' + this.suite(s.finalbody) : '');
+				+ (s.finalizer.length ? this.newline + 'finally' + this.suite(s.finalizer) : '');
 			case 'funcdef':			return this.decorators(s.decorators) + (s.is_async ? 'async ' : '') + 'def ' + s.name
 				+ '(' + this.params(s.params) + ')' + maybe(s.returns, r => ' -> ' + this.expr(r)) + this.suite(s.body);
 			case 'classdef':		return this.decorators(s.decorators) + 'class ' + s.name
