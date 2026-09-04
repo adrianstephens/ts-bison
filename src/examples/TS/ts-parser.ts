@@ -97,7 +97,7 @@ export type Type =
 	| { type: 'this' }
 	| { type: 'tuple'; elements: TupleElement[]; readonly?: boolean }
 	| { type: 'keyof'; argument: Type }
-	| { type: 'typeof'; name: string; source?: string; typeArgs?: Type[] }
+	| { type: 'typeof'; name: string; source?: string; typeArgs?: Type[]; declScope?: unknown }
 	| { type: 'indexed_access'; object: Type; index: Type }
 	| { type: 'conditional'; checkType: Type; extendsType: Type; trueType: Type; falseType: Type }
 	| { type: 'infer'; name: string; constraint?: Type }

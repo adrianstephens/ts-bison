@@ -721,6 +721,12 @@ export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<str
 			if (x.type === 'ref') {
 				if (!x.declScope && !ALL_PRIMITIVES.has(x.name) && !exclude?.has(x.name))
 					x.declScope = scope;
+			} else if (x.type === 'typeof') {
+				// A `typeof X` query names a VALUE, so it needs its declaring scope for exactly the reason a
+				// `ref` does -- `type Options = Partial<typeof DefaultOptions>` exported from one module
+				// resolves its members in the importer's scope, where `DefaultOptions` (a plain
+				// non-exported const) is not a name at all.
+				x.declScope ??= scope;
 			} else if (x.type === 'function' || x.type === 'constructor') {
 				x.declScope ??= scope;
 			}
@@ -1025,11 +1031,14 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				break;
 			}
 			case 'typeof': {
+				// The query's own `declScope` wins over the ambient one, exactly as `case 'ref'` below does
+				// and for the same reason -- the name it queries is a VALUE in its own declaring module.
+				const qScope = t.declScope as Scope ?? scope;
 				const parts = t.name.split('.');
-				let v		= scope.value(parts[0]);
+				let v		= qScope.value(parts[0]);
 				for (let i = 1; v && i < parts.length; i++)
-					v = lookupMember(v, parts[i], scope);
-				return v ? resolve(scope, v, depth - 1, stopAtRef) : ANY;
+					v = lookupMember(v, parts[i], qScope);
+				return v ? resolve(qScope, v, depth - 1, stopAtRef) : ANY;
 			}
 			case 'ref':
 				if (stopAtRef)
