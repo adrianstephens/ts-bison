@@ -8,9 +8,7 @@ import { ModuleLoader } from '../src/examples/TS/module-loader';
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-
-// Official TypeScript compiler test suite, checked out separately on this machine.
-const TS_REPO = '/Volumes/DevSSD/dev/github/TypeScript';
+import { TS_REPO, readSource, splitTestFile } from './ts-corpus';
 
 const parser = TS.make();
 JSX.add();
@@ -20,43 +18,12 @@ const lib = (async () => {
 	const global	= T.makeGlobal();
 	const loader	= new ModuleLoader(__dirname, {});
 	const lib		= await loader.get('typescript/lib/lib.esnext.full', '.');
-	checkBlock(lib!.body, global, new T.TypeContext);
+	checkBlock(lib!.body, global);
 	return global;
 })();
 
 const total_sev = [] as number[];
 let failed = 0, tested = 0;
-
-// The TS test suite bundles multiple virtual files into one physical file with
-// `// @Filename: name` marker lines; anything before the first marker is global test
-// config (e.g. `// @strict: true`), not code. Splitting on these markers is required --
-// without it, a fifth of the corpus is a mangled concatenation of unrelated files (source,
-// JSON, sometimes intentionally-invalid snippets) that fails to parse for reasons that have
-// nothing to do with the checker itself.
-const reFilename = /^\/\/[ \t]*@filename:[ \t]*(\S+)[ \t]*$/gim;
-
-function splitTestFile(source: string, defaultName: string) {
-	const markers = [...source.matchAll(reFilename)];
-	if (!markers.length)
-		return [{name: defaultName, content: source}];
-
-	return markers.map((m, i) => ({
-		name:		m[1],
-		// Strip the one newline right after the marker line -- a real standalone file never has a
-		// leading blank line, and leaving it in breaks a leading shebang (`^#!` only matches col 0).
-		content:	source.slice(m.index + m[0].length, markers[i + 1]?.index ?? source.length).replace(/^\r?\n/, ''),
-	}));
-}
-
-// A handful of corpus files are UTF-16 (BOM-prefixed), not UTF-8 -- reading those as 'utf8' decodes
-// every 2-byte char as two garbage/replacement-char bytes, so the BOM itself picks the real encoding.
-function readSource(buf: Buffer): string {
-	if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe)
-		return buf.toString('utf16le', 2);
-	if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff)
-		return buf.swap16().toString('utf16le', 2);
-	return buf.toString('utf8');
-}
 
 async function testFile(filename: string) {
 	const source = readSource(await fs.readFile(filename));
