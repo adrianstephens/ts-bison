@@ -1449,6 +1449,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// (`ensureLazyGlobal`'s own `FunctionContext.homeModule`) has no other way to recover which module it
 	// came from. Populated once, below, in the same pass that already visits every module's own statements.
 	const stmtHomeModule		= new Map<TS.Stmt, string>();
+	// The entry module's top-level `const`/`let` declarators, by name -- see the `moduleBodies` scan's own
+	// comment on why `Scope.decl` can't answer this for the entry module.
+	const topLevelVars			= new Map<string, { stmt: TS.Stmt; d: JS.Var<Type> }>();
+	// The backing slot of each `ensureLazyGlobal` wrapper, so a WRITE can reach the same storage the
+	// wrapper reads. Keyed exactly like `lazyGlobals`.
+	const lazyGlobalSlots		= new Map<string, { index: number; wtype: WasmType }>();
 
 	function homeKey(homeModule: string, name: string) {
 		return homeModule === '.' ? name : homeModule + '\0' + name;
@@ -1651,6 +1657,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			return undefined;
 		const slotName = `$lazy$${key}`;
 		const g = ensureGlobal(slotName, nullableWtype(wt), { type: 'identifier', name: 'undefined' }, true);
+		lazyGlobalSlots.set(key, g);
 
 		const { funcIndex, typeIndex } = registerFunc([], toResults(wt));
 		const info: FuncInfo = { params: [], result: wt, funcIndex, typeIndex };
@@ -1671,6 +1678,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			info.body = ctx.toFuncBody(0, toValType);
 		}, name, homeModule));
 		return info;
+	}
+
+	// A module-level `const`/`let` whose value isn't a wasm compile-time constant (an array, object, string,
+	// `new`, or call), resolved to its `ensureLazyGlobal` wrapper AND the slot that wrapper caches into: the
+	// wrapper is the only correct way to READ one (it runs the initializer exactly once, on first use), the
+	// slot the only way to WRITE one. `Scope.decl` answers for an imported module; `topLevelVars` for the
+	// entry module, which `exportScope` never stamps.
+	function lazyGlobalFor(name: string, ctx: FunctionContext) {
+		const varStmt	= ctx.scope.decl(name);
+		const own		= varStmt?.type === 'var_decl'
+			? { stmt: varStmt as TS.Stmt, d: varStmt.declarations.find(d => d.name === name) }
+			: topLevelVars.get(name);
+		if (!own?.d)
+			return undefined;
+		const homeModule	= stmtHomeModule.get(own.stmt) ?? ctx.homeModule;
+		const wrapper		= ensureLazyGlobal(name, homeModule, own.d, ctx.scope);
+		const slot			= lazyGlobalSlots.get(homeKey(homeModule, name));
+		return wrapper && slot ? { wrapper, slot } : undefined;
 	}
 
 	function addData(newdata: Uint8Array, align = 1): number {
@@ -3359,7 +3384,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			const isGlobal = !loc;
 			if (!loc)
 				loc = globals.get(name);
-			const { wtype, index } = loc!;
+			if (!loc) {
+				// A lazily-initialized module-level value (see `lazyGlobalFor`). The old value must be read
+				// through the wrapper, never straight off the slot: until the initializer has run once the
+				// slot is still null. The write then goes to that same slot, so the wrapper sees it after.
+				const lazy = lazyGlobalFor(name, ctx);
+				if (lazy) {
+					const wtype = lazy.wrapper.result;
+					return {
+						wtype,
+						old:	captureOld(wtype, () => ctx.emit(I.call(lazy.wrapper.funcIndex))),
+						write:	makeWrite(wtype, val => ctx.emit(I.local.get(val), I.global.set(lazy.slot.index))),
+					};
+				}
+				throw `unresolved identifier '${name}'`;
+			}
+			const { wtype, index } = loc;
 			return {
 				wtype,
 				old: captureOld(wtype, () => ctx.emit(isGlobal ? I.global.get(index) : I.local.get(index))),
@@ -3953,6 +3993,19 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				if (g) {
 					ctx.emit(I.global.get(g.index));
 					return g.wtype;
+				}
+
+				// A module-level `const`/`let` whose value ISN'T a wasm compile-time constant -- an array, an
+				// object literal, a string, a `new`, a call. Exactly what `ensureLazyGlobal` already builds for
+				// the same declaration when it's *called* (`case 'call'`'s own factory-const path); it just was
+				// never reached by a plain READ, which is why `const A = [1,2,3]` was visible to nothing but
+				// the top level. Same lookup that path uses, so a cross-module const resolves identically.
+				{
+					const lazy = lazyGlobalFor(name, ctx);
+					if (lazy) {
+						ctx.emit(I.call(lazy.wrapper.funcIndex));
+						return lazy.wrapper.result;
+					}
 				}
 
 				// A plain named function read as a value (passed as a callback, assigned, returned, ...)
@@ -7611,6 +7664,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				for (const d of s.declarations) {
 					if (typeof d.name !== 'string' || !d.init)
 						continue;
+					// The entry module's own top-level declarators, so a plain READ of one can find its real
+					// initializer. Only `exportScope` (an IMPORTED module's shape) stamps `Scope.addDecl` for a
+					// var_decl, so `ctx.scope.decl(name)` -- what the cross-module path uses -- finds nothing at
+					// all here. Entry-only, matching the eager/promoted handling right below.
+					if (moduleId === '.')
+						topLevelVars.set(d.name, { stmt: s, d });
 					if (s.kind === 'const' && (d.init.type === 'arrow' || d.init.type === 'function')) {
 						functionDeclByName.set(homeKey(moduleId, d.name), arrowOrFunctionToDecl(d.name, d.init));
 						if (moduleId === '.')
@@ -7624,7 +7683,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						// `foldConstants` here matches `case 'switch'`'s own linear-jump-table detection, the
 						// file's existing "is this expression actually a compile-time constant" idiom.
 						const folded = foldConstants(d.init)!;
-						if (folded.type === 'literal') {
+						// Only a literal a wasm global can actually be INITIALIZED from -- i.e. one the
+						// `mod.globals` builder below accepts. A string literal is still a `literal` node but
+						// has no constant form (its physical value is an i16 array built at runtime), and so
+						// is a `bigint` unless it lands on a real `i64` slot; claiming those here registered a
+						// global that then threw "needs a compile-time-constant initializer" at emit time.
+						// Everything rejected here falls through to `ensureLazyGlobal` on first reference.
+						const eagerKind = folded.type === 'literal' && notUnsigned(scalarKind(typeOf(d.typeAnnotation ?? checkerTypeOf(d.init, libGlobal))));
+						if (eagerKind && (typeof folded.value === 'number' || typeof folded.value === 'boolean' || (typeof folded.value === 'bigint' && eagerKind === 'i64'))) {
 							// A top-level `let`/`const` primitive with a compile-time-constant initializer
 							// becomes a real wasm global -- the same mechanism a library declaration (e.g.
 							// `lib/console.ts`'s `heap`) already uses, just registered *eagerly* here rather than

@@ -3117,6 +3117,46 @@ async function main() {
 	}
 
 	{
+		// Module-level state. A top-level `const`/`let` holding anything but a wasm compile-time constant --
+		// an array, an object, a string, a `new`, a call -- was visible to NOTHING but the top level itself:
+		// any function referencing it threw "unresolved identifier". `ensureLazyGlobal` already built exactly
+		// the right thing (a null slot plus a wrapper that runs the initializer once on first use), but only
+		// a CALL of such a const ever reached it; a plain read didn't, and a write crashed.
+		//
+		// This is the shape every self-hosting target file is built around, and the shape this suite had no
+		// coverage of at all -- every other check here keeps its state local to one function.
+		const { arr, obj, str, inst, mutate, sharedAcrossFunctions, reassign, writeThenRead } = await compile(`
+			class P { constructor(public x: number) {} }
+			const A = [1, 2, 3];
+			const D = { a: 1, b: 2 };
+			const S = 'hello';
+			const P1 = new P(4);
+			export function arr(): number { return A.length; }
+			export function obj(): number { return D.a + D.b; }
+			export function str(): number { return S.length; }
+			export function inst(): number { return P1.x; }
+			const M = [1, 2, 3];
+			export function mutate(): number { M.push(4); return M.length; }
+			const Acc: number[] = [];
+			function add(): void { Acc.push(1); }
+			export function sharedAcrossFunctions(): number { add(); add(); return Acc.length; }
+			let L = [1, 2, 3];
+			export function reassign(): number { L = [4, 5]; return L.length; }
+			let W = [1, 2, 3];
+			function setW(): void { W = [4, 5]; }
+			export function writeThenRead(): number { setW(); return W.length; }
+		`);
+		check('module state: an array const is readable from a function', arr(), 3);
+		check('module state: an object const', obj(), 3);
+		check('module state: a string const', str(), 5);
+		check('module state: a class instance const', inst(), 4);
+		check('module state: mutating an array const in place', mutate(), 4);
+		check('module state: two functions share one accumulator', sharedAcrossFunctions(), 2);
+		check('module state: reassigning a top-level let', reassign(), 2);
+		check("module state: one function's write is visible to another's read", writeThenRead(), 2);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only
