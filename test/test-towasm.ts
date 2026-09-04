@@ -2847,6 +2847,40 @@ async function main() {
 	}
 
 	{
+		// WeakMap<K,V> -- Map-backed (lib/map.ts), added because type-utils.ts's `Scope.resolveCache`/
+		// `lookupMemberCache` are WeakMap-typed, and an unresolvable field type on `Scope` blocked every
+		// declaration touching a scope across checker/towasm/transform/type-utils.
+		const { basic, bare, fromEntries } = await compile(`
+			class Node { constructor(public id: number) {} }
+			export function basic(): number {
+				const m = new WeakMap<Node, number>();
+				const a = new Node(1);
+				const b = new Node(2);
+				m.set(a, 10);
+				m.set(b, 20);
+				const c = new Node(1);
+				return (m.get(a) ?? -1) * 10000 + (m.get(b) ?? -1) * 100 + (m.has(c) ? 1 : 0);
+			}
+			export function bare(): number {
+				const m = new WeakMap<Node, number>;
+				const a = new Node(7);
+				m.set(a, 5);
+				const gone = m.delete(a) ? 1 : 0;
+				return gone * 10 + (m.get(a) ?? 9);
+			}
+			export function fromEntries(): number {
+				const a = new Node(1);
+				const b = new Node(2);
+				const m = new WeakMap<Node, number>([[a, 4], [b, 5]]);
+				return (m.get(a) ?? -1) * 10 + (m.get(b) ?? -1);
+			}
+		`);
+		check('WeakMap: get/set/has use reference identity, not structural equality', basic(), 102000);
+		check('WeakMap: bare `new WeakMap` (no parens/type args), then delete()', bare(), 19);
+		check("WeakMap: entries-array constructor", fromEntries(), 45);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only

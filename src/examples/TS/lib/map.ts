@@ -143,3 +143,23 @@ export class Set<T> {
 	}
 
 }
+
+//-----------------------------------------------------------------------------
+//	WeakMap -- backed by Map, and not actually weak
+//-----------------------------------------------------------------------------
+
+// Nothing is collected: an entry lives as long as the WeakMap does, since there's no finalization to
+// hook. Every use in this project is a cache keyed by an immutable Type/AST node, so it costs only
+// retention, never correctness.
+export class WeakMap<K, V> {
+	private map_: Map<K, V>;
+
+	constructor(entries: [K, V][] = []) {
+		this.map_ = new Map<K, V>(entries);
+	}
+
+	get(key: K): V | undefined		{ return this.map_.get(key); }
+	has(key: K): boolean			{ return this.map_.has(key); }
+	set(key: K, value: V): this		{ this.map_.set(key, value); return this; }
+	delete(key: K): boolean			{ return this.map_.delete(key); }
+}
