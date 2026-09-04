@@ -6727,6 +6727,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// syntactically-identical anonymous shapes (including after generic substitution, e.g. two different
 	// instantiations that happen to produce the same concrete member types) collapse to one physical struct,
 	// which is correct -- there's no name to keep them apart by even if desired.
+	// Shapes currently being vetted below -- a member whose own type leads back here would otherwise
+	// recurse forever, and a cyclic anonymous shape is exactly one this can't build anyway.
+	const anonShapeVetting = new Set<string>();
+
 	function ensureAnonObjectShape(obj: TS.ObjectType): ClassInfo | undefined {
 		if (obj.members.some(m => m.type !== 'property' && m.type !== 'method'))
 			return undefined;
@@ -6734,6 +6738,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const existing	= classes.get(key);
 		if (existing)
 			return existing;
+		if (anonShapeVetting.has(key))
+			return undefined;
+		// Every property must have a representation before this commits to building a struct. This is a
+		// last-resort fallback, so a shape it can't represent is simply not one it should claim -- and
+		// failing here rather than inside `addField` matters because the caller still has `wasmTypeOf` to
+		// fall back to. The case that forced it: a namespace object (`import * as T from ...`) is a
+		// perfectly good object TYPE whose members include classes and type aliases, and is never a value.
+		anonShapeVetting.add(key);
+		try {
+			if (obj.members.some(m => m.type === 'property' && !(m.typeAnnotation && typeOf(m.typeAnnotation))))
+				return undefined;
+		} finally {
+			anonShapeVetting.delete(key);
+		}
 		return buildObjectShape(key, obj.members, obj, key, true);
 	}
 
