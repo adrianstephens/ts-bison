@@ -2417,7 +2417,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// early check returns first). A generic parameter's own structural bound substituted with
 				// a real interface-typed argument is the one case that's actually anonymous by
 				// construction (`matchObjectShapeByType`'s own comment).
-				return matchObjectShapeByType(w);
+				// ...and when nothing declared matches either, synthesize the shape -- the same last resort
+				// `matchObjectShape` already applies on the literal side, so a value whose type is a bare
+				// anonymous object (an inferred field, a spread result) has an owner to read fields off.
+				return matchObjectShapeByType(w) ?? ensureAnonObjectShape(w);
 			}
 			// An interface `extends`ing another (`Method<T> extends CallSig<T>`) resolves to a real
 			// intersection, not an 'object' -- `resolveObjectType` flattens+merges it into one flat object

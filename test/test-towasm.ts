@@ -3226,6 +3226,47 @@ async function main() {
 	}
 
 	{
+		// The options-bag shape end to end: a field whose type comes only from `this.x = {...defaults,
+		// ...opts}` in the constructor. Three separate things had to be true for this to work.
+		//
+		// The constructor's own PARAMETERS have to be in scope when that initializer is typed -- resolved
+		// against the class scope, `o` is an unknown name and the whole field silently becomes `any`.
+		//
+		// A later OPTIONAL member of a spread must not erase an earlier required one, matching what the
+		// runtime actually does (see the spread checks above): `{...Full, ...Partial}` is Full, not Partial.
+		// A mapped type's member (`Partial<typeof D>['k']`) is an unresolved indexed access, so it needs
+		// resolving before it can collapse into the earlier `string` rather than unioning with it.
+		//
+		// And a value whose type is a bare anonymous object shape needs an owner to read fields off at all
+		// -- `ownerFor` now synthesizes one as a last resort, the same fallback the literal side had.
+		const { fromCtorParam, optionsBag, defaultsKept } = await compile(`
+			class V { v; constructor(v: number) { this.v = v; } }
+			export function fromCtorParam(): number { return new V(9).v + 1; }
+			const D = { newline: 10, indent: 2 };
+			type O = Partial<typeof D>;
+			class Output {
+				opts;
+				constructor(o: O = {}) { this.opts = { ...D, ...o }; }
+				total(): number { return this.opts.newline * 100 + this.opts.indent; }
+			}
+			export function optionsBag(): number { return new Output({ newline: 3 }).total(); }
+			export function defaultsKept(): number { return new Output().total(); }
+		`);
+		check("field inference: through the constructor's own parameter scope", fromCtorParam(), 10);
+		check('options bag: a supplied option overrides its default', optionsBag(), 302);
+		check('options bag: an omitted one keeps the default', defaultsKept(), 1002);
+		// The merged type is `Full`, not `Partial` -- a required member survives an optional one spread
+		// over it, so this assigns cleanly.
+		check('spread type: a required member survives an optional one spread over it',
+			typeErrors(`
+				type Full = { a: number; b: number };
+				const D: Full = { a: 1, b: 2 };
+				const p: { a?: number } = {};
+				const m: Full = { ...D, ...p };
+			`).length, 0);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only

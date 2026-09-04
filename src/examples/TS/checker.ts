@@ -200,7 +200,7 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// call at the bottom -- that call already walks every member's `typeAnnotation` once, and installing the getter
 	// before it would make *that* walk the "first read", forcing inference right here (still mid-`hoist`, before
 	// later-in-file declarations like `__asm` are hoisted) instead of at whatever later, real, post-hoist read asks.
-	const pendingFieldInit: { prop: TS.TypeMember; init: Expr | Expr[] }[] = [];
+	const pendingFieldInit: { prop: TS.TypeMember; init: Expr | Expr[]; inner?: Scope }[] = [];
 	// Fields with neither an annotation nor an initializer: their type lives only in the constructor's own
 	// `this.x = ...`, which can't be read here because the constructor may come later in `c.body`. Resolved
 	// once the loop below has seen every member (`ctorMembers`), through the same lazy getter.
@@ -260,12 +260,21 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// body, not a nested closure's own assignments -- real TS looks wider, but this covers the shape that
 	// actually declares a field's type, without inferring from a callback that runs who-knows-when.
 	for (const { prop, key } of pendingCtorInit) {
-		const inits = ctorMembers.flatMap(ctor => (ctor.body ?? []).flatMap(st =>
-			st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '='
-			&& st.expression.left.type === 'member' && st.expression.left.object.type === 'this' && st.expression.left.property === key
-				? [st.expression.right] : []));
-		if (inits.length)
-			pendingFieldInit.push({ prop, init: inits });
+		for (const ctor of ctorMembers) {
+			const inits = (ctor.body ?? []).flatMap(st =>
+				st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '='
+				&& st.expression.left.type === 'member' && st.expression.left.object.type === 'this' && st.expression.left.property === key
+					? [st.expression.right] : []);
+			if (!inits.length)
+				continue;
+			// `this.p = o` names the CONSTRUCTOR's own parameter, which the class scope has never heard of --
+			// resolved there it types as `any`, silently defeating the whole inference.
+			const inner = new Scope(scope);
+			for (const p of T.FixParams(ctor).params)
+				if (typeof p.key === 'string')
+					inner.addValue(p.key, p.typeAnnotation ?? T.ANY);
+			pendingFieldInit.push({ prop, init: inits, inner });
+		}
 	}
 
 	const obj = TS.ObjectType(members);
@@ -291,7 +300,8 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	T.stampScope(value, scope);
 
 	// Installed only now, *after* the walks above -- a self-memoizing lazy getter
-	for (const { prop, init } of pendingFieldInit) {
+	for (const { prop, init, inner } of pendingFieldInit) {
+		const initScope = inner ?? scope;
 		let resolving = false;
 		Object.defineProperty(prop, 'typeAnnotation', {
 			configurable:	true,
@@ -301,8 +311,8 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 					return T.ANY;
 				resolving = true;
 				const raw = Array.isArray(init)
-					? T.combineTypes(init.map(e => typeOf(e, scope) ?? T.ANY))
-					: typeOf(init, scope) ?? T.ANY;
+					? T.combineTypes(init.map(e => typeOf(e, initScope) ?? T.ANY))
+					: typeOf(init, initScope) ?? T.ANY;
 				const t = T.stampScope(T.widenLiterals(raw), scope);
 				Object.defineProperty(prop, 'typeAnnotation', { value: t, writable: true, enumerable: true, configurable: true });
 				return t;
@@ -1115,7 +1125,19 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					if ('key' in m && typeof m.key === 'string') {
 						const i = byKey.get(m.key);
 						if (i !== undefined) {
-							members[i] = m;
+							// A later OPTIONAL property does NOT erase an earlier one: at runtime an absent
+							// property leaves the earlier value in place, which is exactly what the
+							// `{...defaults, ...opts}` idiom relies on. So the result is either type, and is
+							// optional only if both were. An explicit `key: value` is never optional and
+							// still overrides outright, as does a required spread member.
+							const prev = members[i];
+							// Resolved before combining: a mapped type's own member (`Partial<typeof D>['k']`) is an
+							// unresolved indexed access, which would union with the earlier `string` instead of
+							// collapsing into it. Its `| undefined` is dropped too -- optionality is the
+							// modifier, and the absent case is precisely what the earlier member covers.
+							members[i] = m.type === 'property' && prev.type === 'property' && hasMod(m, 'optional')
+								? TS.TypeProperty(m.key, T.combineTypes([prev.typeAnnotation, T.nonNullable(T.resolveOwn(m.typeAnnotation, scope), scope)]), hasMod(prev, 'optional') ? ['optional'] : undefined)
+								: m;
 							return;
 						}
 						byKey.set(m.key, members.length);
