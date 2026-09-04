@@ -32,7 +32,7 @@ export function guard<R>(types: string[]) {
 
 const definitionTags	= ['declaration', 'typedef', 'function_def', 'namespace', 'linkage', 'using_namespace', 'using_decl', 'using_alias', 'template', 'static_assert', 'method_def', 'constructor_def', 'destructor_def', 'operator_def', 'static_member_def'];
 const statementOnlyTags = ['block', 'if', 'while', 'do_while', 'for', 'switch', 'case', 'default', 'break', 'continue', 'return', 'goto', 'labeled', 'empty', 'throw', 'try', 'range_for'];
-const exprTags			= ['identifier', 'literal', 'char_literal', 'unary', 'unary_post', 'binary', 'conditional', 'subscript', 'member_access', 'pointer_member', 'function_call', 'cast', 'sizeof_type', 'this', 'null_literal', 'qualified', 'new', 'delete', 'pack_expansion', 'sizeof_pack', 'cpp_cast', 'typeid', 'alignof', 'functional_cast', 'lambda'];
+const exprTags			= ['identifier', 'literal', 'char_literal', 'unary', 'unary_post', 'binary', 'conditional', 'index', 'member', 'pointer_member', 'call', 'cast', 'sizeof_type', 'this', 'null_literal', 'qualified', 'new', 'delete', 'spread', 'sizeof_pack', 'cpp_cast', 'typeid', 'alignof', 'functional_cast', 'lambda'];
 const classMemberTags	= ['struct_member', 'member_typedef', 'access_label', 'constructor', 'destructor', 'method', 'conversion', 'using_decl', 'using_alias', 'member_template'];
 const declaratorTags	= ['identifier', 'pointer', 'array', 'function', 'reference', 'rvalue_reference'];
 const packParamTags	= ['parameter']; // both ParameterDecl and PackParameter use this tag; distinguished by `pack`
@@ -155,18 +155,18 @@ export function walk<T extends Walkable>(ast: T,
 			case 'unary_post':			return mapObject(e, {operand: mapExpressionA});
 			case 'binary':				return mapObject(e, {left: mapExpressionA, right: mapExpressionA});
 			case 'conditional':			return mapObject(e, {test: mapExpressionA, consequent: mapExpressionA, alternate: mapExpressionA});
-			case 'subscript':			return mapObject(e, {array: mapExpressionA, index: mapExpressionA});
-			case 'member_access':
+			case 'index':				return mapObject(e, {object: mapExpressionA, index: mapExpressionA});
+			case 'member':
 			case 'pointer_member':		return mapObject(e, {object: mapExpressionA});
-			case 'function_call':		return mapObject(e, {function: mapExpressionA, arguments: mapArrayA(mapExpressionA)});
+			case 'call':				return mapObject(e, {callee: mapExpressionA, arguments: mapArrayA(mapExpressionA)});
 			// `cast`/`sizeof_type` come from C's plain Expr (see cpp-parser.ts's `Expr` comment on why it isn't
 			// widened) -- their TypeName stays narrow accordingly.
-			case 'cast':				return mapObject(e, {type1: narrowTypeName, expression: mapExpressionA});
+			case 'cast':				return mapObject(e, {typeAnnotation: narrowTypeName, expression: mapExpressionA});
 			case 'sizeof_type':			return mapObject(e, {operand: narrowTypeName});
 			// cpp
 			case 'new':					return mapObject(e, {typeName: typeSpecifier, arguments: mapArray(mapExpressionA), size: mapExpression, placement: mapArray(mapExpressionA)});
 			case 'delete':				return mapObject(e, {operand: mapExpressionA});
-			case 'pack_expansion':		return mapObject(e, {operand: mapExpressionA});
+			case 'spread':				return mapObject(e, {operand: mapExpressionA});
 			case 'cpp_cast':			return mapObject(e, {target: typeName, expression: mapExpressionA});
 			case 'typeid':				return mapObject(e, {expression: mapExpression, target: typeName});
 			case 'alignof':				return mapObject(e, {target: typeName});
@@ -239,22 +239,22 @@ export function walk<T extends Walkable>(ast: T,
 			case 'declaration':
 			case 'typedef':				return declarationLike(s);
 			case 'block':				return mapObject(s, {body: mapArrayA(mapStatementA)});
-			case 'if':					return mapObject(s, {condition: mapExpressionA, then: mapStatementA, else: mapStatement});
+			case 'if':					return mapObject(s, {test: mapExpressionA, consequent: mapStatementA, alternate: mapStatement});
 			case 'while':
-			case 'do_while':			return mapObject(s, {condition: mapExpressionA, body: mapStatementA});
+			case 'do_while':			return mapObject(s, {test: mapExpressionA, body: mapStatementA});
 			case 'for':					return mapObject(s, {
 				// `ForClauses.init`'s `Expr` component is C's plain (never-extended) Expr too -- same residual
 				// narrowness as `ArrayDecl.size` above.
 				init:		(i: C.Expr | Declaration | TypedefDecl): C.Expr | Declaration | TypedefDecl | undefined =>
 					isExpr(i) ? mapExpression(i as Expr) as unknown as C.Expr : declarationLike(i),
-				condition:	mapExpression,
+				test:		mapExpression,
 				update:		mapExpression,
 				body:		mapStatementA,
 			});
-			case 'switch':				return mapObject(s, {condition: mapExpressionA, body: mapStatementA});
-			case 'case':				return mapObject(s, {value: mapExpressionA, body: mapStatementA});
+			case 'switch':				return mapObject(s, {discriminant: mapExpressionA, body: mapStatementA});
+			case 'case':				return mapObject(s, {test: mapExpressionA, body: mapStatementA});
 			case 'default':				return mapObject(s, {body: mapStatementA});
-			case 'return':				return mapObject(s, {expression: mapExpression});
+			case 'return':				return mapObject(s, {argument: mapExpression});
 			case 'labeled':				return mapObject(s, {body: mapStatementA});
 			// cpp
 			case 'throw':				return mapObject(s, {argument: mapExpression});
@@ -387,16 +387,16 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 			case 'unary_post':			return walkExpression(e.operand);
 			case 'binary':				return walkExpression(e.left) || walkExpression(e.right);
 			case 'conditional':			return walkExpression(e.test) || walkExpression(e.consequent) || walkExpression(e.alternate);
-			case 'subscript':			return walkExpression(e.array) || walkExpression(e.index);
-			case 'member_access':
+			case 'index':				return walkExpression(e.object) || walkExpression(e.index);
+			case 'member':
 			case 'pointer_member':		return walkExpression(e.object);
-			case 'function_call':		return walkExpression(e.function) || e.arguments.some(walkExpression);
-			case 'cast':				return walkTypeName(e.type1) || walkExpression(e.expression);
+			case 'call':				return walkExpression(e.callee) || e.arguments.some(walkExpression);
+			case 'cast':				return walkTypeName(e.typeAnnotation) || walkExpression(e.expression);
 			case 'sizeof_type':			return walkTypeName(e.operand);
 			// cpp
 			case 'new':					return walkTypeSpecifier(e.typeName) || !!e.arguments?.some(walkExpression) || walkExpression(e.size) || !!e.placement?.some(walkExpression);
 			case 'delete':				return walkExpression(e.operand);
-			case 'pack_expansion':		return walkExpression(e.operand);
+			case 'spread':				return walkExpression(e.operand);
 			case 'cpp_cast':			return walkTypeName(e.target) || walkExpression(e.expression);
 			case 'typeid':				return walkExpression(e.expression) || walkTypeName(e.target);
 			case 'alignof':				return walkTypeName(e.target);
@@ -440,15 +440,15 @@ export function walkB<T extends C.TranslationUnit | Definition | Statement | Exp
 			case 'declaration':
 			case 'typedef':				return declarationLike(s);
 			case 'block':				return s.body.some(walkStatement);
-			case 'if':					return walkExpression(s.condition) || walkStatement(s.then) || (!!s.else && walkStatement(s.else));
+			case 'if':					return walkExpression(s.test) || walkStatement(s.consequent) || (!!s.alternate && walkStatement(s.alternate));
 			case 'while':
-			case 'do_while':			return walkExpression(s.condition) || walkStatement(s.body);
+			case 'do_while':			return walkExpression(s.test) || walkStatement(s.body);
 			case 'for':					return (s.init ? (isExpr(s.init) ? walkExpression(s.init) : declarationLike(s.init)) : false)
-				|| walkExpression(s.condition) || walkExpression(s.update) || walkStatement(s.body);
-			case 'switch':				return walkExpression(s.condition) || walkStatement(s.body);
-			case 'case':				return walkExpression(s.value) || walkStatement(s.body);
+				|| walkExpression(s.test) || walkExpression(s.update) || walkStatement(s.body);
+			case 'switch':				return walkExpression(s.discriminant) || walkStatement(s.body);
+			case 'case':				return walkExpression(s.test) || walkStatement(s.body);
 			case 'default':				return walkStatement(s.body);
-			case 'return':				return walkExpression(s.expression);
+			case 'return':				return walkExpression(s.argument);
 			case 'labeled':				return walkStatement(s.body);
 			// cpp
 			case 'throw':				return walkExpression(s.argument);

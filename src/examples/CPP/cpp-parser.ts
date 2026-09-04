@@ -3,6 +3,7 @@ import { makeRule, Rules, List, OneOf, termOneOf, terminal, WithPrec, removeRule
 import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
 import { Literal, Identifier, stampPos } from '../common';
+import type * as Common from '../common';
 import * as C from './c-parser';
 
 // ===================================================================
@@ -102,7 +103,7 @@ export type Expr = C.Expr
 	| { type: 'qualified'; parts: string[] }
 	| { type: 'new'; typeName: TypeSpecifier; arguments?: C.Expr[]; size?: C.Expr; braced?: boolean; placement?: C.Expr[] }
 	| { type: 'delete'; operand: C.Expr; array?: boolean }
-	| { type: 'pack_expansion'; operand: C.Expr }
+	| Common.Spread<C.Expr>
 	| { type: 'sizeof_pack'; name: string }
 	| { type: 'cpp_cast'; kind: string; target: TypeName; expression: C.Expr }
 	| { type: 'typeid'; expression?: C.Expr; target?: TypeName }
@@ -329,8 +330,8 @@ struct_declaration.push(
 // Casts through unknown pointer types (`(MemoryPoolCleanup*)fn`). ForceFork: after `( IDENT` the `*` is
 // one-token-ambiguous with multiplication. `*`s are spelled inline, not via `pointer`, so the fork tag reaches this rule.
 assignment_expression.push(
-	ForceFork(Rule(['(', C.IDENT, '*', ')', C.assignment_expression],		$ => ({ type: 'cast', type1: { specifiers: { type: C.RefType($[1]) }, declarator: C.Pointer([[]], undefined) }, expression: $[4] } as const))),
-	ForceFork(Rule(['(', C.IDENT, '*', '*', ')', C.assignment_expression],	$ => ({ type: 'cast', type1: { specifiers: { type: C.RefType($[1]) }, declarator: C.Pointer([[], []], undefined) }, expression: $[5] } as const))),
+	ForceFork(Rule(['(', C.IDENT, '*', ')', C.assignment_expression],		$ => ({ type: 'cast', typeAnnotation: { specifiers: { type: C.RefType($[1]) }, declarator: C.Pointer([[]], undefined) }, expression: $[4] } as const))),
+	ForceFork(Rule(['(', C.IDENT, '*', '*', ')', C.assignment_expression],	$ => ({ type: 'cast', typeAnnotation: { specifiers: { type: C.RefType($[1]) }, declarator: C.Pointer([[], []], undefined) }, expression: $[5] } as const))),
 );
 
 // Constructor-style init (`int x(5);`): an unregistered identifier inside the parens reads as an argument, matching
@@ -342,7 +343,7 @@ assignment_expression.push(
 
 // Zero-argument calls (`g()`) -- C's postfix_expression only had the argument_expression_list form, and that list (like every List here) is non-empty.
 (C.postfix_expression as unknown as Rules<Expr>).push(
-	Rule([C.postfix_expression, '(', ')'],	$ => ({ type: 'function_call', function: $[0], arguments: [] } as const)),
+	Rule([C.postfix_expression, '(', ')'],	$ => ({ type: 'call', callee: $[0], arguments: [] } as const)),
 );
 
 
@@ -351,14 +352,14 @@ assignment_expression.push(
 C.for_statement.push(
 	Rule([';', ';'],											_ => ({ init: undefined })),
 	Rule([';', ';', C.expression],								$ => ({ init: undefined, update: $[2] })),
-	Rule([';', C.expression, ';'],								$ => ({ init: undefined, condition: $[1] })),
-	Rule([';', C.expression, ';', C.expression],				$ => ({ init: undefined, condition: $[1], update: $[3] })),
+	Rule([';', C.expression, ';'],								$ => ({ init: undefined, test: $[1] })),
+	Rule([';', C.expression, ';', C.expression],				$ => ({ init: undefined, test: $[1], update: $[3] })),
 	Rule([C.expression, ';', ';'],								$ => ({ init: $[0] })),
 	Rule([C.expression, ';', ';', C.expression],				$ => ({ init: $[0], update: $[3] })),
-	Rule([C.expression, ';', C.expression, ';'],				$ => ({ init: $[0], condition: $[2] })),
+	Rule([C.expression, ';', C.expression, ';'],				$ => ({ init: $[0], test: $[2] })),
 	Rule([C.declaration, ';'],									$ => ({ init: $[0] })),
 	Rule([C.declaration, ';', C.expression],					$ => ({ init: $[0], update: $[2] })),
-	Rule([C.declaration, C.expression, ';'],					$ => ({ init: $[0], condition: $[1] })),
+	Rule([C.declaration, C.expression, ';'],					$ => ({ init: $[0], test: $[1] })),
 );
 
 // Functional casts (`T(3.14)`, `T()`) -- the ctor-call-shaped counterpart of C's `(T)x`. Only for
@@ -527,7 +528,7 @@ assignment_expression.push(
 
 	// Pack expansion (`args...`) -- a left-recursive postfix continuation (same shape as the `::` continuation
 	// above), since unlike most unary operators this one trails its operand rather than leading it.
-	Rule([C.assignment_expression, '...'],											$ => ({ type: 'pack_expansion', operand: $[0] } as const)),
+	Rule([C.assignment_expression, '...'],											$ => ({ type: 'spread', operand: $[0] } as const)),
 	// `sizeof...(Args)` -- the pack-count counterpart of plain `sizeof`/`sizeof(Type)`, which c-parser.ts
 	// already has at this same level.
 	WithPrec(Rule(['sizeof', '...', '(', type_ident, ')'],							$ => ({ type: 'sizeof_pack', name: $[3] } as const)), 'unary'),
@@ -617,10 +618,10 @@ const template_argument = Rules<TemplateArg>(
 const template_argument_list = List(template_argument, ',');
 
 (C.postfix_expression as unknown as Rules<Expr>).push(
-	Rule([template_fn_open, template_argument_list, '>', '(', ')'],										($, ctx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'template_ref', name: $[0], args: $[1] } as unknown as C.Expr, arguments: [] } as const; }),
-	Rule([template_fn_open, template_argument_list, '>', '(', C.argument_expression_list, ')'],			($, ctx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'template_ref', name: $[0], args: $[1] } as unknown as C.Expr, arguments: $[4] } as const; }),
-	Rule([member_template_fn_open, template_argument_list, '>', '(', ')'],								($, ctx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'member_template_ref', ...$[0], args: $[1] } as unknown as C.Expr, arguments: [] } as const; }),
-	Rule([member_template_fn_open, template_argument_list, '>', '(', C.argument_expression_list, ')'],	($, ctx) => { ctx.templateDepth--; return { type: 'function_call', function: { type: 'member_template_ref', ...$[0], args: $[1] } as unknown as C.Expr, arguments: $[4] } as const; }),
+	Rule([template_fn_open, template_argument_list, '>', '(', ')'],										($, ctx) => { ctx.templateDepth--; return { type: 'call', callee: { type: 'template_ref', name: $[0], args: $[1] } as unknown as C.Expr, arguments: [] } as const; }),
+	Rule([template_fn_open, template_argument_list, '>', '(', C.argument_expression_list, ')'],			($, ctx) => { ctx.templateDepth--; return { type: 'call', callee: { type: 'template_ref', name: $[0], args: $[1] } as unknown as C.Expr, arguments: $[4] } as const; }),
+	Rule([member_template_fn_open, template_argument_list, '>', '(', ')'],								($, ctx) => { ctx.templateDepth--; return { type: 'call', callee: { type: 'member_template_ref', ...$[0], args: $[1] } as unknown as C.Expr, arguments: [] } as const; }),
+	Rule([member_template_fn_open, template_argument_list, '>', '(', C.argument_expression_list, ')'],	($, ctx) => { ctx.templateDepth--; return { type: 'call', callee: { type: 'member_template_ref', ...$[0], args: $[1] } as unknown as C.Expr, arguments: $[4] } as const; }),
 	// Template-id as a plain value (`vput(tput<T>)` -- a pointer to a specialization, no call).
 	Rule([template_fn_open, template_argument_list, '>'],												($, ctx) => { ctx.templateDepth--; return { type: 'template_ref', name: $[0], args: $[1] } as unknown as C.Expr; }),
 	// Static member of a template-id in expression position (`T_same<A, B>::value`).
@@ -1182,11 +1183,11 @@ statement.push(
 	// classic for's declaration is looking for `=`/`,`/`;`, none of which is `:`.
 	Rule(['for', '(', C.declaration_specifiers, C.declarator, ':', C.expression, ')', C.statement],		$ => ({ type: 'range_for', specifiers: $[2], declarator: $[3], range: $[5], body: $[7] })),
 	// `return {...};` list-initialized returns.
-	Rule(['return', '{', C.initializer_list, '}', ';'],													$ => ({ type: 'return', expression: { type: 'initializer_list', elements: $[2] } as unknown as C.Expr } as const)),
+	Rule(['return', '{', C.initializer_list, '}', ';'],													$ => ({ type: 'return', argument: { type: 'initializer_list', elements: $[2] } as unknown as C.Expr } as const)),
 	// Condition declarations (`if (int exp = f())`, `while (int c = next())`).
-	Rule(['if', '(', C.declaration_specifiers, C.declarator, '=', C.assignment_expression, ')', C.statement],						$ => ({ type: 'if', condition: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as C.Expr, then: $[7] } as const)),
-	Rule(['if', '(', C.declaration_specifiers, C.declarator, '=', C.assignment_expression, ')', C.statement, 'else', C.statement],	$ => ({ type: 'if', condition: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as C.Expr, then: $[7], else: $[9] } as const)),
-	Rule(['while', '(', C.declaration_specifiers, C.declarator, '=', C.assignment_expression, ')', C.statement],					$ => ({ type: 'while', condition: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as C.Expr, body: $[7] } as const)),
+	Rule(['if', '(', C.declaration_specifiers, C.declarator, '=', C.assignment_expression, ')', C.statement],						$ => ({ type: 'if', test: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as C.Expr, consequent: $[7] } as const)),
+	Rule(['if', '(', C.declaration_specifiers, C.declarator, '=', C.assignment_expression, ')', C.statement, 'else', C.statement],	$ => ({ type: 'if', test: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as C.Expr, consequent: $[7], alternate: $[9] } as const)),
+	Rule(['while', '(', C.declaration_specifiers, C.declarator, '=', C.assignment_expression, ')', C.statement],					$ => ({ type: 'while', test: { type: 'decl_condition', specifiers: $[2], declarator: $[3], initializer: $[5] } as unknown as C.Expr, body: $[7] } as const)),
 );
 
 // Braced direct-init (`T x{1, 2};`) -- non-empty lists only: an empty `{}` would tie with an empty function *body*

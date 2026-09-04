@@ -74,12 +74,12 @@ function exprPrecedence(e: Expr): number {
 		case 'sizeof_pack':
 		case 'new':
 		case 'delete':
-		case 'pack_expansion':	return UNARY_PREC;
+		case 'spread':			return UNARY_PREC;
 		case 'unary_post':
-		case 'subscript':
-		case 'member_access':
+		case 'index':
+		case 'member':
 		case 'pointer_member':
-		case 'function_call':
+		case 'call':
 		case 'cpp_cast':
 		case 'functional_cast':
 		case 'typeid':
@@ -334,16 +334,16 @@ export class Output {
 			case 'declaration':
 			case 'typedef':				return this.declarationLike(s);
 			case 'block':				return this.block(s);
-			case 'if':					return 'if (' + this.expr(s.condition) + ') ' + this.dependentCode(s.then) + maybe(s.else, alt => ' else ' + this.dependentCode(alt));
-			case 'while':				return 'while (' + this.expr(s.condition) + ') ' + this.dependentCode(s.body);
-			case 'do_while':			return 'do ' + this.dependentCode(s.body) + ' while (' + this.expr(s.condition) + ');';
-			case 'for':					return 'for (' + this.forInitStr(s.init) + '; ' + maybe(s.condition, c => this.expr(c)) + '; ' + maybe(s.update, u => this.expr(u)) + ') ' + this.dependentCode(s.body);
-			case 'switch':				return 'switch (' + this.expr(s.condition) + ') ' + this.dependentCode(s.body);
-			case 'case':				return 'case ' + this.expr(s.value) + ': ' + this.statement(s.body);
+			case 'if':					return 'if (' + this.expr(s.test) + ') ' + this.dependentCode(s.consequent) + maybe(s.alternate, alt => ' else ' + this.dependentCode(alt));
+			case 'while':				return 'while (' + this.expr(s.test) + ') ' + this.dependentCode(s.body);
+			case 'do_while':			return 'do ' + this.dependentCode(s.body) + ' while (' + this.expr(s.test) + ');';
+			case 'for':					return 'for (' + this.forInitStr(s.init) + '; ' + maybe(s.test, c => this.expr(c)) + '; ' + maybe(s.update, u => this.expr(u)) + ') ' + this.dependentCode(s.body);
+			case 'switch':				return 'switch (' + this.expr(s.discriminant) + ') ' + this.dependentCode(s.body);
+			case 'case':				return 'case ' + this.expr(s.test) + ': ' + this.statement(s.body);
 			case 'default':				return 'default: ' + this.statement(s.body);
 			case 'break':				return 'break;';
 			case 'continue':			return 'continue;';
-			case 'return':				return 'return' + maybe(s.expression, e => ' ' + this.expr(e)) + ';';
+			case 'return':				return 'return' + maybe(s.argument, e => ' ' + this.expr(e)) + ';';
 			case 'goto':				return 'goto ' + s.label + ';';
 			case 'labeled':				return s.label + ': ' + this.statement(s.body);
 			case 'empty':				return ';';
@@ -431,11 +431,11 @@ export class Output {
 				return this.expr(e.left, rightAssoc ? prec + 1 : prec) + this.operator(op) + this.expr(e.right, rightAssoc ? prec : prec + 1);
 			}
 			case 'conditional':			return this.expr(e.test, LOGICAL_OR_PREC) + this.operator('?') + this.expr(e.consequent, 0) + this.operator(':') + this.expr(e.alternate, CONDITIONAL_PREC);
-			case 'subscript':			return this.expr(e.array, POSTFIX_PREC) + '[' + this.expr(e.index) + ']';
-			case 'member_access':		return this.expr(e.object, POSTFIX_PREC) + '.' + e.member;
-			case 'pointer_member':		return this.expr(e.object, POSTFIX_PREC) + '->' + e.member;
-			case 'function_call':		return this.expr(e.function, POSTFIX_PREC) + '(' + e.arguments.map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + ')';
-			case 'cast':				return '(' + this.typeName(e.type1) + ')' + this.expr(e.expression, UNARY_PREC);
+			case 'index':				return this.expr(e.object, POSTFIX_PREC) + '[' + this.expr(e.index) + ']';
+			case 'member':				return this.expr(e.object, POSTFIX_PREC) + '.' + e.property;
+			case 'pointer_member':		return this.expr(e.object, POSTFIX_PREC) + '->' + e.property;
+			case 'call':				return this.expr(e.callee, POSTFIX_PREC) + '(' + e.arguments.map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + ')';
+			case 'cast':				return '(' + this.typeName(e.typeAnnotation) + ')' + this.expr(e.expression, UNARY_PREC);
 			case 'sizeof_type':			return 'sizeof(' + this.typeName(e.operand) + ')';
 			// cpp
 			case 'this':				return 'this';
@@ -446,7 +446,7 @@ export class Output {
 				+ (e.braced ? '{' + (e.arguments ?? []).map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + '}'
 					: e.arguments ? '(' + e.arguments.map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + ')' : '');
 			case 'delete':				return 'delete' + poss(e.array, '[]') + ' ' + this.expr(e.operand, UNARY_PREC);
-			case 'pack_expansion':		return this.expr(e.operand) + '...';
+			case 'spread':				return this.expr(e.operand) + '...';
 			case 'sizeof_pack':			return 'sizeof...(' + e.name + ')';
 			case 'cpp_cast':			return e.kind + '<' + this.typeName(e.target) + '>(' + this.expr(e.expression) + ')';
 			case 'typeid':				return 'typeid(' + (e.expression ? this.expr(e.expression) : this.typeName(e.target!)) + ')';

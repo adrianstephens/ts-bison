@@ -3,6 +3,7 @@ import { makeRule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../..
 import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
 import { Literal, Identifier, Unary, UnaryPost, Binary, stampPos } from '../common';
+import type * as Common from '../common';
 
 // ===================================================================
 //  C Parser Grammar using tison
@@ -177,22 +178,22 @@ export type Definition<D = Declarator, X = never>				= Declaration<D, X> | Typed
 export interface TranslationUnit<D = Declarator, X = never>	{ type: 'translation_unit'; body: Definition<D, X>[]; }
 
 export interface Block<D = Declarator, X = never>				{ type: 'block'; body: Statement<D, X>[]; }
-export interface ForClauses<D = Declarator, X = never>			{ init: Expr | Declaration<D, X> | TypedefDecl<D, X> | undefined; condition?: Expr; update?: Expr; }
+export interface ForClauses<D = Declarator, X = never>			{ init: Expr | Declaration<D, X> | TypedefDecl<D, X> | undefined; test?: Expr; update?: Expr; }
 
 export type Statement<D = Declarator, X = never> =
 	| Block<D, X>
 	| Declaration<D, X>
 	| TypedefDecl<D, X>
-	| { type: 'if'; condition: Expr; then: Statement<D, X>; else?: Statement<D, X> }
-	| { type: 'while'; condition: Expr; body: Statement<D, X> }
-	| { type: 'do_while'; body: Statement<D, X>; condition: Expr }
+	| { type: 'if'; test: Expr; consequent: Statement<D, X>; alternate?: Statement<D, X> }
+	| { type: 'while'; test: Expr; body: Statement<D, X> }
+	| { type: 'do_while'; body: Statement<D, X>; test: Expr }
 	| { type: 'for'; body: Statement<D, X> } & ForClauses<D, X>
-	| { type: 'switch'; condition: Expr; body: Statement<D, X> }
-	| { type: 'case'; value: Expr; body: Statement<D, X> }
+	| { type: 'switch'; discriminant: Expr; body: Statement<D, X> }
+	| { type: 'case'; test: Expr; body: Statement<D, X> }
 	| { type: 'default'; body: Statement<D, X> }
 	| { type: 'break' }
 	| { type: 'continue' }
-	| { type: 'return'; expression?: Expr }
+	| Common.Return<Expr>
 	| { type: 'goto'; label: string }
 	| { type: 'labeled'; label: string; body: Statement<D, X> }
 	| { type: 'empty' }
@@ -206,11 +207,12 @@ export type Expr =
 	| UnaryPost<Expr, unaryOps>
 	| Binary<Expr, binaryOps>
 	| { type: 'conditional'; test: Expr; consequent: Expr; alternate: Expr }
-	| { type: 'subscript'; array: Expr; index: Expr }
-	| { type: 'member_access'; object: Expr; member: string }
-	| { type: 'pointer_member'; object: Expr; member: string }
-	| { type: 'function_call'; function: Expr; arguments: Expr[] }
-	| { type: 'cast'; type1: TypeName; expression: Expr }
+	| Common.Index<Expr>
+	| Common.Member<Expr>
+	// `->` is not `.`: it dereferences first, so it stays its own node rather than a flag on `member`.
+	| { type: 'pointer_member'; object: Expr; property: string }
+	| Common.Call<Expr>
+	| { type: 'cast'; typeAnnotation: TypeName; expression: Expr }
 	| { type: 'sizeof_type'; operand: TypeName };
 
 /** The base identifier a declarator ultimately names, digging through function/array/pointer wrappers. */
@@ -246,7 +248,7 @@ assignment_expression = Rules<Expr>(self => [
 	// 'type_name' stays a string: it's declared later (it needs specifier_qualifier_list, which itself needs constant_expression --
 	// part of this same expression chain), the same kind of cycle the original cast rule already cut this way with 'type_specifier'.
 	WithPrec(Rule(['sizeof', '(', fwd_type_name, ')'],			$ => ({ type: 'sizeof_type',	operand: $[2] } as const)), 			PREC.unary),
-	WithPrec(Rule(['(', fwd_type_name, ')', self], 				$ => ({ type: 'cast',			type1: $[1], expression: $[3] })), 		PREC.cast),
+	WithPrec(Rule(['(', fwd_type_name, ')', self], 				$ => ({ type: 'cast',			typeAnnotation: $[1], expression: $[3] })), 		PREC.cast),
 	WithPrec(Rule([self, OneOf(['*','/','%']),  self], 			$ => Binary($[1],	$[0], $[2])), 		PREC.multiplicative),
 	WithPrec(Rule([self, OneOf(['+', '-']),  self],				$ => Binary($[1],	$[0], $[2])), 		PREC.additive),
 	WithPrec(Rule([self, OneOf(['<<', '>>']), self], 			$ => Binary($[1],	$[0], $[2])), 		PREC.shift),
@@ -289,10 +291,10 @@ postfix_expression = Rules<Expr>(self => [
 	primary_expression,
 	WithPrec(Rule([self, '++'],									$ => ({ type: 'unary_post', operator: $[1], operand: $[0] } as const)), PREC.unary),
 	WithPrec(Rule([self, '--'],									$ => ({ type: 'unary_post',	operator: $[1], operand: $[0] } as const)), PREC.unary),
-	Rule([self, '[', expression, ']'], 							$ => ({ type: 'subscript',	array: $[0], index: $[2] } as const)),
-	Rule([self, '.', IDENT],									$ => ({ type: 'member_access',	object: $[0], member: $[2] } as const)),
-	Rule([self, '->', IDENT], 									$ => ({ type: 'pointer_member', object: $[0], member: $[2] } as const)),
-	Rule([self, '(', argument_expression_list, ')'],			$ => ({ type: 'function_call', function: $[0], arguments: $[2] } as const)),
+	Rule([self, '[', expression, ']'], 							$ => ({ type: 'index',		object: $[0], index: $[2] } as const)),
+	Rule([self, '.', IDENT],									$ => ({ type: 'member',		object: $[0], property: $[2] } as const)),
+	Rule([self, '->', IDENT], 									$ => ({ type: 'pointer_member', object: $[0], property: $[2] } as const)),
+	Rule([self, '(', argument_expression_list, ')'],			$ => ({ type: 'call',			callee: $[0], arguments: $[2] } as const)),
 ]),
 
 type_qualifier = OneOf(['const', 'volatile']),
@@ -471,11 +473,11 @@ declaration = Rules<Declaration | TypedefDecl>(
 // --- Statements ---
 // NOTE: 'declaration' already consumes its own trailing ';', so the declaration-based alternatives must not require a second one.
 for_statement = Rules<ForClauses>(
-	Rule([expression, ';'], 									$ => ({ init: $[0], condition: undefined, update: undefined })),
-	Rule([expression, ';', expression], 						$ => ({ init: $[0], condition: $[2], update: undefined })),
-	Rule([expression, ';', expression, ';', expression], 		$ => ({ init: $[0], condition: $[2], update: $[4] })),
-	Rule([declaration, expression], 							$ => ({ init: $[0], condition: $[1], update: undefined })),
-	Rule([declaration, expression, ';', expression], 			$ => ({ init: $[0], condition: $[1], update: $[3] })),
+	Rule([expression, ';'], 									$ => ({ init: $[0], test: undefined, update: undefined })),
+	Rule([expression, ';', expression], 						$ => ({ init: $[0], test: $[2], update: undefined })),
+	Rule([expression, ';', expression, ';', expression], 		$ => ({ init: $[0], test: $[2], update: $[4] })),
+	Rule([declaration, expression], 							$ => ({ init: $[0], test: $[1], update: undefined })),
+	Rule([declaration, expression, ';', expression], 			$ => ({ init: $[0], test: $[1], update: $[3] })),
 ),
 
 // statement -> compound_statement stays a string: cheapest cut in the statement <-> compound_statement <-> statement_list cycle
@@ -483,17 +485,17 @@ for_statement = Rules<ForClauses>(
 statement = Rules<Statement>(self => [
 	Forward<Block>(()=>compound_statement),
 	declaration,
-	Rule(['if', '(', expression, ')', self], 					$ => ({ type: 'if', condition: $[2], then: $[4] })),
-	Rule(['if', '(', expression, ')', self, 'else', self], 		$ => ({ type: 'if', condition: $[2], then: $[4], else: $[6] })),
-	Rule(['while', '(', expression, ')', self], 				$ => ({ type: 'while', condition: $[2], body: $[4] })),
-	Rule(['do', self, 'while', '(', expression, ')', ';'], 		$ => ({ type: 'do_while', body: $[1], condition: $[4] })),
+	Rule(['if', '(', expression, ')', self], 					$ => ({ type: 'if', test: $[2], consequent: $[4] })),
+	Rule(['if', '(', expression, ')', self, 'else', self], 		$ => ({ type: 'if', test: $[2], consequent: $[4], alternate: $[6] })),
+	Rule(['while', '(', expression, ')', self], 				$ => ({ type: 'while', test: $[2], body: $[4] })),
+	Rule(['do', self, 'while', '(', expression, ')', ';'], 		$ => ({ type: 'do_while', body: $[1], test: $[4] })),
 	Rule(['for', '(', for_statement, ')', self], 				$ => ({ type: 'for', ...$[2], body: $[4] })),
-	Rule(['switch', '(', expression, ')', self], 				$ => ({ type: 'switch', condition: $[2], body: $[4] })),
-	Rule(['case', constant_expression, ':', self], 				$ => ({ type: 'case', value: $[1], body: $[3] })),
+	Rule(['switch', '(', expression, ')', self], 				$ => ({ type: 'switch', discriminant: $[2], body: $[4] })),
+	Rule(['case', constant_expression, ':', self], 				$ => ({ type: 'case', test: $[1], body: $[3] })),
 	Rule(['default', ':', self], 								$ => ({ type: 'default', body: $[2] })),
 	Rule(['break', ';'], 										_ => ({ type: 'break' })),
 	Rule(['continue', ';'], 									_ => ({ type: 'continue' })),
-	Rule(['return', expression, ';'], 							$ => ({ type: 'return', expression: $[1] })),
+	Rule(['return', expression, ';'], 							$ => ({ type: 'return', argument: $[1] })),
 	Rule(['return', ';'], 										_ => ({ type: 'return' })),
 	Rule(['goto', IDENT, ';'], 									$ => ({ type: 'goto', label: $[1] })),
 	Rule([IDENT, ':', self], 									$ => ({ type: 'labeled', label: $[0], body: $[2] })),
