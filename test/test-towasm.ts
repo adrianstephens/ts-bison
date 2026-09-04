@@ -5068,6 +5068,49 @@ async function main() {
 	}
 
 	{
+		// `new NS.Cls(...)` -- a namespace-qualified class. `case 'new'` only ever accepted a bare
+		// identifier callee, and a namespace-qualified TYPE ref (`c: M.Cls`) resolved through
+		// `ensureClass`'s bare-name-only lookup to a structural shape-only stand-in instead of the real
+		// class, so the annotation and the `new` disagreed on the physical type.
+		const { main } = await compileMulti({
+			mod: `export class Cls { x: number; constructor(x: number) { this.x = x; } double(): number { return this.x * 2; } }`,
+			mainFile: `
+				import * as M from './mod';
+				export function main(): number { const c: M.Cls = new M.Cls(5); return c.double(); }
+			`,
+		}, 'mainFile');
+		check('multi-file: a namespace-qualified class constructs and dispatches methods', main(), 10);
+	}
+
+	{
+		// `const Cls = M.Cls` -- towasm.ts's own `const Scope = T.Scope` shape. A class has no runtime
+		// value here (classes are nominal), so the const is a compile-time alias: the start function must
+		// emit nothing for it, and both names must land on the SAME physical class.
+		const { main } = await compileMulti({
+			mod: `export class Cls { x: number; constructor(x: number) { this.x = x; } double(): number { return this.x * 2; } }`,
+			mainFile: `
+				import * as M from './mod';
+				type Cls = M.Cls;
+				const Cls = M.Cls;
+				export function take(c: M.Cls): number { return c.double(); }
+				export function main(): number { const c: Cls = new Cls(5); return take(c); }
+			`,
+		}, 'mainFile');
+		check('multi-file: a class aliased through a namespace-member const is the same class', main(), 10);
+	}
+
+	{
+		// The same alias, in one file and never used as a value -- the start function used to try to
+		// evaluate it (`unresolved identifier 'Base'`) even though nothing reads it.
+		const { main } = await compile(`
+			class Base { x: number; constructor(x: number) { this.x = x; } }
+			const Alias = Base;
+			export function main(): number { return new Alias(5).x; }
+		`);
+		check('a class aliased through a plain const constructs', main(), 5);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

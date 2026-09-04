@@ -1700,6 +1700,36 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// entry module, which `exportScope` never stamps.
 	const ownerThisType2 = (cls: ClassInfo | undefined) => cls && ownerThisType(cls);
 
+	// A class REFERENCE written as an expression -- a bare name, or a namespace-qualified one (`T.Scope`,
+	// through an `import * as T`) -- resolved to the class's own name plus the scope to look it up in. A
+	// qualified reference resolves in the NAMESPACE's own scope, not the caller's, so the class's field and
+	// method types resolve against its declaring module and both names land on the same physical class.
+	function classRefTarget(e: Expr, scope: Scope, seen?: Set<string>): { name: string; scope: Scope } | undefined {
+		if (e.type === 'identifier')
+			return scope.decl(e.name)?.type === 'class_decl' ? { name: e.name, scope } : classAliasTarget(e.name, scope, seen);
+		if (e.type === 'member' && e.object.type === 'identifier') {
+			const ns = scope.namespace(e.object.name);
+			if (ns?.decl(e.property)?.type === 'class_decl')
+				return { name: e.property, scope: ns };
+		}
+		return undefined;
+	}
+
+	// A top-level `const X = C` / `const X = T.C`. A class has no runtime value here (classes are nominal,
+	// never first-class objects), so such a const is a compile-time alias rather than a global to evaluate:
+	// `ensureClass` resolves through it to the real declaration and `__toplevel` emits nothing for it.
+	// `Scope.decl` answers for an imported module, `topLevelVars` for the entry module (`hoist` deliberately
+	// doesn't hoist a plain top-level `var_decl`, so it never reaches a scope) -- the same pair `lazyGlobalFor`
+	// uses. `seen` guards a self- or mutually-referential chain (`const A = B; const B = A;`).
+	function classAliasTarget(name: string, scope: Scope, seen = new Set<string>()): { name: string; scope: Scope } | undefined {
+		if (seen.has(name))
+			return undefined;
+		seen.add(name);
+		const varStmt	= scope.decl(name);
+		const d			= varStmt?.type === 'var_decl' ? varStmt.declarations.find(v => v.name === name) : topLevelVars.get(name)?.d;
+		return d?.init ? classRefTarget(d.init, scope, seen) : undefined;
+	}
+
 	function lazyGlobalFor(name: string, ctx: FunctionContext) {
 		const varStmt	= ctx.scope.decl(name);
 		const own		= varStmt?.type === 'var_decl'
@@ -1932,6 +1962,23 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return { params, result, hasRest: sigs.some(s => s.hasRest), defaults };
 	}
 
+	// The `ClassInfo` a type REFERENCE names. A namespace-qualified ref (`T.Scope`, from an `import * as T`)
+	// resolves its leaf in the NAMESPACE's own scope -- `ensureClass`'s own lookup never splits on '.', so
+	// such a ref otherwise fell through to a structural shape-only stand-in with no constructor or methods,
+	// which then collided with the real class built for the same declaration via `new T.Scope(...)`. Scoped
+	// to a leaf that really is a CLASS there: an interface or alias reached by a dotted name (`JS.CallSig`)
+	// keeps the structural path that already represents it.
+	function ensureClassRef(t: TS.RefType): ClassInfo | undefined {
+		const dot = t.name.lastIndexOf('.');
+		if (dot > 0) {
+			const leaf	= t.name.slice(dot + 1);
+			const ns	= ((t.declScope as Scope | undefined) ?? global).lookupScope(t.name.slice(0, dot).split('.'));
+			if (ns?.decl(leaf)?.type === 'class_decl')
+				return ensureClass(leaf, t.typeArgs, ns);
+		}
+		return ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
+	}
+
 	function typeOf(t: Type): WasmType | undefined {
 		if (t.type === 'ref' && t.typeArgs?.length) {
 			const name = READONLY_ALIAS[t.name] ?? t.name;
@@ -2047,7 +2094,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			}
 		}
 		if (t.type === 'ref') {
-			const cls = ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
+			const cls = ensureClassRef(t);
 			if (cls)
 				return ownerThisType(cls);
 		}
@@ -2395,7 +2442,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// an `intersection` type, which no longer carries a traceable class name/typeArgs at all. Safe
 			// unconditionally: `ensureClass` returns `undefined`, no throw, for a name that's neither a real
 			// class nor a valid alias, so this simply falls through to the existing logic below when it doesn't apply.
-			const direct = ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
+			const direct = ensureClassRef(t);
 			if (direct)
 				return direct;
 		}
@@ -4844,17 +4891,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// `constructor(elements: number[])` overload (`lib/typedarray.ts`), same as a real `number[]`
 				// variable would be. That overload's own comment covers the (not yet done) literal-specific
 				// optimization this used to hand-implement here.
-				if (e.callee.type !== 'identifier')
-					throw `'new' is only supported for a known class`;
 				// `ctx.scope` (not `global`): a non-entry function's own compiled body now roots its scope at
 				// its OWN declaring module (see `compileFunc`'s `homeScope`), so a class declared in the SAME
 				// file as the function being compiled resolves here even when the entry module itself never
-				// imports that class by name at all.
-				const cls = ensureClass(e.callee.name, newTypeArgs(e.callee.name, e.typeArgs, e, ctx), ctx.scope);
+				// imports that class by name at all. `classRefTarget` additionally covers `new T.Scope(...)`
+				// and a local alias to either; a plain identifier naming a lib class (`Set`, `Map` -- no
+				// `Scope.decl` of its own) falls through to the unqualified lookup it always used.
+				const target = classRefTarget(e.callee, ctx.scope)
+					?? (e.callee.type === 'identifier' ? { name: e.callee.name, scope: ctx.scope } : undefined);
+				if (!target)
+					throw `'new' is only supported for a known class`;
+				const cls = ensureClass(target.name, newTypeArgs(target.name, e.typeArgs, e, ctx), target.scope);
 				if (!cls)
 					throw `'new' is only supported for a known class`;
 				const ctor = ensureCtor(cls, e.arguments, ctx);
-				emitCallArgs(`${e.callee.name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, e.arguments, ctx, ctor.resolvedParams);
+				emitCallArgs(`${target.name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, e.arguments, ctx, ctor.resolvedParams);
 				ctx.emit(I.call(ctor.funcIndex));
 				return cls.thisWtype!;
 			}
@@ -6802,6 +6853,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					if (alias)
 						return ensureClass(alias.name, alias.typeArgs, declScope);
 				}
+				// Checked before the structural fallback below, which would otherwise reconstruct a
+				// shape-only stand-in (no constructor, no methods) for what is really a known class -- and
+				// cache it under this very name, so whichever of the annotation and the `new` resolves first
+				// wins for both. `?? global`: a bare ref annotation often carries no `declScope` of its own,
+				// and the alias itself is a top-level declaration either way.
+				const aliased = classAliasTarget(name, declScope ?? global);
+				if (aliased && (aliased.name !== name || aliased.scope !== (declScope ?? global)))
+					return ensureClass(aliased.name, typeArgs, aliased.scope);
 				return ensureObjectShape(name, typeArgs, declScope);
 			}
 			if (decl.typeParams?.length) {
@@ -7894,12 +7953,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		ast.body!.forEach(st => {
 			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl' || st.type === 'interface_decl' || st.type === 'import')
 				return;
-			if (st.type === 'var_decl' && promotedConsts.size) {
-				const declarations = st.declarations.filter(d => typeof d.name !== 'string' || !promotedConsts.has(d.name));
+			if (st.type === 'var_decl') {
+				// A promoted const is already a real function; a class alias (`const Scope = T.Scope`) has no
+				// runtime value at all -- neither leaves anything for the start function to evaluate.
+				const declarations = st.declarations.filter(d => typeof d.name !== 'string'
+					|| !(promotedConsts.has(d.name) || (d.init && classRefTarget(d.init, ctx.scope))));
 				if (!declarations.length)
 					return;
-				emitStmt({ ...st, declarations }, ctx);
-				return;
+				if (declarations.length !== st.declarations.length) {
+					emitStmt({ ...st, declarations }, ctx);
+					return;
+				}
 			}
 			emitStmt(st, ctx);
 		});
