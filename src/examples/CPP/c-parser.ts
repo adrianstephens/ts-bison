@@ -184,9 +184,9 @@ export type Statement<D = Declarator, X = never> =
 	| Block<D, X>
 	| Declaration<D, X>
 	| TypedefDecl<D, X>
-	| { type: 'if'; test: Expr; consequent: Statement<D, X>; alternate?: Statement<D, X> }
-	| { type: 'while'; test: Expr; body: Statement<D, X> }
-	| { type: 'do_while'; body: Statement<D, X>; test: Expr }
+	| Common.If<Expr, Statement<D, X>>
+	| Common.While<Expr, Statement<D, X>>
+	| Common.DoWhile<Expr, Statement<D, X>>
 	| { type: 'for'; body: Statement<D, X> } & ForClauses<D, X>
 	| { type: 'switch'; discriminant: Expr; body: Statement<D, X> }
 	| { type: 'case'; test: Expr; body: Statement<D, X> }
@@ -195,7 +195,7 @@ export type Statement<D = Declarator, X = never> =
 	| { type: 'continue' }
 	| Common.Return<Expr>
 	| { type: 'goto'; label: string }
-	| { type: 'labeled'; label: string; body: Statement<D, X> }
+	| Common.Labeled<Statement<D, X>>
 	| { type: 'empty' }
 	// An expression used as a statement gets a real wrapper node, like js-parser's and py-parser's --
 	// inlining bare `Expr` into this union made "is this a statement or an expression" undecidable.

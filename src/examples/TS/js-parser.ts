@@ -199,16 +199,16 @@ export type Statement<T, X = never> = Declaration<T>
 	| Common.Block<Statement<T, X>>
 	| Common.ExprStmt<Expr>
 	| { type: 'empty' }
-	| { type: 'if'; test: Expr; consequent: Statement<T, X>; alternate?: Statement<T, X> }
-	| { type: 'do_while'; body: Statement<T, X>; test: Expr<T> }
-	| { type: 'while'; test: Expr; body: Statement<T, X> }
+	| Common.If<Expr, Statement<T, X>>
+	| Common.DoWhile<Expr, Statement<T, X>>
+	| Common.While<Expr, Statement<T, X>>
 	| { type: 'for'; kind: 'normal'; init?: ForInit<T>; test?: Expr; update?: Expr; body: Statement<T, X> }
 	| { type: 'for'; kind: 'in' | 'of' | 'of await'; init: ForInit<T>; right: Expr; body: Statement<T, X> }
 	| { type: 'continue'; label?: string }
 	| { type: 'break'; label?: string }
 	| Common.Return<Expr>
 	| { type: 'with'; argument: Expr; body: Statement<T, X> }
-	| { type: 'labeled'; label: string; body: Statement<T, X> }
+	| Common.Labeled<Statement<T, X>>
 	| { type: 'switch'; discriminant: Expr; cases: SwitchCase<T, Statement<T, X>>[] }
 	| (Common.Throw<Expr> & { argument: Expr })
 	| Common.Try<Statement<T, X>, BindingTarget>
