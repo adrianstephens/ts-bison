@@ -777,7 +777,8 @@ function hoist(stmts: Stmt[], scope: Scope) {
 				break;
 			}
 			case 'namespace_decl': {
-				const { scope: ns, value } = exportScope(stmt.body, scope);
+				const { scope: ns, alias } = exportScope(stmt.body, scope);
+				const value = alias ?? ns.toObject();
 				// A type-only namespace (empty value type) merged onto a same-named const/class here would clobber that name's real value with a
 				// sealed empty object before the sequential 'var_decl' walk assigns it, breaking an earlier-declared class's eager forward reference.
 				if (!(value.type === 'object' && value.members.length === 0))
@@ -886,8 +887,10 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 }
 
 // Resolves what a `namespace X { ... }` block or module body exposes, as a genuine `Scope` (not a flattened `Type`) since `NS.Foo` can appear
-// in a type position too. `isAlias` marks `export = X` (`.d.ts`-only), where the whole namespace collapses to `X`'s own value.
-export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; value: Type; isAlias: boolean } {
+// in a type position too. A caller needing the value-position `Type` calls `scope.toObject()` itself, at the point it needs one -- a snapshot
+// taken here would go stale against anything the caller adds afterwards (transform.ts's `export ... from` re-export loop does exactly that).
+// `alias` is set only for `export = X` (`.d.ts`-only), where the namespace collapses to `X`'s own value instead of its scope's shape.
+export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; alias?: Type } {
 	// `hoist` + `hoistVars` (not full `checkBlock`): only top-level declaration *types* are needed, not a full check of a body checked separately.
 	const inner = new Scope(parent);
 	hoist(body, inner);
@@ -914,8 +917,7 @@ export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; value:
 	if (assign) {
 		return {
 			scope: inner.namespace(assign.expr) ?? new Scope(),
-			value: inner.value(assign.expr) ?? T.ANY,
-			isAlias: true,
+			alias: inner.value(assign.expr) ?? T.ANY,
 		};
 	}
 
@@ -962,7 +964,7 @@ export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; value:
 		// Ambient `.d.ts` convention: a body with no `export` keyword anywhere implicitly exports every top-level declaration.
 		scope.copyAll(inner);
 	}
-	return { scope, value: scope.toObject(), isAlias: false };
+	return { scope };
 }
 
 // ---- lazy return-type inference -------------------------------------------------------------

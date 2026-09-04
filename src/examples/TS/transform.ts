@@ -670,7 +670,7 @@ const waitingFor		= new Map<LoadedModule, Set<LoadedModule>>();
 
 // Own declarations recorded before re-export merging (the part that can cycle) -- lets a plain `import`'s deadlock
 // fallback (`awaitScope`'s `fallbackToOwn`) resolve from here instead, since imports never need re-exports.
-const ownScopeSettled	= new Map<LoadedModule, { scope: Scope; value: Type; isAlias: boolean }>();
+const ownScopeSettled	= new Map<LoadedModule, { scope: Scope; alias?: Type }>();
 
 function wouldDeadlock(waiter: LoadedModule, target: LoadedModule): boolean {
 	const seen = new Set<LoadedModule>([target]);
@@ -734,7 +734,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 			const own = ownScopeSettled.get(impSrc);
 			if (!own)
 				return false;	// genuine import cycle -- contribute nothing further rather than deadlock
-			resolved = { scope: own.scope, value: own.isAlias ? own.value : own.scope.toObject(), tainted: true };
+			resolved = { scope: own.scope, value: own.alias ?? own.scope.toObject(), tainted: true };
 		}
 
 		const { scope: impScope, value } = resolved;
@@ -765,9 +765,9 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 		const importScope = new Scope(global);
 		const cached = Promise.all(src.body.filter(s => s.type === 'import').map(s => resolveImport(src, importScope, s, src.canonical))).then(async imports => {
 			let tainted = imports.some(clean => !clean);
-			const { scope, value, isAlias } = exportScope(src.body, importScope);
+			const { scope, alias } = exportScope(src.body, importScope);
 			// Recorded before the (possibly cyclic) re-export loop awaits anything -- see `ownScopeSettled` for why placement matters.
-			ownScopeSettled.set(src, { scope, value, isAlias });
+			ownScopeSettled.set(src, { scope, alias });
 			for (const stmt of src.body) {
 				if (stmt.type !== 'export' || !stmt.source)
 					continue;
@@ -794,7 +794,9 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 					scope.copyAll(targetShape.scope, stmt.typeOnly);
 				}
 			}
-			return { scope, value: isAlias ? value : scope.toObject(), tainted };
+			// `toObject()` here, after the re-export loop -- the flattened value type has to include everything
+			// `export ... from` just merged in, not just what the module's own body declared.
+			return { scope, value: alias ?? scope.toObject(), tainted };
 		});
 		importScopeCache.set(src, cached);
 		// Caches only clean builds; a tainted one stays valid for concurrent awaiters, then gets evicted (identity-checked,
