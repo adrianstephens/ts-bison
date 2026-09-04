@@ -365,12 +365,16 @@ function wTypeKey(type: wasm.SubType): string|undefined {
 // `defaults`: only ever set for a function TYPE with a bare `p?: T` (optional, no `=`) trailing param --
 // see `case 'function'`'s own comment. A closure *literal*'s own params can never be optional (a real,
 // separate restriction, unaffected), so this stays `undefined` for every other `FuncSig` producer.
-interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean; defaults?: (Expr | undefined)[] }
 // `resolvedParams`: the same params `defaults` came from, before flattening to bare `WasmType`s --
-// only ever set for a real user function/method/constructor (never a closure, which can't have
-// defaults at all), and only actually needed by `emitCallArgs` when a default value itself reads an
-// earlier parameter (`resolveParams`'s own comment) rather than standing alone as a literal.
-interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; defaults?: (Expr | undefined)[]; resolvedParams?: ResolvedParam[]; reassignsThis?: boolean }
+// only actually needed by `emitCallArgs` when a default value itself reads an earlier parameter
+// (`resolveParams`'s own comment) rather than standing alone as a literal. Set for a real user
+// function/method/constructor, and for a function TYPE that carries defaults of its own -- which one
+// can, since a type derived from a declaration (`typeof f`, a method's type) keeps them.
+interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean; defaults?: (Expr | undefined)[]; resolvedParams?: ResolvedParam[] }
+// A signature with `hasRest`/`defaults` definitely settled -- but `resolvedParams` genuinely absent
+// when no default needs it, which is what `emitCallArgs` tests, so it stays optional through `Required`.
+type FullSig = Required<Omit<FuncSig, 'resolvedParams'>> & Pick<FuncSig, 'resolvedParams'>;
+interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; reassignsThis?: boolean }
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
 interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number }
@@ -1813,7 +1817,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// physical signature reuses this identical generic-substitution/optional-param/anon-return-type logic,
 	// not a second copy of it. Returns `undefined` only when the return type genuinely can't be represented
 	// at all (never silently drops a param -- an unrepresentable param type still throws, same as before).
-	function closureSigParts(sig: TS.CallSig): Required<FuncSig> | undefined {
+	function closureSigParts(sig: TS.CallSig): FullSig | undefined {
 		// See `emitClosureLiteral`'s own identical comment (this is the type-annotation-side twin of that
 		// expression-side case, e.g. a `const redo: <T extends U>(t?: T) => T` binding, or a generic closure
 		// passed through a function's own return type) -- same bound substitution, same free-when-bounded
@@ -1826,16 +1830,18 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// Naming the whole signature, not just the parameter: one of these reaches a caller from some
 		// enclosing declaration's own type, and the parameter name alone rarely says which.
 		const sigText = () => T.typeKey({ type: 'function', ...sig } as Type);
+		// Names to this parameter's own LEFT, so a default that reads an earlier one (`dstScope = scope`)
+		// validates exactly as it does on the declaration side (`resolveParams`).
+		const earlier = new Set<string>();
 		const params = func.params.map(p => {
 			// A default is NOT a reason to reject a function type. `defaultsWithImplicitUndefined` below
 			// hands the very same expression to every call site, exactly as a direct call to the real
 			// declaration already gets it -- so the only requirement is the one the declaration path
 			// (`resolveParam`) already imposes: that the expression can be re-emitted there.
-			// Deliberately NOT passing `earlierNames`: a default reading an earlier parameter needs the
-			// `resolvedParams` that only a real declaration carries, so accepting one here just trades this
-			// honest message for an `internal:` one at whichever call site later omits the argument.
-			if (p.default && !isReemittableDefault(p.default))
-				throw `function type parameter '${describeBinding(p.key)}''s default value must be a literal (or an array literal of them), in '${sigText()}'`;
+			if (p.default && !isReemittableDefault(p.default, earlier))
+				throw `function type parameter '${describeBinding(p.key)}''s default value must be a literal, an array literal of them, or a read of an earlier parameter, in '${sigText()}'`;
+			if (typeof p.key === 'string')
+				earlier.add(p.key);
 			// `void` is real, valid TS here (real TS lets a param/field declare `void`, if uselessly) --
 			// there's just no wasm value it can itself represent, so box it as `any` like any other
 			// "no meaningful value" position instead of rejecting otherwise-valid source.
@@ -1853,6 +1859,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			return !p.default && hasMod(p, 'optional') ? nullableWtype(boxed) : boxed;
 		});
 		const defaults = defaultsWithImplicitUndefined(func.params);
+		// Only a default that reads an earlier parameter needs these, and only then does the memo key below
+		// have to distinguish parameter NAMES -- the substitution `emitCallArgs` does is by name.
+		const resolvedParams = func.params.some(p => p.default && !isReemittableDefault(p.default))
+			? func.params.map((p, i) => ({ key: p.key, wtype: params[i], tsType: p.typeAnnotation! }))
+			: undefined;
 		let hasRest = false;
 		if (func.rest?.typeAnnotation) {
 			const wt = typeOf(func.rest.typeAnnotation);
@@ -1881,7 +1892,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		}
 		if (!result)
 			return undefined;
-		return { params, result, hasRest, defaults };
+		return { params, result, hasRest, defaults, resolvedParams };
 	}
 
 	// A genuinely overloaded VALUE type (every member of an object type is a 'call' signature, e.g. real
@@ -1898,7 +1909,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// common case -- one overload a strict prefix of another). Confirmed against a real case (js-parser.ts's
 	// `Rule`, from tison.ts's `makeRule`): its own local `rule` overload group erases to exactly this shape
 	// at runtime -- one implementation, one optional trailing param.
-	function mergeOverloadSigs(sigs: Required<FuncSig>[]): Required<FuncSig> | undefined {
+	function mergeOverloadSigs(sigs: FullSig[]): FullSig | undefined {
 		if (!sigs.length)
 			return undefined;
 		const maxParams = Math.max(...sigs.map(s => s.params.length));
@@ -1944,7 +1955,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					// Every overload must resolve, or this isn't attempted at all -- a partial merge would
 					// silently misrepresent the physical signature rather than honestly falling through to
 					// whatever error the caller's own unresolved-type handling already gives.
-					if (sigs.every((s): s is Required<FuncSig> => !!s)) {
+					if (sigs.every((s): s is FullSig => !!s)) {
 						const merged = mergeOverloadSigs(sigs);
 						if (merged) {
 							const key = `(${merged.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(merged.result)}${merged.hasRest ? '...' : ''}${merged.defaults.map(d => d ? `?${T.exprKey(d)}` : '.').join('')}`;
@@ -2024,10 +2035,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// own TEXT is part of it as well, not just that a position has one: a call site synthesizes
 				// the omitted argument FROM this memoized signature, so `(a, by = 10)` and `(a, by = 10.5)`
 				// sharing an entry would silently hand one function the other's default.
-				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${hasRest ? '...' : ''}${defaults.map(d => d ? `?${T.exprKey(d)}` : '.').join('')}`;
+				// Parameter NAMES join the key only when a default reads one: `emitCallArgs` substitutes those
+				// references by name, so two otherwise-identical signatures whose parameters are named
+				// differently must not share an entry. Omitted otherwise, to keep the cache from fragmenting.
+				const names = parts.resolvedParams ? `[${parts.resolvedParams.map(p => describeBinding(p.key)).join(',')}]` : '';
+				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${hasRest ? '...' : ''}${defaults.map(d => d ? `?${T.exprKey(d)}` : '.').join('')}${names}`;
 				let wt = closureWasmTypes.get(key);
 				if (!wt)
-					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest, defaults } });
+					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest, defaults, resolvedParams: parts.resolvedParams } });
 				return wt;
 			}
 		}
@@ -2054,7 +2069,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// Flattened through the shared `resolveObjectType`, so this agrees with `ownerFor` on the shape.
 		const flat = resolved.type === 'object' ? resolved : resolved.type === 'intersection' ? resolveObjectType(resolved, global) : undefined;
 		if (flat) {
-			const shapeMatch = matchObjectShapeByType(flat) ?? (resolved.type === 'intersection' ? ensureAnonObjectShape(flat) : undefined);
+			const shapeMatch = matchObjectShapeByType(flat) ?? ensureAnonObjectShape(flat);
 			if (shapeMatch)
 				return ownerThisType(shapeMatch);
 		}
@@ -3247,7 +3262,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				ctx.emit(I.struct.get(owner.typeIndex, fieldIndex!));
 				const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, fieldWtype);
 				ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-				emitCallArgs(name, sig.params, sig.defaults, !!sig.hasRest, args, ctx);
+				emitCallArgs(name, sig.params, sig.defaults, !!sig.hasRest, args, ctx, sig.resolvedParams);
 				ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 				return sig.result;
 			}
@@ -4907,7 +4922,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							// restriction, unaffected) -- `sig.defaults` is only ever populated when this closure's
 							// static TYPE (not necessarily its concrete value) declared a bare `p?: T` trailing
 							// param, same rest-packing as a plain named function's own call site either way.
-							emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx);
+							emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 							// The code pointer (funcref) is pushed last -- `call_ref` consumes it off the stack top, after every real argument.
 							ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 							return sig.result;
@@ -4937,7 +4952,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 									ctx.emit(I.call(wrapper!.funcIndex));
 									const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
 									ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-									emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx);
+									emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 									ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 									return sig.result;
 								}
@@ -5070,7 +5085,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						emitAs(e.callee, ctx, calleeWtype);
 						const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
 						ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-						emitCallArgs('<indexed closure>', sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx);
+						emitCallArgs('<indexed closure>', sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 						ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 						return sig.result;
 					}

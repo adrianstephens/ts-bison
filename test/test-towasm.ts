@@ -3181,6 +3181,31 @@ async function main() {
 	}
 
 	{
+		// A parameter default that reads an EARLIER parameter (`dstScope = scope`, all over type-utils.ts).
+		// The declaration side has always handled it, by binding each argument into a scratch local and
+		// rewriting the default's references to those; a function TYPE rejected it outright, because the
+		// `resolvedParams` that rewrite needs were assumed to be something only a real declaration has --
+		// no longer true once a type derived from a declaration keeps its defaults. Parameter NAMES join
+		// the closure-type memo key when this applies, since the rewrite is by name.
+		const { omitted, supplied, distinctNames } = await compile(`
+			function pick(a: number, b: number = a): number { return a * 10 + b; }
+			export function omitted(): number { const g: typeof pick = pick; return g(3); }
+			export function supplied(): number { const g: typeof pick = pick; return g(3, 4); }
+			// Same physical signature, same default TEXT, different parameter names: these must not share
+			// one memoized closure type, or the rewrite substitutes the wrong name.
+			function other(x: number, y: number = x): number { return x * 100 + y; }
+			export function distinctNames(): number {
+				const g: typeof pick = pick;
+				const h: typeof other = other;
+				return g(2) + h(5);
+			}
+		`);
+		check('function type: a default reading an earlier parameter, omitted', omitted(), 33);
+		check('function type: the same default, supplied', supplied(), 34);
+		check('function type: two signatures differing only in parameter names', distinctNames(), 527);
+	}
+
+	{
 		// Module-level state. A top-level `const`/`let` holding anything but a wasm compile-time constant --
 		// an array, an object, a string, a `new`, a call -- was visible to NOTHING but the top level itself:
 		// any function referencing it threw "unresolved identifier". `ensureLazyGlobal` already built exactly
