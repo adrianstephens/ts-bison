@@ -6814,7 +6814,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					if (isAsm(m.value))
 						inlineDecls.push({ key: m.key, value: m.value! });
 					else if (!m.modifiers?.includes('static'))
-						addField(info, m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, libGlobal) : undefined), !m.value && hasMod(m, 'optional'));
+						// Neither an annotation nor an initializer (`opts;`) -- the type lives only in the
+						// constructor's own `this.opts = ...`, which `classShapes` already infers. Ask the
+						// checker for the member rather than re-deriving it from the AST here.
+						addField(info, m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, libGlobal) : T.lookupMember(info.thisTsType, m.key, libGlobal)), !m.value && hasMod(m, 'optional'));
 
 				} else if (m.type === 'method') {
 					// A computed name can't be stored as a decl key -- and can never be called via `.name()` syntax either, so it's simply never reachable, no need to throw.

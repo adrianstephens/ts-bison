@@ -3171,6 +3171,32 @@ async function main() {
 	}
 
 	{
+		// A field with neither an annotation nor an initializer (`opts;`) -- its type exists only in the
+		// constructor's own `this.opts = ...`, which is what real TS infers it from. `classShapes` typed it
+		// `any` and towasm, which read the AST rather than asking the checker, threw outright.
+		const { scalar, objectShape, classInstance, fromParameter } = await compile(`
+			class P { constructor(public x: number) {} }
+			class N { n; constructor() { this.n = 5; } }
+			export function scalar(): number { return new N().n + 1; }
+			class O { p; constructor() { this.p = { a: 1, b: 2 }; } }
+			export function objectShape(): number { const o = new O(); return o.p.a + o.p.b; }
+			class Q { p; constructor() { this.p = new P(7); } }
+			export function classInstance(): number { return new Q().p.x; }
+			class V { v; constructor(v: number) { this.v = v; } }
+			export function fromParameter(): number { return new V(9).v; }
+		`);
+		check('field inference: a scalar assigned in the constructor', scalar(), 6);
+		check('field inference: an object literal', objectShape(), 3);
+		check('field inference: a class instance', classInstance(), 7);
+		check("field inference: from the constructor's own parameter", fromParameter(), 9);
+		// The inferred type is real, not `any` -- a later mismatched write is now an error, exactly as real
+		// tsc reports it (TS2322) for the same source.
+		check('field inference: a later mismatched write is rejected',
+			typeErrors(`class C { v; constructor() { this.v = 1; } m(): void { this.v = 'x'; } }`)
+				.some(e => /not assignable to type 'number'/.test(e)), true);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only

@@ -200,7 +200,11 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// call at the bottom -- that call already walks every member's `typeAnnotation` once, and installing the getter
 	// before it would make *that* walk the "first read", forcing inference right here (still mid-`hoist`, before
 	// later-in-file declarations like `__asm` are hoisted) instead of at whatever later, real, post-hoist read asks.
-	const pendingFieldInit: { prop: TS.TypeMember; init: Expr }[] = [];
+	const pendingFieldInit: { prop: TS.TypeMember; init: Expr | Expr[] }[] = [];
+	// Fields with neither an annotation nor an initializer: their type lives only in the constructor's own
+	// `this.x = ...`, which can't be read here because the constructor may come later in `c.body`. Resolved
+	// once the loop below has seen every member (`ctorMembers`), through the same lazy getter.
+	const pendingCtorInit: { prop: TS.TypeMember; key: string }[] = [];
 
 	for (const m of c.body) {
 		if (m.type === 'index_signature') {
@@ -216,7 +220,12 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 				// No annotation falls back to inferring the initializer's own *widened* type, matching real TS' own field-inference.
 				// Anything else (a call, `new`, ...) is queued into `pendingFieldInit`, resolved once the whole shape (and `hoist`'s later declarations
 				const lit = m.typeAnnotation ? undefined : T.literalTypeOf(m.value);
-				if (m.typeAnnotation || lit || !m.value) {
+				if (!m.typeAnnotation && !m.value && !hasMod(m, 'static')) {
+					// `x;` -- real TS infers such a field from the assignments its own constructor makes to it.
+					const prop = TS.TypeProperty(m.key, T.ANY, m.modifiers);
+					pendingCtorInit.push({ prop, key: m.key });
+					list.push(prop);
+				} else if (m.typeAnnotation || lit || !m.value) {
 					list.push(TS.TypeProperty(m.key, m.typeAnnotation ?? (lit && T.widenLiterals(lit)) ?? T.ANY, m.modifiers));
 				} else {
 					const prop = TS.TypeProperty(m.key, T.ANY, m.modifiers);
@@ -247,6 +256,18 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 				break;
 		}
 	}
+	// Every `this.<key> = <expr>` written directly in a constructor body. Only top-level statements of the
+	// body, not a nested closure's own assignments -- real TS looks wider, but this covers the shape that
+	// actually declares a field's type, without inferring from a callback that runs who-knows-when.
+	for (const { prop, key } of pendingCtorInit) {
+		const inits = ctorMembers.flatMap(ctor => (ctor.body ?? []).flatMap(st =>
+			st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '='
+			&& st.expression.left.type === 'member' && st.expression.left.object.type === 'this' && st.expression.left.property === key
+				? [st.expression.right] : []));
+		if (inits.length)
+			pendingFieldInit.push({ prop, init: inits });
+	}
+
 	const obj = TS.ObjectType(members);
 	// a base the checker can't model (mixin call, namespace member, imported class) leaves the instance unsealed; likewise an inherited constructor accepts any arguments.
 	// Own members come first: lookupMember's first match implements override precedence
@@ -279,7 +300,10 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 				if (resolving)
 					return T.ANY;
 				resolving = true;
-				const t = T.stampScope(T.widenLiterals(typeOf(init, scope) ?? T.ANY), scope);
+				const raw = Array.isArray(init)
+					? T.combineTypes(init.map(e => typeOf(e, scope) ?? T.ANY))
+					: typeOf(init, scope) ?? T.ANY;
+				const t = T.stampScope(T.widenLiterals(raw), scope);
 				Object.defineProperty(prop, 'typeAnnotation', { value: t, writable: true, enumerable: true, configurable: true });
 				return t;
 			},
