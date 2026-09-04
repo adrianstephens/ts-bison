@@ -274,7 +274,7 @@ export type Stmt =
 	| { type: 'assert'; test: Expr; msg?: Expr }
 	| { type: 'import'; names: Alias[] }
 	| { type: 'importfrom'; module?: string; level: number; names: Alias[] | '*' }
-	| { type: 'if'; test: Expr; body: Stmt[]; orelse: Stmt[] }
+	| { type: 'if'; test: Expr; consequent: Stmt[]; alternate: Stmt[] }
 	| { type: 'while'; test: Expr; body: Stmt[]; orelse: Stmt[] }
 	| { type: 'for'; target: Expr; iter: Expr; body: Stmt[]; orelse: Stmt[]; is_async: boolean }
 	| { type: 'with'; items: WithItem[]; body: Stmt[]; is_async: boolean }
@@ -772,11 +772,11 @@ else_opt = Rules<Stmt[]>(
 ),
 if_tail = Rules<Stmt[]>(self => [
 	Rule([],								() => []),
-	Rule([ELIF, namedexpr_test, ':', suite, self],	$ => [{ type: 'if', test: $[1], body: $[3], orelse: $[4] as Stmt[] }]),
+	Rule([ELIF, namedexpr_test, ':', suite, self],	$ => [{ type: 'if', test: $[1], consequent: $[3], alternate: $[4] as Stmt[] }]),
 	Rule([ELSE, ':', suite],				$ => $[2]),
 ]),
 if_stmt = Rules<Stmt>(
-	Rule(['if', namedexpr_test, ':', suite, if_tail],	$ => ({ type: 'if', test: $[1], body: $[3], orelse: $[4] })),
+	Rule(['if', namedexpr_test, ':', suite, if_tail],	$ => ({ type: 'if', test: $[1], consequent: $[3], alternate: $[4] })),
 ),
 while_stmt = Rules<Stmt>(
 	Rule(['while', namedexpr_test, ':', suite, else_opt],	$ => ({ type: 'while', test: $[1], body: $[3], orelse: $[4] })),

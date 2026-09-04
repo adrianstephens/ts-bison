@@ -113,14 +113,14 @@ export class Output {
 
 	// `else` / `elif` tail. A lone `if` in the `orelse` prints back as `elif` -- CPython's own
 	// unparser makes the same (irreversible either way) choice.
-	private elseChain(orelse: Stmt[]): string {
-		if (orelse.length === 0)
+	private elseChain(alternate: Stmt[]): string {
+		if (alternate.length === 0)
 			return '';
-		if (orelse.length === 1 && orelse[0].type === 'if') {
-			const e = orelse[0];
-			return this.newline + 'elif ' + this.expr(e.test) + this.suite(e.body) + this.elseChain(e.orelse);
+		if (alternate.length === 1 && alternate[0].type === 'if') {
+			const e = alternate[0];
+			return this.newline + 'elif ' + this.expr(e.test) + this.suite(e.consequent) + this.elseChain(e.alternate);
 		}
-		return this.newline + 'else' + this.suite(orelse);
+		return this.newline + 'else' + this.suite(alternate);
 	}
 	private elseClause(orelse: Stmt[]): string {
 		return orelse.length ? this.newline + 'else' + this.suite(orelse) : '';
@@ -152,7 +152,7 @@ export class Output {
 			case 'import':			return 'import ' + s.names.map(a => a.name + maybe(a.asname, n => ' as ' + n)).join(this.comma);
 			case 'importfrom':		return 'from ' + '.'.repeat(s.level) + (s.module ?? '') + ' import '
 				+ (s.names === '*' ? '*' : s.names.map(a => a.name + maybe(a.asname, n => ' as ' + n)).join(this.comma));
-			case 'if':				return 'if ' + this.expr(s.test) + this.suite(s.body) + this.elseChain(s.orelse);
+			case 'if':				return 'if ' + this.expr(s.test) + this.suite(s.consequent) + this.elseChain(s.alternate);
 			case 'while':			return 'while ' + this.expr(s.test) + this.suite(s.body) + this.elseClause(s.orelse);
 			case 'for':				return (s.is_async ? 'async ' : '') + 'for ' + this.exprList(s.target) + ' in ' + this.exprList(s.iter)
 				+ this.suite(s.body) + this.elseClause(s.orelse);

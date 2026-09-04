@@ -165,7 +165,7 @@ export function walk<T extends Walkable>(ast: T,
 			case 'throw':				return mapObject(s, {argument: mapExpression, cause: mapExpression});
 			case 'del':					return mapObject(s, {targets: mapExpressionA});
 			case 'assert':				return mapObject(s, {test: mapExpressionA, msg: mapExpression});
-			case 'if':
+			case 'if':					return mapObject(s, {test: mapExpressionA, consequent: mapStmts, alternate: mapStmts});
 			case 'while':				return mapObject(s, {test: mapExpressionA, body: mapStmts, orelse: mapStmts});
 			case 'for':					return mapObject(s, {target: mapExpressionA, iter: mapExpressionA, body: mapStmts, orelse: mapStmts});
 			case 'with':				return mapObject(s, {items: mapArrayA(withItem), body: mapStmts});
@@ -253,7 +253,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'throw':				return walkExpression(s.argument) || walkExpression(s.cause);
 			case 'del':					return walkExpression(s.targets);
 			case 'assert':				return walkExpression(s.test) || walkExpression(s.msg);
-			case 'if':
+			case 'if':					return walkExpression(s.test) || s.consequent.some(walkStatement) || s.alternate.some(walkStatement);
 			case 'while':				return walkExpression(s.test) || s.body.some(walkStatement) || s.orelse.some(walkStatement);
 			case 'for':					return walkExpression(s.target) || walkExpression(s.iter) || s.body.some(walkStatement) || s.orelse.some(walkStatement);
 			case 'with':				return s.items.some(withItem) || s.body.some(walkStatement);
