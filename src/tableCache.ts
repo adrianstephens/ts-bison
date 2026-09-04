@@ -37,14 +37,14 @@ export function makeCachedParser<T>(spec: GrammarSpec<T>, options: LALROptions, 
 
 	if (cached?.fingerprint === fingerprint) {
 		try {
-			return makeParser(spec, { prebuiltBuilder: g, prebuiltTables: deserializeTables(g, cached.tables) });
+			return makeParser(spec, { ...options, prebuiltBuilder: g, prebuiltTables: deserializeTables(g, cached.tables) });
 		} catch {
 			// stale/corrupt cache content despite a matching fingerprint (e.g. hand-edited) -- rebuild
 		}
 	}
 
 	// No `tables` given: makeParser builds and (unless `spec.optimize === false`) optimizes them itself.
-	const parser = makeParser(spec, { prebuiltBuilder: g });
+	const parser = makeParser(spec, { ...options, prebuiltBuilder: g });
 	try {
 		const json = JSON.stringify({ fingerprint, tables: serializeTables(g, parser.tables) });
 		fs.mkdirSync(path.dirname(cachePath), { recursive: true });
