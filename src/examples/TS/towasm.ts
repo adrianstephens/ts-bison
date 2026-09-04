@@ -1730,17 +1730,31 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return d?.init ? classRefTarget(d.init, scope, seen) : undefined;
 	}
 
-	function lazyGlobalFor(name: string, ctx: FunctionContext) {
-		const varStmt	= ctx.scope.decl(name);
+	// `scope`: where to resolve `name` -- the reading function's own by default, or an `import * as NS`
+	// namespace's own scope for an `NS.name` read, which is the same module-level const reached by its
+	// qualified name (`case 'member'`).
+	function lazyGlobalFor(name: string, ctx: FunctionContext, scope: Scope = ctx.scope) {
+		const varStmt	= scope.decl(name);
 		const own		= varStmt?.type === 'var_decl'
 			? { stmt: varStmt as TS.Stmt, d: varStmt.declarations.find(d => d.name === name) }
-			: topLevelVars.get(name);
+			: scope === ctx.scope ? topLevelVars.get(name) : undefined;
 		if (!own?.d)
 			return undefined;
 		const homeModule	= stmtHomeModule.get(own.stmt) ?? ctx.homeModule;
-		const wrapper		= ensureLazyGlobal(name, homeModule, own.d, ctx.scope);
+		const wrapper		= ensureLazyGlobal(name, homeModule, own.d, scope);
 		const slot			= lazyGlobalSlots.get(homeKey(homeModule, name));
 		return wrapper && slot ? { wrapper, slot } : undefined;
+	}
+
+	// A top-level `const` that is only another name for something already declared elsewhere: a class
+	// (`const Scope = T.Scope`) or a cross-module binding (`const I = wasm.I`). Such a declaration has no
+	// module-init effect of its own -- every read of it resolves through `ensureClass`/`lazyGlobalFor` to
+	// the real declaration -- so the start function emits nothing for it. Evaluating it there would instead
+	// demand a physical representation for the referenced value in EVERY module that declares such an
+	// alias, whether or not anything in it ever reads the name.
+	function isAliasInit(e: Expr, scope: Scope): boolean {
+		return !!classRefTarget(e, scope)
+			|| (e.type === 'member' && e.object.type === 'identifier' && !!scope.namespace(e.object.name));
 	}
 
 	function addData(newdata: Uint8Array, align = 1): number {
@@ -4171,6 +4185,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						if (!f || f.type !== 'field' || !f.value)
 							throw `unknown static field '${owner.name}.${e.property}'`;
 						return emitExpr(f.value, ctx);
+					}
+					// `NS.someConst` -- another module's module-level const, through `import * as NS`. The same
+					// lazy wrapper a bare identifier read of one already uses, just resolved in the namespace's
+					// own scope. Only when nothing local shadows the namespace name.
+					const ns = ctx.lookup(e.object.name) ? undefined : ctx.scope.namespace(e.object.name);
+					if (ns) {
+						const lazy = lazyGlobalFor(e.property, ctx, ns);
+						if (lazy) {
+							ctx.emit(I.call(lazy.wrapper.funcIndex));
+							return lazy.wrapper.result;
+						}
 					}
 				}
 
@@ -7984,10 +8009,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl' || st.type === 'interface_decl' || st.type === 'import')
 				return;
 			if (st.type === 'var_decl') {
-				// A promoted const is already a real function; a class alias (`const Scope = T.Scope`) has no
-				// runtime value at all -- neither leaves anything for the start function to evaluate.
+				// A promoted const is already a real function; an alias (`const Scope = T.Scope`, `const I =
+				// wasm.I`) only renames something declared elsewhere -- see `isAliasInit`. Neither leaves
+				// anything for the start function to evaluate.
 				const declarations = st.declarations.filter(d => typeof d.name !== 'string'
-					|| !(promotedConsts.has(d.name) || (d.init && classRefTarget(d.init, ctx.scope))));
+					|| !(promotedConsts.has(d.name) || (d.init && isAliasInit(d.init, ctx.scope))));
 				if (!declarations.length)
 					return;
 				if (declarations.length !== st.declarations.length) {

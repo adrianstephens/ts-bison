@@ -5147,6 +5147,24 @@ async function main() {
 	}
 
 	{
+		// `NS.someConst` -- another module's module-level const, read through `import * as NS`. Only a bare
+		// identifier read reached `ensureLazyGlobal` before, so the qualified form threw `unknown field`.
+		// The local `const A = NS.pair` beside it is a pure alias: it renames a cross-module binding, so the
+		// start function must emit nothing for it and the read must still resolve.
+		const { direct, viaAlias } = await compileMulti({
+			consts: `export const pair = [3, 4]; export const greeting = 'hi';`,
+			mainFile: `
+				import * as C from './consts';
+				const A = C.pair;
+				export function direct(): number { return C.pair[0] + C.pair[1] + C.greeting.length; }
+				export function viaAlias(): number { return A[1]; }
+			`,
+		}, 'mainFile');
+		check('multi-file: a namespace-qualified module-level const reads', direct(), 9);
+		check('multi-file: a const aliasing a cross-module binding reads', viaAlias(), 4);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
