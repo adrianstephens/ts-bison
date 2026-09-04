@@ -96,6 +96,7 @@ const forkGrammar = (forkCtx?: (ctx: any) => any) => {
             Rule([A, 'x', 'p'] as const, (_, ctx) => ({...ctx})),
             Rule([B, 'x', 'q'] as const, (_, ctx) => ({...ctx})),
         ),
+    }, {
         forkCtx,
     });
 };
