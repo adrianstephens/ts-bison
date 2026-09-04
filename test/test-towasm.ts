@@ -3033,6 +3033,42 @@ async function main() {
 	}
 
 	{
+		// A scalar-typed optional field used to keep a bare `f64`/`i32` slot with a zero default, so there
+		// was no "absent" distinct from `0` -- `??=` threw outright, and an unassigned `n?: number` silently
+		// read back as `0` rather than `undefined`. It now gets the same null-boxing an optional *parameter*
+		// already got. `??=` not firing on a stored `0` is the whole point: `0` is falsy but not nullish.
+		const { creates, keepsZero, absentIsUndefined, coalesce, arithmetic, optionalBoolean, optionalBigint } = await compile(`
+			class H { n?: number; b?: boolean; g?: bigint; constructor() {} }
+			export function creates(): number { const h = new H(); h.n ??= 4; return h.n; }
+			export function keepsZero(): number { const h = new H(); h.n = 0; h.n ??= 4; return h.n; }
+			export function absentIsUndefined(): number { return new H().n === undefined ? 1 : 0; }
+			export function coalesce(): number {
+				const h = new H();
+				const before = h.n ?? 7;
+				h.n = 2;
+				return before * 10 + (h.n ?? 7);
+			}
+			export function arithmetic(): number { const h = new H(); h.n = 5; return h.n + 1; }
+			export function optionalBoolean(): number {
+				const h = new H();
+				const before = h.b === undefined ? 1 : 0;
+				h.b = true;
+				return before * 10 + (h.b ? 1 : 0);
+			}
+			// bigint's physical form is an i32 array, so an optional one lands on the nullable-target
+			// path of the i64-to-bigint conversion -- which used to compare nullability and give up.
+			export function optionalBigint(): number { const h = new H(); h.g = 5n; return h.g === 5n ? 1 : 0; }
+		`);
+		check("optional scalar field: '??=' creates a value when absent", creates(), 4);
+		check("optional scalar field: '??=' does NOT overwrite a stored 0", keepsZero(), 0);
+		check('optional scalar field: unassigned reads back as undefined, not 0', absentIsUndefined(), 1);
+		check("optional scalar field: '??' before and after assignment", coalesce(), 72);
+		check('optional scalar field: unboxes for ordinary arithmetic', arithmetic(), 6);
+		check('optional scalar field: an optional boolean', optionalBoolean(), 11);
+		check('optional scalar field: an optional bigint assigns from an i64 literal', optionalBigint(), 1);
+	}
+
+	{
 		// Tuple arrays (`[K,V][]`) -- no dedicated physical representation of their own, just the same
 		// boxed 'ref'-kind ("everything else") array storage already used for `any[]`/mixed-type
 		// arrays; the checker already fully tracks each element's own precise type, codegen only

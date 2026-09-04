@@ -2739,7 +2739,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			}
 		}
 		// generate bigint -- must track `bigint`'s own physical representation (`builtinTypes.bigint.wtype`, currently `{arr:'u32'}`, see `lib/bigint.ts`), not assume a fixed `{arr:'i32'}`.
-		if (wasmTypeEq(want, ARR_WTYPE.i32)) {
+		// Nullability is ignored: a `bigint | undefined` slot takes the freshly-built array exactly as a
+		// plain `bigint` one does, since a non-nullable `(ref array)` is already a subtype of it.
+		if (wasmTypeEq(typeof want === 'object' && want.nullable ? { ...want, nullable: false } : want, ARR_WTYPE.i32)) {
 			const array = I.array(ensureArrayType('i32'));
 
 			switch (got) {
@@ -6439,6 +6441,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// `emitDefaultValue` with no `.nullable` needed -- only a real, non-`any` object/array/closure kind
 		// needs the wrap.
 		if (optional && typeof wt === 'object' && !wt.nullable && !('ref' in wt && wt.ref === 'any'))
+			wt = nullableWtype(wt);
+		// A scalar-typed one needs the same null-boxing an optional *parameter* already gets: without it
+		// there's no "absent" distinct from `0`/`false`, so `??=` and `=== undefined` can't work at all
+		// (and an unassigned `n?: number` silently read back as `0`). Only `f64`/`i32` have a box.
+		if (optional && (wt === 'f64' || wt === 'i32'))
 			wt = nullableWtype(wt);
 		if (info.fieldIndex.has(key))
 			throw `field '${key}' redeclares an inherited field -- not supported`;
