@@ -1410,16 +1410,16 @@ export function makeLibScope(): Scope {
 // `modules`: every other loaded module (canonical path -> its own top-level statements) reachable from
 // `ast` -- built by the caller (see `module-loader.ts`'s `collectModules`) via the same `ModuleLoader` the
 // checking pass already resolved against, since `TStoWasm` has no loader of its own and no async boundary
-// to load one lazily. `namespaceImports`: for each module (by canonical path, keyed the same way), its own
-// `import * as X from '...'` local bindings, each mapped to the target module's canonical path -- lets a
-// namespace-qualified call (`X.foo(...)`) resolve `foo` against the right module's own declarations
-// instead of the calling module's. `namedImports`: the same, for a plain `import { foo } from '...'` (or
-// `import { foo as bar } from '...'`) -- the *local* name maps to `{module, name}`, the target module's own
-// canonical path plus the name it's actually declared under there (which may differ from the local alias).
+// to load one lazily. `namedImports`: for each module (by canonical path, keyed the same way), its own
+// plain `import { foo } from '...'` (or `import { foo as bar } from '...'`) bindings -- the *local* name
+// maps to `{module, name}`, the target module's own canonical path plus the name it's actually declared
+// under there (which may differ from the local alias). An `import * as X from '...'` needs no such map:
+// the checker already binds `X` to the target module's own `Scope` (`Scope.addNamespace`), which carries
+// both the declarations (`Scope.decl`) and, via `stmtHomeModule`, which module each came from.
 // Only top-level *functions* are seeded/resolved across modules this way today -- a cross-module class or
 // scalar global reference is still unsupported (throws a clear, unrelated error), a real, separate,
 // not-yet-attempted follow-on.
-export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, namespaceImports?: Map<string, Map<string, string>>, namedImports?: Map<string, Map<string, { module: string; name: string }>>): wasm.WasmModule {
+export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, namedImports?: Map<string, Map<string, { module: string; name: string }>>): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new TSWError('ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
@@ -1448,14 +1448,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// functions are stored under `homeKey(canonical, name)` instead, so a same-named function in two
 	// different files never collides in this (or `funcs`') shared cache.
 	const moduleBodies			= new Map<string, TS.Stmt[]>([['.', ast.body], ...(modules ?? [])]);
-	const namespaceImportsByModule = namespaceImports ?? new Map<string, Map<string, string>>();
 	const namedImportsByModule = namedImports ?? new Map<string, Map<string, { module: string; name: string }>>();
-	// Recovers a top-level statement's own home module string -- `Scope.decl(name)` (via `declScope`) gives
-	// back the real declaration object directly, but a plain `var_decl` (unlike a function/class, both
-	// already `homeKey`-scoped via `functionDeclByName`/per-module `classes`) has no other module-scoped
-	// registration at all, so a consumer needing to compile ITS OWN cross-module references correctly
-	// (`ensureLazyGlobal`'s own `FunctionContext.homeModule`) has no other way to recover which module it
-	// came from. Populated once, below, in the same pass that already visits every module's own statements.
+	// Recovers a top-level statement's own home module string -- `Scope.decl(name)` (via `declScope`, or via
+	// `Scope.namespace` for an `import * as X`) gives back the real declaration object directly, but a
+	// declaration alone doesn't say which file it came from, and a plain `var_decl` (unlike a function/class,
+	// both already `homeKey`-scoped via `functionDeclByName`/per-module `classes`) has no module-scoped
+	// registration at all. Consumers needing to compile a cross-module reference correctly (a
+	// namespace-qualified call's own target module, `ensureLazyGlobal`'s own `FunctionContext.homeModule`)
+	// pair the two. Populated once, below, in the same pass that already visits every module's own statements.
 	const stmtHomeModule		= new Map<TS.Stmt, string>();
 	// The entry module's top-level `const`/`let` declarators, by name -- see the `moduleBodies` scan's own
 	// comment on why `Scope.decl` can't answer this for the entry module.
@@ -5034,7 +5034,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						// `functionDeclByName` directly, not `resolveDecl` -- a namespace-qualified reference must
 						// only ever match what the *target module itself* actually declares, never spuriously
 						// fall back to an unrelated same-named `LIB_DECL_MAP` global.
-						const nsTarget = namespaceImportsByModule.get(ctx.homeModule)?.get(obj.name);
+						const nsDecl	= ctx.scope.namespace(obj.name)?.decl(e.callee.property);
+						const nsTarget	= nsDecl && stmtHomeModule.get(nsDecl);
 						if (nsTarget !== undefined && functionDeclByName.has(homeKey(nsTarget, e.callee.property)))
 							return emitCall(e.callee.property, e.arguments, ctx, typeArgs, undefined, nsTarget);
 						const owner = namespaceOwner(obj.name, ctx);

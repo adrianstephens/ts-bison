@@ -197,8 +197,8 @@ async function compile(filein: string, fileout: string, wat = false) {
 	// resolves to the declaring file's own AST, not just its checked type. Only a plain top-level
 	// *function* declared in another module is supported this way today -- a cross-module class/scalar
 	// global still isn't; that throws a clear, specific error from `TStoWasm` rather than miscompiling.
-	const { modules, namespaceImports, namedImports } = await collectModules(program.body, loader);
-	const mod		= TStoWasm(program, modules, namespaceImports, namedImports);
+	const { modules, namedImports } = await collectModules(program.body, loader);
+	const mod		= TStoWasm(program, modules, namedImports);
 	if (wat)
 		console.log(mod.toWAT({expandTypes: true, hexFloats: false}));
 

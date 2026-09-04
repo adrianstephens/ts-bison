@@ -54,7 +54,7 @@ async function compile(src: string) {
 	return instantiate(mod.toBytes());
 }
 
-// Real multi-file codegen (`TStoWasm`'s `modules`/`namespaceImports` params) needs a real `ModuleLoader`
+// Real multi-file codegen (`TStoWasm`'s `modules`/`namedImports` params) needs a real `ModuleLoader`
 // resolving real files -- an in-memory `parser.parse(src)` string, unlike `compile()` above, has no file
 // system location for a relative `import` to resolve against. `files`: every module's own source, keyed
 // by its filename (no `.ts` extension) relative to a fresh temp directory; `entry` names which one is the
@@ -75,8 +75,8 @@ async function compileMulti(files: Record<string, string>, entry: string) {
 		if (errors.length)
 			throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
 
-		const { modules, namespaceImports, namedImports } = await collectModules(program.body, loader);
-		const mod = TStoWasm(program, modules, namespaceImports, namedImports);
+		const { modules, namedImports } = await collectModules(program.body, loader);
+		const mod = TStoWasm(program, modules, namedImports);
 		console.log(mod.toWAT({expandTypes: true, hexFloats: false}));
 		return instantiate(mod.toBytes());
 	} finally {
@@ -4933,8 +4933,8 @@ async function main() {
 		// `collectNames` used to only ever walk the single entry `Program`'s own top-level statements, so
 		// a namespace-import-qualified call to another module's function had no AST body to compile against
 		// (the checker resolves its *type* fine via `ModuleLoader`, but codegen needs the callee's real
-		// declaration). `modules`/`namespaceImports` (built by `collectModules`, the same loader-driven walk
-		// `tsw.ts`'s own CLI uses) close that gap for a plain top-level function.
+		// declaration). `modules` (built by `collectModules`, the same loader-driven walk `tsw.ts`'s own CLI
+		// uses) closes that gap; `H` itself resolves through the checker's own `Scope.namespace`.
 		const { main } = await compileMulti({
 			helperFile: `
 				export function helper(a: number, b: number): number {
@@ -4999,6 +4999,27 @@ async function main() {
 			`,
 		}, 'mainFile');
 		check('multi-file: a closure nested inside a cross-module function resolves its own module\'s names', main(), 15);
+	}
+
+	{
+		// A namespace import in a NON-entry module (`mid` does `import * as D from './deep'`, and the entry
+		// only ever reaches `mid` by a plain named import). The namespace binding resolves through the
+		// checker's own `Scope.addNamespace`, reached from the compiled body's `declScope` chain -- so this
+		// covers the case where the entry module's own scope has never seen `D` at all.
+		const { main } = await compileMulti({
+			deep: `
+				export function twice(n: number): number { return n * 2; }
+			`,
+			mid: `
+				import * as D from './deep';
+				export function go(x: number): number { return D.twice(x) + 1; }
+			`,
+			mainFile: `
+				import { go } from './mid';
+				export function main(): number { return go(5); }
+			`,
+		}, 'mainFile');
+		check('multi-file: a namespace import inside a non-entry module resolves through its own scope', main(), 11);
 	}
 
 	{
