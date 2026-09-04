@@ -106,12 +106,28 @@ export function Manual<T>(name: string, trigger: RegExp, fn: (remaining: string,
 	return term;
 }
 
+// A syntactic predicate: matches (or, negated, refuses to match) `sym` without consuming any input.
+// PEG-only -- there's no LR equivalent, so `buildTables` rejects a grammar containing one.
+export class Predicate<T = undefined> {
+	declare readonly _value: T;	// phantom: only carries the predicate's value type for `ElemValue`
+	constructor(public negate: boolean, public sym: GrammarSym) {}
+}
+// `&sym`: succeeds where `sym` would, consuming nothing. Its value is `sym`'s.
+export function And<const S extends GrammarSym>(sym: S) {
+	return new Predicate<ElemValue<S>>(false, sym);
+}
+// `!sym`: succeeds exactly where `sym` would fail, consuming nothing. Its value is always `undefined`.
+export function Not(sym: GrammarSym) {
+	return new Predicate(true, sym);
+}
+
 export type Action<T, C = any, A = any[]> = (values: WithTextPos<A>, ctx: C) => T
-type GrammarSym<C = any> = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Action<any, C>;
+type GrammarSym<C = any> = string | RegExp | Terminal | Rules<any> | (()=>Rules<any>) | Ref<any> | Predicate<any> | Action<any, C>;
 
 export type ElemValue<S> = S extends Rule2<infer U>[] ? U
 	: S extends RegExp ? string
 	: S extends Terminal<infer U> ? U
+	: S extends Predicate<infer U> ? U
 	: S extends (()=>infer U) ? ElemValue<U>
 	: S extends Ref<infer U> ? U
 	: S extends string ? S
@@ -243,14 +259,22 @@ export interface Parser<T, C = any> {
 //  Internal representation
 // ===================================================================
 
-class NonTerminal {
+/** @internal */
+export class NonTerminal {
 	constructor(public name: string) {}
 }
 
-type InternalSym = Terminal | NonTerminal;
+/** @internal */
+export class InternalPredicate {
+	constructor(public negate: boolean, public sym: InternalSym) {}
+	get name(): string { return (this.negate ? '!' : '&') + this.sym.name; }
+}
 
-const EOF		= new Terminal('$end');
-const ERROR		= new Terminal('$error');
+/** @internal */
+export type InternalSym = Terminal | NonTerminal | InternalPredicate;
+
+/** @internal */ export const EOF	= new Terminal('$end');
+/** @internal */ export const ERROR	= new Terminal('$error');
 const ACCEPT	= new NonTerminal('$accept');
 const identityAction: Action<unknown> = values => values[0];
 
@@ -311,9 +335,10 @@ export class GrammarBuilder {
 	alwaysTerminals:	Terminal[] = [];
 	alwaysSkip:			Terminal[] = [];
 	terminalsByName	= new Map<string, Terminal>();
+	/** @internal */ hasPredicates = false;	// grammar uses And()/Not(), so it's PEG-only
 
 	private first	= new Map<InternalSym, { terms: Set<Terminal>; nullable: boolean }>();
-	private startSymbol: NonTerminal;
+	/** @internal */ readonly startSymbol: NonTerminal;
 
 	constructor(spec: GrammarSpec<any>) {
 		const rules = [
@@ -387,13 +412,23 @@ export class GrammarBuilder {
 
 		// -- Discover non-terminals -----------------------------------
 
-		const resolveSym = (sym: GrammarSym, i: number) =>
+		const resolveSym = (sym: GrammarSym, i: number): InternalSym =>
 			typeof sym === 'string'		? nonTerminalsByName.get(sym) ?? internTerminal(sym, new RegExp(literalPattern(sym)))
 			: typeof sym === 'function'	? (has0args(sym) ? internByRules(sym()) : anon(sym, i))
 			: sym instanceof RegExp		? internTerminal(sym.source, sym)
 			: sym instanceof Terminal	? this.terminalsByName.get(sym.name) ?? addTerminal(sym)
+			: sym instanceof Predicate	? predicate(sym, i)
 			: 'ref' in sym				? nonTerminalsByName.get(sym.ref)!
 			: internByRules(sym)!;
+
+		// A predicate consumes nothing, so it contributes nothing to FIRST and is trivially nullable --
+		// enough to keep the fixed point below well-defined; `buildTables` rejects the grammar outright.
+		const predicate = (p: Predicate<any>, i: number) => {
+			const ip = new InternalPredicate(p.negate, resolveSym(p.sym, i));
+			this.first.set(ip, { terms: new Set(), nullable: true });
+			this.hasPredicates = true;
+			return ip;
+		};
 
 		for (const r of rules) {
 			const lhs = nonTerminalsByRules.get(r)!;
@@ -465,6 +500,11 @@ export class GrammarBuilder {
 	// `lalr: false` falls back to plain FOLLOW(lhs)-based SLR(1) lookaheads (weaker: more spurious
 	// conflicts, but no correctness difference since conflicts still resolve via precedence/GLR either way).
 	buildTables(lalr = true): ParseTables {
+		if (this.hasPredicates) {
+			const bad = this.rules.find(r => r.rhs.some(s => s instanceof InternalPredicate))!;
+			throw new Error(`And()/Not() are PEG-only and have no LR equivalent (rule '${bad.lhs.name} -> ${bad.rhs.map(s => s.name).join(' ')}'); build this grammar with makePegParser() instead`);
+		}
+
 		interface LR0Item { rule: number; dot: number; }
 		const lr0Key = (i: LR0Item) => `${i.rule}:${i.dot}`;
 
@@ -539,7 +579,7 @@ export class GrammarBuilder {
 			for (const rule of this.rules) {
 				for (let i = 0; i < rule.rhs.length; i++) {
 					const sym = rule.rhs[i];
-					if (sym instanceof Terminal)
+					if (!(sym instanceof NonTerminal))
 						continue;
 					const followSym = follow.get(sym)!;
 
@@ -654,7 +694,7 @@ export class GrammarBuilder {
 			for (const [sym, target] of lr0Trans[s]) {
 				if (sym instanceof Terminal)
 					this.setAction(action[s], sym, sym === EOF ? { kind: 'accept' } : { kind: 'shift', state: target }, s, shiftRule[s].get(sym)?.prec, conflicts);
-				else
+				else if (sym instanceof NonTerminal)
 					goto[s].set(sym, target);
 			}
 			for (const item of lr0States[s]) {
@@ -745,11 +785,13 @@ export class GrammarBuilder {
 //  Parser runtime
 // ===================================================================
 
-function getTextPos(x: TextPos) {
+/** @internal */
+export function getTextPos(x: TextPos) {
 	return {offset: x.offset, line: x.line, col: x.col };
 }
 
-function advancePos(state: TextPos, text: string) {
+/** @internal */
+export function advancePos(state: TextPos, text: string) {
 	for (const ch of text) {
 		if (ch === '\n') {
 			state.line++;
@@ -787,7 +829,8 @@ export function sameValue(a: unknown, b: unknown): boolean {
 	return keysA.length === Object.keys(b).length && keysA.every(k => sameValue((a as any)[k], (b as any)[k]));
 }
 
-function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: TextPos & { prev?: Token }, ctx: any, resolveSym: (sym: Token<any>|Terminal|string|RegExp|undefined) => Token<any>|Terminal|undefined): Token<any> {
+/** @internal */
+export function nextToken(allowed: Map<Terminal, ActionEntry>, input: string, state: TextPos & { prev?: Token }, ctx: any, resolveSym: (sym: Token<any>|Terminal|string|RegExp|undefined) => Token<any>|Terminal|undefined): Token<any> {
 
 	while (state.offset < input.length) {
 		const pos = getTextPos(state);
@@ -1360,7 +1403,10 @@ export function deserializeTables(g: GrammarBuilder, s: SerializedTables): Parse
 // and is naturally versioned via TABLE_FORMAT_VERSION for engine-side algorithm changes.
 export function grammarFingerprint(g: GrammarBuilder, spec: GrammarSpec<any>): unknown {
 	const ntIndex = indexNonTerminals(g);
-	const symKey = (sym: InternalSym) => sym instanceof Terminal ? `t:${sym.name}` : `n:${ntIndex.get(sym)}`;
+	const symKey = (sym: InternalSym): string =>
+		sym instanceof Terminal				? `t:${sym.name}`
+		: sym instanceof InternalPredicate	? `p:${sym.negate ? '!' : '&'}${symKey(sym.sym)}`
+		: `n:${ntIndex.get(sym)}`;
 	return {
 		version:			TABLE_FORMAT_VERSION,
 		lalr:				spec.lalr ?? true,
@@ -1435,3 +1481,7 @@ export function makeParser<T>(spec: GrammarSpec<T>, prebuilt?: { g: GrammarBuild
 		}
 	};
 }
+
+// PEG back end (recursive descent over the same grammar values); kept last so the re-export
+// resolves after this module's own declarations are in place.
+export * from './peg';

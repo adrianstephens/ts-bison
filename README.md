@@ -24,10 +24,10 @@ There's no shortage of JS/TS parser generators -- tison's particular combination
 - **[Jison](https://github.com/zaach/jison)** is the closest precedent (LALR(1), Bison-style precedence, integrated lexer) but is largely unmaintained, and its lexer has nothing like tison's `Terminal.lex`/state-restricted-lexing hooks for context-sensitive tokens.
 - **[Chevrotain](https://chevrotain.io/)** is the closest peer for "define the grammar as TS code, no build step" -- but it's a hand-rolled LL(k)/CST-builder under the hood, not LR tables, and ambiguity is handled via explicit backtracking/gates rather than GLR forking.
 - **[nearley](https://nearley.js.org/)** also embraces ambiguity (it returns every parse) via Earley parsing, but grammars are `.ne` files compiled to JS, not a TS value you construct and call directly.
-- **[Peggy](https://peggyjs.org/)** (the maintained PEG.js fork) is by far the most widely used JS parser generator, but PEG's ordered-choice semantics are a different tool for a different problem shape -- no real notion of ambiguity to resolve.
+- **[Peggy](https://peggyjs.org/)** (the maintained PEG.js fork) is by far the most widely used JS parser generator, but grammars are a `.pegjs` file compiled to JS, and PEG's ordered choice is the only semantics on offer. tison [has a PEG back end too](#the-peg-back-end) -- the same grammar value, read either way.
 - **[lezer](https://lezer.codemirror.net/)** is GSS-based like tison's GLR fallback, but built for incremental/editor reparsing (it's CodeMirror 6's parser), and its grammars are still a separate `.grammar` file run through a generator.
 
-tison's niche: SLR(1) tables with GLR forking used only on the specific `(state, token)` pairs that are genuinely ambiguous, a grammar that's a plain TS value rather than a generated file, and a lexer wired directly into the parser's own state (the `allowed`-row trick) instead of a separate phase.
+tison's niche: SLR(1) tables with GLR forking used only on the specific `(state, token)` pairs that are genuinely ambiguous, a grammar that's a plain TS value rather than a generated file, a lexer wired directly into the parser's own state (the `allowed`-row trick) instead of a separate phase -- and, for the same grammar value, an alternative PEG back end.
 
 ## Usage
 
@@ -73,6 +73,7 @@ A few things to note:
   - **State-restricted lexing** -- when several terminals' patterns could all match at the current position, the parser's own current set of valid actions narrows the choice. This is enough to parse template-literal interpolations (`` `${ {a:1}.a} ` ``) correctly with no explicit brace-depth counter anywhere -- the grammar state itself already knows which `}` is which.
 - **`GrammarSpec.recover`** -- a single error-recovery hook: if the real lookahead has no action, it's handed the state's valid actions and the offending token, and can substitute a different token to retry with. This is enough to implement ECMAScript-style automatic semicolon insertion as pure userland policy.
 - **Precedence and associativity**, Bison-style: named levels, rules opt in, conflicts resolved automatically.
+- **Two back ends over one grammar.** `makeParser` builds LR tables; `makePegParser` reads the same spec as a parsing expression grammar instead.
 
 ### Handling ambiguity: GLR on demand
 
@@ -80,12 +81,66 @@ Most grammars are unambiguous almost everywhere, with at most a handful of genui
 
 Where two paths converge on the same parser state, their values are combined with a merge function (`tison(spec, mergeFns)`, keyed by table state) -- by default, into an array of all the surviving interpretations.
 
+### The PEG back end
+
+`makePegParser(spec)` takes the *same* `GrammarSpec` value as `makeParser` and returns a packrat
+recursive-descent parser instead of LR tables. A nonterminal's alternatives become an **ordered choice**
+-- the first one that matches wins, outright -- so there is no such thing as a conflict, and nothing to
+resolve with precedence, GLR or lookahead.
+
+```ts
+import { makePegParser, Rules, Rule, MaybeList, Not, And, pegDiagnostics } from '@isopodlabs/tison';
+
+const parser = makePegParser(spec);
+parser.parse('3 + 4 * 5');
+```
+
+Everything about the grammar surface carries over unchanged: `Rule`/`Rules`/`List`/`Maybe`, terminals as
+regexes, `Terminal.lex` callbacks, `Manual()` islands, `skip`, and semantic actions (same `$[i]`, same
+`ctx`). Two things are new:
+
+- **`And(sym)` / `Not(sym)`** -- syntactic predicates. They match (or, negated, refuse to match) without
+  consuming anything: `Rule([Not('if'), IDENT])` is the classic "an identifier, but not that keyword"
+  guard. There's no LR equivalent, so `makeParser` rejects a grammar containing one.
+- **`lex: 'direct'`** -- match only the terminal the grammar is currently asking for, i.e. true scannerless
+  PEG, letting ordered choice decide what a piece of text is. The default, `'maxmunch'`, lexes one token
+  from all the grammar's terminals with longest-match-wins, exactly like the LR back end (so a keyword
+  still beats an identifier without a `Not()` guard) -- minus its narrowing of the candidate set by parser
+  state, which is the one lexer feature that has no PEG counterpart.
+
+**Left recursion and precedence still work.** Naive PEG can't express `expr -> expr '+' expr` at all, and
+has no notion of precedence levels. tison's PEG back end handles direct left recursion by seed growing,
+with the spec's `precedence` levels driving it as precedence climbing -- so the arithmetic grammar at the
+top of this README parses identically under both back ends, associativity and all. *Indirect* left
+recursion (a cycle through another nonterminal) is the one thing it can't do; it's detected up front and
+reported rather than recursing forever.
+
+**What to watch for when reusing an LR grammar.** Alternative order is irrelevant to LR and decisive
+here, so `pegDiagnostics(spec)` reports what changes meaning, without building a parser:
+
+```ts
+pegDiagnostics(spec);
+// [ "warning: 'decl -> IDENT' shadows the later 'decl -> IDENT = expr': under ordered choice
+//    the first match wins, so put the longer alternative first" ]
+```
+
+It returns `error:` entries (left recursion the back end can't express -- `makePegParser` throws on these)
+and `warning:` entries (an alternative that ordered choice makes unreachable -- these still build, because
+that really is what PEG does). An empty list means the grammar carries over as-is.
+
+Two smaller differences: semantic actions run **speculatively** (an alternative that matches and is then
+abandoned has already run its actions, so an action must not mutate anything but its return value), and
+`$.pos` is the start of the matched text rather than the LR back end's following-token position.
+`recover`, `merge`, `forkCtx`, `lalr` and `optimize` are LR-only and ignored.
+
+
 ## Examples
 
 The package itself ships just the library -- these live in the [repository](https://github.com/adrianstephens/ts-bison)'s `test/` folder, not in the npm package, in increasing order of size:
 - [`test-tison.ts`](https://github.com/adrianstephens/ts-bison/blob/main/test/test-tison.ts) -- a minimal arithmetic expression grammar.
 - [`c-parser.ts`](https://github.com/adrianstephens/ts-bison/blob/main/test/c-parser.ts) -- a C grammar.
 - [`js-parser.ts`](https://github.com/adrianstephens/ts-bison/blob/main/test/js-parser.ts) -- a JavaScript grammar covering the full statement and expression grammar, including destructuring, classes, generators, async/await, modules, and more -- the proving ground for tison's lexer extension points.
+- [`test-peg.ts`](https://github.com/adrianstephens/ts-bison/blob/main/test/test-peg.ts) -- the PEG back end, including a JSON grammar and the arithmetic grammar above run through both back ends.
 
 ## License
 
