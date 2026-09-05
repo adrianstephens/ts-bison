@@ -63,21 +63,27 @@ export function join(...parts: string[]): string {
 export function dirname(p: string): string {
 	if (p.length === 0)
 		return '.';
-	const absolute = p.charCodeAt(0) === 47;
-	const min = absolute ? 1 : 0;
-
-	let end = p.length;
-	while (end > min && p.charCodeAt(end - 1) === 47)
-		end--;
-	let i = end;
-	while (i > min && p.charCodeAt(i - 1) !== 47)
-		i--;
-	while (i > min && p.charCodeAt(i - 1) === 47)
-		i--;
-
-	if (i === 0)
-		return absolute ? '/' : '.';
-	return p.slice(0, i);
+	const hasRoot = p.charCodeAt(0) === 47;
+	// node's own scan, and worth keeping literally: it takes the FIRST slash above the trailing run and
+	// does NOT collapse a run below it, so `dirname('a//b')` is `'a/'` and `dirname('a///b//c')` is
+	// `'a///b/'`. Collapsing (the obvious reading) disagrees with node on every repeated separator.
+	let end = -1;
+	let matchedSlash = true;
+	for (let i = p.length - 1; i >= 1; i--) {
+		if (p.charCodeAt(i) === 47) {
+			if (!matchedSlash) {
+				end = i;
+				break;
+			}
+		} else {
+			matchedSlash = false;
+		}
+	}
+	if (end === -1)
+		return hasRoot ? '/' : '.';
+	if (hasRoot && end === 1)
+		return '//';
+	return p.slice(0, end);
 }
 
 export function basename(p: string, ext: string = ''): string {
