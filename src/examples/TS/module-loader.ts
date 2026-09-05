@@ -152,10 +152,23 @@ class NodeModules {
 
 	private async loadDirectory(dir: string): Promise<void> {
 		await Promise.all((await fs.readdir(dir, {withFileTypes: true})).map(async i => {
+			const full = path.join(dir, i.name);
 			if (i.isDirectory())
-				return this.loadDirectory(path.join(dir, i.name));
-			if (i.name.endsWith('.d.ts'))
-				this.registerDeclaredModules(await fs.readFile(path.join(dir, i.name), 'utf8').then(code => TS.parse(code).body));
+				return this.loadDirectory(full);
+			if (!i.name.endsWith('.d.ts'))
+				return;
+			// One unparseable `.d.ts` must not reject the whole scan. `Promise.all` short-circuits, so
+			// `scan`'s own catch used to resolve `ready` while the rest of `@types` was still registering --
+			// leaving ambient-module resolution to depend on which specifier happened to be asked for first.
+			// Silent by default: this is a bulk scan of third-party types, and `export * from '...'` inside a
+			// `declare module` block (which this parser doesn't accept yet) alone fails ~164 files of
+			// `@types/node`. `DBGMODULES=1` to see them.
+			try {
+				this.registerDeclaredModules(TS.parse(await fs.readFile(full, 'utf8')).body);
+			} catch (e) {
+				if (process.env.DBGMODULES)
+					console.error(`Failed to parse ${full}: ${e}`);
+			}
 		}));
 	}
 
