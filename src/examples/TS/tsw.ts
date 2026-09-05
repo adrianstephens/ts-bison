@@ -196,15 +196,24 @@ async function compile(filein: string, fileout: string, wat = false) {
 	// Real multi-file codegen: seed `TStoWasm` from every module the loader actually resolved (not just
 	// the entry file's own body), plus each module's own namespace-import and named-import bindings, so a
 	// real cross-file call (`NS.foo(...)` or a plain `foo(...)` imported via `import { foo } from '...'`)
-	// resolves to the declaring file's own AST, not just its checked type. Only a plain top-level
-	// *function* declared in another module is supported this way today -- a cross-module class/scalar
-	// global still isn't; that throws a clear, specific error from `TStoWasm` rather than miscompiling.
+	// resolves to the declaring file's own AST, not just its checked type. A cross-module *class* still
+	// isn't supported, and throws a clear, specific error from `TStoWasm`.
 	const { modules, namedImports } = await collectModules(program.body, loader);
 	const mod		= TStoWasm(program, modules, namedImports);
 	if (wat)
 		console.log(mod.toWAT({expandTypes: true, hexFloats: false}));
 
-	await fs.writeFile(fileout, mod.toBytes());
+	const bytes = mod.toBytes();
+	// Codegen reporting success means only that it had an answer for every node, not that the bytes it
+	// built will load: a boxed value returned where its wrapper's signature promised a scalar produced a
+	// module no runtime accepts, and nothing here noticed. `new WebAssembly.Module` rather than
+	// `WebAssembly.validate` -- the latter answers only true/false, and the message is the whole point.
+	try {
+		new WebAssembly.Module(bytes as BufferSource);
+	} catch (e) {
+		throw new Error(`internal: emitted invalid wasm -- ${e instanceof Error ? e.message : String(e)}`);
+	}
+	await fs.writeFile(fileout, bytes);
 }
 
 // --- CLI ---
