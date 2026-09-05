@@ -284,7 +284,15 @@ function intWasmType(min: number, max: number): WasmType {
 
 // null parses as a literal; undefined is a real identifier -- both need ref.null with a heap type.
 function isNullLiteral(e: Expr): boolean {
-	return (e.type === 'literal' && e.value === null) || (e.type === 'identifier' && e.name === 'undefined');
+	return nullLiteralKind(e) !== undefined;
+}
+
+// Which of the two nullish literals `e` is, if either. They share one physical form here (`ref.null`),
+// so only a STRICT comparison ever has to tell them apart, and only statically -- see `case '==='`.
+function nullLiteralKind(e: Expr): 'null' | 'undefined' | undefined {
+	return	e.type === 'literal' && e.value === null			? 'null'
+		:	e.type === 'identifier' && e.name === 'undefined'	? 'undefined'
+		:	undefined;
 }
 
 // Checks builtinTypes before T.resolve to avoid expanding a hoisted class name and losing it.
@@ -5430,6 +5438,32 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							const wt		= wtypeOf(valueExpr, ctx);
 							if (!wt || typeof wt === 'string' || !wt.nullable)
 								throw "comparing to 'null'/'undefined' needs a nullable object-typed value on the other side";
+							// `null` and `undefined` are the same physical value (`ref.null`), so `ref.is_null`
+							// answers both alike -- correct for `==`, which treats them as equal anyway, but
+							// `null === undefined` is FALSE and used to come back true. A strict comparison can
+							// only separate them statically: when the value's type carries the OTHER nullish
+							// kind and not this one, the answer is constant, whatever it holds at runtime.
+							// Deliberately not extended to a type carrying NEITHER -- that still throws above,
+							// and must, because this compiler hands back a physical `undefined` in places whose
+							// declared type says it cannot (a missing key on `{[k: string]: V}`); answering a
+							// constant there would turn a loud error into a silent wrong one.
+							if (operator.length === 3) {
+								const kind	= nullLiteralKind(leftIsNull ? left : right)!;
+								const t		= T.resolve(ctx.typeScope, narrowedTypeOf(valueExpr, ctx));
+								const members = T.isAny(t) ? [] : t.type === 'union' ? T.unionMembers(t, ctx.typeScope) : [t];
+								const has	= (want: 'null' | 'undefined') => !members.length || members.some(m => {
+									const r = T.resolveOwn(m, ctx.typeScope);
+									return want === 'null'
+										? r.type === 'literal' && r.value === null
+										: r.type === 'ref' && (r.name === 'undefined' || r.name === 'void');
+								});
+								if (!has(kind) && has(kind === 'null' ? 'undefined' : 'null')) {
+									if (emitExpr(valueExpr, ctx, 'void') !== 'void')
+										ctx.emit(I.drop);
+									ctx.emit(I.i32.const(negate ? 1 : 0));
+									return 'i32';
+								}
+							}
 							emitAs(valueExpr, ctx, wt);
 							ctx.emit(I.ref.is_null);
 							if (negate)
