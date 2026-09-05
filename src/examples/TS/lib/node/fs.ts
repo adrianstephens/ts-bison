@@ -15,6 +15,24 @@ function loadI32(ptr: i32): i32 { return __asm<[i32], i32>('i32.load')(ptr); }
 function storeU8(ptr: i32, v: i32): void { __asm<[i32, i32], void>('i32.store8')(ptr, v); }
 function storeI32(ptr: i32, v: i32): void { __asm<[i32, i32], void>('i32.store')(ptr, v); }
 
+// WASI rights are a capability mask, and `path_open` REFUSES (errno 76, ENOTCAPABLE) any right the parent
+// directory fd does not itself hold -- asking for all-ones fails against every real host. Ask for exactly
+// what each call uses: fd_read(1<<1) | fd_seek(1<<2) | fd_tell(1<<5) | fd_filestat_get(1<<21), and the
+// same with fd_write(1<<6) in place of fd_read.
+// Written as literals, not named consts: a module-level scalar `const` in an ON-DEMAND module has no
+// module-scoped global to live in (only functions are seeded across modules), so naming them here makes
+// the whole file miscompile -- the same limitation that stops `const f = __asm<...>(...)` binding.
+function rightsRead(): i64	{ return 2097190; }
+function rightsWrite(): i64	{ return 2097252; }
+
+// There is no exception mechanism to raise yet, and CONTINUING is worse than stopping: an ignored errno
+// leaves the out-pointer unwritten, so the next step reads whatever was in that scratch as a descriptor or
+// a length. That is how a failed open became a multi-hundred-megabyte allocation, and then a hang.
+function wasiCheck(errno: i32): void {
+	if (errno !== 0)
+		__asm<[], void>('unreachable')();
+}
+
 function writeBytes(s: string): i32 {
 	const len = s.length;
 	const buf = __alloc(len, 1);
@@ -93,13 +111,12 @@ export function readFileSync(p: string, encoding: string): string {
 	const pathBuf = writeBytes(pre.rel);
 
 	const fdOut = __alloc(4, 4);
-	// dirflags=1 (follow symlinks); rights fields are all-ones -- this toy WASI layer never narrows
-	// per-call capabilities, it just asks for everything.
-	path_open(pre.fd, 1, pathBuf, pre.rel.length, 0, -1, -1, 0, fdOut);
+	// dirflags=1 (follow symlinks).
+	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 0, rightsRead(), rightsRead(), 0, fdOut));
 	const fileFd = loadI32(fdOut);
 
 	const statBuf = __alloc(64, 8);
-	fd_filestat_get(fileFd, statBuf);
+	wasiCheck(fd_filestat_get(fileFd, statBuf));
 	// filestat.size is a 64-bit field at byte offset 32; wasm is little-endian, so a plain i32.load
 	// there reads its low 32 bits, which is exactly the file's size for anything under 4GiB.
 	const size = loadI32(statBuf + 32);
@@ -109,8 +126,8 @@ export function readFileSync(p: string, encoding: string): string {
 	storeI32(iov, dataBuf);
 	storeI32(iov + 4, size);
 	const nreadPtr = __alloc(4, 4);
-	fd_read(fileFd, iov, 1, nreadPtr);
-	fd_close(fileFd);
+	wasiCheck(fd_read(fileFd, iov, 1, nreadPtr));
+	wasiCheck(fd_close(fileFd));
 
 	// Release only after the bytes are copied into a GC string -- `dataBuf` is a raw pointer, `result` isn't.
 	const result = readBytes(dataBuf, size);
@@ -126,7 +143,7 @@ export function writeFileSync(p: string, data: string): void {
 
 	const fdOut = __alloc(4, 4);
 	// oflags 9 = CREAT (1) | TRUNC (8): create the file if missing, replace its contents if present.
-	path_open(pre.fd, 1, pathBuf, pre.rel.length, 9, -1, -1, 0, fdOut);
+	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 9, rightsWrite(), rightsWrite(), 0, fdOut));
 	const fileFd = loadI32(fdOut);
 
 	const dataBuf = writeBytes(data);
@@ -134,8 +151,8 @@ export function writeFileSync(p: string, data: string): void {
 	storeI32(iov, dataBuf);
 	storeI32(iov + 4, data.length);
 	const nwrittenPtr = __alloc(4, 4);
-	fd_write(fileFd, iov, 1, nwrittenPtr);
-	fd_close(fileFd);
+	wasiCheck(fd_write(fileFd, iov, 1, nwrittenPtr));
+	wasiCheck(fd_close(fileFd));
 
 	// Nothing here escapes past this point -- void return, safe to release.
 	__allocRelease(mark);
@@ -145,6 +162,6 @@ export function mkdirSync(p: string): void {
 	const pre = findPreopen(p);
 	const mark = __allocMark();
 	const pathBuf = writeBytes(pre.rel);
-	path_create_directory(pre.fd, pathBuf, pre.rel.length);
+	path_create_directory(pre.fd, pathBuf, pre.rel.length);	// an existing directory is not an error here
 	__allocRelease(mark);
 }
