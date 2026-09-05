@@ -3120,7 +3120,26 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	}
 
 	function emitTruthy(e: Expr, ctx: FunctionContext): void {
-		let got = emitExpr(e, ctx);
+		// In a CONDITION, `a && b` only has to decide the branch -- both readings of it agree there, so this
+		// keeps the cheap boolean lowering rather than materialising the operand `case 'binary'` now yields
+		// and testing that. It also means neither side needs a representable value type here.
+		if (e.type === 'binary' && (e.operator === '&&' || e.operator === '||')) {
+			emitTruthy(e.left, ctx);
+			const _old = ctx.swapOut();
+			emitTruthy(e.right, ctx);
+			ctx.emit(e.operator === '&&'
+				? I.if('i32', ctx.swapOut(_old), [I.i32.const(0)])
+				: I.if('i32', [I.i32.const(1)], ctx.swapOut(_old)));
+			return;
+		}
+		emitTruthyOf(emitExpr(e, ctx), checkerTypeOf(unwrapAs(e), ctx.scope), ctx);
+	}
+
+	// The truthiness test for a value ALREADY on the stack, of physical type `got` and checker type `t`.
+	// Split out of `emitTruthy` so `&&`/`||` can test their left operand after teeing it into a local --
+	// re-emitting the expression would evaluate its side effects twice.
+	function emitTruthyOf(gotIn: WasmType, t: Type, ctx: FunctionContext): void {
+		let got = gotIn;
 		// A boxed nullable primitive (`number | null`/`boolean | null`) has no truthiness of its own --
 		// unbox it first (same unconditional-narrowing contract `coerceTop` uses everywhere else), then
 		// test the underlying scalar. A genuinely-null value traps here, same as any other unguarded use.
@@ -3142,7 +3161,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			case 'f64':
 			case 'f32': ctx.emit(I[got].abs, I[got](0), I[got].gt); return;
 		}
-		const t = checkerTypeOf(unwrapAs(e), ctx.scope);
 		// A string is falsy when EMPTY, so it tests its own length rather than its reference. A nullable one
 		// is falsy when null too, and `array.len` would trap there -- hence the null test first.
 		if (T.isStringLike(t, ctx.scope) && typeof got === 'object' && 'arr' in got) {
@@ -4918,19 +4936,49 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				}
 
 				switch (operator) {
-					case '&&': {
-						emitTruthy(left, ctx);
-						const _old = ctx.swapOut();
-						emitTruthy(right, ctx);
-						ctx.emit(I.if('i32', ctx.swapOut(_old), [I.i32.const(0)]));
-						return 'i32';
-					}
+					// `a && b` and `a || b` yield an OPERAND, not a boolean: `0.5 && 7` is `7`, `0 || 7` is
+					// `7`. Both used to lower to a bare boolean, which agrees with real JS in a condition --
+					// which is why it went unnoticed -- but is simply the wrong value anywhere else.
+					// `emitTruthy` above keeps the cheap boolean form for conditions.
+					case '&&':
 					case '||': {
-						emitTruthy(left, ctx);
+						const isAnd = operator === '&&';
+						// As a STATEMENT (`a && f()`) only the short-circuit is observable. Handled before the
+						// value form because neither operand needs a representable result then -- `f()` may
+						// well return `void`.
+						if (want === 'void') {
+							emitTruthy(left, ctx);
+							if (!isAnd)
+								ctx.emit(I.i32.eqz);
+							const _old = ctx.swapOut();
+							if (emitExpr(right, ctx, 'void') !== 'void')
+								ctx.emit(I.drop);
+							ctx.emit(I.if(undefined, ctx.swapOut(_old)));
+							return 'void';
+						}
+						const leftWtype		= wtypeOf(left, ctx);
+						const rightWtype	= wtypeOf(right, ctx);
+						if (!leftWtype || !rightWtype || leftWtype === 'void' || rightWtype === 'void')
+							throw `'${operator}' needs both operands to have a representable value type`;
+						// Same rule `typeOf`'s own union case uses -- one shared physical form when both
+						// sides already agree, else the checker's own type for the whole expression (a real
+						// union, so boxed). Not taken from the checker outright: this stays correct even
+						// where its type for `&&` is narrower than the two operands together.
+						const wtype = wasmTypeEq(leftWtype, rightWtype) ? leftWtype : (wtypeOf(e, ctx) ?? REF_ANY);
+						const leftLocal = ctx.declareLocal(`$logic$left$${optionalTempCounter++}`, leftWtype);
+						emitAs(left, ctx, leftWtype);
+						ctx.emit(I.local.tee(leftLocal.index));
+						emitTruthyOf(leftWtype, checkerTypeOf(unwrapAs(left), ctx.scope), ctx);
+						const keepLeft = () => {
+							ctx.emit(I.local.get(leftLocal.index));
+							coerceTop(leftWtype, ctx, wtype);
+						};
 						const _old = ctx.swapOut();
-						emitTruthy(right, ctx);
-						ctx.emit(I.if('i32', [I.i32.const(1)], ctx.swapOut(_old)));
-						return 'i32';
+						if (isAnd) emitAs(right, ctx, wtype); else keepLeft();
+						const _then = ctx.swapOut();
+						if (isAnd) keepLeft(); else emitAs(right, ctx, wtype);
+						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+						return wtype;
 					}
 					// `a ?? b` -- `a`'s combined-with-`b` type drives the `if`'s result. A left that can never
 					// actually be null/undefined makes `b` provably dead code -- same conclusion real TS's

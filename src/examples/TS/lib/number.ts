@@ -1,6 +1,13 @@
 /* eslint-disable no-loss-of-precision */
 /// <reference path="./lib.d.ts" />
 
+// JS `%` is fmod, not the truncated-difference formula alone, and wasm has no float remainder
+// instruction. Two edges the bare `x - trunc(x/y)*y` gets wrong, both found by `assistant/difftest.sh`:
+// a `y` of +-Infinity makes `trunc(x/y)*y` a `0 * Infinity` NaN (JS says `7 % Infinity` is `7`), and the
+// subtraction yields +0 where JS keeps the dividend's sign (`-1 % 1` is `-0`).
+// `|x| < |y| -> x` settles the first (and every case where the dividend is already the answer, sign
+// intact) while still falling through to NaN for a `y` of 0/NaN and an infinite `x`; `copysign(..., x)`
+// settles the second, and is a no-op wherever the difference already carries x's sign.
 export const __towasm_mod = __asm<[number, number], number>(`
 	(switch $T
 		(($i32 $i64) $T.rem_s)
@@ -8,7 +15,9 @@ export const __towasm_mod = __asm<[number, number], number>(`
 			(local $x $T)
 			(local $y $T)
 			local.set	$y
-			local.tee	$x
+			local.set	$x
+			local.get	$x
+			local.get	$x
 			local.get	$x
 			local.get	$y
 			$T.div
@@ -16,6 +25,14 @@ export const __towasm_mod = __asm<[number, number], number>(`
 			local.get	$y
 			$T.mul
 			$T.sub
+			local.get	$x
+			$T.copysign
+			local.get	$x
+			$T.abs
+			local.get	$y
+			$T.abs
+			$T.lt
+			select
 		)
 	)
 `);

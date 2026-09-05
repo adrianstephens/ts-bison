@@ -5393,6 +5393,64 @@ async function main() {
 	}
 
 	{
+		// `a && b` / `a || b` yield an OPERAND, not a boolean -- `0.5 && 7` is `7`. Both lowered to a bare
+		// boolean, which agrees with real JS in a CONDITION (which is why it went unnoticed) and is simply
+		// the wrong value anywhere else. Found by `assistant/difftest.sh`, which runs the same source
+		// through the real TypeScript compiler and compares.
+		const r = await compile(`
+			export function andValue(): number { const a: number = 0.5; const b: number = 7; return (a && b) as number; }
+			export function andShort(): number { const a: number = 0; const b: number = 7; return (a && b) as number; }
+			export function orValue(): number { const a: number = 0; const b: number = 7; return (a || b) as number; }
+			export function orShort(): number { const a: number = 4; const b: number = 7; return (a || b) as number; }
+			// still a plain branch decision in a condition, where both readings agree
+			export function asCondition(): number { const a: number = 0.5; const b: number = 0; return (a && b) ? 1 : 2; }
+			export function orCondition(): number { const a: number = 0; const b: number = 3; return (a || b) ? 1 : 2; }
+			// short-circuit really is one: the right side must not run when the left decides it
+			export function shortCircuits(): number {
+				let hits = 0;
+				const bump = (): number => { hits = hits + 1; return 1; };
+				const zero: number = 0;
+				if (zero && bump()) { hits = hits + 100; }
+				return hits;
+			}
+			// as a statement, where no value is produced at all
+			export function asStatement(): number { let n = 0; const one: number = 1; one && (n = 5); return n; }
+		`);
+		check('&& yields the right operand when the left is truthy', r.andValue(), 7);
+		check('&& yields the left operand when it is falsy', r.andShort(), 0);
+		check('|| yields the right operand when the left is falsy', r.orValue(), 7);
+		check('|| yields the left operand when it is truthy', r.orShort(), 4);
+		check('&& in a condition still just branches', r.asCondition(), 2);
+		check('|| in a condition still just branches', r.orCondition(), 1);
+		check('&& short-circuits its right operand', r.shortCircuits(), 0);
+		check('&& as a statement runs for its effect', r.asStatement(), 5);
+	}
+
+	{
+		// `%` is fmod, and wasm has no float remainder instruction. The bare `x - trunc(x/y)*y` made
+		// `7 % Infinity` a `0 * Infinity` NaN, and lost the dividend's sign on an exact division.
+		const r = await compile(`
+			function mod(a: number, b: number): number { return a % b; }
+			export function byInfinity(): number { return mod(7, 1 / 0); }
+			export function negByNegInfinity(): number { return mod(-3, -1 / 0); }
+			export function signOfZero(): number { return 1 / mod(-1, 1); }
+			export function plainSignOfZero(): number { return 1 / mod(1, 1); }
+			export function ordinary(): number { return mod(7, 3); }
+			export function negOrdinary(): number { return mod(-5, 3); }
+			export function byZero(): number { const n = mod(5, 0); return n === n ? 1 : 0; }
+			export function infByFinite(): number { const n = mod(1 / 0, 3); return n === n ? 1 : 0; }
+		`);
+		check('x % Infinity is x', r.byInfinity(), 7);
+		check('and keeps the sign through -Infinity', r.negByNegInfinity(), -3);
+		check('-1 % 1 is -0, not 0', r.signOfZero(), -Infinity);
+		check('...while 1 % 1 stays +0', r.plainSignOfZero(), Infinity);
+		check('an ordinary remainder is unchanged', r.ordinary(), 1);
+		check('...including a negative dividend', r.negOrdinary(), -2);
+		check('x % 0 is still NaN', r.byZero(), 0);
+		check('Infinity % x is still NaN', r.infByFinite(), 0);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
