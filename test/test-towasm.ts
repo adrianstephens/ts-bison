@@ -5635,6 +5635,34 @@ async function main() {
 	}
 
 	{
+		// A union whose members are themselves union ALIASES (`type AB = A | B` used in `AB | C`).
+		// `T.resolve` reduces the union itself but leaves its members alone, so every consumer that walked
+		// `.types` directly saw an unresolved alias and gave up -- the same root that broke the `in` test,
+		// both union dispatches and a mapped type's key constraint, each found separately.
+		// `T.unionMembers` is the shared walk now; it resolves only to DISCOVER nesting and yields the raw
+		// member, since `ownerFor` matches on nominal identity and a resolved class is just a shape.
+		const r = await compile(`
+			class A { a: number; constructor(a: number) { this.a = a; } m(): number { return 1; } }
+			class B { a: number; b: number; constructor(a: number) { this.a = a; this.b = 2; } m(): number { return 2; } }
+			class C { a: number; constructor(a: number) { this.a = a; } m(): number { return 3; } }
+			type AB = A | B;
+			type Nested = AB | C;
+			function field(u: Nested): number { return u.a; }
+			function method(u: Nested): number { return u.m(); }
+			function inTest(u: Nested): number { return 'b' in u ? 1 : 0; }
+			function truthy(u: Nested): number { return u ? 1 : 0; }
+			export function viaField(): number { return field(new B(5)) * 10 + field(new C(6)); }
+			export function viaMethod(): number { return method(new A(0)) * 100 + method(new C(0)); }
+			export function viaIn(): number { return inTest(new B(0)) * 10 + inTest(new C(0)); }
+			export function viaTruthy(): number { return truthy(new C(0)); }
+		`);
+		check('nested union alias: field access', r.viaField(), 56);
+		check('nested union alias: method dispatch', r.viaMethod(), 103);
+		check("nested union alias: 'in' type test", r.viaIn(), 10);
+		check('nested union alias: truthiness', r.viaTruthy(), 1);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

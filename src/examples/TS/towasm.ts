@@ -249,12 +249,6 @@ function unboxedPrimitive(wtype: WasmType): { kind: 'f64' | 'i32'; typeIndex: nu
 	return typeof wtype !== 'string' && 'primKind' in wtype ? { kind: wtype.primKind, typeIndex: wtype.typeIndex } : undefined;
 }
 
-// Nothing inhabits `never`, so it can never be the runtime value -- every union walk that asks "what
-// could this be" must skip it alongside the nullish members, or one uninhabited arm makes the whole
-// union unanswerable. It has bitten three separate places now (`alwaysTruthy`, `T.typeofName`, and the
-// union-member dispatches); a generic parameter substituted away is where they come from.
-const isUninhabited = (t: Type) => t.type === 'ref' && t.name === 'never';
-
 function wasmTypeEq(a: WasmType, b: WasmType): boolean {
 	if (typeof a === 'string' || typeof b === 'string')
 		return a === b;
@@ -2795,7 +2789,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			return [direct];
 		const resolved = T.resolve(scope, t);
 		if (resolved.type === 'union') {
-			const parts = resolved.types.filter(m => !T.isNullish(m, scope) && !isUninhabited(m)).map(m => flattenOwners(m, scope));
+			const parts = T.unionMembers(resolved, scope).filter(m => !T.isNullish(m, scope)).map(m => flattenOwners(m, scope));
 			return parts.every((p): p is ClassInfo[] => !!p) ? parts.flat() : undefined;
 		}
 		return undefined;
@@ -2810,7 +2804,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const t = T.resolve(ctx.typeScope, narrowedTypeOf(obj, ctx));
 		if (t.type !== 'union')
 			return undefined;
-		const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope) && !isUninhabited(m))
+		const owners = T.unionMembers(t, ctx.typeScope).filter(m => !T.isNullish(m, ctx.typeScope))
 			.flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
 		if (owners.length < 2 || !owners.every(o => o && o.typeIndex !== -1 && methodSig(o, name, ctx)))
 			return undefined;
@@ -3227,10 +3221,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				return true;
 			case 'union':
 				// An all-nullish union lands here as `true`, which is still correct: the null test below
-				// answers `false` for it, which is what it always is. `never` members are skipped for the
-				// same reason -- nothing inhabits one, so it can't be the falsy thing (`JS.Stmt<any>` has one,
-				// from a generic parameter substituted away).
-				return r.types.every(m => T.isNullish(m, scope) || alwaysTruthy(m, scope));
+				// answers `false` for it, which is what it always is. `T.unionMembers` drops `never` and
+				// flattens nested aliases -- see its own comment.
+				return T.unionMembers(r, scope).every(m => T.isNullish(m, scope) || alwaysTruthy(m, scope));
 			case 'intersection':
 				// A value satisfying an intersection satisfies every part, so one object-ish part is enough
 				// to make it an object -- unless another part makes it a PRIMITIVE (a branded
@@ -4525,7 +4518,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 					const t = T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx));
 					if (t.type === 'union') {
-						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope) && !isUninhabited(m)).flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
+						const owners = T.unionMembers(t, ctx.typeScope).filter(m => !T.isNullish(m, ctx.typeScope)).flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1)) {
 							emitAs(e.object, ctx, REF_ANY);
 							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property, T.lookupMember(t, e.property, ctx.typeScope));
@@ -4646,7 +4639,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					// always through `get(i)` rather than a field/getter (see `ensureUnionIndexDispatch`).
 					const t = T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx));
 					if (t.type === 'union') {
-						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope) && !isUninhabited(m)).map(m => ownerFor(m));
+						const owners = T.unionMembers(t, ctx.typeScope).filter(m => !T.isNullish(m, ctx.typeScope)).map(m => ownerFor(m));
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1 && methodSig(o, 'get', ctx))) {
 							emitAs(e.object, ctx, REF_ANY);
 							emitAs(e.index, ctx, 'i32');
@@ -5201,20 +5194,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						// a null test would just be a different wrong answer (it would also reject a
 						// property explicitly set to `undefined`, which JS says IS present).
 						const key = left.type === 'literal' && typeof left.value === 'string' ? left.value : undefined;
-						// Flattened, not just `resolve`d: `resolve` reduces the union itself but leaves its
-						// members alone, so `typeof LIB_DECLS[number] | undefined` arrives as one unresolved
-						// member beside `undefined`, and resolving THAT yields a further nested union.
-						const flat: Type[] = [];
-						if (key !== undefined) {
-							const addMember = (m: Type, depth: number) => {
-								const r = T.resolve(ctx.typeScope, m);
-								if (r.type === 'union' && depth < 4)
-									r.types.forEach(x => addMember(x, depth + 1));
-								else if (!T.isNullish(r, ctx.typeScope) && !isUninhabited(r))
-									flat.push(r);
-							};
-							addMember(checkerTypeOf(unwrapAs(right), ctx.typeScope), 0);
-						}
+						// `T.unionMembers`, not a `.types` walk: `resolve` leaves a union's own members alone,
+						// so `typeof LIB_DECLS[number] | undefined` hides a further nested union behind one
+						// of them -- see that helper's own comment.
+						const flat = key === undefined ? [] : T.unionMembers(checkerTypeOf(unwrapAs(right), ctx.typeScope), ctx.typeScope)
+							.filter(m => !T.isNullish(m, ctx.typeScope));
 						if (key !== undefined && flat.length > 1) {
 							const owners = flat.map(m => ownerFor(m));
 							const state = owners.map(o => {

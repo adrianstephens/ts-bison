@@ -116,9 +116,10 @@ export function typeofName(t: Type, scope?: Scope): string | undefined {
 				?? (parts.includes('function') ? 'function' : 'object');
 		}
 		case 'union': {
-			// Every inhabitant must agree. `never` members are skipped: nothing inhabits one, so it can
-			// never be the inhabitant whose tag differs (a generic parameter substituted away leaves them).
-			const names = new Set(r.types.filter(m => !isRefOfName(m, 'never')).map(m => typeofName(m, scope)));
+			// Every inhabitant must agree. `unionMembers` resolves and flattens, and drops `never` -- see
+			// its own comment. Only with a `scope`; without one this stays a shallow, as-given answer.
+			const members = scope ? unionMembers(r, scope) : r.types.filter(m => !isRefNamed(m, 'never'));
+			const names = new Set(members.map(m => typeofName(m, scope)));
 			return names.size === 1 && !names.has(undefined) ? [...names][0] : undefined;
 		}
 		case 'ref':					return TYPEOF_PRIMITIVES.includes(r.name) ? r.name : r.name === 'void' ? 'undefined' : r.name === 'null' ? 'object' : undefined;
@@ -126,7 +127,6 @@ export function typeofName(t: Type, scope?: Scope): string | undefined {
 	}
 }
 
-const isRefOfName = (t: Type, name: string) => t.type === 'ref' && t.name === name;
 
 // ===================================================================
 //  numeric/bigint range narrowing
@@ -887,20 +887,14 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				// Every string-literal key a constraint denotes, resolving as it descends: `resolve` reduces a
 				// union but leaves its MEMBERS alone, so `WasmScalarI | 'i8' | 'ref'` arrives with one
 				// member still an alias to a further union and a flat `every(isLiteral)` test fails on it.
-				const literalKeys = (x: Type, d: number): string[] | undefined => {
-					const r = resolve(scope, x, d);
-					if (isLiteral(r, 'string'))
-						return [r.value];
-					if (r.type === 'union' && d > 0) {
-						const parts = r.types.map(m => literalKeys(m, d - 1));
-						return parts.every((p): p is string[] => !!p) ? parts.flat() : undefined;
-					}
-					return undefined;
+				const literalKeys = (x: Type) => {
+					const parts = unionMembers(x, scope).map(m => resolve(scope, m)).map(m => isLiteral(m, 'string') ? m.value : undefined);
+					return parts.length && parts.every((p): p is string => p !== undefined) ? parts : undefined;
 				};
 				const constraintParts	= t.constraint.type === 'intersection' ? t.constraint.types : [t.constraint];
 				const resolvedParts	= constraintParts.map(m => resolve(scope, m, depth - 1));
-				const constraint	= resolvedParts.find(m => literalKeys(m, depth - 1)) ?? resolvedParts[0];
-				const keys			= literalKeys(constraint, depth - 1);
+				const constraint	= resolvedParts.find(m => literalKeys(m)) ?? resolvedParts[0];
+				const keys			= literalKeys(constraint);
 				if (keys) {
 					// Homomorphic case (`[P in keyof T]`): each synthesized property starts from *that* key's own modifiers on `T`,
 					const keyofArg		= constraintParts.find(m => m.type === 'keyof')?.argument;
@@ -1113,6 +1107,30 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 		return t;
 	}
 }
+// Every member a union could actually BE, resolved and flattened. `resolve` reduces the union itself but
+// leaves its MEMBERS alone, and a member can resolve to a further nested union (`type AB = A | B;` used
+// in `AB | C`), so a bare `resolved.types` walk silently misses aliases. `never` members are dropped:
+// nothing inhabits one, so it can never be the runtime value, and treating it as an unanswerable member
+// makes the whole union unanswerable.
+//
+// That pair -- unresolved members and `never` -- broke four separate places in one session (the `in`
+// type test, union field access, union method dispatch, and a mapped type's key constraint), each
+// rediscovered independently. Reach for this instead of walking `.types` directly. A non-union returns
+// itself, so a caller that doesn't care whether it has a union needs no special case.
+export function unionMembers(t: Type, scope: Scope, depth = 8): Type[] {
+	const r = resolve(scope, t);
+	if (r.type === 'union' && depth > 0)
+		return r.types.flatMap(m => unionMembers(m, scope, depth - 1));
+	// The RAW `t`, never the resolved `r`: resolving is only how nesting is DISCOVERED. A consumer that
+	// matches on nominal identity -- `ownerFor`'s own `ref` fast path, which needs a real class's name and
+	// type args -- must still be handed the reference it was given, not the bare structural shape
+	// resolving expands it into. (Handing it the resolved form made every `ref.test` arm miss and traps
+	// replaced real dispatches.) A consumer wanting the resolved form resolves the member itself.
+	return isRefNamed(r, 'never') ? [] : [t];
+}
+
+const isRefNamed = (t: Type, name: string) => t.type === 'ref' && t.name === name;
+
 export function flattenIntersection(t: Type, scope: Scope): Type[] {
 	const r = resolveOwn(t, scope);
 	return r.type === 'intersection' ? r.types.flatMap(t => flattenIntersection(t, scope)) : [r];
