@@ -1632,6 +1632,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	}
 	// Zero-field, non-`final` struct -- the common supertype every closure literal's env struct is a subtype
 	// of (wasm-GC width-subtyping needs the supertype's fields as a prefix, vacuous with zero fields); also usable directly as the env value for a no-capture literal.
+	// The one supertype every closure value struct declares. Sound by wasm-GC's covariant immutable-field
+	// subtyping: a closure's own first field is `(ref $itsFuncType)`, and every func type is a subtype of
+	// the abstract `func`. That makes `ref.test (ref $closureBase)` exactly "is this value a function" --
+	// nominal, so no unrelated struct can match it however its fields happen to line up.
+	function ensureClosureBase(): number {
+		return registerType({ final: false, supertypes: [], type: { kind: 'struct', fields: [
+			{ type: { ref: 'func', nullable: false }, mut: false },
+			{ type: { ref: ensureEnvBase(), nullable: false }, mut: false },
+		] } });
+	}
+
 	function ensureEnvBase(): number {
 		return registerType({ final: false, supertypes: [], type: { kind: 'struct', fields: [] } });
 	}
@@ -3060,6 +3071,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			case 'boolean':	return ensureBoxType('i32');
 			case 'string':	return ensureArrayType('i16');
 			case 'bigint':	return ensureArrayType('i32');
+			case 'function':	return ensureClosureBase();
 		}
 		return undefined;
 	}
@@ -6110,7 +6122,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		if (!info) {
 			const envBase		= ensureEnvBase();
 			const funcTypeIndex	= registerFuncType([{ type: {ref: envBase, nullable: false}, id: 'env' }, ...toParams(sig.params)], toResults(sig.result));
-			info = { funcTypeIndex, structTypeIndex: addType({final: true, supertypes: [], type: { kind: 'struct', fields: [
+			info = { funcTypeIndex, structTypeIndex: addType({final: true, supertypes: [ensureClosureBase()], type: { kind: 'struct', fields: [
 				{ type: { ref: funcTypeIndex, nullable: false }, mut: false },
 				{ type: { ref: envBase, nullable: false }, mut: false },
 			] } } ) };

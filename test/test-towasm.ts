@@ -5349,6 +5349,31 @@ async function main() {
 	}
 
 	{
+		// `typeof x === 'function'` on a genuinely boxed value. Every closure value struct declares one
+		// shared, non-final base -- sound by wasm-GC's covariant immutable-field subtyping, since a
+		// closure's own first field is `(ref $itsFuncType)` and every func type is a subtype of the
+		// abstract `func`. The test is nominal, so two differently-shaped closures both match it and no
+		// unrelated struct can.
+		const r = await compile(`
+			class P { p: number; constructor(p: number) { this.p = p; } }
+			type Sym = string | P | ((a: number) => number);
+			function tag(s: Sym): number { return typeof s === 'function' ? 1 : typeof s === 'string' ? 2 : 3; }
+			type Sym2 = string | ((a: number, b: number) => number);
+			function tag2(s: Sym2): number { return typeof s === 'function' ? 1 : 2; }
+			export function fnTag(): number { return tag((x: number) => x + 1); }
+			export function strTag(): number { return tag('a'); }
+			export function objTag(): number { return tag(new P(1)); }
+			export function fnTag2(): number { return tag2((a: number, b: number) => a + b); }
+			export function strTag2(): number { return tag2('a'); }
+		`);
+		check('typeof: a closure is a function', r.fnTag(), 1);
+		check('typeof: a string beside it is a string', r.strTag(), 2);
+		check('typeof: a class instance beside it is neither', r.objTag(), 3);
+		check('typeof: a differently-shaped closure shares the same base', r.fnTag2(), 1);
+		check('typeof: ...and still is not a string', r.strTag2(), 2);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
