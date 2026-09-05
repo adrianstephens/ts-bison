@@ -1849,7 +1849,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			emitAs(d.init!, ctx, g.wtype);
 			ctx.emit(I.global.set(g.index));
 			ctx.emit(I.if(undefined, ctx.swapOut(old)));
-			ctx.emit(I.global.get(g.index), I.ref.as_non_null, I.return);
+			// `coerceTop`, not a bare `ref.as_non_null`: `nullableWtype` BOXES a scalar slot, so for an
+			// `i32`/`f64` const the slot holds a box while this wrapper's signature promises the scalar.
+			ctx.emit(I.global.get(g.index));
+			coerceTop(g.wtype, ctx, wt);
+			ctx.emit(I.return);
 			info.body = ctx.toFuncBody(0, toValType);
 		}, name, homeModule));
 		return info;
@@ -3940,7 +3944,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					return {
 						wtype,
 						old:	captureOld(wtype, () => ctx.emit(I.call(lazy.wrapper.funcIndex))),
-						write:	makeWrite(wtype, val => ctx.emit(I.local.get(val), I.global.set(lazy.slot.index))),
+						write:	makeWrite(wtype, val => {
+							ctx.emit(I.local.get(val));
+							coerceTop(wtype, ctx, lazy.slot.wtype);
+							ctx.emit(I.global.set(lazy.slot.index));
+						}),
 					};
 				}
 				throw `unresolved identifier '${name}'`;
