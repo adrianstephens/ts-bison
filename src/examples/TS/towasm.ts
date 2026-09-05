@@ -1498,7 +1498,13 @@ export function makeLibScope(): Scope {
 // Only top-level *functions* are seeded/resolved across modules this way today -- a cross-module class or
 // scalar global reference is still unsupported (throws a clear, unrelated error), a real, separate,
 // not-yet-attempted follow-on.
-export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, namedImports?: Map<string, Map<string, { module: string; name: string }>>): wasm.WasmModule {
+// `onTopLevelError`: when given, a top-level statement that fails to compile is REPORTED through this
+// and skipped, instead of failing the whole module. Every top-level statement shares one start function,
+// so without it a single unrepresentable module-level `const` takes every other declaration in the file
+// down with it -- which is exactly what made the self-hosting survey attribute ~35 declarations to
+// whichever module-level statement happened to fail first. Omitted (the CLI's case) it rethrows, since a
+// module whose initialisation silently didn't run is not something to hand back without comment.
+export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new TSWError('ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
@@ -8461,7 +8467,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const ctx	= new FunctionContext('__toplevel', new Scope(libGlobal), plainReturn('void'), undefined);
 		ctx.widenedTypes = collectRangeWidenings(ast.body!, ctx.scope);
 		ctx.ownBody = ast.body!;
-		ast.body!.forEach(st => {
+		// Each statement emitted into its own buffer so a failure can discard exactly its own partial
+		// output and leave everything before it intact -- `ctx.emit` appends, so without the swap a
+		// half-emitted statement would corrupt the start function's stack balance.
+		const emitTopLevel = (st: Stmt) => {
+			if (!onTopLevelError)
+				return emitOneTopLevel(st);
+			const before = ctx.swapOut();
+			try {
+				emitOneTopLevel(st);
+				ctx.emit(...ctx.swapOut(before));
+			} catch (e) {
+				ctx.swapOut(before);
+				onTopLevelError(new TSWError(e as any, st, '<module init>'));
+			}
+		};
+		const emitOneTopLevel = (st: Stmt) => {
 			if (st.type === 'export_decl' || st.type === 'function_decl' || st.type === 'class_decl' || st.type === 'type_alias_decl' || st.type === 'interface_decl' || st.type === 'import')
 				return;
 			// A bare `export {a, b}` / `export type {T} from '...'` / `export * from '...'` binds nothing and
@@ -8492,7 +8513,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				return;
 			}
 			emitStmt(st, ctx);
-		});
+		};
+		ast.body!.forEach(emitTopLevel);
 		//emitTrailingUnreachable(ctx, result);
 		info.body = ctx.toFuncBody(0, toValType);
 	}));
