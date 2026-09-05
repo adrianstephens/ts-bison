@@ -5451,6 +5451,48 @@ async function main() {
 	}
 
 	{
+		// A closure captures a BINDING, not a value. Copying the value into the env struct meant a write on
+		// either side of the capture was invisible to the other: `let n = 1; const f = () => n + 1; n = 4;`
+		// gave 2, and the counter idiom left `n` at 0. `ensureForwardCell` already built the right thing --
+		// a shared heap cell -- but only ever fired for a name used BEFORE its own declaration ran.
+		const r = await compile(`
+			export function mutateAfter(): number { let n = 1; const f = () => n + 1; n = 4; return f(); }
+			export function mutateInside(): number { let n = 1; const f = () => { n = n + 1; return n; }; f(); f(); return n; }
+			export function counter(): number { let n = 0; const inc = () => { n = n + 1; }; inc(); inc(); inc(); return n; }
+			export function compound(): number { let n = 1; const f = () => { n *= 3; }; f(); f(); return n; }
+			export function incr(): number { let n = 0; const f = () => { n++; }; f(); f(); return n; }
+			export function twoClosures(): number { let n = 0; const a = () => { n = n + 1; }; const b = () => n * 10; a(); a(); return b(); }
+			export function refCell(): number { let s = 'a'; const f = () => { s = s + 'b'; }; f(); f(); return s.length; }
+			export function nested(): number { let n = 1; const outer = () => { const inner = () => { n = n + 5; }; inner(); }; outer(); return n; }
+			// A 'for (let i)' binding is PER-ITERATION, so each closure keeps its own -- one shared cell
+			// would have every closure below see 3. This is 'Promise.all's own shape, and celling it wrote
+			// past the end of the results array.
+			export function perIteration(): number {
+				const out: number[] = [0, 0, 0];
+				const fs: (() => void)[] = [];
+				for (let i = 0; i < 3; i++)
+					fs.push(() => { out[i] = i + 1; });
+				for (const f of fs) f();
+				return out[0] * 100 + out[1] * 10 + out[2];
+			}
+			// controls: neither of these needs a cell at all
+			export function notCaptured(): number { let n = 1; n = n + 2; return n; }
+			export function capturedNotMutated(): number { const n = 3; const f = () => n * 2; return f(); }
+		`);
+		check('capture: a later write is seen by the closure', r.mutateAfter(), 5);
+		check('capture: a write inside the closure is seen outside', r.mutateInside(), 3);
+		check('capture: the counter idiom', r.counter(), 3);
+		check('capture: compound assignment through the cell', r.compound(), 9);
+		check("capture: '++' through the cell", r.incr(), 2);
+		check('capture: two closures share one binding', r.twoClosures(), 20);
+		check('capture: a reference-typed binding', r.refCell(), 3);
+		check('capture: through a doubly-nested closure', r.nested(), 6);
+		check('capture: a for-let binding stays per-iteration', r.perIteration(), 123);
+		check('capture: an uncaptured local is untouched', r.notCaptured(), 3);
+		check('capture: a captured const is untouched', r.capturedNotMutated(), 6);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
