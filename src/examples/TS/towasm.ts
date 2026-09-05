@@ -8827,7 +8827,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	}
 	mod.types			= { types, groupSizes };
 
-	if (globals.has('heap')) {
+	// Declare a memory exactly when the compiled code really touches one -- any `load`/`store`/`memory.*`
+	// it actually contains, whatever emitted it. This was keyed off the `heap` GLOBAL'S NAME, a proxy for
+	// "console.ts's allocator was reached", which missed a linear-memory read that never allocates
+	// (`String.fromCharCodesAt`) and emitted a module whose own code then failed validation.
+	const memOp		= (op: string) => op.startsWith('memory.') || /^(i32|i64|f32|f64|v128)\.(load|store)/.test(op);
+	const seenInstr	= new Set<object>();
+	const touchesMemory = (v: unknown): boolean => {
+		if (!v || typeof v !== 'object' || seenInstr.has(v))
+			return false;
+		seenInstr.add(v);
+		if (typeof (v as {op?: unknown}).op === 'string' && memOp((v as {op: string}).op))
+			return true;
+		return (Array.isArray(v) ? v : Object.values(v)).some(touchesMemory);
+	};
+
+	if (touchesMemory(mod.code)) {
 		mod.memories	= [{ min: 1 }];
 		// So a host can actually read back what got written to it (e.g. console.log's fd_write buffer) --
 		// any consumer of real linear memory benefits, not just console.log specifically.
