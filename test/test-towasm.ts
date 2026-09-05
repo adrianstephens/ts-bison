@@ -5493,6 +5493,28 @@ async function main() {
 	}
 
 	{
+		// A field access the checker allowed only because it NARROWED the receiver first -- every
+		// discriminated union in a real program. Codegen doesn't track narrowing, so the union-field
+		// dispatch still sees every member and used to reject the ones that lack the field. A member the
+		// narrowing excluded cannot be the runtime value, so it is simply left out of the cascade.
+		const r = await compile(`
+			type U = { k: 'a'; a: number } | { k: 'b'; b: number };
+			function pick(u: U): number { return u.k === 'b' ? u.b : u.a; }
+			export function viaB(): number { return pick({ k: 'b', b: 6 }); }
+			export function viaA(): number { return pick({ k: 'a', a: 4 }); }
+			// a field every member declares still dispatches across all of them, as before
+			type Shared = { k: 'a'; n: number } | { k: 'b'; n: number };
+			function common(s: Shared): number { return s.n; }
+			export function sharedA(): number { return common({ k: 'a', n: 7 }); }
+			export function sharedB(): number { return common({ k: 'b', n: 8 }); }
+		`);
+		check('union field: narrowed access reaches the member that has it', r.viaB(), 6);
+		check('union field: ...and the other arm still works', r.viaA(), 4);
+		check('union field: a field on every member is unaffected', r.sharedA(), 7);
+		check('union field: ...on either member', r.sharedB(), 8);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

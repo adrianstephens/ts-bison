@@ -7989,6 +7989,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return out;
 	}
 
+	// A member declares `name` as a real field, or as a getter (`Array<T>.length` is inline asm, so
+	// `methodSig` rather than `ensureMethod` -- the same "either shape" dispatch index-syntax `get`/`set`
+	// already needs).
+	function memberFieldOf(m: ClassInfo, name: string, dctx: FunctionContext) {
+		const idx = m.fieldIndex.get(name);
+		if (idx !== undefined)
+			return { cls: m, kind: 'field' as const, fieldIdx: idx, wtype: m.fields[idx].wtype };
+		if (m.getterNames?.has(name)) {
+			const sig = methodSig(m, accessorKey('get', name), dctx);
+			if (sig)
+				return { cls: m, kind: 'getter' as const, wtype: sig.result };
+		}
+		return undefined;
+	}
+
 	function ensureUnionFieldDispatch(members: readonly ClassInfo[], name: string, resultTsType: Type | undefined): FuncInfo {
 		members = expandArrayMembers(members);
 		const key = `${name}=>[${members.map(m => m.typeIndex).join(',')}]`;
@@ -8004,23 +8019,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// emits its own raw `I.return`-free branching directly, never through `ctx.onReturn`.
 		const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(REF_ANY), undefined);
 
-		// Each member's own field or `get` accessor, looked up once up front -- an internal inconsistency
-		// (not a real program error) if any member turns out to have neither, since the checker already
-		// required every member of a union to have a given property before allowing `.property` on it at all.
-		const memberFields = members.map(m => {
-			const idx = m.fieldIndex.get(name);
-			if (idx !== undefined)
-				return { cls: m, kind: 'field' as const, fieldIdx: idx, wtype: m.fields[idx].wtype };
-			// `methodSig`, not `ensureMethod` directly -- a getter like `Array<T>.length` is inline asm
-			// (`inlineMethods`, not `methodDecls`), same "either shape" dispatch `methodSig` already
-			// handles for index-syntax `get(i)`/`set(i,v)`; `ensureMethod` alone would silently miss it.
-			if (m.getterNames?.has(name)) {
-				const sig = methodSig(m, accessorKey('get', name), dctx);
-				if (sig)
-					return { cls: m, kind: 'getter' as const, wtype: sig.result };
-			}
-			throw `internal: '${m.name}' (a member of a union type) has no field '${name}'`;
-		});
+		// Each member's own field or `get` accessor. A member that has NEITHER is dropped rather than
+		// rejected: the checker allowed this access, so either every member has the property or it
+		// NARROWED the receiver first (`u.k === 'b' ? u.b : ...`, and every discriminated union in a real
+		// program). Codegen doesn't track narrowing, so it still sees the whole union here -- but a member
+		// the narrowing excluded cannot be the runtime value, so leaving it out of the cascade is exactly
+		// right. It also stays honest for an unchecked program: a receiver matching no arm reaches
+		// `buildArm`'s own trailing `unreachable` and traps, rather than reading a field that isn't there.
+		const memberFields = members.map(m => memberFieldOf(m, name, dctx)).filter(f => !!f);
+		if (!memberFields.length)
+			throw `internal: no member of the union type has a field '${name}'`;
 		// The dispatch's own result type comes from the property's real checker type on the union
 		// (`T.lookupMember`'s own 'union' case unions each constituent's own property type together) --
 		// NOT from comparing each member's raw *physical* wtype, which can legitimately differ even when
