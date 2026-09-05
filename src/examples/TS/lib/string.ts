@@ -66,6 +66,14 @@ export class String {
 		String._setChar(result, 0, c);
 		return result;
 	}
+	// One `array.new_default` up front, then a straight fill -- the point is precisely to avoid
+	// `concat`'s per-call fresh-array-and-copy-both-sides cost when a caller has `len` bytes in hand.
+	static fromCharCodesAt(ptr: i32, len: i32): string {
+		const result = String._alloc(len);
+		for (let i = 0; i < len; i++)
+			String._setChar(result, i, __asm<[i32], i32>('i32.load8_u')(ptr + i));
+		return result;
+	}
 
 	toString(): string { return this as unknown as string; }
 	charAt		= __asm<[i32], string>('array.get_u $this array.new_fixed $this 1');

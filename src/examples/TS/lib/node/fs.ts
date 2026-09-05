@@ -24,10 +24,7 @@ function writeBytes(s: string): i32 {
 }
 
 function readBytes(ptr: i32, len: i32): string {
-	let result = '';
-	for (let i = 0; i < len; i++)
-		result = result.concat(String.fromCharCode(loadU8(ptr + i)));
-	return result;
+	return String.fromCharCodesAt(ptr, len);
 }
 
 class Preopen {

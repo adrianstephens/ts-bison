@@ -176,6 +176,9 @@ interface String {
 declare var String: {
 //	fromCharCode(...codes: number[]): string;
 	fromCharCode(code: number): string;
+	// One byte per char code, read straight out of linear memory -- the single-alloc counterpart to
+	// building a string one `fromCharCode` at a time, for `lib/node/*`'s own WASI buffers.
+	fromCharCodesAt(ptr: i32, len: i32): string;
 };
 
 //-----------------------------------------------------------------------------

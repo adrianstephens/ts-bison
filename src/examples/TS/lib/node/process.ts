@@ -10,19 +10,10 @@ export function exit(code: i32): void {
 }
 
 function readCString(ptr: i32): string {
-	let result = '';
-	let p = ptr;
-	let go = true;
-	while (go) {
-		const c = loadU8(p);
-		if (c === 0) {
-			go = false;
-		} else {
-			result = result.concat(String.fromCharCode(c));
-			p++;
-		}
-	}
-	return result;
+	let len = 0;
+	while (loadU8(ptr + len) !== 0)
+		len++;
+	return String.fromCharCodesAt(ptr, len);
 }
 
 // Both `args_get`/`environ_get` share this shape: a sizes call, then a fixed table of pointers into a
