@@ -884,12 +884,23 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				// literal/union-of-literals as the effective key set. Doesn't verify the *other* members don't further
 				// exclude some of those literals (true for the common "restrict to string|number" idiom, where every
 				// `keyof T` result already qualifies) -- same best-effort spirit as the rest of this function.
+				// Every string-literal key a constraint denotes, resolving as it descends: `resolve` reduces a
+				// union but leaves its MEMBERS alone, so `WasmScalarI | 'i8' | 'ref'` arrives with one
+				// member still an alias to a further union and a flat `every(isLiteral)` test fails on it.
+				const literalKeys = (x: Type, d: number): string[] | undefined => {
+					const r = resolve(scope, x, d);
+					if (isLiteral(r, 'string'))
+						return [r.value];
+					if (r.type === 'union' && d > 0) {
+						const parts = r.types.map(m => literalKeys(m, d - 1));
+						return parts.every((p): p is string[] => !!p) ? parts.flat() : undefined;
+					}
+					return undefined;
+				};
 				const constraintParts	= t.constraint.type === 'intersection' ? t.constraint.types : [t.constraint];
 				const resolvedParts	= constraintParts.map(m => resolve(scope, m, depth - 1));
-				const constraint	= resolvedParts.find(m => isLiteral(m, 'string') || (m.type === 'union' && m.types.every(x => isLiteral(x, 'string')))) ?? resolvedParts[0];
-				const keys			= isLiteral(constraint, 'string') ? [constraint.value]
-					: constraint.type === 'union' && constraint.types.every(m => isLiteral(m, 'string')) ? constraint.types.map(m => m.value)
-					: undefined;
+				const constraint	= resolvedParts.find(m => literalKeys(m, depth - 1)) ?? resolvedParts[0];
+				const keys			= literalKeys(constraint, depth - 1);
 				if (keys) {
 					// Homomorphic case (`[P in keyof T]`): each synthesized property starts from *that* key's own modifiers on `T`,
 					const keyofArg		= constraintParts.find(m => m.type === 'keyof')?.argument;

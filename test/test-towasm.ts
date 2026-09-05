@@ -5616,6 +5616,25 @@ async function main() {
 	}
 
 	{
+		// A mapped type's key constraint that is a NESTED union of aliases (`type Keys = Small | 'c'`).
+		// `resolve` reduces the union itself but leaves its members alone, so one member arriving as an
+		// unresolved alias made the flat "every key is a literal" test fail and the whole mapped type
+		// stayed opaque. towasm.ts's own `ARR_WTYPE: Record<WasmElementI, WasmType>` is exactly this, and
+		// it blocked that file at module level.
+		const { sum, deeper } = await compile(`
+			type Small = 'a' | 'b';
+			type Keys = Small | 'c';
+			type Deeper = Keys | 'd';
+			const M: Record<Keys, number> = { a: 1, b: 2, c: 30 };
+			const D: Record<Deeper, number> = { a: 1, b: 2, c: 30, d: 400 };
+			export function sum(): number { return M.a + M.b + M.c; }
+			export function deeper(): number { return D.a + D.d; }
+		`);
+		check('mapped type: a nested-union key constraint resolves', sum(), 33);
+		check('mapped type: ...however deeply the aliases nest', deeper(), 401);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
