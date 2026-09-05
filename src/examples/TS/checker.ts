@@ -890,6 +890,18 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 // in a type position too. A caller needing the value-position `Type` calls `scope.toObject()` itself, at the point it needs one -- a snapshot
 // taken here would go stale against anything the caller adds afterwards (transform.ts's `export ... from` re-export loop does exactly that).
 // `alias` is set only for `export = X` (`.d.ts`-only), where the namespace collapses to `X`'s own value instead of its scope's shape.
+// `__filename`/`__dirname` are not globals: CommonJS injects them PER MODULE, via the module wrapper
+// (`(function (exports, require, module, __filename, __dirname) {...})`), each derived from that module's
+// own resolved file. So they are bound into the module's own scope, never the lib scope -- a global would
+// give every module the same answer, which is exactly what they are not. Only the two this compiler can
+// actually supply; `require`/`module`/`exports` are deliberately still unbound.
+export function bindModuleNames(body: Stmt[], scope: Scope) {
+	if ((body as Stmt[] & { filename?: string }).filename) {
+		scope.addValue('__filename', T.STRING);
+		scope.addValue('__dirname', T.STRING);
+	}
+}
+
 export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; alias?: Type } {
 	// `hoist` + `hoistVars` (not full `checkBlock`): only top-level declaration *types* are needed, not a full check of a body checked separately.
 	const inner = new Scope(parent);
@@ -899,6 +911,7 @@ export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; alias?
 	// exact arrays, never a `Program`) has no other way to resolve a name declared in the module it is
 	// compiling. `scope` below is the export-only VIEW; this is the full one.
 	(body as Stmt[] & { scope?: Scope }).scope ??= inner;
+	bindModuleNames(body, inner);
 
 	// Infers top-level `var`/`const`/`let` types only -- muted, since this just resolves what a module *exposes*; its own real (unmuted)
 	// check happens when it's the direct entry point. Without muting, every importer would re-diagnose the same exports from scratch (no cross-run cache).

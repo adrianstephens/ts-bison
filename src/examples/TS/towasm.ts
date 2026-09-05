@@ -1533,6 +1533,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// functions are stored under `homeKey(canonical, name)` instead, so a same-named function in two
 	// different files never collides in this (or `funcs`') shared cache.
 	const moduleBodies			= new Map<string, TS.Stmt[]>([['.', ast.body], ...(modules ?? [])]);
+	// Where each module really lives: the loader stamps it on an imported body (`collectModules`), and the
+	// ENTRY's own comes off the `Program`, which its caller stamps the same way it already stamps `scope`.
+	function moduleFilename(homeModule: string): string | undefined {
+		return homeModule === '.'
+			? (ast as TS.Program & { filename?: string }).filename
+			: (moduleBodies.get(homeModule) as (TS.Stmt[] & { filename?: string }) | undefined)?.filename;
+	}
 	const namedImportsByModule = namedImports ?? new Map<string, Map<string, { module: string; name: string }>>();
 	// Recovers a top-level statement's own home module string -- `Scope.decl(name)` (via `declScope`, or via
 	// `Scope.namespace` for an `import * as X`) gives back the real declaration object directly, but a
@@ -4178,6 +4185,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// e.g. `extra !== undefined`, threw here unconditionally before this).
 			if (name === 'undefined' || name === 'NaN' || name === 'Infinity')
 				continue;
+			// Module-scoped, so `resolvesGlobally` can never see them; the read site substitutes a constant.
+			if ((name === '__dirname' || name === '__filename') && moduleFilename(ctx.homeModule))
+				continue;
 			if (!ctx.resolvesName(name) && !resolvesGlobally(ctx.homeModule, name) && !ensureForwardCell(ctx, name))
 				throw `unresolved identifier '${name}'`;
 		}
@@ -4552,6 +4562,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					const { info, structTypeIndex } = ensureFunctionValueWrapper(fnName, fnDecl, fnModule);
 					ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
 					return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
+				}
+				// CommonJS's own per-module wrapper names -- see `checker.bindModuleNames` for why these are
+				// module-scoped and not global. A compile-time constant, the substitution a bundler makes:
+				// the compiled module has no file of its own to ask at runtime.
+				if (name === '__dirname' || name === '__filename') {
+					const file = moduleFilename(ctx.homeModule);
+					if (file)
+						return emitExpr(Literal(name === '__dirname' ? path.dirname(file) : file), ctx, want);
 				}
 				throw `unresolved identifier '${name}'`;
 			}

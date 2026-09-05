@@ -48,6 +48,7 @@ async function tryLoadFile(full: string): Promise<string | undefined> {
 export interface LoadedModule {
 	body:		TS.Stmt[];
 	canonical:	string;	// relative import *inside* that module must resolve relative to where the module really lives
+	filename?:	string;	// the real file this came from -- what CommonJS derives a module's own `__filename`/`__dirname` from
 }
 
 async function loadCodeFromPackage(pkgDir: string, pkg: string, subpath: string): Promise<{ code: string; canonical: string } | undefined> {
@@ -266,11 +267,15 @@ export class ModuleLoader {
 
 	async local(resolved: string) {
 		const load = async (canonical: string) => {
-			const code = await tryLoadFile(path.join(this.root, canonical + '.ts'))
-					||	await tryLoadFile(path.join(this.root, canonical + '.d.ts'));
-			if (code) {
+			let filename = path.join(this.root, canonical + '.ts');
+			let code = await tryLoadFile(filename);
+			if (code === undefined) {
+				filename = path.join(this.root, canonical + '.d.ts');
+				code = await tryLoadFile(filename);
+			}
+			if (code !== undefined) {
 				try {
-					return {body: TS.parse(code).body, canonical };
+					return {body: TS.parse(code).body, canonical, filename };
 				} catch(e) {
 					console.error(`Failed to parse ${canonical}: ${e}`);
 				}
@@ -289,11 +294,12 @@ export class ModuleLoader {
 	// (`string`, `map`, `array` are all plausible package names).
 	private async nodeBuiltin(spec: string): Promise<LoadedModule | undefined> {
 		const canonical = 'lib/node/' + spec.replace(/^node:/, '');
-		const code = await tryLoadFile(path.join(NODE_LIB_DIR, path.basename(canonical) + '.ts'));
+		const filename = path.join(NODE_LIB_DIR, path.basename(canonical) + '.ts');
+		const code = await tryLoadFile(filename);
 		if (!code)
 			return undefined;
 		try {
-			return { body: TS.parse(code).body, canonical };
+			return { body: TS.parse(code).body, canonical, filename };
 		} catch (e) {
 			console.error(`Failed to parse ${canonical}: ${e}`);
 		}
@@ -367,6 +373,9 @@ export async function collectModules(entryBody: TS.Stmt[], loader: ModuleLoader)
 			}
 			if (!seen.has(target.canonical)) {
 				seen.add(target.canonical);
+				// Stamped beside `exportScope`'s own `.scope`: `TStoWasm` receives these bodies and nothing
+				// else, and a module's `__filename`/`__dirname` are derived from where it really lives.
+				(target.body as TS.Stmt[] & { filename?: string }).filename ??= target.filename;
 				modules.set(target.canonical, target.body);
 				await walk(target.canonical, target.body);
 			}
