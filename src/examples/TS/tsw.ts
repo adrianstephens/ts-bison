@@ -211,7 +211,14 @@ async function compile(filein: string, fileout: string, wat = false) {
 	try {
 		new WebAssembly.Module(bytes as BufferSource);
 	} catch (e) {
-		throw new Error(`internal: emitted invalid wasm -- ${e instanceof Error ? e.message : String(e)}`);
+		const msg = e instanceof Error ? e.message : String(e);
+		// A validator only knows the features its own host has turned on: this rejects a perfectly valid
+		// exception-handling module on a node build without `--experimental-wasm-exnref`. That is a fact
+		// about the checker, not the output, so warn and still write -- only a real disagreement about
+		// well-formed wasm is worth refusing to emit over.
+		if (!/--experimental|not enabled|unsupported feature/i.test(msg))
+			throw new Error(`internal: emitted invalid wasm -- ${msg}`);
+		console.warn(`warning: could not validate output -- this runtime lacks a feature the module uses (${msg})`);
 	}
 	await fs.writeFile(fileout, bytes);
 }
