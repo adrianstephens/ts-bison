@@ -5304,6 +5304,51 @@ async function main() {
 	}
 
 	{
+		// `typeof x === 'lit'` is a runtime TYPE TEST, not a string comparison, so it never needs a
+		// `typeof` string to exist. Answered statically when the checker's type gives every inhabitant the
+		// same tag (the only way to reach 'object'/'function', which have no single physical form), by a
+		// null test when only nullability varies, and otherwise by `ref.test` on the boxed value.
+		const r = await compile(`
+			class P { p: number; constructor(p: number) { this.p = p; } }
+			type Target = string | P;
+			function isStr(t: Target): number { return typeof t === 'string' ? 1 : 2; }
+			function notStr(t: Target): number { return typeof t !== 'string' ? 1 : 2; }
+			function isBig(v: number | bigint): number { return typeof v === 'bigint' ? 1 : 2; }
+			function isNum(v: number | bigint): number { return typeof v === 'number' ? 1 : 2; }
+			function isBool(v: string | boolean): number { return typeof v === 'boolean' ? 1 : 2; }
+			function maybeStr(v: string | undefined): number { return typeof v === 'string' ? 1 : 2; }
+			function isUndef(v: P | undefined): number { return typeof v === 'undefined' ? 1 : 2; }
+			export function strIsStr(): number { return isStr('hi'); }
+			export function objIsStr(): number { return isStr(new P(1)); }
+			export function objNotStr(): number { return notStr(new P(1)); }
+			export function numIsBig(): number { return isBig(5); }
+			export function numIsNum(): number { return isNum(5); }
+			export function boolIsBool(): number { return isBool(true); }
+			export function strIsBool(): number { return isBool('x'); }
+			export function presentStr(): number { return maybeStr('a'); }
+			export function absentStr(): number { return maybeStr(undefined); }
+			export function undefIsUndef(): number { return isUndef(undefined); }
+			export function objIsUndef(): number { return isUndef(new P(1)); }
+			// Statically decided, including the tags with no physical form of their own.
+			export function staticStr(): number { const s = 'x'; return typeof s === 'string' ? 1 : 2; }
+			export function staticNum(): number { const n = 1.5; return typeof n === 'string' ? 1 : 2; }
+			export function staticObj(): number { const p = new P(1); return typeof p === 'object' ? 1 : 2; }
+			export function staticFn(): number { const f = (x: number) => x; return typeof f === 'function' ? 1 : 2; }
+			// ...and as a plain value, when the tag is statically known ('number' is 6 characters).
+			export function tagOfNum(): number { const n = 1.5; return (typeof n).length; }
+			export function tagOfObj(): number { const p = new P(1); return (typeof p).length; }
+		`);
+		for (const [name, want] of [
+			['strIsStr', 1], ['objIsStr', 2], ['objNotStr', 1], ['numIsBig', 2], ['numIsNum', 1],
+			['boolIsBool', 1], ['strIsBool', 2], ['presentStr', 1], ['absentStr', 2],
+			['undefIsUndef', 1], ['objIsUndef', 2],
+			['staticStr', 1], ['staticNum', 2], ['staticObj', 1], ['staticFn', 1],
+			['tagOfNum', 6], ['tagOfObj', 6],
+		] as [string, number][])
+			check(`typeof: ${name}`, (r as any)[name](), want);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

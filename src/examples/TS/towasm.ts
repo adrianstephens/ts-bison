@@ -3016,6 +3016,96 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return want;
 	}
 
+	// The `typeof` tag every inhabitant of `t` shares, or `undefined` when it varies. This is the only way
+	// to answer `'object'`/`'function'`/`'symbol'`, none of which has a single physical form to `ref.test`
+	// against (every closure signature gets its own final struct type, with no shared base).
+	function typeofTagOf(t: Type, scope: Scope): string | undefined {
+		const r = T.resolve(scope, t);
+		switch (r.type) {
+			case 'literal':
+				// An array value here is a template literal's own parts, not a real `typeof` answer.
+				return Array.isArray(r.value) ? undefined : r.value === null ? 'object' : typeof r.value;
+			case 'range':								return 'number';
+			case 'object':	case 'array':	case 'tuple':	return 'object';
+			case 'function':	case 'constructor':			return 'function';
+			case 'union': {
+				// `never` members are skipped for the same reason `alwaysTruthy` skips them -- nothing
+				// inhabits one, so it can't be the inhabitant whose tag differs.
+				const tags = new Set(r.types.filter(m => !(m.type === 'ref' && m.name === 'never')).map(m => typeofTagOf(m, scope)));
+				return tags.size === 1 && !tags.has(undefined) ? [...tags][0] : undefined;
+			}
+			case 'ref':
+				switch (r.name) {
+					case 'string':		return 'string';
+					case 'number':		return 'number';
+					case 'boolean':		return 'boolean';
+					case 'bigint':		return 'bigint';
+					case 'symbol':		return 'symbol';
+					case 'undefined':	case 'void':	return 'undefined';
+					case 'null':		case 'object':	return 'object';
+				}
+				return undefined;
+			default:
+				return undefined;
+		}
+	}
+
+	// The heap type a boxed value has when `typeof` would call it `tag` -- only for the tags with exactly
+	// one physical form. `'string'` shares `arr:i16` with a real `Int16Array` and `'bigint'` shares
+	// `arr:i32` with an `Int32Array`, the same physical ambiguity `emitTruthy` already lives with; the
+	// checker's own type settles it whenever it can (`typeofTagOf`, above), and this is the fallback.
+	function typeofHeapType(tag: string): number | undefined {
+		switch (tag) {
+			case 'number':	return ensureBoxType('f64');
+			case 'boolean':	return ensureBoxType('i32');
+			case 'string':	return ensureArrayType('i16');
+			case 'bigint':	return ensureArrayType('i32');
+		}
+		return undefined;
+	}
+
+	// `typeof x === 'lit'` is a runtime TYPE TEST, not a string comparison -- so it never needs a `typeof`
+	// string to exist at all. Leaves an `i32` on the stack; returns false (emitting nothing) when the tag
+	// has neither a static answer nor a physical form, so the caller falls through to its own error.
+	function emitTypeofTest(operand: Expr, tag: string, ctx: FunctionContext): boolean {
+		const t		= checkerTypeOf(unwrapAs(operand), ctx.scope);
+		const answer = (v: 0 | 1) => {
+			// Still evaluated, for its side effects, exactly as an expression statement would.
+			if (emitExpr(operand, ctx, 'void') !== 'void')
+				ctx.emit(I.drop);
+			ctx.emit(I.i32.const(v));
+			return true;
+		};
+		const known = typeofTagOf(t, ctx.scope);
+		if (known !== undefined)
+			return answer(known === tag ? 1 : 0);
+
+		// Nullable, but every NON-null inhabitant shares one tag: `'undefined'` asks exactly "is it null",
+		// the matching tag asks exactly "is it not null", and any other tag can never hold.
+		const r		= T.resolve(ctx.scope, t);
+		const nnTag	= r.type === 'union' ? typeofTagOf(TS.UnionType(r.types.filter(m => !T.isNullish(m, ctx.scope))), ctx.scope) : undefined;
+		if (tag === 'undefined' || nnTag !== undefined) {
+			if (nnTag !== undefined && nnTag !== tag && tag !== 'undefined')
+				return answer(0);
+			emitAs(operand, ctx, REF_ANY_NULLABLE);
+			ctx.emit(I.ref.is_null);
+			if (tag !== 'undefined')
+				ctx.emit(I.i32.eqz);
+			return true;
+		}
+
+		// A real runtime test, and only a boxed `any` slot can carry one: two types that share a physical
+		// form (`number` and `boolean` are both `f64` here) are indistinguishable at runtime, so anything
+		// else would be a WRONG answer rather than an unsupported one.
+		const heap = typeofHeapType(tag);
+		const w    = wtypeOf(operand, ctx);
+		if (heap === undefined || !(w && typeof w === 'object' && 'ref' in w && w.ref === 'any'))
+			return false;
+		emitAs(operand, ctx, REF_ANY_NULLABLE);
+		ctx.emit(I.ref.test(heap));
+		return true;
+	}
+
 	// True when a value of this type is truthy whenever it is non-null -- an object, an array, a tuple, a
 	// function. Never a `string` (`''` is falsy), a `number` (`0`, `NaN`), a `boolean`, a literal, or a
 	// genuinely dynamic `any`/type parameter, for all of which truthiness is a property of the VALUE.
@@ -4707,6 +4797,18 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					}
 				}
 
+				// A bare `typeof x` as a VALUE -- answerable only when the checker's type gives every
+				// inhabitant the same tag; a genuinely dynamic one would need a real runtime cascade
+				// producing a string, which nothing in the target set actually asks for.
+				if (e.operator === 'typeof') {
+					const known = typeofTagOf(checkerTypeOf(unwrapAs(e.operand), ctx.scope), ctx.scope);
+					if (known !== undefined) {
+						if (emitExpr(e.operand, ctx, 'void') !== 'void')
+							ctx.emit(I.drop);
+						return emitExpr(Literal(known), ctx, want);
+					}
+				}
+
 				// `!x` is exactly "is x falsy", so it answers for every operand shape `emitTruthy` understands
 				// -- a nullable object reference, a string (empty is falsy), an array, a scalar -- not just
 				// the scalar-kinded ones. The old scalar-only path also coerced the operand to `i32` first,
@@ -4768,6 +4870,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 			case 'binary': {
 				const { operator, left, right } = e;
+				// `typeof x === 'lit'` (either way round) -- a type test, handled before anything else.
+				if (operator === '===' || operator === '!==' || operator === '==' || operator === '!=') {
+					const asTypeof = (a: Expr, b: Expr) => a.type === 'unary' && a.operator === 'typeof'
+						&& b.type === 'literal' && typeof b.value === 'string' ? { operand: a.operand, tag: b.value } : undefined;
+					const test = asTypeof(left, right) ?? asTypeof(right, left);
+					if (test && emitTypeofTest(test.operand, test.tag, ctx)) {
+						if (operator === '!==' || operator === '!=')
+							ctx.emit(I.i32.eqz);
+						return 'i32';
+					}
+				}
 				const rightInfo = operandInfo(right, ctx);
 
 				if (ASSIGN_OPS.has(operator)) {
