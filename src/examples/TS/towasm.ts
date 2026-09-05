@@ -249,6 +249,12 @@ function unboxedPrimitive(wtype: WasmType): { kind: 'f64' | 'i32'; typeIndex: nu
 	return typeof wtype !== 'string' && 'primKind' in wtype ? { kind: wtype.primKind, typeIndex: wtype.typeIndex } : undefined;
 }
 
+// Nothing inhabits `never`, so it can never be the runtime value -- every union walk that asks "what
+// could this be" must skip it alongside the nullish members, or one uninhabited arm makes the whole
+// union unanswerable. It has bitten three separate places now (`alwaysTruthy`, `T.typeofName`, and the
+// union-member dispatches); a generic parameter substituted away is where they come from.
+const isUninhabited = (t: Type) => t.type === 'ref' && t.name === 'never';
+
 function wasmTypeEq(a: WasmType, b: WasmType): boolean {
 	if (typeof a === 'string' || typeof b === 'string')
 		return a === b;
@@ -2789,7 +2795,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			return [direct];
 		const resolved = T.resolve(scope, t);
 		if (resolved.type === 'union') {
-			const parts = resolved.types.filter(m => !T.isNullish(m, scope)).map(m => flattenOwners(m, scope));
+			const parts = resolved.types.filter(m => !T.isNullish(m, scope) && !isUninhabited(m)).map(m => flattenOwners(m, scope));
 			return parts.every((p): p is ClassInfo[] => !!p) ? parts.flat() : undefined;
 		}
 		return undefined;
@@ -4502,7 +4508,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 					const t = T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx));
 					if (t.type === 'union') {
-						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope)).flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
+						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope) && !isUninhabited(m)).flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1)) {
 							emitAs(e.object, ctx, REF_ANY);
 							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property, T.lookupMember(t, e.property, ctx.typeScope));
@@ -4623,7 +4629,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					// always through `get(i)` rather than a field/getter (see `ensureUnionIndexDispatch`).
 					const t = T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx));
 					if (t.type === 'union') {
-						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope)).map(m => ownerFor(m));
+						const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope) && !isUninhabited(m)).map(m => ownerFor(m));
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1 && methodSig(o, 'get', ctx))) {
 							emitAs(e.object, ctx, REF_ANY);
 							emitAs(e.index, ctx, 'i32');
@@ -5187,7 +5193,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 								const r = T.resolve(ctx.typeScope, m);
 								if (r.type === 'union' && depth < 4)
 									r.types.forEach(x => addMember(x, depth + 1));
-								else if (!T.isNullish(r, ctx.typeScope))
+								else if (!T.isNullish(r, ctx.typeScope) && !isUninhabited(r))
 									flat.push(r);
 							};
 							addMember(checkerTypeOf(unwrapAs(right), ctx.typeScope), 0);

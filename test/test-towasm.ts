@@ -5568,6 +5568,24 @@ async function main() {
 	}
 
 	{
+		// A `never` member makes a union unanswerable for every walk that asks "what could this be" --
+		// nothing inhabits one, so it can never be the runtime value. `typeof LIB_DECLS[number]` really has
+		// one (a generic parameter substituted away), and a single uninhabited arm was enough to stop the
+		// union-member dispatch resolving owners at all.
+		const { field, viaIn } = await compile(`
+			class A { a: number; constructor(a: number) { this.a = a; } }
+			class B { a: number; b: number; constructor(a: number) { this.a = a; this.b = 9; } }
+			type U = A | never | B;
+			function readField(u: U): number { return u.a; }
+			function hasB(u: U): number { return 'b' in u ? 1 : 0; }
+			export function field(): number { return readField(new A(5)) * 10 + readField(new B(6)); }
+			export function viaIn(): number { return hasB(new B(0)) * 10 + hasB(new A(0)); }
+		`);
+		check('never: an uninhabited member does not block union field access', field(), 56);
+		check("never: ...nor the union's own 'in' type test", viaIn(), 10);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
