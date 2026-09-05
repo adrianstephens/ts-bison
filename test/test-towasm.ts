@@ -5586,6 +5586,36 @@ async function main() {
 	}
 
 	{
+		// Calling a method on a UNION receiver -- the sibling of `case 'member'`'s union FIELD dispatch,
+		// and the same `ref.test` cascade, just calling each member's method instead of reading its field.
+		// Emitted inline rather than as a shared dispatcher: the arguments are ordinary expressions at the
+		// call site, and re-emitting them per arm duplicates code but not evaluation, since exactly one arm
+		// ever runs -- `argOnce` is the check that matters there.
+		const r = await compile(`
+			class A { v: number; constructor(v: number) { this.v = v; } n(): number { return this.v * 10; } add(k: number): number { return this.v + k; } tag(): string { return 'a'; } }
+			class B { w: number; constructor(w: number) { this.w = w; } n(): number { return this.w * 100; } add(k: number): number { return this.w - k; } tag(): string { return 'bb'; } }
+			type U = A | B;
+			function callN(u: U): number { return u.n(); }
+			function callAdd(u: U, k: number): number { return u.add(k); }
+			function callTag(u: U): number { return u.tag().length; }
+			export function viaA(): number { return callN(new A(2)); }
+			export function viaB(): number { return callN(new B(3)); }
+			export function withArgA(): number { return callAdd(new A(10), 4); }
+			export function withArgB(): number { return callAdd(new B(10), 4); }
+			export function strResult(): number { return callTag(new A(0)) * 10 + callTag(new B(0)); }
+			export function argOnce(): number { let n = 0; const bump = (): number => { n = n + 1; return 1; }; const u: U = new B(5); callAdd(u, bump()); return n; }
+			export function withNever(): number { const u: A | never | B = new B(4); return u.n(); }
+		`);
+		check('union method: dispatches to the first member', r.viaA(), 20);
+		check('union method: ...and to the second', r.viaB(), 300);
+		check('union method: passes arguments through', r.withArgA(), 14);
+		check('union method: ...to either member', r.withArgB(), 6);
+		check('union method: a non-scalar result still agrees across arms', r.strResult(), 12);
+		check('union method: an argument is evaluated exactly once', r.argOnce(), 1);
+		check('union method: a never member is skipped', r.withNever(), 400);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

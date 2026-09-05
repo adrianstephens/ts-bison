@@ -2801,6 +2801,23 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return undefined;
 	}
 
+	// The union members a `u.m(...)` call could dispatch to, or `undefined` when this isn't that shape.
+	// Every member must be a struct-backed owner declaring a matching `m` -- a partial answer would be a
+	// silent wrong dispatch, so anything less falls through to the caller's own error. Deduped by
+	// `typeIndex`: several members can share one physical type, and a repeated `ref.test` arm is dead code
+	// the first one already claimed.
+	function unionMethodOwners(obj: Expr, name: string, args: Expr[], ctx: FunctionContext): ClassInfo[] | undefined {
+		const t = T.resolve(ctx.typeScope, narrowedTypeOf(obj, ctx));
+		if (t.type !== 'union')
+			return undefined;
+		const owners = t.types.filter(m => !T.isNullish(m, ctx.typeScope) && !isUninhabited(m))
+			.flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
+		if (owners.length < 2 || !owners.every(o => o && o.typeIndex !== -1 && methodSig(o, name, ctx)))
+			return undefined;
+		const seen = new Set<number>();
+		return (owners as ClassInfo[]).filter(o => !seen.has(o.typeIndex) && (seen.add(o.typeIndex), true));
+	}
+
 	// A namespace-style reference (`Box.describe()`) never carries real type arguments the way a genuine
 	// instantiation (`new Box<number>()`, or a value typed `Box<number>`) does -- and real TS forbids a
 	// static member from ever referencing its class's own type parameters in the first place (checker-
@@ -5560,6 +5577,33 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							emitAs(obj, ctx, REF_ANY);
 							ctx.emit(I.call(info.funcIndex));
 							return info.result;
+						}
+						// A real union receiver -- the sibling of `case 'member'`'s own union FIELD dispatch,
+						// and the same `ref.test` cascade, just calling each member's method instead of
+						// reading its field. Emitted inline rather than as a shared dispatcher function
+						// (`ensureUnionFieldDispatch`) because the arguments are ordinary expressions right
+						// here: re-emitting them per arm duplicates code but not evaluation, since exactly
+						// one arm ever runs. The receiver itself goes through a local so it is evaluated once.
+						const methodName = e.callee.property;
+						const unionOwners = unionMethodOwners(obj, methodName, e.arguments, ctx);
+						if (unionOwners) {
+							const args = e.arguments;
+							const result = wtypeOf(e, ctx) ?? want ?? REF_ANY;
+							const recv = ctx.declareLocal(`$udisp$${optionalTempCounter++}`, REF_ANY_NULLABLE);
+							emitAs(obj, ctx, REF_ANY_NULLABLE);
+							ctx.emit(I.local.set(recv.index));
+							const buildArm = (i: number): wasm.Instr[] => {
+								if (i >= unionOwners.length)
+									return [I.unreachable];
+								const m = unionOwners[i];
+								ctx.emit(I.local.get(recv.index), I.ref.test(m.typeIndex));
+								const _cond = ctx.swapOut();
+								ctx.emit(I.local.get(recv.index), I.ref.cast(m.typeIndex));
+								coerceTop(emitMethodCall(m, methodName, args, ctx, typeArgs), ctx, result);
+								return [..._cond, I.if(result === 'void' ? undefined : toValType(result), ctx.swapOut(), buildArm(i + 1))];
+							};
+							ctx.emit(...buildArm(0));
+							return result;
 						}
 						throw `unknown method '${e.callee.property}'`;
 					}
