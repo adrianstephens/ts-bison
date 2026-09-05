@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
-import { Literal, Binary, hasMod } from '../common';
+import { Literal, hasMod } from '../common';
 import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink } from './checker';
 import { Walkable, walk, walkB } from './walker';
 import { Output } from './tocode';
@@ -1568,6 +1568,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	const worklist:			(()=>void)[] = [];
 	const lateWorklist: 	(()=>void)[] = [];
 	const anyDispatchFuncs	= new Map<string, FuncInfo>();
+	// `ensureAnyIn`'s own cache -- keyed by the property name alone, since its candidate set is exactly
+	// `anyDispatchFuncs`' "every class ever reached" and so depends on nothing else.
+	const anyInFuncs		= new Map<string, FuncInfo>();
+	// `ensureAnyField`'s own cache -- same "every class ever reached" candidate set as `anyInFuncs`, so the
+	// field name alone keys it too.
+	const anyFieldFuncs		= new Map<string, FuncInfo>();
 	// `ensureUnionFieldDispatch`'s own cache -- keyed by field name + the exact, bounded member set (not
 	// "every class ever reached" like `anyDispatchFuncs`), so a real union type's own field access never
 	// silently succeeds via some unrelated third class that happens to share the same field name.
@@ -1705,7 +1711,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// Promotes `name` to a shared, heap-allocated one-field cell -- the physical form a captured BINDING
 	// needs, so that a write from either side of the capture is seen by the other.
 	function declareCell(ctx: FunctionContext, name: string, wt: WasmType, tsType: Type): Local {
-		if (process.env.DBGCELL) console.error(`CELL ${ctx.name}.${name}`);
+		if (process.env.DBGCELL)
+			console.error(`CELL ${ctx.name}.${name}`);
 		const cellTypeIndex = ensureCellType(wt);
 		const local = ctx.declareValue(name, { typeIndex: cellTypeIndex, nullable: false }, tsType);
 		local.cellInner = wt;
@@ -2123,7 +2130,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// through this, so the physical type and the method/field owner can never disagree about such a value.
 	function arrayPartOf(t: Type): { part: Type; element: Type } | undefined {
 		const parts: Type[] = [];
-		const flatten = (x: Type): void => { x.type === 'intersection' ? x.types.forEach(flatten) : parts.push(x); };
+		const flatten = (x: Type): void => {
+			if (x.type === 'intersection')
+				x.types.forEach(flatten);
+			else
+				parts.push(x);
+		};
 		flatten(t);
 		// Matched on the part's own written shape, never through `T.resolve`: with `Array` declared in the
 		// lib scope, resolving `Array<string>` expands it to the class's own object shape and loses the very
@@ -3207,11 +3219,28 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// else would be a WRONG answer rather than an unsupported one.
 		const heap = typeofHeapType(tag);
 		const w    = wtypeOf(operand, ctx);
-		if (heap === undefined || !(w && typeof w === 'object' && 'ref' in w && w.ref === 'any'))
+		if (!(w && typeof w === 'object' && 'ref' in w && w.ref === 'any'))
 			return false;
-		emitAs(operand, ctx, REF_ANY_NULLABLE);
-		ctx.emit(I.ref.test(heap));
-		return true;
+		if (heap !== undefined) {
+			emitAs(operand, ctx, REF_ANY_NULLABLE);
+			ctx.emit(I.ref.test(heap));
+			return true;
+		}
+		// `'object'` is the one tag with no physical form of its own -- it is the COMPLEMENT of the ones
+		// that have one, so a plain OR of those tests answers it with no branching. `guard()`'s own
+		// `typeof node === 'object'` is the shape. A null slot reads as `'undefined'` here (see above), so
+		// JS's `typeof null === 'object'` is deliberately not reproduced -- that value cannot be told from
+		// a real `undefined` in this representation either way.
+		if (tag === 'object') {
+			const tmp = ctx.temp(`$typeofobj$${optionalTempCounter++}`, REF_ANY_NULLABLE);
+			emitAs(operand, ctx, REF_ANY_NULLABLE);
+			ctx.emit(I.local.set(tmp), I.local.get(tmp), I.ref.is_null);
+			for (const h of [ensureBoxType('f64'), ensureBoxType('i32'), ensureArrayType('i16'), ensureClosureBase()])
+				ctx.emit(I.local.get(tmp), I.ref.test(h), I.i32.or);
+			ctx.emit(I.i32.eqz);
+			return true;
+		}
+		return false;
 	}
 
 	// True when a value of this type is truthy whenever it is non-null -- an object, an array, a tuple, a
@@ -3246,6 +3275,49 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// A literal, `keyof`, a conditional, a type parameter: not decidable here either.
 				return false;
 		}
+	}
+
+	// Truthiness of a value whose physical slot is a boxed `any`, decided at RUNTIME -- `guard()`'s own
+	// `node && typeof node === 'object' && ...` is the shape, and there the checker's type really is `any`,
+	// so `alwaysTruthy` can never answer. `ref.test` against the boxes a scalar takes on entering an `any`
+	// slot (`coerceTop`) separates the falsy candidates from a real object, which is unconditionally truthy.
+	// A `bigint` shares `arr:i32` with `Int32Array` (see `typeofHeapType`) so it reaches the object arm:
+	// `0n` in a dynamic slot reads as truthy, the one wrong answer this cascade can give.
+	function emitAnyTruthy(got: WasmType, ctx: FunctionContext): void {
+		// Always the NULLABLE slot: a non-nullable local is not defaultable, and a null test costs nothing
+		// to skip below when `got` already rules null out.
+		const tmp		= ctx.temp(`$anytruthy$${optionalTempCounter++}`, REF_ANY_NULLABLE);
+		const boxI32	= ensureBoxType('i32');
+		const boxF64	= ensureBoxType('f64');
+		const str		= ensureArrayType('i16');
+		ctx.emit(I.local.set(tmp));
+
+		const arms: (() => void)[][] = [
+			// A boxed `i32` is a `boolean` or an `i32`-kind number, and `0` is the falsy one for both.
+			[()	=> ctx.emit(I.local.get(tmp), I.ref.test(boxI32)),
+			()	=> ctx.emit(I.local.get(tmp), I.ref.cast(boxI32), I.struct.get(boxI32, 0), I.i32.const(0), I.i32.ne)],
+			// `abs(x) > 0`, for the same NaN/`-0` reasons the bare-`f64` case above gives.
+			[()	=> ctx.emit(I.local.get(tmp), I.ref.test(boxF64)),
+			()	=> ctx.emit(I.local.get(tmp), I.ref.cast(boxF64), I.struct.get(boxF64, 0), I.f64.abs, I.f64(0), I.f64.gt)],
+			// A string is falsy when EMPTY -- same `arr:i16` test the checker-typed path above makes statically.
+			[()	=> ctx.emit(I.local.get(tmp), I.ref.test(str)),
+			()	=> ctx.emit(I.local.get(tmp), I.ref.cast(str), I.array.len, I.i32.const(0), I.i32.ne)],
+		];
+		if (typeof got === 'object' && got.nullable)
+			arms.unshift([() => ctx.emit(I.local.get(tmp), I.ref.is_null), () => ctx.emit(I.i32.const(0))]);
+
+		// Nested `if`s, innermost last: everything that matched no box is a real object/array/closure.
+		const chain = (i: number): void => {
+			if (i === arms.length)
+				return ctx.emit(I.i32.const(1));
+			arms[i][0]();
+			const _old = ctx.swapOut();
+			arms[i][1]();
+			const _then = ctx.swapOut();
+			chain(i + 1);
+			ctx.emit(I.if('i32', _then, ctx.swapOut(_old)));
+		};
+		chain(0);
 	}
 
 	function emitTruthy(e: Expr, ctx: FunctionContext): void {
@@ -3331,6 +3403,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				ctx.emit(I.ref.is_null, I.i32.eqz);
 			else
 				ctx.emit(I.drop, I.i32.const(1));
+			return;
+		}
+		// A genuinely dynamic `any` slot -- the checker's type rules nothing out, so decide it at runtime.
+		if (typeof got === 'object' && 'ref' in got && got.ref === 'any') {
+			emitAnyTruthy(got, ctx);
 			return;
 		}
 		throw `'${T.typeKey(t)}' (${wasmTypeKey(got)}) cannot be used as a boolean condition`;
@@ -4567,6 +4644,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							}
 						}
 					}
+					// A genuinely dynamic receiver still has a real answer -- see `ensureAnyField`.
+					if (T.isAny(T.resolveOwn(narrowedTypeOf(e.object, ctx), ctx.typeScope))) {
+						emitAs(e.object, ctx, REF_ANY);
+						ctx.emit(I.call(ensureAnyField(e.property, ctx).funcIndex));
+						return REF_ANY;
+					}
 					throw `unknown field '${e.property}'`;
 				}
 				const fieldWtype = cls.fields[fieldIdx].wtype;
@@ -5125,9 +5208,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							coerceTop(leftWtype, ctx, wtype);
 						};
 						const _old = ctx.swapOut();
-						if (isAnd) emitAs(right, ctx, wtype); else keepLeft();
+						if (isAnd)
+							emitAs(right, ctx, wtype);
+						else
+							keepLeft();
 						const _then = ctx.swapOut();
-						if (isAnd) keepLeft(); else emitAs(right, ctx, wtype);
+						if (isAnd)
+							keepLeft();
+						else
+							emitAs(right, ctx, wtype);
 						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
 						return wtype;
 					}
@@ -5234,8 +5323,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							}
 						}
 						const cls = ownerOf(right, ctx);
-						if (!cls?.methodDecls.get('has'))
+						if (!cls?.methodDecls.get('has')) {
+							// A genuinely dynamic receiver still has a real answer -- see `ensureAnyIn`.
+							if (key !== undefined && T.isAny(checkerTypeOf(unwrapAs(right), ctx.scope))) {
+								emitAs(right, ctx, REF_ANY_NULLABLE);
+								ctx.emit(I.call(ensureAnyIn(key).funcIndex));
+								return 'i32';
+							}
 							throw "'in' is only supported over a dynamic object (a structural '{[k: string]: V}'-typed value)";
+						}
 						emitAs(right, ctx, cls.thisWtype!);
 						return emitMethodCall(cls, 'has', [left], ctx);
 					}
@@ -7140,7 +7236,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const rawWt = typeAnnotation && typeOf(typeAnnotation);
 		let wt	= rawWt === 'void' ? REF_ANY : rawWt;
 		if (!wt) {
-			if (process.env.DBG) console.error(`addField FAIL info=${info.name} key=${key} ann=${typeAnnotation ? typeAnnotation.type + ' ' + T.typeKey(typeAnnotation).replace(/\s+/g,' ').slice(0,120) : 'undefined'} resolved=${typeAnnotation ? T.typeKey(T.resolve(global, typeAnnotation)).replace(/\s+/g,' ').slice(0,120) : '-'}`);
+			if (process.env.DBG)
+				console.error(`addField FAIL info=${info.name} key=${key} ann=${typeAnnotation ? typeAnnotation.type + ' ' + T.typeKey(typeAnnotation).replace(/\s+/g,' ').slice(0,120) : 'undefined'} resolved=${typeAnnotation ? T.typeKey(T.resolve(global, typeAnnotation)).replace(/\s+/g,' ').slice(0,120) : '-'}`);
 			throw `'${key}' needs an explicit number/boolean/object type`;
 		}
 		// An `optional` field's own declared type is just its bare annotation (`value?: Expr`) -- this
@@ -8004,6 +8101,108 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return [...found.values()];
 	}
 
+	// `x.name` where `x`'s static type is genuinely `any` -- the FIELD sibling of `ensureAnyDispatch`, and
+	// the same `ref.test` cascade `ensureUnionFieldDispatch` runs over a union, just over "every class ever
+	// reached" instead of a bounded member set. `guard()`'s own `set.has(node.type)` is the shape.
+	// Always yields `REF_ANY`: the candidates' own field types legitimately differ, and every consumer of a
+	// dynamic read already has to `coerceTop` its way back out of one.
+	function ensureAnyField(name: string, ctx: FunctionContext): FuncInfo {
+		const existing = anyFieldFuncs.get(name);
+		if (existing)
+			return existing;
+
+		const { funcIndex, typeIndex } = registerFunc(toParams2([{key: 'recv', wtype: REF_ANY, tsType: T.ANY}]), toResults(REF_ANY));
+		const info: FuncInfo = { params: [REF_ANY], result: REF_ANY, funcIndex, typeIndex };
+		anyFieldFuncs.set(name, info);
+		funcs.set(`<any field>.${name}`, info);
+
+		lateWorklist.push(() => {
+			const dctx = new FunctionContext(`field_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`, new Scope(libGlobal), plainReturn(REF_ANY), undefined);
+			const recv = dctx.declareLocal('$recv', REF_ANY);
+
+			// Deduped by physical type index -- several owners can share one, and a repeated arm is dead code.
+			const seen = new Set<number>();
+			const candidates: { cls: ClassInfo; read: () => void }[] = [];
+			for (const cls of classes.values()) {
+				// `-1` is `ensureClass`'s scalar-backed sentinel: no heap type, so no `ref.test` target.
+				if (cls.typeIndex === -1 || seen.has(cls.typeIndex))
+					continue;
+				const idx = cls.fieldIndex.get(name);
+				if (idx !== undefined) {
+					seen.add(cls.typeIndex);
+					candidates.push({ cls, read: () => {
+						dctx.emit(I.struct.get(cls.typeIndex, idx));
+						coerceTop(cls.fields[idx].wtype, dctx, REF_ANY);
+					} });
+				} else if (cls.getterNames?.has(name)) {
+					const sig = methodSig(cls, accessorKey('get', name), dctx);
+					if (sig) {
+						seen.add(cls.typeIndex);
+						candidates.push({ cls, read: () => {
+							emitMethodCall(cls, accessorKey('get', name), [], dctx);
+							coerceTop(sig.result, dctx, REF_ANY);
+						} });
+					}
+				}
+			}
+			if (!candidates.length)
+				throw `no reachable class declares a field '${name}' -- a dynamic read on 'any' needs at least one real candidate`;
+
+			// A receiver matching nothing reaches `unreachable` and traps, exactly as `ensureAnyDispatch`
+			// does -- reading a field that isn't there has no honest answer.
+			function buildArm(i: number): wasm.Instr[] {
+				if (i >= candidates.length)
+					return [I.unreachable];
+				const c = candidates[i];
+				dctx.emit(I.local.get(recv.index), I.ref.test(c.cls.typeIndex));
+				const _cond = dctx.swapOut();
+				dctx.emit(I.local.get(recv.index), I.ref.cast(c.cls.typeIndex));
+				c.read();
+				return [..._cond, I.if(toValType(REF_ANY), dctx.swapOut(), buildArm(i + 1))];
+			}
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(1, toValType);
+		});
+		return info;
+	}
+
+	// `'k' in x` where `x`'s static type is genuinely `any`: with no runtime property metadata, "has `k`"
+	// is exactly "is one of the classes that declare `k`" -- a `ref.test` over every reachable one, OR-ed.
+	// A method or getter counts (JS finds a prototype member too), and so does an OPTIONAL field, for the
+	// same reason the union case above gives. Null fails every test and so answers `false`, which is what
+	// `k in undefined` should be (real JS throws; there is no throwing to do here).
+	// Shared function + `lateWorklist` for the same reason `ensureAnyDispatch` needs them: the candidate
+	// set is every class ever reached, and is only final once `worklist` has drained.
+	function ensureAnyIn(name: string): FuncInfo {
+		const existing = anyInFuncs.get(name);
+		if (existing)
+			return existing;
+
+		const { funcIndex, typeIndex } = registerFunc(toParams2([{key: 'recv', wtype: REF_ANY_NULLABLE, tsType: T.ANY}]), toResults('i32'));
+		const info: FuncInfo = { params: [REF_ANY_NULLABLE], result: 'i32', funcIndex, typeIndex };
+		anyInFuncs.set(name, info);
+		funcs.set(`<any in>.${name}`, info);
+
+		lateWorklist.push(() => {
+			const dctx = new FunctionContext(`in_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`, new Scope(libGlobal), plainReturn('i32'), undefined);
+			const recv = dctx.declareLocal('$recv', REF_ANY_NULLABLE);
+			// `-1` is `ensureClass`'s scalar-backed sentinel -- no physical heap type, so no `ref.test` target.
+			const declaring = [...classes.values()].filter(c => c.typeIndex !== -1
+				&& (c.fieldIndex.has(name) || c.getterNames?.has(name) || c.methodDecls.has(name)));
+			if (!declaring.length) {
+				dctx.emit(I.i32.const(0));
+			} else {
+				declaring.forEach((c, i) => {
+					dctx.emit(I.local.get(recv.index), I.ref.test(c.typeIndex));
+					if (i)
+						dctx.emit(I.i32.or);
+				});
+			}
+			info.body = dctx.toFuncBody(1, toValType);
+		});
+		return info;
+	}
+
 	// A real dynamic-dispatch cascade for `recv.name()` where `recv`'s static type is genuinely `any`.
 	// One shared function per `(name, want)` pair, reserved immediately so call sites can `call` it right away -- but its body can only be built
 	// once the full, final candidate set is known, needing every class ever discovered. `lateWorklist`, drained only once `worklist` has fully emptied, is what guarantees that.
@@ -8083,21 +8282,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return out;
 	}
 
-	// A member declares `name` as a real field, or as a getter (`Array<T>.length` is inline asm, so
-	// `methodSig` rather than `ensureMethod` -- the same "either shape" dispatch index-syntax `get`/`set`
-	// already needs).
-	function memberFieldOf(m: ClassInfo, name: string, dctx: FunctionContext) {
-		const idx = m.fieldIndex.get(name);
-		if (idx !== undefined)
-			return { cls: m, kind: 'field' as const, fieldIdx: idx, wtype: m.fields[idx].wtype };
-		if (m.getterNames?.has(name)) {
-			const sig = methodSig(m, accessorKey('get', name), dctx);
-			if (sig)
-				return { cls: m, kind: 'getter' as const, wtype: sig.result };
-		}
-		return undefined;
-	}
-
 	function ensureUnionFieldDispatch(members: readonly ClassInfo[], name: string, resultTsType: Type | undefined): FuncInfo {
 		members = expandArrayMembers(members);
 		const key = `${name}=>[${members.map(m => m.typeIndex).join(',')}]`;
@@ -8120,9 +8304,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// the narrowing excluded cannot be the runtime value, so leaving it out of the cascade is exactly
 		// right. It also stays honest for an unchecked program: a receiver matching no arm reaches
 		// `buildArm`'s own trailing `unreachable` and traps, rather than reading a field that isn't there.
-		const memberFields = members.map(m => memberFieldOf(m, name, dctx)).filter(f => !!f);
+		const memberFields = members.map(m => {
+			// A member declares `name` as a real field, or as a getter (`Array<T>.length` is inline asm, so
+			// `methodSig` rather than `ensureMethod` -- the same "either shape" dispatch index-syntax `get`/`set`
+			// already needs).
+			const idx = m.fieldIndex.get(name);
+			if (idx !== undefined)
+				return { cls: m, kind: 'field' as const, fieldIdx: idx, wtype: m.fields[idx].wtype };
+			if (m.getterNames?.has(name)) {
+				const sig = methodSig(m, accessorKey('get', name), dctx);
+				if (sig)
+					return { cls: m, kind: 'getter' as const, wtype: sig.result };
+			}
+			return undefined;
+		}).filter(f => !!f);
+
 		if (!memberFields.length)
 			throw `internal: no member of the union type has a field '${name}'`;
+
 		// The dispatch's own result type comes from the property's real checker type on the union
 		// (`T.lookupMember`'s own 'union' case unions each constituent's own property type together) --
 		// NOT from comparing each member's raw *physical* wtype, which can legitimately differ even when
@@ -8232,28 +8431,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return info;
 	}
 
-	// Every *reachable* (already `ensureClass`'d, unlike `directSubclasses`' whole-source-text set) class
-	// transitively extending `owner` that overrides `name` with a real body, deepest-first -- `ref.test`
-	// recognizes a value as a subtype of *every* ancestor's own struct type too (a grandchild instance
-	// passes `ref.test $Child` as well as `ref.test $GrandChild`), so testing shallower candidates first
-	// would wrongly stop at an ancestor's override even when the receiver's real, more-derived class has
-	// its own. Depth is measured by walking each candidate's own `superClass` chain back up to `owner`.
-	function collectOverridingCandidates(owner: ClassInfo, name: string): { depth: number; cls: ClassInfo }[] {
-		const found: { depth: number; cls: ClassInfo }[] = [];
-		for (const cls of classes.values()) {
-			if (cls === owner || cls.typeIndex === -1 || !cls.methodDecls.get(name)?.some(d => d.body))
-				continue;
-			let depth = 0;
-			for (let p: ClassInfo | undefined = cls; p; p = p.superClass, depth++) {
-				if (p === owner) {
-					found.push({ depth, cls });
-					break;
-				}
-			}
-		}
-		return found.sort((a, b) => b.depth - a.depth);
-	}
-
 	// A real dynamic-dispatch cascade for `recv.name(...args)` where `recv`'s *static* type (`owner`) has
 	// at least one reachable subclass overriding `name` (`emitMethodCall` only ever routes here when
 	// `hasDeclaredOverride` says so -- every other call, the overwhelming majority even in a program that
@@ -8281,8 +8458,27 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const info: FuncInfo = { params: base.params, result: base.result, funcIndex, typeIndex, defaults: base.defaults, hasRest: base.hasRest };
 		anyDispatchFuncs.set(key, info);
 		funcs.set(`<virtual dispatch>.${key}`, info);
+
 		lateWorklist.push(() => {
-			const candidates = collectOverridingCandidates(owner, name).map(({ cls }) => ({ cls, funcInfo: ensureMethod(cls, name, [], ctx)! }));
+			// Every *reachable* (already `ensureClass`'d, unlike `directSubclasses`' whole-source-text set) class
+			// transitively extending `owner` that overrides `name` with a real body, deepest-first -- `ref.test`
+			// recognizes a value as a subtype of *every* ancestor's own struct type too (a grandchild instance
+			// passes `ref.test $Child` as well as `ref.test $GrandChild`), so testing shallower candidates first
+			// would wrongly stop at an ancestor's override even when the receiver's real, more-derived class has
+			// its own. Depth is measured by walking each candidate's own `superClass` chain back up to `owner`.
+			const found: { depth: number; cls: ClassInfo }[] = [];
+			for (const cls of classes.values()) {
+				if (cls === owner || cls.typeIndex === -1 || !cls.methodDecls.get(name)?.some(d => d.body))
+					continue;
+				let depth = 0;
+				for (let p: ClassInfo | undefined = cls; p; p = p.superClass, depth++) {
+					if (p === owner) {
+						found.push({ depth, cls });
+						break;
+					}
+				}
+			}
+			const candidates = found.sort((a, b) => b.depth - a.depth).map(({ cls }) => ({ cls, funcInfo: ensureMethod(cls, name, [], ctx)! }));
 			const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(base.result), undefined);
 			const recv = dctx.declareLocal('$recv', owner.thisWtype!);
 			// Already-evaluated argument values (the caller pushed these against `owner`'s own signature,
