@@ -74,4 +74,7 @@ function loadEnv(): Map<string, string> {
 }
 
 export const argv: string[] = loadArgv();
-export const env: Map<string, string> = loadEnv();
+// An index signature, not the `Map` `loadEnv` physically builds: node's `process.env` is read as
+// `env.PATH`/`env['PATH']`, and only an index-signature type gives those. The two are the same value --
+// towasm routes `{[k: string]: V}` to `Map<string, V>` (see `indexSignatureValueType`).
+export const env: {[key: string]: string} = loadEnv();

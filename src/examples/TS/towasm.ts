@@ -4649,6 +4649,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 				const cls = classOfForIndexing(e.object, ctx);
 
+				// A dynamic object (`{[k: string]: V}`, routed to `Map<string, V>` -- see
+				// `indexSignatureValueType`): `o.a` and `o['a']` are the same access in TS, but only the
+				// bracket form was ever routed to `get`, so a dot read threw "unknown field". Before the
+				// getter and field checks below, because the receiver's TS type exposes no `Map` member at
+				// all -- `env.size` must read the `'size'` KEY, not the map's own count. A real `Map`-typed
+				// value is unaffected: its type is a `ref`, for which `indexSignatureValueType` is undefined.
+				if (cls && !isOptionalChainLink(e) && indexSignatureValueType(T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx))) && methodSig(cls, 'get', ctx)) {
+					emitAs(e.object, ctx, cls.thisWtype!);
+					return emitMethodCall(cls, 'get', [{ type: 'literal', value: e.property }], ctx);
+				}
+
 				// A `get` accessor -- checked before both the `.length` special case and the ordinary
 				// struct-field read, so a real getter (e.g. `Array<T>.length`) takes priority over either.
 				if (cls?.getterNames?.has(e.property)) {
