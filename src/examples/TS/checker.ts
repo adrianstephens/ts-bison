@@ -327,7 +327,10 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 
 // Returns a scope refined by `test` holding (sense=true) or failing (sense=false). Covers truthiness, `!`, `&&`/`||`, typeof, null/undefined
 // comparisons, discriminant-property comparisons, instanceof, `in`, and user-defined type predicates.
-function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
+// Exported for towasm: only `ctx.stmtScope` carries narrowing into codegen, and the checker stamps a
+// scope on STATEMENTS only, so a narrowing a ternary's or `&&`'s own test introduces has no stamp to
+// read. Pure, so codegen re-deriving it reaches the same scope the check pass used.
+export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 	const aliasing = new Set<string>();
 	return recurse(test, scope, sense);
 

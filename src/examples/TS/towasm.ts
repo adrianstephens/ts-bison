@@ -4,7 +4,7 @@ import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
 import { Literal, hasMod } from '../common';
-import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink } from './checker';
+import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
 import { Walkable, walk, walkB } from './walker';
 import { Output } from './tocode';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary, patternBindings } from './transform';
@@ -2374,6 +2374,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return T.isAny(narrowed) ? base : narrowed;
 	}
 
+	// Emit `fn` with `ctx.stmtScope` refined by `test` holding (or failing), for a ternary's or logical
+	// operator's own branch. Narrowing only ever reaches codegen through `stmtScope`, and the checker
+	// stamps a scope on STATEMENTS only -- so a receiver narrowed by the very expression being emitted
+	// (`p ? p.typeArgs![0] : x`) was invisible, and every read through it fell back to `any`. `typeScope`,
+	// not `scope`, so a branch inside an already-narrowed statement composes rather than resets.
+	function inNarrowed<R>(test: Expr, sense: boolean, ctx: FunctionContext, fn: () => R): R {
+		const saved = ctx.stmtScope;
+		ctx.stmtScope = narrow(test, ctx.typeScope, sense);
+		try {
+			return fn();
+		} finally {
+			ctx.stmtScope = saved;
+		}
+	}
+
 	// The type arguments for a `new C(...)` that spells none out. Nothing is inferred here -- both sources
 	// already exist: the checker solves them from the constructor's own arguments (asked about
 	// `new Set(['a'])` it answers `Set<string>`), and `ctx.contextualReturn` -- the same contextual channel
@@ -3359,7 +3374,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		if (e.type === 'binary' && (e.operator === '&&' || e.operator === '||')) {
 			emitTruthy(e.left, ctx);
 			const _old = ctx.swapOut();
-			emitTruthy(e.right, ctx);
+			inNarrowed(e.left, e.operator === '&&', ctx, () => emitTruthy(e.right, ctx));
 			ctx.emit(e.operator === '&&'
 				? I.if('i32', ctx.swapOut(_old), [I.i32.const(0)])
 				: I.if('i32', [I.i32.const(1)], ctx.swapOut(_old)));
@@ -5239,7 +5254,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							if (!isAnd)
 								ctx.emit(I.i32.eqz);
 							const _old = ctx.swapOut();
-							if (emitExpr(right, ctx, 'void') !== 'void')
+							if (inNarrowed(left, isAnd, ctx, () => emitExpr(right, ctx, 'void')) !== 'void')
 								ctx.emit(I.drop);
 							ctx.emit(I.if(undefined, ctx.swapOut(_old)));
 							return 'void';
@@ -5262,15 +5277,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							coerceTop(leftWtype, ctx, wtype);
 						};
 						const _old = ctx.swapOut();
+						const emitRight = () => inNarrowed(left, isAnd, ctx, () => emitAs(right, ctx, wtype));
 						if (isAnd)
-							emitAs(right, ctx, wtype);
+							emitRight();
 						else
 							keepLeft();
 						const _then = ctx.swapOut();
 						if (isAnd)
 							keepLeft();
 						else
-							emitAs(right, ctx, wtype);
+							emitRight();
 						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
 						return wtype;
 					}
@@ -5487,9 +5503,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					throw 'conditional expression has an unsupported type';
 				emitTruthy(e.test, ctx);
 				const _old = ctx.swapOut();
-				emitAs(e.consequent, ctx, wtype);
+				inNarrowed(e.test, true, ctx, () => emitAs(e.consequent, ctx, wtype));
 				const _then = ctx.swapOut();
-				emitAs(e.alternate, ctx, wtype);
+				inNarrowed(e.test, false, ctx, () => emitAs(e.alternate, ctx, wtype));
 				const _else = ctx.swapOut(_old);
 				ctx.emit(I.if(toValType(wtype), _then, _else));
 				return wtype;
