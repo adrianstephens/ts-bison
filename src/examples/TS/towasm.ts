@@ -3027,44 +3027,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return want;
 	}
 
-	// The `typeof` tag every inhabitant of `t` shares, or `undefined` when it varies. This is the only way
-	// to answer `'object'`/`'function'`/`'symbol'`, none of which has a single physical form to `ref.test`
-	// against (every closure signature gets its own final struct type, with no shared base).
-	function typeofTagOf(t: Type, scope: Scope): string | undefined {
-		const r = T.resolve(scope, t);
-		switch (r.type) {
-			case 'literal':
-				// An array value here is a template literal's own parts, not a real `typeof` answer.
-				return Array.isArray(r.value) ? undefined : r.value === null ? 'object' : typeof r.value;
-			case 'range':								return 'number';
-			case 'object':	case 'array':	case 'tuple':	return 'object';
-			case 'function':	case 'constructor':			return 'function';
-			case 'union': {
-				// `never` members are skipped for the same reason `alwaysTruthy` skips them -- nothing
-				// inhabits one, so it can't be the inhabitant whose tag differs.
-				const tags = new Set(r.types.filter(m => !(m.type === 'ref' && m.name === 'never')).map(m => typeofTagOf(m, scope)));
-				return tags.size === 1 && !tags.has(undefined) ? [...tags][0] : undefined;
-			}
-			case 'ref':
-				switch (r.name) {
-					case 'string':		return 'string';
-					case 'number':		return 'number';
-					case 'boolean':		return 'boolean';
-					case 'bigint':		return 'bigint';
-					case 'symbol':		return 'symbol';
-					case 'undefined':	case 'void':	return 'undefined';
-					case 'null':		case 'object':	return 'object';
-				}
-				return undefined;
-			default:
-				return undefined;
-		}
-	}
-
 	// The heap type a boxed value has when `typeof` would call it `tag` -- only for the tags with exactly
 	// one physical form. `'string'` shares `arr:i16` with a real `Int16Array` and `'bigint'` shares
 	// `arr:i32` with an `Int32Array`, the same physical ambiguity `emitTruthy` already lives with; the
-	// checker's own type settles it whenever it can (`typeofTagOf`, above), and this is the fallback.
+	// checker's own type settles it whenever it can (`T.typeofName`), and this is the fallback.
 	function typeofHeapType(tag: string): number | undefined {
 		switch (tag) {
 			case 'number':	return ensureBoxType('f64');
@@ -3088,14 +3054,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			ctx.emit(I.i32.const(v));
 			return true;
 		};
-		const known = typeofTagOf(t, ctx.scope);
+		const known = T.typeofName(t, ctx.scope);
 		if (known !== undefined)
 			return answer(known === tag ? 1 : 0);
 
 		// Nullable, but every NON-null inhabitant shares one tag: `'undefined'` asks exactly "is it null",
 		// the matching tag asks exactly "is it not null", and any other tag can never hold.
 		const r		= T.resolve(ctx.scope, t);
-		const nnTag	= r.type === 'union' ? typeofTagOf(TS.UnionType(r.types.filter(m => !T.isNullish(m, ctx.scope))), ctx.scope) : undefined;
+		const nnTag	= r.type === 'union' ? T.typeofName(TS.UnionType(r.types.filter(m => !T.isNullish(m, ctx.scope))), ctx.scope) : undefined;
 		if (tag === 'undefined' || nnTag !== undefined) {
 			if (nnTag !== undefined && nnTag !== tag && tag !== 'undefined')
 				return answer(0);
@@ -4813,7 +4779,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// inhabitant the same tag; a genuinely dynamic one would need a real runtime cascade
 				// producing a string, which nothing in the target set actually asks for.
 				if (e.operator === 'typeof') {
-					const known = typeofTagOf(checkerTypeOf(unwrapAs(e.operand), ctx.scope), ctx.scope);
+					const known = T.typeofName(checkerTypeOf(unwrapAs(e.operand), ctx.scope), ctx.scope);
 					if (known !== undefined) {
 						if (emitExpr(e.operand, ctx, 'void') !== 'void')
 							ctx.emit(I.drop);

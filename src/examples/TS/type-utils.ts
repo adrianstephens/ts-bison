@@ -91,21 +91,42 @@ export function isLiteral<K extends keyof TypeOfMap>(t: Type|Expr, type: K): t i
 	return t.type === 'literal' && literalType(t) === type;
 }
 
-// What `typeof` would report for a value of this type, or undefined when it can't be known statically
-export function typeofName(t: Type): string | undefined {
-	switch (t.type) {
-		case 'literal':				return Array.isArray(t.value) ? 'string' : typeof t.value;
-		case 'range':				return t.base;
+const TYPEOF_PRIMITIVES = ['number', 'string', 'boolean', 'bigint', 'symbol', 'undefined'];
+
+// What `typeof` would report for a value of this type, or undefined when it can't be known statically --
+// which is also the only way to answer `'object'`/`'function'`, neither of which has a single physical
+// form for codegen to test for at runtime.
+// `scope`: resolve first, and resolve each union member. Omit it to answer from the type exactly as
+// given, which is what the checker's own narrowing wants (it applies this per already-split member).
+export function typeofName(t: Type, scope?: Scope): string | undefined {
+	const r = scope ? resolve(scope, t) : t;
+	switch (r.type) {
+		case 'literal':				return Array.isArray(r.value) ? 'string' : typeof r.value;
+		case 'range':				return r.base;
 		case 'function':
 		case 'constructor':			return 'function';
 		case 'array':
 		case 'tuple':
 		case 'object':				return 'object';
-		case 'intersection':		return t.types.some(p => p.type === 'function' || p.type === 'constructor') ? 'function' : 'object';
-		case 'ref':					return ['number', 'string', 'boolean', 'bigint', 'symbol', 'undefined'].includes(t.name) ? t.name : t.name === 'null' ? 'object' : undefined;
+		case 'intersection': {
+			// A part that makes the value a PRIMITIVE wins over the object-ish ones -- a branded
+			// `string & {brand}` is a string, and `typeof` reports it as one.
+			const parts = r.types.map(p => typeofName(p, scope));
+			return parts.find(n => n && TYPEOF_PRIMITIVES.includes(n))
+				?? (parts.includes('function') ? 'function' : 'object');
+		}
+		case 'union': {
+			// Every inhabitant must agree. `never` members are skipped: nothing inhabits one, so it can
+			// never be the inhabitant whose tag differs (a generic parameter substituted away leaves them).
+			const names = new Set(r.types.filter(m => !isRefOfName(m, 'never')).map(m => typeofName(m, scope)));
+			return names.size === 1 && !names.has(undefined) ? [...names][0] : undefined;
+		}
+		case 'ref':					return TYPEOF_PRIMITIVES.includes(r.name) ? r.name : r.name === 'void' ? 'undefined' : r.name === 'null' ? 'object' : undefined;
 		default:					return undefined;
 	}
 }
+
+const isRefOfName = (t: Type, name: string) => t.type === 'ref' && t.name === name;
 
 // ===================================================================
 //  numeric/bigint range narrowing
