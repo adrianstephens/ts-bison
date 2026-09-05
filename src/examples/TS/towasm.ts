@@ -5166,6 +5166,60 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					// semantics to. Same shape as `instanceof` just above: resolve the class, dispatch
 					// to its own conventionally-named method (`has`, matching `Map`'s real API).
 					case 'in': {
+						// `'k' in u` on a UNION is a TYPE test, not a property lookup -- it is how TypeScript
+						// narrows a union whose members aren't discriminated by a literal field, and each
+						// member is its own nominal struct, so the answer is simply which member `u` is.
+						// Decided statically when every member agrees, else a `ref.test` over the members
+						// that declare it. A member declaring it OPTIONALLY counts as declaring it: this
+						// compiler has no notion of property presence -- an optional field is physically
+						// there and null when unset -- and that is also what TS's own `in` narrowing means
+						// by it ("this member is possible"), which is what every real use of it wants. The
+						// cost is that `in` cannot distinguish an omitted optional property from a set one;
+						// a null test would just be a different wrong answer (it would also reject a
+						// property explicitly set to `undefined`, which JS says IS present).
+						const key = left.type === 'literal' && typeof left.value === 'string' ? left.value : undefined;
+						// Flattened, not just `resolve`d: `resolve` reduces the union itself but leaves its
+						// members alone, so `typeof LIB_DECLS[number] | undefined` arrives as one unresolved
+						// member beside `undefined`, and resolving THAT yields a further nested union.
+						const flat: Type[] = [];
+						if (key !== undefined) {
+							const addMember = (m: Type, depth: number) => {
+								const r = T.resolve(ctx.typeScope, m);
+								if (r.type === 'union' && depth < 4)
+									r.types.forEach(x => addMember(x, depth + 1));
+								else if (!T.isNullish(r, ctx.typeScope))
+									flat.push(r);
+							};
+							addMember(checkerTypeOf(unwrapAs(right), ctx.typeScope), 0);
+						}
+						if (key !== undefined && flat.length > 1) {
+							const owners = flat.map(m => ownerFor(m));
+							const state = owners.map(o => {
+								if (!o || o.typeIndex === -1)
+									return undefined;
+								const idx = o.fieldIndex.get(key);
+								return { o, has: idx !== undefined };
+							});
+							if (state.every(x => !!x)) {
+								const declaring = state.filter(x => x!.has).map(x => x!.o);
+								if (!declaring.length || declaring.length === state.length) {
+									// Every member agrees, so the operand is only evaluated for its effects.
+									if (emitExpr(right, ctx, 'void') !== 'void')
+										ctx.emit(I.drop);
+									ctx.emit(I.i32.const(declaring.length ? 1 : 0));
+									return 'i32';
+								}
+								const recv = ctx.declareLocal(`$in$${optionalTempCounter++}`, REF_ANY_NULLABLE);
+								emitAs(right, ctx, REF_ANY_NULLABLE);
+								ctx.emit(I.local.set(recv.index));
+								declaring.forEach((o, i) => {
+									ctx.emit(I.local.get(recv.index), I.ref.test(o.typeIndex));
+									if (i)
+										ctx.emit(I.i32.or);
+								});
+								return 'i32';
+							}
+						}
 						const cls = ownerOf(right, ctx);
 						if (!cls?.methodDecls.get('has'))
 							throw "'in' is only supported over a dynamic object (a structural '{[k: string]: V}'-typed value)";

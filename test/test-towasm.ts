@@ -5538,6 +5538,36 @@ async function main() {
 	}
 
 	{
+		// `'k' in u` on a UNION is a TYPE test, not a property lookup -- it is how TypeScript narrows a
+		// union whose members carry no literal discriminant, and each member is its own nominal struct, so
+		// the answer is which member `u` actually is. `in` was only ever supported over a dynamic object.
+		const r = await compile(`
+			class A { a: number; constructor(a: number) { this.a = a; } }
+			class B { b: number; constructor(b: number) { this.b = b; } }
+			type U = A | B;
+			function hasB(u: U): number { return 'b' in u ? 1 : 0; }
+			function pick(u: U): number { return 'b' in u ? u.b : u.a; }
+			class N1 { n: number; constructor(n: number) { this.n = n; } }
+			class N2 { n: number; constructor(n: number) { this.n = n; } }
+			function everyone(u: N1 | N2): number { return 'n' in u ? 1 : 0; }
+			function nobody(u: U): number { return 'z' in u ? 1 : 0; }
+			export function present(): number { return hasB(new B(1)); }
+			export function absent(): number { return hasB(new A(1)); }
+			export function narrows(): number { return pick(new B(7)) * 10 + pick(new A(3)); }
+			export function allDeclare(): number { return everyone(new N1(1)); }
+			export function noneDeclare(): number { return nobody(new A(1)); }
+			// the pre-existing dynamic-object path is untouched
+			export function dynamic(): number { const o: { [k: string]: number } = { x: 1 }; return ('x' in o ? 1 : 0) * 10 + ('y' in o ? 1 : 0); }
+		`);
+		check("in: true for the member that declares it", r.present(), 1);
+		check("in: false for the member that doesn't", r.absent(), 0);
+		check('in: and it narrows, so the field is readable', r.narrows(), 73);
+		check('in: constant when every member declares it', r.allDeclare(), 1);
+		check('in: constant when none does', r.noneDeclare(), 0);
+		check('in: a dynamic object still asks the map', r.dynamic(), 10);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
