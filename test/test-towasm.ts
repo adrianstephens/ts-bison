@@ -5289,6 +5289,21 @@ async function main() {
 	}
 
 	{
+		// A `never` member in that union is uninhabited, so it can't be the falsy thing -- skip it like a
+		// nullish one. `JS.Stmt<any>` really has one (a generic parameter substituted away), and it alone
+		// made the whole union undecidable.
+		const { present, absent } = await compile(`
+			class A { a: number; constructor(a: number) { this.a = a; } }
+			class B { b: number; constructor(b: number) { this.b = b; } }
+			type U = A | never | B | undefined;
+			export function present(): number { const u: U = new A(1); return u ? 1 : 2; }
+			export function absent(): number { const u: U = undefined; return u ? 1 : 2; }
+		`);
+		check('a never member does not make a union undecidable', present(), 1);
+		check('...and the null test still answers', absent(), 2);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

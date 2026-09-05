@@ -3029,7 +3029,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				return true;
 			case 'union':
 				// An all-nullish union lands here as `true`, which is still correct: the null test below
-				// answers `false` for it, which is what it always is.
+				// answers `false` for it, which is what it always is. `never` members are skipped for the
+				// same reason -- nothing inhabits one, so it can't be the falsy thing (`JS.Stmt<any>` has one,
+				// from a generic parameter substituted away).
 				return r.types.every(m => T.isNullish(m, scope) || alwaysTruthy(m, scope));
 			case 'intersection':
 				// A value satisfying an intersection satisfies every part, so one object-ish part is enough
@@ -3038,9 +3040,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// `extends` another resolves to exactly this (`FunctionType` = `{type:'function'} & CallSig`).
 				return r.types.some(m => alwaysTruthy(m, scope))
 					&& !r.types.some(m => ['ref', 'literal'].includes(T.resolve(scope, m).type));
+			case 'ref':
+				// `never` is uninhabited, so no value can BE the falsy one -- vacuously true, and a union
+				// member `JS.Stmt<any>` really has (a generic parameter substituted away). Every other `ref`
+				// surviving `resolve` is a primitive or an unresolved name, neither decidable here.
+				return r.name === 'never';
 			default:
-				// A `ref` surviving `resolve` is a primitive or an unresolved name; either way, not decidable
-				// here. Everything else (a literal, `keyof`, a conditional, a type parameter) likewise.
+				// A literal, `keyof`, a conditional, a type parameter: not decidable here either.
 				return false;
 		}
 	}
@@ -3083,6 +3089,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			} else {
 				ctx.emit(I.array.len, I.i32.const(0), I.i32.ne);
 			}
+			return;
+		}
+		// A real wasm ARRAY slot holds an array whatever the checker's own type degraded to, and an array is
+		// truthy -- so this is a null test too. `arr:i16` is the exception: a string shares that exact
+		// physical form and `''` is falsy, so that one stays decided from the checker's type, above.
+		if (typeof got === 'object' && 'arr' in got && got.arr !== 'i16') {
+			if (got.nullable)
+				ctx.emit(I.ref.is_null, I.i32.eqz);
+			else
+				ctx.emit(I.drop, I.i32.const(1));
 			return;
 		}
 		// A real object/array/closure reference is always truthy in JS -- only null/undefined isn't -- so
