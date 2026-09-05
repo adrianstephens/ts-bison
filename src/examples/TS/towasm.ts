@@ -179,13 +179,19 @@ for (const d of LIB_DECLS) {
 // A lib file declares a real host (wasm) import with ordinary TS syntax -- `declare module 'name' {...}` plus `import {f} from 'name'` -- instead of a hand-registered one per feature.
 // `source` matching an *ambient* `module_decl` (not a filename) discriminates a host import from an ordinary intra-lib one (e.g. regexp.ts's `import { StringParser } from './string'`).
 interface HostImport { source: string; name: string; params: Type[]; returnType?: Type }
-const LIB_HOST_IMPORTS: HostImport[] = (() => {
-	const ambientModules = new Map(LIB_AST.filter((n): n is Extract<TS.Stmt, { type: 'module_decl' }> => n.type === 'module_decl' && !!n.ambient).map(n => [n.name, n]));
-	return LIB_AST.filter((n): n is JS.Import => n.type === 'import' && ambientModules.has(n.source)).flatMap(imp => (imp.specifiers ?? []).flatMap(s => {
-		const decl = ambientModules.get(imp.source)!.body.find(d => d.type === 'function_decl' && d.name === s.imported);
+// The ambient `declare module '...'` blocks are always the LIB's own (`lib.d.ts` is always loaded); only
+// the `import` statements naming one have to be looked for per body, so an on-demand `lib/node/*` module
+// can declare a host import of its own instead of having to register it in a static lib file.
+const LIB_AMBIENT_MODULES = new Map(LIB_AST.filter((n): n is Extract<TS.Stmt, { type: 'module_decl' }> => n.type === 'module_decl' && !!n.ambient).map(n => [n.name, n]));
+
+function hostImportsIn(body: TS.Stmt[]): HostImport[] {
+	return body.filter((n): n is JS.Import => n.type === 'import' && LIB_AMBIENT_MODULES.has(n.source)).flatMap(imp => (imp.specifiers ?? []).flatMap(s => {
+		const decl = LIB_AMBIENT_MODULES.get(imp.source)!.body.find(d => d.type === 'function_decl' && d.name === s.imported);
 		return decl?.type === 'function_decl' ? [{ source: imp.source, name: s.local, params: decl.params.map(p => p.typeAnnotation!), returnType: decl.returnType }] : [];
 	}));
-})();
+}
+
+const LIB_HOST_IMPORTS: HostImport[] = hostImportsIn(LIB_AST);
 
 type WasmScalarI	= 'i32' | 'i64' | 'f32' | 'f64'
 type WasmScalar		= WasmScalarI | 'u32' | 'u64'
@@ -1533,6 +1539,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// functions are stored under `homeKey(canonical, name)` instead, so a same-named function in two
 	// different files never collides in this (or `funcs`') shared cache.
 	const moduleBodies			= new Map<string, TS.Stmt[]>([['.', ast.body], ...(modules ?? [])]);
+	// That module's own scope: the entry carries it on its `Program`, an imported body gets it stamped by
+	// `exportScope` (see `compileFunc`'s own note on why a body needs one at all).
+	function moduleScopeOf(homeModule: string): Scope | undefined {
+		return homeModule === '.' ? global : (moduleBodies.get(homeModule) as (TS.Stmt[] & { scope?: Scope }) | undefined)?.scope;
+	}
+
 	// Where each module really lives: the loader stamps it on an imported body (`collectModules`), and the
 	// ENTRY's own comes off the `Program`, which its caller stamps the same way it already stamps `scope`.
 	function moduleFilename(homeModule: string): string | undefined {
@@ -1569,7 +1581,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// `case 'identifier'` fallback chain, regardless of lexical nesting.
 	function resolvesGlobally(homeModule: string, name: string): boolean {
 		return globals.has(name) || LIB_DECL_MAP.get(name)?.type === 'var_decl' || !!resolveDecl(homeModule, name)
-			|| !!namedImportsByModule.get(homeModule)?.has(name);
+			|| !!namedImportsByModule.get(homeModule)?.has(name)
+			// A NAMESPACE import (`import * as TS from './ts-parser'`) binds a compile-time namespace, not a
+			// value -- every use is resolved at its own site, so it never needs a capture slot either. Only
+			// named imports were listed here, so `TS.parse(...)` inside a callback read as a free variable
+			// and threw "unresolved identifier 'TS'".
+			|| !!moduleScopeOf(homeModule)?.namespace(name);
 	}
 
 	const worklist:			(()=>void)[] = [];
@@ -3674,9 +3691,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			}
 		}
 
-		const info = decl?.typeParams?.length
-			? ensureGenericFunc(name, decl, args, typeArgs, ctx.scope, expected, homeModule)
-			: ensureFunc(name, decl!, homeModule);
+		// A pre-seeded host import (`LIB_HOST_IMPORTS`) has no `FunctionDecl` and belongs to no module: it is
+		// registered under its BARE name, so it must be looked up under that name too. `ensureFunc` keys on
+		// `homeKey(homeModule, name)`, which is the identity ONLY for the entry -- from any other module the
+		// lookup missed and `compileFunc` then crashed on the absent decl, so no `lib/node/*` function that
+		// touches WASI could be compiled at all.
+		const info = decl
+			? (decl.typeParams?.length
+				? ensureGenericFunc(name, decl, args, typeArgs, ctx.scope, expected, homeModule)
+				: ensureFunc(name, decl, homeModule))
+			: funcs.get(name);
 		if (!info)
 			throw `call to unknown function '${name}'`;
 		emitCallArgs(name, info.params, info.defaults, !!info.hasRest, args, ctx, info.resolvedParams);
@@ -6684,7 +6708,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// the checker's type rather than the physical one (indexing, `.length`, a field read) silently
 			// lost. `global.value` only ever found a name imported DIRECTLY into the entry, so a function
 			// reached through a namespace import (`path.join`) never resolved at all.
-			const moduleScope = (moduleBodies.get(homeModule) as (TS.Stmt[] & { scope?: Scope }) | undefined)?.scope;
+			const moduleScope = moduleScopeOf(homeModule);
 			const checkedType = moduleScope?.value(realName) ?? global.value(realName);
 			const inferredReturnType = !decl.returnType && checkedType?.type === 'function' ? checkedType.returnType : undefined;
 			const result = decl.returnType ? typeOf(decl.returnType)
@@ -8653,7 +8677,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		}
 	}
 
-	mod.imports = LIB_HOST_IMPORTS.filter(hi => reached.has(hi.name)).map(hi => {
+	// Every module's own host imports, not just the static lib's -- an on-demand `lib/node/*` module
+	// declaring `import { path_open } from 'wasi_snapshot_preview1'` now registers it exactly as a lib file
+	// does. Deduped by name: the same host function imported by two modules is still ONE wasm import.
+	const hostImports = [...new Map(
+		[...LIB_HOST_IMPORTS, ...[...moduleBodies.values()].flatMap(hostImportsIn)].map(hi => [hi.name, hi] as const)
+	).values()];
+
+	mod.imports = hostImports.filter(hi => reached.has(hi.name)).map(hi => {
 		const params = hi.params.map(p => resolveParam({ key: '', typeAnnotation: p }).wtype);
 		const result = hi.returnType ? typeOf(hi.returnType) ?? 'void' : 'void';
 		const { funcIndex, typeIndex } = registerFunc(toParams(params), toResults(result));
