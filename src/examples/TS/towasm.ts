@@ -6660,7 +6660,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// whenever this doesn't apply (not a function-typed value, or the name isn't directly reachable
 			// this way at all -- e.g. a function only ever called indirectly through another non-entry
 			// module), unchanged from before.
-			const checkedType = global.value(realName);
+			// The declaring module's own internal scope (`exportScope` stamps it on the body it hoisted).
+			// Without it a non-entry function's body rooted at `libGlobal`, so every module-local name --
+			// a sibling function's RETURN TYPE included -- resolved to `any`, and every lowering that reads
+			// the checker's type rather than the physical one (indexing, `.length`, a field read) silently
+			// lost. `global.value` only ever found a name imported DIRECTLY into the entry, so a function
+			// reached through a namespace import (`path.join`) never resolved at all.
+			const moduleScope = (moduleBodies.get(homeModule) as (TS.Stmt[] & { scope?: Scope }) | undefined)?.scope;
+			const checkedType = moduleScope?.value(realName) ?? global.value(realName);
 			const inferredReturnType = !decl.returnType && checkedType?.type === 'function' ? checkedType.returnType : undefined;
 			const result = decl.returnType ? typeOf(decl.returnType)
 				: inferredReturnType ? typeOf(inferredReturnType)
@@ -6676,7 +6683,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// reachability limitation as the return-type fallback just above (only when `name` is directly
 			// reachable via `global`) -- `homeScope` is simply `undefined` otherwise, falling back to
 			// `libGlobal` exactly as before.
-			const homeScope = checkedType?.type === 'function' ? checkedType.declScope as Scope | undefined : undefined;
+			const homeScope = (checkedType?.type === 'function' ? checkedType.declScope as Scope | undefined : undefined) ?? moduleScope;
 
 			const params	= resolveParams(decl.params);
 			if (decl.rest?.typeAnnotation)
