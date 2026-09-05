@@ -914,11 +914,22 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 			}
 
 			case 'indexed_access': {
-				// `T[K]`: resolvable only when the index resolves to a literal (or union of literals), by looking up each corresponding member.
+				// `T[K]`: resolvable when the index resolves to a literal (or union of literals), by looking up
+				// each corresponding member -- or when it is the `number` TYPE, the standard "element type of
+				// this array" idiom (`typeof LIB_DECLS[number]`), which means every position at once.
 				const index = resolve(scope, t.index);
 				// A numeric literal index into a *tuple* (the `FlatArray` idiom) picks a fixed element positionally -- distinct from the
 				// string-keyed lookups below and from `lookupMember`, which has no notion of a numeric tuple position.
-				if (isLiteral(index, 'number')) {
+				// `T[number]` -- indexed by the `number` TYPE rather than a literal -- is the standard "element
+				// type of this array" idiom (`typeof LIB_DECLS[number]`), and means every position at once:
+				// an array's element type, or a tuple's own elements unioned.
+				if (index.type === 'ref' && index.name === 'number') {
+					const object = resolve(scope, t.object);
+					if (object.type === 'array')
+						return resolve(scope, object.element, undefined, stopAtRef);
+					if (object.type === 'tuple')
+						return resolve(scope, combineTypes(object.elements.map(e => tupleElementType(e) ?? ANY)), undefined, stopAtRef);
+				} else if (isLiteral(index, 'number')) {
 					const object = resolve(scope, t.object);
 					if (object.type === 'tuple') {
 						const el = object.elements[index.value];

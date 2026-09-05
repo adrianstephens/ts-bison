@@ -5374,6 +5374,25 @@ async function main() {
 	}
 
 	{
+		// `T[number]` -- indexed by the `number` TYPE rather than a literal -- is the standard "element type
+		// of this array" idiom, and `resolve` only ever reduced an indexed access for a literal index. It is
+		// what `Map<string, typeof LIB_DECLS[number]>` is built on, and `.get`'s return type had no
+		// representation without it.
+		const { viaArray, viaTuple } = await compile(`
+			const DECLS = [{ n: 1 }, { n: 2 }];
+			type Decl = typeof DECLS[number];
+			const PAIR: [number, number] = [3, 4];
+			type Either = typeof PAIR[number];
+			function take(d: Decl): number { return d.n; }
+			function both(a: Either, b: Either): number { return a + b; }
+			export function viaArray(): number { return take({ n: 7 }); }
+			export function viaTuple(): number { return both(1, 2); }
+		`);
+		check('T[number] resolves an array element type', viaArray(), 7);
+		check('T[number] resolves a tuple to its elements unioned', viaTuple(), 3);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
