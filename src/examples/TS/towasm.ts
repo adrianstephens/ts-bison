@@ -5877,11 +5877,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					// never reflects flow-sensitive narrowing the way the checker's internal scope tree does).
 					// Without it, a narrowed-non-null receiver (e.g. `if (m === null) return; ...; m.group(0)`)
 					// would still look nullable to `checkerTypeOf` here and member/call resolution could fail
-					// on it. `ctx.typeScope`, not `ctx.scope`, when unset: a SYNTHETIC statement (the `for...of`
-					// and destructuring desugarings both synthesize a `var_decl`) is never stamped, so the
-					// fallback is the normal path for those, and it must not throw away the narrowing the
-					// enclosing real statement already established.
-					const stmtScope = (s as any).scope as Scope ?? ctx.typeScope;
+					// on it. Falls back to `ctx.scope` only if somehow unset (shouldn't happen post-`TStypeCheck`).
+					const stmtScope = (s as any).scope as Scope ?? ctx.scope;
 					const {methodOwner, methodName, calleeOptional} = d.init.type === 'call' && d.init.callee.type === 'member'
 						? {methodOwner: ownerOf(d.init.callee.object, ctx), methodName: d.init.callee.property, calleeOptional: d.init.callee.optional}
 						: {};
@@ -5941,6 +5938,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					}
 
 					tsType ??= checkerTypeOf(d.init, stmtScope);
+					// A SYNTHETIC statement (`for...of` and destructuring both synthesize a `var_decl`) is
+					// never stamped, so `stmtScope` above is just `ctx.scope`, which carries no narrowing:
+					// `for (const i of w.body)` inside `if (w.kind === 'w')` bound `#for0$arr` from an
+					// unnarrowed `w` and got `any`. `narrowedTypeOf` rather than `ctx.typeScope` outright,
+					// so this only fires where `ctx.scope` had NO answer -- a narrowed scope can otherwise
+					// resolve a clean nominal `Map<K,V>` into its full structural shape, which `ownerFor`
+					// then builds an anonymous struct for instead of finding the class.
+					if (T.isAny(tsType) && !(s as any).scope)
+						tsType = narrowedTypeOf(d.init, ctx);
 
 					let wtype = typeOf(tsType);
 					// This declarator is itself later the target of a real Object.defineProperty call
