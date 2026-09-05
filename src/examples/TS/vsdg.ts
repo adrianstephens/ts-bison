@@ -350,7 +350,6 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// Seeds the top-level (and, transitively, each function body's) state chain -- without it, any
 	// effect before the first function_decl has nothing valid to thread its first state edge from.
 	let end: Node = makeMarker('PROGRAM_START');
-	const programStart = end;
 
 	// True when the path just walked never falls through to its own lexical successor (it broke,
 	// continued, or returned) -- consulted by 'if' to decide whether a branch needs a real gamma
@@ -492,8 +491,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 		scope = preLoop.scope;
 		for (const [name, muNode] of muScope.muNodes) {
-			const node = muScope.bindings.get(name)!;
-			connectValue(node, 0, muNode, 1);		// Slot 1 = Feedback loop
+			connectValue(muScope.bindings.get(name)!, 0, muNode, 1);		// Slot 1 = Feedback loop
 
 			const theta = makeNamedNode('thetaValue', name);
 			connectValue(testNode, 0, theta, 0);	// Slot 0 = Condition
@@ -960,9 +958,8 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// Evaluate the discriminant exactly once, into a dedicated wrapper node so every
 					// case test reads the same value.
 					recurse(s.discriminant, 'expression');
-					const discValue = getExprNode(s.discriminant);
 					const discNode	= makeNode({ type: 'var', declKind: 'let' });
-					connectValue(discValue, 0, discNode, 0);
+					connectValue(getExprNode(s.discriminant), 0, discNode, 0);
 					const suffix	= discNode.id;
 					const discName	= `__disc_${suffix}`;
 					discNode.name	= discName;
@@ -2385,12 +2382,11 @@ export function BuildProgram(
 				// with nothing but its own trailing `break;` -- if EVERY case is in that shape, the whole
 				// dispatch is observably a no-op and drops entirely. A continue/return/throw blocks this.
 				const isNoOp = (stmts: Stmt[]) => stmts.length === 0 || (stmts.length === 1 && stmts[0].type === 'break');
-				const switchIsNoOp = cases.every(c => isNoOp(c.consequent));
 
 				return [
 					...forceDeclare(control.switchDiscriminantId!),
 					...control.switchCases!.flatMap(c => c.testNodeId ? forceDeclare(c.testNodeId) : []),
-					...(switchIsNoOp ? [] : [JS.Switch(resolveNode(control.switchDiscriminantId!), ...cases)]),
+					...(cases.every(c => isNoOp(c.consequent)) ? [] : [JS.Switch(resolveNode(control.switchDiscriminantId!), ...cases)]),
 				];
 			});
 
@@ -2933,8 +2929,7 @@ export function applyGlobalCodeMotion(graph: VSDG) {
 			// The current node must be scheduled AFTER its inputs are ready -- find the deepest block
 			// among all inputs. A param edge (port >= 1) uses the function's own body block, not the
 			// entry's own -- and 'function' covers both a declaration and an arrow/function expression.
-			const targetNode	= graph.get(edge.nodeId)!;
-			const edgeBlock	= targetNode.type === 'function' && edge.port !== 0
+			const edgeBlock	= graph.get(edge.nodeId)!.type === 'function' && edge.port !== 0
 				? functionBodyBlockOf(edge.nodeId)
 				: blockIds.get(edge.nodeId);
 			if (edgeBlock !== undefined && blocks.isDeeperThan(edgeBlock, earliestBlock))

@@ -3032,9 +3032,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			case 'u64':
 				got = 'i64';
 				//fallthrough
-			case 'i64':
+			case 'i64': ctx.emit(I[got](0), I[got].ne); return;
+			// `abs(x) > 0`, not `x != 0`: NaN is FALSY in JS, but wasm's `ne` is true for an unordered
+			// compare, so a bare `x != 0` called it truthy. `abs` keeps NaN NaN and `gt` is false for it,
+			// which also collapses `-0` correctly -- and needs no scratch local, unlike `x != 0 && x == x`.
 			case 'f64':
-			case 'f32': ctx.emit(I[got](0), I[got].ne); return;
+			case 'f32': ctx.emit(I[got].abs, I[got](0), I[got].gt); return;
 		}
 		const t = checkerTypeOf(unwrapAs(e), ctx.scope);
 		// A string is falsy when EMPTY, so it tests its own length rather than its reference. A nullable one
@@ -4654,6 +4657,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					}
 				}
 
+				// `!x` is exactly "is x falsy", so it answers for every operand shape `emitTruthy` understands
+				// -- a nullable object reference, a string (empty is falsy), an array, a scalar -- not just
+				// the scalar-kinded ones. The old scalar-only path also coerced the operand to `i32` first,
+				// which TRUNCATED a real `f64`: `!0.5` came out `true`.
+				if (e.operator === '!') {
+					emitTruthy(e.operand, ctx);
+					ctx.emit(I.i32.eqz);
+					return 'i32';
+				}
+
 				const t = notUnsigned(scalarKind(info.wtype));
 				if (t) {
 					switch (e.operator) {
@@ -4670,10 +4683,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						case '+':
 							emitAs(e.operand, ctx, t);
 							return t;
-						case '!':
-							emitAs(e.operand, ctx, 'i32');
-							ctx.emit(I.i32.eqz);
-							return 'i32';
 						case '~':
 							emitAs(e.operand, ctx, 'i32');
 							ctx.emit(I.i32(-1), I.i32.xor);

@@ -5233,6 +5233,40 @@ async function main() {
 	}
 
 	{
+		// `!x` is exactly "is x falsy", so it answers for every shape `emitTruthy` understands. It used to
+		// be scalar-only -- and even there it coerced the operand to `i32` first, so `!0.5` TRUNCATED to
+		// `!0` and came out `true`. Separately, NaN is falsy in JS, but wasm's `ne` is true for an
+		// unordered compare, so `emitTruthy` called it truthy; `abs(x) > 0` is right for both.
+		const r = await compile(`
+			class C { n: number; constructor(n: number) { this.n = n; } }
+			export function notFraction(): boolean { const x = 0.5; return !x; }
+			export function notZero(): boolean { const x = 0.0; return !x; }
+			export function notNull(): boolean { const s: C | undefined = undefined; return !s; }
+			export function notObject(): boolean { const s: C | undefined = new C(1); return !s; }
+			export function notEmptyStr(): boolean { const s = ''; return !s; }
+			export function notStr(): boolean { const s = 'a'; return !s; }
+			export function notArray(): boolean { const a = [1]; return !a; }
+			export function doubleNot(): boolean { const s: C | undefined = undefined; return !!s; }
+			export function notNaN(): boolean { const x = 0.0 / 0.0; return !x; }
+			export function nanIsFalsy(): number { const x = 0.0 / 0.0; return x ? 1 : 2; }
+			export function fractionIsTruthy(): number { const x = 0.5; return x ? 1 : 2; }
+			export function minusZeroIsFalsy(): number { const x = -0.0; return x ? 1 : 2; }
+		`);
+		check('!0.5 is false (not truncated to !0)', !!r.notFraction(), false);
+		check('!0 is true', !!r.notZero(), true);
+		check('! on a null object reference', !!r.notNull(), true);
+		check('! on a live object reference', !!r.notObject(), false);
+		check("! on '' is true", !!r.notEmptyStr(), true);
+		check("! on 'a' is false", !!r.notStr(), false);
+		check('! on an array is false', !!r.notArray(), false);
+		check('!! on a null object reference', !!r.doubleNot(), false);
+		check('!NaN is true', !!r.notNaN(), true);
+		check('NaN is falsy as a condition', r.nanIsFalsy(), 2);
+		check('0.5 is truthy as a condition', r.fractionIsTruthy(), 1);
+		check('-0 is falsy as a condition', r.minusZeroIsFalsy(), 2);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
