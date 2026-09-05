@@ -5515,6 +5515,29 @@ async function main() {
 	}
 
 	{
+		// `flatMap` wasn't declared at all -- not in `lib/array.ts`, not in `lib.d.ts` -- so every
+		// `xs.flatMap(...)` typed as `any`. towasm.ts's own `LIB_DECLS` is `[...filter(...),
+		// ...filter(...).flatMap(...)]`, and one `any` in a spread poisons the array: `for (const d of
+		// LIB_DECLS)` gave `d: any`, which is where all 35 of that file's `unknown field 'name'` came from.
+		// Full-arity callbacks here because a shorter one is a separate, still-open gap (a 1-parameter
+		// arrow handed to a `(value, index, array)` signature -- the array-callback cluster).
+		const r = await compile(`
+			export function len(): number { const a = [1, 2]; return a.flatMap((x: number, i: number, arr: number[]) => [x, x]).length; }
+			export function nested(): number { const a = [1, 2]; return a.flatMap((x: number, i: number, arr: number[]) => [x, x, x]).length; }
+			export function empties(): number { const a = [1, 2, 3]; return a.flatMap((x: number, i: number, arr: number[]) => x > 1 ? [x] : []).length; }
+			// the callback must run exactly ONCE per element -- sizing the result with a second pass would
+			// re-run its effects
+			export function once(): number { let n = 0; const a = [1, 2, 3]; a.flatMap((x: number, i: number, arr: number[]) => { n = n + 1; return [x]; }); return n; }
+			export function emptySource(): number { const a: number[] = []; return a.flatMap((x: number, i: number, arr: number[]) => [x]).length; }
+		`);
+		check('flatMap: flattens one level', r.len(), 4);
+		check('flatMap: ...whatever the part length', r.nested(), 6);
+		check('flatMap: an empty part contributes nothing', r.empties(), 2);
+		check('flatMap: the callback runs once per element', r.once(), 3);
+		check('flatMap: an empty source gives an empty result', r.emptySource(), 0);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
