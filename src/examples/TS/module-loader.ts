@@ -24,6 +24,9 @@ export const OptionsDefault = {
 	types:									undefined as string | undefined,
 };
 
+// Ships beside this file, and beside `lib/` proper -- see `ModuleLoader.nodeBuiltin`.
+const NODE_LIB_DIR	= path.join(__dirname, 'lib', 'node');
+
 const reExt			= /\.[^/]+$/;
 const reReference	= /^\/\/\/\s*<reference\s+(path|types|lib)=["']([^"']+)["']\s*\/>/gm;
 
@@ -277,6 +280,25 @@ export class ModuleLoader {
 		return await load(resolved) || await load(resolved + '/index');
 	}
 
+	// A node builtin (`import * as path from 'path'`) served from this compiler's own runtime library.
+	// Loaded ON DEMAND, unlike `lib/*.ts` proper -- those are concatenated into one always-present global
+	// declaration list (towasm.ts's `LIB_AST`), so everything in them is linked into every module whether
+	// it is used or not. These are ordinary modules instead: nothing resolves here unless a program really
+	// imports the specifier, and adding a new builtin is a new file, not a compiler change. Its own
+	// directory, not `lib/` itself, so a bare specifier can never collide with a static lib file
+	// (`string`, `map`, `array` are all plausible package names).
+	private async nodeBuiltin(spec: string): Promise<LoadedModule | undefined> {
+		const canonical = 'lib/node/' + spec.replace(/^node:/, '');
+		const code = await tryLoadFile(path.join(NODE_LIB_DIR, path.basename(canonical) + '.ts'));
+		if (!code)
+			return undefined;
+		try {
+			return { body: TS.parse(code).body, canonical };
+		} catch (e) {
+			console.error(`Failed to parse ${canonical}: ${e}`);
+		}
+	}
+
 	private async get0(resolved: string): Promise<LoadedModule|undefined> {
 		if (this.opts.paths) {
 			for (const [alias, paths] of Object.entries(this.opts.paths)) {
@@ -292,6 +314,12 @@ export class ModuleLoader {
 		}
 		if (resolved.startsWith('.'))
 			return this.local(resolved);
+
+		// Ahead of `node_modules`: `@types/node` also declares these, as bodyless `.d.ts` signatures with
+		// nothing to compile, which is exactly what made `path` an "unresolved identifier" in codegen.
+		const builtin = await this.nodeBuiltin(resolved);
+		if (builtin)
+			return builtin;
 
 		const nm	= await NodeModules.get(this.root);
 		if (nm)

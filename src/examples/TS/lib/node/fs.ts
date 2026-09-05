@@ -1,6 +1,5 @@
-/// <reference path="./lib.d.ts" />
+/// <reference path="../lib.d.ts" />
 
-import { __alloc } from './console';
 import {
 	fd_write, fd_read, fd_close, fd_filestat_get,
 	fd_prestat_get, fd_prestat_dir_name,

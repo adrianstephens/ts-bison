@@ -1,4 +1,4 @@
-/// <reference path="./lib.d.ts" />
+/// <reference path="../lib.d.ts" />
 
 //-----------------------------------------------------------------------------
 //	path -- POSIX ('/') semantics only, pure string manipulation, no WASI

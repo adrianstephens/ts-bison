@@ -1,7 +1,5 @@
-/// <reference path="./lib.d.ts" />
+/// <reference path="../lib.d.ts" />
 
-import { __alloc } from './console';
-import { Map } from './map';
 import { proc_exit, args_get, args_sizes_get, environ_get, environ_sizes_get } from 'wasi_snapshot_preview1';
 
 const loadU8	= __asm<[i32], i32>('i32.load8_u');

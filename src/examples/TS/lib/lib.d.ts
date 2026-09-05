@@ -36,6 +36,27 @@ declare module 'wasi:io/resource-error' {
 // it's assigned to, and this is what supplies it.
 declare function __asm<P extends any[], R>(asm: string): (...args: P) => R;
 
+// `console.ts`'s bump allocator, declared here as a global rather than imported: `lib/node/*` is loaded
+// ON DEMAND as a real module, and an `import` of `./console` would compile a SECOND copy of it -- a second
+// `heap` over the same linear memory, which is silent corruption, not duplication.
+declare function __alloc(size: i32, align: i32): i32;
+
+// Same reason, and the same shape `Array<T>`/`StringParser` below already use: the real class lives in
+// `map.ts`, which is always static, so an on-demand `lib/node/*` module names it rather than importing it.
+declare class Map<K, V> {
+	constructor(entries?: [K, V][]);
+	get size(): number;
+	get(key: K): V | undefined;
+	has(key: K): boolean;
+	set(key: K, value: V): this;
+	delete(key: K): boolean;
+	clear(): void;
+	keys(): K[];
+	values(): V[];
+	entries(): [K, V][];
+	forEach(callbackfn: (value: V, key: K, map: Map<K, V>) => void, thisArg?: any): void;
+}
+
 declare function pure(target: any, propertyKey: string, descriptor: PropertyDescriptor): void;
 
 // Pseudo-types for `__asm`'s own `P`/`R` generic args, purely so an asm-backed method can declare its
