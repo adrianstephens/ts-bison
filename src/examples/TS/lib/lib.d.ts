@@ -7,6 +7,18 @@
 
 declare module 'wasi_snapshot_preview1' {
 	export function fd_write(fd: i32, iovsPtr: i32, iovsLen: i32, nwrittenPtr: i32): i32;
+	export function fd_read(fd: i32, iovsPtr: i32, iovsLen: i32, nreadPtr: i32): i32;
+	export function fd_close(fd: i32): i32;
+	export function fd_filestat_get(fd: i32, bufPtr: i32): i32;
+	export function fd_prestat_get(fd: i32, prestatPtr: i32): i32;
+	export function fd_prestat_dir_name(fd: i32, pathPtr: i32, pathLen: i32): i32;
+	export function path_open(fd: i32, dirflags: i32, pathPtr: i32, pathLen: i32, oflags: i32, fsRightsBase: i64, fsRightsInheriting: i64, fdflags: i32, openedFdPtr: i32): i32;
+	export function path_create_directory(fd: i32, pathPtr: i32, pathLen: i32): i32;
+	export function proc_exit(code: i32): void;
+	export function args_get(argvPtr: i32, argvBufPtr: i32): i32;
+	export function args_sizes_get(argcPtr: i32, argvBufSizePtr: i32): i32;
+	export function environ_get(environPtr: i32, environBufPtr: i32): i32;
+	export function environ_sizes_get(environCountPtr: i32, environBufSizePtr: i32): i32;
 }
 // Declaring standard modern WASI resource management functions
 declare module 'wasi:io/resource-error' {
