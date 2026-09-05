@@ -2364,7 +2364,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	function narrowedTypeOf(e: Expr, ctx: FunctionContext): Type {
 		const unwrapped = unwrapAs(e);
 		const base = checkerTypeOf(unwrapped, ctx.scope);
-		if (!ctx.stmtScope || T.resolve(ctx.scope, base).type !== 'union')
+		// `any` counts as well as a real union: a field read off a NARROWED union receiver (`w.body`
+		// inside `if (w.kind === 'w')`) has no baseline type at all, because `ctx.scope` still sees `w` as
+		// the whole union, on which `body` doesn't exist. Every divergence the union-only guard was
+		// protecting against needs `ctx.scope` to have a real answer, so an `any` baseline can't reach one.
+		if (!ctx.stmtScope || !(T.isAny(base) || T.resolve(ctx.scope, base).type === 'union'))
 			return base;
 		const narrowed = checkerTypeOf(unwrapped, ctx.stmtScope);
 		return T.isAny(narrowed) ? base : narrowed;
