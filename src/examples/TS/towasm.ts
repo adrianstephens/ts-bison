@@ -5877,8 +5877,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					// never reflects flow-sensitive narrowing the way the checker's internal scope tree does).
 					// Without it, a narrowed-non-null receiver (e.g. `if (m === null) return; ...; m.group(0)`)
 					// would still look nullable to `checkerTypeOf` here and member/call resolution could fail
-					// on it. Falls back to `ctx.scope` only if somehow unset (shouldn't happen post-`TStypeCheck`).
-					const stmtScope = (s as any).scope as Scope ?? ctx.scope;
+					// on it. `ctx.typeScope`, not `ctx.scope`, when unset: a SYNTHETIC statement (the `for...of`
+					// and destructuring desugarings both synthesize a `var_decl`) is never stamped, so the
+					// fallback is the normal path for those, and it must not throw away the narrowing the
+					// enclosing real statement already established.
+					const stmtScope = (s as any).scope as Scope ?? ctx.typeScope;
 					const {methodOwner, methodName, calleeOptional} = d.init.type === 'call' && d.init.callee.type === 'member'
 						? {methodOwner: ownerOf(d.init.callee.object, ctx), methodName: d.init.callee.property, calleeOptional: d.init.callee.optional}
 						: {};
