@@ -40,6 +40,11 @@ declare function __asm<P extends any[], R>(asm: string): (...args: P) => R;
 // ON DEMAND as a real module, and an `import` of `./console` would compile a SECOND copy of it -- a second
 // `heap` over the same linear memory, which is silent corruption, not duplication.
 declare function __alloc(size: i32, align: i32): i32;
+// Mark/release around `__alloc`'s bump offset -- the only reclamation it has. Release only once every
+// value that must outlive the scratch (a GC string/array/object) has been built; a raw pointer does not
+// survive a release.
+declare function __allocMark(): i32;
+declare function __allocRelease(mark: i32): void;
 
 // Same reason, and the same shape `Array<T>`/`StringParser` below already use: the real class lives in
 // `map.ts`, which is always static, so an on-demand `lib/node/*` module names it rather than importing it.

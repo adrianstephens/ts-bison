@@ -16,6 +16,16 @@ export function __alloc(size: i32, align: i32): i32 {
 	return ret;
 }
 
+// `heap` itself stays private -- these two are the only way another module can carve out temporary
+// scratch and give it back: mark before allocating, release once nothing live still points into it.
+// There is no free(); release is the only reclamation this bump allocator ever gets.
+export function __allocMark(): i32 {
+	return heap;
+}
+export function __allocRelease(mark: i32): void {
+	heap = mark;
+}
+
 //-----------------------------------------------------------------------------
 //	console.log
 //-----------------------------------------------------------------------------
@@ -28,7 +38,7 @@ export function __alloc(size: i32, align: i32): i32 {
 // Copies `s`'s code units into a fresh linear-memory buffer, builds a 2-field (ptr, len) WASI iovec right
 // after it, and writes it via `fd_write` to fd 1 (stdout).
 function __writeString(s: string): void {
-	const save_heap = heap;
+	const mark = __allocMark();
 
 	const len = s.length;
 	const buf = __alloc(len, 1);
@@ -42,7 +52,7 @@ function __writeString(s: string): void {
 	const nwritten = __alloc(4, 4);
 	fd_write(1, iov, 1, nwritten);
 
-	heap = save_heap;
+	__allocRelease(mark);
 }
 
 export class console {

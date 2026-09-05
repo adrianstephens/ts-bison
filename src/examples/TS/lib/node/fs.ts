@@ -6,14 +6,14 @@ import {
 	path_open, path_create_directory,
 } from 'wasi_snapshot_preview1';
 
-// No `heap` save/restore here (unlike console.ts's `__writeString`): `heap` is private to console.ts,
-// only `__alloc` is exported, so every scratch buffer allocated below is permanent bump-allocator waste.
-// Fine for a bump allocator with no free -- just not reclaimed, same tradeoff `__alloc` itself already has.
-
-const loadU8	= __asm<[i32], i32>('i32.load8_u');
-const loadI32	= __asm<[i32], i32>('i32.load');
-const storeU8	= __asm<[i32, i32], void>('i32.store8');
-const storeI32	= __asm<[i32, i32], void>('i32.store');
+// Plain functions wrapping an inline `__asm(...)(...)` call, not `const x = __asm(...)` -- towasm.ts's
+// asm-builtin binding only resolves that shorthand for a name declared in the always-loaded static lib
+// files, never an on-demand module like this one; a real function body containing the same inline call
+// compiles fine everywhere. (Confirmed via `WebAssembly.validate`, not difftest -- see report.)
+function loadU8(ptr: i32): i32 { return __asm<[i32], i32>('i32.load8_u')(ptr); }
+function loadI32(ptr: i32): i32 { return __asm<[i32], i32>('i32.load')(ptr); }
+function storeU8(ptr: i32, v: i32): void { __asm<[i32, i32], void>('i32.store8')(ptr, v); }
+function storeI32(ptr: i32, v: i32): void { __asm<[i32, i32], void>('i32.store')(ptr, v); }
 
 function writeBytes(s: string): i32 {
 	const len = s.length;
@@ -40,6 +40,7 @@ class Preopen {
 // preopen table (fd 3 upward, per the WASI convention) for the longest preopened name that prefixes
 // `p`, the same "longest matching preopen" rule wasi-libc's own path resolution uses.
 function findPreopen(p: string): Preopen {
+	const mark = __allocMark();
 	const prestatBuf = __alloc(8, 4);
 	let fd = 3;
 	let bestFd = -1;
@@ -51,9 +52,13 @@ function findPreopen(p: string): Preopen {
 		} else {
 			if (loadU8(prestatBuf) === 0) {
 				const nameLen = loadI32(prestatBuf + 4);
+				// Nested mark: `nameBuf`'s size varies per fd, so it's released as soon as its one use
+				// (`readBytes`, which copies it into a GC string) is done, not held for the whole scan.
+				const nameMark = __allocMark();
 				const nameBuf = __alloc(nameLen, 1);
 				fd_prestat_dir_name(fd, nameBuf, nameLen);
 				const name = readBytes(nameBuf, nameLen);
+				__allocRelease(nameMark);
 				const matches = name === '.' || p === name || p.slice(0, name.length + 1) === name + '/';
 				if (matches && name.length >= bestName.length) {
 					bestFd = fd;
@@ -63,6 +68,10 @@ function findPreopen(p: string): Preopen {
 			fd++;
 		}
 	}
+	// Safe here: everything that survives the scan (`bestFd`, `bestName`) is either a plain fd number
+	// or a GC string, never a pointer into `prestatBuf`.
+	__allocRelease(mark);
+
 	if (bestFd === -1)
 		return new Preopen(3, p);
 	if (bestName === '.') {
@@ -79,6 +88,8 @@ function findPreopen(p: string): Preopen {
 // same byte-per-codeunit representation `console.ts` documents, so there's no second encoding to pick.
 export function readFileSync(p: string, encoding: string): string {
 	const pre = findPreopen(p);
+	const mark = __allocMark();
+
 	const pathBuf = writeBytes(pre.rel);
 
 	const fdOut = __alloc(4, 4);
@@ -101,11 +112,16 @@ export function readFileSync(p: string, encoding: string): string {
 	fd_read(fileFd, iov, 1, nreadPtr);
 	fd_close(fileFd);
 
-	return readBytes(dataBuf, size);
+	// Release only after the bytes are copied into a GC string -- `dataBuf` is a raw pointer, `result` isn't.
+	const result = readBytes(dataBuf, size);
+	__allocRelease(mark);
+	return result;
 }
 
 export function writeFileSync(p: string, data: string): void {
 	const pre = findPreopen(p);
+	const mark = __allocMark();
+
 	const pathBuf = writeBytes(pre.rel);
 
 	const fdOut = __alloc(4, 4);
@@ -120,10 +136,15 @@ export function writeFileSync(p: string, data: string): void {
 	const nwrittenPtr = __alloc(4, 4);
 	fd_write(fileFd, iov, 1, nwrittenPtr);
 	fd_close(fileFd);
+
+	// Nothing here escapes past this point -- void return, safe to release.
+	__allocRelease(mark);
 }
 
 export function mkdirSync(p: string): void {
 	const pre = findPreopen(p);
+	const mark = __allocMark();
 	const pathBuf = writeBytes(pre.rel);
 	path_create_directory(pre.fd, pathBuf, pre.rel.length);
+	__allocRelease(mark);
 }

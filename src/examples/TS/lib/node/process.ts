@@ -2,8 +2,9 @@
 
 import { proc_exit, args_get, args_sizes_get, environ_get, environ_sizes_get } from 'wasi_snapshot_preview1';
 
-const loadU8	= __asm<[i32], i32>('i32.load8_u');
-const loadI32	= __asm<[i32], i32>('i32.load');
+// Plain functions, not `const x = __asm(...)` -- see the identical note in `lib/node/fs.ts`.
+function loadU8(ptr: i32): i32 { return __asm<[i32], i32>('i32.load8_u')(ptr); }
+function loadI32(ptr: i32): i32 { return __asm<[i32], i32>('i32.load')(ptr); }
 
 export function exit(code: i32): void {
 	proc_exit(code);
@@ -26,6 +27,8 @@ function readCStringTable(count: i32, bufPtr: i32): string[] {
 }
 
 function loadArgv(): string[] {
+	const mark = __allocMark();
+
 	const countPtr = __alloc(4, 4);
 	const bufSizePtr = __alloc(4, 4);
 	args_sizes_get(countPtr, bufSizePtr);
@@ -35,10 +38,16 @@ function loadArgv(): string[] {
 	const argvPtr = __alloc(count * 4, 4);
 	const bufPtr = __alloc(bufSize, 1);
 	args_get(argvPtr, bufPtr);
-	return readCStringTable(count, argvPtr);
+
+	// `readCStringTable` copies every entry into a GC string before this returns -- safe to release.
+	const result = readCStringTable(count, argvPtr);
+	__allocRelease(mark);
+	return result;
 }
 
 function loadEnv(): Map<string, string> {
+	const mark = __allocMark();
+
 	const countPtr = __alloc(4, 4);
 	const bufSizePtr = __alloc(4, 4);
 	environ_sizes_get(countPtr, bufSizePtr);
@@ -50,6 +59,8 @@ function loadEnv(): Map<string, string> {
 	environ_get(environPtr, bufPtr);
 
 	const entries = readCStringTable(count, environPtr);
+	__allocRelease(mark);
+
 	const result = new Map<string, string>();
 	for (let i = 0; i < entries.length; i++) {
 		const entry = entries[i];
