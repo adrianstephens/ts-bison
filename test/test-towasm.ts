@@ -5267,6 +5267,28 @@ async function main() {
 	}
 
 	{
+		// A union of two differently-shaped classes boxes to a plain `any` slot, so truthiness looked
+		// undecidable ("could be holding 0") even though the CHECKER's type says every non-null thing it can
+		// hold is an object. `alwaysTruthy` reads that type, and the test is a null test after all -- the
+		// `Stmt | undefined` shape that blocked seven declarations across checker.ts and type-utils.ts.
+		const { present, absent, negated, viaField } = await compile(`
+			class A { a: number; constructor(a: number) { this.a = a; } }
+			class B { b: string; constructor(b: string) { this.b = b; } }
+			type Node = A | B;
+			function test(n: Node | undefined): number { return n ? 1 : 2; }
+			export function present(): number { return test(new B('')); }
+			export function absent(): number { return test(undefined); }
+			export function negated(): number { const n: Node | undefined = undefined; return !n ? 7 : 8; }
+			// An empty-string field on the object -- the OBJECT is truthy regardless of what it holds.
+			export function viaField(): number { const n: Node | undefined = new B(''); return n ? 3 : 4; }
+		`);
+		check('a boxed union of object types is truthy when present', present(), 1);
+		check('...and falsy when null', absent(), 2);
+		check('...and negatable', negated(), 7);
+		check('...decided by the reference, not by what it holds', viaField(), 3);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

@@ -3016,6 +3016,35 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return want;
 	}
 
+	// True when a value of this type is truthy whenever it is non-null -- an object, an array, a tuple, a
+	// function. Never a `string` (`''` is falsy), a `number` (`0`, `NaN`), a `boolean`, a literal, or a
+	// genuinely dynamic `any`/type parameter, for all of which truthiness is a property of the VALUE.
+	// Answered from the CHECKER's type, which is the only thing that still knows a boxed `any` slot holds
+	// `Stmt | undefined` rather than something that could be `0`.
+	function alwaysTruthy(t: Type, scope: Scope): boolean {
+		const r = T.resolve(scope, t);
+		switch (r.type) {
+			case 'object':	case 'array':	case 'tuple':
+			case 'function':	case 'constructor':
+				return true;
+			case 'union':
+				// An all-nullish union lands here as `true`, which is still correct: the null test below
+				// answers `false` for it, which is what it always is.
+				return r.types.every(m => T.isNullish(m, scope) || alwaysTruthy(m, scope));
+			case 'intersection':
+				// A value satisfying an intersection satisfies every part, so one object-ish part is enough
+				// to make it an object -- unless another part makes it a PRIMITIVE (a branded
+				// `string & {brand}`), where truthiness is still the primitive's own. An interface that
+				// `extends` another resolves to exactly this (`FunctionType` = `{type:'function'} & CallSig`).
+				return r.types.some(m => alwaysTruthy(m, scope))
+					&& !r.types.some(m => ['ref', 'literal'].includes(T.resolve(scope, m).type));
+			default:
+				// A `ref` surviving `resolve` is a primitive or an unresolved name; either way, not decidable
+				// here. Everything else (a literal, `keyof`, a conditional, a type parameter) likewise.
+				return false;
+		}
+	}
+
 	function emitTruthy(e: Expr, ctx: FunctionContext): void {
 		let got = emitExpr(e, ctx);
 		// A boxed nullable primitive (`number | null`/`boolean | null`) has no truthiness of its own --
@@ -3060,8 +3089,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// `if (obj)`/`obj ? a : b` is exactly a null test, and a non-nullable one is unconditionally true
 		// (the value still has to be evaluated for its side effects, hence the `drop`). A boxed `any` stays
 		// excluded: truthiness is a property of the VALUE there (it could be holding `0` or `''`).
-		if (typeof got === 'object' && !('ref' in got && (got.ref === 'any' || got.ref === 'exn'))
-			&& !T.isAny(T.resolveOwn(t, ctx.scope))) {
+		// ...and a boxed `any` slot is that same null test whenever the CHECKER's type says every non-null
+		// thing it can hold is an object/array/function (`alwaysTruthy`). `Stmt | undefined` is the common
+		// case: the physical type collapsed to `any` because the union's members differ physically, not
+		// because the value could be a primitive.
+		if (typeof got === 'object' && (!('ref' in got && (got.ref === 'any' || got.ref === 'exn'))
+				? !T.isAny(T.resolveOwn(t, ctx.scope))
+				: alwaysTruthy(t, ctx.scope))) {
 			if (got.nullable)
 				ctx.emit(I.ref.is_null, I.i32.eqz);
 			else
