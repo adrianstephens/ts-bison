@@ -5697,6 +5697,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						const leftInfo	= operandInfo(left, ctx);
 						const method	= BINARY_OP_NAMES[operator as keyof typeof BINARY_OP_NAMES];
 
+						// JS `+` is string CONCATENATION as soon as either operand is a string, whatever
+						// the other one is. Compiled as the equivalent template literal so it goes through
+						// exactly the `stringTemplate`/`.toString()` path `${x}` already does, rather than
+						// a second stringifier that could disagree with it. Only when the two sides
+						// DISAGREE -- `string + string` keeps `String.add`, and `number + number` its
+						// numeric op. `definitelyString` is deliberately all-members-of-a-union: a
+						// `string | number` operand really is decided at runtime, which this cannot model.
+						if (method === 'add') {
+							const definitelyString = (x: Expr) => {
+								const t = T.resolve(ctx.typeScope, narrowedTypeOf(x, ctx));
+								const ms = T.unionMembers(t, ctx.typeScope);
+								return ms.length > 0 && ms.every(m => T.isStringLike(m, ctx.typeScope));
+							};
+							const ls = definitelyString(left), rs = definitelyString(right);
+							if (ls !== rs)
+								return emitExpr(Literal([{ str: '', exp: left }, { str: '', exp: right }]), ctx, want);
+						}
+
 						if (leftInfo.owner) {
 							if (leftInfo.owner.methodDecls?.get(method)) {
 								emitAs(left, ctx, leftInfo.owner.thisWtype!);
