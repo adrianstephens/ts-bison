@@ -1377,7 +1377,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// isn't `'function'`/`'constructor'`-shaped, so signature lookup below would just fail and
 				// fall back to `any`). The call's own short-circuit-to-`undefined` is instead reattached to
 				// the result once, right before the final `return`.
-				const calleeOptional = e.callee.type === 'member' && isOptionalChainLink(e.callee);
+				// `f?.()` puts the optionality on the CALL node itself, not on a member callee, so the
+				// nullish strip-and-reattach below never ran for it: `(() => number) | undefined` isn't
+				// function-shaped, signature lookup found nothing, and the whole call typed as `any`.
+				const calleeOptional = (e.callee.type === 'member' && isOptionalChainLink(e.callee)) || !!(e as { optional?: boolean }).optional;
 				const calleeT		= T.resolveOwn(T.nonNullable(recurse(e.callee), scope, calleeOptional), scope);
 				// Explicit call-site type args (`f<Foo>(...)`) are raw AST, never stamped like a declaration's own annotations --
 				// unstamped, a ref substituted into the callee's generic body would resolve against the callee's scope, not the caller's.
