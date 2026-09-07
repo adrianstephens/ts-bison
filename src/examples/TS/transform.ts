@@ -811,6 +811,8 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 	// The entry program never goes through `makeScope` (nothing imports it) -- just its own stable identity for `wouldDeadlock`'s bookkeeping.
 	const entrySrc: LoadedModule = { body: program.body, canonical: '.' };
 	const entryScope = new Scope(global);
+	// A SCRIPT (no top-level import/export) declares into the global space -- see `Scope.globalSpace`.
+	entryScope.globalSpace = !program.body.some(s => s.type === 'import' || s.type === 'export' || s.type === 'export_decl' || s.type === 'export_assignment');
 	await Promise.all(program.body.filter(s => s.type === 'import').map(s => resolveImport(entrySrc, entryScope, s, '.')));
 
 	const depthExhaustion = new Map<string, number>();

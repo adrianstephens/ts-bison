@@ -749,7 +749,7 @@ function hoist(stmts: Stmt[], scope: Scope) {
 		} else if (stmt.type === 'interface_decl') {
 			const obj = T.stampScope(TS.ObjectType(stmt.body), scope);
 			// own members first: lookupMember's first match implements override precedence
-			scope.mergeType(stmt.name, stmt.extendsClause?.length ? T.intersectTypes([obj, ...stmt.extendsClause.map(e => T.stampScope(e, scope))]) : obj, stmt.typeParams);
+			scope.mergeType(stmt.name, stmt.extendsClause?.length ? T.intersectTypes([obj, ...stmt.extendsClause.map(e => T.stampScope(e, scope))]) : obj, stmt.typeParams, true);
 		}
 	}
 	for (let stmt of stmts) {

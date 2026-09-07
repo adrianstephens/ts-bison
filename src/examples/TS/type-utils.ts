@@ -2142,6 +2142,11 @@ export class Scope {
 	resolveCache?: 			WeakMap<Type, [Type | undefined, Type | undefined]>;
 	lookupMemberCache?:		WeakMap<Type, Map<string, Type | undefined>>;
 
+	// This scope IS the global declaration space: the top level of a SCRIPT (a file with no top-level
+	// import/export). Real TS puts such a file's declarations in the global space, so an `interface` there
+	// augments a same-named global one; a module's top level, and any block, is its own space instead.
+	globalSpace = false;
+
 	constructor(public parent?: Scope, private genericTemplate?: boolean) {}
 
 	hitDepthLimit(fn: string): void					{ this.parent?.hitDepthLimit(fn); }
@@ -2212,8 +2217,20 @@ export class Scope {
 	addNamespace(name: string, s: Scope)			{ (this.namespaces ??= new Map()).set(name, s); }
 	addDecl(name: string, stmt: TS.Stmt)		{ (this.decls ??= new Map()).set(name, stmt); }
 
-	mergeType(name: string, type: Type, typeParams: TS.TypeParam[] | undefined) {
-		return this.mergeTypeEntry(name, {type, typeParams});
+	mergeType(name: string, type: Type, typeParams: TS.TypeParam[] | undefined, augment = false) {
+		// `augment` (an `interface` declaration) in the GLOBAL declaration space merges with a same-named
+		// declaration from an enclosing scope: real TS puts a script's top level in the global space, so
+		// `interface Array<T> { slice(): this }` augments the lib's `Array`. Modelled here as a child
+		// scope, it silently replaced it instead and every other member's real signature was lost.
+		// Gated on `globalSpace` because a local interface genuinely shadows (`localTypes4.ts`: "local
+		// types are block scoped"). Inherited part FIRST, same order `mergeTypeEntry` uses: `lookupMember`
+		// REVERSES an intersection when merging same-named signatures into one overload set, so this is
+		// what actually gets the augmenting declaration tried first.
+		const inherited = augment && this.globalSpace && !this.types.has(name) ? this.parent?.type(name) : undefined;
+		if (inherited)
+			this.types.set(name, { typeParams: typeParams ?? inherited.typeParams, type: intersectTypes([inherited.type, type]) });
+		else
+			this.mergeTypeEntry(name, {type, typeParams});
 	}
 
 	private mergeTypeEntry(name: string, te: TypeEntry) {
