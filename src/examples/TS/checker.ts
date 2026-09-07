@@ -1141,7 +1141,21 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					}
 					i++;
 				}
-				return wantTuple ? { type: 'tuple', elements: elems } : TS.ArrayType(elems.length ? T.combineTypes(elems) : T.ANY);
+				if (wantTuple)
+					return { type: 'tuple', elements: elems };
+				if (!elems.length)
+					return TS.ArrayType(T.ANY);
+				// LITERAL WIDENING, as real TS does it: `[1, 2, 3]` is `number[]`, not `(1|2|3)[]` -- an
+				// array literal is MUTABLE, so keeping the initialiser's literal types made `a[0] = 5` a
+				// type error ("Type '5' is not assignable to type '1 | 2 | 3'"). It also leaked into
+				// codegen: the element STORAGE already widens (`wasmTypeOf`), so a callback parameter
+				// contextually typed from the unwidened element came back `i32` against an `f64` array,
+				// and `[1,2,3].map(x => x * 2)` could not compile at all.
+				// Skipped when a contextual array type supplied the element type -- that annotation is a
+				// deliberate choice and outranks inference. `widenLiterals` keeps a `frozen` leaf as-is, so
+				// `[1, 2, 3] as const` still means exactly what it says.
+				const elem = T.combineTypes(elems);
+				return TS.ArrayType(resolvedExpected?.type === 'array' ? elem : T.widenLiterals(elem));
 			}
 
 			case 'object': {

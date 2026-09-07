@@ -162,11 +162,18 @@ export class Array<T> {
 		return true;
 	}
 	filter(callback: (value: T, index: number, array: this) => any, thisArg?: any): T[] {
-		const result: T[] = Array._alloc<T>(this.length);
-		for (let i = 0, j = 0; i < this.length; i++) {
+		// Collected into a full-length scratch first, then copied down to the real count: a wasm-GC array's
+		// length is fixed at allocation, and the old code returned the SCRATCH, so `.length` was always the
+		// input's. Counting in a first pass instead would call `callback` twice per element, which is
+		// observable whenever the predicate has a side effect.
+		const scratch: T[] = Array._alloc<T>(this.length);
+		let n = 0;
+		for (let i = 0; i < this.length; i++) {
 			if (callback(this[i], i, this))
-				result[j++] = this[i];
+				scratch[n++] = this[i];
 		}
+		const result: T[] = Array._alloc<T>(n);
+		Array._copy(result, 0, scratch, 0, n);
 		return result;
 	}
 	find(callback: (value: T, index: number, array: this) => boolean, thisArg?: any): T | undefined {
