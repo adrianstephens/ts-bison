@@ -4677,6 +4677,25 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return result;
 	}
 
+	// Real `ToInt32`: truncate, then keep the low 32 bits. `2147483648 | 0` is -2147483648 and
+	// `(4294967296 + 5) | 0` is 5; the plain saturating `i32.trunc_sat_f64_s` that `coerceTop` uses
+	// everywhere else answers `i32::MAX` to both. Scoped to the bitwise operators, which is exactly where
+	// JS specifies `ToInt32` -- saturation stays the rule for an index or a length, deliberately, for the
+	// reasons `coerceTop`'s own comment gives. A non-finite input has no meaningful `i64` truncation, so
+	// it is tested for and answered as 0 directly, which is also what JS says.
+	function emitToInt32(e: Expr, ctx: FunctionContext): void {
+		emitAs(e, ctx, 'f64');
+		const tmp = ctx.temp(`$toint32$${optionalTempCounter++}`, 'f64');
+		ctx.emit(I.local.set(tmp), I.local.get(tmp), I.f64.abs, I.f64.const(Infinity), I.f64.lt);
+		const _old = ctx.swapOut();
+		ctx.emit(I.local.get(tmp), I.i64.trunc_sat_f64_s, I.i32.wrap_i64);
+		const _then = ctx.swapOut();
+		ctx.emit(I.i32.const(0));
+		ctx.emit(I.if(toValType('i32'), _then, ctx.swapOut(_old)));
+	}
+
+	const BITWISE_METHODS = new Set(['and', 'or', 'xor', 'shl', 'shr_s', 'shr_u']);
+
 	// A numeric/bitwise binary op's instructions as data (`Inline`), keyed by `BINARY_OP_NAMES`'s method name
 	function numericOpInline(method: string, a: WasmType | undefined, b: WasmType | undefined, ctx: FunctionContext): Inline {
 		const at = scalarKind(a), bt = scalarKind(b);
@@ -5800,8 +5819,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						}
 
 						const inline	= numericOpInline(method, leftInfo.wtype, rightInfo.wtype, ctx);
-						emitAs(left, ctx, inline.params[0]);
-						emitAs(right, ctx, inline.params[1]);
+						// Only a FLOAT-kinded operand needs the real `ToInt32` sequence; one that is already
+						// `i32`/`u32` is exactly its own low 32 bits, so it costs nothing there.
+						const asInt32	= (x: Expr, w: WasmType | undefined, want: WasmType) =>
+							BITWISE_METHODS.has(method) && want === 'i32' && (scalarKind(w) === 'f64' || scalarKind(w) === 'f32')
+								? emitToInt32(x, ctx)
+								: emitAs(x, ctx, want);
+						asInt32(left, leftInfo.wtype, inline.params[0]);
+						asInt32(right, rightInfo.wtype, inline.params[1]);
 						ctx.emit(...inline.inline);
 						return inline.result;
 					}
