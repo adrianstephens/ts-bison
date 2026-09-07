@@ -62,6 +62,17 @@ declare class Map<K, V> {
 	forEach(callbackfn: (value: V, key: K, map: Map<K, V>) => void, thisArg?: any): void;
 }
 
+// Same shape and the same reason as `Map` above: the real class lives in `error.ts`, which is always
+// static, so an on-demand `lib/node/*` module names it rather than importing it. `noLib` means there is
+// no ambient `Error` from TypeScript's own lib to inherit -- without this, `lib/node/fs.ts` throwing one
+// is "Cannot find name 'Error'" in the editor and under this directory's own tsconfig.
+declare class Error {
+	name: string;
+	message: string;
+	constructor(message: string);
+	toString(): string;
+}
+
 declare function pure(target: any, propertyKey: string, descriptor: PropertyDescriptor): void;
 
 // Pseudo-types for `__asm`'s own `P`/`R` generic args, purely so an asm-backed method can declare its
