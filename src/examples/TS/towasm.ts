@@ -409,7 +409,10 @@ interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number }
 
 // Per-operand info for builtin dispatch -- wtype for kind-polymorphic dispatch, owner for identity dispatch.
 interface OperandInfo { wtype: WasmType | undefined; owner?: ClassInfo }
-type Builtin<T = Inline | MethodDelegate | FunctionDecl> = (args: OperandInfo[], ctx: FunctionContext) => T
+// `typeArgs`: the call site's own type arguments, for an inline whose declared types mention the
+// METHOD's own type parameters (`Array._alloc<T>(n): T[]`). Class-level defines are baked once per
+// instantiation and cannot carry these -- see `makeAsm`'s `$ret`.
+type Builtin<T = Inline | MethodDelegate | FunctionDecl> = (args: OperandInfo[], ctx: FunctionContext, typeArgs?: Type[]) => T
 
 // A `get`/`set` accessor's `methodDecls`/`inlineMethods`/`funcs` key, mangled apart from a plain same-named
 // method so a getter and a setter for one property can coexist as two entries instead of overwriting each other.
@@ -1022,7 +1025,11 @@ function isAsmMethod(m: JS.Method<Type>): JS.Call<Type> | undefined {
 	}
 }
 
-function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>): Builtin<Inline> {
+// `typeParams`/`retIndexOf`: only needed by an asm mentioning `$ret` -- the wasm type index of the asm's
+// own DECLARED return type, resolved with the call site's type arguments substituted in. A generic static
+// (`Array._alloc<T>(n): T[]`) has no `this` to name, and its `T` is the METHOD's, so no class-level define
+// can reach it: `array.new_default $this` allocated the enclosing class's array type for every `T` alike.
+function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, typeParams?: string[], retIndexOf?: (w: WasmType) => number | undefined): Builtin<Inline> {
 	let		asm		= (call.arguments[0] as Literal<string | JS.TemplatePart<Expr>[]>).value;
 
 	if (typeof asm !== 'string') {
@@ -1034,6 +1041,49 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>): 
 			throw 'inline asm: expected a string literal';
 		}
 	}
+
+	const resolveType = (t: Type): WasmType | undefined => {
+		if (t.type === 'ref') {
+			switch (t.name) {
+				case 'i8': case 'i16':	return 'i32';
+				case 'u8': case 'u16':	return 'u32';
+				case 'i32': case 'i64': case 'f32': case 'f64': case 'u32': case 'void':
+					return t.name;
+				case 'number':	return 'f64';
+				case 'boolean':	return 'i32';
+				case 'string':	return ARR_WTYPE.i16;
+				case 'any':		return REF_ANY_NULLABLE;
+			}
+		}
+		if (t.type === 'array') {
+			if (t.element.type === 'ref' && TYPED_ARRAY_TAGS.has(t.element.name))
+				return ARR_WTYPE[notUnsigned(t.element.name as WasmElement)];
+			const arr = notUnsigned(scalarKind(resolveType(t.element)));
+			if (arr)
+				return {arr};
+			return ARR_WTYPE.ref;
+		}
+		return undefined;
+	};
+
+	// The asm's own declared param/result types, resolved with `subs` (the call site's type arguments)
+	// applied -- for `__asm<[i32], T[]>` that turns `T[]` into a real element kind instead of the
+	// `arr:ref` an unsubstituted `T` falls back to.
+	const sigFor = (subs?: Map<string, Type>) => {
+		const sub = (t: Type) => subs ? T.substituteType(t, subs) : t;
+		const [paramsTuple, resultType] = call.typeArgs ?? [];
+		const params = paramsTuple?.type === 'tuple' ? paramsTuple.elements.map(te => {
+			const el = T.tupleElementType(te);
+			const wt = el && resolveType(sub(el));
+			if (!wt)
+				throw `unsupported inline-asm param type '${tocode.tupleElement(te)}'`;
+			return wt;
+		}) : [];
+		const result = resultType ? resolveType(sub(resultType)) : 'void';
+		if (!result)
+			throw `unsupported inline-asm result type '${tocode.type(resultType)}'`;
+		return { params, result };
+	};
 
 	const parsed = WAT.parseAsmBody(asm, defines);
 
@@ -1056,6 +1106,28 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>): 
 			return i;
 		});
 	};
+
+	// `$ret` -- the type index of that resolved return type. Parsed per index (memoised), because the
+	// index is only known once the caller's type arguments are: this is the whole reason a generic
+	// static could not allocate its own return type.
+	if (asm.includes('$ret')) {
+		if (!retIndexOf)
+			throw `inline asm '${asm}': '$ret' is only available on a class method`;
+		const cache = new Map<number, ReturnType<typeof WAT.parseAsmBody>>();
+		return (_args, ctx, typeArgs) => {
+			const subs	= typeParams?.length && typeArgs?.length ? new Map(typeParams.map((n, i) => [n, typeArgs[i]] as const)) : undefined;
+			const sig	= sigFor(subs);
+			const index	= retIndexOf(sig.result);
+			if (index === undefined)
+				throw `inline asm '${asm}': '$ret' needs a return type with a real wasm type index, not '${wasmTypeKey(sig.result)}'`;
+			let p = cache.get(index);
+			if (!p) {
+				p = WAT.parseAsmBody(asm, { ...defines, ret: index });
+				cache.set(index, p);
+			}
+			return { ...sig, inline: resolveAsmLocals(assertFlatInstrs(p.body, asm), p.locals.map(l => ({ id: l.id, count: l.count, type: l.type as wasm.ValType })), ctx, asm) };
+		};
+	}
 
 	const sw = parsed.body.find((i): i is WAT.SwitchPlaceholder => i.op === '__switch' && i.key === '$T');
 	if (sw) {
@@ -1129,29 +1201,6 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>): 
 	} else {
 		// A param/result type that isn't a plain wasm primitive is this owner's own array type or one element of it -- `elemKind` (its real physical storage) is authoritative for both, checked *before* the name switch below:
 		// a bare `T` substituting to e.g. `string` is still physically boxed `{ref:'any'}` like every other non-scalar element, not a real `{arr:'i16'}`.
-		const resolveType = (t: Type): WasmType | undefined => {
-			if (t.type === 'ref') {
-				switch (t.name) {
-					case 'i8': case 'i16':	return 'i32';
-					case 'u8': case 'u16':	return 'u32';
-					case 'i32': case 'i64': case 'f32': case 'f64': case 'u32': case 'void':
-						return t.name;
-					case 'number':	return 'f64';
-					case 'boolean':	return 'i32';
-					case 'string':	return ARR_WTYPE.i16;
-					case 'any':		return REF_ANY_NULLABLE;
-				}
-			}
-			if (t.type === 'array') {
-				if (t.element.type === 'ref' && TYPED_ARRAY_TAGS.has(t.element.name))
-					return ARR_WTYPE[notUnsigned(t.element.name as WasmElement)];
-				const arr = notUnsigned(scalarKind(resolveType(t.element)));
-				if (arr)
-					return {arr};
-				return ARR_WTYPE.ref;
-			}
-			return undefined;
-		};
 
 		const body = {
 			locals: parsed.locals.map(l => {
@@ -1161,16 +1210,7 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>): 
 			}),
 			body: assertFlatInstrs(parsed.body, asm)
 		};
-		const [paramsTuple, resultType] = call.typeArgs ?? [];
-		const params = paramsTuple?.type === 'tuple' ? paramsTuple.elements.map(te => {
-			const wt = T.tupleElementType(te) && resolveType(T.tupleElementType(te)!);
-			if (!wt)
-				throw `unsupported inline-asm param type '${tocode.tupleElement(te)}'`;
-			return wt;
-		}) : [];
-		const result = resultType ? resolveType(resultType) : 'void';
-		if (!result)
-			throw `unsupported inline-asm result type '${tocode.type(resultType)}'`;
+		const { params, result } = sigFor();
 		return (_args, ctx) => ({ params, result, inline: resolveAsmLocals(body.body, body.locals, ctx, asm) });
 	}
 }
@@ -3048,8 +3088,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// genuinely incompatible shape. See `ensureClosureCoercionWrapper`'s own comment.
 		if (typeof got !== 'string' && typeof want !== 'string' && 'closure' in got && 'closure' in want) {
 			const gotSig = got.closure, wantSig = want.closure;
+			// A shared param may DIFFER, so long as adapting it is a reference narrowing the wrapper can do
+			// with a cast: `Array<T>`'s methods are compiled at `T = any` for every non-scalar element (one
+			// physical `arr:ref` store for all of them), so a callback honestly declared `(x: string)` meets
+			// a `(x: any)` slot and has to be adapted, not rejected. Both sides must be REFERENCE types --
+			// a scalar mismatch (`f64` caller, `i32` callback) would be a lossy narrowing, and silently
+			// truncating an argument is worse than the error it replaces.
+			const paramFits = (p: WasmType, i: number) => wasmTypeEq(p, wantSig.params[i])
+				|| (typeof p !== 'string' && typeof wantSig.params[i] !== 'string');
 			if (gotSig.params.length <= wantSig.params.length && !!gotSig.hasRest === !!wantSig.hasRest
-				&& gotSig.params.every((p, i) => wasmTypeEq(p, wantSig.params[i]))) {
+				&& gotSig.params.every(paramFits)) {
 				const orig = ctx.temp(`$origClosure$${closureCallTempCounter++}`, got);
 				ctx.emit(I.local.set(orig));
 				const { info, wantStructTypeIndex, envTypeIndex } = ensureClosureCoercionWrapper(gotSig, wantSig);
@@ -3810,7 +3858,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		if (inline) {
 			if (args.some(a => a.type === 'spread'))
 				throw 'spread call arguments are not supported';
-			return emitInline(name, inline(args.map(a => operandInfo(a, ctx)), ctx), args, ctx);
+			return emitInline(name, inline(args.map(a => operandInfo(a, ctx)), ctx, typeArgs), args, ctx);
 		}
 
 		// `owner.decl.name`, not `owner.name` -- `hasDeclaredOverride` (like `directSubclasses` it reads)
@@ -4476,7 +4524,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			const env		= wctx.declareLocal('#env', { typeIndex: envTypeIndex, nullable: false });
 			wctx.emit(I.local.get(envParam.index), I.ref.cast(envTypeIndex), I.local.set(env.index));
 			wctx.emit(I.local.get(env.index), I.struct.get(envTypeIndex, 0), I.struct.get(gotStructTypeIndex, 1));
-			argLocals.slice(0, gotSig.params.length).forEach(l => wctx.emit(I.local.get(l.index)));
+			// Each argument coerced from what the CALLER passes to what the callback declared -- see the
+			// `paramFits` guard: for a reference that is a `ref.cast`, and a no-op when the two agree.
+			argLocals.slice(0, gotSig.params.length).forEach((l, i) => {
+				wctx.emit(I.local.get(l.index));
+				coerceTop(wantSig.params[i], wctx, gotSig.params[i]);
+			});
 			wctx.emit(I.local.get(env.index), I.struct.get(envTypeIndex, 0), I.struct.get(gotStructTypeIndex, 0), I.call_ref(gotFuncTypeIndex));
 			coerceTop(gotSig.result, wctx, wantSig.result);
 			info.body = wctx.toFuncBody(1 + argLocals.length, toValType);
@@ -7752,7 +7805,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				info.methodDecls.set(key, [m]);
 		};
 
-		const inlineDecls: { key: string; value: JS.Call<Type> }[] = [];
+		const inlineDecls: { key: string; value: JS.Call<Type>; typeParams?: string[] }[] = [];
 
 		if (decl.abstract)
 			throw `abstract class '${name}' is not supported`;
@@ -7785,7 +7838,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					if (typeof m.key === 'string') {
 						const value = isAsmMethod(m);
 						if (value) {
-							inlineDecls.push({ key: m.key, value});
+							inlineDecls.push({ key: m.key, value, typeParams: m.typeParams?.map(tp => tp.name) });
 						} else {
 							addMethod(m.key, m);
 						}
@@ -7857,7 +7910,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const inlineMethods = new Map<string, Builtin<Inline>>();
 		for (const i of inlineDecls) {
 			try {
-				inlineMethods.set(i.key, makeAsm(i.value, defines));
+				inlineMethods.set(i.key, makeAsm(i.value, defines, i.typeParams, w => typeof w === 'object' && 'arr' in w ? ensureArrayType(w.arr) : undefined));
 			} catch (err) {
 				throw new TSWError(err as any, i.value);
 			}

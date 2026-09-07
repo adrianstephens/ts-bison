@@ -11,7 +11,10 @@ export class Array<T> {
 	get(i: i32): T			{ return __asm<[i32], T>('array.get $this')(i); }
 	set(i: i32, v: T): void	{ return __asm<[i32, T], void>('array.set $this')(i, v); }
 
-	private static _alloc<T>(n: i32): T[] { return __asm<[i32], T[]>('array.new_default $this')(n); }
+	// '$ret', not '$this': a static has no 'this', and this one's T is the METHOD's own -- '$this' named
+	// the enclosing class's array type, so 'map<U>' over a ref array allocated 'arr:ref' where 'U[]' is
+	// 'arr:f64'. '$ret' is the index of this asm's own declared return type, per call site.
+	private static _alloc<E>(n: i32): E[] { return __asm<[i32], E[]>('array.new_default $ret')(n); }
 	private static _copy<T>(dst: T[], dstStart: i32, src: T[], srcStart: i32, len: i32): void {
 		return __asm<[T[], i32, T[], i32, i32], void>('array.copy $this $this')(dst, dstStart, src, srcStart, len);
 	}
