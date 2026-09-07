@@ -85,7 +85,11 @@ interface Boolean {}
 declare var Boolean: {
 	(value?: any): boolean;
 };
-interface BigInt {}
+interface BigInt {
+	// Declared because the lib's own `toString` recurses on the magnitude; `lib/bigint.ts` implements
+	// more than this, and `lib/tsconfig.json` is the only thing that type-checks those sources.
+	toString(radix?: number): string;
+}
 // The CALL side, which is not the constructor: `BigInt(5)` is a `bigint`, `new BigInt()` is a `BigInt`.
 // Same two-declaration shape `Number` below already uses, and TypeScript's own lib uses for all four.
 declare var BigInt: {

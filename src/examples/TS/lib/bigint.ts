@@ -362,11 +362,20 @@ export class BigInt {
 	ne(b: bigint): boolean { return this.compare(b) !== 0; }
 
 	toString(radix?: number): string {
+		const self = this as unknown as bigint;
+		// Zero has no digits to walk, so the loop below produced '' for it rather than '0'.
+		if (self === 0n)
+			return '0';
+		// A NEGATIVE walks its own magnitude and prefixes '-': the digit loop below is `i > 0`, so
+		// anything negative came back as '' too.
+		if (self < 0n)
+			return '-'.concat((-self).toString(radix));
 		let s = '';
 		const radixb = radix ? bigFromNumber(radix) : 10n;
-		for (let i = this as unknown as bigint; i > 0; i /= radixb) {
+		for (let i = self; i > 0; i /= radixb) {
 			const d = Number(i % radixb);
-			s = String.fromCharCode(d < 10 ? 48 + d : 65 + d - 10) + s;
+			// LOWERCASE above 9, matching JS -- and `Number.prototype.toString`, which had the same bug.
+			s = String.fromCharCode(d < 10 ? 48 + d : 97 + d - 10).concat(s);
 		}
 		return s;
 	}
