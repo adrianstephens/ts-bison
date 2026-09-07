@@ -265,7 +265,9 @@ if (inputs.length > 1 && output) {
 for (const input of inputs) {
 	const out = output ?? input.replace(/\.ts$/, '.wasm');
 	compile(input, out, wat).catch(e => {
-		console.error(e.message);
+		// A raw `throw 'text'` (towasm's own idiom for a codegen gap) has no `.message` at all, and
+		// printing it lost the diagnostic entirely -- a bare "undefined" with no clue what failed.
+		console.error(typeof e === 'string' ? e : e?.message ?? String(e));
 		process.exit(1);
 	});
 }
