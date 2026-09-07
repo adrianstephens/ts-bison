@@ -97,12 +97,25 @@ function bigAdd(a: u32[], b: u32[], negb: boolean): u32[] {
 }
 
 function bigCompare(a: u32[], b: u32[]): number {
-	let i = a.length;
-	if (i !== b.length)
-		return i < b.length ? -1 : 1;
+	// SIGN FIRST. These limbs are two's complement -- `bigToNumber` reads the sign off the top bit of the
+	// highest limb -- so an unsigned walk gets every mixed-sign comparison wrong: `0n > -1n` was false,
+	// because `0 < 0xffffffff` as unsigned. Every `<`/`>`/`<=`/`>=`/`==`/`!=` on bigints comes through
+	// here, so that one line was wrong for all of them.
+	const an = a.length > 0 && (a[a.length - 1] & 0x80000000) !== 0;
+	const bn = b.length > 0 && (b[b.length - 1] & 0x80000000) !== 0;
+	if (an !== bn)
+		return an ? -1 : 1;
+
+	// SIGN-EXTENDED, so this compares VALUES rather than representations. Length alone cannot decide it:
+	// a `bigint` has two physical forms here -- a literal emits `i64.const`, the `BigInt` class holds
+	// `u32[]` -- so the same number reaches this with different limb counts, and `BigInt(0) === 0n` was
+	// false purely because one zero was one limb longer than the other.
+	let i = a.length > b.length ? a.length : b.length;
 	while (i--) {
-		if (a[i] !== b[i])
-			return a[i] < b[i] ? -1 : 1;
+		const av = i < a.length ? a[i] : (an ? 0xffffffff : 0);
+		const bv = i < b.length ? b[i] : (bn ? 0xffffffff : 0);
+		if (av !== bv)
+			return av < bv ? -1 : 1;
 	}
 	return 0;
 }
@@ -233,11 +246,13 @@ function bigDivModMag(a: u32[], b: u32[], mod: boolean): u32[] {
 }
 
 export class BigInt {
-	// `value` is never actually read -- this exists purely so `towasm.ts`'s `ensureClass` has a real,
-	// explicit-return constructor to determine this class's own physical `this`-type from (a `u32[]`,
-	// same representation real bigint arithmetic already reinterprets `this` as everywhere below).
-	constructor(value?: any) {
-		return new Array<u32>(0) as unknown as BigInt;
+	// A REAL conversion, not a placeholder: `BigInt(5)` is a call, and towasm lowers a call on a class to
+	// its constructor, so a constructor that ignored `value` silently produced zero for every input.
+	// The `as unknown as` is for tsc's benefit only -- towasm reads the last statement's type with the
+	// casts stripped, so `bigFromNumber`'s own `bigint` is what determines this class's physical form
+	// (a `u32[]`, the same representation the arithmetic below reinterprets `this` as).
+	constructor(value: number) {
+		return bigFromNumber(value) as unknown as BigInt;
 	}
 
     valueOf(): bigint { return this as unknown as bigint; }

@@ -3901,6 +3901,18 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				const imported = namedImportsByModule.get(homeModule)?.get(name);
 				if (imported && functionDeclByName.has(homeKey(imported.module, imported.name)))
 					return emitCall(imported.name, args, ctx, typeArgs, expected, imported.module);
+				// `C(...)` where `C` names a CLASS: the primitive wrappers are called without `new`, and
+				// their constructors are the conversion (`String`'s is `return s.toString()`). Structural,
+				// not a list of names. It is only as correct as the constructor is -- a constructor that
+				// IGNORES its argument makes this compute the wrong value silently, which is why the
+				// `wrapper/call` difftest cases exist and why each wrapper's constructor has to be real.
+				const cls = ensureClass(name, undefined, ctx.scope);
+				if (cls) {
+					const ctor = ensureCtor(cls, args, ctx);
+					emitCallArgs(`${name}'s constructor`, ctor.params, ctor.defaults, !!ctor.hasRest, args, ctx, ctor.resolvedParams);
+					ctx.emit(I.call(ctor.funcIndex));
+					return cls.thisWtype!;
+				}
 				throw `call to unknown function '${name}'`;
 			}
 		}
