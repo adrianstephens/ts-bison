@@ -21,12 +21,43 @@ const storeI32	= __asm<[i32, i32], void>('i32.store');
 function rightsRead(): i64	{ return 2097190; }
 function rightsWrite(): i64	{ return 2097252; }
 
-// There is no exception mechanism to raise yet, and CONTINUING is worse than stopping: an ignored errno
-// leaves the out-pointer unwritten, so the next step reads whatever was in that scratch as a descriptor or
-// a length. That is how a failed open became a multi-hundred-megabyte allocation, and then a hang.
-function wasiCheck(errno: i32): void {
-	if (errno !== 0)
-		__asm<[], void>('unreachable')();
+// A WASI errno as node names it. Only the codes these calls can actually produce -- an unmapped one keeps
+// its number rather than being dressed up as something it is not.
+function errnoName(errno: i32): string {
+	if (errno === 44) return 'ENOENT';
+	if (errno === 20) return 'EEXIST';
+	if (errno === 31) return 'EISDIR';
+	if (errno === 54) return 'ENOTDIR';
+	if (errno === 2) return 'EACCES';
+	if (errno === 8) return 'EBADF';
+	if (errno === 76) return 'ENOTCAPABLE';
+	return 'EIO';
+}
+
+function errnoText(errno: i32): string {
+	if (errno === 44) return 'no such file or directory';
+	if (errno === 20) return 'file already exists';
+	if (errno === 31) return 'illegal operation on a directory';
+	if (errno === 54) return 'not a directory';
+	if (errno === 2) return 'permission denied';
+	if (errno === 8) return 'bad file descriptor';
+	if (errno === 76) return 'capabilities insufficient';
+	return 'i/o error';
+}
+
+// Throws what node throws, in node's own message format (`ENOENT: no such file or directory, open
+// '/p'`), so a caught error compares equal on both sides rather than being a trap no test can observe.
+// CONTINUING is still not an option: an ignored errno leaves the out-pointer unwritten, so the next step
+// reads whatever was in that scratch as a descriptor or a length -- that is how a failed open became a
+// multi-hundred-megabyte allocation, and then a hang.
+// `mark` is released BEFORE throwing: the bump allocator reclaims only by restoring a mark, so an
+// escaping throw would otherwise leak every buffer this call took. Safe here because the message is a GC
+// string built from GC strings -- nothing surviving points into the released region.
+function wasiCheck(errno: i32, syscall: string, p: string, mark: i32): void {
+	if (errno !== 0) {
+		__allocRelease(mark);
+		throw new Error(errnoName(errno) + ': ' + errnoText(errno) + ', ' + syscall + " '" + p + "'");
+	}
 }
 
 function writeBytes(s: string): i32 {
@@ -108,11 +139,11 @@ export function readFileSync(p: string, encoding: string): string {
 
 	const fdOut = __alloc(4, 4);
 	// dirflags=1 (follow symlinks).
-	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 0, rightsRead(), rightsRead(), 0, fdOut));
+	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 0, rightsRead(), rightsRead(), 0, fdOut), 'open', p, mark);
 	const fileFd = loadI32(fdOut);
 
 	const statBuf = __alloc(64, 8);
-	wasiCheck(fd_filestat_get(fileFd, statBuf));
+	wasiCheck(fd_filestat_get(fileFd, statBuf), 'fstat', p, mark);
 	// filestat.size is a 64-bit field at byte offset 32; wasm is little-endian, so a plain i32.load
 	// there reads its low 32 bits, which is exactly the file's size for anything under 4GiB.
 	const size = loadI32(statBuf + 32);
@@ -122,8 +153,8 @@ export function readFileSync(p: string, encoding: string): string {
 	storeI32(iov, dataBuf);
 	storeI32(iov + 4, size);
 	const nreadPtr = __alloc(4, 4);
-	wasiCheck(fd_read(fileFd, iov, 1, nreadPtr));
-	wasiCheck(fd_close(fileFd));
+	wasiCheck(fd_read(fileFd, iov, 1, nreadPtr), 'read', p, mark);
+	wasiCheck(fd_close(fileFd), 'close', p, mark);
 
 	// Release only after the bytes are copied into a GC string -- `dataBuf` is a raw pointer, `result` isn't.
 	const result = readBytes(dataBuf, size);
@@ -139,7 +170,7 @@ export function writeFileSync(p: string, data: string): void {
 
 	const fdOut = __alloc(4, 4);
 	// oflags 9 = CREAT (1) | TRUNC (8): create the file if missing, replace its contents if present.
-	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 9, rightsWrite(), rightsWrite(), 0, fdOut));
+	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 9, rightsWrite(), rightsWrite(), 0, fdOut), 'open', p, mark);
 	const fileFd = loadI32(fdOut);
 
 	const dataBuf = writeBytes(data);
@@ -147,8 +178,8 @@ export function writeFileSync(p: string, data: string): void {
 	storeI32(iov, dataBuf);
 	storeI32(iov + 4, data.length);
 	const nwrittenPtr = __alloc(4, 4);
-	wasiCheck(fd_write(fileFd, iov, 1, nwrittenPtr));
-	wasiCheck(fd_close(fileFd));
+	wasiCheck(fd_write(fileFd, iov, 1, nwrittenPtr), 'write', p, mark);
+	wasiCheck(fd_close(fileFd), 'close', p, mark);
 
 	// Nothing here escapes past this point -- void return, safe to release.
 	__allocRelease(mark);
