@@ -1676,8 +1676,19 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return typeIndex;
 	}
 
+	const arrayTypeDesc = (kind: WasmElementI): wasm.SubType =>
+		({ final: true, supertypes: [], type: { kind: 'array', field: { type: kind === 'ref' ? { ref: 'any', nullable: true } : kind, mut: true } } });
+
 	function ensureArrayType(kind: WasmElementI): number {
-		return registerType({ final: true, supertypes: [], type: { kind: 'array', field: { type: kind === 'ref' ? { ref: 'any', nullable: true } : kind, mut: true } } });
+		return registerType(arrayTypeDesc(kind));
+	}
+
+	// "Does this module already have this array type" WITHOUT creating it -- `ensureArrayType` would
+	// register one as a side effect, and a candidate scan asking speculative questions must not add types
+	// nothing uses. If the type is absent, no value of that kind exists to reach an `any` slot anyway.
+	function hasArrayType(kind: WasmElementI): boolean {
+		const key = wTypeKey(arrayTypeDesc(kind));
+		return key !== undefined && typeMap.has(key);
 	}
 	function ensureBoxType(kind: 'f64' | 'i32'): number {
 		return registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } });
@@ -8278,30 +8289,70 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			const dctx = new FunctionContext(`field_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`, new Scope(libGlobal), plainReturn(REF_ANY), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY);
 
-			// Deduped by physical type index -- several owners can share one, and a repeated arm is dead code.
-			const seen = new Set<number>();
-			const candidates: { cls: ClassInfo; read: () => void }[] = [];
-			for (const cls of classes.values()) {
-				// `-1` is `ensureClass`'s scalar-backed sentinel: no heap type, so no `ref.test` target.
-				if (cls.typeIndex === -1 || seen.has(cls.typeIndex))
-					continue;
+			// Deduped by physical HEAP type, not by `ClassInfo` -- several owners can share one, and a
+			// repeated arm is dead code.
+			const seen = new Set<wasm.HeapType>();
+			const candidates: { cls: ClassInfo; heap: wasm.HeapType; read: () => void }[] = [];
+			const probe = (cls: ClassInfo | undefined, heap: wasm.HeapType | undefined) => {
+				if (!cls || heap === undefined || seen.has(heap))
+					return;
 				const idx = cls.fieldIndex.get(name);
-				if (idx !== undefined) {
-					seen.add(cls.typeIndex);
-					candidates.push({ cls, read: () => {
+				if (idx !== undefined && cls.typeIndex !== -1) {
+					seen.add(heap);
+					candidates.push({ cls, heap, read: () => {
 						dctx.emit(I.struct.get(cls.typeIndex, idx));
 						coerceTop(cls.fields[idx].wtype, dctx, REF_ANY);
 					} });
 				} else if (cls.getterNames?.has(name)) {
 					const sig = methodSig(cls, accessorKey('get', name), dctx);
 					if (sig) {
-						seen.add(cls.typeIndex);
-						candidates.push({ cls, read: () => {
+						// Boxed by the member's DECLARED type, not the physical width the getter's body
+						// happens to produce. `String.length` is `get length(): number` over an `array.len`,
+						// so it yields `u32`; boxed as-is that is an i32 box, while every consumer reads a
+						// `number` back out of an `any` by casting to the f64 box, and that cast traps.
+						// Anything entering an `any` slot has to be in its logical type's canonical form.
+						// `T.lookupMember`, not the decl: an `__asm` accessor keeps no declaration at all
+						// (it becomes an `inlineMethods` entry, and `String.length` is exactly one).
+						const declared	= cls.thisTsType && T.lookupMember(cls.thisTsType, name, dctx.scope);
+						const canonical	= (declared && typeOf(declared)) || sig.result;
+						const want		= canonical === 'void' ? sig.result : canonical;
+						seen.add(heap);
+						candidates.push({ cls, heap, read: () => {
 							emitMethodCall(cls, accessorKey('get', name), [], dctx);
-							coerceTop(sig.result, dctx, REF_ANY);
+							coerceTop(sig.result, dctx, want);
+							coerceTop(want, dctx, REF_ANY);
 						} });
 					}
 				}
+			};
+
+			// The builtin owners FIRST, exactly as `findAnyDispatchCandidates` seeds `number`/`boolean`:
+			// none of them is ever in `classes` unless something happened to reach it as a class, and a
+			// `string` in an `any` slot is the commonest dynamic receiver there is. `e.message.length` on a
+			// caught error reported "no reachable class declares a field 'length'" purely because of this --
+			// `String.length` is a getter on a class with no struct of its own, so neither this loop nor the
+			// `typeIndex !== -1` test below could ever see it.
+			probe(builtinTypeOwner('string'), ensureArrayType('i16'));
+			probe(builtinTypeOwner('bigint'), ensureArrayType('i32'));
+			probe(builtinTypeOwner('number'), ensureBoxType('f64'));
+			probe(builtinTypeOwner('boolean'), ensureBoxType('i32'));
+			// A plain array literal never reaches `ensureClass('Array', ...)` -- it is built straight into
+			// its physical array type -- so `Array<T>`'s own members are absent from `classes` however many
+			// arrays the program has. Gated on the array type ALREADY existing: if it does not, no value of
+			// that kind can be in an `any` slot, and asking would only add a type nothing uses.
+			for (const [kind, elem] of [['f64', T.NUMBER], ['ref', T.ANY]] as const) {
+				if (hasArrayType(kind))
+					probe(ensureClass('Array', [elem]), ensureArrayType(kind));
+			}
+			for (const cls of classes.values()) {
+				// `-1` is `ensureClass`'s no-struct-of-its-own sentinel -- but that does not mean untestable:
+				// an array-backed class (`Array<number>` is `arr:f64`, a typed-array view its own element
+				// kind) has a real heap type to `ref.test` against. Only a genuinely scalar-backed owner has
+				// none, and those are already covered by the boxed probes above.
+				const w = cls.thisWtype;
+				probe(cls, cls.typeIndex !== -1 ? cls.typeIndex
+					: w && typeof w !== 'string' && ('arr' in w || 'typeIndex' in w) ? heapTypeIndexOf(w)
+					: undefined);
 			}
 			if (!candidates.length)
 				throw `no reachable class declares a field '${name}' -- a dynamic read on 'any' needs at least one real candidate`;
@@ -8312,9 +8363,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				if (i >= candidates.length)
 					return [I.unreachable];
 				const c = candidates[i];
-				dctx.emit(I.local.get(recv.index), I.ref.test(c.cls.typeIndex));
+				dctx.emit(I.local.get(recv.index), I.ref.test(c.heap));
 				const _cond = dctx.swapOut();
-				dctx.emit(I.local.get(recv.index), I.ref.cast(c.cls.typeIndex));
+				dctx.emit(I.local.get(recv.index), I.ref.cast(c.heap));
 				c.read();
 				return [..._cond, I.if(toValType(REF_ANY), dctx.swapOut(), buildArm(i + 1))];
 			}
