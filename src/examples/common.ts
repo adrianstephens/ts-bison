@@ -109,8 +109,11 @@ export function  Block<S>(...body: S[]): Block<S> { return { type: 'block', body
 // The control-flow statements. `B` is the BODY slot -- one statement in js-parser and c-parser (a `Block` when the source delimited it), a statement list in py-parser.
 // The languages genuinely differ there, so it stays a type parameter rather than being forced into one representation;
 export interface If<E, B>			{ type: 'if'; test: E; consequent: B; alternate?: B }
+export function	If<E, B>(test: E, consequent: B, alternate?: B): If<E, B> { return { type: 'if', test, consequent, alternate }; }
 export interface While<E, B>		{ type: 'while'; test: E; body: B }
+export function While<E, B>(test: E, body: B): While<E, B> { return { type: 'while', test, body }; }
 export interface DoWhile<E, B>		{ type: 'do_while'; body: B; test: E }
+export function DoWhile<E, B>(body: B, test: E): DoWhile<E, B> { return { type: 'do_while', body, test }; }
 export interface Labeled<B>			{ type: 'labeled'; label: string; body: B }
 
 // A `catch` / `except` clause. `param` is whatever the language binds (a JS binding target, a Python or C++ name); each parser intersects its own extras onto it
