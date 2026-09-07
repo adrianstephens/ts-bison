@@ -22,6 +22,8 @@
 		"lint": "eslint \"src/**/*.ts\"",
 		"link": "npm link @isopodlabs/binary_libs",
 		"gate": "ts-node -T test/test-ts-corpus-gate.ts",
+		"libdecls": "ts-node -T test/test-lib-decls.ts",
+		"libdecls:update": "ts-node -T test/test-lib-decls.ts --update",
 		"gate:list": "ts-node -T test/test-ts-corpus-gate.ts --list",
 		"gate:update": "ts-node -T test/test-ts-corpus-gate.ts --update"
 	},

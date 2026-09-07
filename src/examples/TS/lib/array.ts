@@ -277,4 +277,9 @@ export class Array<T> {
 	toString(): string {
 		return this.join(',');
 	}
+	// Real JS calls `toLocaleString` on each element; with no locale support here that is exactly
+	// `toString`, so this is an alias rather than a stub. Same reasoning as `String.toLocaleLowerCase`.
+	toLocaleString(): string {
+		return this.toString();
+	}
 }

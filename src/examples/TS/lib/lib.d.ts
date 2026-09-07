@@ -179,9 +179,9 @@ interface String {
 	split(separator: string | RegExp, limit?: number): string[];
 	substring(start: number, end?: number): string;
 	toLowerCase(): string;
-	toLocaleLowerCase(locales?: string | string[]): string;
+	toLocaleLowerCase(): string;
 	toUpperCase(): string;
-	toLocaleUpperCase(locales?: string | string[]): string;
+	toLocaleUpperCase(): string;
 	trim(): string;
 
 	valueOf(): string;
@@ -235,7 +235,6 @@ interface RegExp {
 	lastIndex: number;
 
 	// Non-standard extensions
-	compile(pattern: string, flags?: string): this;
 }
 
 //-----------------------------------------------------------------------------

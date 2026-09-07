@@ -172,6 +172,13 @@ export class String {
 		}
 		return result;
 	}
+	// No locale support exists in this runtime, so the locale-aware forms ARE the plain ones -- an alias
+	// is the honest implementation, not a stub. Declared without a `locales` parameter for the same
+	// reason: taking one and ignoring it would be a lie the signature tells.
+	toLocaleUpperCase(): string { return this.toUpperCase(); }
+	toLocaleLowerCase(): string { return this.toLowerCase(); }
+	valueOf(): string { return this as unknown as string; }
+
 	repeat(count: i32): string {
 		const len = this.length;
 		const result = String._alloc(len * count);
