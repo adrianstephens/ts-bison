@@ -5909,6 +5909,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
 							const sig = calleeWtype.closure;
 							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
+							// `f?.()` on a NULLABLE closure: the whole call short-circuits to `undefined`,
+							// so it needs the same guard `a?.[i]`/`a?.m()` already use. Without it the call
+							// went straight through and trapped on a null code pointer.
+							if (e.optional && calleeWtype.nullable) {
+								if (sig.result === 'void')
+									throw "'f?.()' is not supported -- 'f' returns 'void', which can't become 'void | undefined'";
+								const resultWtype = nullableWtype(sig.result);
+								emitExpr(e.callee, ctx);
+								return emitOptionalAccess(ctx, calleeWtype, resultWtype, objLocal => {
+									ctx.emit(I.local.get(objLocal), I.struct.get(structTypeIndex, 1));
+									emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
+									ctx.emit(I.local.get(objLocal), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+									coerceTop(sig.result, ctx, resultWtype);
+								});
+							}
 							emitExpr(e.callee, ctx);
 							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
 							ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
