@@ -6895,7 +6895,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// optional param, needed here too so an ordinary top-level function (not just a closure value)
 		// can actually be called with an explicit `undefined`/an omitted trailing argument
 		// (`defaultsWithImplicitUndefined`'s synthesized default) for such a param.
-		return { key: p.key, wtype: !p.default && hasMod(p, 'optional') ? nullableWtype(boxed) : boxed, tsType };
+		// `tsType` widens with the slot: it is what goes into `ctx.scope` for this parameter, and leaving
+		// it as the bare annotation made `wtypeOf` derive a plain scalar for a slot that is physically a
+		// nullable box -- so `b === undefined` on `b?: number` was rejected as "needs a nullable
+		// object-typed value" even though the box it is held in answers exactly that.
+		return !p.default && hasMod(p, 'optional')
+			? { key: p.key, wtype: nullableWtype(boxed), tsType: T.combineTypes([tsType, T.UNDEFINED]) }
+			: { key: p.key, wtype: boxed, tsType };
 	}
 
 	// Resolves a whole param list left to right, growing the earlier-names/scope `resolveParam` needs to
