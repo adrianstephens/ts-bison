@@ -3824,13 +3824,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// value into first. Scoped to exactly the grammar `isReemittableDefault` accepts (identifier, or a
 	// non-optional property-read chain off one) -- nothing here needs to handle anything wider.
 	function substituteEarlierParamRefs(e: Expr, rename: ReadonlyMap<string, string>): Expr {
-		if (e.type === 'identifier') {
-			const to = rename.get(e.name);
-			return to ? { ...e, name: to } : e;
+		const sub = (x: Expr) => substituteEarlierParamRefs(x, rename);
+		switch (e.type) {
+			case 'identifier': {
+				const to = rename.get(e.name);
+				return to ? { ...e, name: to } : e;
+			}
+			case 'member':		return { ...e, object: sub(e.object) };
+			// The operator shapes `isReemittableDefault` accepts must be descended into as well, or the
+			// `a` in `b = a * 2` stayed pointing at a name the call site has never heard of.
+			case 'binary':		return { ...e, left: sub(e.left), right: sub(e.right) };
+			case 'unary':		return { ...e, operand: sub(e.operand) };
+			case 'conditional':	return { ...e, test: sub(e.test), consequent: sub(e.consequent), alternate: sub(e.alternate) };
+			case 'array':		return { ...e, elements: e.elements.map(el => el && el.type !== 'spread' ? sub(el) : el) };
+			default:			return e;
 		}
-		if (e.type === 'member')
-			return { ...e, object: substituteEarlierParamRefs(e.object, rename) };
-		return e;
 	}
 
 	// A spread argument whose expression has a TUPLE type has a statically known length -- and that is
@@ -6915,7 +6923,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// Same reasoning as the array case, and `{}` -- an all-defaults options bag -- is the common one.
 			|| (e.type === 'object' && e.properties.every(pr => pr.type === 'field' && typeof pr.key === 'string' && !!pr.value && isReemittableDefault(pr.value, earlierNames)))
 			|| (e.type === 'identifier' && !!earlierNames?.has(e.name))
-			|| (e.type === 'member' && !e.optional && isReemittableDefault(e.object, earlierNames));
+			|| (e.type === 'member' && !e.optional && isReemittableDefault(e.object, earlierNames))
+			// An OPERATOR over things already re-emittable (`b = a * 2`, `n = -1`, `x = a ? 1 : 2`).
+			// Adds no new name to resolve at the call site -- every leaf is still a literal, an earlier
+			// parameter, or a property chain off one -- so it carries none of the cross-module hazard a
+			// default that *called* something would.
+			|| (e.type === 'binary' && e.operator !== '=' && isReemittableDefault(e.left, earlierNames) && isReemittableDefault(e.right, earlierNames))
+			|| (e.type === 'unary' && isReemittableDefault(e.operand, earlierNames))
+			|| (e.type === 'conditional' && isReemittableDefault(e.test, earlierNames) && isReemittableDefault(e.consequent, earlierNames) && isReemittableDefault(e.alternate, earlierNames));
 	}
 
 	// A bare `p?: T` (optional, no `= value`) is real, valid TS distinct from `p: T = value` (a real
