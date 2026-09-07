@@ -18,6 +18,16 @@ export class Array<T> {
 	private static _copy<T>(dst: T[], dstStart: i32, src: T[], srcStart: i32, len: i32): void {
 		return __asm<[T[], i32, T[], i32, i32], void>('array.copy TYPEINDEX("T[]") TYPEINDEX("T[]")')(dst, dstStart, src, srcStart, len);
 	}
+	// `for (const k in arr)` enumerates INDICES, as strings. towasm desugars that loop into a
+	// `for...of` over this, so the number-to-string conversion happens in ordinary typed lib code
+	// rather than in a synthesized AST whose nodes the checker never stamped.
+	static _indexKeys<T>(a: T[]): string[] {
+		const n = a.length;
+		const result: string[] = Array._alloc<string>(n);
+		for (let i = 0; i < n; i++)
+			result[i] = i.toString();
+		return result;
+	}
 	private static _fill<T>(dst: T[], start: i32, val: T, len: i32): void {
 		return __asm<[T[], i32, T, i32], void>('array.fill TYPEINDEX("T[]")')(dst, start, val, len);
 	}

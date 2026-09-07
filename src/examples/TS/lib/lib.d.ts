@@ -137,7 +137,11 @@ declare var Object: {
 //	Number
 //-----------------------------------------------------------------------------
 
-interface Number {}
+interface Number {
+	// `lib/number.ts` implements far more than this; declared here because the lib's own sources call it
+	// (`Array._indexKeys`), and `lib/tsconfig.json` is the only thing that type-checks them.
+	toString(radix?: number): string;
+}
 declare var Number: {
 	new (value?: any): Number;
 	(value?: any): number;

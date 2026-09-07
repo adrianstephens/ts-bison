@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-this-alias */
 import * as JS from './js-parser';
 import * as TS from './ts-parser';
-import { Identifier, Literal, Binary } from '../common';
+import { Identifier, Literal, Unary, Binary, If, While, DoWhile } from '../common';
 import { Walkable, walkB, calcUnary, calcBinary, RecurseB, isJsStatement, isTsDeclaration } from './walker';
 import { patternBindings as buildPatternBindings } from './transform';
 import { tocode } from './type-utils';
@@ -928,7 +928,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						const value = JS.Member<TS.Type>(Identifier(resultName), 'value');
 						buildLoop(recurse, Literal(true), JS.Block<Stmt>(
 							JS.VarDecl<TS.Type>('const', JS.Var<TS.Type>(resultName, JS.Call<TS.Type>(JS.Member<TS.Type>(Identifier(iterName), 'next'), []))),
-							JS.If<Stmt>(JS.Member<TS.Type>(Identifier(resultName), 'done'), { type: 'break' }),
+							If(JS.Member<TS.Type>(Identifier(resultName), 'done'), { type: 'break' }),
 							(s.init.type === 'var_decl'
 								? JS.VarDecl<TS.Type>(s.init.kind, JS.Var<TS.Type>(s.init.declarations[0].name, value))
 								: JS.Expression<TS.Type>(JS.JSBinary('=', s.init, value))),
@@ -2352,7 +2352,7 @@ export function BuildProgram(
 				// there's no `else` at all -- as opposed to one that's genuinely empty, which still
 				// prints `else {}` (see JS.If's own falseStmts check).
 				const falseStmts	= control.inputs[3].nodeId !== predecessorId ? emitChain(control.inputs[3].nodeId, predecessorId) : undefined;
-				return [JS.If(
+				return [If(
 					resolveOperand(control.id, 1),
 					JS.Block(...trueStmts),
 					falseStmts ? JS.Block(...falseStmts) : undefined
@@ -2442,7 +2442,7 @@ export function BuildProgram(
 				if (control.loopKind === 'do') {
 					// No rotation needed: the body already runs before the test in do-while's own
 					// native semantics (the mu's INITIAL value is what the body sees on its first pass).
-					statements.push(JS.DoWhile(JS.Block(
+					statements.push(DoWhile(JS.Block(
 						...restOfBody,
 						...restStatements,
 						...testStatements
@@ -2454,9 +2454,9 @@ export function BuildProgram(
 					// literal `true` (a real `for(;;)`, or a for-of/for-in desugar) makes the check
 					// provably dead, so it's dropped instead of printed as inert clutter.
 					const condExpr = resolveOperand(thetaNode.id, 1);
-					statements.push(JS.While(Literal(true), JS.Block(
+					statements.push(While(Literal(true), JS.Block(
 						...testStatements,
-						...(condExpr.type === 'literal' && condExpr.value === true ? [] : [JS.If({ type: 'unary', operator: '!', operand: condExpr },
+						...(condExpr.type === 'literal' && condExpr.value === true ? [] : [If(Unary('!', condExpr),
 							JS.Block<Stmt>({ type: 'break' })
 						)]),
 						...restStatements,
@@ -2469,7 +2469,7 @@ export function BuildProgram(
 				// emitted before restOfBody, same reasoning as the thetaNode branch above.
 				const restStatements = emitLocalStatements(ownIds);
 				const restOfBody = emitChain(control.inputs[1].nodeId, control.id);
-				statements.push(JS.While(Literal(true),
+				statements.push(While(Literal(true),
 					JS.Block(...restStatements, ...restOfBody)
 				));
 			}

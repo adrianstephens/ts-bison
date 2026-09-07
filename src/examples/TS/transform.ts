@@ -1,7 +1,7 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
-import { Identifier, Literal, Binary, hasMod, dropMod } from '../common';
+import { Identifier, Literal, Binary, hasMod, dropMod, If, While } from '../common';
 import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
@@ -401,7 +401,7 @@ export function StateMachineToAST(machine: StateMachine) {
 
 	return JS.Block<S>(
 		JS.VarDecl<Type>('let', JS.Var<Type>('state', Literal(machine.entryId))),
-		JS.While(Literal(true), JS.Block<S>(JS.Switch<S>(state, ...machine.segments.map((seg, k) => {
+		While(Literal(true), JS.Block<S>(JS.Switch<S>(state, ...machine.segments.map((seg, k) => {
 			const stmts: S[] = [];
 			const resultVar = resultVars.get(k);
 			if (resultVar)
@@ -419,7 +419,7 @@ export function StateMachineToAST(machine: StateMachine) {
 
 				case 'branch':
 					stmts.push(
-						JS.If<S>(next.test,
+						If(next.test,
 							JS.Block<S>(setState(next.then)),
 							JS.Block<S>(setState(next.else))
 						),

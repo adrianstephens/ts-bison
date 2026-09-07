@@ -181,9 +181,9 @@ export const    Return  = Common.Return;
 export const    Throw   = Common.Throw;
 export const    ExprStmt = Common.ExprStmt;
 export function For<S>(init: ForInit<any>|undefined, test: Expr|undefined, update: Expr|undefined, body: S) { return { type: 'for' as const, kind: 'normal' as const, init, test, update, body }; }
-export function If<S>(test: Expr, consequent: S, alternate?: S) { return {type: 'if' as const, test, consequent, alternate }; }
-export function While<S>(test: Expr, body: S) { return {type: 'while' as const, test, body }; }
-export function DoWhile<S>(body: S, test: Expr) { return {type: 'do_while' as const, body, test }; }
+//export function If<S>(test: Expr, consequent: S, alternate?: S) { return {type: 'if' as const, test, consequent, alternate }; }
+//export function While<S>(test: Expr, body: S) { return {type: 'while' as const, test, body }; }
+//export function DoWhile<S>(body: S, test: Expr) { return {type: 'do_while' as const, body, test }; }
 
 // `X`: the statement extension seam -- defaults to `never` (plain JS), ts-parser instantiates it with
 // its own `Declaration` so a TS-only declaration (`type A = B`, `interface`, `enum`, `namespace`) can

@@ -1355,11 +1355,14 @@ const builtinTypes: Record<string, { wtype: WasmType; class?: string }> = {
 	String:		{ wtype: ARR_WTYPE.i16,		class: 'String' },
 	bigint:		{ wtype: ARR_WTYPE.i32,		class: 'BigInt' },
 	// Pseudo-types from `lib.d.ts` (`declare type i32 = number`, etc) -- real wasm value types, for a field/method whose storage isn't the usual `number`->`f64` mapping (see `lib/typedarray.ts`'s `Uint8Array`).
-	i32:		{ wtype: 'i32' },
-	i64:		{ wtype: 'i64' },
-	f32:		{ wtype: 'f32' },
-	f64:		{ wtype: 'f64' },
-	u32:		{ wtype: 'u32' },
+	// `class: 'Number'` because that is exactly what each one is an alias OF: without it a value that
+	// happened to get a storage refinement had no method owner at all, so `let i = 0; i.toString()`
+	// failed as "unknown method" where `const n: number = 0; n.toString()` worked.
+	i32:		{ wtype: 'i32',				class: 'Number' },
+	i64:		{ wtype: 'i64',				class: 'Number' },
+	f32:		{ wtype: 'f32',				class: 'Number' },
+	f64:		{ wtype: 'f64',				class: 'Number' },
+	u32:		{ wtype: 'u32',				class: 'Number' },
 };
 
 const UNARY_OP_NAMES = {
@@ -6462,6 +6465,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					case 'in': {
 						if (s.init.type !== 'var_decl' || s.init.declarations.length !== 1)
 							throw "'for...in' loop variable must be a single declaration";
+
+						// A real ARRAY enumerates its INDICES, as strings. Falling through to
+						// `Object.entries` below bound the entries instead, so `for (const i in [5, 6])`
+						// gave the wrong values and the wrong count. `Array._indexKeys` builds them in
+						// ordinary typed lib code -- a synthesized `String(i)` here has no checker stamp
+						// to resolve `toString` through.
+						if (objectArrayKind(s.right, ctx)) {
+							emitStmt({
+								type: 'for', kind: 'of',
+								init: s.init,
+								right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Array' }, property: '_indexKeys' }, arguments: [s.right] },
+								body: s.body,
+							}, ctx);
+							return;
+						}
 
 						if (ownerOf(s.right, ctx)?.methodDecls.get('keys')) {
 							emitStmt({
