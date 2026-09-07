@@ -461,13 +461,14 @@ interface ClassInfo extends MethodOwner {
 // overwhelmingly common case (an ordinary local/capture, never forward-referenced), where `wtype`
 // alone is the whole story, exactly as before.
 interface Local			{ wtype: WasmType, index: number; cellInner?: WasmType; }
-type Global				= Local & {init: Expr, mut: boolean}
+interface Global extends Local {init: Expr, mut: boolean}
+
 interface ResolvedParam { key: BindingTarget; wtype: WasmType; tsType: Type }
 
 interface ClosureEnv {
 	envLocal:		Local;
 	envTypeIndex:	number;
-	fields:			Map<string, { index: number; wtype: WasmType; cellInner?: WasmType }>
+	fields:			Map<string, Local>
 };
 
 // Pushed by `case 'try'` while compiling a `try`/`catch` that has a `finally` -- `emitBreak`/
@@ -589,18 +590,17 @@ class FunctionContext {
 		return undefined;
 	}
 
-	private allocLocal(wtype: WasmType): Local {
+	private allocLocal(wtype: WasmType): number {
 		const free = this.freeSlots.get(wasmTypeKey(wtype));
-		const index = free?.length ? free.pop()! : this.slotTypes.push(wtype) - 1;
-		return { wtype, index };
+		return free?.length ? free.pop()! : this.slotTypes.push(wtype) - 1;
 	}
-	private freeLocal(local: Local) {
-		const key	= wasmTypeKey(local.wtype);
+	private freeLocal(wtype: WasmType, index: number) {
+		const key	= wasmTypeKey(wtype);
 		const free	= this.freeSlots.get(key);
 		if (free)
-			free.push(local.index);
+			free.push(index);
 		else
-			this.freeSlots.set(key, [local.index]);
+			this.freeSlots.set(key, [index]);
 	}
 
 	// more WAT labels with no `break`/`continue` targets of their own
@@ -631,7 +631,7 @@ class FunctionContext {
 			const d = this.declared[i];
 			if (!d.closed) {
 				d.closed = true;
-				this.freeLocal(d.local);
+				this.freeLocal(d.local.wtype, d.local.index);
 			}
 		}
 		return this;
@@ -665,9 +665,9 @@ class FunctionContext {
 				throw `local '${name}' redeclared with different type`;
 			return prev.index;
 		}
-		const local = this.allocLocal(wtype);
-		this.declared.push({ name, local, closed: false });
-		return local.index;
+		const index = this.allocLocal(wtype);
+		this.declared.push({ name, local: { wtype, index}, closed: false });
+		return index;
 	}
 
 	declareLocal(name: string, wtype: WasmType): Local {
@@ -677,7 +677,7 @@ class FunctionContext {
 			if (!d.closed && d.name === name)
 				throw `local '${name}' redeclared (shadowing within the same scope is not supported)`;
 		}
-		const local = this.allocLocal(wtype);
+		const local = {wtype, index: this.allocLocal(wtype)};
 		this.declared.push({ name, local, closed: false });
 		return local;
 	}
