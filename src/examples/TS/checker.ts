@@ -2064,9 +2064,10 @@ type checkStmt = (s: Stmt, scope: Scope, typeOf: typeOf)=>void;
 // `typeOf`/`typeOf1` already uses -- and inside, `checkStmt1` is this same closure with `typeOf` bound.
 //
 // `onReturn` is not part of the check at all: it is simply something *a* checkStmt does AFTER calling
-// *the* checkStmt, so it composes as a wrapper instead of a hook every layer has to carry. `outer` (the
-// wrapper) is what a nested BLOCK is checked with, so a `return` inside one still reaches it exactly as
-// it did when `checkBlock` ran the hook.
+// *the* checkStmt, so it composes as a wrapper instead of a hook every layer has to carry. EVERY nested
+// statement recurses through `outer`, block or not -- when the hook lived in `checkBlock` a bare nested
+// `return` never reached it, so `if (x) return 'ab';` inferred `void` while the identical body WITH
+// BRACES inferred `string | undefined`. Adding braces changed the type.
 export function checkStmt1(err?: Err, onReturn?: (s: Stmt, scope: Scope)=>void, noStamp?: boolean): checkStmt {
 	const checkStmt = Object.assign((stmt: Stmt, scope: Scope, typeOf: typeOf): void => {
 		// The real (post-narrowing, where applicable) `Scope` this statement was type-checked under --
@@ -2086,7 +2087,7 @@ export function checkStmt1(err?: Err, onReturn?: (s: Stmt, scope: Scope)=>void, 
 			(stmt as any).scope ??= scope;
 
 		const checkBlock1	= (stmts: Stmt[], scope: Scope)		=> checkBlock(stmts, scope, typeOf, outer);
-		const checkStmt1	= (stmt: Stmt, scope: Scope)		=> checkStmt(stmt, scope, typeOf);
+		const checkStmt1	= (stmt: Stmt, scope: Scope)		=> outer(stmt, scope, typeOf);
 
 		switch (stmt.type) {
 			case 'var_decl': {
