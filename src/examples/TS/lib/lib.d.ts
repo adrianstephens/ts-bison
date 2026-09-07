@@ -76,7 +76,15 @@ interface CallableFunction {}
 interface NewableFunction {}
 interface IArguments {}
 interface Boolean {}
+declare var Boolean: {
+	(value?: any): boolean;
+};
 interface BigInt {}
+// The CALL side, which is not the constructor: `BigInt(5)` is a `bigint`, `new BigInt()` is a `BigInt`.
+// Same two-declaration shape `Number` below already uses, and TypeScript's own lib uses for all four.
+declare var BigInt: {
+	(value?: any): bigint;
+};
 
 //-----------------------------------------------------------------------------
 //	Object
@@ -163,6 +171,7 @@ interface String {
 }
 
 declare var String: {
+	(value?: any): string;
 //	fromCharCode(...codes: number[]): string;
 	fromCharCode(code: number): string;
 	// One byte per char code, read straight out of linear memory -- the single-alloc counterpart to

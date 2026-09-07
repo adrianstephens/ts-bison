@@ -764,7 +764,9 @@ function hoist(stmts: Stmt[], scope: Scope) {
 				// `stmt` reassigned twice above (unwrap `while`, then a guard `if`) -- beyond this checker's own narrowing, so the cast below is a real gap, not a type error.
 				const { instance, value } = classShapes(stmt as TS.Class, scope);
 				scope.mergeType(stmt.name, instance, stmt.typeParams as TS.TypeParam[]);
-				scope.addValue(stmt.name, value);
+				// `mergeValue`, matching `mergeType` directly above: a primitive wrapper is declared twice
+				// on purpose (see `Scope.mergeValue`), and overwriting lost the ambient call signature.
+				scope.mergeValue(stmt.name, value);
 				scope.addDecl(stmt.name, stmt);
 				break;
 			}
@@ -1391,8 +1393,16 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				}
 
 				let overloads: TS.CallSig[] | undefined;
-				let sig: TS.CallSig|undefined = (calleeT.type === 'intersection' ? calleeT.types.map(p => T.resolveOwn(p, scope)) : [calleeT])
-					.find(p => p.type === 'function' || p.type === 'constructor');
+				const parts = calleeT.type === 'intersection' ? calleeT.types.map(p => T.resolveOwn(p, scope)) : [calleeT];
+				// A bare `constructor` part is NOT taken for a plain call here any more -- it used to be, which
+				// pre-empted the call-vs-construct preference the member scan below already implements. A
+				// primitive wrapper is exactly that shape: `class BigInt`'s constructor alongside a
+				// `declare var BigInt` whose call signature returns `bigint`, so `BigInt(5)` typed as
+				// `BigInt`. It stays available as the LENIENT fallback below, so calling a construct-only
+				// value still works as it always has.
+				let sig: TS.CallSig|undefined = e.type === 'new'
+					? parts.find(p => p.type === 'constructor') ?? parts.find(p => p.type === 'function')
+					: parts.find(p => p.type === 'function');
 				if (!sig) {
 					// `new` prefers a construct signature, a plain call a bare call signature -- each falls back to the other when its preferred
 					// kind is absent (real TS wouldn't allow that cross-fallback), matching this checker's existing leniency.
@@ -1405,6 +1415,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						sig = calls[0];
 					} else if (calls.length > 1) {
 						overloads = calls;		// resolved below, once argument types are known
+					} else if ((sig = parts.find(p => p.type === 'constructor'))) {
+						// The leniency noted above: a plain call on a value that only has a construct
+						// signature. Real TS rejects it; this checker has always allowed it.
 					} else if (T.sealed(calleeT, scope)) {
 						if (err)
 							err(SEVERITY.ERROR, pos)`Type '${calleeT}' is not callable in '${e}'`;

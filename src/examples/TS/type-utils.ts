@@ -2162,6 +2162,15 @@ export class Scope {
 	}
 
 	addValue(name: string, type: Type)				{ this.values.set(name, type); }
+	// The value counterpart of `mergeType`, and only against a binding in THIS scope (`values`, not the
+	// parent-walking `value()`) -- a class in a user module must never merge with a lib class of the same
+	// name. It exists for the primitive wrappers, which TypeScript itself models as two declarations:
+	// `class BigInt` supplies `new` and the instance side, `declare var BigInt` the CALL signature that
+	// returns `bigint`. Overwriting dropped the call signature entirely.
+	mergeValue(name: string, type: Type) {
+		const prev = this.values.get(name);
+		this.values.set(name, prev ? TS.IntersectionType([type, prev]) : type);
+	}
 	addType(name: string, type: Type, typeParams?: TS.TypeParam[])	{ this.types.set(name, {type, typeParams}); }
 	// See `TypeEntry.isTypeParam`'s own comment -- `constraint` is only an upper-bound approximation, not
 	// a real resolvable alias; `isAbstract` treats a flagged entry as still abstract accordingly.
