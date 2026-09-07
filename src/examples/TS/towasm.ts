@@ -159,7 +159,16 @@ class TSWError {
 
 // lib files concatenated into one flat declaration list.
 const LIB_DIR		= path.join(__dirname, 'lib');
-const LIB_AST		= ['lib.d.ts', 'number.ts', 'bigint.ts', 'string.ts', 'array.ts', 'typedarray.ts', 'regexp.ts', 'map.ts', 'console.ts', 'generator.ts', 'promise.ts', 'error.ts'].flatMap(f => TS.parse(fs.readFileSync(path.join(LIB_DIR, f), 'utf8')).body);
+// Globbed, not listed: a hardcoded list fails SILENTLY when a new lib file is forgotten -- the
+// declarations simply do not exist, and the first sign is an "unknown class"/"unresolved identifier"
+// somewhere unrelated. `readdirSync` order is filesystem-dependent, so it is sorted for a reproducible
+// build, with `lib.d.ts` pinned first: it declares the pseudo-types and ambient host modules the rest
+// are written against, and reading it first matches how the file is meant to be understood.
+// `lib/node/*` is deliberately NOT included -- those are on-demand modules resolved through the loader
+// (see `ModuleLoader.nodeBuiltin`), not part of this always-linked flat scope; the `.ts` filter drops
+// the `node` directory entry along with `tsconfig.json`.
+const LIB_FILES		= ['lib.d.ts', ...fs.readdirSync(LIB_DIR).filter(f => f.endsWith('.ts') && f !== 'lib.d.ts').sort()];
+const LIB_AST		= LIB_FILES.flatMap(f => TS.parse(fs.readFileSync(path.join(LIB_DIR, f), 'utf8')).body);
 const LIB_EXPORTS	= LIB_AST.filter(n => n.type === 'export_decl').map(n =>n.declaration);
 const LIB_DECLS		= [
 	...[...LIB_EXPORTS, ...LIB_AST].filter(n => n.type === 'function_decl' || n.type === 'class_decl'),
