@@ -202,7 +202,8 @@ function UnsignedToString(n: number, radix = 10, digits = 1): string {
 	while (n > 0 || digits > 0) {
 		digits--;
 		const d = n % radix;
-		s = String.fromCharCode(d < 10 ? 48 + d : 65 + d - 10) + s;
+		// LOWERCASE above 9: `(255).toString(16)` is 'ff' in JS, not 'FF'.
+		s = String.fromCharCode(d < 10 ? 48 + d : 97 + d - 10) + s;
 		n = Math.floor(n / radix);
 	}
 	return s;
@@ -245,17 +246,26 @@ export class Number {
     static readonly NEGATIVE_INFINITY	= 0;
     static readonly POSITIVE_INFINITY	= 0;
 
-	static isInteger(x: number): boolean		{ return x === Math.floor(x); }
+	// `x === Math.floor(x)` alone is true for the infinities, which JS says are not integers.
+	static isInteger(x: number): boolean		{ return Number.isFinite(x) && x === Math.floor(x); }
 	static isNaN(x: number): boolean			{ return x !== x; }
-	static isSafeInteger(x: number): boolean	{ return Math.abs(x) < Number.MAX_SAFE_INTEGER; }
+	// An INTEGER within the safe range, inclusive: the magnitude test alone called `1.5` safe and
+	// `MAX_SAFE_INTEGER` itself unsafe.
+	static isSafeInteger(x: number): boolean	{ return Number.isInteger(x) && Math.abs(x) <= Number.MAX_SAFE_INTEGER; }
 	static isFinite(x: number): boolean			{ return Math.abs(x) < Infinity; }
 
+	// Leading whitespace is skipped by both, per JS. Only here, not inside `getInt`/`getFloat`
+	// themselves -- `getInt` also reads a float's exponent, where `1e 5` is not `1e5`.
 	static parseInt(s: string, radix = 10): number {
-		return getInt(new StringParser(s), radix);
+		const p = new StringParser(s);
+		p.skipWhitespace();
+		return getInt(p, radix);
 	}
 
 	static parseFloat(str: string): number {
-		return getFloat(new StringParser(str));
+		const p = new StringParser(str);
+		p.skipWhitespace();
+		return getFloat(p);
 	}
 	valueOf():	number { return this as unknown as number; }
 
@@ -348,7 +358,15 @@ export class Math {
 	static floor	= __asm<[number], number>('(switch $T (($f32 $f64) $T.floor))');
 	static ceil		= __asm<[number], number>('(switch $T (($f32 $f64) $T.ceil))');
 	static trunc	= __asm<[number], number>('(switch $T (($f32 $f64) $T.trunc))');
-	static round	= __asm<[number], number>('(switch $T (($f32 $f64) $T.nearest))');
+	// Round-half-UP toward +Infinity. NOT wasm's `nearest`, which is round-half-to-EVEN: that gave
+	// `Math.round(0.5) === 0` and `Math.round(2.5) === 2`. `x - f` is 0 for an already-integral `x`
+	// (including the infinities), so those pass straight through instead of losing precision to `+ 0.5`.
+	static round(x: number): number {
+		const f = Math.floor(x);
+		const r = x - f >= 0.5 ? f + 1 : f;
+		// JS keeps a zero result's sign: `Math.round(-0.5)` is `-0`, not `+0`.
+		return r === 0 && x < 0 ? -0 : r;
+	}
 	static fround	= __asm<[f64], f32>('f32.demote_f64');
 	static sqrt		= __asm<[number], number>('(switch $T (($f32 $f64) $T.sqrt))');
 	static clz32	= __asm<[i32], i32>('i32.clz');
