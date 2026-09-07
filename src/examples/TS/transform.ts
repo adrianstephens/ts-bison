@@ -1,7 +1,7 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
-import { Identifier, Literal, Binary, hasMod, dropMod, If, While } from '../common';
+import { Identifier, Literal, Binary, Conditional, hasMod, dropMod, If, While } from '../common';
 import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
@@ -464,7 +464,12 @@ export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget,
 			if (!el)
 				return [];
 			const elemExpr: Expr = JS.Index(valueExpr, Literal(i));
-			return patternBindings(kind, el.target, el.default ? Binary('??', elemExpr, el.default) : elemExpr);
+			// A default is LENGTH-guarded, not `?? default`: the pattern can be longer than the value
+			// (`const [a, b = 7] = [1]`, entirely ordinary JS), and reading past the end traps in wasm
+			// rather than giving `undefined`, so `??` never got the chance to supply the default.
+			return patternBindings(kind, el.target, el.default
+				? Conditional<Expr>(Binary('<', Literal(i), JS.Member(valueExpr, 'length')), elemExpr, el.default)
+				: elemExpr);
 		});
 		if (target.rest) {
 			// Real JS semantics: the rest collects the remaining elements into a genuinely new array, not
