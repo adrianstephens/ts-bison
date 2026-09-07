@@ -1857,7 +1857,11 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		// Computed unconditionally (not just `!muted`) so it's available below for a defaulted,
 		// unannotated param's own type too -- `typeOf`'s own diagnostics are already self-gated by
 		// the ambient `muted` counter, so only the explicit assignability check+report needs the guard.
-		const dt = p.default && typeOf(p.default, inner, true, undefined, undefined, err);
+		// `anno` as the contextual type, which is what real TS does: a default is checked AGAINST the
+		// parameter's declared type, and without it an unannotated arrow default (`compareFn: (a: T, b: T)
+		// => number = (a, b) => ...`) typed its own params as `any` -- so `Array.sort` could not be called
+		// without an explicit comparator at all.
+		const dt = p.default && typeOf(p.default, inner, true, anno, undefined, err);
 		if (err && dt && anno && !checkAssignable(dt, anno, inner, (p as any).pos, inner, err))
 			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
 		if (typeof p.key === 'string')

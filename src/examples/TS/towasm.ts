@@ -6820,8 +6820,30 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// a literal is -- no call, no side effect, nothing but a value already known by the time it's needed.
 	// `emitCallArgs` is the one that actually makes an earlier-parameter reference resolve correctly (see
 	// its own comment) -- this only decides whether the *shape* of the expression is safe to attempt.
+	// A CLOSURE default (`sort(compareFn = (a, b) => ...)`) is re-emitted at every call site that omits the
+	// argument, so the question is not what kind of expression it is but what it CAPTURES: it may mention
+	// only its own parameters and the earlier parameters those call sites already pass. Anything else is an
+	// enclosing local that would be re-emitted out of scope. `(a, b) => a < b ? -1 : ...` -- the lib's own
+	// `Array.sort` default, and the reason `sort` was unusable at all -- captures nothing.
+	function closureDefaultIsSelfContained(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
+		if (e.type !== 'arrow' && e.type !== 'function')
+			return false;
+		const bound = new Set<string>(earlierNames);
+		for (const p of e.params)
+			if (typeof p.key === 'string')
+				bound.add(p.key);
+		let ok = true;
+		walk(e.body as Walkable, undefined, (x, process) => {
+			if (x.type === 'identifier' && !bound.has(x.name))
+				ok = false;
+			return process(x);
+		});
+		return ok;
+	}
+
 	function isReemittableDefault(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
 		return e.type === 'literal'
+			|| closureDefaultIsSelfContained(e, earlierNames)
 			|| (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el, earlierNames)))
 			// Same reasoning as the array case, and `{}` -- an all-defaults options bag -- is the common one.
 			|| (e.type === 'object' && e.properties.every(pr => pr.type === 'field' && typeof pr.key === 'string' && !!pr.value && isReemittableDefault(pr.value, earlierNames)))
