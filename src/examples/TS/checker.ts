@@ -1837,6 +1837,10 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 	const noStamp = !!expected && !err && scope.isGenericTemplate();
 	if (!noStamp)
 		fn.scope ??= inner;
+	// The per-STATEMENT stamp is a wrapper this walk either composes or does not (see `stampScopes`),
+	// rather than a flag threaded through `checkStmt` and `checkBlock`. `fn.scope` just above is the
+	// separate, function-level stamp and still needs the flag itself.
+	const stamp = noStamp ? (c: checkStmt) => c : stampScopes;
 	// Each of this function's own type params gets registered into its body's scope (`addTypeParam`,
 	// not `addType` -- see its own comment on why the distinction matters for conditional-type
 	// deferral), using its declared constraint (or `any` when unconstrained) as a real, resolvable
@@ -1887,7 +1891,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 
 	if (Array.isArray(body)) {
 		if (expected) {
-			checkBlock(body, inner, typeOf1(err), checkStmt1(err, (s: Stmt, scope: Scope): void => {
+			checkBlock(body, inner, typeOf1(err), checkStmt1(err, c => stamp(afterReturn(c, (s: Stmt, scope: Scope): void => {
 				if (s.type === 'return' && s.argument) {
 					const argument = s.argument;
 					const t = typeOf(argument, scope, false, expected, undefined, err);
@@ -1898,18 +1902,18 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 							checkExcessProps(argument, expected, (argument as any).pos, scope, err);
 					}
 				}
-			}, noStamp));
+			}))));
 		} else if (isPredicate) {
-			checkBlock(body, inner, typeOf1(err), checkStmt1(err, undefined, noStamp));
+			checkBlock(body, inner, typeOf1(err), checkStmt1(err, stamp));
 
 		} else {
 			const	returns: {s: (Stmt & {type: 'return'}), type?: Type}[] = [];
 			const	yields = generator ? [] as Type[] : undefined;
 			const	typeOf1		= (e: Expr, scope: Scope, expected?: Type)	=> typeOf(e, scope, true, expected, yields, err);
-			checkBlock(body, inner, typeOf1, checkStmt1(err, (s: Stmt, scope: Scope): void => {
+			checkBlock(body, inner, typeOf1, checkStmt1(err, c => stamp(afterReturn(c, (s: Stmt, scope: Scope): void => {
 				if (s.type === 'return')
 					returns.push({s, type: s.argument && typeOf(s.argument, scope, true, undefined, undefined, err)});
-			}, noStamp));
+			}))));
 
 			const last			= body[body.length - 1];
 			const retDef		= returns.map(r => r.type).filter(r => !!r);
@@ -2032,11 +2036,9 @@ function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; ri
 	return undefined;
 }
 
-// `noStamp`: threaded down from `checkFunctionBody`'s own `noStamp` (see its own long comment) --
-// only ever `true` for the muted, first-ever walk of a generic class's shared method-body template.
-// Every other caller (real user-program checks, `static_block`, the top-level `makeLibScope`/
-// `transform.ts` calls) leaves it `undefined`, so `checkStmt`'s `(stmt as any).scope ??=` stamp fires
-// exactly as it always has for them.
+// `check`: the walk to use, defaulting to the plain scope-stamping one. The only caller that wants
+// anything else is `checkFunctionBody`, which composes a return hook and (for the muted first walk of a
+// generic method-body template) drops the stamp -- see `stampScopes`/`afterReturn`.
 export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), check: checkStmt = checkStmt1()) {
 	hoist(stmts, scope);
 
@@ -2070,34 +2072,38 @@ export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), chec
 
 type checkStmt = (s: Stmt, scope: Scope, typeOf: typeOf)=>void;
 
-// `err`/`onReturn`/`noStamp` are bound HERE rather than passed at every call: they were parameters on
-// both `checkStmt` and `checkBlock`, threaded through every recursive call and through signatures whose
-// only job was to pass them on, while only `checkFunctionBody` ever set `onReturn`/`noStamp` at all. A
-// walk that needs them is now *a* `checkStmt`; everything else uses the plain one. Same `x`/`x1` shape
-// `typeOf`/`typeOf1` already uses -- and inside, `checkStmt1` is this same closure with `typeOf` bound.
-//
-// `onReturn` is not part of the check at all: it is simply something *a* checkStmt does AFTER calling
-// *the* checkStmt, so it composes as a wrapper instead of a hook every layer has to carry. EVERY nested
-// statement recurses through `outer`, block or not -- when the hook lived in `checkBlock` a bare nested
-// `return` never reached it, so `if (x) return 'ab';` inferred `void` while the identical body WITH
-// BRACES inferred `string | undefined`. Adding braces changed the type.
-export function checkStmt1(err?: Err, onReturn?: (s: Stmt, scope: Scope)=>void, noStamp?: boolean): checkStmt {
-	const checkStmt = Object.assign((stmt: Stmt, scope: Scope, typeOf: typeOf): void => {
-		// The real (post-narrowing, where applicable) `Scope` this statement was type-checked under --
-		// stamped directly on the node (like `pos`, `CallSig.scope`), not tracked as checker state, so a
-		// consumer with no narrowing-aware scope of its own (towasm.ts's codegen, whose own scope tracking
-		// never reflects flow narrowing) can read back the same scope the checker concluded for this
-		// statement instead of only ever seeing the function-entry scope. Untyped (`any`), not a formal
-		// field on `Statement` -- that union is large enough that a shared field added via an intersection
-		// broke unrelated generic AST-mapping code elsewhere (`walker.ts`'s `keyof`-based `NodeMap`).
-		// `??=`: first (real, unmuted) check wins, same reasoning as `fn.scope ??=` above -- a speculative
-		// (muted) re-walk always reaches a given statement only after the real pass already has. `noStamp`
-		// (see `checkFunctionBody`'s own comment) skips it entirely for the one case where even a first
-		// stamp would be wrong -- deliberately *not* re-derived here from `scope.isGenericTemplate()`
-		// directly: that would also catch a constructor (always walked in full regardless of genericity,
-		// via `skipReturn`, and never itself at risk), which must keep stamping as before.
-		if (!noStamp)
-			(stmt as any).scope ??= scope;
+// The two things a walk can do BESIDES checking, each a wrapper rather than a flag `checkStmt` carries.
+// Composed by the caller, so `checkStmt` itself has no `onReturn` and no `noStamp` to thread anywhere.
+
+// The real (post-narrowing, where applicable) `Scope` a statement was checked under, stamped on the node
+// (like `pos`, `CallSig.scope`) rather than kept as checker state -- so a consumer with no
+// narrowing-aware scope of its own (towasm's codegen) reads back the scope the checker concluded here
+// instead of only ever seeing the function-entry one. Untyped (`any`), not a formal field on `Statement`:
+// that union is large enough that a shared field added via an intersection broke unrelated generic
+// AST-mapping code (`walker.ts`'s `keyof`-based `NodeMap`). `??=`: the first (real, unmuted) check wins,
+// same reasoning as `fn.scope ??=`, since a speculative re-walk always arrives after the real pass.
+// OMITTED for a muted generic-template walk, where even a first stamp would be wrong -- and that is now
+// simply a caller not composing this, rather than a `noStamp` flag every signature had to pass along.
+const stampScopes = (check: checkStmt): checkStmt => (stmt, scope, typeOf) => {
+	(stmt as any).scope ??= scope;
+	check(stmt, scope, typeOf);
+};
+
+// Run `after` on every `return` the walk reaches -- something a checkStmt does AFTER the check, so it
+// composes here rather than being a hook the check has to know about. EVERY nested statement recurses
+// through the composed walk, block or not: when this lived in `checkBlock` a bare nested `return` never
+// reached it, and `if (x) return 'ab';` inferred `void` while the braced form inferred `string | undefined`.
+const afterReturn = (check: checkStmt, after: (s: Stmt, scope: Scope)=>void): checkStmt => (stmt, scope, typeOf) => {
+	check(stmt, scope, typeOf);
+	if (stmt.type === 'return')
+		after(stmt, scope);
+};
+
+// `err` is bound here, and `wrap` says how to compose the base walk into the one every nested statement
+// recurses through -- so a wrapper's behaviour reaches the whole subtree, not just the top statement.
+// Same `x`/`x1` shape `typeOf`/`typeOf1` uses; inside, `checkStmt1` is this same walk with `typeOf` bound.
+export function checkStmt1(err?: Err, wrap: (c: checkStmt) => checkStmt = stampScopes): checkStmt {
+	const base: checkStmt = (stmt, scope, typeOf) => {
 
 		const checkBlock1	= (stmts: Stmt[], scope: Scope)		=> checkBlock(stmts, scope, typeOf, outer);
 		const checkStmt1	= (stmt: Stmt, scope: Scope)		=> outer(stmt, scope, typeOf);
@@ -2188,10 +2194,6 @@ export function checkStmt1(err?: Err, onReturn?: (s: Stmt, scope: Scope)=>void, 
 				}
 				break;
 			}
-	//		case 'return':
-	//			onReturn?.(stmt, scope);
-	//			break;
-
 			case 'switch': {
 				typeOf(stmt.discriminant, scope);
 				// A `case` with no body falls through to the next -- reuse `if`'s discriminated-union narrowing by synthesizing that binary
@@ -2266,12 +2268,8 @@ export function checkStmt1(err?: Err, onReturn?: (s: Stmt, scope: Scope)=>void, 
 			// type_alias_decl / interface_decl / enum_decl / import / export /
 			// empty / debugger / continue / break: declaration-only or nothing to check (hoist saw them)
 		}
-	});
-	const outer: checkStmt = !onReturn ? checkStmt : (stmt, scope, typeOf) => {
-		checkStmt(stmt, scope, typeOf);
-		if (stmt.type === 'return')
-			onReturn(stmt, scope);
 	};
+	const outer = wrap(base);
 	return outer;
 }
 
