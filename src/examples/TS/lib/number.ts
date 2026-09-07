@@ -87,8 +87,12 @@ function intPow(x: number, y: number): number {
 //-----------------------------------------------------------------------------
 
 export class Boolean {
-	constructor(value: i32) {
-		return value as unknown as Boolean;
+	// `Boolean(x)` is a real truthiness test, not a pass-through: towasm lowers a call on a class to its
+	// constructor, so this IS `Boolean('')`/`Boolean(0)`/`Boolean(NaN)`. The local is declared `i32` so
+	// the (cast-stripped) return type still tells `ensureClass` this class is physically an `i32`.
+	constructor(value: any) {
+		const b: i32 = value ? 1 : 0;
+		return b as unknown as Boolean;
 	}
 	valueOf():	boolean { return this as unknown as boolean; }
 	toString(): string	{ return (this as unknown as boolean) ? 'true' : 'false'; }
@@ -116,7 +120,9 @@ function getUnsigned(p: StringParser, radix = 10, value = 0): number {
 		let d = p.code() - 48;
 		if (d > 9)
 			d = (d + 48 - 65 + 10) & 0x1f;
-		if (d < 0 || d > radix) {
+		// `>=`, not `>`: a digit equal to the radix is out of range, and `> radix` let 'a' (10) through
+		// for radix 10, so `Number('abc')` parsed as 10 instead of NaN.
+		if (d < 0 || d >= radix) {
 			stop = true;
 		} else {
 			value = value * radix + d;
@@ -125,6 +131,44 @@ function getUnsigned(p: StringParser, radix = 10, value = 0): number {
 	}
 	return value;
 }
+// `parseFloat`'s body, taking the parser so a caller can see how much of the string it consumed --
+// `Number(str)` is NOT `parseFloat(str)`: it rejects trailing junk rather than ignoring it.
+function getFloat(p: StringParser): number {
+		const sign = getSign(p);
+
+	let exp		= 0;
+	let pos		= p.pos;
+	let value	= getUnsigned(p);
+	if (p.pos === pos)
+		return NaN;
+
+	// fractional part
+	if (p.skipCode(46)) {
+		pos		= p.pos;
+		value	= getUnsigned(p, 10, value);
+		exp		= pos - p.pos;
+	}
+
+	const c = p.code();
+	if (c === 101 || c === 69) { // 'e' or 'E'
+		p.pos++;
+		exp += getInt(p);
+	}
+
+	return sign * value * intPow(10, exp);
+}
+
+// Real `Number(str)`: whitespace-trimmed, an empty string is 0 (not NaN, which is what `parseFloat`
+// gives), and anything left over after the number makes the whole thing NaN.
+function numberFromString(s: string): number {
+	const t = s.trim();
+	if (t.length === 0)
+		return 0;
+	const p = new StringParser(t);
+	const v = getFloat(p);
+	return p.remaining() === 0 ? v : NaN;
+}
+
 function getInt(p: StringParser, radix = 10): number {
 	const sign = getSign(p);
 	const pos = p.pos;
@@ -179,10 +223,16 @@ function fracToString(f: number, digits: number): string {
 }
 
 export class Number {
-	// A real `f64` -- lets `towasm.ts`'s `ensureClass` read this class's own physical `this`-type
-	// straight off the (stripped-of-casts) return expression's real type, same as every other class.
-	constructor(value: number) {
-		return value as unknown as Number;
+	// A real conversion, because towasm lowers a call on a class to its constructor and this IS
+	// `Number('42')`/`Number(true)`. `n` is declared `number`, so the (cast-stripped) return type still
+	// tells `ensureClass` this class is physically an `f64`, exactly as the pass-through version did.
+	constructor(value: any) {
+		const n: number = typeof value === 'number' ? value
+			: typeof value === 'string' ? numberFromString(value)
+			: typeof value === 'boolean' ? (value ? 1 : 0)
+			: typeof value === 'bigint' ? bigToNumber(value)
+			: 0;
+		return n as unknown as Number;
 	}
 
 	static readonly EPSILON = 2.2204460492503130808472633361816e-16;
@@ -205,35 +255,20 @@ export class Number {
 	}
 
 	static parseFloat(str: string): number {
-		const p = new StringParser(str);
-		const sign = getSign(p);
-
-		let exp		= 0;
-		let pos		= p.pos;
-		let value	= getUnsigned(p);
-		if (p.pos === pos)
-			return NaN;
-
-		// fractional part
-		if (p.skipCode(46)) {
-			pos		= p.pos;
-			value	= getUnsigned(p, 10, value);
-			exp		= pos - p.pos;
-		}
-
-		const c = p.code();
-		if (c === 101 || c === 69) { // 'e' or 'E'
-			p.pos++;
-			exp += getInt(p);
-		}
-
-		return sign * value * intPow(10, exp);
+		return getFloat(new StringParser(str));
 	}
-
 	valueOf():	number { return this as unknown as number; }
 
 	toString(radix = 10): string {
 		let x = this as unknown as number;
+		// The non-finite values first: `Math.floor(NaN)` and the digit walk below produce '' for all
+		// three, so `String(NaN)` was the empty string rather than 'NaN'.
+		if (x !== x)
+			return 'NaN';
+		if (x === Infinity)
+			return 'Infinity';
+		if (x === -Infinity)
+			return '-Infinity';
 		const sign = x < 0 ? '-' : '';
 		x = Math.abs(x);
 

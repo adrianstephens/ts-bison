@@ -24,6 +24,12 @@
 export const __towasm_mulWide	= __asm<[i64, i64], i64>('i64.mul');
 
 export function bigFromNumber(n: number): bigint {
+	// The limb loop below builds a MAGNITUDE (its `Math.floor(m / 0x100000000)` walk assumes `n >= 0`),
+	// so a negative goes round once on its absolute value and is negated at the end -- otherwise
+	// `BigInt(-5)` produced garbage that compared as positive.
+	if (n < 0)
+		return -bigFromNumber(-n);
+
 	let count = 1;
 	for (let t = Math.floor(n / 0x100000000); t > 0; t = Math.floor(t / 0x100000000))
 		++count;

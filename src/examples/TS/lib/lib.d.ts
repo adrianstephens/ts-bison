@@ -46,6 +46,11 @@ declare function __alloc(size: i32, align: i32): i32;
 declare function __allocMark(): i32;
 declare function __allocRelease(mark: i32): void;
 
+// Same shape as `StringParser` below: the real one is `export`ed from `bigint.ts`, which makes it a
+// MODULE to tsc and so invisible to a sibling lib file -- towasm sees one flat scope. Named here rather
+// than imported, for the reason `lib/node/*` must never import a static lib file.
+declare function bigToNumber(a: bigint): number;
+
 declare function pure(target: any, propertyKey: string, descriptor: PropertyDescriptor): void;
 
 // Pseudo-types for `__asm`'s own `P`/`R` generic args, purely so an asm-backed method can declare its
