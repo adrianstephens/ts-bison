@@ -468,7 +468,7 @@ export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget,
 			// (`const [a, b = 7] = [1]`, entirely ordinary JS), and reading past the end traps in wasm
 			// rather than giving `undefined`, so `??` never got the chance to supply the default.
 			return patternBindings(kind, el.target, el.default
-				? Conditional<Expr>(Binary('<', Literal(i), JS.Member(valueExpr, 'length')), elemExpr, el.default)
+				? Conditional<Expr>(Binary<Expr, '<'>('<', Literal(i), JS.Member(valueExpr, 'length')), elemExpr, el.default)
 				: elemExpr);
 		});
 		if (target.rest) {
