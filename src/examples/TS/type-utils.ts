@@ -1994,10 +1994,15 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				// Real TS does exactly this; without it `unbox<T>(b: {value: T | undefined}): T` came back
 				// as `number | undefined` and every use of its result was then rejected.
 				const keys		= new Set(concrete.map(c => typeKey(resolveOwn(c, scope))));
-				const rest		= a.type === 'union' ? a.types.filter(m => !keys.has(typeKey(resolveOwn(m, scope)))) : [];
-				const narrowed	= rest.length && rest.length < a.types.length ? (rest.length === 1 ? rest[0] : TS.UnionType(rest)) : argT;
-				for (const t of bare)
-					recurse(t, narrowed, depth - 1);
+				if (a.type === 'union') {
+					const rest		= a.types.filter(m => !keys.has(typeKey(resolveOwn(m, scope))));
+					const narrowed	= rest.length && rest.length < a.types.length ? (rest.length === 1 ? rest[0] : TS.UnionType(rest)) : argT;
+					for (const t of bare)
+						recurse(t, narrowed, depth - 1);
+				} else {
+					for (const t of bare)
+						recurse(t, argT, depth - 1);
+				}
 			}
 		}
 	}

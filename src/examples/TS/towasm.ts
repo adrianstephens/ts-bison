@@ -2540,11 +2540,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// The `WasmType` a value expression resolves to -- `classOf`/`arrayKindOf` below are thin discriminating views over this one (previously identical) checker walk.
 	// `unwrapAs`: see that function's own comment -- the checker's `typeOf` must see the real (post-`as`) expression, not the asserted one.
 	function wtypeOf(e: Expr, ctx: FunctionContext): WasmType | undefined {
-		// `narrowedTypeOf`, not `ctx.scope` outright: `ctx.scope` carries no control-flow narrowing, so a
-		// read off a receiver narrowed out of `T | undefined` (`if (!r) return; r.min`) had no baseline
-		// type at all. See `narrowedTypeOf` for why that stays safe -- it only defers to `stmtScope` where
-		// `ctx.scope` has a union or no answer.
-		return typeOf(narrowedTypeOf(e, ctx));
+		// `ctx.scope` FIRST: a value's physical type is its slot's, and control-flow narrowing never
+		// changes that. Asking `narrowedTypeOf` outright broke `let p: Point | null = null; p = new
+		// Point(...); p === null` -- the narrowed type is `Point`, so the comparison was rejected as
+		// having no nullable operand, even though the slot it lives in is still nullable.
+		// `narrowedTypeOf` only fills in where `ctx.scope` has no answer at all: a read off a receiver
+		// narrowed out of `T | undefined` (`if (!r) return; r.min`) comes back `any` there.
+		const base = checkerTypeOf(unwrapAs(e), ctx.scope);
+		return typeOf(T.isAny(base) ? narrowedTypeOf(e, ctx) : base);
 	}
 
 	// Like `checkerTypeOf(e, ctx.scope)`, but for a receiver whose *unnarrowed* type is a real union,
@@ -3366,13 +3369,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				}
 				case 'f32':
 					ctx.emit(I.f64.promote_f32);
-					//fall through
 				// `bigFromNumber` (lib/bigint.ts) is the real, tested conversion, and calling it is the
 				// only way this stays in step with the limb encoding it has to produce. What used to be
 				// here was a hand-written exponent walk that was never finished -- it fell out of the
 				// switch into the throw below, and it named two differently-typed temps `$exp`, so it
 				// could not have run anyway. A mixed `bigint`/`number` comparison, which real TS allows
 				// and which `BigInt.toString`'s own `i > 0` loop depends on, therefore never compiled.
+					//fall through
 				case 'f64': {
 					const decl = LIB_DECL_MAP.get('bigFromNumber');
 					if (decl && decl.type === 'function_decl') {
@@ -6001,11 +6004,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							if (e.optional && calleeWtype.nullable) {
 								if (sig.result === 'void')
 									throw "'f?.()' is not supported -- 'f' returns 'void', which can't become 'void | undefined'";
-								const resultWtype = nullableWtype(sig.result);
+								const resultWtype	= nullableWtype(sig.result);
+								// Bound out here: the enclosing `e.callee.type === 'identifier'` narrowing
+								// doesn't survive into the closure below.
+								const calleeName	= e.callee.name;
 								emitExpr(e.callee, ctx);
 								return emitOptionalAccess(ctx, calleeWtype, resultWtype, objLocal => {
 									ctx.emit(I.local.get(objLocal), I.struct.get(structTypeIndex, 1));
-									emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
+									emitCallArgs(calleeName, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 									ctx.emit(I.local.get(objLocal), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 									coerceTop(sig.result, ctx, resultWtype);
 								});
