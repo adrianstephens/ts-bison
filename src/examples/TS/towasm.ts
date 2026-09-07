@@ -3833,8 +3833,29 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return e;
 	}
 
+	// A spread argument whose expression has a TUPLE type has a statically known length -- and that is
+	// exactly the case real TS allows in a fixed-arity call ("A spread argument must either have a tuple
+	// type or be passed to a rest parameter"). Expanded into that many positional index reads, in place,
+	// so nothing is reordered and the surrounding argument sequence is untouched. Restricted to an
+	// expression that can be re-emitted without side effects (an identifier, or a plain property chain
+	// off one), since each element re-evaluates it; anything else still gets the error below.
+	function expandTupleSpreads(args: Expr[], ctx: FunctionContext): Expr[] {
+		const reemittable = (e: Expr): boolean => e.type === 'identifier' || e.type === 'this'
+			|| (e.type === 'member' && !e.optional && reemittable(e.object));
+		return args.flatMap(a => {
+			if (a.type !== 'spread' || !reemittable(a.operand))
+				return [a];
+			const t = T.resolve(ctx.typeScope, narrowedTypeOf(a.operand, ctx));
+			if (t.type !== 'tuple')
+				return [a];
+			return t.elements.map((_, i): Expr => ({ type: 'index', object: a.operand, index: Literal(i) } as Expr));
+		});
+	}
+
 	function emitCallArgs(label: string, params: WasmType[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FunctionContext, resolvedParams?: ResolvedParam[]): void {
 		if (!hasRest) {
+			if (args.some(a => a.type === 'spread'))
+				args = expandTupleSpreads(args, ctx);
 			if (args.some(a => a.type === 'spread'))
 				throw `'${label}' takes no rest parameter -- a spread argument has nowhere to expand into`;
 
