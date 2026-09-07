@@ -76,14 +76,18 @@ export class String {
 	}
 
 	toString(): string { return this as unknown as string; }
-	charAt		= __asm<[i32], string>('array.get_u $this array.new_fixed $this 1');
 	charCodeAt	= __asm<[i32], i32>('array.get_u $this');
 
+	// Out of range is `''`, not a trap -- so this cannot be the bare `array.get_u`/`array.new_fixed` pair
+	// it used to be. `charCodeAt` stays raw: every caller in this file guards its own index.
+	charAt(pos: i32): string {
+		return pos < 0 || pos >= this.length ? '' : String.fromCharCode(this.charCodeAt(pos));
+	}
+	// `s[i]`. Was its own asm pair that read with `array.get` (illegal on a packed `i16` array -- V8
+	// rejected the whole module) and then wrote through `$this`, i.e. into the receiver rather than the
+	// fresh one-character result.
 	get(i: i32): string {
-		const result = String._alloc(1);
-		const v = __asm<[i32], u32>('array.get $this')(i);
-		__asm<[i32, u32], void>('array.set $this')(0, v);
-		return result;
+		return this.charAt(i);
 	}
 
 	indexOf(needle: string): number {
@@ -135,13 +139,18 @@ export class String {
 		}
 		return true;
 	}
+	// CLAMPED at both ends, and a reversed or out-of-range range is empty: `rlen` could otherwise go
+	// negative (`slice(3, 1)`, `slice(9)`) and reach `_alloc` as a huge unsigned length -- "requested new
+	// array is too large" -- where JS simply gives `''`.
 	slice(start: i32 = 0, end: i32 = 0x7fffffff): string {
 		const len = this.length;
-		start	= start < 0 ? start + len : start;
-		end		= end < 0 ? end + len : end > len ? len : end;
-		const rlen = end - start;
+		let from	= start < 0 ? len + start : start;
+		let to		= end < 0 ? len + end : end;
+		from	= from < 0 ? 0 : from > len ? len : from;
+		to		= to < 0 ? 0 : to > len ? len : to;
+		const rlen = to > from ? to - from : 0;
 		const result = String._alloc(rlen);
-		String._copy(result, 0, this as unknown as string, start, rlen);
+		String._copy(result, 0, this as unknown as string, from, rlen);
 		return result;
 	}
 	trim(): string {
@@ -252,8 +261,20 @@ export class String {
 		return result;
 	}
 
+	// NOT `slice`: `substring` clamps a negative (or NaN) argument to 0 rather than counting from the
+	// end, and SWAPS the two when `start > end`.
 	substring(start: i32, end: i32 = 0x7fffffff): string {
-		return this.slice(start, end);
+		const len = this.length;
+		let from	= start < 0 ? 0 : start > len ? len : start;
+		let to		= end < 0 ? 0 : end > len ? len : end;
+		if (from > to) {
+			const t = from;
+			from = to;
+			to = t;
+		}
+		const result = String._alloc(to - from);
+		String._copy(result, 0, this as unknown as string, from, to - from);
+		return result;
 	}
 
 	add(b: string) { return this.concat(b); }
