@@ -2058,6 +2058,11 @@ export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), onRe
 	}
 }
 
+type checkStmt = (s: Stmt, scope: Scope, typeOf: typeOf)=>void;
+function checkStmt1(err?: Err): checkStmt {
+	return (s, scope, typeOf) => checkStmt(s, scope, typeOf, undefined, err);
+}
+
 
 function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, onReturn?: (s: Stmt, scope: Scope)=>void, err?: Err, noStamp?: boolean): void {
 	// The real (post-narrowing, where applicable) `Scope` this statement was type-checked under --
