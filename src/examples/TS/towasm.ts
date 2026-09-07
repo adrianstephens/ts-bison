@@ -8045,6 +8045,25 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			}
 		}
 
+		// An IMPLICIT constructor, exactly as real TS synthesizes one for a class that declares none:
+		// empty for a base class, and for a derived one, the base's own parameter list forwarded through
+		// `super(...)`. (TS spells that `constructor(...args) { super(...args) }`; the base's real list is
+		// the same thing here and avoids a spread `super(...)` this back end does not support.) Without
+		// it, `class A { x = 5 }` and `class B extends A {}` -- both entirely ordinary TS -- failed with
+		// "needs an explicit constructor" the moment they were instantiated.
+		if (!info.methodDecls.has('constructor')) {
+			const superCtor = info.superClass?.methodDecls.get('constructor');
+			const params	= superCtor?.length === 1 ? superCtor[0].params : [];
+			addMethod('constructor', {
+				type:	'method',
+				key:	'constructor',
+				params,
+				body:	info.superClass
+					? [JS.ExprStmt({ type: 'call', callee: { type: 'super' }, arguments: params.map(p => ({ type: 'identifier', name: p.key as string })) } as Expr)]
+					: [],
+			} as unknown as MethodMember);
+		}
+
 		// `thisWtype`/`typeIndex` were already decided by the pre-scan above -- an explicit-return
 		// constructor's scalar/array result needs nothing more here; the ordinary struct case just needs
 		// its real field list patched into the placeholder type registered earlier.
