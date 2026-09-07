@@ -4,7 +4,7 @@
 //	GC Array
 //-----------------------------------------------------------------------------
 
-class Array<T> {
+export class Array<T> {
 	[i: number]: T;
 
 	get length(): number	{ return __asm<[], u32>('array.len')(); }
