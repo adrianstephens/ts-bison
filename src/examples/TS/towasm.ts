@@ -2672,7 +2672,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// field-construction loop below (`for (const f of owner.fields)`) already fills a missing optional
 		// field with its default value; it just never used to be reached for a class with unfilled optionals,
 		// since this filter used to require an exact field-count match first.
-		const candidates = [...classes.values()].filter(cls =>
+		// `new Set`: one `ClassInfo` can be reachable under more than one key (a named alias/interface and
+		// its structurally identical anonymous shape share one -- see `ensureObjectShape`), and counting it
+		// twice made the "exactly one candidate" test below fail for a shape that has exactly one.
+		const candidates = [...new Set(classes.values())].filter(cls =>
 			cls.typeIndex !== -1 && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
 		);
 		if (candidates.length === 1)
@@ -2719,8 +2722,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				return undefined;
 			props.set(m.key, m.typeAnnotation);
 		}
-		// See `matchObjectShape`'s own comment -- same optional-field-omission tolerance, not an exact match.
-		const candidates = [...classes.values()].filter(cls =>
+		// See `matchObjectShape`'s own comment -- same optional-field-omission tolerance, not an exact match,
+		// and the same `new Set` for the same reason: one `ClassInfo` is reachable under several keys.
+		const candidates = [...new Set(classes.values())].filter(cls =>
 			cls.typeIndex !== -1 && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
 		);
 		if (candidates.length === 1)
@@ -2781,7 +2785,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	function objectArrayKind(e: Expr, ctx: FunctionContext): WasmElementI | undefined {
 		//if (e.type === 'index' && objectArrayKind(e.object, ctx) === 'ref')
 		//	return 'ref';
-		return arrayKindOf(e, ctx);
+		// `narrowedTypeOf`, not `arrayKindOf`'s plain `ctx.scope` view: a value NARROWED out of
+		// `T | undefined` still reads as the whole union there, so a field off it comes back `any` and
+		// has no array kind at all. `[...a.rights, ...b.rights]` after `a && b` then failed with "a
+		// spread element in an array literal must be an array of the same element type" -- a message
+		// about element kinds, for a value whose kind was simply never looked up under the right scope.
+		// The same root as the indexing gap `ownerOf` already avoids by going through `narrowedTypeOf`.
+		const wt = typeOf(narrowedTypeOf(e, ctx));
+		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : undefined;
 	}
 
 	// `classOf`, but for a value that's *about to be indexed into* (`e[i]`) via generic class-method
@@ -7693,7 +7704,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		if (resolved.members.some(m => m.type !== 'property' && m.type !== 'method'))
 			return undefined;
 
-		return buildObjectShape(key, resolved.members, ref, name, !everExtended.has(name));
+		// Shared with the structurally-identical ANONYMOUS shape, under `ensureAnonObjectShape`'s own
+		// `T.typeKey` identity. `type A = { n: number }` written as `A` in one place and inlined in
+		// another is ONE type in TS, but keying a named shape by its name alone built a second struct for
+		// it -- and then a value built as one failed `ref.cast` to the other ("illegal cast", at runtime,
+		// from something as ordinary as spreading an array of them). Only alias/interface SHAPES collapse
+		// this way; a real `class` keeps its nominal identity via `ensureClass`'s own name-based key.
+		const structural	= T.typeKey(resolved);
+		const shared		= classes.get(structural);
+		if (shared) {
+			classes.set(key, shared);
+			return shared;
+		}
+		const info = buildObjectShape(key, resolved.members, ref, name, !everExtended.has(name));
+		if (info)
+			classes.set(structural, info);
+		return info;
 	}
 
 	// An anonymous inline object-type annotation (`{value: T; consumed: number}` as a return/field/param
