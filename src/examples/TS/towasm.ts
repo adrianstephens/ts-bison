@@ -2537,7 +2537,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// The `WasmType` a value expression resolves to -- `classOf`/`arrayKindOf` below are thin discriminating views over this one (previously identical) checker walk.
 	// `unwrapAs`: see that function's own comment -- the checker's `typeOf` must see the real (post-`as`) expression, not the asserted one.
 	function wtypeOf(e: Expr, ctx: FunctionContext): WasmType | undefined {
-		return typeOf(checkerTypeOf(unwrapAs(e), ctx.scope));
+		// `narrowedTypeOf`, not `ctx.scope` outright: `ctx.scope` carries no control-flow narrowing, so a
+		// read off a receiver narrowed out of `T | undefined` (`if (!r) return; r.min`) had no baseline
+		// type at all. See `narrowedTypeOf` for why that stays safe -- it only defers to `stmtScope` where
+		// `ctx.scope` has a union or no answer.
+		return typeOf(narrowedTypeOf(e, ctx));
 	}
 
 	// Like `checkerTypeOf(e, ctx.scope)`, but for a receiver whose *unnarrowed* type is a real union,
