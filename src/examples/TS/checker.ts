@@ -1023,7 +1023,20 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 			if (sig.rest?.typeAnnotation && restElementTs?.length) {
 				const t		= sig.rest.typeAnnotation;
 				const elem	= t.type === 'array' ? t.element : t;
-				restElementTs.forEach(t => T.inferTypeArgs(elem, t, names, map, scope, declScope, deferred));
+				// Every rest argument is a candidate for the SAME type param, so they UNION:
+				// `new Array(false, 1, 'x')` is `T = boolean | number | string`. Inferring them all into
+				// one `map` instead let `inferTypeArgs`'s first-wins guard (right where a single union
+				// argument distributes over one parameter) stop at `false`, and every later argument was
+				// then reported as not assignable to it.
+				const perElem = restElementTs.map(at => {
+					const m = new Map<string, Type>();
+					T.inferTypeArgs(elem, at, names, m, scope, declScope, deferred);
+					return m;
+				});
+				for (const name of new Set(perElem.flatMap(m => [...m.keys()]))) {
+					if (!map.has(name))
+						map.set(name, T.combineTypes(perElem.map(m => m.get(name)).filter(x => !!x)));
+				}
 			}
 			// Same reasoning as the `preMap` pass above: whatever's still unbound after arguments, try the call's own contextual
 			// expected type before falling back to a default/constraint/`any` guess below.
