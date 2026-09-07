@@ -116,7 +116,11 @@ async function main() {
 			console.log(`ok - ${name}`);
 		} catch {
 			++failures;
-			console.error(`FAIL - ${name}: expected ${expected}, got ${actual}`);
+			// `show`, not plain interpolation: a wasm-GC reference (an exported `bigint`/array/object)
+			// has no primitive conversion, so building this message threw and took the whole run with it
+			// instead of reporting the one failure.
+			const show = (v: unknown) => { try { return String(v); } catch { return Object.prototype.toString.call(v); } };
+			console.error(`FAIL - ${name}: expected ${show(expected)}, got ${show(actual)}`);
 		}
 	};
 	const checkThrows = async (name: string, fn: () => Promise<unknown>, pattern: RegExp) => {
@@ -181,7 +185,12 @@ async function main() {
 		// type) on a boxed-any array crashed at runtime ("illegal cast"). Fixed via `classOfForIndexing`
 		// (only overrides the built-in `Array` class, detected via the same "is my own container ref-kind"
 		// propagation `objectArrayKind` uses for the plain-raw-array path).
-		const { arrayarray, arrayarrayWrite, factorial } = await compile(`
+		// `big` returns `Number(...)` rather than the bigint itself: an exported `bigint` crosses the
+		// boundary as an opaque wasm-GC array reference, which nothing on this side can compare.
+		const { big, arrayarray, arrayarrayWrite, factorial } = await compile(`
+			export function big() {
+				return Number(1000000n * 1000000n);
+			}
 			export function arrayarray() {
 				const x: number[][] = [[1, 2], [3, 4]];
 				return x[0][1];
@@ -204,6 +213,7 @@ async function main() {
 				}
 			}
 		`);
+		check('big', big(), Number(1000000n * 1000000n));
 		check('arrayarray', arrayarray(), 2);
 		check('arrayarray: write + .length on a nested array read back correctly', arrayarrayWrite(), 105);
 		check('factorial(0)', factorial(0), 1);
@@ -1667,9 +1677,13 @@ async function main() {
 
 		// A genuinely ambiguous literal (same field set, no literal discriminant at all) must be rejected,
 		// not silently guessed at.
+		// `B` carries a member `A` doesn't: the literal fits BOTH, and the two have different layouts, so
+		// there is a real choice to get wrong. (Two *identical* shapes, which this used to use, are not
+		// ambiguous in any way that matters -- either resolution gives the same layout -- and the
+		// compiler now resolves them rather than refusing.)
 		await checkThrows('discriminated union object literal: genuine ambiguity (no discriminant) is rejected', () => compile(`
 			type A = { value: number };
-			type B = { value: number };
+			type B = { value: number; extra?: string };
 			function pick(useA: boolean): A | B {
 				return { value: 5 };
 			}
@@ -2372,8 +2386,7 @@ async function main() {
 		check("(123).toString()", hHashToStringDefault(123), jsHash((123).toString()));
 		check("(-123).toString()", hHashToStringDefault(-123), jsHash((-123).toString()));
 		check("(0.5).toString()", hHashToStringDefault(0.5), jsHash((0.5).toString()));
-		// This lib's radix conversion uses uppercase letter digits ('A'-'F'), unlike real JS's lowercase.
-		check("(255).toString(16)", hHashToString16(255), jsHash((255).toString(16).toUpperCase()));
+		check("(255).toString(16)", hHashToString16(255), jsHash((255).toString(16)));
 		check("(3.14159).toFixed(2)", hHashToFixed(3.14159, 2), jsHash((3.14159).toFixed(2)));
 		check("(0).toFixed(2)", hHashToFixed(0, 2), jsHash((0).toFixed(2)));
 		check("(123.456).toExponential(2)", hHashToExponential(123.456, 2), jsHash((123.456).toExponential(2)));
@@ -4523,16 +4536,16 @@ async function main() {
 		check("calling a closure read directly off an array element ('arr[i](x)')", indexCall(), 31);
 
 		// `(a / 0) | 0` -- an `f64`->`i32` coercion of a non-finite value must never trap (real division
-		// by zero is `+-Infinity`/`NaN`, not an error) -- confirms the saturating conversion itself, not
-		// any particular value it saturates to (real JS's own `ToInt32` gives `0` for every non-finite
-		// input, which this doesn't replicate -- a documented, accepted gap, see the file's own top comment).
+		// by zero is `+-Infinity`/`NaN`, not an error). The bitwise operators implement real `ToInt32`
+		// now, so all three answer `0` exactly as JS does; the saturating conversion `coerceTop` still
+		// uses for an index or a length is a separate, deliberate rule (see its own comment).
 		const { divByZero, divByZeroNeg, divNaN } = await compile(`
 			export function divByZero(a: number): number { return (a / 0) | 0; }
 			export function divByZeroNeg(a: number): number { return (a / -0) | 0; }
 			export function divNaN(): number { return (0 / 0) | 0; }
 		`);
-		check("'f64'->'i32' coercion of '+Infinity' never traps", divByZero(5), 2147483647);
-		check("'f64'->'i32' coercion of '-Infinity' never traps", divByZeroNeg(5), -2147483648);
+		check("'f64'->'i32' coercion of '+Infinity' never traps", divByZero(5), (5 / 0) | 0);
+		check("'f64'->'i32' coercion of '-Infinity' never traps", divByZeroNeg(5), (5 / -0) | 0);
 		check("'f64'->'i32' coercion of 'NaN' never traps", divNaN(), 0);
 	}
 
