@@ -149,15 +149,23 @@ function bigMulMag(a: u32[], b: u32[]): u32[] {
 		let j = 0;
 		while (j < nb) {
 			const prod: u32[] = __towasm_mulWide(a[i], b[j]) as unknown as u32[];
-			const t: number = r[i + j] + prod[0] + carry;
+			// Each limb bound to its own `number` local FIRST -- the idiom this file's header describes,
+			// and the reason for it: two limb reads added directly are both `u32`-kinded, so the add is
+			// done in `i32` and WRAPS. `t` then went negative, `Math.floor(t / 2^32)` gave -1 instead of
+			// 0, and the row lost a carry -- `1000000n * 1000000n` came out exactly 2^32 short.
+			const acc: number	= r[i + j];
+			const lo: number	= prod[0];
+			const hi: number	= prod[1];
+			const t: number		= acc + lo + carry;
 			r[i + j] = t & 0xffffffff;
-			carry = prod[1] + Math.floor(t / 4294967296);
+			carry = hi + Math.floor(t / 4294967296);
 			j = j + 1;
 		}
 		// Flushes the row's leftover carry into the columns above it -- a ripple, not a single add, since
 		// a column here can receive contributions from both this row's flush and the next row's own pass.
 		for (let k = i + nb, c = carry; c > 0; ++k) {
-			const tf: number = r[k] + c;
+			const at: number = r[k];
+			const tf: number = at + c;
 			r[k] = tf & 0xffffffff;
 			c = Math.floor(tf / 4294967296);
 		}
