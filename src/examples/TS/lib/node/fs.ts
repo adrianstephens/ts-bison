@@ -15,11 +15,8 @@ const storeI32	= __asm<[i32, i32], void>('i32.store');
 // directory fd does not itself hold -- asking for all-ones fails against every real host. Ask for exactly
 // what each call uses: fd_read(1<<1) | fd_seek(1<<2) | fd_tell(1<<5) | fd_filestat_get(1<<21), and the
 // same with fd_write(1<<6) in place of fd_read.
-// Written as literals, not named consts: a module-level scalar `const` in an ON-DEMAND module has no
-// module-scoped global to live in (only functions are seeded across modules), so naming them here makes
-// the whole file miscompile -- the same limitation that stops `const f = __asm<...>(...)` binding.
-function rightsRead(): i64	{ return 2097190; }
-function rightsWrite(): i64	{ return 2097252; }
+const RIGHTS_READ: i64	= 2097190;
+const RIGHTS_WRITE: i64	= 2097252;
 
 // A WASI errno as node names it. Only the codes these calls can actually produce -- an unmapped one keeps
 // its number rather than being dressed up as something it is not.
@@ -139,7 +136,7 @@ export function readFileSync(p: string, encoding: string): string {
 
 	const fdOut = __alloc(4, 4);
 	// dirflags=1 (follow symlinks).
-	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 0, rightsRead(), rightsRead(), 0, fdOut), 'open', p, mark);
+	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 0, RIGHTS_READ, RIGHTS_READ, 0, fdOut), 'open', p, mark);
 	const fileFd = loadI32(fdOut);
 
 	const statBuf = __alloc(64, 8);
@@ -170,7 +167,7 @@ export function writeFileSync(p: string, data: string): void {
 
 	const fdOut = __alloc(4, 4);
 	// oflags 9 = CREAT (1) | TRUNC (8): create the file if missing, replace its contents if present.
-	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 9, rightsWrite(), rightsWrite(), 0, fdOut), 'open', p, mark);
+	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 9, RIGHTS_WRITE, RIGHTS_WRITE, 0, fdOut), 'open', p, mark);
 	const fileFd = loadI32(fdOut);
 
 	const dataBuf = writeBytes(data);

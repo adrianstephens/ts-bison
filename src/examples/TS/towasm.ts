@@ -207,7 +207,7 @@ type WasmType		= WasmScalar
 	// never sets `primKind`, so it's what tells a `typeIndex`-shaped type apart from those -- see
 	// `unboxedPrimitive`. Structural, not a side-table, since `registerType`'s memoization could
 	// otherwise coincidentally share a type index with an unrelated single-scalar-field struct.
-	| { typeIndex:	number; nullable?: boolean; primKind: 'f64' | 'i32' };
+	| { typeIndex:	number; nullable?: boolean; primKind: WasmScalarI };
 
 const TYPED_ARRAY_TAGS = new Set(['i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'f32', 'f64']);
 
@@ -251,7 +251,7 @@ function elementKind(wtype: WasmType | undefined): WasmElementI {
 // `registerType`'s structural memoization means an unrelated single-scalar-field struct (e.g. a
 // closure's env struct capturing exactly one `f64`) could otherwise coincidentally share a box's
 // type index, which a table keyed by type index alone couldn't tell apart.
-function unboxedPrimitive(wtype: WasmType): { kind: 'f64' | 'i32'; typeIndex: number } | undefined {
+function unboxedPrimitive(wtype: WasmType): { kind: WasmScalarI; typeIndex: number } | undefined {
 	return typeof wtype !== 'string' && 'primKind' in wtype ? { kind: wtype.primKind, typeIndex: wtype.typeIndex } : undefined;
 }
 
@@ -1690,7 +1690,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const key = wTypeKey(arrayTypeDesc(kind));
 		return key !== undefined && typeMap.has(key);
 	}
-	function ensureBoxType(kind: 'f64' | 'i32'): number {
+	function ensureBoxType(kind: WasmScalarI): number {
 		return registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } });
 	}
 
@@ -1706,9 +1706,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	function nullableWtype(base: WasmType): WasmType {
 		if (typeof base !== 'string')
 			return { ...base, nullable: true };
-		if (base !== 'f64' && base !== 'i32')
-			throw `a nullable '${base}'-kind value is not supported -- only 'number'/'boolean' can be null-boxed`;
-		return { typeIndex: ensureBoxType(base), nullable: true, primKind: base };
+		// Every scalar kind, not just `f64`/`i32`: a box is a one-field struct and there is nothing
+		// special about the field's type. The restriction meant an `i64` module-level `const` in an
+		// imported module had nowhere to live (its `ensureLazyGlobal` slot is a nullable box), which is
+		// why `lib/node/fs.ts` had to write its WASI rights masks as functions returning literals.
+		// `notUnsigned`: `u32`/`u64` are the same physical value as their signed twins (`coerceTop`
+		// treats the pair as identical), so they share one box rather than registering a duplicate type.
+		if (base === 'void')
+			throw "a nullable 'void' value is not supported -- 'void' has no value representation to box";
+		const kind = notUnsigned(base);
+		return { typeIndex: ensureBoxType(kind), nullable: true, primKind: kind };
 	}
 
 	// A real, shared, mutable one-field struct wrapping `wt` (nullable, so it can start empty) -- used
