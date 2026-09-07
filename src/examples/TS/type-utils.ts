@@ -689,7 +689,16 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 			[{ name: S.name, constraint: elem, default: elem }],
 		);
 	}
-	const ret =	prop === 'pop' || prop === 'shift' ? combineTypes([elem, UNDEFINED])
+	return undefined;
+}
+
+// Everything else `interface Array<T>` declares for real; only the RETURN type is refined here, over that
+// declaration's own parameters. This used to synthesise a whole `(...args: any[]) => ret` signature, which
+// threw away every parameter type -- so an unannotated callback (`a.some(x => x > 0)`, `a.findIndex(...)`)
+// got no contextual typing at all and only died much later, in codegen, as "closure parameter needs an
+// explicit type".
+function arrayMethodReturn(elem: Type, prop: string): Type | undefined {
+	return	prop === 'pop' || prop === 'shift' ? combineTypes([elem, UNDEFINED])
 			// Bounded (not bare `number`) so a loop comparing against these stays in `i32` instead of
 			// promoting to `f64` -- see `towasm.ts`'s `numericPairWtype`, which requires both operands
 			// already `i32`. `0x7fffffff`, not `0xffffffff`, so `intWasmType` picks `i32` not `u32`.
@@ -699,7 +708,30 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 			:	prop === 'join' ? STRING
 			:	prop === 'slice' || prop === 'concat' || prop === 'reverse' || prop === 'flat' ? { type: 'array', element: elem } as Type
 			:	undefined;
-	return ret && TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(ANY)) }, ret);
+}
+
+// Applies `arrayMethodReturn`'s refinement to whatever shape the declaration came back as -- a lone
+// `function`, or the multi-signature `object` an overload set groups into.
+function withReturnType(t: Type | undefined, ret: Type): Type | undefined {
+	if (t?.type === 'function')
+		return { ...t, returnType: ret };
+	if (t?.type === 'object' && t.members.every(m => m.type === 'call'))
+		return TS.ObjectType(t.members.map(m => ({ ...m, returnType: ret })));
+	return undefined;
+}
+
+// The built-in members of an array/tuple value: this checker's own more precise model where it has one,
+// otherwise `interface Array<T>`'s real declaration, return-refined.
+function arrayMember(elem: Type, prop: string, scope: Scope, depth: number): Type | undefined {
+	const own = arrayMethod(elem, prop);
+	if (own)
+		return own;
+	const declared	= lookupMember(TS.RefType('Array', [elem]), prop, scope, depth - 1);
+	const ret		= arrayMethodReturn(elem, prop);
+	// The synthetic fallback survives only for a member `lib.d.ts` doesn't declare at all -- keeping the
+	// old behaviour rather than losing the member, but every such name is a gap in `interface Array<T>`.
+	return !ret ? declared
+		: withReturnType(declared, ret) ?? TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(ANY)) }, ret);
 }
 
 // `Object.prototype`'s members, for object types that don't declare their own override -- `hasOwnProperty`/`isPrototypeOf`/
@@ -1484,11 +1516,11 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 			// `arrayMethod` first: for `filter`/`find`/`findLast`/`every` it's genuinely more precise than the real 2-overload lib.es5
 			// interface, whose type-guard-predicate overload always wins overload selection here even for a plain boolean callback.
 			case 'array':
-				return arrayMethod(t.element, prop) ?? lookupMember(TS.RefType('Array', [t.element]), prop, scope, depth - 1);
+				return arrayMember(t.element, prop, scope, depth);
 
 			case 'tuple': {
 				const elem = combineTypes(t.elements.map(tupleElementType).filter(x => !!x));
-				return arrayMethod(elem, prop) ?? lookupMember(TS.RefType('Array', [elem]), prop, scope, depth - 1);
+				return arrayMember(elem, prop, scope, depth);
 			}
 
 			case 'object': {
