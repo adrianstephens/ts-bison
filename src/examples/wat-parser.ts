@@ -194,7 +194,15 @@ const id  		= Rules(Rule([ID],  	$ => $[0]));
 const nat 		= Rules(Rule([NAT], 	$ => parseInt($[0], $[0].startsWith('0x') ? 16 : 10)));
 const str 		= Rules(Rule([STRING], 	$ => JSON.parse($[0]) as string));	// JSON.parse returns any; recover the real type
 const maybe_id	= Maybe(id);
+// `TYPEINDEX("T[]")` -- a type index named by a TYPE rather than by a `$name` or a literal. The text is
+// opaque here: this parser knows nothing about TypeScript types, and deliberately keeps it that way (see
+// `toWasm`'s own note on leaving every `$name` for a later pass). It lowers to a sentinel string that the
+// embedder resolves afterwards, exactly as `$name`s are resolved afterwards -- `ID` always starts with
+// `$`, so a `type:`-prefixed string can never collide with a real name, and if one ever escapes
+// unresolved it fails loudly as an unknown name rather than silently meaning something else.
+const TYPE_EXPR_PREFIX = 'type:';
 const idx		= Rules<index>(
+	Rule(['TYPEINDEX', '(', str, ')'], $ => TYPE_EXPR_PREFIX + $[2]),
 	Rule([ID],  	($, ctx) => ctx.defines.get($[0]) ?? $[0]),
 	nat
 );
@@ -821,6 +829,8 @@ const asmBodyParser = makeCachedParser({
 		Rule([MaybeList(instr)], $ => collectAsmItems($[0])),
 	)
 }, {}, path.join(__dirname, '../../.tables-cache/wat-parser-asm.json.gz'));
+
+export const TYPE_EXPR = TYPE_EXPR_PREFIX;
 
 export function parseAsmBody(src: string, defines?: Record<string, string|number>) {
 	return asmBodyParser.parse(src, new ParseCtx(defines));

@@ -1,4 +1,5 @@
-import { parseWat, toWasm } from '../src/examples/wat-parser';
+import assert from 'assert';
+import { parseWat, toWasm, parseAsmBody, TYPE_EXPR } from '../src/examples/wat-parser';
 
 function testWat(name: string, wat: string) {
 	console.log(`=== Test: ${name} ===`);
@@ -107,3 +108,25 @@ testWat('If with no else branch', `
   )
 )
 `);
+
+// `TYPEINDEX("T[]")` -- a type index named by a TYPE. The assembler must carry the text through
+// OPAQUELY: it knows nothing of TypeScript types, and the embedder resolves the sentinel afterwards,
+// exactly as `$name`s are resolved afterwards. `ID` always starts with `$`, so a `type:`-prefixed
+// string can never collide with a real name.
+{
+	const one = parseAsmBody('array.new_default TYPEINDEX("T[]")', {}).body[0] as { op: string; typeIndex: unknown };
+	assert.strictEqual(one.op, 'array.new_default');
+	assert.strictEqual(one.typeIndex, TYPE_EXPR + 'T[]');
+
+	// `array.copy` carries TWO type operands, and they are `dst`/`src` rather than `typeIndex` --
+	// resolving only `typeIndex` left these sentinels in place to fail much later.
+	const two = parseAsmBody('array.copy TYPEINDEX("T[]") TYPEINDEX("U[][]")', {}).body[0] as { op: string; dst: unknown; src: unknown };
+	assert.strictEqual(two.op, 'array.copy');
+	assert.strictEqual(two.dst, TYPE_EXPR + 'T[]');
+	assert.strictEqual(two.src, TYPE_EXPR + 'U[][]');
+
+	// A `$name` and a literal index still mean what they always did in the same position.
+	assert.strictEqual((parseAsmBody('array.new_default $this', { this: 7 }).body[0] as { typeIndex: unknown }).typeIndex, 7);
+	assert.strictEqual((parseAsmBody('array.new_default 3', {}).body[0] as { typeIndex: unknown }).typeIndex, 3);
+	console.log('ok    TYPEINDEX("...") lowers to an opaque sentinel');
+}

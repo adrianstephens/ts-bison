@@ -1029,6 +1029,19 @@ function isAsmMethod(m: JS.Method<Type>): JS.Call<Type> | undefined {
 // own DECLARED return type, resolved with the call site's type arguments substituted in. A generic static
 // (`Array._alloc<T>(n): T[]`) has no `this` to name, and its `T` is the METHOD's, so no class-level define
 // can reach it: `array.new_default $this` allocated the enclosing class's array type for every `T` alike.
+// `TYPEINDEX("...")`'s payload: a name followed by any number of `[]`, and deliberately no more --
+// `resolveType` can only answer for a ref name or an array of one, so the grammar is bounded by what an
+// answer exists for, and anything richer would parse only to fail a step later.
+function parseTypeExpr(text: string): Type | undefined {
+	const m = /^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*((?:\[\s*\]\s*)*)$/.exec(text);
+	if (!m)
+		return undefined;
+	let t: Type = TS.RefType(m[1]);
+	for (let i = m[2].split('[').length - 1; i > 0; i--)
+		t = TS.ArrayType(t);
+	return t;
+}
+
 function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, typeParams?: string[], retIndexOf?: (w: WasmType) => number | undefined): Builtin<Inline> {
 	let		asm		= (call.arguments[0] as Literal<string | JS.TemplatePart<Expr>[]>).value;
 
@@ -1107,53 +1120,81 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 		});
 	};
 
-	// A GENERIC method's asm resolves its own declared types per call. Real TS forbids a static from
-	// referencing its class's type parameters, so `substituteClassTypeParam` leaves a static alone and its
-	// `T` stays genuinely open -- there is no class-level define that could stand in for it, and `$this`
-	// (the enclosing class's type index) is exactly the wrong answer a static used to settle for.
-	// `$ret` and `$p0`/`$p1`/... are this asm's OWN declared return and parameter type indices, so
-	// `array.new_default $ret` / `array.copy $p0 $p2` mean what they say at every instantiation.
-	// Parsed per resolved index set (memoised): the indices are only known once the caller's type
-	// arguments are.
-	if (typeParams?.length || asm.includes('$ret')) {
-		if (!retIndexOf)
-			throw `inline asm '${asm}': '$ret'/'$pN' are only available on a class method`;
-		const cache = new Map<string, ReturnType<typeof WAT.parseAsmBody>>();
+	// A `TYPEINDEX("T[]")` operand, resolved AFTER parsing -- the assembler carried the text through
+	// opaquely (it knows nothing of TypeScript types, and `toWasm`'s own note keeps it that way), exactly
+	// as it leaves a `$name` for a later pass. The sibling of `resolveAsmLocals`, one operand slot over.
+	// `subs`: the call site's type arguments, so `T[]` names a different type at each instantiation.
+	const resolveTypeExprs = (instrs: wasm.Instr[], known: Map<string, WasmType>): wasm.Instr[] => {
+		// Looked up against the SIGNATURE this call settled on, keyed by the type expression itself (not by
+		// position). That matters where a type parameter is still open: `_copy(dst, 0, src, 0, n)` passes no
+		// type arguments, so `T[]` alone resolves to the `arr:ref` fallback while the signature has already
+		// taken `arr:f64` from the argument -- and an `array.copy` whose operand type disagreed with its
+		// operands emitted wasm that would not even encode.
+		const resolve = (v: unknown): number | undefined => {
+			if (typeof v !== 'string' || !v.startsWith(WAT.TYPE_EXPR))
+				return undefined;
+			const text = v.slice(WAT.TYPE_EXPR.length);
+			const pt = parseTypeExpr(text);
+			if (!pt)
+				throw `inline asm '${asm}': TYPEINDEX("${text}") is not a name-and-'[]' type expression`;
+			const wt = known.get(T.typeKey(pt)) ?? resolveType(pt);
+			const index = wt && retIndexOf?.(wt);
+			if (index === undefined)
+				throw `inline asm '${asm}': TYPEINDEX("${text}") has no wasm type index`;
+			return index;
+		};
+		// Every field a type index can land in -- `array.copy` carries two (`dst`/`src`), not `typeIndex`,
+		// and missing them left the sentinel string in place to fail much later as a NaN.
+		// Narrowed with `in` before each spread, as `resolveAsmLocals` does: spreading the whole `Instr`
+		// union without it is "a union type that is too complex to represent".
+		return instrs.map(i => {
+			if ('typeIndex' in i) {
+				const r = resolve(i.typeIndex);
+				if (r !== undefined)
+					return { ...i, typeIndex: r };
+			}
+			if ('dst' in i && 'src' in i) {
+				const d = resolve(i.dst), sr = resolve(i.src);
+				if (d !== undefined || sr !== undefined)
+					return { ...i, dst: d ?? i.dst, src: sr ?? i.src };
+			}
+			return i;
+		});
+	};
+
+	// A GENERIC method's asm, or any asm naming a type: both its signature and its type operands depend on
+	// the call site's type arguments. Real TS forbids a static from referencing its class's type
+	// parameters, so `substituteClassTypeParam` leaves a static alone and its `T` stays genuinely open --
+	// no class-level define could stand in for it, and `$this` was exactly the wrong answer a static used
+	// to settle for. Parsed ONCE: the type operands are resolved afterwards, not baked in at parse time.
+	if (typeParams?.length || asm.includes('TYPEINDEX')) {
+		const flat = assertFlatInstrs(parsed.body, asm);
+		const locals = parsed.locals.map(l => ({ id: l.id, count: l.count, type: l.type as wasm.ValType }));
 		return (args, ctx, typeArgs) => {
-			const subs	= typeParams?.length && typeArgs?.length ? new Map(typeParams.map((n, i) => [n, typeArgs[i]] as const)) : undefined;
-			const base	= sigFor(subs);
+			const subs = typeParams?.length && typeArgs?.length ? new Map(typeParams.map((n, i) => [n, typeArgs[i]] as const)) : undefined;
+			const base = sigFor(subs);
 			// No explicit type arguments (`Array._copy(dst, 0, src, 0, n)`), so those type parameters are
 			// still open and `resolveType` can only fall back to `arr:ref` for them. The ARGUMENT in such a
-			// position already carries the physical type the callee will actually receive, so use it --
-			// but ONLY there: a position whose declared type is closed (`start: i32`, `val: T` against an
-			// `f64` array) still needs its real declared type, or a coercion `emitInline` would have made
-			// silently disappears.
-			const declared	= (call.typeArgs?.[0]?.type === 'tuple' ? call.typeArgs[0].elements : []).map(te => T.tupleElementType(te));
-			const isOpen	= (t: Type | undefined): boolean => !t ? false
+			// position already carries the physical type the callee will receive, so use it -- but ONLY
+			// there: a closed position (`start: i32`, `val: T` against an `f64` array) still needs its real
+			// declared type, or a coercion `emitInline` would have emitted silently disappears.
+			const declared = (call.typeArgs?.[0]?.type === 'tuple' ? call.typeArgs[0].elements : []).map(te => T.tupleElementType(te));
+			const isOpen = (t: Type | undefined): boolean => !t ? false
 				: t.type === 'ref' ? !!typeParams?.includes(t.name)
 				: t.type === 'array' ? isOpen(t.element)
 				: false;
-			const sig	= subs || !typeParams?.length ? base
+			const sig = subs || !typeParams?.length ? base
 				: { result: base.result, params: base.params.map((w, i) => isOpen(declared[i]) && args[i]?.wtype ? args[i].wtype : w) };
-			const extra: Record<string, string|number> = {};
-			const idx	= (w: WasmType) => retIndexOf(w);
-			const r		= idx(sig.result);
-			if (r !== undefined)
-				extra.ret = r;
-			sig.params.forEach((w, i) => {
-				const pi = idx(w);
-				if (pi !== undefined)
-					extra[`p${i}`] = pi;
-			});
-			const key = JSON.stringify(extra);
-			let p = cache.get(key);
-			if (!p) {
-				p = WAT.parseAsmBody(asm, { ...defines, ...extra });
-				cache.set(key, p);
-			}
-			return { ...sig, inline: resolveAsmLocals(assertFlatInstrs(p.body, asm), p.locals.map(l => ({ id: l.id, count: l.count, type: l.type as wasm.ValType })), ctx, asm) };
+			// Every declared type this call has an answer for, keyed by the type as written.
+			const known = new Map<string, WasmType>();
+			declared.forEach((t, i) => { if (t) known.set(T.typeKey(t), sig.params[i]); });
+			const retType = call.typeArgs?.[1];
+			if (retType)
+				known.set(T.typeKey(retType), sig.result);
+			return { ...sig, inline: resolveAsmLocals(resolveTypeExprs(flat, known), locals, ctx, asm) };
 		};
 	}
+
 
 	const sw = parsed.body.find((i): i is WAT.SwitchPlaceholder => i.op === '__switch' && i.key === '$T');
 	if (sw) {
