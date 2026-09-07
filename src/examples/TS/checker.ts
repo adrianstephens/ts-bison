@@ -1874,7 +1874,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 
 	if (Array.isArray(body)) {
 		if (expected) {
-			checkBlock(body, inner, typeOf1(err), (s: Stmt, scope: Scope): void => {
+			checkBlock(body, inner, typeOf1(err), checkStmt1(err, (s: Stmt, scope: Scope): void => {
 				if (s.type === 'return' && s.argument) {
 					const argument = s.argument;
 					const t = typeOf(argument, scope, false, expected, undefined, err);
@@ -1885,18 +1885,18 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 							checkExcessProps(argument, expected, (argument as any).pos, scope, err);
 					}
 				}
-			}, err, noStamp);
+			}, noStamp));
 		} else if (isPredicate) {
-			checkBlock(body, inner, typeOf1(err), undefined, err, noStamp);
+			checkBlock(body, inner, typeOf1(err), checkStmt1(err, undefined, noStamp));
 
 		} else {
 			const	returns: {s: (Stmt & {type: 'return'}), type?: Type}[] = [];
 			const	yields = generator ? [] as Type[] : undefined;
 			const	typeOf1		= (e: Expr, scope: Scope, expected?: Type)	=> typeOf(e, scope, true, expected, yields, err);
-			checkBlock(body, inner, typeOf1, (s: Stmt, scope: Scope): void => {
+			checkBlock(body, inner, typeOf1, checkStmt1(err, (s: Stmt, scope: Scope): void => {
 				if (s.type === 'return')
 					returns.push({s, type: s.argument && typeOf(s.argument, scope, true, undefined, undefined, err)});
-			}, err, noStamp);
+			}, noStamp));
 
 			const last			= body[body.length - 1];
 			const retDef		= returns.map(r => r.type).filter(r => !!r);
@@ -1984,7 +1984,7 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 				checkFunctionBody(m, m.body, instScope, false, true, false, err);
 				break;
 			case 'static_block':
-				checkBlock(m.body, new Scope(statScope), typeOf1(err), undefined, err);
+				checkBlock(m.body, new Scope(statScope), typeOf1(err), checkStmt1(err));
 		}
 	}
 	return value;
@@ -2024,11 +2024,11 @@ function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; ri
 // Every other caller (real user-program checks, `static_block`, the top-level `makeLibScope`/
 // `transform.ts` calls) leaves it `undefined`, so `checkStmt`'s `(stmt as any).scope ??=` stamp fires
 // exactly as it always has for them.
-export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), onReturn?: (s: Stmt, scope: Scope)=>void, err?: Err, noStamp?: boolean) {
+export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), check: checkStmt = checkStmt1()) {
 	hoist(stmts, scope);
 
 	for (const s of stmts) {
-		checkStmt(s, scope, typeOf, onReturn, err, noStamp);
+		check(s, scope, typeOf);
 
 		switch (s.type) {
 			case 'if':
@@ -2051,203 +2051,214 @@ export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), onRe
 					}
 				}
 				break;
-			case 'return':
-				onReturn?.(s, scope);
-				break;
 		}
 	}
 }
 
 type checkStmt = (s: Stmt, scope: Scope, typeOf: typeOf)=>void;
-function checkStmt1(err?: Err): checkStmt {
-	return (s, scope, typeOf) => checkStmt(s, scope, typeOf, undefined, err);
-}
 
+// `err`/`onReturn`/`noStamp` are bound HERE rather than passed at every call: they were parameters on
+// both `checkStmt` and `checkBlock`, threaded through every recursive call and through signatures whose
+// only job was to pass them on, while only `checkFunctionBody` ever set `onReturn`/`noStamp` at all. A
+// walk that needs them is now *a* `checkStmt`; everything else uses the plain one. Same `x`/`x1` shape
+// `typeOf`/`typeOf1` already uses -- and inside, `checkStmt1` is this same closure with `typeOf` bound.
+//
+// `onReturn` is not part of the check at all: it is simply something *a* checkStmt does AFTER calling
+// *the* checkStmt, so it composes as a wrapper instead of a hook every layer has to carry. `outer` (the
+// wrapper) is what a nested BLOCK is checked with, so a `return` inside one still reaches it exactly as
+// it did when `checkBlock` ran the hook.
+export function checkStmt1(err?: Err, onReturn?: (s: Stmt, scope: Scope)=>void, noStamp?: boolean): checkStmt {
+	const checkStmt = Object.assign((stmt: Stmt, scope: Scope, typeOf: typeOf): void => {
+		// The real (post-narrowing, where applicable) `Scope` this statement was type-checked under --
+		// stamped directly on the node (like `pos`, `CallSig.scope`), not tracked as checker state, so a
+		// consumer with no narrowing-aware scope of its own (towasm.ts's codegen, whose own scope tracking
+		// never reflects flow narrowing) can read back the same scope the checker concluded for this
+		// statement instead of only ever seeing the function-entry scope. Untyped (`any`), not a formal
+		// field on `Statement` -- that union is large enough that a shared field added via an intersection
+		// broke unrelated generic AST-mapping code elsewhere (`walker.ts`'s `keyof`-based `NodeMap`).
+		// `??=`: first (real, unmuted) check wins, same reasoning as `fn.scope ??=` above -- a speculative
+		// (muted) re-walk always reaches a given statement only after the real pass already has. `noStamp`
+		// (see `checkFunctionBody`'s own comment) skips it entirely for the one case where even a first
+		// stamp would be wrong -- deliberately *not* re-derived here from `scope.isGenericTemplate()`
+		// directly: that would also catch a constructor (always walked in full regardless of genericity,
+		// via `skipReturn`, and never itself at risk), which must keep stamping as before.
+		if (!noStamp)
+			(stmt as any).scope ??= scope;
 
-function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, onReturn?: (s: Stmt, scope: Scope)=>void, err?: Err, noStamp?: boolean): void {
-	// The real (post-narrowing, where applicable) `Scope` this statement was type-checked under --
-	// stamped directly on the node (like `pos`, `CallSig.scope`), not tracked as checker state, so a
-	// consumer with no narrowing-aware scope of its own (towasm.ts's codegen, whose own scope tracking
-	// never reflects flow narrowing) can read back the same scope the checker concluded for this
-	// statement instead of only ever seeing the function-entry scope. Untyped (`any`), not a formal
-	// field on `Statement` -- that union is large enough that a shared field added via an intersection
-	// broke unrelated generic AST-mapping code elsewhere (`walker.ts`'s `keyof`-based `NodeMap`).
-	// `??=`: first (real, unmuted) check wins, same reasoning as `fn.scope ??=` above -- a speculative
-	// (muted) re-walk always reaches a given statement only after the real pass already has. `noStamp`
-	// (see `checkFunctionBody`'s own comment) skips it entirely for the one case where even a first
-	// stamp would be wrong -- deliberately *not* re-derived here from `scope.isGenericTemplate()`
-	// directly: that would also catch a constructor (always walked in full regardless of genericity,
-	// via `skipReturn`, and never itself at risk), which must keep stamping as before.
-	if (!noStamp)
-		(stmt as any).scope ??= scope;
+		const checkBlock1	= (stmts: Stmt[], scope: Scope)		=> checkBlock(stmts, scope, typeOf, outer);
+		const checkStmt1	= (stmt: Stmt, scope: Scope)		=> checkStmt(stmt, scope, typeOf);
 
-	const checkBlock1	= (stmts: Stmt[], scope: Scope)		=> checkBlock(stmts, scope, typeOf, onReturn, err, noStamp);
-	const checkStmt1	= (stmt: Stmt, scope: Scope)		=> checkStmt(stmt, scope, typeOf, onReturn, err, noStamp);
-
-	switch (stmt.type) {
-		case 'var_decl': {
-			// `hoistVar` (which actually *registers* each declared name's type in `scope`) must run
-			// regardless of `muted` -- only the assignability diagnostics below are real "reporting" and
-			// should be skipped. These used to share one `if (!muted)` guard, so a plain top-level
-			// `const`/`let` (not `stmt.ambient`, so `hoist`'s own pre-pass skips it -- see that function's
-			// comment) checked under a muted pass (`checkBlock`'s own `muted` param, e.g. towasm.ts's
-			// bundled-lib check) never got registered at all: any later reference to it resolved to `any`
-			// as a plain "unknown identifier" fallback, not a real error -- found via `lib/number.ts`'s
-			// `export const ieeeFrom = __asm<...>(...)`, whose call result silently became `any` deep
-			// inside `Math.log`, well past where the missing registration actually happened.
-			// `stmt.ambient`: skip here -- `hoist`'s own pre-pass already registered it, in the same
-			// sequential order as every other top-level declaration (so a same-named real `class` later
-			// in the file correctly wins, last-declaration-wins). Re-running `hoistVar` here too would
-			// re-register it a second time at *this* statement's own position in the sequential walk --
-			// earlier than that later class -- silently clobbering the class's binding back to the
-			// ambient stub for the rest of this pass (found via `String`: `declare var String` in
-			// lib.d.ts plus the real `class String` in string.ts, both bind the name `String`, and the
-			// real class's own constructor -- checked *after* this re-clobber -- saw the ambient stub's
-			// type when resolving its own self-referential `String.alloc(...)` call).
-			const pos = (stmt as any).pos;
-			for (const d of stmt.declarations) {
-				if (err && d.typeAnnotation && d.init) {
-					const anno = d.typeAnnotation;
-					const init = typeOf(d.init, scope, anno);
-					if (!init)
-						checkExcessProps(d.init, anno, pos, scope, err);
-					else if (!checkAssignable(init, anno, scope, pos, scope, err))
-						err(SEVERITY.ERROR, pos)`Type '${init}' is not assignable to type '${anno}' in declaration of '${d.name}'`;
+		switch (stmt.type) {
+			case 'var_decl': {
+				// `hoistVar` (which actually *registers* each declared name's type in `scope`) must run
+				// regardless of `muted` -- only the assignability diagnostics below are real "reporting" and
+				// should be skipped. These used to share one `if (!muted)` guard, so a plain top-level
+				// `const`/`let` (not `stmt.ambient`, so `hoist`'s own pre-pass skips it -- see that function's
+				// comment) checked under a muted pass (`checkBlock`'s own `muted` param, e.g. towasm.ts's
+				// bundled-lib check) never got registered at all: any later reference to it resolved to `any`
+				// as a plain "unknown identifier" fallback, not a real error -- found via `lib/number.ts`'s
+				// `export const ieeeFrom = __asm<...>(...)`, whose call result silently became `any` deep
+				// inside `Math.log`, well past where the missing registration actually happened.
+				// `stmt.ambient`: skip here -- `hoist`'s own pre-pass already registered it, in the same
+				// sequential order as every other top-level declaration (so a same-named real `class` later
+				// in the file correctly wins, last-declaration-wins). Re-running `hoistVar` here too would
+				// re-register it a second time at *this* statement's own position in the sequential walk --
+				// earlier than that later class -- silently clobbering the class's binding back to the
+				// ambient stub for the rest of this pass (found via `String`: `declare var String` in
+				// lib.d.ts plus the real `class String` in string.ts, both bind the name `String`, and the
+				// real class's own constructor -- checked *after* this re-clobber -- saw the ambient stub's
+				// type when resolving its own self-referential `String.alloc(...)` call).
+				const pos = (stmt as any).pos;
+				for (const d of stmt.declarations) {
+					if (err && d.typeAnnotation && d.init) {
+						const anno = d.typeAnnotation;
+						const init = typeOf(d.init, scope, anno);
+						if (!init)
+							checkExcessProps(d.init, anno, pos, scope, err);
+						else if (!checkAssignable(init, anno, scope, pos, scope, err))
+							err(SEVERITY.ERROR, pos)`Type '${init}' is not assignable to type '${anno}' in declaration of '${d.name}'`;
+					}
+					if (!stmt.ambient)
+						hoistVar(scope, d, stmt.kind !== 'const', undefined, err);
 				}
-				if (!stmt.ambient)
-					hoistVar(scope, d, stmt.kind !== 'const', undefined, err);
+				break;
 			}
-			break;
-		}
-		case 'expression':
-			typeOf(stmt.expression, scope);
-			break;
+			case 'expression':
+				typeOf(stmt.expression, scope);
+				break;
 
-		case 'block':
-			checkBlock1(stmt.body, new Scope(scope));
-			break;
+			case 'block':
+				checkBlock1(stmt.body, new Scope(scope));
+				break;
 
-		case 'if':
-			typeOf(stmt.test, scope);
-			checkStmt1(stmt.consequent, new Scope(narrow(stmt.test, scope, true)));
-			if (stmt.alternate)
-				checkStmt1(stmt.alternate, new Scope(narrow(stmt.test, scope, false)));
-			break;
+			case 'if':
+				typeOf(stmt.test, scope);
+				checkStmt1(stmt.consequent, new Scope(narrow(stmt.test, scope, true)));
+				if (stmt.alternate)
+					checkStmt1(stmt.alternate, new Scope(narrow(stmt.test, scope, false)));
+				break;
 
-		case 'while':
-		case 'do_while':
-			typeOf(stmt.test, scope);
-			checkStmt1(stmt.body, new Scope(stmt.type === 'while' ? narrow(stmt.test, scope, true) : scope));
-			break;
+			case 'while':
+			case 'do_while':
+				typeOf(stmt.test, scope);
+				checkStmt1(stmt.body, new Scope(stmt.type === 'while' ? narrow(stmt.test, scope, true) : scope));
+				break;
 
-		case 'for': {
-			const inner = new Scope(scope);
-			if (stmt.kind === 'normal') {
-				if (stmt.init) {
-					if (stmt.init.type === 'var_decl')
-						checkStmt1(stmt.init, inner);
-					else
-						typeOf(stmt.init, inner);
-				}
-				if (stmt.test)
-					typeOf(stmt.test, inner);
-				if (stmt.update)
-					typeOf(stmt.update, inner);
-				checkStmt1(stmt.body, stmt.test ? narrow(stmt.test, inner, true) : inner);
-			} else {
-				const rightT = T.resolveOwn(typeOf(stmt.right, inner), inner);
-				const elemT = stmt.kind === 'in' ? T.STRING
-					: rightT.type === 'array' ? rightT.element
-					: T.isString(rightT) ? T.STRING
-					: T.ANY;
-				if (stmt.init.type === 'var_decl') {
-					for (const d of stmt.init.declarations)
-						hoistVar(inner, d, true, d.typeAnnotation ?? elemT);
-				} else {
-					typeOf(stmt.init, inner);
-				}
-				checkStmt1(stmt.body, inner);
-			}
-			break;
-		}
-//		case 'return':
-//			onReturn?.(stmt, scope);
-//			break;
-
-		case 'switch': {
-			typeOf(stmt.discriminant, scope);
-			// A `case` with no body falls through to the next -- reuse `if`'s discriminated-union narrowing by synthesizing that binary
-			// test per case, OR-ing fallthrough cases together. A bare `default` needs "none of the others" narrowing, unmodeled -- body stays unnarrowed.
-			let pending: Expr[] = [];
-			for (const c of stmt.cases) {
-				if (c.test) {
-					typeOf(c.test, scope);
-					pending.push({ type: 'binary', operator: '===', left: stmt.discriminant, right: c.test });
-				}
-				if (c.consequent.length || !c.test) {
-					const test = pending.reduce<Expr | undefined>((acc, t) => acc ? { type: 'binary', operator: '||', left: acc, right: t } : t, undefined);
-					checkBlock1(c.consequent, new Scope(test ? narrow(test, scope, true) : scope));
-					pending = [];
-				}
-			}
-			break;
-		}
-		case 'throw':
-		case 'with':
-			typeOf(stmt.argument, scope);
-			if (stmt.type === 'with')
-				checkStmt1(stmt.body, scope);
-			break;
-
-		case 'try':
-			checkBlock1(stmt.body, new Scope(scope));
-			for (const h of stmt.handlers) {
+			case 'for': {
 				const inner = new Scope(scope);
-				if (h.param) {
-					if (typeof h.param === 'string')
-						inner.addValue(h.param, T.ANY);
-					else
-						T.bindingNames(h.param).forEach(n => inner.addValue(n, T.ANY));
+				if (stmt.kind === 'normal') {
+					if (stmt.init) {
+						if (stmt.init.type === 'var_decl')
+							checkStmt1(stmt.init, inner);
+						else
+							typeOf(stmt.init, inner);
+					}
+					if (stmt.test)
+						typeOf(stmt.test, inner);
+					if (stmt.update)
+						typeOf(stmt.update, inner);
+					checkStmt1(stmt.body, stmt.test ? narrow(stmt.test, inner, true) : inner);
+				} else {
+					const rightT = T.resolveOwn(typeOf(stmt.right, inner), inner);
+					const elemT = stmt.kind === 'in' ? T.STRING
+						: rightT.type === 'array' ? rightT.element
+						: T.isString(rightT) ? T.STRING
+						: T.ANY;
+					if (stmt.init.type === 'var_decl') {
+						for (const d of stmt.init.declarations)
+							hoistVar(inner, d, true, d.typeAnnotation ?? elemT);
+					} else {
+						typeOf(stmt.init, inner);
+					}
+					checkStmt1(stmt.body, inner);
 				}
-				checkBlock1(h.body, inner);
+				break;
 			}
-			if (stmt.finalizer)
-				checkBlock1(stmt.finalizer, new Scope(scope));
-			break;
+	//		case 'return':
+	//			onReturn?.(stmt, scope);
+	//			break;
 
-		case 'labeled':
-			checkStmt1(stmt.body, scope);
-			break;
-
-		case 'function_decl':
-			if (stmt.body)
-				checkFunctionBody(stmt, stmt.body, scope, hasMod(stmt, 'async'), hasMod(stmt, 'generator'), hasMod(stmt, 'generator'), err);
-			break;
-
-		case 'class_decl':
-			checkClass(stmt, scope, err);
-			break;
-
-		case 'export_decl':
-			checkStmt1(stmt.declaration, scope);
-			break;
-
-		case 'export':
-			if (stmt.default) {
-				if (isTsDeclaration(stmt.default))
-					checkStmt1(stmt.default, scope);
-				else
-					typeOf(stmt.default, scope);
+			case 'switch': {
+				typeOf(stmt.discriminant, scope);
+				// A `case` with no body falls through to the next -- reuse `if`'s discriminated-union narrowing by synthesizing that binary
+				// test per case, OR-ing fallthrough cases together. A bare `default` needs "none of the others" narrowing, unmodeled -- body stays unnarrowed.
+				let pending: Expr[] = [];
+				for (const c of stmt.cases) {
+					if (c.test) {
+						typeOf(c.test, scope);
+						pending.push({ type: 'binary', operator: '===', left: stmt.discriminant, right: c.test });
+					}
+					if (c.consequent.length || !c.test) {
+						const test = pending.reduce<Expr | undefined>((acc, t) => acc ? { type: 'binary', operator: '||', left: acc, right: t } : t, undefined);
+						checkBlock1(c.consequent, new Scope(test ? narrow(test, scope, true) : scope));
+						pending = [];
+					}
+				}
+				break;
 			}
-			break;
+			case 'throw':
+			case 'with':
+				typeOf(stmt.argument, scope);
+				if (stmt.type === 'with')
+					checkStmt1(stmt.body, scope);
+				break;
 
-		case 'namespace_decl':
-			checkBlock1(stmt.body, new Scope(scope));
-			break;
+			case 'try':
+				checkBlock1(stmt.body, new Scope(scope));
+				for (const h of stmt.handlers) {
+					const inner = new Scope(scope);
+					if (h.param) {
+						if (typeof h.param === 'string')
+							inner.addValue(h.param, T.ANY);
+						else
+							T.bindingNames(h.param).forEach(n => inner.addValue(n, T.ANY));
+					}
+					checkBlock1(h.body, inner);
+				}
+				if (stmt.finalizer)
+					checkBlock1(stmt.finalizer, new Scope(scope));
+				break;
 
-		// type_alias_decl / interface_decl / enum_decl / import / export /
-		// empty / debugger / continue / break: declaration-only or nothing to check (hoist saw them)
-	}
+			case 'labeled':
+				checkStmt1(stmt.body, scope);
+				break;
+
+			case 'function_decl':
+				if (stmt.body)
+					checkFunctionBody(stmt, stmt.body, scope, hasMod(stmt, 'async'), hasMod(stmt, 'generator'), hasMod(stmt, 'generator'), err);
+				break;
+
+			case 'class_decl':
+				checkClass(stmt, scope, err);
+				break;
+
+			case 'export_decl':
+				checkStmt1(stmt.declaration, scope);
+				break;
+
+			case 'export':
+				if (stmt.default) {
+					if (isTsDeclaration(stmt.default))
+						checkStmt1(stmt.default, scope);
+					else
+						typeOf(stmt.default, scope);
+				}
+				break;
+
+			case 'namespace_decl':
+				checkBlock1(stmt.body, new Scope(scope));
+				break;
+
+			// type_alias_decl / interface_decl / enum_decl / import / export /
+			// empty / debugger / continue / break: declaration-only or nothing to check (hoist saw them)
+		}
+	});
+	const outer: checkStmt = !onReturn ? checkStmt : (stmt, scope, typeOf) => {
+		checkStmt(stmt, scope, typeOf);
+		if (stmt.type === 'return')
+			onReturn(stmt, scope);
+	};
+	return outer;
 }
 
 export function inferReturn(fnj: JS.CallSig<any>, body: JS.Stmt<any>[], outer: Scope): Type {

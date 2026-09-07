@@ -3,7 +3,7 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import { Identifier, Literal, Binary, hasMod, dropMod } from '../common';
 import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
-import { SEVERITY, Err, checkBlock, exportScope, typeOf, inferReturn } from './checker';
+import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
 import { Output } from './tocode';
 
@@ -654,7 +654,7 @@ export function TStypeCheck(ast: TS.Program, global: Scope): Diagnostic[] {
 	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
 
 	const diagnostics: Diagnostic[] = [];
-	checkBlock(ast.body, global, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
+	checkBlock(ast.body, global, undefined, checkStmt1(makeDiagnostic(d => diagnostics.push(d))));
 	pushDepthExhaustionGap(depthExhaustion, diagnostics);
 	ast.scope = global;
 	return diagnostics;
@@ -815,7 +815,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 
 	const depthExhaustion = new Map<string, number>();
 	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
-	checkBlock(program.body, entryScope, undefined, undefined, makeDiagnostic(d => diagnostics.push(d)));
+	checkBlock(program.body, entryScope, undefined, checkStmt1(makeDiagnostic(d => diagnostics.push(d))));
 	pushDepthExhaustionGap(depthExhaustion, diagnostics);
 	program.scope = entryScope;
 	return diagnostics;
