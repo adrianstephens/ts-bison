@@ -1498,6 +1498,12 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 		// A bare `ref` stamped with its own `declScope` resolves there instead of in `scope` -- the caller's chain may shadow it
 		// (e.g. DOM's `Element`). `resolve()` itself stays unaware of `declScope`; this is the one bounded place that consults it.
 		t = resolveOwn(t, scope);
+		// A LITERAL type has the members of the primitive it is a literal of. Without this, a method call
+		// on a literal receiver -- `'a,b'.split(/,/)`, `(255).toString(16)` -- typed as `any`, and towasm
+		// only got away with it because a `var_decl` has a separate path that reads the declared return
+		// type straight off the class; the same call used inline (`'a,b'.split(/,/)[0]`) had no type at all.
+		if (t.type === 'literal')
+			t = widenLiterals(t);
 		// Bounded, not bare `number` -- see the `arrayMethod` comment above for why. `tuple`/`string`
 		// only, not a plain `array` -- a real JS array's `.length` is writable (`a.length = 0` to
 		// truncate), so it must stay assignable from a general `number`; narrowing it here as a
