@@ -309,7 +309,7 @@ export class BigInt {
 	// rounds toward -Infinity, *not* toward zero the way `div` does: `-5n >> 1n === -3n`, not `-2n`).
 	// That's exactly what a bit-level shift with sign-extension from the top gives for free, so this
 	// shifts limbs directly rather than going through `div`/`bigPow2`.
-	shrs(b: bigint): bigint {
+	shr_s(b: bigint): bigint {
 		const k			= bigToNumber(b);
 		const limbShift = k >>> 5;
 		const bitShift	= k & 31;
@@ -331,7 +331,7 @@ export class BigInt {
 	// `this` as if it were a fixed-width unsigned integer exactly as wide as its own current limbs. One
 	// guard limb above the result (unlike `shrs`) forces a non-negative read even when a negative input's
 	// shifted-down bits leave the new top limb's own top bit set.
-	shru(b: bigint): bigint {
+	shr_u(b: bigint): bigint {
 		const k			= bigToNumber(b);
 		const limbShift = k >>> 5;
 		const bitShift	= k & 31;
@@ -344,6 +344,56 @@ export class BigInt {
 			r[0] = bitShift === 0 ? lo: ((lo >>> bitShift) | ((srcLo + 1 < na ? a[srcLo + 1] : 0) << (32 - bitShift))) & 0xffffffff;
 		}
 		return bigTrim(r) as unknown as bigint;
+	}
+
+	// `&`/`|`/`^` limb-wise over the two's-complement bit patterns, each operand sign-extended to the
+	// wider length plus one guard limb -- which is what makes the infinite sign extension real JS
+	// specifies fall out for free, including for a negative operand. `toU32` because this compiler (like
+	// JS) gives a bitwise op a *signed* 32-bit result even for unsigned-meaning limbs.
+	private static bitwise(a: u32[], b: u32[], op: i32): u32[] {
+		const na = a.length;
+		const nb = b.length;
+		const n = (na > nb ? na : nb) + 1;
+		const aext: u32 = bigSign(a) ? 0xffffffff : 0;
+		const bext: u32 = bigSign(b) ? 0xffffffff : 0;
+		const r = new Array<u32>(n);
+		for (let i = 0; i < n; i++) {
+			const x: u32 = i < na ? a[i] : aext;
+			const y: u32 = i < nb ? b[i] : bext;
+			r[i] = op === 0 ? toU32(x & y) : op === 1 ? toU32(x | y) : toU32(x ^ y);
+		}
+		return bigTrim(r);
+	}
+	and(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as u32[], b as unknown as u32[], 0) as unknown as bigint; }
+	or(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as u32[], b as unknown as u32[], 1) as unknown as bigint; }
+	xor(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as u32[], b as unknown as u32[], 2) as unknown as bigint; }
+
+	// `~x` inverts every bit of the infinite two's-complement pattern, which is `-x - 1`.
+	not(): bigint {
+		const a = this as unknown as u32[];
+		const n = a.length;
+		const r = new Array<u32>(n + 1);
+		const ext: u32 = bigSign(a) ? 0xffffffff : 0;
+		for (let i = 0; i < n + 1; i++)
+			r[i] = toU32(~(i < n ? a[i] : ext));
+		return bigTrim(r) as unknown as bigint;
+	}
+
+	// Exponentiation by squaring. A negative exponent is a RangeError in real JS; there is no useful
+	// integer answer, so it comes back as zero rather than looping forever.
+	pow(b: bigint): bigint {
+		let e = bigToNumber(b);
+		if (e < 0)
+			return bigFromNumber(0);
+		let base = this as unknown as bigint;
+		let result = bigFromNumber(1);
+		while (e > 0) {
+			if ((e & 1) !== 0)
+				result = result.mul(base);
+			base = base.mul(base);
+			e = Math.floor(e / 2);
+		}
+		return result;
 	}
 
 	// -1/0/1, comparing by magnitude.
