@@ -2,12 +2,13 @@
 
 import {
 	fd_write, fd_read, fd_close, fd_filestat_get,
-	fd_prestat_get, fd_prestat_dir_name,
+	fd_prestat_get, fd_prestat_dir_name, fd_readdir,
 	path_open, path_create_directory,
 } from 'wasi_snapshot_preview1';
 
 const loadU8	= __asm<[i32], i32>('i32.load8_u');
 const loadI32	= __asm<[i32], i32>('i32.load');
+const loadI64	= __asm<[i32], i64>('i64.load');
 const storeU8	= __asm<[i32, i32], void>('i32.store8');
 const storeI32	= __asm<[i32, i32], void>('i32.store');
 
@@ -17,6 +18,9 @@ const storeI32	= __asm<[i32, i32], void>('i32.store');
 // same with fd_write(1<<6) in place of fd_read.
 const RIGHTS_READ: i64	= 2097190;
 const RIGHTS_WRITE: i64	= 2097252;
+// fd_readdir(1<<14) | fd_filestat_get(1<<21), and `path_open` with oflags DIRECTORY needs
+// path_open(1<<13) on the directory itself -- again exactly what is used, never all-ones.
+const RIGHTS_DIR: i64	= 2113536;
 
 // A WASI errno as node names it. Only the codes these calls can actually produce -- an unmapped one keeps
 // its number rather than being dressed up as something it is not.
@@ -121,7 +125,10 @@ function findPreopen(p: string): Preopen {
 		return new Preopen(bestFd, rel.length === 0 ? '.' : rel);
 	}
 	let rel = p.slice(bestName.length);
-	if (rel.charCodeAt(0) === 47)
+	// The length guard matters when `p` IS the preopen root: `rel` is then empty, and `charCodeAt(0)`
+	// on an empty string reads element 0 of a zero-length array and traps rather than giving JS's NaN.
+	// Only `readdirSync` reaches this -- every other entry point has a filename after the directory.
+	if (rel.length > 0 && rel.charCodeAt(0) === 47)
 		rel = rel.slice(1);
 	return new Preopen(bestFd, rel.length === 0 ? '.' : rel);
 }
@@ -180,6 +187,66 @@ export function writeFileSync(p: string, data: string): void {
 
 	// Nothing here escapes past this point -- void return, safe to release.
 	__allocRelease(mark);
+}
+
+// Node's `readdirSync`, over `fd_readdir`. A WASI dirent is a fixed 24-byte header -- d_next (u64),
+// d_ino (u64), d_namlen (u32), d_type (u8) -- immediately followed by `d_namlen` name bytes, packed with
+// no alignment between entries.
+//
+// The read LOOPS on the cookie rather than assuming one buffer holds the directory: `fd_readdir` fills
+// what it can and reports how much, and a caller that stops after one call silently loses entries in any
+// directory bigger than the buffer. `d_next` from the last complete entry is the cookie to resume from.
+// A trailing PARTIAL entry is normal (it is how the host says "buffer full"), so it is skipped rather
+// than treated as an error -- the next round re-reads it whole.
+export function readdirSync(p: string): string[] {
+	const pre	= findPreopen(p);
+	const mark	= __allocMark();
+	const pathBuf = writeBytes(pre.rel);
+
+	const fdOut = __alloc(4, 4);
+	// oflags 2 = DIRECTORY: fail loudly on a plain file rather than reading a nonsense dirent stream.
+	wasiCheck(path_open(pre.fd, 1, pathBuf, pre.rel.length, 2, RIGHTS_DIR, RIGHTS_DIR, 0, fdOut), 'scandir', p, mark);
+	const dirFd = loadI32(fdOut);
+
+	const bufLen	= 4096;
+	const buf		= __alloc(bufLen, 8);
+	const usedPtr	= __alloc(4, 4);
+	const result: string[] = [];
+
+	let cookie: i64	= 0;
+	let more		= true;
+	while (more) {
+		wasiCheck(fd_readdir(dirFd, buf, bufLen, cookie, usedPtr), 'scandir', p, mark);
+		const used = loadI32(usedPtr);
+		// Short of the buffer means the directory is exhausted; a full buffer means there may be more.
+		more = used === bufLen;
+
+		let off = 0;
+		// `break` is not available in this subset, so "stop at the first incomplete entry" folds into the
+		// loop condition -- the same shape `getUnsigned` uses in `lib/number.ts`.
+		let stop = false;
+		while (!stop && off + 24 <= used) {
+			const namlen = loadI32(buf + off + 16);
+			if (off + 24 + namlen > used) {
+				stop = true;
+			} else {
+				const name = String.fromCharCodesAt(buf + off + 24, namlen);
+				// Node omits these two; WASI reports them.
+				if (name !== '.' && name !== '..')
+					result.push(name);
+				cookie	= loadI64(buf + off);
+				off		= off + 24 + namlen;
+			}
+		}
+		// No complete entry fitted at all: the buffer cannot hold this name, and looping would spin.
+		if (off === 0)
+			more = false;
+	}
+
+	wasiCheck(fd_close(dirFd), 'close', p, mark);
+	// Every name is already a GC string by now, so the scratch can go back.
+	__allocRelease(mark);
+	return result;
 }
 
 export function mkdirSync(p: string): void {

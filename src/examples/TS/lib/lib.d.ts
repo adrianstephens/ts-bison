@@ -13,6 +13,7 @@ declare module 'wasi_snapshot_preview1' {
 	export function fd_prestat_get(fd: i32, prestatPtr: i32): i32;
 	export function fd_prestat_dir_name(fd: i32, pathPtr: i32, pathLen: i32): i32;
 	export function path_open(fd: i32, dirflags: i32, pathPtr: i32, pathLen: i32, oflags: i32, fsRightsBase: i64, fsRightsInheriting: i64, fdflags: i32, openedFdPtr: i32): i32;
+	export function fd_readdir(fd: i32, bufPtr: i32, bufLen: i32, cookie: i64, bufusedPtr: i32): i32;
 	export function path_create_directory(fd: i32, pathPtr: i32, pathLen: i32): i32;
 	export function proc_exit(code: i32): void;
 	export function args_get(argvPtr: i32, argvBufPtr: i32): i32;
