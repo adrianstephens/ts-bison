@@ -322,10 +322,15 @@ export function walk<T extends Walkable>(ast: T,
 				expression: mapExpressionA,
 				typeArgs:	mapArray(mapTypeU)
 			});
+			// The cast's own TYPE is mapped too: skipping it meant a type-rewriting walk
+			// (`substituteClassTypeParam`) left `this as unknown as T[]` inside a generic class method
+			// with an unsubstituted `T`, so an unannotated local initialised from it lowered to
+			// `arr:ref` while the value was `arr:f64`.
 			case 'as':
 			case 'satisfies':
 				return mapObject(expr, {
-				expression: 	mapExpressionA
+				expression: 	mapExpressionA,
+				typeAnnotation:	mapTypeU
 			});
 			case 'jsx':	return mapObject(expr, {
 				attributes:	mapArrayA(p => mapObject(p, {value: mapExpressionA})),
@@ -569,7 +574,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'class':				return walkExpression(e.superClass) || (e.body as TS.ClassMember[]).some(walkClassMember) || !!e.implements?.some(t => walkType(t as Type));
 			case 'instantiation':		return walkExpression(e.expression) || e.typeArgs.some(t => walkType(t as Type));
 			case 'as':
-			case 'satisfies': return walkExpression(e.expression);
+			case 'satisfies': return walkExpression(e.expression) || walkType(e.typeAnnotation as Type);
 			case 'jsx':			return e.attributes.some(p => walkExpression(p.value)) || e.children.some(walkExpression);
 			case 'this':
 			case 'super':
