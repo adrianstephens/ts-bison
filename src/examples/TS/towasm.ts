@@ -1107,23 +1107,49 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 		});
 	};
 
-	// `$ret` -- the type index of that resolved return type. Parsed per index (memoised), because the
-	// index is only known once the caller's type arguments are: this is the whole reason a generic
-	// static could not allocate its own return type.
-	if (asm.includes('$ret')) {
+	// A GENERIC method's asm resolves its own declared types per call. Real TS forbids a static from
+	// referencing its class's type parameters, so `substituteClassTypeParam` leaves a static alone and its
+	// `T` stays genuinely open -- there is no class-level define that could stand in for it, and `$this`
+	// (the enclosing class's type index) is exactly the wrong answer a static used to settle for.
+	// `$ret` and `$p0`/`$p1`/... are this asm's OWN declared return and parameter type indices, so
+	// `array.new_default $ret` / `array.copy $p0 $p2` mean what they say at every instantiation.
+	// Parsed per resolved index set (memoised): the indices are only known once the caller's type
+	// arguments are.
+	if (typeParams?.length || asm.includes('$ret')) {
 		if (!retIndexOf)
-			throw `inline asm '${asm}': '$ret' is only available on a class method`;
-		const cache = new Map<number, ReturnType<typeof WAT.parseAsmBody>>();
-		return (_args, ctx, typeArgs) => {
+			throw `inline asm '${asm}': '$ret'/'$pN' are only available on a class method`;
+		const cache = new Map<string, ReturnType<typeof WAT.parseAsmBody>>();
+		return (args, ctx, typeArgs) => {
 			const subs	= typeParams?.length && typeArgs?.length ? new Map(typeParams.map((n, i) => [n, typeArgs[i]] as const)) : undefined;
-			const sig	= sigFor(subs);
-			const index	= retIndexOf(sig.result);
-			if (index === undefined)
-				throw `inline asm '${asm}': '$ret' needs a return type with a real wasm type index, not '${wasmTypeKey(sig.result)}'`;
-			let p = cache.get(index);
+			const base	= sigFor(subs);
+			// No explicit type arguments (`Array._copy(dst, 0, src, 0, n)`), so those type parameters are
+			// still open and `resolveType` can only fall back to `arr:ref` for them. The ARGUMENT in such a
+			// position already carries the physical type the callee will actually receive, so use it --
+			// but ONLY there: a position whose declared type is closed (`start: i32`, `val: T` against an
+			// `f64` array) still needs its real declared type, or a coercion `emitInline` would have made
+			// silently disappears.
+			const declared	= (call.typeArgs?.[0]?.type === 'tuple' ? call.typeArgs[0].elements : []).map(te => T.tupleElementType(te));
+			const isOpen	= (t: Type | undefined): boolean => !t ? false
+				: t.type === 'ref' ? !!typeParams?.includes(t.name)
+				: t.type === 'array' ? isOpen(t.element)
+				: false;
+			const sig	= subs || !typeParams?.length ? base
+				: { result: base.result, params: base.params.map((w, i) => isOpen(declared[i]) && args[i]?.wtype ? args[i].wtype : w) };
+			const extra: Record<string, string|number> = {};
+			const idx	= (w: WasmType) => retIndexOf(w);
+			const r		= idx(sig.result);
+			if (r !== undefined)
+				extra.ret = r;
+			sig.params.forEach((w, i) => {
+				const pi = idx(w);
+				if (pi !== undefined)
+					extra[`p${i}`] = pi;
+			});
+			const key = JSON.stringify(extra);
+			let p = cache.get(key);
 			if (!p) {
-				p = WAT.parseAsmBody(asm, { ...defines, ret: index });
-				cache.set(index, p);
+				p = WAT.parseAsmBody(asm, { ...defines, ...extra });
+				cache.set(key, p);
 			}
 			return { ...sig, inline: resolveAsmLocals(assertFlatInstrs(p.body, asm), p.locals.map(l => ({ id: l.id, count: l.count, type: l.type as wasm.ValType })), ctx, asm) };
 		};
@@ -1218,9 +1244,17 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 // Substitutes a generic class's own single type parameter (`PARAM`) for `subs` throughout its decl -- shared
 // by `builtinOwner` and `ensureClass`. `thisTsType`, when given, also substitutes a `T[]`-shaped member type for the whole instantiation itself -- specific to `Array<T>`'s own shape, ordinary callers omit it.
 function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<string, Type>): JS.ClassDecl<Type> {
-	return walk(decl, undefined, undefined, (t, process) =>
+	const out = walk(decl, undefined, undefined, (t, process) =>
 		t.type === 'ref' && map.has(t.name) ? map.get(t.name) : process(t)
 	)!;
+	// A STATIC member is restored verbatim: real TS forbids one from referencing its class's type
+	// parameters at all ("Static members cannot reference class type parameters"), so substituting into
+	// one can only ever corrupt something -- and what it corrupted was a static's OWN type parameter of
+	// the same name. `Array<any>`'s `_alloc<T>(n): T[]` was rewritten to `any[]`, so it allocated
+	// `arr:ref` whatever it was called with, and `$ret` never had a chance to resolve it.
+	// Order is structural, so `out.body[i]` is `decl.body[i]` throughout.
+	out.body = out.body.map((m, i) => hasMod(decl.body[i] as { modifiers?: string[] }, 'static') ? decl.body[i] : m);
+	return out;
 }
 
 // General N-type-param substitution, for a generic top-level function/method's own type params -- unlike
