@@ -13,7 +13,7 @@
 //	and a field that is always `''` would be worse than its absence.
 //-----------------------------------------------------------------------------
 
-export class Error {
+class Error {
 	name: string = 'Error';
 
 	constructor(public message: string) {}

@@ -10,7 +10,7 @@
 // A real hash table (O(1) for string keys, the common case) is a legitimate later optimization, not
 // attempted yet -- this project's own actual Map usage (checker.ts/type-utils.ts/etc, the reason
 // this file exists) isn't at a scale where O(n) lookup matters.
-export class Map<K, V> {
+class Map<K, V> {
 	private keys_: K[] = [];
 	private values_: V[] = [];
 
@@ -87,7 +87,7 @@ export class Map<K, V> {
 //	Set -- linear-scan implementation (see lib/map.ts's header comment for the tradeoff)
 //-----------------------------------------------------------------------------
 
-export class Set<T> {
+class Set<T> {
 	private items_: T[] = [];
 
 	constructor(values: T[] = []) {
@@ -151,7 +151,7 @@ export class Set<T> {
 // Nothing is collected: an entry lives as long as the WeakMap does, since there's no finalization to
 // hook. Every use in this project is a cache keyed by an immutable Type/AST node, so it costs only
 // retention, never correctness.
-export class WeakMap<K, V> {
+class WeakMap<K, V> {
 	private map_: Map<K, V>;
 
 	constructor(entries: [K, V][] = []) {

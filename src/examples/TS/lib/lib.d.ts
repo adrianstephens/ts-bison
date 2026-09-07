@@ -46,33 +46,6 @@ declare function __alloc(size: i32, align: i32): i32;
 declare function __allocMark(): i32;
 declare function __allocRelease(mark: i32): void;
 
-// Same reason, and the same shape `Array<T>`/`StringParser` below already use: the real class lives in
-// `map.ts`, which is always static, so an on-demand `lib/node/*` module names it rather than importing it.
-declare class Map<K, V> {
-	constructor(entries?: [K, V][]);
-	get size(): number;
-	get(key: K): V | undefined;
-	has(key: K): boolean;
-	set(key: K, value: V): this;
-	delete(key: K): boolean;
-	clear(): void;
-	keys(): K[];
-	values(): V[];
-	entries(): [K, V][];
-	forEach(callbackfn: (value: V, key: K, map: Map<K, V>) => void, thisArg?: any): void;
-}
-
-// Same shape and the same reason as `Map` above: the real class lives in `error.ts`, which is always
-// static, so an on-demand `lib/node/*` module names it rather than importing it. `noLib` means there is
-// no ambient `Error` from TypeScript's own lib to inherit -- without this, `lib/node/fs.ts` throwing one
-// is "Cannot find name 'Error'" in the editor and under this directory's own tsconfig.
-declare class Error {
-	name: string;
-	message: string;
-	constructor(message: string);
-	toString(): string;
-}
-
 declare function pure(target: any, propertyKey: string, descriptor: PropertyDescriptor): void;
 
 // Pseudo-types for `__asm`'s own `P`/`R` generic args, purely so an asm-backed method can declare its
@@ -253,46 +226,6 @@ interface ConcatArray<T> {
 	slice(start?: number, end?: number): T[];
 }
 
-declare class Array<T> {
-	[i: number]: T;
-	length: number;
-
-	constructor(n: number);
-
-	grow(n: i32): i32;
-	toString(): string;
-	toLocaleString(): string;
-	pop(): T | undefined;
-	//push(...items: T[]): number;
-	//concat(...items: ConcatArray<T>[]): T[];
-	//concat(...items: (T | ConcatArray<T>)[]): T[];
-	//unshift(...items: T[]): number;
-	push(item: T): number;
-	concat(item: T[]): T[];
-	unshift(item: T): number;
-	join(separator?: string): string;
-	reverse(): T[];
-	shift(): T | undefined;
-	slice(start?: number, end?: number): T[];
-	sort(compareFn?: (a: T, b: T) => number): this;
-	splice(start: number, deleteCount?: number): T[];
-	splice(start: number, deleteCount: number, ...items: T[]): T[];
-	indexOf(searchElement: T, fromIndex?: number): number;
-	lastIndexOf(searchElement: T, fromIndex?: number): number;
-	every<S extends T>(predicate: (value: T, index: number, array: T[]) => value is S, thisArg?: any): this is S[];
-	every(predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any): boolean;
-	some(predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any): boolean;
-	forEach(callbackfn: (value: T, index: number, array: T[]) => void, thisArg?: any): void;
-	map<U>(callbackfn: (value: T, index: number, array: T[]) => U, thisArg?: any): U[];
-	filter<S extends T>(predicate: (value: T, index: number, array: T[]) => value is S, thisArg?: any): S[];
-	filter(predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any): T[];
-	reduce(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T): T;
-	reduce(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T, initialValue: T): T;
-	reduce<U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number, array: T[]) => U, initialValue: U): U;
-	reduceRight(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T): T;
-	reduceRight(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T, initialValue: T): T;
-	reduceRight<U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number, array: T[]) => U, initialValue: U): U;
-}
 
 //-----------------------------------------------------------------------------
 //	TypedArray
@@ -395,6 +328,9 @@ declare var Math: {
 	tan(x: number): number;
 };
 
+//-----------------------------------------------------------------------------
+//
+//-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 //
 //-----------------------------------------------------------------------------
