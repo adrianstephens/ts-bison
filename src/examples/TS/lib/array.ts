@@ -113,8 +113,15 @@ export class Array<T> {
 		}
 		return -1;
 	}
+	// SameValueZero, NOT `indexOf(x) !== -1`: the two genuinely differ on NaN -- `indexOf` uses strict
+	// equality and can never find one (correctly), while `[NaN].includes(NaN)` is true.
 	includes(x: T): boolean {
-		return this.indexOf(x) !== -1;
+		for (let i = 0; i < this.length; i++) {
+			const v = this[i];
+			if (v === x || (v !== v && x !== x))
+				return true;
+		}
+		return false;
 	}
 	// `end`'s "omitted" default can't be `this.length` (towasm's call-site defaults must be plain
 	// literals -- see towasm.ts's `paramWasmType`), and a nullable `number` isn't supported either (no
@@ -122,9 +129,15 @@ export class Array<T> {
 	// same as real JS already clamps an over-long `end` to the array's length.
 	slice(start: i32 = 0, end: i32 = 0x7fffffff): T[] {
 		const len = this.length;
-		start	= start < 0 ? start + len : start;
-		end		= end < 0 ? end + len : end > len ? len : end;
-		const rlen = end - start;
+		// CLAMPED at both ends, and a reversed or out-of-range range is empty. `rlen` could go negative
+		// (`slice(5)` on length 3, `slice(2, 1)`) and reached `_alloc` as a huge unsigned length --
+		// "requested new array is too large" -- where JS simply gives `[]`.
+		let from	= start < 0 ? len + start : start;
+		let to		= end < 0 ? len + end : end;
+		from	= from < 0 ? 0 : from > len ? len : from;
+		to		= to < 0 ? 0 : to > len ? len : to;
+		const rlen = to > from ? to - from : 0;
+		start	= from;
 		const result: T[] = Array._alloc<T>(rlen);
 		Array._copy(result, 0, this as unknown as T[], start, rlen);
 		return result;
@@ -184,6 +197,9 @@ export class Array<T> {
 			if (callback(this[i], i, this))
 				return this[i];
 		}
+		// Explicit: falling off the end reached `unreachable` rather than returning the `undefined` JS
+		// specifies for no match.
+		return undefined;
 	}
 	findIndex(callback: (value: T, index: number, array: this) => boolean, thisArg?: any): number {
 		for (let i = 0; i < this.length; i++) {
@@ -227,19 +243,38 @@ export class Array<T> {
 			result[i] = callback(this[i], i, this);
 		return result;
 	}
+	// With no seed the accumulator starts at the first element and the walk at the second, and an empty
+	// array is a TypeError -- seeding with `initial` regardless folded a leading `undefined` into every
+	// no-seed reduce. `initial === undefined` is the only signal available (no `arguments.length` here).
 	reduce(callback: (prev: T, curr: T, index: number, array: this) => T, initial?: T): T;
-    reduce<U>(callback: (prev: U, curr: T, index: number, array: this) => U, initial: U): U {
+	reduce<U>(callback: (prev: U, curr: T, index: number, array: this) => U, initial?: U): U {
+		const len = this.length;
+		let i = 0;
 		let result = initial;
-		for (let i = 0; i < this.length; i++)
-			result = callback(result, this[i], i, this);
-		return result;
+		if (initial === undefined) {
+			if (len === 0)
+				throw new Error('Reduce of empty array with no initial value');
+			result = this[0] as any as U;
+			i = 1;
+		}
+		for (; i < len; i++)
+			result = callback(result as U, this[i], i, this);
+		return result as U;
 	}
 	reduceRight(callback: (prev: T, curr: T, index: number, array: this) => T, initial?: T): T;
-    reduceRight<U>(callback: (prev: U, curr: T, index: number, array: this) => U, initial: U): U {
+	reduceRight<U>(callback: (prev: U, curr: T, index: number, array: this) => U, initial?: U): U {
+		const len = this.length;
+		let i = len - 1;
 		let result = initial;
-		for (let i = this.length - 1; i >= 0; i--)
-			result = callback(result, this[i], i, this);
-		return result;
+		if (initial === undefined) {
+			if (len === 0)
+				throw new Error('Reduce of empty array with no initial value');
+			result = this[len - 1] as any as U;
+			i = len - 2;
+		}
+		for (; i >= 0; i--)
+			result = callback(result as U, this[i], i, this);
+		return result as U;
 	}
 	reverse(): T[] {
 		const len = this.length;
