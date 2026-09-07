@@ -2020,10 +2020,7 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 				checkFunctionBody(m, m.body, instScope, false, true, false, err);
 				break;
 			case 'static_block':
-				checkBlock(m.body, new Scope(statScope), typeOf1(err), (s, scope, typeOf1, checkStmt1) => {
-					(s as any).scope ??= scope;
-					checkStmt(s, scope, typeOf1, checkStmt1, err);
-				});
+				checkBlock(m.body, new Scope(statScope), typeOf1(err), checkStmt1(err));
 		}
 	}
 	return value;
