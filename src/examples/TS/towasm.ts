@@ -1612,7 +1612,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// value -- every use is resolved at its own site, so it never needs a capture slot either. Only
 			// named imports were listed here, so `TS.parse(...)` inside a callback read as a free variable
 			// and threw "unresolved identifier 'TS'".
-			|| !!moduleScopeOf(homeModule)?.namespace(name);
+			|| !!moduleScopeOf(homeModule)?.namespace(name)
+			// Same reasoning again for the ENTRY module's own top-level `const`/`let`: it becomes a real
+			// global (or an `ensureLazyGlobal` wrapper), so every use resolves at its own site and it never
+			// needs a capture slot. `hoist` deliberately doesn't hoist a plain top-level `var_decl` into a
+			// scope, so `resolveDecl` above cannot see one -- `topLevelVars` is where they live, and without
+			// this a closure referencing one read as a free variable ("unresolved identifier 'LIB_DIR'").
+			|| (homeModule === '.' && topLevelVars.has(name));
 	}
 
 	const worklist:			(()=>void)[] = [];
