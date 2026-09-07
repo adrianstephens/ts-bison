@@ -1579,6 +1579,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	function homeKey(homeModule: string, name: string) {
 		return homeModule === '.' ? name : homeModule + '\0' + name;
 	}
+
+	// `const f = __asm<[...], R>('...')` declared in a USER module. `builtins` is built once, at module
+	// scope, from `LIB_DECLS` -- so the shorthand only ever bound inside `lib/*.ts` proper, and the same
+	// declaration in the ENTRY module (never mind an imported one) failed as "call to unknown function".
+	// Keyed by module: the binding is that module's own, exactly like a top-level function's.
+	const moduleAsmBuiltins = new Map<string, Builtin<Inline>>();
+	for (const [moduleId, body] of moduleBodies) {
+		for (let s of body) {
+			if (s.type === 'export_decl')
+				s = s.declaration;
+			if (s.type !== 'var_decl')
+				continue;
+			for (const d of s.declarations) {
+				if (typeof d.name === 'string' && isAsm(d.init))
+					moduleAsmBuiltins.set(homeKey(moduleId, d.name), makeAsm(d.init, {}));
+			}
+		}
+	}
 	// The one place an unqualified (or namespace-resolved) name turns into a `FunctionDecl` -- a lib
 	// declaration is always homeModule-independent, checked only after the calling module's own.
 	function resolveDecl(homeModule: string, name: string) {
@@ -1824,6 +1842,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// `declScope` as this wrapper's own home scope, so any name it references (another lazy global, a
 	// sibling function) resolves against ITS OWN declaring module, not the caller's.
 	function ensureLazyGlobal(name: string, homeModule: string, d: JS.Var<Type>, declScope: Scope): FuncInfo | undefined {
+		// `const f = __asm<[...], R>('...')` DECLARES a builtin; it holds no value. A lazy global here makes
+		// the wrapper evaluate the initializer -- really trying to CALL `__asm`. Guarded at this level, not
+		// in `lazyGlobalFor`, because `case 'call'`'s own closure-valued-const path reaches this directly.
+		// `undefined` lets the reference fall through to `moduleAsmBuiltins`, where the binding actually is.
+		if (d.init && isAsm(d.init))
+			return undefined;
 		const key = homeKey(homeModule, name);
 		const existing = lazyGlobals.get(key);
 		if (existing)
@@ -1931,7 +1955,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// arguments is still just naming it.
 		if (e.type === 'instantiation')
 			return isAliasInit(e.expression, scope);
-		return !!classRefTarget(e, scope)
+		// `const f = __asm<[...], R>('...')` DECLARES a builtin (`moduleAsmBuiltins`); there is no value to
+		// evaluate, and the start function trying to call `__asm` is exactly the "unknown function" it got.
+		return isAsm(e)
+			|| !!classRefTarget(e, scope)
 			|| (e.type === 'identifier' && scope.decl(e.name)?.type === 'function_decl')
 			|| (e.type === 'member' && e.object.type === 'identifier' && !!scope.namespace(e.object.name));
 	}
@@ -3696,7 +3723,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// declaring file's own top level, not the caller's.
 	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Type, homeModule: string = ctx.homeModule): WasmType {
 		let decl;
-		const builtin = builtins[name];
+		const builtin = builtins[name] ?? moduleAsmBuiltins.get(homeKey(homeModule, name));
 		if (builtin) {
 			const result = builtin(args.map(a => operandInfo(a, ctx)), ctx);
 			if ('inline' in result)

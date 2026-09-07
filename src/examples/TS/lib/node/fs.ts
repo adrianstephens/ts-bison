@@ -6,14 +6,10 @@ import {
 	path_open, path_create_directory,
 } from 'wasi_snapshot_preview1';
 
-// Plain functions wrapping an inline `__asm(...)(...)` call, not `const x = __asm(...)` -- towasm.ts's
-// asm-builtin binding only resolves that shorthand for a name declared in the always-loaded static lib
-// files, never an on-demand module like this one; a real function body containing the same inline call
-// compiles fine everywhere. (Confirmed via `WebAssembly.validate`, not difftest -- see report.)
-function loadU8(ptr: i32): i32 { return __asm<[i32], i32>('i32.load8_u')(ptr); }
-function loadI32(ptr: i32): i32 { return __asm<[i32], i32>('i32.load')(ptr); }
-function storeU8(ptr: i32, v: i32): void { __asm<[i32, i32], void>('i32.store8')(ptr, v); }
-function storeI32(ptr: i32, v: i32): void { __asm<[i32, i32], void>('i32.store')(ptr, v); }
+const loadU8	= __asm<[i32], i32>('i32.load8_u');
+const loadI32	= __asm<[i32], i32>('i32.load');
+const storeU8	= __asm<[i32, i32], void>('i32.store8');
+const storeI32	= __asm<[i32, i32], void>('i32.store');
 
 // WASI rights are a capability mask, and `path_open` REFUSES (errno 76, ENOTCAPABLE) any right the parent
 // directory fd does not itself hold -- asking for all-ones fails against every real host. Ask for exactly
