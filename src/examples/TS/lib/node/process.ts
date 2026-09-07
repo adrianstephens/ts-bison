@@ -44,7 +44,12 @@ function loadArgv(): string[] {
 	return result;
 }
 
-function loadEnv(): Map<string, string> {
+// The index-signature type all the way through, not the `Map` this physically builds: that is how
+// `process.env` is read (`env.PATH`/`env['PATH']`), and the two are the same value here -- towasm
+// routes `{[k: string]: V}` to `Map<string, V>` (see `indexSignatureValueType`). Declaring the two
+// sides differently would lean on an assignment real TypeScript rejects, and nothing would catch it:
+// `TS/lib/**` is excluded from this project's tsconfig.
+function loadEnv(): {[key: string]: string} {
 	const mark = __allocMark();
 
 	const countPtr = __alloc(4, 4);
@@ -60,20 +65,17 @@ function loadEnv(): Map<string, string> {
 	const entries = readCStringTable(count, environPtr);
 	__allocRelease(mark);
 
-	const result = new Map<string, string>();
+	const result: {[key: string]: string} = {};
 	for (let i = 0; i < entries.length; i++) {
 		const entry = entries[i];
 		const eq = entry.indexOf('=');
 		if (eq === -1)
-			result.set(entry, '');
+			result[entry] = '';
 		else
-			result.set(entry.slice(0, eq), entry.slice(eq + 1));
+			result[entry.slice(0, eq)] = entry.slice(eq + 1);
 	}
 	return result;
 }
 
 export const argv: string[] = loadArgv();
-// An index signature, not the `Map` `loadEnv` physically builds: node's `process.env` is read as
-// `env.PATH`/`env['PATH']`, and only an index-signature type gives those. The two are the same value --
-// towasm routes `{[k: string]: V}` to `Map<string, V>` (see `indexSignatureValueType`).
 export const env: {[key: string]: string} = loadEnv();
