@@ -1984,12 +1984,21 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 			// A bare `T` alternative matches the whole argument too coarsely when a more structural alternative (`TypeT<K>`) could
 			// drill into K's position instead -- so non-bare alternatives are tried first; bare ones only fill in what's still unbound.
 			const isBare = (t: Type) => t.type === 'ref' && !t.typeArgs && tparams.has(t.name);
-			for (const t of paramT.types)
-				if (!isBare(t))
-					recurse(t, argT, depth - 1);
-			for (const t of paramT.types)
-				if (isBare(t))
-					recurse(t, argT, depth - 1);
+			const concrete = paramT.types.filter(t => !isBare(t));
+			for (const t of concrete)
+				recurse(t, argT, depth - 1);
+			const bare = paramT.types.filter(isBare);
+			if (bare.length) {
+				// A bare alternative stands for what the CONCRETE ones do not already account for:
+				// `T | undefined` against `number | undefined` infers `T = number`, not the whole union.
+				// Real TS does exactly this; without it `unbox<T>(b: {value: T | undefined}): T` came back
+				// as `number | undefined` and every use of its result was then rejected.
+				const keys		= new Set(concrete.map(c => typeKey(resolveOwn(c, scope))));
+				const rest		= a.type === 'union' ? a.types.filter(m => !keys.has(typeKey(resolveOwn(m, scope)))) : [];
+				const narrowed	= rest.length && rest.length < a.types.length ? (rest.length === 1 ? rest[0] : TS.UnionType(rest)) : argT;
+				for (const t of bare)
+					recurse(t, narrowed, depth - 1);
+			}
 		}
 	}
 }
