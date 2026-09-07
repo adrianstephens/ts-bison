@@ -134,13 +134,29 @@ export class TypedArray<T> {
 	// `Uint8Array`/`Int32Array`/`Uint32Array`/etc alike, same as every other method here. Only covers a
 	// `number`-representable (<=4-byte) element -- `i64`/`u64`/`f32`/`f64` elements need a wider *declared*
 	// result than this shared `i32` signature can express, not yet supported (see `elemSize`'s own switch).
-	get(i: i32): i32 {
+	// Whether this instantiation's element type is SIGNED -- resolved the same `$T`-switch way
+	// `elemSize` is, and needed for exactly the same reason: one shared body serving every view.
+	private static signed(): i32 { return __asm<[], i32>(`
+		(switch $T
+			(($i8 $i16 $i32 $i64)	i32.const 1)
+			(($u8 $u16 $u32 $u64)	i32.const 0)
+			(($f32 $f64)			i32.const 0)
+		)`)(); }
+
+	// The bytes are composed UNSIGNED, so the result still has to be interpreted per element type --
+	// this is the whole point of a typed array, and it was missing entirely: `new Int8Array([200])[0]`
+	// read back 200 instead of -56, and `new Uint32Array([-1])[0]` read back -1 instead of 4294967295.
+	// Return type is `number`, not `i32`, because a full-width unsigned element does not fit in one.
+	get(i: i32): number {
 		const elemSize: i32 = TypedArray.elemSize();
 		const base: i32 = this.byteOffset + i * elemSize;
 		let v: i32 = 0;
 		for (let b: i32 = 0; b < elemSize; b++)
 			v = v | (this.buffer.get(base + b) << (b * 8));
-		return v;
+		const bits: i32 = elemSize * 8;
+		if (TypedArray.signed() !== 0)
+			return bits < 32 ? (v << (32 - bits)) >> (32 - bits) : v;
+		return bits < 32 ? v : (v >>> 0);
 	}
 	set(i: i32, v: i32): void {
 		const elemSize: i32 = TypedArray.elemSize();
@@ -178,14 +194,19 @@ export class TypedArray<T> {
 	// Same "omitted `end`" large-sentinel-clamped-to-`length` trick as `lib/array.ts`'s own `slice`/
 	// `fill` -- a call-site default must be a plain literal (towasm's `fillDefaultArgs`), and
 	// `this.length` isn't one.
+	// CLAMPED at both ends, and a reversed or out-of-range range is empty -- `rlen` could otherwise go
+	// negative and reach the constructor as a huge unsigned length. Same fix as `Array.slice` and
+	// `String.slice`; all three had the identical bug.
 	slice(start: i32 = 0, end: i32 = 0x7fffffff): TypedArray<T> {
 		const len = this.length;
-		start	= start < 0 ? start + len : start;
-		end		= end < 0 ? end + len : end > len ? len : end;
-		const rlen = end - start;
+		let from: i32	= start < 0 ? len + start : start;
+		let to: i32		= end < 0 ? len + end : end;
+		from	= from < 0 ? 0 : from > len ? len : from;
+		to		= to < 0 ? 0 : to > len ? len : to;
+		const rlen = to > from ? to - from : 0;
 		const result = new TypedArray<T>(rlen);
 		for (let i = 0; i < rlen; i++)
-			result[i] = this[start + i];
+			result[i] = this[from + i];
 		return result;
 	}
 	fill(x: number, start: i32 = 0, end: i32 = 0x7fffffff): TypedArray<T> {
