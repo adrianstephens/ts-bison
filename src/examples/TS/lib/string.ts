@@ -233,31 +233,44 @@ export class String {
 	}
 	// Capture groups aren't interleaved into the result (unlike real JS's `split(/(\d)/)`) -- explicit
 	// scope simplification (see StringParts's own comment), not an oversight.
+	// ES `SplitMatcher`, which is not "find the next separator": the separator must match starting
+	// EXACTLY at the cursor, and an empty match at the previous split point never splits again. The old
+	// loop pushed each SEPARATOR match instead of the text between them, so `'a,b,c'.split(/,/)` was
+	// `[',', ',', 'c']` -- with the right length, which is why only a value comparison caught it.
 	split(separator: RegExp, limit: i32 = 0x7fffffff): string[] {
 		const s: string = this as unknown as string;
 		const result: string[] = [];
-		let last = 0;
-		let pos = 0;
-		while (pos <= s.length && result.length < limit) {
-			// `execFrom`, not `exec` -- split scans the whole string regardless of `separator`'s own
-			// `g`/`lastIndex` state (real JS split() ignores them the same way).
-			const m: RegExpMatch | null = separator.execFrom(s, pos);
-			if (m === null) {
-				result.push(this.substring(pos));
-				break;
-			}
-			const ms = m.groupStart(0);
-			const me = m.groupEnd(0);
-			if (ms >= s.length)
-				break;
-			if (me === ms) {
-				pos = pos + 1;
-			} else {
-				result.push(s.substring(ms, me));
-				last = me;
-				pos = me;
-			}
+		const size = s.length;
+		if (limit === 0)
+			return result;
+		// An empty subject is `[]` when the separator matches it, `['']` otherwise.
+		if (size === 0) {
+			// `execFrom`, not `exec` -- split scans regardless of `separator`'s own `g`/`lastIndex`
+			// state, the same way real JS split() ignores them.
+			if (separator.execFrom(s, 0) === null)
+				result.push(s);
+			return result;
 		}
+		let p = 0;
+		let q = 0;
+		while (q < size) {
+			const m: RegExpMatch | null = separator.execFrom(s, q);
+			if (m === null || m.groupStart(0) !== q) {
+				q = q + 1;
+				continue;
+			}
+			const e = m.groupEnd(0);
+			if (e === p) {
+				q = q + 1;
+				continue;
+			}
+			result.push(s.slice(p, q));
+			if (result.length >= limit)
+				return result;
+			p = e;
+			q = p;
+		}
+		result.push(s.slice(p));
 		return result;
 	}
 
