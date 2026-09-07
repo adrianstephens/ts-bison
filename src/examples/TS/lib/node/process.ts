@@ -49,7 +49,10 @@ function loadArgv(): string[] {
 // routes `{[k: string]: V}` to `Map<string, V>` (see `indexSignatureValueType`). Declaring the two
 // sides differently would lean on an assignment real TypeScript rejects, and nothing would catch it:
 // `TS/lib/**` is excluded from this project's tsconfig.
-function loadEnv(): {[key: string]: string} {
+// `string | undefined`, matching node's own `ProcessEnv` and the physical truth: a missing key really
+// does read back as `undefined`, and declaring it `string` made `process.env.X === undefined` --
+// the idiomatic presence test -- fail codegen as "needs a nullable object-typed value".
+function loadEnv(): {[key: string]: string | undefined} {
 	const mark = __allocMark();
 
 	const countPtr = __alloc(4, 4);
@@ -65,7 +68,7 @@ function loadEnv(): {[key: string]: string} {
 	const entries = readCStringTable(count, environPtr);
 	__allocRelease(mark);
 
-	const result: {[key: string]: string} = {};
+	const result: {[key: string]: string | undefined} = {};
 	for (let i = 0; i < entries.length; i++) {
 		const entry = entries[i];
 		const eq = entry.indexOf('=');
@@ -78,4 +81,4 @@ function loadEnv(): {[key: string]: string} {
 }
 
 export const argv: string[] = loadArgv();
-export const env: {[key: string]: string} = loadEnv();
+export const env: {[key: string]: string | undefined} = loadEnv();
