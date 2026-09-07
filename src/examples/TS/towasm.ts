@@ -1057,6 +1057,12 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 
 	const resolveType = (t: Type): WasmType | undefined => {
 		if (t.type === 'ref') {
+			// An OPEN type parameter, unsubstituted because this call site gave no explicit type
+			// arguments. `T[]` already falls back to `arr:ref` here for exactly the same reason; a bare
+			// `T` had no fallback at all, so `Array._fill(a, i, x, n)` threw instead of letting the
+			// caller below replace it with the argument's real physical type (`isOpen`).
+			if (typeParams?.includes(t.name))
+				return REF_ANY_NULLABLE;
 			switch (t.name) {
 				case 'i8': case 'i16':	return 'i32';
 				case 'u8': case 'u16':	return 'u32';
