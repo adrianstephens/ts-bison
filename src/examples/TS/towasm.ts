@@ -3367,15 +3367,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				case 'f32':
 					ctx.emit(I.f64.promote_f32);
 					//fall through
+				// `bigFromNumber` (lib/bigint.ts) is the real, tested conversion, and calling it is the
+				// only way this stays in step with the limb encoding it has to produce. What used to be
+				// here was a hand-written exponent walk that was never finished -- it fell out of the
+				// switch into the throw below, and it named two differently-typed temps `$exp`, so it
+				// could not have run anyway. A mixed `bigint`/`number` comparison, which real TS allows
+				// and which `BigInt.toString`'s own `i > 0` loop depends on, therefore never compiled.
 				case 'f64': {
-					const tmp64	= ctx.temp('$tmp64', 'i64');
-					const exp	= ctx.temp('$exp', 'i32');
-					const arr	= ctx.temp('$exp', ARR_WTYPE.i32);
-					ctx.emit(I.local.tee(tmp64));
-					// get exponent
-					ctx.emit(I.i64.reinterpret_f64, I.i64(53), I.i64.shr_u, I.i32.wrap_i64, I.i32(0x7ff), I.i32.and, I.i32(1023), I.i32.add, I.local.tee(exp));
-					ctx.emit(array.new([I.i32(5), I.i32.shr_s]), I.local.set(arr));
-					ctx.emit(array.set(I.local.get(arr), 0, [I.local.get(tmp64), I.i64.const(0xffffffffn), I.i64.and, I.i32.wrap_i64]));
+					const decl = LIB_DECL_MAP.get('bigFromNumber');
+					if (decl && decl.type === 'function_decl') {
+						const info = ensureFunc('bigFromNumber', decl);
+						if (info) {
+							ctx.emit(I.call(info.funcIndex));
+							return;
+						}
+					}
 					break;
 				}
 
@@ -3603,11 +3609,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// re-emitting the expression would evaluate its side effects twice.
 	function emitTruthyOf(gotIn: WasmType, t: Type, ctx: FunctionContext): void {
 		let got = gotIn;
-		// A boxed nullable primitive (`number | null`/`boolean | null`) has no truthiness of its own --
-		// unbox it first (same unconditional-narrowing contract `coerceTop` uses everywhere else), then
-		// test the underlying scalar. A genuinely-null value traps here, same as any other unguarded use.
+		// A boxed primitive (`number | undefined`, `boolean | null`) has no truthiness of its own -- unbox
+		// it and test the underlying scalar. A NULLABLE one tests for null first and answers falsy, which
+		// is what JS says: `r ? a : b` on an omitted optional parameter (`r?: number`) is entirely
+		// ordinary, and used to dereference the null box. Same shape the nullable-string case below uses.
 		const box = unboxedPrimitive(got);
 		if (box) {
+			if (typeof got === 'object' && got.nullable) {
+				const tmp = ctx.declareLocal(`$numtruthy$${optionalTempCounter++}`, got);
+				ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
+				const old = ctx.swapOut();
+				ctx.emit(I.i32.const(0));
+				const _then = ctx.swapOut();
+				ctx.emit(I.local.get(tmp.index));
+				coerceTop(got, ctx, box.kind);
+				emitTruthyOf(box.kind, t, ctx);
+				ctx.emit(I.if('i32', _then, ctx.swapOut(old)));
+				return;
+			}
 			coerceTop(got, ctx, box.kind);
 			got = box.kind;
 		}
@@ -3798,6 +3817,33 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			}
 			ctx.emit(I.array.new_fixed(typeIndex, elements.length));
 		}
+	}
+
+	// A `bigint` literal's limbs, in exactly the form `lib/bigint.ts` reads back: little-endian `u32`,
+	// TWO'S COMPLEMENT (not sign-magnitude), sign-extended so the top limb's high bit IS the sign, and
+	// trimmed the way `bigTrim` trims -- no top limb that merely repeats the sign of the one below it.
+	function bigintLimbs(v: bigint): number[] {
+		const limbs: number[] = [];
+		let x = v;
+		if (v >= 0n) {
+			while (x > 0n) {
+				limbs.push(Number(x & 0xffffffffn));
+				x >>= 32n;
+			}
+			// `0n`, and a value whose top limb would otherwise read as negative, both need a limb of room.
+			if (!limbs.length || (limbs[limbs.length - 1] & 0x80000000))
+				limbs.push(0);
+		} else {
+			// `>>` on a negative bigint is arithmetic in JS, so this converges on `-1n`, which is exactly
+			// the infinite sign extension the encoding wants.
+			while (x < -1n) {
+				limbs.push(Number(x & 0xffffffffn));
+				x >>= 32n;
+			}
+			if (!limbs.length || !(limbs[limbs.length - 1] & 0x80000000))
+				limbs.push(0xffffffff);
+		}
+		return limbs;
 	}
 
 	function emitInline(name: string, inline: Inline, args: Expr[], ctx: FunctionContext): WasmType {
@@ -4755,9 +4801,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						emitStringConst(e.value, ctx);
 						return ARR_WTYPE.i16;
 
-					case 'bigint':
-						ctx.emit(I.i64.const(e.value));
-						return 'i64';
+					case 'bigint': {
+						// A `bigint` VALUE is a two's-complement little-endian `u32[]` (see `typeOf`, and
+						// `lib/bigint.ts`'s own limb walks) -- so that is what a literal has to build. It
+						// used to emit `i64.const` and claim `'i64'`, disagreeing with every other bigint
+						// in the compiler: `10n - 4n` reinterpreted an i64 value as a limb array and gave
+						// -1, `Number(5n)` could not convert at all, and anything past 64 bits truncated.
+						// A real `i64` slot (`__towasm_mulWide`'s declared params, a global on an i64 slot)
+						// still gets the constant directly -- that is the one place the two agree.
+						if (want === 'i64') {
+							ctx.emit(I.i64.const(e.value));
+							return 'i64';
+						}
+						const limbs = bigintLimbs(e.value);
+						for (const l of limbs)
+							ctx.emit(I.i32.const(l | 0));
+						ctx.emit(I.array.new_fixed(ensureArrayType('i32'), limbs.length));
+						return ARR_WTYPE.i32;
+					}
 
 					case 'object':
 						if (e.value instanceof RegExp) {
