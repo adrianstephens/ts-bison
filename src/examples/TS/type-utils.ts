@@ -122,7 +122,17 @@ export function typeofName(t: Type, scope?: Scope): string | undefined {
 			const names = new Set(members.map(m => typeofName(m, scope)));
 			return names.size === 1 && !names.has(undefined) ? [...names][0] : undefined;
 		}
-		case 'ref':					return TYPEOF_PRIMITIVES.includes(r.name) ? r.name : r.name === 'void' ? 'undefined' : r.name === 'null' ? 'object' : undefined;
+		case 'ref': {
+			if (TYPEOF_PRIMITIVES.includes(r.name))
+				return r.name;
+			if (r.name === 'void' || r.name === 'null')
+				return r.name === 'void' ? 'undefined' : 'object';
+			// Whatever `resolve` left as a ref names a real class -- `typeof` is a question about the
+			// STRUCTURE, so ask for it. Guarded on actually getting one back, or a ref with no entry to
+			// expand would recurse on itself.
+			const m = scope && resolveMembers(r, scope);
+			return m && m.type !== 'ref' ? typeofName(m, scope) : undefined;
+		}
 		default:					return undefined;
 	}
 }
@@ -341,7 +351,11 @@ export function combineTypes(types: Type[]): Type {
 	const add = (t: Type) => {
 		if (t.type === 'union') {
 			t.types.forEach(add);
-		} else {
+		} else if (!isRefNamed(t, 'never')) {
+			// `never` is a union's identity element -- nothing inhabits it, so it can never be the runtime
+			// value. Left in, it makes the whole union unanswerable to every consumer that asks "one owner
+			// or many" (`ownerFor` returned nothing at all for a `Stream | never` a branch merge produced).
+			// Same rule `unionMembers` already applies when it flattens.
 			const key = typeKey(t);
 			if (!seen.has(key)) {
 				seen.add(key);
@@ -350,7 +364,7 @@ export function combineTypes(types: Type[]): Type {
 		}
 	};
 	types.forEach(add);
-	return unique.length === 1 ? unique[0] : TS.UnionType(unique);
+	return !unique.length ? NEVER : unique.length === 1 ? unique[0] : TS.UnionType(unique);
 }
 
 export function optional(type:Type, optional?: boolean) {
@@ -855,6 +869,26 @@ export function resolveOwn(t: Type, scope: Scope): Type {
 	return resolve(ownScope(t, scope), t);
 }
 
+// The one direction `resolve` deliberately will not go: expanding a named class into its structural
+// member list. Every other consumer dispatches on a class by NAME and needs the ref kept intact, so
+// this is opt-in -- ask for it only where the MEMBERS are what you actually want (`lookupMember`).
+// Expands exactly one level: the members it yields keep their own nominal refs.
+export function resolveMembers(t: Type, scope: Scope, depth = 10): Type {
+	const r = resolveOwn(t, scope);
+	if (r.type !== 'ref' || ALL_PRIMITIVES.has(r.name))
+		return r;
+	const refScope	= r.declScope as Scope ?? scope;
+	const parts		= r.name.split('.');
+	const name		= parts.pop()!;
+	const ns		= refScope.lookupScope(parts);
+	const entry		= ns?.type(name);
+	if (!ns || !entry)
+		return r;
+	return resolve(ns, entry.typeParams?.length
+		? substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, r.typeArgs?.[i] ?? p.default ?? ANY])))
+		: entry.type, depth - 1);
+}
+
 export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): Type {
 	const idx = stopAtRef ? 1 : 0;
 	const slot = scope.resolveCache?.get(t);
@@ -1122,6 +1156,12 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 					if (!ns)
 						return t;
 
+					// A ref naming a real CLASS keeps its nominal identity, exactly as `case 'array'` above
+					// keeps a named element: this compiler dispatches on a class by NAME (`ownerFor`,
+					// `ensureClass`), and an expanded member list has no name left. A consumer that wants
+					// the MEMBERS asks for them: `resolveMembers`.
+					if (ns.decl(name)?.type === 'class_decl')
+						return t;
 					const entry = ns.type(name);
 					if (entry) {
 						if (!entry.typeParams?.length)
@@ -1497,7 +1537,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 		}
 		// A bare `ref` stamped with its own `declScope` resolves there instead of in `scope` -- the caller's chain may shadow it
 		// (e.g. DOM's `Element`). `resolve()` itself stays unaware of `declScope`; this is the one bounded place that consults it.
-		t = resolveOwn(t, scope);
+		t = resolveMembers(t, scope, depth);
 		// A LITERAL type has the members of the primitive it is a literal of. Without this, a method call
 		// on a literal receiver -- `'a,b'.split(/,/)`, `(255).toString(16)` -- typed as `any`, and towasm
 		// only got away with it because a `var_decl` has a separate path that reads the declared return
@@ -2082,7 +2122,7 @@ export function memberOptional(t: Type, prop: string, scope: Scope, depth = 6): 
 // `undefined` = `prop` isn't declared by this part at all -- only meaningful within an intersection, where a part
 // that doesn't mention `prop` imposes no constraint on it and must neither force it required nor count as optional.
 function memberOptionalState(t: Type, prop: string, scope: Scope, depth: number): 'optional' | 'required' | undefined {
-	t = resolveOwn(t, scope);
+	t = resolveMembers(t, scope, depth);
 	if (t.type === 'object') {
 		const m = findTypeMember(t.members, prop);
 		return m ? (hasMod(m, 'optional') ? 'optional' : 'required') : undefined;

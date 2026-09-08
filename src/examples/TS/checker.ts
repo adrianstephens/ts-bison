@@ -878,13 +878,11 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 		// throughout). Scoped to just this one call site, not `resolve` globally -- unwrapping still has
 		// to happen everywhere else (e.g. so an `i32` and a `number` branch of a ternary still unify).
 		const stopAtPseudoType = typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs && T.WASM_PSEUDO_TYPES.has(typeAnnotation.name);
-		const stopAtClassRef = typeAnnotation?.type === 'ref' && !typeAnnotation.name.includes('.')
-			&& ((typeAnnotation.declScope as Scope | undefined) ?? scope).decl(typeAnnotation.name)?.type === 'class_decl';
 		// A bare (no-typeArgs) ref's own `declScope` wins over the ambient `scope` here -- this bakes the result in once rather than
 		// re-resolving lazily, so it must resolve in the declaring module now, before a generic ref's own type args get lost.
 		scope.addValue(d.name, typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs && typeAnnotation.declScope
-			? T.resolve(typeAnnotation.declScope as Scope, typeAnnotation, undefined, stopAtPseudoType || stopAtClassRef)
-			: typeAnnotation ? T.resolve(scope, typeAnnotation, undefined, stopAtPseudoType || stopAtClassRef)
+			? T.resolve(typeAnnotation.declScope as Scope, typeAnnotation, undefined, stopAtPseudoType)
+			: typeAnnotation ? T.resolve(scope, typeAnnotation, undefined, stopAtPseudoType)
 			: d.init ? typeOf(d.init, scope, widen, undefined, undefined, err) : T.ANY);
 		// TS 4.4 aliased conditions: a `const`'s initializer stays true for its whole lifetime, so narrowing the const
 		// also narrows through what its initializer itself would narrow (`narrow()`'s `case 'identifier'` reads this).
@@ -1314,7 +1312,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// nullish) union, none of the branches below (`'array'`/`'tuple'`/index-signature/named-key)
 				// would ever match at all, since `T.resolve` never collapses a union on its own, and every
 				// one would silently fall through to the bare `T.ANY` at the end.
-				const objT = T.resolve(scope, T.nonNullable(rawObjT, scope, chained));
+				// `resolveMembers`: every branch below reads a STRUCTURE off `objT` -- an element type, a
+				// tuple, an index signature, a named key -- so this is one of the few places a named class
+				// has to give up its nominal identity (`Array<T>` spelled out, chief among them).
+				const objT = T.resolveMembers(T.nonNullable(rawObjT, scope, chained), scope);
 				recurse(e.index);
 				if (objT.type === 'array')
 					return T.optional(objT.element, chained);
