@@ -237,12 +237,53 @@ export class String {
 	// EXACTLY at the cursor, and an empty match at the previous split point never splits again. The old
 	// loop pushed each SEPARATOR match instead of the text between them, so `'a,b,c'.split(/,/)` was
 	// `[',', ',', 'c']` -- with the right length, which is why only a value comparison caught it.
-	split(separator: RegExp, limit: i32 = 0x7fffffff): string[] {
+	// `string | RegExp`, narrowed by `typeof`: lib.d.ts always declared the union, but only the RegExp
+	// half existed, so `'a.b'.split('.')` type-checked and then failed codegen converting the string to
+	// a `RegExp`.
+	split(separator: string | RegExp, limit: i32 = 0x7fffffff): string[] {
 		const s: string = this as unknown as string;
 		const result: string[] = [];
 		const size = s.length;
 		if (limit === 0)
 			return result;
+		if (typeof separator === 'string') {
+			const sep: string = separator;
+			const m = sep.length;
+			// An empty subject splits to `[]` only when the separator matches it -- i.e. is itself empty.
+			if (size === 0) {
+				if (m !== 0)
+					result.push(s);
+				return result;
+			}
+			// An empty separator splits into single characters; the general scan below would match at
+			// every position and make no progress.
+			if (m === 0) {
+				for (let i = 0; i < size; i++) {
+					result.push(s.slice(i, i + 1));
+					if (result.length >= limit)
+						return result;
+				}
+				return result;
+			}
+			let p = 0;
+			let q = 0;
+			while (q + m <= size) {
+				let j = 0;
+				while (j < m && s.charCodeAt(q + j) === sep.charCodeAt(j))
+					j++;
+				if (j === m) {
+					result.push(s.slice(p, q));
+					if (result.length >= limit)
+						return result;
+					q = q + m;
+					p = q;
+				} else {
+					q = q + 1;
+				}
+			}
+			result.push(s.slice(p, size));
+			return result;
+		}
 		// An empty subject is `[]` when the separator matches it, `['']` otherwise.
 		if (size === 0) {
 			// `execFrom`, not `exec` -- split scans regardless of `separator`'s own `g`/`lastIndex`

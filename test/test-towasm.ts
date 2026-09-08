@@ -1313,6 +1313,36 @@ async function main() {
 	}
 
 	{
+		// `String.split` was declared `string | RegExp` in lib.d.ts but only the RegExp half was ever
+		// implemented, so a string separator type-checked and then failed codegen trying to convert the
+		// string to a `RegExp`. The two degenerate cases are the ones worth pinning: an empty separator
+		// splits into characters (the general scan would match everywhere and never advance), and an
+		// empty subject splits to `[]` only when the separator matches it -- i.e. is itself empty.
+		const r = await compile(`
+			export function parts(): number { return "a.b.c".split(".").length; }
+			export function keepsText(): number { return "a.bb.c".split(".")[1].length; }
+			export function multiChar(): number { return "a::b::c".split("::").length; }
+			export function noMatch(): number { return "abc".split(",").length; }
+			export function limited(): number { return "a,b,c,d".split(",", 2).length; }
+			export function emptySep(): number { return "abcd".split("").length; }
+			export function emptySubject(): number { return "".split(",").length; }
+			export function emptyBoth(): number { return "".split("").length; }
+			export function leadingSep(): number { return ",a".split(",")[0].length; }
+			export function regexpStill(): number { return "a1b2c".split(/[0-9]/).length; }
+		`);
+		check("split: a string separator", r.parts(), 3);
+		check("split: the pieces are the text BETWEEN separators", r.keepsText(), 2);
+		check("split: a multi-character separator", r.multiChar(), 3);
+		check("split: no match is the whole string", r.noMatch(), 1);
+		check("split: 'limit' caps the result", r.limited(), 2);
+		check("split: an empty separator splits into characters", r.emptySep(), 4);
+		check("split: an empty subject with a non-matching separator", r.emptySubject(), 1);
+		check("split: an empty subject with an empty separator", r.emptyBoth(), 0);
+		check("split: a leading separator yields an empty first piece", r.leadingSep(), 0);
+		check("split: the RegExp overload still works", r.regexpStill(), 3);
+	}
+
+	{
 		// An empty array literal `[]` has no elements for `arrayKindOf` to infer a kind from -- it used
 		// to fall back to 'ref' unconditionally, ignoring the declared target type entirely, and fail
 		// for any non-ref target ("cannot convert {arr:ref} to {arr:f64}"). Found while building Map/Set
