@@ -13,11 +13,11 @@ type TypeSpecifierExt	= CPP.TypeSpecifierExt;
 type TypeName			= CPP.TypeName;
 type DeclSpec			= CPP.DeclSpec;
 type ParamDecl			= CPP.ParamDecl;
-type Block				= C.Block<Declarator, TypeSpecifierExt>;
+type Block				= C.Block<Declarator, TypeSpecifierExt, Expr, Stmt>;
 // The `declaration`/`typedef` tags, widened -- cpp's `Definition`/`Statement` unions inline these rather than
 // exporting them under their own names (see walker.ts's identical note).
-type Declaration			= C.Declaration<Declarator, TypeSpecifierExt>;
-type TypedefDecl			= C.TypedefDecl<Declarator, TypeSpecifierExt>;
+type Declaration			= C.Declaration<Declarator, TypeSpecifierExt, Expr>;
+type TypedefDecl			= C.TypedefDecl<Declarator, TypeSpecifierExt, Expr>;
 type DeclarationSpec		= CPP.DeclarationSpec;
 
 const DefaultOptions = {
@@ -40,7 +40,6 @@ export type Options = Partial<typeof DefaultOptions>;
 
 const BINARY_PREC: Record<string, number> = {
 	',':	1,
-	'=':2, '+=':2, '-=':2, '*=':2, '/=':2, '%=':2, '&=':2, '|=':2, '^=':2, '<<=':2, '>>=':2, '&&=':2, '||=':2,
 	'||':	4,
 	'&&':	5,
 	'|':	6,
@@ -60,13 +59,10 @@ const POSTFIX_PREC		= 16;
 const PRIMARY_PREC		= 17;
 const ASSIGN_PREC		= 2;	// what function args / initializers / default values are parsed as (excludes bare comma)
 
-function isAssignOp(op: string) {
-	return op === '=' || (op.endsWith('=') && !['==', '!=', '<=', '>='].includes(op));
-}
-
 function exprPrecedence(e: Expr): number {
 	switch (e.type) {
 		case 'binary':			return BINARY_PREC[e.operator] ?? 0;
+		case 'assign':			return ASSIGN_PREC;
 		case 'conditional':		return CONDITIONAL_PREC;
 		case 'cast':			return CAST_PREC;
 		case 'unary':
@@ -255,12 +251,12 @@ export class Output {
 		return this.declSpec(p.specifiers) + (declared ? ' ' + declared : '') + maybe(p.default, d => ' = ' + this.expr(d, ASSIGN_PREC));
 	}
 
-	initDeclaratorStr(d: C.InitDeclarator<Declarator>): string {
+	initDeclaratorStr(d: C.InitDeclarator<Declarator, Expr>): string {
 		return isDeclarator(d) ? this.declStr(d as Declarator)
 			: this.declStr(d.declarator) + ' = ' + this.initializerStr(d.initializer);
 	}
-	initializerStr(i: C.Initializer): string {
-		return isExpr(i) ? this.expr(i as Expr, ASSIGN_PREC)
+	initializerStr(i: C.Initializer<Expr>): string {
+		return isExpr(i) ? this.expr(i, ASSIGN_PREC)
 			: '{' + i.elements.map(e => this.initializerStr(e)).join(this.comma) + '}';
 	}
 
@@ -407,6 +403,12 @@ export class Output {
 		}
 	}
 
+	// The AST holds the real (unescaped) character(s), like `literal`'s string case -- re-escaped via
+	// `JSON.stringify` (whose escape set is a subset of C's) and re-quoted single rather than double.
+	charLiteral(value: string): string {
+		return "'" + JSON.stringify(value).slice(1, -1).replace(/\\"/g, '"').replace(/'/g, "\\'") + "'";
+	}
+
 	captureStr(c: CPP.LambdaCapture): string {
 		if (c.thisCapture)
 			return 'this';
@@ -424,13 +426,16 @@ export class Output {
 		switch (e.type) {
 			case 'identifier':			return e.name;
 			case 'literal':				return this.literal(e);
-			case 'char_literal':		return "'" + e.value + "'";
+			case 'char_literal':		return this.charLiteral(e.value);
 			case 'unary':				return e.operator + poss(/[a-z]/i.test(e.operator), ' ') + this.expr(e.operand, UNARY_PREC);
 			case 'unary_post':			return this.expr(e.operand, POSTFIX_PREC) + e.operator;
 			case 'binary': {
-				const op = e.operator, prec = BINARY_PREC[op] ?? 0, rightAssoc = isAssignOp(op);
-				return this.expr(e.left, rightAssoc ? prec + 1 : prec) + this.operator(op) + this.expr(e.right, rightAssoc ? prec : prec + 1);
+				const op = e.operator, prec = BINARY_PREC[op] ?? 0;
+				return this.expr(e.left, prec) + this.operator(op) + this.expr(e.right, prec + 1);
 			}
+			// Right-associative and the loosest thing there is: the target re-emits at the postfix tier
+			// the grammar demands, the value at assignment's own tier -- same shape as TS/tocode.ts's own `assign`.
+			case 'assign':				return this.expr(e.target, POSTFIX_PREC) + this.operator((e.operator ?? '') + '=') + this.expr(e.value, ASSIGN_PREC);
 			case 'conditional':			return this.expr(e.test, LOGICAL_OR_PREC) + this.operator('?') + this.expr(e.consequent, 0) + this.operator(':') + this.expr(e.alternate, CONDITIONAL_PREC);
 			case 'index':				return this.expr(e.object, POSTFIX_PREC) + '[' + this.expr(e.index) + ']';
 			case 'member':				return this.expr(e.object, POSTFIX_PREC) + '.' + e.property;

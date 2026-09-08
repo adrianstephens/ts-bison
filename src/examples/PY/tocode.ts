@@ -61,14 +61,19 @@ function exprPrecedence(e: Expr): number {
 function withParens(s: string, wrap: boolean) { return wrap ? '(' + s + ')' : s; }
 function maybe<T>(v: T, f: (v: NonNullable<T>) => string) { return v ? f(v as NonNullable<T>) : ''; }
 
-// Re-quote a string `Literal` value. The parser keeps the *raw* inner text (escapes not processed),
-// so this must not re-escape either -- just pick a quote style the raw text doesn't already contain.
+// Re-quote a string `Literal` value. The parser now decodes escapes into the real string (matching
+// js-parser.ts's/c-parser.ts's own convention), so this has to re-escape backslashes and whichever
+// quote character it picks -- a literal embedded newline is the one thing left un-escaped, since a
+// triple-quoted string can hold one directly (picking whichever triple-quote style isn't already present).
 function pyStr(v: string): string {
-	const single = !v.includes('\n') && (!v.includes('"') ? '"' : !v.includes("'") ? "'" : '');
-	return single ? single + v + single
-		: !v.includes('"""') ? '"""' + v + '"""'
-		: !v.includes("'''") ? "'''" + v + "'''"
-		: '"""' + v.replace(/"/g, '\\"') + '"""';
+	const esc = v.replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\r/g, '\\r');
+	if (!v.includes('\n')) {
+		const quote = !esc.includes('"') ? '"' : !esc.includes("'") ? "'" : '"';
+		return quote + esc.split(quote).join('\\' + quote) + quote;
+	}
+	return	!esc.includes('"""')	? '"""' + esc + '"""'
+		:	!esc.includes("'''")	? "'''" + esc + "'''"
+		:	'"""' + esc.replace(/"/g, '\\"') + '"""';
 }
 
 export class Output {

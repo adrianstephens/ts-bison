@@ -2,7 +2,7 @@ import * as path from 'path';
 import { makeRule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
-import { Literal, Identifier, Unary, UnaryPost, Binary, stampPos } from '../common';
+import { Literal, Identifier, Unary, UnaryPost, Binary, Assign, stampPos } from '../common';
 import type * as Common from '../common';
 
 // ===================================================================
@@ -31,6 +31,27 @@ export const CHAR_LITERAL 	= /'(?:[^'\\]|\\.)*'/;
 
 export const BUILTIN_TYPE	= ['int', 'float', 'double', 'void', 'char', 'short', 'long', 'signed', 'unsigned'] as const;
 
+// A code point outside the valid range (an over-long `\U`/`\u` escape) falls back to U+FFFD rather than
+// throwing -- same call js-parser.ts's own `codePoint` makes for `\u{...}`.
+const codePoint = (n: number) => n >= 0 && n <= 0x10FFFF ? String.fromCodePoint(n) : '�';
+
+// Decodes a C string/char literal's escapes into real characters -- same convention js-parser.ts's
+// `unescapeString` uses (and py-parser.ts deliberately does NOT: see its own header comment), so a
+// `Literal<string>.value` means the same thing (the actual runtime string) across every one of these
+// parsers rather than raw source text the consumer has to know to unescape itself.
+export const unescapeCString = (s: string): string => s.replace(
+	/\\(?:x([0-9a-fA-F]+)|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([0-7]{1,3})|(.))/g,
+	(_, hex, u4, u8, oct, ch) =>
+		hex !== undefined	? String.fromCharCode(parseInt(hex, 16) & 0xFF)
+		: u4 !== undefined	? codePoint(parseInt(u4, 16))
+		: u8 !== undefined	? codePoint(parseInt(u8, 16))
+		: oct !== undefined	? String.fromCharCode(parseInt(oct, 8) & 0xFF)
+		: ch === undefined	? ''
+		: ch === 'n' ? '\n' : ch === 't' ? '\t' : ch === 'r' ? '\r' : ch === 'a' ? '\x07' : ch === 'b' ? '\b' : ch === 'f' ? '\f' : ch === 'v' ? '\v'
+		: ch
+);
+export const unquoteCString = (s: string): string => unescapeCString(s.slice(1, -1));
+
 // --- Precedence Levels (lowest to highest) ---
 export const PREC = {
 	comma:			{assoc: 'left'},
@@ -54,11 +75,15 @@ export const PREC = {
 //  AST Types -- one per non-terminal group (or shared where alts agree)
 // ===================================================================
 export type unaryOps	= '++'|'--'|'+'|'-'|'~'|'!'|'&'|'*'|'sizeof';
-export type binaryOps	= ','|'+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'|'>>'
+export type binaryOps	= ','|'+'|'-'|'*'|'/'|'%'|'**'|'&'|'|'|'^'|'<<'|'>>'
 						| '&&'|'||'
 						|'<'|'>'|'<='|'>='|'=='|'!='
-						|'='|'+='|'-='|'*='|'/='|'%='|'&='|'|='|'^='|'<<='|'>>='
-						|'&&='|'||='
+
+// The base operators a compound assignment (`+=`, `&&=`, ...) can combine with; `assignOps` is the
+// full spelling as it appears in source. Mirrors js-parser.ts's `assignableOps`/`assignOps` split --
+// see common.ts's `Assign` for why this is its own node rather than a `Binary` ending in `=`.
+export type assignableOps	= '+'|'-'|'*'|'/'|'%'|'&'|'|'|'^'|'<<'|'>>'|'&&'|'||';
+export type assignOps		= '='|`${assignableOps}=`;
 
 export type TypeQualifier	= 'const' | 'volatile';
 // `typedef` is recognized by the same terminal as these (see `storage_class_specifier`), but it isn't a storage
@@ -96,12 +121,12 @@ export interface Enumerator			{ name: string; init?: Expr; }
 // Same tag-only-vs-definition distinction as StructSpecifier above.
 export interface EnumSpecifier		{ type: 'enum'; name?: string; members?: Enumerator[]; }
 
-export interface Declaration<D = Declarator, X = never>		{ type: 'declaration'; specifiers: DeclarationSpec<X>; initDeclarators?: InitDeclarator<D>[]; }
+export interface Declaration<D = Declarator, X = never, E = never>	{ type: 'declaration'; specifiers: DeclarationSpec<X>; initDeclarators?: InitDeclarator<D, E>[]; }
 // `typedef int foo, *foo_ptr;` -- a distinct declaration kind (declares type aliases, not variables), not a
 // `Declaration` tagged with a `typedef` storage class. `declarators` reuses `InitDeclarator` (rather than a
 // bare `Declarator[]`) purely to share `init_declarator_list`'s grammar production; typedefs never actually
 // carry an initializer.
-export interface TypedefDecl<D = Declarator, X = never>		{ type: 'typedef'; specifiers: DeclSpec<X>; declarators: InitDeclarator<D>[]; }
+export interface TypedefDecl<D = Declarator, X = never, E = never>	{ type: 'typedef'; specifiers: DeclSpec<X>; declarators: InitDeclarator<D, E>[]; }
 
 // One qualifier set per `*`, outermost (leftmost in source) first -- `int * const * volatile p` is
 // `[['const'], ['volatile']]` (the outer pointer is `const`, the inner one `volatile`).
@@ -157,8 +182,8 @@ export interface TypeName<D = AbstractDeclarator, X = never>			{ specifiers: Dec
 
 // Initializers permissively allow a brace list anywhere an initializer can go (mirroring real C's `initializer-list`); designated initializers
 // (`.field = x`, `[i] = x`) aren't supported -- a known simplification.
-export type Initializer				= Expr | { type: 'initializer_list'; elements: Initializer[] };
-export type InitDeclarator<D = Declarator>	= D | { declarator: D; initializer: Initializer };
+export type Initializer<X = never>			= Expr<X> | { type: 'initializer_list'; elements: Initializer<X>[] };
+export type InitDeclarator<D = Declarator, X = never>	= D | { declarator: D; initializer: Initializer<X> };
 
 // `Declarator`'s own default for `P` is (bare) `ParameterDecl`, so `ParameterDecl`'s default for `D` can't
 // also be (bare) `Declarator` -- TS can't resolve two type-parameter defaults that each depend on the other's
@@ -173,49 +198,63 @@ export function  ParameterDecl<D = PlainDeclarator, X = never>(specifiers: Decla
 // sentinel mixed into the array, mirroring JS/TS's `Params<T> = {params, rest?}` split.
 export interface ParamList<P = ParameterDecl>		{ params: P[]; variadic?: boolean; }
 
-export interface FunctionDef<D = Declarator, X = never>		{ type: 'function_def'; specifiers: DeclarationSpec<X>; declarator: D; body: Block<D, X>; }
-export type Definition<D = Declarator, X = never>				= Declaration<D, X> | TypedefDecl<D, X> | FunctionDef<D, X>;
-export interface TranslationUnit<D = Declarator, X = never>	{ type: 'translation_unit'; body: Definition<D, X>[]; }
+export interface FunctionDef<D = Declarator, X = never, E = never, S = never>		{ type: 'function_def'; specifiers: DeclarationSpec<X>; declarator: D; body: Block<D, X, E, S>; }
+export type Definition<D = Declarator, X = never, E = never, S = never>			= Declaration<D, X, E> | TypedefDecl<D, X, E> | FunctionDef<D, X, E, S>;
+export interface TranslationUnit<D = Declarator, X = never, E = never, S = never>	{ type: 'translation_unit'; body: Definition<D, X, E, S>[]; }
 
-export interface Block<D = Declarator, X = never>				{ type: 'block'; body: Stmt<D, X>[]; }
-export interface ForClauses<D = Declarator, X = never>			{ init: Expr | Declaration<D, X> | TypedefDecl<D, X> | undefined; test?: Expr; update?: Expr; }
+export interface Block<D = Declarator, X = never, E = never, S = never>			{ type: 'block'; body: Stmt<D, X, E, S>[]; }
+export interface ForClauses<D = Declarator, X = never, E = never>		{ init: Expr<E> | Declaration<D, X, E> | TypedefDecl<D, X, E> | undefined; test?: Expr<E>; update?: Expr<E>; }
 
-export type Stmt<D = Declarator, X = never> =
-	| Block<D, X>
-	| Declaration<D, X>
-	| TypedefDecl<D, X>
-	| Common.If<Expr, Stmt<D, X>>
-	| Common.While<Expr, Stmt<D, X>>
-	| Common.DoWhile<Expr, Stmt<D, X>>
-	| { type: 'for'; body: Stmt<D, X> } & ForClauses<D, X>
-	| { type: 'switch'; discriminant: Expr; body: Stmt<D, X> }
-	| { type: 'case'; test: Expr; body: Stmt<D, X> }
-	| { type: 'default'; body: Stmt<D, X> }
+// `E`: `Expr`'s own widening seam, threaded through (defaults to `never`, same as `Expr<X>` itself) so a
+// cpp-only expression form is legal in every statement position (`if`/`while`/`return`/...) too, not just
+// nested inside another expression. `S`: a whole extra STATEMENT shape (`throw`/`try`/...) -- same idea as
+// js-parser.ts's own `Stmt<T,X>` seam, just under a different letter since this file's `X` is already the
+// TypeSpecifier seam. Mirrors `Declarator<R,P>`/`TypeName<D,X>`'s own seams -- these were missing (see
+// ts2py.ts's cpp2ts section history for what their absence costs a consumer).
+export type Stmt<D = Declarator, X = never, E = never, S = never> =
+	| Block<D, X, E, S>
+	| Declaration<D, X, E>
+	| TypedefDecl<D, X, E>
+	| Common.If<Expr<E>, Stmt<D, X, E, S>>
+	| Common.While<Expr<E>, Stmt<D, X, E, S>>
+	| Common.DoWhile<Expr<E>, Stmt<D, X, E, S>>
+	| { type: 'for'; body: Stmt<D, X, E, S> } & ForClauses<D, X, E>
+	| { type: 'switch'; discriminant: Expr<E>; body: Stmt<D, X, E, S> }
+	| { type: 'case'; test: Expr<E>; body: Stmt<D, X, E, S> }
+	| { type: 'default'; body: Stmt<D, X, E, S> }
 	| { type: 'break' }
 	| { type: 'continue' }
-	| Common.Return<Expr>
+	| Common.Return<Expr<E>>
 	| { type: 'goto'; label: string }
-	| Common.Labeled<Stmt<D, X>>
+	| Common.Labeled<Stmt<D, X, E, S>>
 	| { type: 'empty' }
 	// An expression used as a statement gets a real wrapper node, like js-parser's and py-parser's --
 	// inlining bare `Expr` into this union made "is this a statement or an expression" undecidable.
-	| Common.ExprStmt<Expr>;
+	| Common.ExprStmt<Expr<E>>
+	| S;
 
-export type Expr =
+// `X`: the expression-widening seam -- defaults to `never` (plain C), cpp instantiates it with its own
+// (self-referential) `Expr` so a cpp-only expression form (`this`, `new`, a lambda, ...) is legal at
+// every recursive position (a `Binary`'s operands, a `Call`'s arguments, ...) without a cast. Mirrors
+// `Declarator<R,P>`'s own seam -- including the same "union `X` in once, recursive refs need no `| X`"
+// shape, since every recursive `Expr<X>` here already carries `X` along with it.
+export type Expr<X = never> =
 	| Identifier
 	| Literal<number|string>
 	| { type: 'char_literal'; value: string }
-	| Unary<Expr, unaryOps>
-	| UnaryPost<Expr, unaryOps>
-	| Binary<Expr, binaryOps>
-	| { type: 'conditional'; test: Expr; consequent: Expr; alternate: Expr }
-	| Common.Index<Expr>
-	| Common.Member<Expr>
+	| Unary<Expr<X>, unaryOps>
+	| UnaryPost<Expr<X>, unaryOps>
+	| Binary<Expr<X>, binaryOps>
+	| Common.Assign<Expr<X>, assignableOps>
+	| { type: 'conditional'; test: Expr<X>; consequent: Expr<X>; alternate: Expr<X> }
+	| Common.Index<Expr<X>>
+	| Common.Member<Expr<X>>
 	// `->` is not `.`: it dereferences first, so it stays its own node rather than a flag on `member`.
-	| { type: 'pointer_member'; object: Expr; property: string }
-	| Common.Call<Expr>
-	| { type: 'cast'; typeAnnotation: TypeName; expression: Expr }
-	| { type: 'sizeof_type'; operand: TypeName };
+	| { type: 'pointer_member'; object: Expr<X>; property: string }
+	| Common.Call<Expr<X>>
+	| { type: 'cast'; typeAnnotation: TypeName; expression: Expr<X> }
+	| { type: 'sizeof_type'; operand: TypeName }
+	| X;
 
 /** The base identifier a declarator ultimately names, digging through function/array/pointer wrappers. */
 export function declaratorName(d: Declarator): string {
@@ -232,6 +271,11 @@ export function declaratorName(d: Declarator): string {
 const Rule = makeRule<Ctx>(stampPos);
 
 const ASSIGN_OP = OneOf(['+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '&&=', '||=', '=']);
+
+// `=` has no base operator; every other form drops its trailing `=` ONCE, here -- same split as
+// js-parser.ts's own `assign` helper, and for the same reason (see common.ts's `Assign`).
+const assign = (op: assignOps, target: Expr, value: Expr) =>
+	Assign<Expr, assignableOps>(target, value, op === '=' ? undefined : op.slice(0, -1) as assignableOps);
 
 // Declared bottom-up (leaf non-terminals first) so each rule can reference an already-declared group BY OBJECT (typed, no cast needed) instead of by name (untyped string, needs `as`).
 // Every self-recursive rule, and exactly one edge per genuine cycle (chosen as whichever single rule sacrifices the fewest alternatives), necessarily stays a string -- see the comments below.
@@ -262,7 +306,7 @@ assignment_expression = Rules<Expr>(self => [
 	WithPrec(Rule([self, '&&', self], 							$ => Binary('&&',	$[0], $[2])), 		PREC.logicalAnd),
 	WithPrec(Rule([self, '||', self],							$ => Binary('||',	$[0], $[2])), 		PREC.logicalOr),
 	WithPrec(Rule([self, '?', self, ':', self],					$ => ({ type: 'conditional', test: $[0], consequent: $[2], alternate: $[4] })), 	PREC.conditional),
-	WithPrec(Rule([self, ASSIGN_OP,  self], 					$ => Binary($[1],	$[0], $[2])), 		PREC.assignment),
+	WithPrec(Rule([self, ASSIGN_OP,  self], 					$ => assign($[1] as assignOps, $[0], $[2])), 		PREC.assignment),
 ]),
 
 // The comma operator's own level, kept out of assignment_expression -- this is what plain `expression` means in real C:
@@ -284,8 +328,8 @@ primary_expression = Rules(
 	Rule([IDENT], 												$ => Identifier($[0])),
 	Rule([INT_LITERAL],											$ => Literal(parseInt($[0], 10))),
 	Rule([FLOAT_LITERAL], 										$ => Literal(parseFloat($[0]))),
-	Rule([STRING_LITERAL], 										$ => Literal($[0])),
-	Rule([CHAR_LITERAL], 										$ => ({ type: 'char_literal', value: $[0] } as const)),
+	Rule([STRING_LITERAL], 										$ => Literal(unquoteCString($[0]))),
+	Rule([CHAR_LITERAL], 										$ => ({ type: 'char_literal', value: unquoteCString($[0]) } as const)),
 	Rule(['(', expression, ')'], 								$ => $[1]),
 ),
 

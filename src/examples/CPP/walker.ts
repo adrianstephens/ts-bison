@@ -14,12 +14,12 @@ type TypeSpecifier		= CPP.TypeSpecifier;
 type TypeSpecifierExt	= CPP.TypeSpecifierExt;
 type DeclSpec			= CPP.DeclSpec;
 type ParamDecl			= CPP.ParamDecl;
-type InitDeclarator	=	 C.InitDeclarator<Declarator>;
-type Block				= C.Block<Declarator, TypeSpecifierExt>;
+type InitDeclarator	=	 C.InitDeclarator<Declarator, Expr>;
+type Block				= C.Block<Declarator, TypeSpecifierExt, Expr, Stmt>;
 // The `declaration`/`typedef` tags, widened -- cpp's `Definition`/`Statement` unions inline these rather than
 // exporting them under their own names, so name the widened instantiations locally.
-type Declaration		= C.Declaration<Declarator, TypeSpecifierExt>;
-type TypedefDecl		= C.TypedefDecl<Declarator, TypeSpecifierExt>;
+type Declaration		= C.Declaration<Declarator, TypeSpecifierExt, Expr>;
+type TypedefDecl		= C.TypedefDecl<Declarator, TypeSpecifierExt, Expr>;
 
 // ===================================================================
 //  Type Guards
@@ -32,7 +32,7 @@ export function guard<R>(types: string[]) {
 
 const definitionTags	= ['declaration', 'typedef', 'function_def', 'namespace', 'linkage', 'using_namespace', 'using_decl', 'using_alias', 'template', 'static_assert', 'method_def', 'constructor_def', 'destructor_def', 'operator_def', 'static_member_def'];
 const statementOnlyTags = ['block', 'expression', 'if', 'while', 'do_while', 'for', 'switch', 'case', 'default', 'break', 'continue', 'return', 'goto', 'labeled', 'empty', 'throw', 'try', 'range_for'];
-const exprTags			= ['identifier', 'literal', 'char_literal', 'unary', 'unary_post', 'binary', 'conditional', 'index', 'member', 'pointer_member', 'call', 'cast', 'sizeof_type', 'this', 'null_literal', 'qualified', 'new', 'delete', 'spread', 'sizeof_pack', 'cpp_cast', 'typeid', 'alignof', 'functional_cast', 'lambda'];
+const exprTags			= ['identifier', 'literal', 'char_literal', 'unary', 'unary_post', 'binary', 'assign', 'conditional', 'index', 'member', 'pointer_member', 'call', 'cast', 'sizeof_type', 'this', 'null_literal', 'qualified', 'new', 'delete', 'spread', 'sizeof_pack', 'cpp_cast', 'typeid', 'alignof', 'functional_cast', 'lambda'];
 const classMemberTags	= ['struct_member', 'member_typedef', 'access_label', 'constructor', 'destructor', 'method', 'conversion', 'using_decl', 'using_alias', 'member_template'];
 const declaratorTags	= ['identifier', 'pointer', 'array', 'function', 'reference', 'rvalue_reference'];
 const packParamTags	= ['parameter']; // both ParameterDecl and PackParameter use this tag; distinguished by `pack`
@@ -125,8 +125,8 @@ export function walk<T extends Walkable>(ast: T,
 		isDeclarator(d) ? declarator(d as Declarator)
 			: mapObject(d, {declarator, initializer});
 
-	const initializer = (i: C.Initializer): C.Initializer =>
-		isExpr(i) ? mapExpression(i as Expr) as C.Initializer
+	const initializer = (i: C.Initializer<Expr>): C.Initializer<Expr> =>
+		isExpr(i) ? mapExpression(i)!
 			: mapObject(i, {elements: mapArrayA(initializer)});
 
 	const memberInitializer = (m: CPP.MemberInitializer): CPP.MemberInitializer => mapObject(m, {arguments: mapArrayA(mapExpressionA)});
@@ -154,6 +154,7 @@ export function walk<T extends Walkable>(ast: T,
 			case 'unary':
 			case 'unary_post':			return mapObject(e, {operand: mapExpressionA});
 			case 'binary':				return mapObject(e, {left: mapExpressionA, right: mapExpressionA});
+			case 'assign':				return mapObject(e, {target: mapExpressionA, value: mapExpressionA});
 			case 'conditional':			return mapObject(e, {test: mapExpressionA, consequent: mapExpressionA, alternate: mapExpressionA});
 			case 'index':				return mapObject(e, {object: mapExpressionA, index: mapExpressionA});
 			case 'member':
@@ -243,10 +244,8 @@ export function walk<T extends Walkable>(ast: T,
 			case 'while':
 			case 'do_while':			return mapObject(s, {test: mapExpressionA, body: mapStatementA});
 			case 'for':					return mapObject(s, {
-				// `ForClauses.init`'s `Expr` component is C's plain (never-extended) Expr too -- same residual
-				// narrowness as `ArrayDecl.size` above.
-				init:		(i: C.Expr | Declaration | TypedefDecl): C.Expr | Declaration | TypedefDecl | undefined =>
-					isExpr(i) ? mapExpression(i as Expr) as unknown as C.Expr : declarationLike(i),
+				init:		(i: Expr | Declaration | TypedefDecl): Expr | Declaration | TypedefDecl | undefined =>
+					isExpr(i) ? mapExpression(i) : declarationLike(i),
 				test:		mapExpression,
 				update:		mapExpression,
 				body:		mapStatementA,
@@ -369,7 +368,7 @@ export function walkB<T extends C.TranslationUnit | Definition | Stmt | Expr | C
 	const walkTypeName			= (t?: TypeName): boolean => !!t && (walkDeclSpec(t.specifiers) || walkDeclarator(t.declarator));
 	const walkParamDecl			= (p: ParamDecl): boolean => isPackParameter(p) ? false : walkDeclSpec(p.specifiers) || walkDeclarator(p.declarator) || walkExpression(p.default);
 	const walkInitDeclarator	= (d: InitDeclarator): boolean => isDeclarator(d) ? walkDeclarator(d as Declarator) : walkDeclarator(d.declarator) || walkInitializer(d.initializer);
-	const walkInitializer		= (i?: C.Initializer): boolean => !i ? false : isExpr(i) ? walkExpression(i as Expr) : i.elements.some(walkInitializer);
+	const walkInitializer		= (i?: C.Initializer<Expr>): boolean => !i ? false : isExpr(i) ? walkExpression(i) : i.elements.some(walkInitializer);
 	const walkStructDeclarator	= (d: CPP.StructDeclarator): boolean => 'declarator' in d ? walkDeclarator(d.declarator) || walkExpression(d.initializer) : walkExpression(d.width);
 	const walkStructMember		= (m: CPP.StructMember): boolean => walkDeclSpec(m.specifiers) || m.declarators.some(walkStructDeclarator);
 	const walkTemplateArg		= (a: CPP.TemplateArg): boolean => isExpr(a.value) ? walkExpression(a.value) : walkTypeName(a.value);
@@ -387,6 +386,7 @@ export function walkB<T extends C.TranslationUnit | Definition | Stmt | Expr | C
 			case 'unary':
 			case 'unary_post':			return walkExpression(e.operand);
 			case 'binary':				return walkExpression(e.left) || walkExpression(e.right);
+			case 'assign':				return walkExpression(e.target) || walkExpression(e.value);
 			case 'conditional':			return walkExpression(e.test) || walkExpression(e.consequent) || walkExpression(e.alternate);
 			case 'index':				return walkExpression(e.object) || walkExpression(e.index);
 			case 'member':

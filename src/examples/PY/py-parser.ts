@@ -327,10 +327,36 @@ function pyNumber(raw: string): Literal<number | bigint> | Imaginary {
 }
 const bigOrNum = (n: number, lit: string): number | bigint => Number.isSafeInteger(n) ? n : BigInt(lit);
 
+// A code point outside the valid range falls back to U+FFFD -- same call js-parser.ts's `codePoint` makes.
+const codePoint = (n: number) => n >= 0 && n <= 0x10FFFF ? String.fromCodePoint(n) : '�';
+
+// Decodes a Python string's escapes into real characters -- same convention js-parser.ts's own
+// `unescapeString`/c-parser.ts's `unescapeCString` use, so `Literal<string>.value` means the same thing
+// (the actual runtime string) across every one of these parsers. An unrecognized escape keeps its
+// backslash (CPython's own behaviour, just a DeprecationWarning there -- not an error), unlike JS/C's
+// "drop the backslash" rule for an unknown escape char.
+export const unescapePyString = (s: string): string => s.replace(
+	/\\(?:x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([0-7]{1,3})|\r\n|\n|(.))/g,
+	(_, hex, u4, u8, oct, ch) =>
+		hex !== undefined	? String.fromCharCode(parseInt(hex, 16))
+		: u4 !== undefined	? codePoint(parseInt(u4, 16))
+		: u8 !== undefined	? codePoint(parseInt(u8, 16))
+		: oct !== undefined	? String.fromCharCode(parseInt(oct, 8))
+		: ch === undefined	? ''		// line continuation (`\` immediately before a newline) vanishes
+		: ch === 'n' ? '\n' : ch === 't' ? '\t' : ch === 'r' ? '\r' : ch === 'a' ? '\x07' : ch === 'b' ? '\b' : ch === 'f' ? '\f' : ch === 'v' ? '\v'
+		: ch === '\\' || ch === '\'' || ch === '"' ? ch
+		: '\\' + ch
+);
+
+// `r`/`R` in the prefix suppresses escape processing entirely (a raw string) -- the prefix is otherwise
+// dropped (string/bytes distinction isn't modeled, see the file header comment).
 function pyString(parts: string[]): Literal<string> {
 	return Literal(parts.map(p => {
-		const m = /^[A-Za-z]*('''|"""|'|")([\s\S]*)\1$/.exec(p);
-		return m ? m[2] : p;
+		const m = /^([A-Za-z]*)('''|"""|'|")([\s\S]*)\2$/.exec(p);
+		if (!m)
+			return p;
+		const [, prefix, , inner] = m;
+		return /r/i.test(prefix) ? inner : unescapePyString(inner);
 	}).join(''));
 }
 

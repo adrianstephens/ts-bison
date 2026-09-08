@@ -50,20 +50,20 @@ export type TypeName			= C.TypeName<AbstractDeclarator, TypeSpecifierExt>;
 export interface PackParameter			{ type: 'parameter'; specifiers: DeclarationSpec; name?: string; byRef?: boolean; rvalueRef?: boolean; pack: true; }
 // A parameter carrying a default value (`int x = 5`) -- the one cpp-only addition to C's plain `ParameterDecl`
 // shape (default arguments don't exist in C). `ParamDecl` is what actually flows through every parameter list.
-export interface ParameterDecl			extends C.ParameterDecl<Declarator, TypeSpecifierExt> { default?: C.Expr; }
+export interface ParameterDecl			extends C.ParameterDecl<Declarator, TypeSpecifierExt> { default?: Expr; }
 export type ParamDecl			= ParameterDecl | PackParameter;
 
 export interface AccessLabel			{ type: 'access_label'; access: AccessSpecifier; }
-export interface MemberInitializer		{ name: string; arguments: C.Expr[]; }
+export interface MemberInitializer		{ name: string; arguments: Expr[]; }
 
 // The suffix of a member function past its parameter list: cv/noexcept/virt-specifiers plus how it ends
 // (a body, a bare declaration `;`, pure-virtual `= 0;`, `= default;`, or `= delete;`).
 export interface MethodTail {
 	isConst?: boolean; noexcept?: boolean; override?: boolean; final?: boolean;
-	body?: C.Block<Declarator, TypeSpecifierExt>; declarationOnly?: boolean; pure?: boolean; defaulted?: boolean; deleted?: boolean;
+	body?: C.Block<Declarator, TypeSpecifierExt, Expr, Stmt>; declarationOnly?: boolean; pure?: boolean; defaulted?: boolean; deleted?: boolean;
 }
 // How a constructor ends: an optional member-initializer list plus body, or `= default;`/`= delete;`/declaration-only.
-export interface CtorTail				{ initializerList?: MemberInitializer[]; body?: C.Block<Declarator, TypeSpecifierExt>; declarationOnly?: boolean; defaulted?: boolean; deleted?: boolean; }
+export interface CtorTail				{ initializerList?: MemberInitializer[]; body?: C.Block<Declarator, TypeSpecifierExt, Expr, Stmt>; declarationOnly?: boolean; defaulted?: boolean; deleted?: boolean; }
 
 const MemberMod = ['static', 'virtual', 'inline', 'constexpr', 'explicit', 'friend', 'mutable'] as const;
 export type MemberMod = typeof MemberMod[number];
@@ -75,7 +75,7 @@ export interface ConversionMember		extends MethodTail { type: 'conversion'; targ
 export interface UsingDeclMember		{ type: 'using_decl'; scope: string[]; name: string; }
 
 // C's own StructDeclarator is bitfield/bare-name only; C++ struct/unknown-type fields also carry a full declarator (pointers, arrays, references) plus an optional initializer.
-export interface DeclaratorField		{ declarator: Declarator; initializer?: C.Expr; }
+export interface DeclaratorField		{ declarator: Declarator; initializer?: Expr; }
 export type StructDeclarator			= C.StructDeclarator | DeclaratorField;
 
 export interface StructMember			extends C.StructMember<StructDeclarator, TypeSpecifierExt> { modifiers?: MemberMod[]; }
@@ -88,39 +88,45 @@ export interface BaseSpecifier			{ access?: AccessSpecifier; virtual?: boolean; 
 export interface ClassSpecifier			{ type: 'class' | 'struct' | 'union'; name?: string; final?: boolean; bases?: BaseSpecifier[]; body?: ClassMember[]; }
 export interface CppEnumSpecifier		{ type: 'enum'; name?: string; scoped?: boolean; base?: TypeSpecifier; members?: C.Enumerator[]; }
 
-export interface LambdaCapture { name?: string; byRef?: boolean; init?: C.Expr; thisCapture?: boolean; defaultCapture?: '=' | '&'; }
-export interface LambdaExpr extends C.ParamList<ParamDecl> { type: 'lambda'; captures: LambdaCapture[]; returnType?: TypeName; mutable?: boolean; body: C.Block<Declarator, TypeSpecifierExt>; }
+export interface LambdaCapture { name?: string; byRef?: boolean; init?: Expr; thisCapture?: boolean; defaultCapture?: '=' | '&'; }
+export interface LambdaExpr extends C.ParamList<ParamDecl> { type: 'lambda'; captures: LambdaCapture[]; returnType?: TypeName; mutable?: boolean; body: C.Block<Declarator, TypeSpecifierExt, Expr, Stmt>; }
 
 // `Expr` stays keyed off C's plain (never-extended) `cast`/`sizeof_type` `TypeName` -- casting/sizeof-ing an
 // inline class/enum-class type is vanishingly rare, not worth threading the seam into C's own Expr union for
 // (see c-parser.ts's `ArrayDecl.size` comment for the same call). cpp's *own* expression forms below all use
 // the widened `TypeName`/`TypeSpecifier`, since those positions (`static_cast<T>`, `new T`, ...) commonly do
 // need it (`static_cast<std::vector<int>&>(x)`).
-export type Expr = C.Expr
+//
+// `ExprAdditions` (rather than instantiating `C.Expr<Expr>` directly) is what makes this legal: TS rejects
+// a type alias whose own body directly names itself with no indirection (`type Expr = C.Expr<Expr> | ...`
+// errors as circular), the same reason `Declarator`'s self-reference above goes through the `Reference`/
+// `RvalueReference` wrapper interfaces rather than passing itself bare.
+export type Expr = C.Expr<ExprAdditions>;
+type ExprAdditions =
 	| { type: 'this' }
 	| Literal<boolean>
 	| { type: 'null_literal' }
 	| { type: 'qualified'; parts: string[] }
-	| { type: 'new'; typeName: TypeSpecifier; arguments?: C.Expr[]; size?: C.Expr; braced?: boolean; placement?: C.Expr[] }
-	| { type: 'delete'; operand: C.Expr; array?: boolean }
-	| Common.Spread<C.Expr>
+	| { type: 'new'; typeName: TypeSpecifier; arguments?: Expr[]; size?: Expr; braced?: boolean; placement?: Expr[] }
+	| { type: 'delete'; operand: Expr; array?: boolean }
+	| Common.Spread<Expr>
 	| { type: 'sizeof_pack'; name: string }
-	| { type: 'cpp_cast'; kind: string; target: TypeName; expression: C.Expr }
-	| { type: 'typeid'; expression?: C.Expr; target?: TypeName }
+	| { type: 'cpp_cast'; kind: string; target: TypeName; expression: Expr }
+	| { type: 'typeid'; expression?: Expr; target?: TypeName }
 	| { type: 'alignof'; target: TypeName }
-	| { type: 'functional_cast'; target: string; arguments: C.Expr[] }
+	| { type: 'functional_cast'; target: string; arguments: Expr[] }
 	| LambdaExpr;
 
 // Counts currently-open `Box<...>` generic-arg lists (for `>>` splitting, see "Wire it up" below). Its presence
 // also gates the shared IDENT callback into C++ mode, so TYPE_SCOPE reclassification never fires for plain cParser.
 export interface CppCtx extends C.Ctx { templateDepth: number; }
 
-export interface CatchClause			{ type?: TypeName; param?: string; byRef?: boolean; body: C.Block<Declarator, TypeSpecifierExt>; }
+export interface CatchClause			{ type?: TypeName; param?: string; byRef?: boolean; body: C.Block<Declarator, TypeSpecifierExt, Expr, Stmt>; }
 export interface UsingDirective			{ type: 'using_namespace'; name: string; }
 export interface UsingAlias				{ type: 'using_alias'; name: string; target: TypeName; }
 export interface NamespaceDecl			{ type: 'namespace'; name?: string; inline?: boolean; body: Definition[]; }
 export interface LinkageSpec			{ type: 'linkage'; language: string; body: Definition[]; }
-export interface StaticAssert			{ type: 'static_assert'; condition: C.Expr; message: string; }
+export interface StaticAssert			{ type: 'static_assert'; condition: Expr; message: string; }
 export interface TemplateParam			{ name: string; pack?: boolean; nonType?: DeclSpec; default?: TypeName | Expr; }
 export interface TemplateDecl			{ type: 'template'; params: TemplateParam[]; declaration: Definition | ClassSpecifier | UsingAlias; }
 
@@ -129,24 +135,27 @@ export interface TemplateDecl			{ type: 'template'; params: TemplateParam[]; dec
 export interface TemplateArg			{ value: TypeName | Expr; pack?: boolean; }
 export interface GenericType			{ type: 'generic'; name: string; args: TemplateArg[]; }
 export interface QualifiedType			{ type: 'qualified_type'; parts: string[]; dependent?: boolean; }
-export interface DecltypeSpecifier		{ type: 'decltype'; expression?: C.Expr; auto?: boolean; }
+export interface DecltypeSpecifier		{ type: 'decltype'; expression?: Expr; auto?: boolean; }
 
 export interface OutOfClassMethod		extends C.ParamList<ParamDecl> { type: 'method_def'; specifiers?: DeclarationSpec; pointer?: C.Levels; scope: string[]; name: string; tail: MethodTail; }
 export interface OutOfClassCtor			extends C.ParamList<ParamDecl> { type: 'constructor_def'; scope: string[]; name: string; tail: CtorTail; }
 export interface OutOfClassDtor			{ type: 'destructor_def'; scope: string[]; name: string; tail: MethodTail; }
 export interface OperatorDef			extends C.ParamList<ParamDecl> { type: 'operator_def'; specifiers: DeclarationSpec; scope?: string[]; operator: string; tail: MethodTail; }
-export interface StaticMemberDef		{ type: 'static_member_def'; specifiers: DeclarationSpec; pointer?: C.Levels; scope: string[]; name: string; initializer?: C.Expr; ctorArgs?: C.Expr[]; }
+export interface StaticMemberDef		{ type: 'static_member_def'; specifiers: DeclarationSpec; pointer?: C.Levels; scope: string[]; name: string; initializer?: Expr; ctorArgs?: Expr[]; }
 
-export type Stmt = C.Stmt<Declarator, TypeSpecifierExt>
-	| { type: 'throw'; argument?: C.Expr }
-	| { type: 'try'; body: C.Block<Declarator, TypeSpecifierExt>; handlers: CatchClause[] }
-	| { type: 'range_for'; specifiers: DeclarationSpec; declarator: Declarator; range: C.Expr; body: Stmt }
+// Same "named Additions type, not a bare self-reference" indirection `ExprAdditions` uses above --
+// `C.Stmt<..., Stmt>` directly would be a circular alias for the same reason `C.Expr<Expr>` was.
+export type Stmt = C.Stmt<Declarator, TypeSpecifierExt, Expr, StmtAdditions>;
+type StmtAdditions =
+	| { type: 'throw'; argument?: Expr }
+	| { type: 'try'; body: C.Block<Declarator, TypeSpecifierExt, Expr, Stmt>; handlers: CatchClause[] }
+	| { type: 'range_for'; specifiers: DeclarationSpec; declarator: Declarator; range: Expr; body: Stmt }
 	| StaticAssert
 	| UsingDirective
 	| UsingAlias
 	| UsingDeclMember;
 
-export type Definition = C.Definition<Declarator, TypeSpecifierExt>
+export type Definition = C.Definition<Declarator, TypeSpecifierExt, Expr, Stmt>
 	| NamespaceDecl
 	| LinkageSpec
 	| UsingDirective
@@ -159,6 +168,8 @@ export type Definition = C.Definition<Declarator, TypeSpecifierExt>
 	| OutOfClassDtor
 	| OperatorDef
 	| StaticMemberDef;
+
+export type TranslationUnit = C.TranslationUnit<Declarator, TypeSpecifierExt, Expr, Stmt>;
 
 // ===================================================================
 //  The TYPE_SCOPE lexer hack
@@ -1204,6 +1215,12 @@ C.init_declarator.push(
 const RIGHT_SHIFT			= terminal('>>',  />>/,		(_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : RIGHT_SHIFT);
 const RIGHT_SHIFT_ASSIGN	= terminal('>>=', />>=/,	(_, ctx: CppCtx) => ctx.templateDepth > 0 ? undefined : RIGHT_SHIFT_ASSIGN);
 
+// Relabeled the same way `external_definition`/`statement`/etc. are above: the exact same Rules object
+// c-parser.ts built (cpp's own productions are `.push()`ed onto `external_definition`, which this
+// reaches transitively), just seen here at cpp's own (widened) `TranslationUnit` type instead of C's
+// bare default -- this is what makes `CPP.parse()`'s return type cpp's own `TranslationUnit`.
+const translation_unit = C.translation_unit as unknown as Rules<TranslationUnit>;
+
 export const parser = makeCachedParser({
 	// On top of C's skips: attributes (`[[nodiscard]]`), `alignas(...)`, and MS calling-convention attributes are
 	// recognized and discarded at the lexer level -- valid input parses but they leave no trace in the AST.
@@ -1212,8 +1229,8 @@ export const parser = makeCachedParser({
 	// it's the only terminal whose pattern matches the text, and its callback reclassifies registered names.
 	terminals: [C.IDENT, TYPE_SCOPE, TEMPLATE_FN, RIGHT_SHIFT, RIGHT_SHIFT_ASSIGN],
 	precedence: C.PREC,
-	start: C.translation_unit,
-	rules: { translation_unit: C.translation_unit },
+	start: translation_unit,
+	rules: { translation_unit },
 }, {
 	// each GLR branch mutates its own ctx (typedef registration, templateDepth); a dying branch's
 	// mutations no longer leak into the survivor
