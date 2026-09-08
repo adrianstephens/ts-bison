@@ -1966,6 +1966,20 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 						recurse(substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, paramT.typeArgs![i] ?? p.default ?? ANY]))), argT, depth - 1);
 				}
 			}
+		} else if (paramT.type === 'tuple') {
+			// `[K, V]` as a parameter type inferred NOTHING before this case existed, so every entries-style
+			// constructor (`Map`/`Set`'s own `[K, V][]`) came out `<any, any>` -- and towasm then rejected it
+			// outright ("class 'Map' needs 2 explicit type argument(s)"), blocking 30 declarations.
+			if (a.type === 'tuple') {
+				paramT.elements.forEach((el, i) => {
+					const p = tupleElementType(el), q = tupleElementType(a.elements[i]);
+					if (p && q)
+						recurse(p, q, depth - 1);
+				});
+			} else if (a.type === 'union') {
+				a.types.forEach(m => recurse(paramT, m, depth - 1));
+			}
+
 		} else if (paramT.type === 'intersection') {
 			// Same reasoning as `union` below: `T` may be embedded in just one part -- trying every part is safe, only the matching one infers anything.
 			for (const p of paramT.types)

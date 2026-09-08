@@ -1477,11 +1477,22 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// coincidence this stayed invisible). Skipped when the declared type still mentions one of *this* signature's own
 					// (not yet inferred) type params -- `preMap`, which resolves those, is itself built FROM this very pass below, so
 					// it isn't available yet, and threading a still-generic shape as `expected` risks a wrong contextual guess.
+					// An ARRAY LITERAL is the one argument shape whose own type depends on context even when
+					// the parameter is still generic: `case 'array'`'s `wantTuple` needs only the tuple
+					// SHAPE, and the type params inside `[K, V][]` land solely as per-position expected
+					// types, where an unresolved ref is an inert hint. Without this the literal typed as a
+					// plain array and every entries-style generic constructor (`new Map([[k, v]])`)
+					// inferred `<any, any>`.
+					const tupleShaped = (t: Type) => {
+						const r = T.resolveOwn(t, scope);
+						return r.type === 'tuple' || (r.type === 'array' && T.resolveOwn(r.element, scope).type === 'tuple');
+					};
 					const preArgTs = e.arguments.map((a, i) => {
 						if (a.type === 'function' || a.type === 'arrow' || a.type === 'spread')
 							return undefined;
 						const declared = sig!.params[i]?.typeAnnotation;
-						return recurse(a, declared && !sig!.typeParams?.some(p => T.mentionsTypeParam(declared, p.name)) ? declared : undefined);
+						const generic  = declared && !!sig!.typeParams?.some(p => T.mentionsTypeParam(declared, p.name));
+						return recurse(a, declared && (!generic || (a.type === 'array' && tupleShaped(declared))) ? declared : undefined);
 					});
 					let preMap: Map<string, Type> | undefined;
 					if (sig.typeParams?.length) {

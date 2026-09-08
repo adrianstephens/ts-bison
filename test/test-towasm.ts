@@ -1343,6 +1343,31 @@ async function main() {
 	}
 
 	{
+		// `[K, V]` as a PARAMETER type inferred nothing -- `inferTypeArgs` had no tuple case -- so every
+		// entries-style generic constructor came out `<any, any>`, which towasm rejects outright ("class
+		// 'Map' needs 2 explicit type argument(s)"). The literal form needs a second thing: an array
+		// literal argument only becomes a TUPLE if the still-generic parameter's shape reaches it as its
+		// contextual type.
+		const r = await compile(`
+			const pairs: [string, number][] = [["a", 1], ["bb", 2]];
+			export function fromTypedPairs(): number { const m = new Map(pairs); return m.get("bb")! + m.size; }
+			export function fromLiteral(): number { const m = new Map([["a", 1], ["bb", 2]]); return m.get("bb")! + m.size; }
+			export function setFromLiteral(): number { const s = new Set([1, 2, 3]); return s.has(2) ? s.size : 0; }
+			// The inferred value type must be the real one, not a widened union: calling a method on it
+			// is what proves the difference.
+			class Box { constructor(public n: number) {} twice(): number { return this.n * 2; } }
+			export function inferredValueKeepsItsClass(): number {
+				const m = new Map([["k", new Box(21)]]);
+				return m.get("k")!.twice();
+			}
+		`);
+		check('Map: inferred from a typed [K, V][] argument', r.fromTypedPairs(), 4);
+		check('Map: inferred from an array literal of pairs', r.fromLiteral(), 4);
+		check('Set: inferred from an array literal', r.setFromLiteral(), 3);
+		check('Map: the inferred value type keeps its class', r.inferredValueKeepsItsClass(), 42);
+	}
+
+	{
 		// An empty array literal `[]` has no elements for `arrayKindOf` to infer a kind from -- it used
 		// to fall back to 'ref' unconditionally, ignoring the declared target type entirely, and fail
 		// for any non-ref target ("cannot convert {arr:ref} to {arr:f64}"). Found while building Map/Set
