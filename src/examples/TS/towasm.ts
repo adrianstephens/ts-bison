@@ -2001,11 +2001,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// nothing else. A string is still a `literal` node but its physical value is an i16 array built at
 	// runtime, and a `bigint` only qualifies on a real `i64` slot. Everything rejected here belongs to
 	// `ensureLazyGlobal` instead.
-	function isEagerGlobalInit(init: Expr, typeAnnotation?: Type): boolean {
-		const folded	= foldConstants(init);
-		const kind		= folded?.type === 'literal' && notUnsigned(scalarKind(typeOf(typeAnnotation ?? checkerTypeOf(init, libGlobal))));
-		return !!kind && folded!.type === 'literal'
-			&& (typeof folded!.value === 'number' || typeof folded!.value === 'boolean' || (typeof folded!.value === 'bigint' && kind === 'i64'));
+	// Returns the FOLDED initializer, which is what the global must actually be registered with:
+	// `-99` is a `unary` node, and the emitter accepts only a literal ("needs a compile-time-constant
+	// initializer"). Returning the folded form rather than a boolean is what keeps the test and the
+	// value that gets used from drifting apart.
+	function eagerGlobalInit(init: Expr, typeAnnotation?: Type): Expr | undefined {
+		const folded = foldConstants(init);
+		if (folded?.type !== 'literal')
+			return undefined;
+		const kind = notUnsigned(scalarKind(typeOf(typeAnnotation ?? checkerTypeOf(init, libGlobal))));
+		return kind && (typeof folded.value === 'number' || typeof folded.value === 'boolean' || (typeof folded.value === 'bigint' && kind === 'i64'))
+			? folded : undefined;
 	}
 
 	function ensureGlobal(name: string, wtype: WasmType, init: Expr, mut: boolean) {
@@ -4983,8 +4989,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					// and -- because `g` was set -- shadowed the `lazyGlobalFor` fallback further down that
 					// exists for exactly this case. That is why a NON-SCALAR module-level binding in a static
 					// lib file was unreachable while a scalar one worked.
-					if (global && global.type === 'var_decl' && global.init && isEagerGlobalInit(global.init, global.typeAnnotation))
-						g = ensureGlobal(name, typeOf(global.typeAnnotation!)!, global.init, global.kind !== 'const');
+					const eager = global?.type === 'var_decl' && global.init ? eagerGlobalInit(global.init, global.typeAnnotation) : undefined;
+					if (global && global.type === 'var_decl' && eager)
+						g = ensureGlobal(name, typeOf(global.typeAnnotation!)!, eager, global.kind !== 'const');
 				}
 				if (g) {
 					ctx.emit(I.global.get(g.index));
