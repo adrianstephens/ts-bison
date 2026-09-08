@@ -5512,6 +5512,14 @@ async function main() {
 				for (const f of fs) f();
 				return out[0] * 100 + out[1] * 10 + out[2];
 			}
+			// ...and 'var' is the exact opposite: function-scoped, so the whole loop shares ONE binding
+			// and every closure sees its final value.
+			export function varShared(): number {
+				const fs: (() => number)[] = [];
+				for (var i = 0; i < 3; i++)
+					fs.push(() => i);
+				return fs[0]() * 100 + fs[2]();
+			}
 			// controls: neither of these needs a cell at all
 			export function notCaptured(): number { let n = 1; n = n + 2; return n; }
 			export function capturedNotMutated(): number { const n = 3; const f = () => n * 2; return f(); }
@@ -5525,6 +5533,7 @@ async function main() {
 		check('capture: a reference-typed binding', r.refCell(), 3);
 		check('capture: through a doubly-nested closure', r.nested(), 6);
 		check('capture: a for-let binding stays per-iteration', r.perIteration(), 123);
+		check('capture: a for-var binding is ONE shared binding', r.varShared(), 303);
 		check('capture: an uncaptured local is untouched', r.notCaptured(), 3);
 		check('capture: a captured const is untouched', r.capturedNotMutated(), 6);
 	}

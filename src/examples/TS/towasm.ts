@@ -949,12 +949,15 @@ function collectCapturedMutables(body: Stmt[]): Set<string> {
 	// exactly this, and a shared cell had it writing past the end of `values`.
 	// (A body that REASSIGNS the variable after creating the closure still isn't modelled -- that needs a
 	// fresh cell per iteration, which is the real general answer.)
+	// `var` is the exact opposite and must NOT be listed here: it is function-scoped, so the whole loop
+	// shares ONE binding and every closure sees its final value -- the shared cell is the correct answer
+	// there, and copying by value gave `for (var i...) fs.push(() => i)` a 0 where JS says 3.
 	const perIteration = new Set<string>();
 	walkB(body,
 		(st, process) => {
 			// A nested function is a closure boundary: everything free in it is captured from here (or
 			// from further out, which is harmless -- an outer name simply isn't one of our locals).
-			if (st.type === 'for' && st.init && !Array.isArray(st.init) && st.init.type === 'var_decl') {
+			if (st.type === 'for' && st.init && !Array.isArray(st.init) && st.init.type === 'var_decl' && st.init.kind !== 'var') {
 				for (const d of st.init.declarations)
 					if (typeof d.name === 'string')
 						perIteration.add(d.name);
