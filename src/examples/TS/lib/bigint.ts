@@ -265,6 +265,11 @@ export class BigInt {
 	// The `as unknown as` is for tsc's benefit only -- towasm reads the last statement's type with the
 	// casts stripped, so `bigFromNumber`'s own `bigint` is what determines this class's physical form
 	// (a `u32[]`, the same representation the arithmetic below reinterprets `this` as).
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: bigint) {
+		return value as unknown as BigInt;
+	}
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(value: number) {
 		return bigFromNumber(value) as unknown as BigInt;
 	}

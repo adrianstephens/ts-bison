@@ -227,14 +227,16 @@ export class Number {
 	// A real conversion, because towasm lowers a call on a class to its constructor and this IS
 	// `Number('42')`/`Number(true)`. `n` is declared `number`, so the (cast-stripped) return type still
 	// tells `ensureClass` this class is physically an `f64`, exactly as the pass-through version did.
-	constructor(value: any) {
-		const n: number = typeof value === 'number' ? value
-			: typeof value === 'string' ? numberFromString(value)
-			: typeof value === 'boolean' ? (value ? 1 : 0)
-			: typeof value === 'bigint' ? bigToNumber(value)
-			: 0;
-		return n as unknown as Number;
-	}
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: number) { return value as unknown as Number;	}
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: string) { return  numberFromString(value) as unknown as Number; }
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: boolean) { return (value ? 1 : 0) as unknown as Number; }
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: i64) { const n = value; return n as unknown as Number; }
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: bigint) { return bigToNumber(value) as unknown as Number; }
 
 	static readonly EPSILON = 2.2204460492503130808472633361816e-16;
 	static readonly MAX_SAFE_INTEGER: number = 9007199254740991;

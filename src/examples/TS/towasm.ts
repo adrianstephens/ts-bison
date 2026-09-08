@@ -3822,33 +3822,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		}
 	}
 
-	// A `bigint` literal's limbs, in exactly the form `lib/bigint.ts` reads back: little-endian `u32`,
-	// TWO'S COMPLEMENT (not sign-magnitude), sign-extended so the top limb's high bit IS the sign, and
-	// trimmed the way `bigTrim` trims -- no top limb that merely repeats the sign of the one below it.
-	function bigintLimbs(v: bigint): number[] {
-		const limbs: number[] = [];
-		let x = v;
-		if (v >= 0n) {
-			while (x > 0n) {
-				limbs.push(Number(x & 0xffffffffn));
-				x >>= 32n;
-			}
-			// `0n`, and a value whose top limb would otherwise read as negative, both need a limb of room.
-			if (!limbs.length || (limbs[limbs.length - 1] & 0x80000000))
-				limbs.push(0);
-		} else {
-			// `>>` on a negative bigint is arithmetic in JS, so this converges on `-1n`, which is exactly
-			// the infinite sign extension the encoding wants.
-			while (x < -1n) {
-				limbs.push(Number(x & 0xffffffffn));
-				x >>= 32n;
-			}
-			if (!limbs.length || !(limbs[limbs.length - 1] & 0x80000000))
-				limbs.push(0xffffffff);
-		}
-		return limbs;
-	}
-
 	function emitInline(name: string, inline: Inline, args: Expr[], ctx: FunctionContext): WasmType {
 		if (args.length !== inline.params.length)
 			throw `'${name}' takes exactly ${inline.params.length} argument(s)`;
@@ -4816,7 +4789,30 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							ctx.emit(I.i64.const(e.value));
 							return 'i64';
 						}
-						const limbs = bigintLimbs(e.value);
+						// A `bigint` literal's limbs, in exactly the form `lib/bigint.ts` reads back: little-endian `u32`,
+						// TWO'S COMPLEMENT (not sign-magnitude), sign-extended so the top limb's high bit IS the sign, and
+						// trimmed the way `bigTrim` trims -- no top limb that merely repeats the sign of the one below it.
+							
+						const limbs: number[] = [];
+						let x = e.value;
+						if (x >= 0n) {
+							while (x > 0n) {
+								limbs.push(Number(x & 0xffffffffn));
+								x >>= 32n;
+							}
+							// `0n`, and a value whose top limb would otherwise read as negative, both need a limb of room.
+							if (!limbs.length || (limbs[limbs.length - 1] & 0x80000000))
+								limbs.push(0);
+						} else {
+							// `>>` on a negative bigint is arithmetic in JS, so this converges on `-1n`, which is exactly
+							// the infinite sign extension the encoding wants.
+							while (x < -1n) {
+								limbs.push(Number(x & 0xffffffffn));
+								x >>= 32n;
+							}
+							if (!limbs.length || !(limbs[limbs.length - 1] & 0x80000000))
+								limbs.push(0xffffffff);
+						}
 						for (const l of limbs)
 							ctx.emit(I.i32.const(l | 0));
 						ctx.emit(I.array.new_fixed(ensureArrayType('i32'), limbs.length));
