@@ -1,17 +1,7 @@
 [
 	"TypedArray.BYTES_PER_ELEMENT",
-	"TypedArray.copyWithin",
-	"TypedArray.every",
-	"TypedArray.filter",
-	"TypedArray.find",
-	"TypedArray.findIndex",
-	"TypedArray.forEach",
-	"TypedArray.join",
-	"TypedArray.map",
 	"TypedArray.reduce",
 	"TypedArray.reduceRight",
-	"TypedArray.some",
-	"TypedArray.sort",
 	"TypedArray.toLocaleString",
 	"TypedArray.toString",
 	"TypedArray.valueOf"

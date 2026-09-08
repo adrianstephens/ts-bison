@@ -217,6 +217,119 @@ export class TypedArray<T> {
 			this[i] = x;
 		return this;
 	}
+	// The callback family. All of these produce a `number` element, so a `TypedArray<T>` result is a
+	// fresh view of this same element type -- `map`/`filter` allocate, the rest do not.
+	forEach(callback: (value: number, index: number, array: this) => void, thisArg?: any): void {
+		for (let i = 0; i < this.length; i++)
+			callback(this[i], i, this);
+	}
+	map(callback: (value: number, index: number, array: this) => number, thisArg?: any): TypedArray<T> {
+		const len = this.length;
+		const result = new TypedArray<T>(len);
+		for (let i = 0; i < len; i++)
+			result[i] = callback(this[i], i, this);
+		return result;
+	}
+	// Two passes: the result's length is only known once the predicate has run, and a typed array has
+	// no `push` to grow with.
+	filter(callback: (value: number, index: number, array: this) => any, thisArg?: any): TypedArray<T> {
+		const len = this.length;
+		let n = 0;
+		for (let i = 0; i < len; i++) {
+			if (callback(this[i], i, this))
+				n = n + 1;
+		}
+		const result = new TypedArray<T>(n);
+		let j = 0;
+		for (let i = 0; i < len; i++) {
+			const v = this[i];
+			if (callback(v, i, this)) {
+				result[j] = v;
+				j = j + 1;
+			}
+		}
+		return result;
+	}
+	every(callback: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean {
+		for (let i = 0; i < this.length; i++) {
+			if (!callback(this[i], i, this))
+				return false;
+		}
+		return true;
+	}
+	some(callback: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean {
+		for (let i = 0; i < this.length; i++) {
+			if (callback(this[i], i, this))
+				return true;
+		}
+		return false;
+	}
+	find(callback: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined {
+		for (let i = 0; i < this.length; i++) {
+			const v = this[i];
+			if (callback(v, i, this))
+				return v;
+		}
+		return undefined;
+	}
+	findIndex(callback: (value: number, index: number, obj: this) => boolean, thisArg?: any): number {
+		for (let i = 0; i < this.length; i++) {
+			if (callback(this[i], i, this))
+				return i;
+		}
+		return -1;
+	}
+	// IN PLACE and returns itself, like `Array.copyWithin`. The ranges may overlap, so the direction of
+	// the copy matters: walking forward when the target is above the source would read bytes already
+	// overwritten.
+	copyWithin(target: i32, start: i32, end: i32 = 0x7fffffff): TypedArray<T> {
+		const len = this.length;
+		let to		= target < 0 ? target + len : target;
+		let from	= start < 0 ? start + len : start;
+		let last	= end < 0 ? end + len : end > len ? len : end;
+		to		= to < 0 ? 0 : to > len ? len : to;
+		from	= from < 0 ? 0 : from > len ? len : from;
+		last	= last < 0 ? 0 : last > len ? len : last;
+		let count = last - from;
+		if (count > len - to)
+			count = len - to;
+		if (count > 0) {
+			if (to > from) {
+				for (let i = count - 1; i >= 0; i--)
+					this[to + i] = this[from + i];
+			} else {
+				for (let i = 0; i < count; i++)
+					this[to + i] = this[from + i];
+			}
+		}
+		return this;
+	}
+	// Insertion sort: `n` here is a view length, not a general collection, and this avoids needing a
+	// scratch array of the element type. The DEFAULT comparator is NUMERIC, unlike `Array.sort`'s
+	// string-conversion default -- that is what JS specifies for a typed array.
+	sort(compareFn: (a: number, b: number) => number = (a, b) => (a < b ? -1 : a > b ? 1 : 0)): TypedArray<T> {
+		const len = this.length;
+		for (let i = 1; i < len; i++) {
+			const v = this[i];
+			let j = i - 1;
+			while (j >= 0 && compareFn(this[j], v) > 0) {
+				this[j + 1] = this[j];
+				j = j - 1;
+			}
+			this[j + 1] = v;
+		}
+		return this;
+	}
+	join(separator = ','): string {
+		let result = '';
+		for (let i = 0; i < this.length; i++) {
+			if (i > 0)
+				result = result.concat(separator);
+			result = result.concat(this[i].toString());
+		}
+		return result;
+	}
+
 	concat(other: TypedArray<T>): TypedArray<T> {
 		const result = new TypedArray<T>(this.length + other.length);
 		const len = this.length;
