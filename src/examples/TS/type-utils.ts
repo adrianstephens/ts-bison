@@ -855,8 +855,9 @@ export function isClassRef(t: Type, scope: Scope): boolean {
 
 // Does `t` mention an unbound type parameter anywhere reachable? `isAbstract` only answers for a bare
 // ref; a conditional's decidability also depends on one buried in an object member or a type argument
-// (`{type: T}`, `Node<T>`).
-function mentionsAbstract(t: Type, scope: Scope, depth = 4): boolean {
+// (`{type: T}`, `Node<T>`). Exported for `instantiate`, which uses it to tell a real inference result
+// from one that is still carrying an OUTER call's unsolved parameters.
+export function mentionsAbstract(t: Type, scope: Scope, depth = 4): boolean {
 	if (depth < 0)
 		return false;
 	if (isAbstract(t, scope))

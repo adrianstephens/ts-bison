@@ -1365,6 +1365,31 @@ async function main() {
 		check('Map: inferred from an array literal of pairs', r.fromLiteral(), 4);
 		check('Set: inferred from an array literal', r.setFromLiteral(), 3);
 		check('Map: the inferred value type keeps its class', r.inferredValueKeepsItsClass(), 42);
+
+		// The hard form: the entries come from a CALL, so the tuple-ness has to travel backwards --
+		// `new Map`'s `[K, V][]` parameter reaches the `.map` call, which reverse-matches its own `U` to
+		// `[K, V]`, which contextually types the callback's RETURN, which finally makes `[n.name, n]` a
+		// tuple. Real TS does exactly this, and rejects the same expression outright once it is hoisted
+		// into a variable ("Target requires 2 element(s) but source may have fewer") -- there is no
+		// inferring `Map<string, Node>` from a `(string | Node)[][]` that has already been formed.
+		// Calling `.kind` on the value is what pins it: that only compiles if `V` really is `Node`.
+		const { fromMapped } = await compile(`
+			class Node { constructor(public name: string, public kind: number) {} }
+			export function fromMapped(): number {
+				const nodes = [new Node("aa", 1), new Node("bbb", 2)];
+				const m = new Map(nodes.map(n => [n.name, n]));
+				return m.get("bbb")!.kind * 10 + m.size;
+			}
+		`);
+		check('Map: inferred through a .map() call, not just a literal', fromMapped(), 22);
+
+		// ...and the contextual return type is only a hint when it carries STRUCTURE. A bare, still-
+		// unsolved type parameter says nothing about the body, and threading one through perturbed real
+		// inference (`after<V, R>(v: V, then: (value: Awaited<V>) => R)` in the binary package).
+		check('a bare type-param return type is not used as a contextual hint',
+			typeErrors(`declare function after<V, R>(v: V, then: (value: V) => R): R;
+				declare const n: number;
+				const out: string = after(n, v => "x" + v);`).length, 0);
 	}
 
 	{

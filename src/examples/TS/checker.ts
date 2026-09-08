@@ -120,6 +120,18 @@ function resolveFnMember(t: Type, scope: Scope): TS.CallSig | undefined {
 // property value, or the RHS of a typed `var_decl`/`satisfies`) would otherwise type its own params as `any`. Fills
 // in whichever of `params` lack their own annotation from `expected`'s matching declared param type -- mutates the
 // AST node in place, so it must run before the caller's own `checkFunctionBody`/`typeOf` walks those params.
+// A contextual return type is only worth handing to a body when it carries STRUCTURE -- that is the
+// whole mechanism (an array literal against a tuple becomes a tuple). A bare `ref` carries none: it is
+// either an unsolved type parameter of the very call being inferred (`after<V, R>`'s own `R`, which
+// says nothing about the body and measurably perturbed inference when threaded through) or a name the
+// body's own expression resolves perfectly well without.
+function shapedHint(t: Type | undefined, scope: Scope): Type | undefined {
+	return t && T.resolveOwn(t, scope).type !== 'ref' ? t : undefined;
+}
+
+// Returns the contextual signature it resolved, so a caller can also take its RETURN type -- an
+// unannotated callback needs that to type its own body (`xs.map(x => [a, b])` against a `[K, V][]`
+// parameter), not just its parameters.
 function applyContextualParams(params: JS.Param<Type>[], expected: Type | undefined, scope: Scope) {
 	const sig = expected && resolveFnMember(expected, scope);
 	if (sig) {
@@ -128,6 +140,7 @@ function applyContextualParams(params: JS.Param<Type>[], expected: Type | undefi
 				p.typeAnnotation = sig.params[j].typeAnnotation;
 		});
 	}
+	return sig || undefined;
 }
 
 // Whether `e` is a link in an *active* optional chain -- either `e` itself is a real `?.`/`?.[`/`?.(`
@@ -1042,10 +1055,23 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 			}
 			// Same reasoning as the `preMap` pass above: whatever's still unbound after arguments, try the call's own contextual
 			// expected type before falling back to a default/constraint/`any` guess below.
+			// Run into its own map first, because a binding read back this way can still MENTION an outer,
+			// not-yet-solved call's type params -- `new Map(xs.map(x => [x.a, x.b]))` reverse-matches
+			// `.map`'s own `U` to `[K, V]`, Map's two unsolved parameters. That is exactly the hint the
+			// callback's body needed (it is what made the literal a tuple), but adopting it as the ANSWER
+			// let `K`/`V` leak straight out as the result type. So a placeholder-bearing binding yields to
+			// the argument's own inferred type, and only fills in afterwards if nothing else pinned it.
+			const fromExpected = new Map<string, Type>();
 			if (expected && sig.returnType)
-				T.inferTypeArgs(sig.returnType, expected, names, map, scope, declScope);
+				T.inferTypeArgs(sig.returnType, expected, names, fromExpected, scope, declScope);
+			for (const [k, v] of fromExpected)
+				if (!map.has(k) && !T.mentionsAbstract(v, scope))
+					map.set(k, v);
 			for (const { paramT, argT } of deferred)
 				T.inferTypeArgs(paramT, argT, names, map, scope, declScope);
+			for (const [k, v] of fromExpected)
+				if (!map.has(k))
+					map.set(k, v);
 			sig.typeParams.forEach(p => {
 				if (!map.has(p.name)) {
 					map.set(p.name, p.default ?? p.constraint ?? T.ANY);
@@ -1240,15 +1266,16 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				return TS.ObjectType(members);
 			}
 
-			case 'function':
-				applyContextualParams(e.params, expected, scope);
-				checkFunctionBody(e, e.body, scope, hasMod(e, 'async'), hasMod(e, 'generator'), hasMod(e, 'generator'), err);
+			case 'function': {
+				const csig = applyContextualParams(e.params, expected, scope);
+				checkFunctionBody(e, e.body, scope, hasMod(e, 'async'), hasMod(e, 'generator'), hasMod(e, 'generator'), err, shapedHint(csig?.returnType, scope));
 				return TS.FunctionType(T.FixSig(e, T.ANY, e.returnType));
-
-			case 'arrow':
-				applyContextualParams(e.params, expected, scope);
-				checkFunctionBody(e, e.body, scope, hasMod(e, 'async'), false, false, err);
+			}
+			case 'arrow': {
+				const csig = applyContextualParams(e.params, expected, scope);
+				checkFunctionBody(e, e.body, scope, hasMod(e, 'async'), false, false, err, shapedHint(csig?.returnType, scope));
 				return TS.FunctionType(T.FixSig(e, T.ANY, e.returnType));
+			}
 
 			case 'member': {
 				const key		= T.pathKey(e);
@@ -1492,7 +1519,12 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							return undefined;
 						const declared = sig!.params[i]?.typeAnnotation;
 						const generic  = declared && !!sig!.typeParams?.some(p => T.mentionsTypeParam(declared, p.name));
-						return recurse(a, declared && (!generic || (a.type === 'array' && tupleShaped(declared))) ? declared : undefined);
+						// A CALL argument gets it too: that is how the shape reaches a callback nested inside
+						// it (`new Map(xs.map(x => [a, b]))`). The inner call reverse-matches its own `U`
+						// from this, contextually types its callback's return, and the literal becomes a
+						// tuple -- see `instantiate`'s `fromExpected`, which keeps that placeholder binding
+						// from escaping as the answer.
+						return recurse(a, declared && (!generic || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared))) ? declared : undefined);
 					});
 					let preMap: Map<string, Type> | undefined;
 					if (sig.typeParams?.length) {
@@ -1518,8 +1550,15 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 
 					const restElementTs: Type[] = [];
 					const argTs = e.arguments.map((a, i) => {
-						if (a.type === 'function' || a.type === 'arrow')
-							return recurse(a);
+						if (a.type === 'function' || a.type === 'arrow') {
+							// The same contextual signature the loop above applied to the params, handed to
+							// the body too: `xs.map(x => [a, b])` against a `[K, V][]`-shaped parameter can
+							// only produce a TUPLE if the callback's own return position is contextually
+							// typed. `preMap` has already reverse-matched `U` from the outer expected type,
+							// so the substitution here is what carries that down.
+							const declared = sig!.params[i]?.typeAnnotation;
+							return recurse(a, declared && preMap?.size ? T.substituteType(declared, preMap) : declared);
+						}
 						if (a.type !== 'spread')
 							return preArgTs[i];
 						const t		= T.resolveOwn(recurse(a.operand), scope);
@@ -1830,7 +1869,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 
 // ---- functions / classes / statements -------------------------------------------------------
 
-function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefined, scope: Scope, async: boolean, skipReturn?: boolean, generator?: boolean, err?: Err) {
+// `contextualReturn`: what the CALL SITE wants this function to return, when it declares no return type
+// of its own. Purely an inference hint -- it shapes the body's own types (an array literal against a
+// tuple becomes a tuple) and never produces an assignability diagnostic, which is what `expected`, the
+// DECLARED return type, is for.
+function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefined, scope: Scope, async: boolean, skipReturn?: boolean, generator?: boolean, err?: Err, contextualReturn?: Type) {
 	if (!body)
 		return;
 
@@ -1871,6 +1914,9 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 	// already falls back to something instantiation-correct when unset (see `makeLibScope`'s own comment
 	// in towasm.ts). The walk itself still has to run either way, muted or not -- `applyContextualParams`'s
 	// side effect on an unannotated callback param below doesn't depend on the scope stamp at all.
+	// Only where there is nothing declared to check against -- a declared return type is always the
+	// better answer, and `expected` alone must keep driving the diagnostics below.
+	const inferHint = expected ? undefined : contextualReturn;
 	const noStamp = !!expected && !err && scope.isGenericTemplate();
 	if (!noStamp)
 		fn.scope ??= inner;
@@ -1968,7 +2014,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 					stamp(s, scope);
 					checkStmt(s, scope, typeOf1, checkStmt1, err);
 					if (s.type === 'return')
-						returns.push({s, type: s.argument && typeOf(s.argument, scope, true, undefined, undefined, err)});
+						returns.push({s, type: s.argument && typeOf(s.argument, scope, true, inferHint, undefined, err)});
 				}
 			);
 
@@ -2000,7 +2046,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		// Precise (unwidened): `expected` may itself be a narrow/literal declared return type (rare, but real), so the
 		// assignability check below must see `body`'s exact inferred type, not a pre-widened one -- only the *inference*
 		// branch (no declared type to check against) widens, and only there.
-		const t = typeOf(body, inner, false, expected, undefined, err);
+		const t = typeOf(body, inner, false, expected ?? inferHint, undefined, err);
 		if (expected) {
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
 				err(SEVERITY.ERROR, (body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
