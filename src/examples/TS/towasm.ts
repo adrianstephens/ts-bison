@@ -133,7 +133,7 @@ type Scope			= T.Scope;
 const Scope			= T.Scope;
 const I				= wasm.I;
 
-const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
+const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=', '&&=', '||=']);
 
 const tocode = new Output({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
 
@@ -3327,6 +3327,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				case 'f32':	ctx.emit(I.f32.demote_f64); return;
 			}
 		}
+		// A bigint (its limb array) to a NUMBER -- the mirror of the `bigFromNumber` direction below, and
+		// the only conversion out of the limb representation there has ever been. `6 > 5n` needs it: a
+		// mixed comparison dispatches on the LEFT operand, so a number on the left never reaches
+		// `BigInt.compare` at all.
+		if (want === 'f64' && wasmTypeEq(typeof got === 'object' && got.nullable ? { ...got, nullable: false } : got, ARR_WTYPE.i32)) {
+			const decl = LIB_DECL_MAP.get('bigToNumber');
+			if (decl && decl.type === 'function_decl') {
+				const info = ensureFunc('bigToNumber', decl);
+				if (info) {
+					ctx.emit(I.call(info.funcIndex));
+					return;
+				}
+			}
+		}
 		if (want === 'f64') {
 			switch (got) {
 				case 'i32':	ctx.emit(I.f64.convert_i32_s); return;
@@ -5540,6 +5554,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				}
 				const rightInfo = operandInfo(right, ctx);
 
+				// `**=` is a real assignment operator the parser accepts, but it is not in `ASSIGN_OPS` --
+				// so it fell through to the plain binary path below, where `BINARY_OP_NAMES` has no entry
+				// for it either, and died as "unsupported compound-assignment method 'undefined'". There is
+				// no wasm instruction for it and no `numericOpInline` case; `Math.pow` is the real
+				// implementation (see the `**` rewrite further down), so this becomes a plain assignment.
+				// Only where the target re-emits without side effects -- an identifier, or a property chain
+				// off one -- since it appears on both sides.
+				if (operator === '**=') {
+					const reemittable = (x: Expr): boolean => x.type === 'identifier' || x.type === 'this'
+						|| (x.type === 'member' && !x.optional && reemittable(x.object));
+					if (!reemittable(left))
+						throw "'**=' is only supported on a plain name or property chain";
+					return emitExpr({ type: 'binary', operator: '=', left, right: { type: 'binary', operator: '**', left, right } } as Expr, ctx, want);
+				}
+
 				if (ASSIGN_OPS.has(operator)) {
 
 					const target	= emitAssignTarget(left, ctx, operator !== '=' ? 'discard' : 'none');
@@ -5559,6 +5588,31 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						case '=':
 							emitValue();
 							break;
+
+						case '&&=':
+						case '||=': {
+							// `a &&= b` assigns only when `a` is TRUTHY, `a ||= b` only when it is falsy --
+							// and in the other case `b` is not evaluated at all. Same `if`-based shape
+							// `??=` uses below, keyed off truthiness rather than nullishness. Both were
+							// simply absent from `ASSIGN_OPS`, so they fell through to the plain binary
+							// path and died as "unsupported compound-assignment method 'undefined'".
+							const isAnd	= operator === '&&=';
+							const cur	= ctx.declareLocal(`$logical$assign$${optionalTempCounter++}`, wtype);
+							ctx.emit(I.local.tee(cur.index));
+							emitTruthyOf(wtype, checkerTypeOf(left, ctx.scope), ctx);
+							const _old = ctx.swapOut();
+							if (isAnd)
+								emitValue();
+							else
+								ctx.emit(I.local.get(cur.index));
+							const _then = ctx.swapOut();
+							if (isAnd)
+								ctx.emit(I.local.get(cur.index));
+							else
+								emitValue();
+							ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+							break;
+						}
 
 						case '??=': {
 							// `a ??= b` -- real JS short-circuits: `b` is only evaluated when `a` is null/undefined, unlike
@@ -5822,6 +5876,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						// DISAGREE -- `string + string` keeps `String.add`, and `number + number` its
 						// numeric op. `definitelyString` is deliberately all-members-of-a-union: a
 						// `string | number` operand really is decided at runtime, which this cannot model.
+						// `**` has no wasm instruction and no `numericOpInline` case, so it failed for every
+						// numeric operand as "unsupported compound-assignment method 'pow'". `Math.pow` is
+						// the real implementation (lib/number.ts); rewriting to it here reuses that rather
+						// than adding a second one. A BIGINT operand still dispatches to `BigInt.pow` above,
+						// via `leftInfo.owner`, so this is only reached for a genuinely numeric `**`.
+						if (method === 'pow')
+							return emitExpr({ type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Math' }, property: 'pow' }, arguments: [left, right] } as Expr, ctx, want);
+
 						if (method === 'add') {
 							const definitelyString = (x: Expr) => {
 								const t = T.resolve(ctx.typeScope, narrowedTypeOf(x, ctx));
