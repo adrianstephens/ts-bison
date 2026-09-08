@@ -85,10 +85,6 @@ export function  Spread<E>(operand: E): Spread<E> { return { type: 'spread', ope
 export interface Sequence<E, K extends string>	{ type: K; elements: readonly E[] }
 export function  Sequence<E, const K extends string>(type: K, elements: readonly E[]): Sequence<E, K> { return { type, elements }; }
 
-// ===================================================================
-//  Shared statement shapes
-// ===================================================================
-
 // Assignment is a MUTATION, not a computation. js-parser used to spell it as a `Binary` whose
 // operator happened to end in `=`, so every consumer re-derived "is this an assignment" from the
 // operator string -- towasm, vsdg and tocode each kept their own copy of that knowledge, the copies
@@ -99,6 +95,10 @@ export function  Sequence<E, const K extends string>(type: K, elements: readonly
 // collapses onto the same node.
 export interface Assign<E, O>		{ type: 'assign'; operator?: O; target: E; value: E }
 export function  Assign<E, const O>(target: E, value: E, operator?: O): Assign<E, O> { return { type: 'assign', operator, target, value }; }
+
+// ===================================================================
+//  Shared statement shapes
+// ===================================================================
 
 // Suspension points, not computations. js-parser used to fold `await` into `Unary` purely because it
 // has the same prefix syntax as `typeof`/`void` -- and then checker, transform, vsdg and ts2py each

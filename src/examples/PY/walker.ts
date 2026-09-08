@@ -253,8 +253,8 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'throw':				return walkExpression(s.argument) || walkExpression(s.cause);
 			case 'del':					return walkExpression(s.targets);
 			case 'assert':				return walkExpression(s.test) || walkExpression(s.msg);
-			case 'if':					return walkExpression(s.test) || s.consequent.some(walkStatement) || s.alternate.some(walkStatement);
-			case 'while':				return walkExpression(s.test) || s.body.some(walkStatement) || s.orelse.some(walkStatement);
+			case 'if':					return walkExpression(s.test) || s.consequent.some(walkStatement) || !!s.alternate?.some(walkStatement);
+			case 'while':				return walkExpression(s.test) || s.body.some(walkStatement) || !!s.orelse?.some(walkStatement);
 			case 'for':					return walkExpression(s.target) || walkExpression(s.iter) || s.body.some(walkStatement) || s.orelse.some(walkStatement);
 			case 'with':				return s.items.some(withItem) || s.body.some(walkStatement);
 			case 'try':					return s.body.some(walkStatement) || s.handlers.some(handler) || s.orelse.some(walkStatement) || s.finalizer.some(walkStatement);

@@ -276,8 +276,8 @@ export type Stmt =
 	| { type: 'assert'; test: Expr; msg?: Expr }
 	| { type: 'import'; names: Alias[] }
 	| { type: 'importfrom'; module?: string; level: number; names: Alias[] | '*' }
-	| Common.If<Expr, Stmt[]> & { alternate: Stmt[] }
-	| Common.While<Expr, Stmt[]> & { orelse: Stmt[] }
+	| Common.If<Expr, Stmt[]>
+	| Common.While<Expr, Stmt[]> & { orelse?: Stmt[] }
 	| { type: 'for'; target: Expr; iter: Expr; body: Stmt[]; orelse: Stmt[]; is_async: boolean }
 	| { type: 'with'; items: WithItem[]; body: Stmt[]; is_async: boolean }
 	| TryStmt

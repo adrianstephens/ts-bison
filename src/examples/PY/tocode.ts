@@ -118,8 +118,8 @@ export class Output {
 
 	// `else` / `elif` tail. A lone `if` in the `orelse` prints back as `elif` -- CPython's own
 	// unparser makes the same (irreversible either way) choice.
-	private elseChain(alternate: Stmt[]): string {
-		if (alternate.length === 0)
+	private elseChain(alternate?: Stmt[]): string {
+		if (!alternate || alternate.length === 0)
 			return '';
 		if (alternate.length === 1 && alternate[0].type === 'if') {
 			const e = alternate[0];
@@ -127,8 +127,8 @@ export class Output {
 		}
 		return this.newline + 'else' + this.suite(alternate);
 	}
-	private elseClause(orelse: Stmt[]): string {
-		return orelse.length ? this.newline + 'else' + this.suite(orelse) : '';
+	private elseClause(orelse?: Stmt[]): string {
+		return orelse?.length ? this.newline + 'else' + this.suite(orelse) : '';
 	}
 
 	// ===================================================================

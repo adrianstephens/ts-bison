@@ -747,7 +747,7 @@ class FunctionContext {
 	}
 
 	toFuncBody(numParams: number, toValType: (t: WasmType) => wasm.ValType): wasm.FuncBody & {id: string} {
-		return { id: this.name, locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
+		return { id: this.name.replace(/[^a-zA-Z0-9_]/g, '_'), locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
 	}
 
 	// Shared by emitGeneratorDispatch/emitAsyncDispatch -- the whole "one dispatch + N nested blocks
@@ -4697,7 +4697,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		functionValueWrappers.set(key, info);
 
 		worklist.push(() => {
-			const wctx		= new FunctionContext(`<fnvalue>.${name}`.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(target.result), undefined);
+			const wctx		= new FunctionContext(`<fnvalue>.${name}`, new Scope(libGlobal), plainReturn(target.result), undefined);
 			wctx.declareLocal('#envParam', { typeIndex: ensureEnvBase(), nullable: false });
 			const argLocals = target.params.map((p, i) => wctx.declareLocal(`$arg$${i}`, p));
 			argLocals.forEach(l => wctx.emit(I.local.get(l.index)));
@@ -4746,7 +4746,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		closureCoercionWrappers.set(key, result);
 
 		worklist.push(() => {
-			const wctx		= new FunctionContext(`<coerce>.${key}`.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(wantSig.result), undefined);
+			const wctx		= new FunctionContext(`<coerce>.${key}`, new Scope(libGlobal), plainReturn(wantSig.result), undefined);
 			const envParam	= wctx.declareLocal('#envParam', { typeIndex: ensureEnvBase(), nullable: false });
 			// Declares `wantSig`'s *full* param list (matching the wrapper's own real arity, since a caller
 			// invoking through `wantFuncTypeIndex` always passes all of them) -- only the leading
@@ -8811,7 +8811,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		funcs.set(key, info);
 		worklist.push(withCatch(() => {
 			// See `ensureCtor`'s own note -- a method body resolves against its class's declaring module too.
-			const ctx	= new FunctionContext(key.replace('.', '_').replace('#', '_'), new Scope(owner.declScope ?? libGlobal), plainReturn(result), owner, owner.homeModule);
+			const ctx	= new FunctionContext(key, new Scope(owner.declScope ?? libGlobal), plainReturn(result), owner, owner.homeModule);
 			if (!isStatic)
 				ctx.declareValue('this', thisWtype, owner.thisTsType);
 			if (reassignsThis) {
@@ -8882,7 +8882,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		funcs.set(`<any field>.${name}`, info);
 
 		lateWorklist.push(() => {
-			const dctx = new FunctionContext(`field_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`, new Scope(libGlobal), plainReturn(REF_ANY), undefined);
+			const dctx = new FunctionContext(`field_${name}`, new Scope(libGlobal), plainReturn(REF_ANY), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY);
 
 			// Deduped by physical HEAP type, not by `ClassInfo` -- several owners can share one, and a
@@ -8989,7 +8989,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		funcs.set(`<any in>.${name}`, info);
 
 		lateWorklist.push(() => {
-			const dctx = new FunctionContext(`in_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`, new Scope(libGlobal), plainReturn('i32'), undefined);
+			const dctx = new FunctionContext(`in_${name}`, new Scope(libGlobal), plainReturn('i32'), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY_NULLABLE);
 			// `-1` is `ensureClass`'s scalar-backed sentinel -- no physical heap type, so no `ref.test` target.
 			const declaring = [...classes.values()].filter(c => c.typeIndex !== -1
@@ -9026,7 +9026,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			const candidates = findAnyDispatchCandidates(name, ctx);
 			if (!candidates.length)
 				throw `no reachable class (or 'number'/'boolean') declares a matching zero-argument '${name}' -- a dynamic dispatch on 'any' needs at least one real candidate`;
-			const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(want), undefined);
+			const dctx = new FunctionContext(key, new Scope(libGlobal), plainReturn(want), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY);
 
 			function buildArm(i: number): wasm.Instr[] {
@@ -9100,7 +9100,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// result type before `result` (and so this dispatcher's own signature) can be decided; `onReturn`
 		// is swapped in below once `result` is known, but nothing here ever actually reads it -- `buildArm`
 		// emits its own raw `I.return`-free branching directly, never through `ctx.onReturn`.
-		const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(REF_ANY), undefined);
+		const dctx = new FunctionContext(key, new Scope(libGlobal), plainReturn(REF_ANY), undefined);
 
 		// Each member's own field or `get` accessor. A member that has NEITHER is dropped rather than
 		// rejected: the checker allowed this access, so either every member has the property or it
@@ -9187,7 +9187,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// Same scratch-ctx-live-for-the-whole-function reasoning as `ensureUnionFieldDispatch` -- `get`'s
 		// own result type must be known, synchronously, before `result` (and so this dispatcher's own
 		// signature) can be decided.
-		const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(REF_ANY), undefined);
+		const dctx = new FunctionContext(key, new Scope(libGlobal), plainReturn(REF_ANY), undefined);
 
 		// Each member's own `get(i)` -- an internal inconsistency (not a real program error) if any member
 		// turns out not to have one, since the one real call site already required every member to satisfy
@@ -9284,7 +9284,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				}
 			}
 			const candidates = found.sort((a, b) => b.depth - a.depth).map(({ cls }) => ({ cls, funcInfo: ensureMethod(cls, name, [], ctx)! }));
-			const dctx = new FunctionContext(key.replace(/[^a-zA-Z0-9_]/g, '_'), new Scope(libGlobal), plainReturn(base.result), undefined);
+			const dctx = new FunctionContext(key, new Scope(libGlobal), plainReturn(base.result), undefined);
 			const recv = dctx.declareLocal('$recv', owner.thisWtype!);
 			// Already-evaluated argument values (the caller pushed these against `owner`'s own signature,
 			// not knowing yet which concrete override will run) -- forwarded as-is to whichever `call`
@@ -9565,18 +9565,64 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// no fixed signature to give a wasm-level export, so it's just skipped here -- a library module's own
 	// generic exports are still reachable to other compiled-in files via the ordinary named/namespace-import
 	// resolution in `emitCall` etc., which needs no wasm-level export at all.
+	const exportedFuncs: { name: string; info: FuncInfo }[] = [];
 	for (const [name, decl] of functionDeclByName) {
 		if (!exportedNames.has(name))
 			continue;
 		if (decl.typeParams?.length)
 			continue;
 		const info = compileFunc(name, decl);
-		if (info)
+		if (info) {
 			(mod.exports??=[]).push({ name, kind: 'func', index: info.funcIndex });
+			exportedFuncs.push({ name, info });
+		}
 	}
 
 	while (worklist.length)
 		worklist.shift()!();
+
+	// A host call into an export IS the job boundary -- the same thing a libuv callback is for node --
+	// so the microtask queue drains when the exported call returns, never mid-call. Each export is
+	// re-pointed at a wrapper that calls the drain hook on the way out.
+	//
+	// "Outermost" needs no depth counter, because it is STRUCTURAL: the wrapper is a separate function
+	// that only the export TABLE points at. An internal call -- including one export calling another --
+	// resolves to the real function's own index and never goes through a wrapper at all, so a wrapper
+	// only ever runs when the host is the caller. (wasm re-entering an export via a host callback would
+	// need a counter, but there is no host-callback mechanism here to make that reachable.)
+	//
+	// Emitted ONLY where the program actually reached the queue -- the lib DIRECTS this by referencing
+	// `microtasks`, rather than the compiler hardwiring a policy. A module with no promises in it is
+	// unchanged, down to its function indices. Built after the worklist because that is when the
+	// machinery has finished being discovered; `mod.exports` is patched rather than rebuilt.
+	if (lazyGlobalSlots.has(homeKey(LIB_MODULE, 'microtasks'))) {
+		const hook = (n: string) => {
+			const decl = LIB_DECL_MAP.get(n);
+			return decl?.type === 'function_decl' ? ensureFunc(n, decl) : undefined;
+		};
+		const exit = hook('__towasm_exitCall');
+		if (exit) {
+			for (const { name, info } of exportedFuncs) {
+				const { funcIndex, typeIndex } = registerFunc(toParams(info.params), toResults(info.result));
+				const wrapper: FuncInfo = { ...info, funcIndex, typeIndex };
+				const wctx		= new FunctionContext(`<export>.${name}`, new Scope(libGlobal), plainReturn(info.result), undefined);
+				const argLocals = info.params.map((p, i) => wctx.declareLocal(`$arg$${i}`, p));
+				argLocals.forEach(l => wctx.emit(I.local.get(l.index)));
+				wctx.emit(I.call(info.funcIndex));
+				// The real result sits on the stack underneath this void call, so the drain runs before
+				// the return without disturbing it -- and this handles a callee with several `return`s,
+				// which appending to its own epilogue could not.
+				wctx.emit(I.call(exit.funcIndex));
+				wrapper.body = wctx.toFuncBody(argLocals.length, toValType);
+				closureLiterals.push(wrapper);
+				const e = mod.exports!.find(x => x.kind === 'func' && x.name === name);
+				if (e)
+					e.index = funcIndex;
+			}
+			while (worklist.length)
+				worklist.shift()!();
+		}
+	}
 
 	// `lateWorklist` (any-dispatch cascade bodies) needs the *full, final* candidate set, so it only starts
 	// once `worklist` has completely drained -- building a cascade can itself reach a not-yet-compiled candidate method, pushing back onto `worklist`, so that's drained again after every `lateWorklist` item too.
