@@ -507,7 +507,9 @@ class FunctionContext {
 	// Declarations (`declareLocal`/`declareValue`, and `local`'s scratch temps), in declaration order. A name may appear
 	// more than once (a closed sibling scope's declaration, or a live nested shadow) -- `lookup` scans
 	// from the end and skips closed entries, so a still-open outer binding resurfaces once an inner one closes.
-	declared:	{ name: string; local: Local; closed: boolean }[] = [];
+	// `pinned`: belongs to the FUNCTION, not to whatever block happened to be open when it was declared,
+	// so `closeScope` leaves it alone. Only `this` in a constructor needs it -- see `materializeThis`.
+	declared:	{ name: string; local: Local; closed: boolean; pinned?: boolean }[] = [];
 	// Watermarks (`declared.length` at open time) for each currently open lexical block -- see `openScope`.
 	scopeStack: number[] = [];
 	// One entry per real wasm local index (params included); a slot's type is fixed for the whole function,
@@ -632,7 +634,7 @@ class FunctionContext {
 			throw 'unbalanced scope close';
 		for (let i = mark; i < this.declared.length; i++) {
 			const d = this.declared[i];
-			if (!d.closed) {
+			if (!d.closed && !d.pinned) {
 				d.closed = true;
 				this.freeLocal(d.local.wtype, d.local.index);
 			}
@@ -673,7 +675,7 @@ class FunctionContext {
 		return index;
 	}
 
-	declareLocal(name: string, wtype: WasmType): Local {
+	declareLocal(name: string, wtype: WasmType, pinned = false): Local {
 		const scopeStart = this.scopeStack.at(-1) ?? 0;
 		for (let i = this.declared.length - 1; i >= scopeStart; i--) {
 			const d = this.declared[i];
@@ -681,13 +683,13 @@ class FunctionContext {
 				throw `local '${name}' redeclared (shadowing within the same scope is not supported)`;
 		}
 		const local = {wtype, index: this.allocLocal(wtype)};
-		this.declared.push({ name, local, closed: false });
+		this.declared.push({ name, local, closed: false, pinned });
 		return local;
 	}
 
-	declareValue(name: string, wtype: WasmType, tsType: Type): Local {
+	declareValue(name: string, wtype: WasmType, tsType: Type, pinned = false): Local {
 		this.scope.addValue(name, tsType);
-		return this.declareLocal(name, wtype);
+		return this.declareLocal(name, wtype, pinned);
 	}
 
 	// No real wasm local -- storage is a closureEnv struct field.
@@ -1746,6 +1748,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// named imports were listed here, so `TS.parse(...)` inside a callback read as a free variable
 			// and threw "unresolved identifier 'TS'".
 			|| !!moduleScopeOf(homeModule)?.namespace(name)
+			// A CLASS name is resolved at its own use site (`new C(...)`, `C.staticMethod()`) exactly as it
+			// is outside a closure -- it is a declaration, not a value, so it never needs a capture slot
+			// either. `collectFreeVars` cannot tell the two apart, so without this ANY closure or nested
+			// function mentioning a module-level class threw "unresolved identifier".
+			|| moduleScopeOf(homeModule)?.decl(name)?.type === 'class_decl'
 			// Same reasoning again for the ENTRY module's own top-level `const`/`let`: it becomes a real
 			// global (or an `ensureLazyGlobal` wrapper), so every use resolves at its own site and it never
 			// needs a capture slot. `hoist` deliberately doesn't hoist a plain top-level `var_decl` into a
@@ -8497,7 +8504,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					for (const f of cls.fields)
 						ctx.emit(I.local.get(values.get(f.name)!.index));
 					ctx.emit(I.struct.new(cls.typeIndex));
-					const thisLocal = ctx.declareValue('this', thisWtype, cls.thisTsType);
+					// PINNED: `this` belongs to the constructor, not to whatever scope happened to be open
+					// when the last field landed. A base class with a param-property constructor completes
+					// it inside the `super(...)` call's own scope, and closing that took `this` with it --
+					// so any `this.field = ...` after `super(...)` failed with "unresolved identifier 'this'".
+					const thisLocal = ctx.declareValue('this', thisWtype, cls.thisTsType, true);
 					ctx.ctorThis = thisLocal;
 					ctx.onReturn = ctorOnReturn;
 					ctx.ctorFields = undefined;
