@@ -1680,6 +1680,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// (zero behavior change from before multi-file support existed); a non-entry module's top-level
 	// functions are stored under `homeKey(canonical, name)` instead, so a same-named function in two
 	// different files never collides in this (or `funcs`') shared cache.
+	// One identity for the whole static lib -- see `lazyGlobalFor`. Not a real entry in `moduleBodies`:
+	// `LIB_AST` is a flat concatenation with no per-file identity, and the `moduleId === '.'` special
+	// cases in the scan below are all entry-only by design.
+	const LIB_MODULE			= '#lib';
 	const moduleBodies			= new Map<string, TS.Stmt[]>([['.', ast.body], ...(modules ?? [])]);
 	// That module's own scope: the entry carries it on its `Program`, an imported body gets it stamped by
 	// `exportScope` (see `compileFunc`'s own note on why a body needs one at all).
@@ -1993,6 +1997,17 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return bt?.class ? ensureClass(bt.class) : undefined;
 	}
 
+	// Whether `init` is something a real wasm global can be initialized from -- a folded scalar literal,
+	// nothing else. A string is still a `literal` node but its physical value is an i16 array built at
+	// runtime, and a `bigint` only qualifies on a real `i64` slot. Everything rejected here belongs to
+	// `ensureLazyGlobal` instead.
+	function isEagerGlobalInit(init: Expr, typeAnnotation?: Type): boolean {
+		const folded	= foldConstants(init);
+		const kind		= folded?.type === 'literal' && notUnsigned(scalarKind(typeOf(typeAnnotation ?? checkerTypeOf(init, libGlobal))));
+		return !!kind && folded!.type === 'literal'
+			&& (typeof folded!.value === 'number' || typeof folded!.value === 'boolean' || (typeof folded!.value === 'bigint' && kind === 'i64'));
+	}
+
 	function ensureGlobal(name: string, wtype: WasmType, init: Expr, mut: boolean) {
 		if (!globals.has(name))
 			globals.set(name, {wtype, index: globals.size, init, mut});
@@ -2107,8 +2122,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const own		= varStmt?.type === 'var_decl'
 			? { stmt: varStmt as TS.Stmt, d: varStmt.declarations.find(d => d.name === name) }
 			: scope === ctx.scope ? topLevelVars.get(name) : undefined;
-		if (!own?.d)
+		if (!own?.d) {
+			// A module-level binding in a STATIC lib file (`LIB_AST`). Those files are never in
+			// `moduleBodies`, so they have no `stmtHomeModule` entry and are absent from `topLevelVars` --
+			// but they are a single flat scope sharing one `libGlobal`, so one identity for the whole lib
+			// is the right granularity, and it must be a FIXED one: falling back to `ctx.homeModule` would
+			// give each referencing module its own separate copy of the same shared state.
+			const lib = LIB_DECL_MAP.get(name);
+			if (lib?.type === 'var_decl' && lib.init && !isAsm(lib.init)) {
+				const wrapper	= ensureLazyGlobal(name, LIB_MODULE, lib as unknown as JS.Var<Type>, libGlobal);
+				const slot		= lazyGlobalSlots.get(homeKey(LIB_MODULE, name));
+				return wrapper && slot ? { wrapper, slot } : undefined;
+			}
 			return undefined;
+		}
 		const homeModule	= stmtHomeModule.get(own.stmt) ?? ctx.homeModule;
 		const wrapper		= ensureLazyGlobal(name, homeModule, own.d, scope);
 		const slot			= lazyGlobalSlots.get(homeKey(homeModule, name));
@@ -4950,8 +4977,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				let g = globals.get(name);
 				if (!g) {
 					const global = LIB_DECL_MAP.get(name);
-					if (global && global.type === 'var_decl')
-						g = ensureGlobal(name, typeOf(global.typeAnnotation!)!, global.init!, global.kind !== 'const');
+					// Only an initializer a wasm global can really be INITIALIZED from -- the same test the
+					// entry module's own top-level scan applies. An array/object/string/`new` one registered
+					// a global here that then threw "needs a compile-time-constant initializer" at emit time,
+					// and -- because `g` was set -- shadowed the `lazyGlobalFor` fallback further down that
+					// exists for exactly this case. That is why a NON-SCALAR module-level binding in a static
+					// lib file was unreachable while a scalar one worked.
+					if (global && global.type === 'var_decl' && global.init && isEagerGlobalInit(global.init, global.typeAnnotation))
+						g = ensureGlobal(name, typeOf(global.typeAnnotation!)!, global.init, global.kind !== 'const');
 				}
 				if (g) {
 					ctx.emit(I.global.get(g.index));
@@ -6348,10 +6381,31 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			wtype: () => result,
 			emit(ctx, argument) {
 				if (result === undefined) {
-					if (argument)
+					// `() => sideEffect()` -- a concise arrow body is compiled as `return <expr>`, and for a
+					// `void`-returning callee that expression genuinely has no value. Real TS allows it (a
+					// `void` expression is a valid `void` return), so the expression is emitted for its
+					// EFFECTS and only a returned value that really exists is rejected.
+					if (argument && emitExpr(argument, ctx, 'void') !== 'void')
 						throw "a 'void' function cannot return a value";
 				} else if (argument) {
-					emitAs(argument, ctx, result);
+					// A `void` expression returned where the signature declares a value: real JS gives
+					// `undefined`, so the expression runs for its effects and the declared result's own
+					// `undefined` placeholder is pushed. Reached when a `() => void` closure is adapted to
+					// an `any`-returning signature -- `Array<T>`'s single physical bucket for every
+					// non-scalar element makes the element type `any`, so `q.push(() => sideEffect())`
+					// compiles the arrow at `result = any` while its body genuinely has no value.
+					// Decided from the argument's own CHECKER type, so everything else keeps going through
+					// `emitAs` -- which has null-literal handling of its own that emitting directly would
+					// skip. Not `wtypeOf`: `typeOf` registers anonymous object shapes as a side effect, and
+					// asking it here perturbed `matchObjectShape`'s candidate set for an unrelated
+					// `makeRule(() => ({...}))` elsewhere.
+					const argT = checkerTypeOf(unwrapAs(argument), ctx.scope);
+					if (argT.type === 'ref' && argT.name === 'void') {
+						emitExpr(argument, ctx, 'void');
+						emitDefaultValue(result, ctx);
+					} else {
+						emitAs(argument, ctx, result);
+					}
 				}
 				ctx.emit(I.return);
 			},
