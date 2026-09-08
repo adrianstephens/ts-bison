@@ -89,6 +89,17 @@ export function  Sequence<E, const K extends string>(type: K, elements: readonly
 //  Shared statement shapes
 // ===================================================================
 
+// Assignment is a MUTATION, not a computation. js-parser used to spell it as a `Binary` whose
+// operator happened to end in `=`, so every consumer re-derived "is this an assignment" from the
+// operator string -- towasm, vsdg and tocode each kept their own copy of that knowledge, the copies
+// disagreed with the grammar, and vsdg silently dropped `x &&= y` as a result. The tag carries it now.
+//
+// `operator` absent is a plain `=`; present it is the compound form's BASE operator (`+=` -> `+`),
+// stored rather than recovered by slicing the `=` off a string. Python's assign/augassign split
+// collapses onto the same node.
+export interface Assign<E, O>		{ type: 'assign'; operator?: O; target: E; value: E }
+export function  Assign<E, const O>(target: E, value: E, operator?: O): Assign<E, O> { return { type: 'assign', operator, target, value }; }
+
 // Suspension points, not computations. js-parser used to fold `await` into `Unary` purely because it
 // has the same prefix syntax as `typeof`/`void` -- and then checker, transform, vsdg and ts2py each
 // had to peel it back out before their unary handling. `yield` was already its own node here; these

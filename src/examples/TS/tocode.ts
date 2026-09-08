@@ -53,6 +53,11 @@ function exprPrecedence(expr: Expr): number {
 		case 'yield':
 		case 'arrow':				return 2;
 		case 'conditional':			return 3;
+		case 'assign':				return 2;
+		// NOTE: `??` binds tighter than `?:`, so this reads `(BINARY_PREC[op] ?? endsWith) ? 2 : 0` --
+		// i.e. every operator WITH a precedence entry reports 2, not its own precedence. That
+		// over-parenthesises, and the expected strings in test-vsdg encode the result. Left exactly as
+		// it was rather than fixed here, so this change stays about the `assign` node alone.
 		case 'binary':				return BINARY_PREC[expr.operator] ?? expr.operator.endsWith('=') ? 2 : 0;
 		case 'as':
 		case 'satisfies':return 11;
@@ -79,7 +84,6 @@ function maybe<T>(value: T, fn: (value: NonNullable<T>) => string)	{ return valu
 // breaks any key that isn't a valid identifier on its own (e.g. `'filter-out': ...`).
 function isValidIdentifier(s: string) { return /^[$_\p{ID_Start}][$\p{ID_Continue}]*$/u.test(s); }
 function isLogicalOp(op: string) { return op === '&&' || op === '||' || op === '??'; } 
-function isAssignOp(op: string) { return !(op in BINARY_PREC) && op.endsWith('='); }
 
 function needsNullishParens(parentOp: string, child: Expr): boolean {
 	const childOp = child.type === 'binary' && isLogicalOp(child.operator) ? child.operator : undefined;
@@ -688,12 +692,17 @@ export class Output {
 			case 'unary_post':
 				return this.expr(expr.operand, 18) + expr.operator;
 
+			// Right-associative and the loosest thing there is: the target re-emits at the
+			// left-hand-side tier the grammar demands, the value at assignment's own tier.
+			case 'assign':
+				return this.expr(expr.target, 18) + this.operator((expr.operator ?? '') + '=') + this.expr(expr.value, 2);
+
 			case 'binary': {
 				const op	= expr.operator;
 				const prec	= BINARY_PREC[op] ?? 0;
-				return withParens(this.expr(expr.left, op === '**' ? 16 : isAssignOp(op) ? 18 : prec), needsNullishParens(op, expr.left) || needsAsIntersectionParens(op, expr.left))
+				return withParens(this.expr(expr.left, op === '**' ? 16 : prec), needsNullishParens(op, expr.left) || needsAsIntersectionParens(op, expr.left))
 					+ this.operator(op)
-					+ withParens(this.expr(expr.right, op === '**' ? 15 : isAssignOp(op) ? 2 : prec + 1), needsNullishParens(op, expr.right));
+					+ withParens(this.expr(expr.right, op === '**' ? 15 : prec + 1), needsNullishParens(op, expr.right));
 			}
 
 			case 'conditional':

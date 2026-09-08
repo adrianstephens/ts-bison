@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { type RecoveryCallback, type MergeValues, type Token, type LALRParser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
-import { Literal, Identifier, Unary, UnaryPost, Binary, Await, mergeMods, withDefault, stampPos } from '../common';
+import { Literal, Identifier, Unary, UnaryPost, Binary, Assign, Await, mergeMods, withDefault, stampPos } from '../common';
 import * as Common from '../common';
 
 // ===================================================================
@@ -24,7 +24,9 @@ export const AssignableOps	= ['+', '-', '*', '**', '/', '%', '&', '|', '^', '<<'
 export type compareOps		= (typeof CompareOps)[number];
 export type assignableOps	= (typeof AssignableOps)[number];
 export type assignOps		= '='|`${assignableOps}=`;
-export type binaryOps		= assignableOps | assignOps | compareOps|'instanceof'|'in'
+// Deliberately excludes `assignOps`: an assignment is a `Common.Assign` node, not a `Binary` whose
+// operator happens to end in `=`. That is what makes "forgot an operator from the set" impossible.
+export type binaryOps		= assignableOps | compareOps|'instanceof'|'in'
 
 export const JSUnary		= Unary<Expr, unaryOps>;
 export const JSBinary		= Binary<Expr, binaryOps>;
@@ -124,6 +126,7 @@ export type Expr<T = any> =
 	| { type: 'new';	callee: Expr<T>; arguments: Expr<T>[]; typeArgs?: T[] }
 	| { type: 'sequence'; expressions: Expr<T>[] }
 	| { type: 'tagged_template'; tag: Expr<T>; quasi: TemplatePart<Expr<T>>[] }
+	| Common.Assign<Expr<T>, assignableOps>
 	| Common.Await<Expr<T>>
 	| Common.Yield<Expr<T>> & { delegate?: boolean }
 	| { type: 'class'; } & Class
@@ -311,6 +314,11 @@ const REGEX_LITERAL = terminal('regex',
 export type { Location } from '../common';
 
 export const Rule = makeRule<any>(stampPos);
+
+// `=` has no base operator; every other form drops its trailing `=` ONCE, here, so nothing downstream
+// has to slice a string to find it again.
+const assign = (op: assignOps, target: Expr, value: Expr) =>
+	Assign<Expr, assignableOps>(target, value, op === '=' ? undefined : op.slice(0, -1) as assignableOps);
 
 const ASSIGN_OP = OneOf(['+=', '-=', '*=', '**=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=', '&&=', '||=', '=']);
 const UNARY_OP	= OneOf(['++', '--', 'delete', 'void', 'typeof', '+', '-', '~', '!']);
@@ -551,7 +559,7 @@ export const property_assignment = Rules<ObjectProperty<any>>(
 	Rule([IDENT], 																			$ => Field($[0], Identifier($[0]))),
 	// `{x = 1}` is never valid as a *real* object literal -- accepted anyway, permissively, purely so arrow
 	// parameters can be parsed as a plain object literal and reinterpreted as a pattern (`exprToBindingTarget` below).
-	Rule([IDENT, '=', fwd_assignment_expression], 											$ => Field($[0], Binary('=', Identifier($[0]), $[2]))),
+	Rule([IDENT, '=', fwd_assignment_expression], 											$ => Field($[0], Assign<Expr, assignableOps>(Identifier($[0]), $[2]))),
 	Rule([property_name_computed, parameter_clause, '{', function_body, '}'], 				$ => Method('method', $[0], $[1], $[3])),
 	Rule(['*', property_name_computed, parameter_clause, '{', function_body, '}'], 			$ => Method('method', $[1], $[2], $[4], ['generator'])),
 	Rule([ASYNC, property_name_computed, parameter_clause, '{', function_body, '}'], 		$ => Method('method', $[1], $[2], $[4], ['async'])),
@@ -587,8 +595,9 @@ function exprToBindingTarget(e: Expr): BindingTarget {
 						throw new SyntaxError('Invalid destructuring target: spread must be last');
 					if (p.type !== 'field')
 						throw new SyntaxError('Invalid destructuring target: function');
-					return p.value!.type === 'binary'
-						? { key: p.key, value: exprToBindingTarget(p.value.left), default: p.value.right }
+					// `{a = 1}` parses its default as a real `assign` node (see `property_assignment`)
+					return p.value!.type === 'assign'
+						? { key: p.key, value: exprToBindingTarget(p.value.target), default: p.value.value }
 						: { key: p.key, value: exprToBindingTarget(p.value!) };
 				}),
 				rest?.name
@@ -602,7 +611,7 @@ function exprToBindingTarget(e: Expr): BindingTarget {
 			return ArrayPattern(
 				(rest ? e.elements.slice(0, -1) : e.elements).map(el =>
 					  el === undefined ? undefined
-					: el.type === 'binary' ? { target: exprToBindingTarget(el.left), default: el.right }
+					: el.type === 'assign' ? { target: exprToBindingTarget(el.target), default: el.value }
 					: { target: exprToBindingTarget(el) }
 				),
 				rest?.name
@@ -614,7 +623,7 @@ function exprToBindingTarget(e: Expr): BindingTarget {
 }
 function exprToParam(e: Expr): Param<any> {
 	return	e.type === 'identifier'						? { key: e.name }
-		:	e.type === 'binary' && e.operator === '='	? { key: exprToBindingTarget(e.left), default: e.right }
+		:	e.type === 'assign' && !e.operator			? { key: exprToBindingTarget(e.target), default: e.value }
 		:	{ key: exprToBindingTarget(e) };
 }
 function exprToParams(e: Expr): Param<any>[] {
@@ -819,13 +828,13 @@ const yield_expression = Rules(
 );
 
 export const assignment_expression = Rules<Expr<any>>(self => [
-	Rule([left_hand_side_expression, ASSIGN_OP, self], 	$ => Binary($[1], $[0], $[2])),
+	Rule([left_hand_side_expression, ASSIGN_OP, self], 	$ => assign($[1], $[0], $[2])),
 	conditional_expression,
 	arrow_function,
 	yield_expression,
 ]);
 export const assignment_expression_noin = Rules<Expr>(self => [
-	Rule([left_hand_side_expression, ASSIGN_OP, self], 	$ => Binary($[1], $[0], $[2])),
+	Rule([left_hand_side_expression, ASSIGN_OP, self], 	$ => assign($[1], $[0], $[2])),
 	conditional_expression_noin,
 ]);
 
@@ -883,7 +892,7 @@ const conditional_expression_nobrace = Rules(
 	Rule([nullish_expression_nobrace, '?', assignment_expression, ':', assignment_expression], $ => ({ type: 'conditional', test: $[0], consequent: $[2], alternate: $[4] } as const)),
 );
 const assignment_expression_nobrace = Rules(
-	Rule([left_hand_side_expression_nobrace, ASSIGN_OP, assignment_expression], $ => Binary($[1], $[0], $[2])),
+	Rule([left_hand_side_expression_nobrace, ASSIGN_OP, assignment_expression], $ => assign($[1], $[0], $[2])),
 	conditional_expression_nobrace,
 	arrow_function,
 	yield_expression,

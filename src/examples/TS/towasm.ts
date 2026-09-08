@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
-import { Literal, hasMod } from '../common';
+import { Literal, Binary, Assign, Member, hasMod } from '../common';
 import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
 import { Walkable, walk, walkB } from './walker';
 import { Output } from './tocode';
@@ -133,7 +133,6 @@ type Scope			= T.Scope;
 const Scope			= T.Scope;
 const I				= wasm.I;
 
-const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=', '&&=', '||=']);
 
 const tocode = new Output({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
 
@@ -845,7 +844,7 @@ function exprMentionsName(name: string, e: Expr): boolean {
 // Whether `body` assigns to `this` anywhere -- real TS never allows this, so it has exactly one meaning
 // here: "this method replaces its own receiver's physical value" (a wasm-GC array/struct can't resize in place). Detected structurally -- any method on any class doing this gets the same treatment, not a hardcoded list.
 function assignsToThis(body: Stmt[]): boolean {
-	return walkB(body, undefined, (e, process) => e.type === 'binary' && e.operator === '=' && e.left.type === 'this' ? true : process(e));
+	return walkB(body, undefined, (e, process) => e.type === 'assign' && !e.operator && e.target.type === 'this' ? true : process(e));
 }
 
 
@@ -985,8 +984,8 @@ function collectCapturedMutables(body: Stmt[]): Set<string> {
 
 // Every identifier this expression assigns to -- `x = v`, any compound form, and `++`/`--`.
 function noteAssignExpr(e: Expr, into: Set<string>) {
-	if (e.type === 'binary' && ASSIGN_OPS.has(e.operator) && e.left.type === 'identifier')
-		into.add(e.left.name);
+	if (e.type === 'assign' && e.target.type === 'identifier')
+		into.add(e.target.name);
 	else if ((e.type === 'unary' || e.type === 'unary_post') && (e.operator === '++' || e.operator === '--') && e.operand.type === 'identifier')
 		into.add(e.operand.name);
 }
@@ -1534,22 +1533,22 @@ function collectRangeWidenings(body: Stmt[], scope: Scope): Map<JS.Var<Type>, Ty
 		(e, process) => {
 			if (e.type === 'arrow' || e.type === 'function')
 				return false; // separate FuncCtx, own pre-pass
-			if (e.type === 'binary' && ASSIGN_OPS.has(e.operator) && e.left.type === 'identifier') {
-				const o = findOpen(e.left.name);
+			if (e.type === 'assign' && e.target.type === 'identifier') {
+				const o = findOpen(e.target.name);
 				if (o) {
 					const op = e.operator;
-					const isExempt = ((op === '+=' || op === '-=') && isSmallIntLit(e.right))
-						|| (op === '='
-							&& e.right.type === 'binary'
-							&& (e.right.operator === '+' || e.right.operator === '-')
-							&& e.right.left.type === 'identifier' && e.right.left.name === e.left.name
-							&& isSmallIntLit(e.right.right)
+					const isExempt = ((op === '+' || op === '-') && isSmallIntLit(e.value))
+						|| (!op
+							&& e.value.type === 'binary'
+							&& (e.value.operator === '+' || e.value.operator === '-')
+							&& e.value.left.type === 'identifier' && e.value.left.name === e.target.name
+							&& isSmallIntLit(e.value.right)
 						);
 					if (!isExempt)
 						contribute(o,
-							op === '=' ? (loopDepth > 0 && exprMentionsName(e.left.name, e.right) ? undefined : T.toRange(checkerTypeOf(e.right, scope)))
-						:	op === '??=' || loopDepth > 0 ? undefined // every other compound op is self-referential by definition
-						:	T.toRange(checkerTypeOf({ type: 'binary', operator: op.slice(0, -1), left: e.left, right: e.right } as Expr, scope))
+							!op ? (loopDepth > 0 && exprMentionsName(e.target.name, e.value) ? undefined : T.toRange(checkerTypeOf(e.value, scope)))
+						:	op === '??' || loopDepth > 0 ? undefined // every other compound op is self-referential by definition
+						:	T.toRange(checkerTypeOf(Binary(op, e.target, e.value), scope))
 					);
 				}
 			}
@@ -5539,6 +5538,102 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				}
 				throw `unsupported postfix operator '${e.operator}'`;
 
+			case 'assign': {
+				const { operator, target, value } = e;
+				const rightInfo = operandInfo(value, ctx);
+
+				// `**=` is a real assignment operator the parser accepts, but it is not in `ASSIGN_OPS` --
+				// so it fell through to the plain binary path below, where `BINARY_OP_NAMES` has no entry
+				// for it either, and died as "unsupported compound-assignment method 'undefined'". There is
+				// no wasm instruction for it and no `numericOpInline` case; `Math.pow` is the real
+				// implementation (see the `**` rewrite further down), so this becomes a plain assignment.
+				// Only where the target re-emits without side effects -- an identifier, or a property chain
+				// off one -- since it appears on both sides.
+				if (operator === '**') {
+				const reemittable = (x: Expr): boolean => x.type === 'identifier' || x.type === 'this'
+					|| (x.type === 'member' && !x.optional && reemittable(x.object));
+				if (!reemittable(target))
+					throw "'**=' is only supported on a plain name or property chain";
+				return emitExpr(Assign<Expr, JS.assignableOps>(target, Binary('**', target, value)), ctx, want);
+				}
+
+
+				const slot		= emitAssignTarget(target, ctx, operator ? 'discard' : 'none');
+				const wtype		= slot.wtype;
+
+				// The target's own declared type is the value's contextual type -- the same channel
+				// `case 'var_decl'` seeds from an annotation, which a bare `new C` on the value needs to
+				// find its own type arguments (`scope.resolveCache ??= new WeakMap`).
+				const emitValue = () => {
+					const saved = ctx.contextualReturn;
+					ctx.contextualReturn = checkerTypeOf(target, ctx.scope);
+					emitAs(value, ctx, wtype);
+					ctx.contextualReturn = saved;
+				};
+
+				if (!operator) {
+					emitValue();
+
+				} else switch (operator) {
+					case '&&':
+					case '||': {
+						// `a &&= b` assigns only when `a` is TRUTHY, `a ||= b` only when it is falsy --
+						// and in the other case `b` is not evaluated at all. Same `if`-based shape
+						// `??=` uses below, keyed off truthiness rather than nullishness.
+						const isAnd	= operator === '&&';
+						const cur	= ctx.declareLocal(`$logical$assign$${optionalTempCounter++}`, wtype);
+						ctx.emit(I.local.tee(cur.index));
+						emitTruthyOf(wtype, checkerTypeOf(target, ctx.scope), ctx);
+						const _old = ctx.swapOut();
+						if (isAnd)
+							emitValue();
+						else
+							ctx.emit(I.local.get(cur.index));
+						const _then = ctx.swapOut();
+						if (isAnd)
+							ctx.emit(I.local.get(cur.index));
+						else
+							emitValue();
+						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+						break;
+					}
+
+					case '??': {
+						// `a ??= b` -- real JS short-circuits: `b` is only evaluated when `a` is null/undefined, unlike
+						// every other compound-assignment op. Mirrors the plain `??` binary-op's own `if`-based lowering exactly, just feeding `target.write` instead of returning the value directly.
+						if (typeof wtype === 'string' || !wtype.nullable)
+							throw "'??=' needs a nullable object-typed target (no boxing in this subset)";
+						const leftLocal = ctx.declareLocal(`$nullish$assign$${optionalTempCounter++}`, wtype);
+						ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
+						const _old = ctx.swapOut();
+						emitValue();
+						const _then = ctx.swapOut();
+						ctx.emit(I.local.get(leftLocal.index));
+						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+						break;
+					}
+
+					default: {
+						const method	= BINARY_OP_NAMES[operator as keyof typeof BINARY_OP_NAMES];
+						const owner		= ownerOf(target, ctx);
+						if (owner && owner.methodDecls?.get(method)) {
+							emitMethodCall(owner, method, [value], ctx);
+
+						} else {
+							const inline = numericOpInline(method, wtype, rightInfo.wtype, ctx);
+							coerceTop(wtype, ctx, inline.params[0]);
+							emitAs(value, ctx, inline.params[1]);
+							ctx.emit(...inline.inline);
+							coerceTop(inline.result, ctx, wtype);
+						}
+					}
+				}
+
+				const tee = want !== 'void';
+				slot.write(tee);
+				return tee ? wtype : 'void';
+			}
+
 			case 'binary': {
 				const { operator, left, right } = e;
 				// `typeof x === 'lit'` (either way round) -- a type test, handled before anything else.
@@ -5554,101 +5649,6 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				}
 				const rightInfo = operandInfo(right, ctx);
 
-				// `**=` is a real assignment operator the parser accepts, but it is not in `ASSIGN_OPS` --
-				// so it fell through to the plain binary path below, where `BINARY_OP_NAMES` has no entry
-				// for it either, and died as "unsupported compound-assignment method 'undefined'". There is
-				// no wasm instruction for it and no `numericOpInline` case; `Math.pow` is the real
-				// implementation (see the `**` rewrite further down), so this becomes a plain assignment.
-				// Only where the target re-emits without side effects -- an identifier, or a property chain
-				// off one -- since it appears on both sides.
-				if (operator === '**=') {
-					const reemittable = (x: Expr): boolean => x.type === 'identifier' || x.type === 'this'
-						|| (x.type === 'member' && !x.optional && reemittable(x.object));
-					if (!reemittable(left))
-						throw "'**=' is only supported on a plain name or property chain";
-					return emitExpr({ type: 'binary', operator: '=', left, right: { type: 'binary', operator: '**', left, right } } as Expr, ctx, want);
-				}
-
-				if (ASSIGN_OPS.has(operator)) {
-
-					const target	= emitAssignTarget(left, ctx, operator !== '=' ? 'discard' : 'none');
-					const wtype		= target.wtype;
-
-					// The target's own declared type is the value's contextual type -- the same channel
-					// `case 'var_decl'` seeds from an annotation, which a bare `new C` on the right needs to
-					// find its own type arguments (`scope.resolveCache ??= new WeakMap`).
-					const emitValue = () => {
-						const saved = ctx.contextualReturn;
-						ctx.contextualReturn = checkerTypeOf(left, ctx.scope);
-						emitAs(right, ctx, wtype);
-						ctx.contextualReturn = saved;
-					};
-
-					switch (operator) {
-						case '=':
-							emitValue();
-							break;
-
-						case '&&=':
-						case '||=': {
-							// `a &&= b` assigns only when `a` is TRUTHY, `a ||= b` only when it is falsy --
-							// and in the other case `b` is not evaluated at all. Same `if`-based shape
-							// `??=` uses below, keyed off truthiness rather than nullishness. Both were
-							// simply absent from `ASSIGN_OPS`, so they fell through to the plain binary
-							// path and died as "unsupported compound-assignment method 'undefined'".
-							const isAnd	= operator === '&&=';
-							const cur	= ctx.declareLocal(`$logical$assign$${optionalTempCounter++}`, wtype);
-							ctx.emit(I.local.tee(cur.index));
-							emitTruthyOf(wtype, checkerTypeOf(left, ctx.scope), ctx);
-							const _old = ctx.swapOut();
-							if (isAnd)
-								emitValue();
-							else
-								ctx.emit(I.local.get(cur.index));
-							const _then = ctx.swapOut();
-							if (isAnd)
-								ctx.emit(I.local.get(cur.index));
-							else
-								emitValue();
-							ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
-							break;
-						}
-
-						case '??=': {
-							// `a ??= b` -- real JS short-circuits: `b` is only evaluated when `a` is null/undefined, unlike
-							// every other compound-assignment op. Mirrors the plain `??` binary-op's own `if`-based lowering exactly, just feeding `target.write` instead of returning the value directly.
-							if (typeof wtype === 'string' || !wtype.nullable)
-								throw "'??=' needs a nullable object-typed target (no boxing in this subset)";
-							const leftLocal = ctx.declareLocal(`$nullish$assign$${optionalTempCounter++}`, wtype);
-							ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
-							const _old = ctx.swapOut();
-							emitValue();
-							const _then = ctx.swapOut();
-							ctx.emit(I.local.get(leftLocal.index));
-							ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
-							break;
-						}
-
-						default: {
-							const method	= BINARY_OP_NAMES[operator.slice(0, -1) as keyof typeof BINARY_OP_NAMES];
-							const owner		= ownerOf(left, ctx);
-							if (owner && owner.methodDecls?.get(method)) {
-								emitMethodCall(owner, method, [right], ctx);
-
-							} else {
-								const inline = numericOpInline(method, wtype, rightInfo.wtype, ctx);
-								coerceTop(wtype, ctx, inline.params[0]);
-								emitAs(right, ctx, inline.params[1]);
-								ctx.emit(...inline.inline);
-								coerceTop(inline.result, ctx, wtype);
-							}
-						}
-					}
-
-					const tee = want !== 'void';
-					target.write(tee);
-					return tee ? wtype : 'void';
-				}
 
 				switch (operator) {
 					// `a && b` and `a || b` yield an OPERAND, not a boolean: `0.5 && 7` is `7`, `0 || 7` is
@@ -7103,7 +7103,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// Adds no new name to resolve at the call site -- every leaf is still a literal, an earlier
 			// parameter, or a property chain off one -- so it carries none of the cross-module hazard a
 			// default that *called* something would.
-			|| (e.type === 'binary' && e.operator !== '=' && isReemittableDefault(e.left, earlierNames) && isReemittableDefault(e.right, earlierNames))
+			|| (e.type === 'binary' && isReemittableDefault(e.left, earlierNames) && isReemittableDefault(e.right, earlierNames))
 			|| (e.type === 'unary' && isReemittableDefault(e.operand, earlierNames))
 			|| (e.type === 'conditional' && isReemittableDefault(e.test, earlierNames) && isReemittableDefault(e.consequent, earlierNames) && isReemittableDefault(e.alternate, earlierNames));
 	}
@@ -8496,8 +8496,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// TS scoping) so an accessor write (`this.someSetter = x`) still falls through to ordinary
 			// `emitStmt` -- calling a setter needs a real `this` receiver, so it's correctly caught by
 			// `case 'this'`'s own guard if attempted too early.
-			if (st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '=' && st.expression.left.type === 'member' && st.expression.left.object.type === 'this' && cls.fieldIndex.has(st.expression.left.property)) {
-				setField(st.expression.left.property, st.expression.right);
+			if (st.type === 'expression' && st.expression.type === 'assign' && !st.expression.operator && st.expression.target.type === 'member' && st.expression.target.object.type === 'this' && cls.fieldIndex.has(st.expression.target.property)) {
+				setField(st.expression.target.property, st.expression.value);
 			} else {
 				emitStmt(st, ctx);
 			}
@@ -8604,7 +8604,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					if (!ctx.ctorFields) {
 						emitStmt({
 							type: 'expression',
-							expression: { type: 'binary', operator: '=', left: { type: 'member', object: { type: 'this' }, property: field }, right: value },
+							expression: Assign<Expr, JS.assignableOps>(Member<Expr>({ type: 'this' }, field), value),
 						}, ctx);
 						return;
 					}
@@ -8631,7 +8631,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				);
 				emitCtorStatements(ctor, cls, ctx, (field: string, value: Expr) => emitStmt({
 					type: 'expression',
-					expression: { type: 'binary', operator: '=', left: { type: 'member', object: { type: 'this' }, property: field }, right: value },
+					expression: Assign<Expr, JS.assignableOps>(Member<Expr>({ type: 'this' }, field), value),
 				}, ctx));
 				ctx.emit(I.local.get(ctx.ctorThis!.index), I.return);
 			}

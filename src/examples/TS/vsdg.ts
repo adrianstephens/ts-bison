@@ -1,12 +1,11 @@
 /* eslint-disable @typescript-eslint/no-this-alias */
 import * as JS from './js-parser';
 import * as TS from './ts-parser';
-import { Identifier, Literal, Unary, Binary, If, While, DoWhile } from '../common';
+import { Identifier, Literal, Unary, Binary, Assign, If, While, DoWhile } from '../common';
 import { Walkable, walkB, calcUnary, calcBinary, RecurseB, isJsStatement, isTsDeclaration } from './walker';
 import { patternBindings as buildPatternBindings } from './transform';
 import { tocode } from './type-utils';
 
-const ASSIGN_OPS	= new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=']);
 type Expr			= TS.Expr;
 type Stmt			= TS.Stmt;
 
@@ -131,7 +130,7 @@ class RawNode {
 			// The assignment-operator's own "old value" port (0) is never read by codegen (buildExpr
 			// only resolves the right-hand side for a plain `=`); threadMutation's own ordering-only
 			// marker edge (port 2) would otherwise make isPureSubgraph wrongly call it impure.
-			case 'mutation':	return port === 2 || (node.expr.type === 'binary' && port === 0 && node.expr.operator === '=');
+			case 'mutation':	return port === 2 || (node.expr.type === 'assign' && port === 0 && !node.expr.operator);
 			// A named theta's own condition edge -- resolveNode always resolves a thetaValue through
 			// its mu source (port 1) instead.
 			case 'thetaValue':	return port === 0;
@@ -931,7 +930,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							If(JS.Member<TS.Type>(Identifier(resultName), 'done'), { type: 'break' }),
 							(s.init.type === 'var_decl'
 								? JS.VarDecl<TS.Type>(s.init.kind, JS.Var<TS.Type>(s.init.declarations[0].name, value))
-								: JS.Expression<TS.Type>(JS.JSBinary('=', s.init, value))),
+								: JS.Expression<TS.Type>(Assign<Expr, JS.assignableOps>(s.init, value))),
 							s.body
 						), false);
 						return false;
@@ -1040,7 +1039,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 								// user-written `hit = true;` would use -- switchInternal keeps it always
 								// resolving by name regardless of forcedPrint/needsTemp, since its own
 								// mutation is structurally never printed (see boundaryId above).
-								recurse({ type: 'binary', operator: '=', left: Identifier(hitName), right: Literal(true) } as Expr, 'expression');
+								recurse(Assign<Expr, JS.assignableOps>(Identifier(hitName), Literal(true)), 'expression');
 								scope.get(hitName)!.switchInternal = true;
 								bodyBoundary = end;
 								for (const stmt of c.consequent)
@@ -1344,29 +1343,36 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					}
 					return false;
 				}
+				// Always a mutation -- no operator set to consult, and none to forget an entry from.
+				case 'assign': {
+					process(s);
+					const node = makeExprNode(s, 'mutation');
+					connectValue(getExprNode(s.target), 0, node, 0);
+					connectValue(getExprNode(s.value), 0, node, 1);
+					if (s.target.type === 'identifier') {
+						// Reassigning a variable CAPTURED from an enclosing function is an effect
+						// that escapes this function -- its real consumer may be a not-yet-run
+						// caller, so a same-region consumer count can't decide it's dead/inlinable.
+						if (!scope.isLocalToCurrentFunction(s.target.name))
+							node.forcedPrint = true;
+						rebindVar(s.target.name, node);
+					} else {
+						// A property/index assignment mutates something outside this pass's scope
+						// tracking -- threadMutation anchors it (no name to bind); forcedPrint keeps
+						// it printing regardless of consumer count, since nothing reads it back
+						// through scope the way a bound variable would.
+						node.forcedPrint = true;
+						threadMutation(node);
+					}
+					return false;
+				}
+
+				// Never a mutation now that assignment has its own tag.
 				case 'binary': {
 					process(s);
-					const isMutation = ASSIGN_OPS.has(s.operator);
-					const node = makeExprNode(s as Expr, isMutation ? 'mutation' : 'floating');
+					const node = makeExprNode(s as Expr, 'floating');
 					connectValue(getExprNode(s.left), 0, node, 0);
 					connectValue(getExprNode(s.right), 0, node, 1);
-					if (isMutation) {
-						if (s.left.type === 'identifier') {
-							// Reassigning a variable CAPTURED from an enclosing function is an effect
-							// that escapes this function -- its real consumer may be a not-yet-run
-							// caller, so a same-region consumer count can't decide it's dead/inlinable.
-							if (!scope.isLocalToCurrentFunction(s.left.name))
-								node.forcedPrint = true;
-							rebindVar(s.left.name, node);
-						} else {
-							// A property/index assignment mutates something outside this pass's scope
-							// tracking -- threadMutation anchors it (no name to bind); forcedPrint keeps
-							// it printing regardless of consumer count, since nothing reads it back
-							// through scope the way a bound variable would.
-							node.forcedPrint = true;
-							threadMutation(node);
-						}
-					}
 					return false;
 				}
 				case 'call': {
@@ -1747,7 +1753,7 @@ export function BuildProgram(
 	// not guaranteed for a purely-value merge with no state anchor forcing its own block to be visited.
 	function isInlinableSlot(node: Node): boolean {
 		return !node.forcedPrint
-			&& ((node.type === 'mutation' && node.expr.type === 'binary') || node.type === 'gammaValue')
+			&& ((node.type === 'mutation' && node.expr.type === 'assign') || node.type === 'gammaValue')
 			&& ((node.type === 'gammaValue' && node.neverMaterialize) || !needsTemp(node));
 	}
 
@@ -1924,11 +1930,12 @@ export function BuildProgram(
 				switch (expr.type) {
 					case 'unary':
 						return { ...expr, operand: resolveTarget(node.id, 0) };
-					case 'binary': {
+					// The base operator is stored on the node now, so no `=` has to be sliced back off.
+					case 'assign': {
 						const right = resolveOperand(node.id, 1);
-						return expr.operator === '='
-							? right
-							: { type: 'binary', operator: expr.operator.slice(0, -1) as JS.binaryOps, left: resolveTarget(node.id, 0), right };
+						return expr.operator
+							? Binary(expr.operator, resolveTarget(node.id, 0), right)
+							: right;
 					}
 				}
 				break;
@@ -2002,7 +2009,7 @@ export function BuildProgram(
 			const expr = resolveOperand(node.id, 0);
 			return first
 				? JS.VarDecl(node.declKind!, JS.Var(name, expr, node.typeAnnotation))
-				: JS.Expression({ type: 'binary', operator: '=', left: Identifier(name), right: expr });
+				: JS.Expression(Assign<Expr, JS.assignableOps>(Identifier(name), expr));
 		}
 		if ((node.type === 'mutation' && node.expr.type === 'unary') || node.type === 'unary_post') {
 			// A prefix or postfix ++/-- already performs its own assignment as a side effect -- printed
@@ -2010,7 +2017,7 @@ export function BuildProgram(
 			// in a reassignment would give a redundant self-assignment: `i = ++i;`/`i = i++;`.
 			return JS.Expression(buildExpr(node));
 		}
-		return JS.Expression(Binary('=', Identifier(name), buildExpr(node)));
+		return JS.Expression(Assign<Expr, JS.assignableOps>(Identifier(name), buildExpr(node)));
 	}
 
 	function resolveOperand(to: NodeId, slot: number): Expr {
@@ -2242,8 +2249,8 @@ export function BuildProgram(
 					// (`y = (x = 1)`), returning just the right-hand side -- wrong for a statement.
 					if (node.forcedPrint) {
 						statements.push(JS.Expression(
-							node.type === 'mutation' && node.expr.type === 'binary'
-								? { ...node.expr, left: resolveTarget(node.id, 0), right: resolveOperand(node.id, 1) }
+							node.type === 'mutation' && node.expr.type === 'assign'
+								? { ...node.expr, target: resolveTarget(node.id, 0), value: resolveOperand(node.id, 1) }
 								: buildExpr(node)
 						));
 					} else if (needsTemp(node)) {
@@ -2262,7 +2269,7 @@ export function BuildProgram(
 	// local declaration -- unlike a gammaValue/named-except merge (a pure value with no state anchor).
 	function needsDirectPlacement(node: Node): boolean {
 		if (node.type === 'unary_post' || node.type === 'mutation' || (node.type === 'var' && node.declKind !== undefined))
-			return !(node.type === 'mutation' && node.expr.type === 'binary') || !isInlinableSlot(node);
+			return !(node.type === 'mutation' && node.expr.type === 'assign') || !isInlinableSlot(node);
 		return false;
 	}
 
@@ -2657,6 +2664,7 @@ function getStructuralKey(node: Node): string {
 		// A 'floating' node's own real discriminator lives in node.expr's own .type, not node.type
 		// (mutation/function never reach here -- optimizeStructuralCSE excludes them before calling).
 		switch (node.expr.type) {
+			case 'assign':
 			case 'binary':
 			case 'unary': key += node.expr.operator; break;
 			// JSON.stringify, not a bare `+=`: this also naturally distinguishes a literal's own

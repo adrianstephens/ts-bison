@@ -1,7 +1,7 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
-import { Identifier, Literal, Binary, Conditional, Await, hasMod, dropMod, If, While } from '../common';
+import { Identifier, Literal, Binary, Conditional, Assign, Await, Member, ExprStmt, hasMod, dropMod, If, While } from '../common';
 import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
@@ -388,7 +388,7 @@ export function BuildStateMachine(stmts: Stmt[]) {
 export function StateMachineToAST(machine: StateMachine) {
 	type S = Stmt;
 	const state		= Identifier('state');
-	const setState	= (v: number): S => ({type: 'expression', expression: JS.JSBinary('=', state, Literal(v))});
+	const setState	= (v: number): S => ExprStmt(Assign<Expr, JS.assignableOps>(state, Literal(v)));
 	const cont: S	= {type: 'continue'};
 
 	// a suspend's `resultVar` ('const v = yield x;') is bound only once control resumes, so it's
@@ -554,8 +554,8 @@ export function TStoJS(ast: TS.Program) {
 									.filter((p) => p.modifiers?.some(x => x !== 'optional'))
 									.map(p => ({
 										type: 'expression',
-										expression: Binary('=',
-											{ type: 'member', object: { type: 'this' }, property: p.key as string } as Expr,
+										expression: Assign<Expr, JS.assignableOps>(
+											Member<Expr>({ type: 'this' }, p.key as string),
 											Identifier(p.key as string),
 										),
 									})

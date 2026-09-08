@@ -262,9 +262,9 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	for (const { prop, key } of pendingCtorInit) {
 		for (const ctor of ctorMembers) {
 			const inits = (ctor.body ?? []).flatMap(st =>
-				st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '='
-				&& st.expression.left.type === 'member' && st.expression.left.object.type === 'this' && st.expression.left.property === key
-					? [st.expression.right] : []);
+				st.type === 'expression' && st.expression.type === 'assign' && !st.expression.operator
+				&& st.expression.target.type === 'member' && st.expression.target.object.type === 'this' && st.expression.target.property === key
+					? [st.expression.value] : []);
 			if (!inits.length)
 				continue;
 			// `this.p = o` names the CONSTRUCTOR's own parameter, which the class scope has never heard of --
@@ -438,11 +438,13 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 				const key	= T.pathKey(test);
 				return (key ? narrowValue(base ?? scope, key, truthy, scope.value(key) ?? typeOf(test, scope)) : base) ?? scope;
 			}
-			case 'binary': {
-				// `if ((x = e))` narrows x by truthiness
-				if (test.operator === '=' && test.left.type === 'identifier')
-					return narrowValue(scope, test.left.name, truthy);
+			// `if ((x = e))` narrows x by truthiness
+			case 'assign':
+				return !test.operator && test.target.type === 'identifier'
+					? narrowValue(scope, test.target.name, truthy)
+					: scope;
 
+			case 'binary': {
 				// `a && b`'s true branch / `a || b`'s false branch: both conjuncts hold (or both fail),
 				// so each narrowing applies on top of the other -- sequential/conjunctive narrowing.
 				if ((test.operator === '&&' && sense) || (test.operator === '||' && !sense))
@@ -1616,6 +1618,76 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				return T.isAny(T.resolveOwn(argT, scope)) ? T.ANY : T.isBigint(argT, scope) ? T.BIGINT : T.NUMBER;
 			}
 
+			// Sibling of the `await` split: `x = y` is a MUTATION, not a `Binary` whose operator happens to
+			// end in `=`. `operator` absent is a plain `=`; present it is the compound form's BASE operator,
+			// so nothing here slices a string to recover it.
+			case 'assign': {
+				let lt = recurse(e.target);
+				// An assignment target's own type contextually types the value being written -- the same
+				// `expected` channel a generic call already solves its type params from, and the only thing a
+				// bare `new C` on the right has to go on (`scope.cache ??= new WeakMap`). Nullish members are
+				// stripped because they defeat inference against a `C<...>`-shaped return without adding
+				// anything: an `undefined` right side doesn't need a contextual type, and the assignability
+				// check below still judges against the full declared `lt`.
+				const rt = recurse(e.value, T.nonNullable(lt, scope));
+				// Assignments are judged against the declaration-site type, not any active narrowing -- a dotted target goes through
+				// `lookupMember` on the object's own type, not `typeOf` (which would consult the narrowings map instead).
+				// A destructuring target (`e.target.type` 'object'/'array', reusing the literal AST shape) has no dedicated pattern
+				// checker yet -- `recurse(e.target)` above just runs it as a value expression, so `lt` isn't a real declared type to
+				// check `rt` against here. Matches `hoistVar`'s same gap for declaration-site patterns (widens to `any`, no check).
+
+				if (e.target.type === 'member' || e.target.type === 'index') {
+					// TBD: mark unpure if assigning to part of a parameter?
+
+				}
+
+				if (err && (e.target.type === 'identifier' || e.target.type === 'member' || e.target.type === 'index')) {
+					if (e.target.type === 'identifier') {
+						lt = scope.declared(e.target.name) || lt;
+					} else if (e.target.type === 'member') {
+						const objT = recurse(e.target.object);
+						lt = T.optional(T.lookupMember(objT, e.target.property, scope) || lt, T.memberOptional(objT, e.target.property, scope));
+					} else if (e.target.type === 'index') {
+						// A typed-array write accepts any real `number` (silently truncated/wrapped via the
+						// element's own real JS coercion, never a type error) -- unlike a read, so the narrow
+						// element range `typeOf`'s 'index' case gives typed-array reads doesn't apply here.
+						// Checked by name, unresolved, same reason `typeOf`'s own 'index' case checks it that way.
+						const objT = recurse(e.target.object);
+						if (T.isRefOf(objT, TYPED_ARRAY_RANGES) && !objT.typeArgs)
+							lt = T.NUMBER;
+					}
+
+					if (!e.operator) {
+						if (!checkAssignable(rt, lt, scope, pos, scope, err)) {
+							err(SEVERITY.ERROR, pos)`Type '${rt}' is not assignable to type '${lt}' in '${e.target} = ...'`;
+						} else {
+							checkExcessProps(e.value, lt, pos, scope, err);
+							// Later statements see the assigned type, not the wider declared one. `pathKey`, not just an identifier: a
+							// dotted target narrows the same way a bare name does, via the same narrowings map.
+							const key = T.pathKey(e.target);
+							if (key)
+								// Always widens for the narrowed-forward type, regardless of this call's own `widen` (a side effect
+								// on `scope`, not part of the return value) -- matches plain JS assignment semantics: `x = 5` narrows
+								// `x` to `number` from here on, not literal `5`, whether or not *this* expression's own answer is widened.
+								scope.addNarrowing(key, T.widenLiterals(rt));
+						}
+					} else if (e.operator === '??' || e.operator === '||' || e.operator === '&&') {
+						const key = T.pathKey(e.target);
+						if (key) {
+							// `x ??= y` leaves x holding its non-nullish members or y (and likewise for ||= / &&=)
+							const r		= T.resolveOwn(lt, scope);
+							const other = T.isOther(e.operator[0]);
+
+							scope.addNarrowing(key, T.combineTypes([
+								...(r.type === 'union' ? r.types : [r]).filter(m => !other(T.resolveOwn(m, scope), scope)),
+								T.widenLiterals(rt),
+							]));
+						}
+					}
+				}
+				return rt;
+			}
+
 			case 'binary': {
 				let lt = recurse(e.left);
 
@@ -1645,75 +1717,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						rt,
 					]);
 				}
-				// An assignment target's own type contextually types the value being written -- the same
-				// `expected` channel a generic call already solves its type params from, and the only thing a
-				// bare `new C` on the right has to go on (`scope.cache ??= new WeakMap`). Nullish members are
-				// stripped because they defeat inference against a `C<...>`-shaped return without adding
-				// anything: an `undefined` right side doesn't need a contextual type, and the assignability
-				// check below still judges against the full declared `lt`.
-				const comparison	= COMPARISON_OPS.has(e.operator);
-				const rt = recurse(e.right, !comparison && e.operator.endsWith('=') ? T.nonNullable(lt, scope) : undefined);
-				if (comparison)
+				const rt = recurse(e.right);
+				if (COMPARISON_OPS.has(e.operator))
 					return T.BOOLEAN;
-
-				if (e.operator.endsWith('=')) {
-					// Assignments are judged against the declaration-site type, not any active narrowing -- a dotted target goes through
-					// `lookupMember` on the object's own type, not `typeOf` (which would consult the narrowings map instead).
-					// A destructuring target (`e.left.type` 'object'/'array', reusing the literal AST shape) has no dedicated pattern
-					// checker yet -- `recurse(e.left)` above just runs it as a value expression, so `lt` isn't a real declared type to
-					// check `rt` against here. Matches `hoistVar`'s same gap for declaration-site patterns (widens to `any`, no check).
-
-					if (e.left.type === 'member' || e.left.type === 'index') {
-						// TBD: mark unpure if assigning to part of a parameter?
-
-					}
-
-					if (err && (e.left.type === 'identifier' || e.left.type === 'member' || e.left.type === 'index')) {
-						if (e.left.type === 'identifier') {
-							lt = scope.declared(e.left.name) || lt;
-						} else if (e.left.type === 'member') {
-							const objT = recurse(e.left.object);
-							lt = T.optional(T.lookupMember(objT, e.left.property, scope) || lt, T.memberOptional(objT, e.left.property, scope));
-						} else if (e.left.type === 'index') {
-							// A typed-array write accepts any real `number` (silently truncated/wrapped via the
-							// element's own real JS coercion, never a type error) -- unlike a read, so the narrow
-							// element range `typeOf`'s 'index' case gives typed-array reads doesn't apply here.
-							// Checked by name, unresolved, same reason `typeOf`'s own 'index' case checks it that way.
-							const objT = recurse(e.left.object);
-							if (T.isRefOf(objT, TYPED_ARRAY_RANGES) && !objT.typeArgs)
-								lt = T.NUMBER;
-						}
-
-						if (e.operator === '=') {
-							if (!checkAssignable(rt, lt, scope, pos, scope, err)) {
-								err(SEVERITY.ERROR, pos)`Type '${rt}' is not assignable to type '${lt}' in '${e.left} = ...'`;
-							} else {
-								checkExcessProps(e.right, lt, pos, scope, err);
-								// Later statements see the assigned type, not the wider declared one. `pathKey`, not just an identifier: a
-								// dotted target narrows the same way a bare name does, via the same narrowings map.
-								const key = T.pathKey(e.left);
-								if (key)
-									// Always widens for the narrowed-forward type, regardless of this call's own `widen` (a side effect
-									// on `scope`, not part of the return value) -- matches plain JS assignment semantics: `x = 5` narrows
-									// `x` to `number` from here on, not literal `5`, whether or not *this* expression's own answer is widened.
-									scope.addNarrowing(key, T.widenLiterals(rt));
-							}
-						} else if (e.operator === '??=' || e.operator === '||=' || e.operator === '&&=') {
-							const key = T.pathKey(e.left);
-							if (key) {
-								// `x ??= y` leaves x holding its non-nullish members or y (and likewise for ||= / &&=)
-								const r		= T.resolveOwn(lt, scope);
-								const other = T.isOther(e.operator[0]);
-
-								scope.addNarrowing(key, T.combineTypes([
-									...(r.type === 'union' ? r.types : [r]).filter(m => !other(T.resolveOwn(m, scope), scope)),
-									T.widenLiterals(rt),
-								]));
-							}
-						}
-					}
-					return rt;
-				}
 
 				if (e.operator === '+') {
 					if (T.isStringLike(lt, scope) || T.isStringLike(rt, scope))
@@ -2050,8 +2056,8 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 // gets re-evaluated with that branch's narrowing in effect, not the pre-`if` scope) so the
 // post-if type can merge the branches.
 function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; rights: { expr: Expr; scope: Scope }[] } | undefined {
-	if (st.type === 'expression' && st.expression.type === 'binary' && st.expression.operator === '=' && st.expression.left.type === 'identifier' && (!name || st.expression.left.name === name))
-		return { name: st.expression.left.name, rights: [{ expr: st.expression.right, scope }] };
+	if (st.type === 'expression' && st.expression.type === 'assign' && !st.expression.operator && st.expression.target.type === 'identifier' && (!name || st.expression.target.name === name))
+		return { name: st.expression.target.name, rights: [{ expr: st.expression.value, scope }] };
 
 	if (st.type === 'block' && st.body.length) {
 		// Not just the last statement: `if (!x) { x = e; bookkeeping(); }` assigns `x` before unrelated further work --

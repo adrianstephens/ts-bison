@@ -52,22 +52,6 @@ const UNARY: Partial<Record<JS.unaryOps, PY.unaryOps>> = {
 	'!':	'not'
 };
 
-// Keyed by the compound operator itself rather than derived from BINARY by stripping the `=`, so the
-// exclusions are structu`&&=`/`||=` short-circuit (they are NOT `x = x and y`) and `>>>=` has no
-// Python form, so simply having no entry is what makes them unsupported.
-const AUGASSIGN: Partial<Record<JS.binaryOps, string>> = {
-	'+=':	'+=',
-	'-=':	'-=',
-	'*=':	'*=',
-	'/=':	'/=',
-	'%=':	'%=',
-	'**=':	'**=',
-	'&=':	'&=',
-	'|=':	'|=',
-	'^=':	'^=',
-	'<<=':	'<<=',
-	'>>=':	'>>=',
-};
 
 const pos		= (value: E): PY.Arg => ({ kind: 'pos', value });
 const compare	= (op: PY.compareOps, left: E, right: E): PY.Compare => ({ type: 'compare', left, ops: [op], comparators: [right] });
@@ -135,6 +119,8 @@ export function expr(e: TS.Expr): E {
 		// [~] `super.m()` -> `Base.m(self)`; needs the enclosing class, so it's threaded through
 		case 'super':		return base();
 		case 'sequence':	return unsupported('comma expression');
+		// [~] Python has no general assignment-expression (`:=` is far narrower) -- statements only
+		case 'assign':		return unsupported('assignment used as an expression');
 		// [=] TS-only wrappers just unwrap
 		case 'as':
 		case 'satisfies':
@@ -153,20 +139,23 @@ const keyName	= (k: JS.Key): string				=> typeof k !== 'string' ? unsupported('c
 const bindName	= (b: JS.BindingTarget): string 	=> typeof b === 'string' ? b : unsupported('destructuring');
 const param		= (p: JS.Param<TS.Type>): PY.Param	=> ({ name: bindName(p.key), default: p.default && expr(p.default) });
 
-// [~] JS models assignment as an expression; Python has assign/augassign statements
+// [~] JS assignment is an EXPRESSION, Python's is a statement -- that difference is real and stays.
+// What the `assign` node removed is the operator archaeology: the base operator (`+` for `+=`) is
+// stored, so this reuses the ordinary BINARY table instead of a second compound-operator one.
 function exprStmt(e: TS.Expr): S {
 	// [~] `i++` / `++i` are expressions in JS but have no Python form at all; in STATEMENT position
 	// they are exactly `i += 1`, which is the only place this accepts them.
 	if ((e.type === 'unary' || e.type === 'unary_post') && (e.operator === '++' || e.operator === '--'))
 		return { type: 'augassign', target: expr(e.operand), op: e.operator === '++' ? '+=' : '-=', value: Literal(1) };
-	if (e.type !== 'binary')
+	if (e.type !== 'assign')
 		return ExprStmt(expr(e));
-	if (e.operator === '=')
-		return { type: 'assign', targets: [expr(e.left)], value: expr(e.right) };
-	const op = AUGASSIGN[e.operator];
-	return op
-		? { type: 'augassign', target: expr(e.left), op, value: expr(e.right) }
-		: ExprStmt(expr(e));
+	if (!e.operator)
+		return { type: 'assign', targets: [expr(e.target)], value: expr(e.value) };
+	const op = BINARY[e.operator];
+	// `&&=`/`||=`/`??=` short-circuit, so they are NOT `x = x and y` -- left unsupported rather than wrong
+	return op && op !== 'and' && op !== 'or'
+		? { type: 'augassign', target: expr(e.target), op: op + '=', value: expr(e.value) }
+		: unsupported(`compound assignment '${e.operator}='`);
 }
 
 // [=] bodyOf is what makes this one line instead of a block/single-statement branch
