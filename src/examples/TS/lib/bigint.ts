@@ -43,6 +43,43 @@ export function bigFromNumber(n: number): bigint {
 	return bigTrim(r) as unknown as bigint;
 }
 
+// `BigInt('123')`. Real JS accepts optional surrounding whitespace, an optional sign and decimal
+// digits (an empty or all-whitespace string is `0n`), and throws a SyntaxError on anything else --
+// there is no NaN to fall back on the way `Number('abc')` has. Digits are accumulated through the
+// ordinary bigint operators, so this is exact at any length rather than going via `number`.
+export function bigFromString(s: string): bigint {
+	const n = s.length;
+	let i = 0;
+	while (i < n && strIsSpace(s.charCodeAt(i)))
+		i++;
+	let neg = false;
+	if (i < n) {
+		const c = s.charCodeAt(i);
+		if (c === 45 || c === 43) {
+			neg = c === 45;
+			i++;
+		}
+	}
+	const start = i;
+	let result = bigFromNumber(0);
+	const ten = bigFromNumber(10);
+	while (i < n) {
+		const d = s.charCodeAt(i) - 48;
+		if (d < 0 || d > 9)
+			break;
+		result = result.mul(ten).add(bigFromNumber(d));
+		i++;
+	}
+	const digits = i - start;
+	while (i < n && strIsSpace(s.charCodeAt(i)))
+		i++;
+	// Trailing garbage, or a sign with no digits after it. A bare '' or all-whitespace is `0n`, which
+	// is why the emptiness test is on `digits` only when something else was actually consumed.
+	if (i < n || (digits === 0 && start > 0))
+		throw new Error('Cannot convert ' + s + ' to a BigInt');
+	return neg ? -result : result;
+}
+
 export function bigToNumber(a: bigint): number {
 	const raw: u32[] = a as unknown as u32[];
 	const neg: boolean = (raw[raw.length - 1] & 0x80000000) !== 0;
@@ -268,6 +305,10 @@ export class BigInt {
 	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(value: bigint) {
 		return value as unknown as BigInt;
+	}
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: string) {
+		return bigFromString(value) as unknown as BigInt;
 	}
 	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(value: number) {
