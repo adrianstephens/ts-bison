@@ -5595,10 +5595,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					ctx.contextualReturn = saved;
 				};
 
-				if (!operator) {
+				// Both arms unbraced: a braced `if` with a bare `switch` for its `else` is the one shape
+				// `custom-control-block-style` rejects, and bracing the switch would reindent all of it.
+				if (!operator)
 					emitValue();
-
-				} else switch (operator) {
+				else switch (operator) {
 					case '&&':
 					case '||': {
 						// `a &&= b` assigns only when `a` is TRUTHY, `a ||= b` only when it is falsy --
@@ -5609,15 +5610,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						ctx.emit(I.local.tee(cur.index));
 						emitTruthyOf(wtype, checkerTypeOf(target, ctx.scope), ctx);
 						const _old = ctx.swapOut();
-						if (isAnd)
-							emitValue();
-						else
-							ctx.emit(I.local.get(cur.index));
+						// The truthy arm assigns for `&&=` and keeps the old value for `||=`; the falsy arm
+						// is the mirror. `emitValue()` is only reached in the arm that actually assigns,
+						// which is what makes the right-hand side unevaluated in the other one.
+						const keep	= () => ctx.emit(I.local.get(cur.index));
+						(isAnd ? emitValue : keep)();
 						const _then = ctx.swapOut();
-						if (isAnd)
-							ctx.emit(I.local.get(cur.index));
-						else
-							emitValue();
+						(isAnd ? keep : emitValue)();
 						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
 						break;
 					}

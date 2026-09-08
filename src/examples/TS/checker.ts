@@ -1689,7 +1689,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			}
 
 			case 'binary': {
-				let lt = recurse(e.left);
+				const lt = recurse(e.left);
 
 				if (LOGICAL_OPS.has(e.operator)) {
 					// Precise throughout (`lt`/`rt` unwidened): a fresh literal's own value determines `other`/`makeNullish`
