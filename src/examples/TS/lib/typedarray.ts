@@ -163,7 +163,12 @@ export class TypedArray<T> {
 			return bits < 32 ? (v << (32 - bits)) >> (32 - bits) : v;
 		return bits < 32 ? v : (v >>> 0);
 	}
-	set(i: i32, v: i32): void {
+	// `v: number`, NOT `i32`: an `i32` parameter makes the call site coerce, and that conversion
+	// SATURATES -- `new Int32Array([2147483648])[0]` came back as `i32::MAX`. Taking the `number` and
+	// letting `>>>` do the narrowing gives real `ToInt32` (see `emitToInt32`), which is what JS
+	// specifies for a typed-array store. A narrower view was already correct, since its own `& 0xff`
+	// masking discarded the excess anyway.
+	set(i: i32, v: number): void {
 		const elemSize: i32 = TypedArray.elemSize();
 		const base: i32 = this.byteOffset + i * elemSize;
 		for (let b: i32 = 0; b < elemSize; b++)
