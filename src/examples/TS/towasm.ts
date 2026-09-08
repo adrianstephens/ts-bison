@@ -1706,6 +1706,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// The entry module's top-level `const`/`let` declarators, by name -- see the `moduleBodies` scan's own
 	// comment on why `Scope.decl` can't answer this for the entry module.
 	const topLevelVars			= new Map<string, { stmt: TS.Stmt; d: JS.Var<Type> }>();
+	// An `enum`'s members, keyed `homeKey(module, 'Enum.member')`. An enum is a COMPILE-TIME
+	// declaration here: it has no runtime object, so a member read folds to its constant (see
+	// `case 'member'`) and the declaration itself emits nothing. `enumNames` is the set of names that
+	// are enums, so `resolvesGlobally` can tell a closure that one needs no capture slot.
+	const enumMembers			= new Map<string, number | string>();
+	const enumNames				= new Set<string>();
 	// The backing slot of each `ensureLazyGlobal` wrapper, so a WRITE can reach the same storage the
 	// wrapper reads. Keyed exactly like `lazyGlobals`.
 	const lazyGlobalSlots		= new Map<string, { index: number; wtype: WasmType }>();
@@ -1752,6 +1758,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// either. `collectFreeVars` cannot tell the two apart, so without this ANY closure or nested
 			// function mentioning a module-level class threw "unresolved identifier".
 			|| moduleScopeOf(homeModule)?.decl(name)?.type === 'class_decl'
+			// An ENUM name, for the same reason: every read of it folds to a constant at its own site.
+			|| enumNames.has(homeKey(homeModule, name))
 			// Same reasoning again for the ENTRY module's own top-level `const`/`let`: it becomes a real
 			// global (or an `ensureLazyGlobal` wrapper), so every use resolves at its own site and it never
 			// needs a capture slot. `hoist` deliberately doesn't hoist a plain top-level `var_decl` into a
@@ -4995,6 +5003,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			}
 
 			case 'member': {
+				// An `enum` MEMBER folds to its constant: an enum has no runtime object here (see
+				// `enumMembers`), so this is the only way a read of one resolves at all.
+				if (e.object.type === 'identifier') {
+					const v = enumMembers.get(homeKey(ctx.homeModule, `${e.object.name}.${e.property}`));
+					if (v !== undefined)
+						return emitExpr(Literal(v), ctx, want);
+				}
 				if (e.object.type === 'identifier') {
 					const owner = namespaceOwner(e.object.name, ctx);
 					if (owner) {
@@ -7029,6 +7044,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						dispatch(3, () => ctx.emitContinue());
 					dispatch(4, () => ctx.emit(I.local.get(exnLocal.index), I.throw_ref));
 				}
+				return;
+
+			// Nothing to emit: an enum declares compile-time constants, collected into `enumMembers` by
+			// the module scan and folded at each read.
+			case 'enum_decl':
 				return;
 
 			default:
@@ -9258,6 +9278,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			stmtHomeModule.set(s, moduleId);
 			if (s.type === 'function_decl' && s.body) {
 				functionDeclByName.set(homeKey(moduleId, s.name), s);
+			} else if (s.type === 'enum_decl') {
+				// Same numbering rule the checker's own `hoist` uses: an implicit member continues from
+				// the previous explicit one, a string member has no successor to continue from.
+				let next = 0;
+				enumNames.add(homeKey(moduleId, s.name));
+				for (const m of s.members) {
+					const init = m.init;
+					const value = !init ? next++
+						: init.type === 'literal' && typeof init.value === 'number' ? (next = init.value + 1, init.value)
+						: init.type === 'literal' && typeof init.value === 'string' ? init.value
+						: undefined;
+					if (value !== undefined)
+						enumMembers.set(homeKey(moduleId, `${s.name}.${m.name}`), value);
+				}
 			} else if (moduleId === '.' && s.type === 'class_decl') {
 				if (s.typeParams?.length) {
 					userGenericClassDecls.set(s.name, s);
