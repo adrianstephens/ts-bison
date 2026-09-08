@@ -7775,7 +7775,18 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		if (args.some(a => a.type === 'spread'))
 			throw `spread arguments are not supported in a call to overloaded '${label}'`;
 		const argTs = args.map(a => checkerTypeOf(a, ctx.scope));
-		const found = decls.find(d => d.body && T.argsFit(T.FixSig(d, T.ANY), argTs, ctx.scope));
+		const fits	= decls.filter(d => d.body && T.argsFit(T.FixSig(d, T.ANY), argTs, ctx.scope));
+		// An EXACT parameter match wins over a merely-assignable one. `argsFit` is deliberately lenient
+		// (`isAssignable(ArrayBuffer, number[])` is `true`, since an `ArrayBuffer` has a numeric index
+		// signature), so plain first-fit picked `TypedArray`'s `constructor(elements: number[])` for
+		// `new Uint8Array(someBuffer)` and then failed to convert `arr:i8` to `arr:f64`. This is a
+		// tie-break, not a full specificity ordering: it only reorders candidates that ALL already fit.
+		const exact = fits.find(d => {
+			const params = T.FixSig(d, T.ANY).params;
+			return params.length === argTs.length
+				&& argTs.every((t, i) => t && params[i]?.typeAnnotation && T.typeKey(t) === T.typeKey(params[i].typeAnnotation!));
+		});
+		const found = exact ?? fits[0];
 		if (!found)
 			throw `no overload of '${label}' matches this call`;
 		return found;
