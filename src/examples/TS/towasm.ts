@@ -6265,10 +6265,13 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					return emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
 				}
 
-				// A closure value read off an array element, called directly (`arr[i](x)`) -- same shape as
-				// the bare-identifier case above, generalized via the callee's own static type (`wtypeOf`)
-				// instead of a name-based lookup (an index expression has no name to resolve by).
-				if (e.callee.type === 'index') {
+				// A closure value called directly, where the callee has no name to resolve by -- an array
+				// element (`arr[i](x)`), the result of another call (`mk(1)(2)`), a parenthesised
+				// expression. Same shape as the bare-identifier case above, generalized via the callee's
+				// own static type (`wtypeOf`). Tried for ANY remaining callee shape: whether the value is
+				// callable is exactly whether its wasm type is a closure, which the check below asks
+				// directly, so there is nothing for a syntactic guard to add.
+				{
 					const calleeWtype = wtypeOf(e.callee, ctx);
 					if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
 						const sig = calleeWtype.closure;
