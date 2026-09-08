@@ -4086,20 +4086,22 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// compile-time-known list, so this synthesizes a real `[string, any][]` array literal -- one
 	// `[fieldName, obj.field]` tuple per declared field -- and hands it to the ordinary array-literal
 	// codegen, the same "synthesize AST, reuse existing codegen" idiom already used for spread/for-in.
-	function emitObjectEntries(args: Expr[], ctx: FunctionContext): WasmType {
+	// `which` selects the projection: `Object.entries`/`keys`/`values` differ only in what each element
+	// is, and `Map` implements all three by name already.
+	function emitObjectEntries(args: Expr[], ctx: FunctionContext, which: 'entries' | 'keys' | 'values' = 'entries'): WasmType {
 		if (args.length !== 1)
-			throw "'Object.entries' takes exactly one argument";
+			throw `'Object.${which}' takes exactly one argument`;
 		const arg	= args[0];
 		const owner = ownerOf(arg, ctx);
 		if (!owner)
-			throw "'Object.entries' needs a known object/class type";
+			throw `'Object.${which}' needs a known object/class type`;
 
 		if (owner.decl.name === 'Map') {
 			emitAs(arg, ctx, owner.thisWtype!);
-			return emitMethodCall(owner, 'entries', [], ctx);
+			return emitMethodCall(owner, which, [], ctx);
 		}
 		if (owner.decl.name && everExtended.has(owner.decl.name))
-			throw `'Object.entries' on '${owner.name}' isn't supported yet -- '${owner.decl.name}' may be subclassed elsewhere, and a correct result needs the receiver's real runtime type, not just its declared one`;
+			throw `'Object.${which}' on '${owner.name}' isn't supported yet -- '${owner.decl.name}' may be subclassed elsewhere, and a correct result needs the receiver's real runtime type, not just its declared one`;
 
 		const n			= closureCallTempCounter++;
 		const objName	= `#objEntries$${n}`;
@@ -4115,9 +4117,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// `emitArrayElements` call: that lets the ordinary per-element `emitAs` this already goes through
 		// (inside `emitArrayElements`'s own loop) delegate back to `case 'array'` for it, reusing the same
 		// coercion logic every other array literal already relies on instead of duplicating it here.
-		emitArrayElements(owner.fields.map((f): Expr => ({
+		// `keys` is a plain `string[]`, so it takes the ordinary array-literal path with its own element
+		// kind rather than the boxed `ref` one the tuple/value forms need.
+		if (which === 'keys') {
+			emitArrayElements(owner.fields.map((f): Expr => Literal(f.name)), ctx, ARR_WTYPE.i16, 'ref', ensureArrayType('ref'));
+			return ARR_WTYPE.ref;
+		}
+		const value = (f: { name: string }): Expr => ({ type: 'member', object: { type: 'identifier', name: objName }, property: f.name });
+		emitArrayElements(owner.fields.map((f): Expr => which === 'values' ? value(f) : ({
 			type: 'array',
-			elements: [Literal(f.name), { type: 'member', object: { type: 'identifier', name: objName }, property: f.name }],
+			elements: [Literal(f.name), value(f)],
 		})), ctx, REF_ANY_NULLABLE, 'ref', ensureArrayType('ref'));
 		return ARR_WTYPE.ref;
 	}
@@ -6187,8 +6196,8 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 						// `Object.entries` -- a known global intrinsic (see `emitObjectEntries`'s own comment for
 						// why this can't just be `namespaceOwner`/`ensureClass`-dispatched like an ordinary static
 						// method), checked before the generic paths below.
-						if (obj.name === 'Object' && e.callee.property === 'entries')
-							return emitObjectEntries(e.arguments, ctx);
+						if (obj.name === 'Object' && (e.callee.property === 'entries' || e.callee.property === 'keys' || e.callee.property === 'values'))
+							return emitObjectEntries(e.arguments, ctx, e.callee.property);
 						if (obj.name === 'Object' && e.callee.property === 'defineProperty')
 							return emitObjectDefineProperty(e.arguments, ctx);
 						// A namespace-import-qualified call (`NS.foo(...)`, `import * as NS from '...'`) into
