@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { type RecoveryCallback, type MergeValues, type Token, type LALRParser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
-import { Literal, Identifier, Unary, UnaryPost, Binary, mergeMods, withDefault, stampPos } from '../common';
+import { Literal, Identifier, Unary, UnaryPost, Binary, Await, mergeMods, withDefault, stampPos } from '../common';
 import * as Common from '../common';
 
 // ===================================================================
@@ -16,7 +16,7 @@ import * as Common from '../common';
 //  AST
 // ===================================================================
 
-export type unaryOps		= '+'|'-'|'~'|'!'|'++'|'--'|'delete'|'void'|'typeof'|'await';
+export type unaryOps		= '+'|'-'|'~'|'!'|'++'|'--'|'delete'|'void'|'typeof';
 
 export const CompareOps		= ['<', '>', '<=', '>=', '==', '!=', '===', '!=='] as const;
 export const AssignableOps	= ['+', '-', '*', '**', '/', '%', '&', '|', '^', '<<', '>>', '>>>', '&&', '||', '??'] as const;
@@ -124,7 +124,8 @@ export type Expr<T = any> =
 	| { type: 'new';	callee: Expr<T>; arguments: Expr<T>[]; typeArgs?: T[] }
 	| { type: 'sequence'; expressions: Expr<T>[] }
 	| { type: 'tagged_template'; tag: Expr<T>; quasi: TemplatePart<Expr<T>>[] }
-	| { type: 'yield'; operand?: Expr<T>; delegate?: boolean }
+	| Common.Await<Expr<T>>
+	| Common.Yield<Expr<T>> & { delegate?: boolean }
 	| { type: 'class'; } & Class
 	// for TS
 	| { type: 'as';				expression: Expr<T>; typeAnnotation: T }
@@ -312,7 +313,7 @@ export type { Location } from '../common';
 export const Rule = makeRule<any>(stampPos);
 
 const ASSIGN_OP = OneOf(['+=', '-=', '*=', '**=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=', '??=', '&&=', '||=', '=']);
-const UNARY_OP	= OneOf(['await', '++', '--', 'delete', 'void', 'typeof', '+', '-', '~', '!']);
+const UNARY_OP	= OneOf(['++', '--', 'delete', 'void', 'typeof', '+', '-', '~', '!']);
 
 
 // Mirrors ECMA-262's own In/NoIn duplication above shift_expression: `for (x in y)` vs `for (x; ...)`
@@ -736,6 +737,9 @@ const postfix_expression = Rules(
 const unary_expression = Rules<Expr>(self => [
 	postfix_expression,
 	Rule([UNARY_OP, self], 			$ => Unary($[0], $[1])),
+	// `await` binds exactly like a prefix unary, but it suspends rather than computing -- its own node,
+	// alongside `yield`, so no consumer has to peel it back out of the unary path.
+	Rule(['await', self], 			$ => Await($[1])),
 ]);
 
 // Right-associative: 2 ** 3 ** 2 === 2 ** (3 ** 2). Spelled as a dedicated self-recursion on the right (rather than binaryChain's left-recursion)
@@ -857,6 +861,7 @@ const postfix_expression_nobrace = Rules(
 const unary_expression_nobrace = Rules(
 	postfix_expression_nobrace,
 	Rule([UNARY_OP, unary_expression], 					$ => Unary($[0], $[1])),
+	Rule(['await', unary_expression], 					$ => Await($[1])),
 );
 const exponentiation_expression_nobrace = Rules(
 	unary_expression_nobrace,

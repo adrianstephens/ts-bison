@@ -311,6 +311,7 @@ export function walk<T extends Walkable>(ast: T,
 			case 'arrow':		return mapObject(expr, {...mapSigU,
 				body: (body: any) => Array.isArray(body) ? mapArrayA(mapStatementC)(body) : mapExpressionA(body),
 			});
+			case 'await':		return mapObject(expr, {operand: mapExpressionA});
 			case 'yield':		return mapObject(expr, {operand: mapExpression});
 			case 'class':		return mapObject(expr, {
 				superClass: mapExpression,
@@ -570,6 +571,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'sequence':			return e.expressions.some(walkExpression);
 			case 'tagged_template':		return walkExpression(e.tag) || e.quasi.some(p => walkExpression(p.exp));
 			case 'arrow':				return walkSig(e as TS.CallSig) || (Array.isArray(e.body) ? e.body.some(walkStatement) : walkExpression(e.body));
+			case 'await':
 			case 'yield':				return walkExpression(e.operand);
 			case 'class':				return walkExpression(e.superClass) || (e.body as TS.ClassMember[]).some(walkClassMember) || !!e.implements?.some(t => walkType(t as Type));
 			case 'instantiation':		return walkExpression(e.expression) || e.typeArgs.some(t => walkType(t as Type));

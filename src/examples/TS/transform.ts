@@ -1,7 +1,7 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
-import { Identifier, Literal, Binary, Conditional, hasMod, dropMod, If, While } from '../common';
+import { Identifier, Literal, Binary, Conditional, Await, hasMod, dropMod, If, While } from '../common';
 import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
@@ -223,7 +223,7 @@ export function BuildStateMachine(stmts: Stmt[]) {
 
 	function suspendExpr(e: Expr): SuspendBoundary | undefined {
 		return e.type === 'yield' ? { kind: 'yield', operand: e.operand, delegate: e.delegate }
-			: e.type === 'unary' && e.operator === 'await' ? { kind: 'await', operand: e.operand }
+			: e.type === 'await' ? { kind: 'await', operand: e.operand }
 			: undefined;
 	}
 
@@ -433,7 +433,7 @@ export function StateMachineToAST(machine: StateMachine) {
 					stmts.push(setState(next.resumeId));
 					stmts.push(JS.Return(next.kind === 'yield'
 						? { type: 'yield', operand: next.operand, delegate: next.delegate }
-						: JS.JSUnary('await', next.operand!)
+						: Await(next.operand!)
 					));
 					break;
 				}

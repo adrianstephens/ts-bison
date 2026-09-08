@@ -1575,6 +1575,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				return T.ANY;
 			}
 
+			case 'await':	return T.awaitType(recurse(e.operand), scope);
+
 			case 'unary': {
 				const argT = recurse(e.operand);
 				switch (e.operator) {
@@ -1582,7 +1584,6 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					case 'typeof':	return T.STRING;
 					case 'void':	return T.UNDEFINED;
 					case 'delete':	return T.BOOLEAN;
-					case 'await':	return T.awaitType(argT, scope);
 				}
 				const r = T.resolveOwn(argT, scope);
 				if (T.isAny(r))

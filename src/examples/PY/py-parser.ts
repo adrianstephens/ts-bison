@@ -233,8 +233,10 @@ export interface GeneratorExp	{ type: 'genexp'; elt: Expr; gens: CompClause[] }
 export interface ListComp		{ type: 'listcomp'; elt: Expr; gens: CompClause[] }
 export interface SetComp			{ type: 'setcomp'; elt: Expr; gens: CompClause[] }
 export interface DictComp		{ type: 'dictcomp'; key: Expr; value: Expr; gens: CompClause[] }
-export interface Await			{ type: 'await'; value: Expr }
-export interface YieldExpr		{ type: 'yield'; value?: Expr; from?: Expr }
+export type      Await			= Common.Await<Expr>;
+// `yield from x` is Python's delegation form; js-parser spells the same idea `yield* x` with a
+// `delegate` flag, so only the extra field differs.
+export interface YieldExpr extends Common.Yield<Expr> { from?: Expr }
 
 // A `{expr[=][!conv][:spec]}` field inside an f-string. `spec`'s own text/nested-field parts
 // mirror `FStringPart` one level down (`f"{x:{width}}"`'s spec is `[{text:''},{expr:width}]`) --
@@ -478,7 +480,7 @@ atom_expr = Rules<Expr>(self => [
 ]),
 await_expr = Rules<Expr>(
 	atom_expr,
-	Rule(['await', atom_expr],		$ => ({ type: 'await', value: $[1] })),
+	Rule(['await', atom_expr],		$ => ({ type: 'await', operand: $[1] })),
 ),
 // `factor` (unary +/-/~) and `power` (**) are mutually recursive, exactly as in CPython's grammar:
 // `factor: ('+'|'-'|'~') factor | power` and `power: await_expr ['**' factor]`. This gives
@@ -555,7 +557,7 @@ star_expr = Rules<Expr>(
 // yield / yield from -- only valid inside parens or as an expression statement / assignment RHS.
 yield_expr = Rules<YieldExpr>(
 	Rule(['yield'],					() => ({ type: 'yield' })),
-	Rule(['yield', fwd_testlist],	$ => ({ type: 'yield', value: $[1] })),
+	Rule(['yield', fwd_testlist],	$ => ({ type: 'yield', operand: $[1] })),
 	Rule(['yield', 'from', test],	$ => ({ type: 'yield', from: $[2] })),
 ),
 

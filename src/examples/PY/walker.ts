@@ -127,7 +127,7 @@ export function walk<T extends Walkable>(ast: T,
 		switch (e.type) {
 			case 'unary':				return mapObject(e, {operand: mapExpressionA});
 			case 'spread':				return mapObject(e, {operand: mapExpressionA});
-			case 'await':				return mapObject(e, {value: mapExpressionA});
+			case 'await':				return mapObject(e, {operand: mapExpressionA});
 			case 'binary':				return mapObject(e, {left: mapExpressionA, right: mapExpressionA});
 			case 'compare':				return mapObject(e, {left: mapExpressionA, comparators: mapArrayA(mapExpressionA)});
 			case 'conditional':			return mapObject(e, {test: mapExpressionA, consequent: mapExpressionA, alternate: mapExpressionA});
@@ -148,7 +148,7 @@ export function walk<T extends Walkable>(ast: T,
 			case 'listcomp':
 			case 'setcomp':				return mapObject(e, {elt: mapExpressionA, gens: mapArrayA(compClause)});
 			case 'dictcomp':			return mapObject(e, {key: mapExpressionA, value: mapExpressionA, gens: mapArrayA(compClause)});
-			case 'yield':				return mapObject(e, {value: mapExpression, from: mapExpression});
+			case 'yield':				return mapObject(e, {operand: mapExpression, from: mapExpression});
 			case 'fstring':				return mapObject(e, {parts: mapArrayA(fstringPart)});
 			// identifier / literal / imaginary / ellipsis -- no nested AST
 			default:					return e;
@@ -219,7 +219,7 @@ export function walkB<T extends Walkable>(ast: T,
 		switch (e.type) {
 			case 'unary':				return walkExpression(e.operand);
 			case 'spread':				return walkExpression(e.operand);
-			case 'await':				return walkExpression(e.value);
+			case 'await':				return walkExpression(e.operand);
 			case 'binary':				return walkExpression(e.left) || walkExpression(e.right);
 			case 'compare':				return walkExpression(e.left) || e.comparators.some(walkExpression);
 			case 'conditional':			return walkExpression(e.test) || walkExpression(e.consequent) || walkExpression(e.alternate);
@@ -237,7 +237,7 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'listcomp':
 			case 'setcomp':				return walkExpression(e.elt) || e.gens.some(compClause);
 			case 'dictcomp':			return walkExpression(e.key) || walkExpression(e.value) || e.gens.some(compClause);
-			case 'yield':				return walkExpression(e.value) || walkExpression(e.from);
+			case 'yield':				return walkExpression(e.operand) || walkExpression(e.from);
 			case 'fstring':				return e.parts.some(fstringPart);
 			default:					return false;
 		}

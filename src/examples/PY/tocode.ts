@@ -282,8 +282,8 @@ export class Output {
 			case 'listcomp':		return '[' + this.expr(e.elt, TERNARY) + ' ' + this.comprehension(e.gens) + ']';
 			case 'setcomp':			return '{' + this.expr(e.elt, TERNARY) + ' ' + this.comprehension(e.gens) + '}';
 			case 'dictcomp':		return '{' + this.expr(e.key, TERNARY) + ': ' + this.expr(e.value, TERNARY) + ' ' + this.comprehension(e.gens) + '}';
-			case 'await':			return 'await ' + this.expr(e.value, AWAIT);
-			case 'yield':			return e.from ? 'yield from ' + this.expr(e.from) : e.value ? 'yield ' + this.exprList(e.value) : 'yield';
+			case 'await':			return 'await ' + this.expr(e.operand, AWAIT);
+			case 'yield':			return e.from ? 'yield from ' + this.expr(e.from) : e.operand ? 'yield ' + this.exprList(e.operand) : 'yield';
 			case 'fstring':			return this.fstring(e.parts);
 		}
 	}

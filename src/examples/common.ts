@@ -89,6 +89,17 @@ export function  Sequence<E, const K extends string>(type: K, elements: readonly
 //  Shared statement shapes
 // ===================================================================
 
+// Suspension points, not computations. js-parser used to fold `await` into `Unary` purely because it
+// has the same prefix syntax as `typeof`/`void` -- and then checker, transform, vsdg and ts2py each
+// had to peel it back out before their unary handling. `yield` was already its own node here; these
+// two are the same kind of thing and now say so. CPython's AST and ESTree both split them likewise.
+export interface Await<E>			{ type: 'await'; operand: E }
+export function  Await<E>(operand: E): Await<E> { return { type: 'await', operand }; }
+
+// `delegate` (`yield*`) / `from` (`yield from`) are each language's own addition.
+export interface Yield<E>			{ type: 'yield'; operand?: E }
+export function  Yield<E>(operand?: E): Yield<E> { return { type: 'yield', operand }; }
+
 export interface ExprStmt<E>		{ type: 'expression'; expression: E }
 export function  ExprStmt<E>(expression: E): ExprStmt<E> { return { type: 'expression', expression }; }
 

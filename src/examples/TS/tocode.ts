@@ -56,6 +56,7 @@ function exprPrecedence(expr: Expr): number {
 		case 'binary':				return BINARY_PREC[expr.operator] ?? expr.operator.endsWith('=') ? 2 : 0;
 		case 'as':
 		case 'satisfies':return 11;
+		case 'await':
 		case 'unary':				return 16;
 		case 'unary_post':			return 17;
 		default:					return 18;
@@ -674,6 +675,10 @@ export class Output {
 				return 'new ' + this.expr(expr.callee, 18)
 					+ this.typeArgs(expr.typeArgs as Type[])
 					+ withParens(expr.arguments.map((a: Expr) => this.expr(a, 2)).join(this.comma) );
+
+			// Binds like a prefix unary, so it shares their operand tier.
+			case 'await':
+				return 'await ' + this.expr(expr.operand, 16);
 
 			case 'unary':
 				// Operand is `unary_expression` (self) in the grammar -- same tier, so chained unaries

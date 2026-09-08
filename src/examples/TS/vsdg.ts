@@ -1285,15 +1285,16 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					return false;
 				}
 
+				// Not pure: it suspends. Same treatment as 'yield'.
+				case 'await': {
+					process(s);
+					const node = makeExprNode(s, 'effect');
+					connectEnd(node);
+					connectValue(getExprNode(s.operand), 0, node, 1);
+					return false;
+				}
+
 				case 'unary': {
-					// `await x` shares the plain prefix-unary AST shape with `-x`/`typeof x`, but isn't pure -- structurally identical to 'yield'
-					if (s.operator === 'await') {
-						process(s);
-						const node = makeExprNode(s, 'effect');
-						connectEnd(node);
-						connectValue(getExprNode(s.operand), 0, node, 1);
-						return false;
-					}
 					process(s);
 					const isMutation = s.operator === '++' || s.operator === '--';
 					const node = makeExprNode(s as Expr, isMutation ? 'mutation' : 'floating');

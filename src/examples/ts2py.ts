@@ -5,7 +5,7 @@ import * as TS from './TS/ts-parser';
 import * as JS from './TS/js-parser';
 import * as PY from './PY/py-parser';
 import { Output, Options } from './PY/tocode';
-import { bodyOf, Identifier, Literal, Unary, Binary, Call, Member, Index, Conditional, Spread, Sequence, ExprStmt, Return, Throw, If, While } from './common';
+import { bodyOf, Identifier, Literal, Unary, Binary, Call, Member, Index, Conditional, Spread, Sequence, Await, Yield, ExprStmt, Return, Throw, If, While } from './common';
 
 type E = PY.Expr;
 type S = PY.Stmt;
@@ -18,22 +18,55 @@ let superName: string | undefined;
 
 // [~] JS folds comparison into Binary; Python needs a Compare node (chained or not).
 const COMPARE: Partial<Record<JS.binaryOps, PY.compareOps>> = {
-	'<': '<', '>': '>', '<=': '<=', '>=': '>=',
-	'==': '==', '===': '==', '!=': '!=', '!==': '!=', 'in': 'in',
+	'<':	'<',
+	'>':	'>',
+	'<=':	'<=',
+	'>=':	'>=',
+	'==':	'==',
+	'===':	'==',
+	'!=':	'!=',
+	'!==':	'!=',
+	'in':	'in',
 };
 // [~] operator spelling
 const BINARY: Partial<Record<JS.binaryOps, PY.binaryOps>> = {
-	'+': '+', '-': '-', '*': '*', '/': '/', '%': '%', '**': '**',
-	'&': '&', '|': '|', '^': '^', '<<': '<<', '>>': '>>',
-	'&&': 'and', '||': 'or',
+	'+':	'+',
+	'-':	'-',
+	'*':	'*',
+	'/':	'/',
+	'%':	'%',
+	'**':	'**',
+	'&':	'&',
+	'|':	'|',
+	'^':	'^',
+	'<<':	'<<',
+	'>>':	'>>',
+	'&&':	'and',
+	'||':	'or',
 };
-const UNARY: Partial<Record<JS.unaryOps, PY.unaryOps>> = { '-': '-', '+': '+', '~': '~', '!': 'not' };
+
+const UNARY: Partial<Record<JS.unaryOps, PY.unaryOps>> = {
+	'-':	'-',
+	'+':	'+',
+	'~':	'~',
+	'!':	'not'
+};
+
 // Keyed by the compound operator itself rather than derived from BINARY by stripping the `=`, so the
-// exclusions are structural: `&&=`/`||=` short-circuit (they are NOT `x = x and y`) and `>>>=` has no
+// exclusions are structu`&&=`/`||=` short-circuit (they are NOT `x = x and y`) and `>>>=` has no
 // Python form, so simply having no entry is what makes them unsupported.
 const AUGASSIGN: Partial<Record<JS.binaryOps, string>> = {
-	'+=': '+=', '-=': '-=', '*=': '*=', '/=': '/=', '%=': '%=', '**=': '**=',
-	'&=': '&=', '|=': '|=', '^=': '^=', '<<=': '<<=', '>>=': '>>=',
+	'+=':	'+=',
+	'-=':	'-=',
+	'*=':	'*=',
+	'/=':	'/=',
+	'%=':	'%=',
+	'**=':	'**=',
+	'&=':	'&=',
+	'|=':	'|=',
+	'^=':	'^=',
+	'<<=':	'<<=',
+	'>>=':	'>>=',
 };
 
 const pos		= (value: E): PY.Arg => ({ kind: 'pos', value });
@@ -51,7 +84,10 @@ export function expr(e: TS.Expr): E {
 		case 'index':		return Index(expr(e.object), expr(e.index));
 		case 'conditional':	return Conditional(expr(e.test), expr(e.consequent), expr(e.alternate));
 		case 'spread':		return Spread(expr(e.operand));
-		case 'yield':		return { type: 'yield', value: e.operand && expr(e.operand) };
+		// [~] `yield* x` and `yield from x` are the same idea spelled with a flag vs a field
+		case 'yield':		return e.delegate
+			?	{ type: 'yield', from: e.operand ? expr(e.operand) : unsupported('`yield*` with no operand') }
+			:	Yield(e.operand && expr(e.operand));
 
 		// [=] retag only
 		case 'array':		return Sequence('list', e.elements.map(x => x ? expr(x) : Literal(null)));
@@ -66,10 +102,10 @@ export function expr(e: TS.Expr): E {
 		}
 		case 'new':			return Call<E, PY.Arg>(expr(e.callee), e.arguments.map(a => pos(expr(a))));
 
+		case 'await':		return Await(expr(e.operand));
 		case 'unary': {
 			const op = UNARY[e.operator];
-			return	e.operator === 'await'	? { type: 'await', value: expr(e.operand) }
-				:	e.operator === 'typeof'	? call('type', expr(e.operand))
+			return	e.operator === 'typeof'	? call('type', expr(e.operand))
 				:	op						? Unary(op, expr(e.operand))
 				:	unsupported(`unary '${e.operator}'`);
 		}
