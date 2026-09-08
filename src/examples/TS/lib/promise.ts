@@ -24,11 +24,6 @@
 // boundary in a single synchronous WASI entry call -- so a real program that needs queued callbacks
 // to actually run must call 'drainMicrotasks()' itself, same as 'resolve()' already has to be called
 // explicitly to make any progress at all.
-// '(() => void)[]', not 'Array<() => void>': a module-level const's explicit 'Array<T>' annotation
-// resolves through the checker's ambient 'declare class Array<T>' merge to that interface's full
-// structural shape rather than staying a nominal array type -- a real towasm.ts gap (only bites a
-// top-level binding; a local 'Array<T>' or a top-level 'T[]' both resolve fine) -- so the equivalent
-// shorthand sidesteps it rather than working around it.
 const microtasks: (() => void)[] = [];
 
 // The host's own call into an export IS the job boundary -- exactly what a libuv callback is for node
@@ -72,8 +67,13 @@ export class Promise<T> {
 		// is already a plain local by the time it's captured -- calling a closure read straight off an
 		// array element in one expression ('cbs[i](value)') isn't supported (see towasm.ts's own gap
 		// comment), a real local of closure type already is.
-		for (const cb of this.callbacks)
-			microtasks.push(() => cb(value));
+		for (const cb of this.callbacks) {
+			// Annotated for the same reason as `drainMicrotasks`' `shift()`: `Array<T>` collapses to
+			// `Array<any>`, so `cb` reads as `any` and `() => cb(value)` becomes `() => any` -- a
+			// physically DIFFERENT closure struct from the `() => void` the queue is cast back to.
+			const f: (value: T) => void = cb;
+			microtasks.push(() => f(value));
+		}
 	}
 
 	then(onFulfilled: (value: T) => void): void {

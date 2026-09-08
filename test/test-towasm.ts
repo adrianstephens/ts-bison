@@ -3227,7 +3227,8 @@ async function main() {
 		//
 		// This is the shape every self-hosting target file is built around, and the shape this suite had no
 		// coverage of at all -- every other check here keeps its state local to one function.
-		const { arr, obj, str, inst, mutate, sharedAcrossFunctions, reassign, writeThenRead } = await compile(`
+		const { arr, obj, str, inst, mutate, sharedAcrossFunctions, reassign, writeThenRead,
+			annotated, annotatedGeneric, annotatedArray } = await compile(`
 			class P { constructor(public x: number) {} }
 			const A = [1, 2, 3];
 			const D = { a: 1, b: 2 };
@@ -3237,6 +3238,13 @@ async function main() {
 			export function obj(): number { return D.a + D.b; }
 			export function str(): number { return S.length; }
 			export function inst(): number { return P1.x; }
+			class Box<T> { constructor(public v: T) {} }
+			const P2: P = new P(6);
+			const B: Box<number> = new Box<number>(7);
+			const AA: Array<number> = [1, 2, 3, 4];
+			export function annotated(): number { return P2.x; }
+			export function annotatedGeneric(): number { return B.v; }
+			export function annotatedArray(): number { return AA.length; }
 			const M = [1, 2, 3];
 			export function mutate(): number { M.push(4); return M.length; }
 			const Acc: number[] = [];
@@ -3252,6 +3260,13 @@ async function main() {
 		check('module state: an object const', obj(), 3);
 		check('module state: a string const', str(), 5);
 		check('module state: a class instance const', inst(), 4);
+		// The EXPLICIT annotation is the interesting half: `hoistVar` records `T.resolve`'s fully expanded
+		// structural shape, so the class name codegen dispatches by was gone and the nominal initializer
+		// had nothing to convert to. A local never hit it -- `case 'var_decl'` reads its raw annotation
+		// instead of the scope -- so only a module-level binding showed the bug.
+		check('module state: a class instance const with an explicit annotation', annotated(), 6);
+		check('module state: ...a generic class', annotatedGeneric(), 7);
+		check('module state: ...and the Array<T> spelling of an array', annotatedArray(), 4);
 		check('module state: mutating an array const in place', mutate(), 4);
 		check('module state: two functions share one accumulator', sharedAcrossFunctions(), 2);
 		check('module state: reassigning a top-level let', reassign(), 2);
@@ -4386,7 +4401,13 @@ async function main() {
 		// comment). A top-level mutable global is used to observe results below, not a captured closure
 		// variable -- capturing a *mutation* back out to the enclosing scope is a separate, pre-existing
 		// limitation (captures snapshot by value at creation time), not something these tests are about.
-		const { alreadySettled } = await compile(`
+		// Every case below reads its result through a SECOND exported call. `.then`/`await` continuations
+		// go on `lib/promise.ts`'s microtask queue, which towasm drains when an exported call returns to
+		// the host -- that call IS the job boundary, exactly as real JS defers a settled promise's
+		// callback to the end of the current job. So the value is still 0 inside the call that resolved
+		// the promise (asserted here, since that is the JS-faithful half these tests originally got
+		// wrong) and only observable from the next one.
+		const { alreadySettled, readSettled } = await compile(`
 			let output: number = 0;
 			async function addOne(p: Promise<number>): Promise<number> {
 				const v = await p;
@@ -4399,28 +4420,31 @@ async function main() {
 				const result = addOne(p);
 				return output;
 			}
+			export function readSettled(): number { return output; }
 		`);
-		check('async: await on an already-settled Promise resumes synchronously via .then()', alreadySettled(), 42);
+		check('async: await on an already-settled Promise does NOT resume inside the same call', alreadySettled(), 0);
+		check('async: ...and has resumed by the next one', readSettled(), 42);
 
-		const { resolvedLater } = await compile(`
+		// The promise is module-level so the suspend and the `resolve()` can be in DIFFERENT exported
+		// calls -- the only way to see that `start()` really suspended, since a drain at the end of it
+		// would otherwise be indistinguishable from never having suspended at all.
+		const { start, resolveIt, readLater } = await compile(`
 			let output: number = 0;
+			const pending: Promise<number> = new Promise<number>(0);
 			async function addOne(p: Promise<number>): Promise<number> {
 				const v = await p;
 				output = v;
 				return v + 1;
 			}
-			export function resolvedLater(): number {
-				const p = new Promise<number>(0);
-				const result = addOne(p);
-				const before = output;
-				p.resolve(41);
-				const after = output;
-				return before * 1000 + after;
-			}
+			export function start(): number { addOne(pending); return output; }
+			export function resolveIt(): number { pending.resolve(41); return output; }
+			export function readLater(): number { return output; }
 		`);
-		check('async: await on a not-yet-settled Promise really suspends, resuming once resolve() runs', resolvedLater(), 41);
+		check('async: await on a not-yet-settled Promise really suspends -- nothing runs, even at the drain', start(), 0);
+		check('async: ...and resolve() alone does not resume it inside its own call', resolveIt(), 0);
+		check('async: ...it resumes at the drain that resolve()\'s own call ends with', readLater(), 41);
 
-		const { twoAwaits } = await compile(`
+		const { twoAwaits, readTwo } = await compile(`
 			let output: number = 0;
 			async function addTwo(p1: Promise<number>, p2: Promise<number>): Promise<number> {
 				const a = await p1;
@@ -4436,8 +4460,10 @@ async function main() {
 				const result = addTwo(p1, p2);
 				return output;
 			}
+			export function readTwo(): number { return output; }
 		`);
-		check('async: two sequential awaits in the same function', twoAwaits(), 30);
+		check('async: two sequential awaits in the same function', twoAwaits(), 0);
+		check('async: ...both resumptions drain by the next call', readTwo(), 30);
 
 		const { nonPromise } = await compile(`
 			let output: number = 0;
@@ -4462,29 +4488,25 @@ async function main() {
 		// binding) sidesteps a separate, also pre-existing gap (a non-nullable ref/array-typed *hoisted*
 		// local -- as opposed to a param, which already works -- crossing a suspend isn't supported yet,
 		// `emitDefaultValue`'s own clear throw), which reading the resolved array back out would need.
-		const { promiseAll } = await compile(`
+		const { startAll, resolveTwo, resolveLast, readAll } = await compile(`
 			let output: number = 0;
+			const p1: Promise<number> = new Promise<number>(0);
+			const p2: Promise<number> = new Promise<number>(0);
+			const p3: Promise<number> = new Promise<number>(0);
 			async function markDone(all: Promise<number[]>): Promise<number> {
 				await all;
 				output = 999;
 				return 999;
 			}
-			export function promiseAll(): number {
-				const p1 = new Promise<number>(0);
-				const p2 = new Promise<number>(0);
-				const p3 = new Promise<number>(0);
-				const all = Promise.all<number>([p1, p2, p3]);
-				const result = markDone(all);
-				p1.resolve(10);
-				const afterP1 = output;
-				p2.resolve(20);
-				const afterP2 = output;
-				p3.resolve(30);
-				const afterP3 = output;
-				return afterP1 * 1000000 + afterP2 * 1000 + afterP3;
-			}
+			export function startAll(): number { markDone(Promise.all<number>([p1, p2, p3])); return output; }
+			export function resolveTwo(): number { p1.resolve(10); p2.resolve(20); return output; }
+			export function resolveLast(): number { p3.resolve(30); return output; }
+			export function readAll(): number { return output; }
 		`);
-		check("async: 'Promise.all' resolves only once every input has, order-independent", promiseAll(), 999);
+		// Each of these calls ends with a full drain, so `readAll()` staying 0 after two of the three
+		// inputs resolved is a real "not yet", not just "not drained yet".
+		check("async: 'Promise.all' -- two of three inputs resolved leaves it pending", (startAll(), resolveTwo(), readAll()), 0);
+		check("async: 'Promise.all' resolves only once every input has, order-independent", (resolveLast(), readAll()), 999);
 
 		// `Promise<void>` -- a real, common instantiation -- unlike `Generator`'s own `Y | R` union,
 		// `Promise<T>.value: T` is a *bare* field with no union to fall back on, so `T=void` needed a
@@ -4494,7 +4516,7 @@ async function main() {
 		// `return` at all, here) and every `resolve()`/await site downstream then agree on that same
 		// substituted shape. Also exercises awaiting an existing `Promise<void>` value (`observe`
 		// below), which must reference the *same* substituted instantiation its producer built.
-		const { asyncVoidTest } = await compile(`
+		const { asyncVoidTest, readVoid } = await compile(`
 			let output: number = 0;
 			async function addOneVoid(p: Promise<number>): Promise<void> {
 				const v = await p;
@@ -4509,8 +4531,9 @@ async function main() {
 				observe(p);
 				return output;
 			}
+			export function readVoid(): number { return output; }
 		`);
-		check("async: 'Promise<void>' -- natural completion (no explicit 'return') resolves fine", asyncVoidTest(), 42);
+		check("async: 'Promise<void>' -- natural completion (no explicit 'return') resolves fine", (asyncVoidTest(), readVoid()), 42);
 	}
 
 	{
@@ -4782,7 +4805,7 @@ async function main() {
 		check("finally: inside a generator -- 'return' still yields the try's own value via the IteratorResult protocol", driveGenFinally(), 1042001);
 		check("finally: inside a generator -- 'finally' itself still ran", genOutput.includes('555\n'), true);
 
-		const { asyncFinallyTest } = await compile(`
+		const { asyncFinallyTest, readFinally } = await compile(`
 			let output: number = 0;
 			let finallyRan: number = 0;
 			async function addOneFinally(p: Promise<number>): Promise<number> {
@@ -4804,8 +4827,9 @@ async function main() {
 				const result = observe(p);
 				return output * 10 + finallyRan;
 			}
+			export function readFinally(): number { return output * 10 + finallyRan; }
 		`);
-		check("finally: inside an async function -- 'return' still resolves the try's own value through 'finally'", asyncFinallyTest(), 421);
+		check("finally: inside an async function -- 'return' still resolves the try's own value through 'finally'", (asyncFinallyTest(), readFinally()), 421);
 
 		const { testCtorFinally } = await compile(`
 			class Widget {
