@@ -59,6 +59,11 @@ export class TypedArray<T> {
 	// lets the constructors below convert between element count and byte count without needing to know
 	// which of Uint8Array/Int32Array/Uint32Array they actually are (towasm.ts substitutes the class's own
 	// name into this call site too, same as everywhere else in this file -- see its header comment).
+	// A GETTER rather than a stored field: this is a per-instantiation constant that `elemSize`'s own
+	// `$T` switch already resolves to 1/2/4/8, so a field would put a redundant word in every instance
+	// and need initialising in all six constructors, for one source of truth instead of two.
+	get BYTES_PER_ELEMENT(): number { return TypedArray.elemSize(); }
+
 	private static elemSize(): i32 { return __asm<[], i32>(`
 		(switch $T
 			(($u8 $i8)			i32.const 1)

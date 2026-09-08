@@ -1,5 +1,4 @@
 [
-	"TypedArray.BYTES_PER_ELEMENT",
 	"TypedArray.reduce",
 	"TypedArray.reduceRight",
 	"TypedArray.toLocaleString",
