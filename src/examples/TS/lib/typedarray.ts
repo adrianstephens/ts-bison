@@ -72,6 +72,14 @@ export class TypedArray<T> {
 			(($i64 $u64 $f64)	i32.const 8)
 		)`)(); }
 
+	// A float view stores an IEEE bit pattern, not the integer value -- `get`/`set` below reinterpret
+	// rather than compose. Every tag is listed because `(switch $T ...)` has no default arm.
+	private static isFloat(): i32 { return __asm<[], i32>(`
+		(switch $T
+			(($u8 $i8 $u16 $i16 $i32 $u32 $i64 $u64)	i32.const 0)
+			(($f32 $f64)								i32.const 1)
+		)`)(); }
+
 	// Real, separately-compiled constructors -- towasm.ts now supports genuine overloading (each of these
 	// gets its own wasm function, resolved per call site by argument shape, the same way the checker itself
 	// already resolves which one a given call typechecks against), so this no longer needs to be a single
@@ -155,6 +163,17 @@ export class TypedArray<T> {
 	get(i: i32): number {
 		const elemSize: i32 = TypedArray.elemSize();
 		const base: i32 = this.byteOffset + i * elemSize;
+		if (TypedArray.isFloat() !== 0) {
+			let lo: i32 = 0;
+			for (let b: i32 = 0; b < 4; b++)
+				lo = lo | (this.buffer.get(base + b) << (b * 8));
+			if (elemSize === 4)
+				return f32FromBits(lo);
+			let hi: i32 = 0;
+			for (let b: i32 = 0; b < 4; b++)
+				hi = hi | (this.buffer.get(base + 4 + b) << (b * 8));
+			return f64FromBits(lo, hi);
+		}
 		let v: i32 = 0;
 		for (let b: i32 = 0; b < elemSize; b++)
 			v = v | (this.buffer.get(base + b) << (b * 8));
@@ -171,6 +190,19 @@ export class TypedArray<T> {
 	set(i: i32, v: number): void {
 		const elemSize: i32 = TypedArray.elemSize();
 		const base: i32 = this.byteOffset + i * elemSize;
+		if (TypedArray.isFloat() !== 0) {
+			// `f32BitsOf` demotes first, so a `Float32Array` store rounds to the nearest f32 exactly as
+			// JS specifies -- and reads back as that rounded value, not the original double.
+			const lo: i32 = elemSize === 4 ? f32BitsOf(v) : f64BitsLo(v);
+			for (let b: i32 = 0; b < 4; b++)
+				this.buffer.set(base + b, (lo >>> (b * 8)) & 0xff);
+			if (elemSize === 8) {
+				const hi: i32 = f64BitsHi(v);
+				for (let b: i32 = 0; b < 4; b++)
+					this.buffer.set(base + 4 + b, (hi >>> (b * 8)) & 0xff);
+			}
+			return;
+		}
 		for (let b: i32 = 0; b < elemSize; b++)
 			this.buffer.set(base + b, (v >>> (b * 8)) & 0xff);
 	}
@@ -362,6 +394,39 @@ export class TypedArray<T> {
 	}
 }
 
+
+// f64 <-> raw IEEE bits as a pair of i32 halves. Split into halves rather than handed round as an
+// `i64` because everything downstream (`ArrayBuffer.set`, the byte loops) is i32, and an i64 local in
+// lib source would need bigint literals to shift by.
+const f32BitsOf = __asm<[f64], i32>(`
+	f32.demote_f64
+	i32.reinterpret_f32
+`);
+const f32FromBits = __asm<[i32], f64>(`
+	f32.reinterpret_i32
+	f64.promote_f32
+`);
+const f64BitsLo = __asm<[f64], i32>(`
+	i64.reinterpret_f64
+	i32.wrap_i64
+`);
+const f64BitsHi = __asm<[f64], i32>(`
+	i64.reinterpret_f64
+	i64.const 32
+	i64.shr_u
+	i32.wrap_i64
+`);
+const f64FromBits = __asm<[i32, i32], f64>(`
+	(local $lo i32)
+	(local $hi i32)
+	local.set $hi
+	local.set $lo
+	(i64.or
+		(i64.shl (i64.extend_i32_u (local.get $hi)) (i64.const 32))
+		(i64.extend_i32_u (local.get $lo))
+	)
+	f64.reinterpret_i64
+`);
 
 const asi32 = __asm<[f32], i32>('i32.reinterpret_f32');
 const asi64 = __asm<[f64], i64>('i64.reinterpret_f64');

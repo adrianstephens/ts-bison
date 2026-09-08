@@ -5530,6 +5530,29 @@ async function main() {
 	}
 
 	{
+		// A FLOAT view stores an IEEE bit pattern; `get`/`set` composed bytes as an integer for every
+		// element type alike, so `a[0] = 1.5` truncated to 1. The f32 cases also pin the round-trip
+		// through single precision -- 0.1 must read back as the f32-rounded double, exactly as JS does.
+		const { f32Frac, f64Frac, f32Rounds, f32Neg, f64Neg, i32Extremes, u8Wraps } = await compile(`
+			export function f32Frac(): number { const a = new Float32Array(1); a[0] = 1.5; return a[0]; }
+			export function f64Frac(): number { const a = new Float64Array(1); a[0] = 3.25; return a[0]; }
+			export function f32Rounds(): number { const a = new Float32Array(1); a[0] = 0.1; return a[0]; }
+			export function f32Neg(): number { const a = new Float32Array(2); a[1] = -2.5; return a[1]; }
+			export function f64Neg(): number { const a = new Float64Array(2); a[1] = -0.5; return a[1]; }
+			export function i32Extremes(): number { const a = new Int32Array(1); a[0] = -2147483648; return a[0]; }
+			export function u8Wraps(): number { const a = new Uint8Array(1); a[0] = 300; return a[0]; }
+		`);
+		check('typed array: a Float32Array stores a fraction', f32Frac(), 1.5);
+		check('typed array: a Float64Array stores a fraction', f64Frac(), 3.25);
+		check('typed array: a Float32Array round-trips through single precision', f32Rounds(), Math.fround(0.1));
+		check('typed array: a negative f32 element', f32Neg(), -2.5);
+		check('typed array: a negative f64 element', f64Neg(), -0.5);
+		// Controls: the integer views must still perform ToInt32/wrapping, not float reinterpretation.
+		check('typed array: an Int32Array still holds the full signed range', i32Extremes(), -2147483648);
+		check('typed array: a Uint8Array still wraps', u8Wraps(), 44);
+	}
+
+	{
 		// A field access the checker allowed only because it NARROWED the receiver first -- every
 		// discriminated union in a real program. Codegen doesn't track narrowing, so the union-field
 		// dispatch still sees every member and used to reject the ones that lack the field. A member the
