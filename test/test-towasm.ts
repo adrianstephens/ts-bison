@@ -1368,6 +1368,36 @@ async function main() {
 	}
 
 	{
+		// A conditional type whose CHECK TYPE is a naked type parameter DISTRIBUTES over a union argument.
+		// Without it the union was tested as a whole, failed, and `Extract`/`Exclude`/`Omit` -- and every
+		// utility built on them -- silently collapsed to `never`, which is assignable to anything, so the
+		// mistake surfaced only as a member read coming back `any`.
+		const { extracted } = await compile(`
+			type Stmt = { kind: "mod"; name: string } | { kind: "other"; n: number };
+			type Mod = Extract<Stmt, { kind: "mod" }>;
+			export function extracted(): number {
+				const m: Mod = { kind: "mod", name: "abcd" };
+				return m.name.length;
+			}
+		`);
+		check('Extract: distributes, so the member read has a real type', extracted(), 4);
+		// `Omit` is `Pick<T, Exclude<keyof T, K>>` -- the same machinery, and the shape the official TS
+		// suite pins (`omitTypeTestErrors01`, `intersectionsAndOptionalProperties`, both of which this
+		// now reports exactly as their own baselines require).
+		check('Omit: the omitted property really is gone',
+			typeErrors(`type To = { field?: number; other: string }; type F = Omit<To, "field">; declare const f: F; const bad = f.field;`)
+				.some(x => /Property 'field' does not exist/.test(x)), true);
+		check('Omit: a non-matching key removes nothing',
+			typeErrors(`type To = { field?: number; other: string }; type F = Omit<To, "nope">; declare const f: F; const ok: string = f.other;`).length, 0);
+		// The deferral half: an unbound type parameter leaves the conditional undecidable, and guessing
+		// (distributing over its CONSTRAINT) invented unions the call site never had.
+		check('a conditional over an unbound type param stays deferred',
+			typeErrors(`type R<T> = T extends number ? number : string;
+				function f<T extends number | string>(v: T): R<T> { return v as any; }
+				const n: number = f(1);`).length, 0);
+	}
+
+	{
 		// An empty array literal `[]` has no elements for `arrayKindOf` to infer a kind from -- it used
 		// to fall back to 'ref' unconditionally, ignoring the declared target type entirely, and fail
 		// for any non-ref target ("cannot convert {arr:ref} to {arr:f64}"). Found while building Map/Set

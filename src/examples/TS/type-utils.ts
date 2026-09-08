@@ -853,6 +853,24 @@ export function isClassRef(t: Type, scope: Scope): boolean {
 	return ((t.declScope as Scope ?? scope).lookupScope(parts)?.decl(name))?.type === 'class_decl';
 }
 
+// Does `t` mention an unbound type parameter anywhere reachable? `isAbstract` only answers for a bare
+// ref; a conditional's decidability also depends on one buried in an object member or a type argument
+// (`{type: T}`, `Node<T>`).
+function mentionsAbstract(t: Type, scope: Scope, depth = 4): boolean {
+	if (depth < 0)
+		return false;
+	if (isAbstract(t, scope))
+		return true;
+	switch (t.type) {
+		case 'union': case 'intersection':	return t.types.some(m => mentionsAbstract(m, scope, depth - 1));
+		case 'array':						return mentionsAbstract(t.element, scope, depth - 1);
+		case 'tuple':						return t.elements.some(e => { const el = tupleElementType(e); return !!el && mentionsAbstract(el, scope, depth - 1); });
+		case 'ref':							return (t.typeArgs ?? []).some(a => mentionsAbstract(a, scope, depth - 1));
+		case 'object':						return t.members.some(m => (m.type === 'property' || m.type === 'index') && mentionsAbstract(m.typeAnnotation, scope, depth - 1));
+		default:							return false;
+	}
+}
+
 function isAbstract(t: Type, scope: Scope): boolean {
 	switch (t.type) {
 		// A CLASS ref is the opposite of abstract -- it is a fully concrete named type. It only reaches
@@ -1183,7 +1201,31 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 							entry.defaultSubstitution ??= substituteType(entry.type, new Map(entry.typeParams.map(p => [p.name, p.default ?? ANY])));
 							return resolve(ns, entry.defaultSubstitution, depth - 1, stopAtRef);
 						}
-						return resolve(ns, substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, t.typeArgs?.[i] ?? p.default ?? ANY]))), depth - 1, stopAtRef);
+						const tparams	= entry.typeParams;
+						const args		= tparams.map((p, i) => t.typeArgs?.[i] ?? p.default ?? ANY);
+						const subst		= (as: Type[]) => resolve(ns, substituteType(entry.type, new Map(tparams.map((p, i) => [p.name, as[i]]))), depth - 1, stopAtRef);
+						// A conditional alias whose CHECK TYPE is a naked type parameter DISTRIBUTES over a
+						// union argument: `Extract<A | B, U>` is `(A extends U ? A : never) | (B extends U ?
+						// B : never)`. Tested as a whole instead, the union isn't assignable to the `extends`
+						// operand at all, so `Extract`/`Exclude` silently collapsed -- and a member read off
+						// one came back `any`. Distributing HERE, not at the conditional itself, because each
+						// arm must see the MEMBER substituted for `T` in its branches too, and by the time a
+						// conditional node exists that substitution has already happened.
+						const check = entry.type.type === 'conditional' ? entry.type.checkType : undefined;
+						const naked = check?.type === 'ref' && !check.typeArgs ? tparams.findIndex(p => p.name === check.name) : -1;
+						// ...but only once every argument is CONCRETE. An unbound type parameter anywhere
+						// leaves the conditional undecidable, and real TS defers it rather than guessing:
+						// distributing `realRoot<T>` over `T`'s own constraint invents a union the call site
+						// never had, and deciding `Extract<INode, {type: T}>` per member against an abstract
+						// `T` matches everything. Both were real false positives.
+						if (naked >= 0 && !args.some(a => mentionsAbstract(a, ns))) {
+							const members = unionMembers(args[naked], ns);
+							if (!members.length)
+								return NEVER;	// `Extract<never, X>` is `never`
+							if (members.length > 1)
+								return combineTypes(members.map(m => subst(args.map((a, i) => i === naked ? m : a))));
+						}
+						return subst(args);
 					}
 				}
 				break;
