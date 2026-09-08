@@ -843,9 +843,22 @@ export function stampSig<T extends TS.CallSig>(sig: T, scope: Scope): T {
 
 // Whether `t` derives from a genuinely uninstantiated type parameter (never registered in `scope`) rather than just being
 // structurally complex. `indexed_access` passes the question through to its inner position.
+// Does this ref name a real `class`? `resolve` keeps such a ref nominal (see its own `case 'ref'`), so
+// every consumer that used to be handed a class's expanded structural shape now meets the ref instead.
+export function isClassRef(t: Type, scope: Scope): boolean {
+	if (t.type !== 'ref' || ALL_PRIMITIVES.has(t.name))
+		return false;
+	const parts	= t.name.split('.');
+	const name	= parts.pop()!;
+	return ((t.declScope as Scope ?? scope).lookupScope(parts)?.decl(name))?.type === 'class_decl';
+}
+
 function isAbstract(t: Type, scope: Scope): boolean {
 	switch (t.type) {
-		case 'ref':				return !t.typeArgs && !ALL_PRIMITIVES.has(t.name) && (!scope.type(t.name) || !!scope.type(t.name)?.isTypeParam);
+		// A CLASS ref is the opposite of abstract -- it is a fully concrete named type. It only reaches
+		// here at all because `resolve` stopped expanding it; calling it abstract made a conditional
+		// (`T extends number | rational ? ...`) refuse to pick a branch and union both instead.
+		case 'ref':				return !t.typeArgs && !ALL_PRIMITIVES.has(t.name) && !isClassRef(t, scope) && (!scope.type(t.name) || !!scope.type(t.name)?.isTypeParam);
 		case 'indexed_access':	return isAbstract(t.object, scope) || isAbstract(t.index, scope);
 		default:				return false;
 	}
@@ -1160,7 +1173,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 					// keeps a named element: this compiler dispatches on a class by NAME (`ownerFor`,
 					// `ensureClass`), and an expanded member list has no name left. A consumer that wants
 					// the MEMBERS asks for them: `resolveMembers`.
-					if (ns.decl(name)?.type === 'class_decl')
+					if (isClassRef(t, refScope))
 						return t;
 					const entry = ns.type(name);
 					if (entry) {
