@@ -1633,6 +1633,12 @@ function collectDefinePropertyTargets(body: Stmt[]): Map<string, string[] | 'dyn
 // the cheaper path for that one, common shape.
 export function makeLibScope(): Scope {
 	const libScope = new Scope;
+	// `undefined` is a language built-in, not a lib declaration -- real tsc REFUSES to let a `.d.ts`
+	// declare it ("conflicts with built-in global identifier"), so `lib.d.ts` can't carry it beside
+	// `NaN`/`Infinity`. `T.makeGlobal` binds it for the checker-only path; this is the wasm path's
+	// equivalent. Without it the identifier typed as `any`, so `cond ? x : undefined` came out
+	// `number | any` -- no `undefined` left in the union for anything downstream to be nullable by.
+	libScope.addValue('undefined', T.UNDEFINED);
 	checkBlock(LIB_AST, libScope);
 	return libScope;
 }

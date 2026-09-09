@@ -1395,6 +1395,29 @@ async function main() {
 		`);
 		check('a function type that takes itself has a representation', selfRef(), 2);
 
+		// `undefined` had no binding on the wasm path at all (`makeLibScope` builds its globals from
+		// `lib.d.ts`, which cannot declare it -- real tsc rejects that as a built-in conflict), so the
+		// identifier typed as `any`. A ternary's `undefined` branch then contributed `any`, which
+		// swallowed the whole union: `cond ? n : undefined` came out `number | any`, leaving nothing
+		// nullable for a later `!== undefined` to test against.
+		// UNANNOTATED on purpose: an explicit `number | undefined` supplies the type itself and never
+		// exercises what the ternary inferred.
+		const { ternaryUndef, bareUndef } = await compile(`
+			export function ternaryUndef(): number {
+				const cond = true;
+				const v = cond ? 7 : undefined;
+				return v !== undefined ? v : -1;
+			}
+			function pick(take: boolean, n: number) { return take ? n : undefined; }
+			export function bareUndef(): number {
+				const a = pick(true, 5);
+				const b = pick(false, 5);
+				return (a !== undefined ? a : 0) * 10 + (b !== undefined ? b : 3);
+			}
+		`);
+		check("a ternary's 'undefined' branch stays 'undefined', not 'any'", ternaryUndef(), 7);
+		check("...and through a function's own INFERRED return type", bareUndef(), 53);
+
 		// ...and the contextual return type is only a hint when it carries STRUCTURE. A bare, still-
 		// unsolved type parameter says nothing about the body, and threading one through perturbed real
 		// inference (`after<V, R>(v: V, then: (value: Awaited<V>) => R)` in the binary package).
