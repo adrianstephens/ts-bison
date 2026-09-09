@@ -1416,6 +1416,15 @@ async function main() {
 			typeErrors(`type To = { field?: number; other: string }; type F = Omit<To, "nope">; declare const f: F; const ok: string = f.other;`).length, 0);
 		// The deferral half: an unbound type parameter leaves the conditional undecidable, and guessing
 		// (distributing over its CONSTRAINT) invented unions the call site never had.
+		// A namespace-qualified type is not an unbound type parameter -- those are always bare names.
+		// `scope.type` doesn't split on '.', so `Extract<NS.Stmt, ...>` looked undecidable and deferred
+		// to `never`, which is assignable to everything and so failed silently.
+		check('Extract over a namespace-qualified union still distributes',
+			typeErrors(`namespace NS { export type Stmt = { kind: "mod"; name: string } | { kind: "other"; n: number }; }
+				type Mod = Extract<NS.Stmt, { kind: "mod" }>;
+				declare const m: Mod;
+				const bad: number = m.name;`)
+				.some(x => /not assignable to type 'number'/.test(x)), true);
 		check('a conditional over an unbound type param stays deferred',
 			typeErrors(`type R<T> = T extends number ? number : string;
 				function f<T extends number | string>(v: T): R<T> { return v as any; }

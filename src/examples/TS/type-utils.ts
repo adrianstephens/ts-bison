@@ -877,7 +877,11 @@ function isAbstract(t: Type, scope: Scope): boolean {
 		// A CLASS ref is the opposite of abstract -- it is a fully concrete named type. It only reaches
 		// here at all because `resolve` stopped expanding it; calling it abstract made a conditional
 		// (`T extends number | rational ? ...`) refuse to pick a branch and union both instead.
-		case 'ref':				return !t.typeArgs && !ALL_PRIMITIVES.has(t.name) && !isClassRef(t, scope) && (!scope.type(t.name) || !!scope.type(t.name)?.isTypeParam);
+		// A DOTTED name is never a type parameter -- those are always bare. `scope.type` doesn't split on
+		// '.', so a namespace-qualified type (`TS.Stmt`) looked unbound and every conditional over one
+		// stayed deferred: `Extract<TS.Stmt, {type:'module_decl'}>` resolved to `never` despite `TS.Stmt`
+		// resolving perfectly well to its 33 members.
+		case 'ref':				return !t.typeArgs && !t.name.includes('.') && !ALL_PRIMITIVES.has(t.name) && !isClassRef(t, scope) && (!scope.type(t.name) || !!scope.type(t.name)?.isTypeParam);
 		case 'indexed_access':	return isAbstract(t.object, scope) || isAbstract(t.index, scope);
 		default:				return false;
 	}
