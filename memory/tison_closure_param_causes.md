@@ -28,7 +28,7 @@ something else is wrong; `want=ref`/`want=arr` means the wrong signature was sel
 nothing. Needs contextual typing to pick the tuple member of a union rest parameter and index it
 per-argument. NOT fixed.
 
-## `hex` (6) -- `String.replace(re, fn)` IS DELIBERATELY UNIMPLEMENTED
+## CLOSED `e97b848`: `hex` -- it was `String.replace(re, fn)` being unimplemented
 
 	s.replace(/.../g, (_, hex, ubrace, u4, ch) => ...)      // js-parser.ts's `unescapeString`
 
@@ -38,7 +38,7 @@ declares both, so the checker is happy and towasm picks the only implemented sig
 which is physically `arr`. **The closure typing is a red herring.** Implementing it is real lib work
 and needs the next item first, since the callback takes `(substring, ...groups)`.
 
-## Underneath both: a closure literal cannot bind params out of a REST
+## CLOSED `eaeef6b`: a closure literal could not bind params out of a REST
 
 A rest parameter is physically ONE array here, so a literal with more parameters than the callee has
 fixed ones cannot match:
@@ -67,3 +67,22 @@ and gets the repro above from "needs an explicit type" to the `cannot convert` l
   the simple shapes, so they never exercised the change. See [[feedback_baseline_in_real_tree]].
 
 Related: [[tison_towasm_self_hosting_plan]], [[tison_checker_inference]].
+
+## RESOLUTION 2026-09-09 -- two of the three are closed
+
+`eaeef6b` (rest-to-parameters binding + contextual parameter types) and `e97b848` (the
+`String.replace` function replacer, plus contextual typing past the fixed params, a closure
+literal argument resolving through a UNION parameter, and calling a union member narrowed by
+`typeof x === 'function'`) between them **moved 30 declarations**, measured against a correctly
+set `selfhost-survey.prev.json`. The `closure parameter 'hex'` and `unknown field 'recover'`
+rows are GONE from the cause table entirely; `compiled` stayed at 56/270, as it does through
+serial blockers.
+
+**`self` (19) is still open** and is still the top row -- a rest parameter typed as a union
+CONTAINING A TUPLE (`Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>)`). The
+union machinery `e97b848` added is for a union PARAMETER whose member is a function; this needs
+the tuple ARM of a union REST, indexed per argument. Next target.
+
+Two new rows appeared where those declarations landed: `14 | towasm.ts | 'typeAnnotation' needs
+an explicit number/boolean/object type` and `4 | js-parser.ts | 'any' (ref:TextPos) cannot be
+used as a boolean condition`.
