@@ -2919,6 +2919,31 @@ async function main() {
 		check('a closure literal binds extra parameters out of the callee\'s rest', restToParams(), 6);
 		check('...and may declare fewer than the rest actually supplies', restPartial(), 12);
 		check('...including an `any[]` rest, the String.replace callback shape', restAny(), 16);
+
+		// `String.replace`'s FUNCTION replacer, which real JS calls as `(match, ...captures, offset,
+		// input)`. Previously declared in lib.d.ts but deliberately unimplemented -- it needs the
+		// rest-to-parameters binding above, and a union parameter narrowed by `typeof x === 'function'`
+		// to be callable at all. Every expectation here was taken from real node, including that a
+		// non-global regexp replaces only the FIRST match and that a non-participating capture group
+		// arrives as `undefined`, not the empty string.
+		const { replFn, replFirst, replOptionalGroup } = await compile(`
+			export function replFn(): number {
+				const out = 'a1b2'.replace(/([a-z])([0-9])/g, (_, letter: string, digit: string) => digit + letter);
+				return out === '1a2b' ? out.length : -1;
+			}
+			export function replFirst(): number {
+				const out = 'x9y8'.replace(/([a-z])([0-9])/, (_, l: string, d: string) => d + l);
+				return out === '9xy8' ? out.length : -1;
+			}
+			export function replOptionalGroup(): number {
+				const out = 'ab'.replace(/(a)|(z)/g, (m: string, a: string | undefined, z: string | undefined) =>
+					a !== undefined ? 'A' : (z !== undefined ? 'Z' : m));
+				return out === 'Ab' ? out.length : -1;
+			}
+		`);
+		check('String.replace with a function replacer', replFn(), 4);
+		check('...a non-global regexp replaces only the first match', replFirst(), 4);
+		check('...and a non-participating capture group arrives as undefined', replOptionalGroup(), 2);
 	}
 
 	{

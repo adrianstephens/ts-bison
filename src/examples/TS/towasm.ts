@@ -3984,6 +3984,21 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	}
 
 	function emitCallArgs(label: string, params: WasmType[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FunctionContext, resolvedParams?: ResolvedParam[]): void {
+		// A closure literal passed where the parameter is a UNION with a function member (`String.replace`'s
+		// `string | ((substring: string, ...args: any[]) => string)`) must compile to THAT member's physical
+		// signature, not to its own parameter list -- the callee only ever calls it through the declared one.
+		// The union's physical type is a boxed `any`, which says nothing, so the TS type is what decides.
+		const wantForArg = (i: number, a: Expr): WasmType => {
+			const declared = resolvedParams?.[i]?.tsType;
+			if (declared && (a.type === 'arrow' || a.type === 'function')) {
+				const r = T.resolveOwn(declared, ctx.typeScope);
+				const fn = r.type === 'union' ? r.types.find(t => T.resolveOwn(t, ctx.typeScope).type === 'function') : undefined;
+				const wt = fn && typeOf(fn);
+				if (wt && typeof wt !== 'string' && 'closure' in wt)
+					return wt;
+			}
+			return params[i];
+		};
 		if (!hasRest) {
 			if (args.some(a => a.type === 'spread'))
 				args = expandTupleSpreads(args, ctx);
@@ -4026,7 +4041,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 				args = [...args, ...missing as Expr[]];
 			}
-			args.forEach((a, i) => emitAs(a, ctx, params[i]));
+			args.forEach((a, i) => emitAs(a, ctx, wantForArg(i, a)));
 		} else {
 			const fixedCount = params.length - 1;
 			if (args.length < fixedCount)
@@ -4034,7 +4049,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			const fixedArgs = args.slice(0, fixedCount);
 			if (fixedArgs.some(a => a.type === 'spread'))
 				throw `'${label}': a spread argument can only appear among the trailing rest arguments -- its length isn't known at compile time, so it can't fill a fixed parameter position`;
-			fixedArgs.forEach((a, i) => emitAs(a, ctx, params[i]));
+			fixedArgs.forEach((a, i) => emitAs(a, ctx, wantForArg(i, a)));
 			const restArrWtype = params[fixedCount];
 			if (typeof restArrWtype === 'string' || !('arr' in restArrWtype))
 				throw `internal: '${label}' rest param has a non-array type`;
@@ -4685,9 +4700,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
 			const pending	= fnCtx.declareParams(params);
 			// Each parameter the callee's rest covers, read back out of that one array -- synthesized as
-			// real `let x = #rest[k]` statements so the ordinary indexing path types and emits them.
-			pending.unshift(...restBound.flatMap((p, k) =>
-				patternBindings('let', p.key, { type: 'index', object: { type: 'identifier', name: '#rest' }, index: Literal(k) } as Expr)));
+			// real `let x = #rest[k]` statements so the ordinary indexing path types and emits them. The
+			// declared type has to ride along, or the binding reads back as the rest's own element type.
+			pending.unshift(...restBound.flatMap((p, k) => {
+				const read = { type: 'index', object: { type: 'identifier', name: '#rest' }, index: Literal(k) } as Expr;
+				return typeof p.key === 'string'
+					? [JS.VarDecl('let', JS.Var<Type>(p.key, read, p.typeAnnotation ?? wantSig!.restElem!.tsType))]
+					: patternBindings('let', p.key, read);
+			}));
 			// The cast-down env local (or, with no captures, just the param itself) is declared after the real params, so it's a genuine local, not mistaken for one more wasm param.
 			let envLocal	= envParam;
 			if (fields) {
@@ -6234,6 +6254,20 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 							// param, same rest-packing as a plain named function's own call site either way.
 							emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 							// The code pointer (funcref) is pushed last -- `call_ref` consumes it off the stack top, after every real argument.
+							ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+							return sig.result;
+						}
+						// A union member NARROWED to a function (`typeof r === 'function' ? r(x) : r`).
+						// The binding's own physical type is the boxed union, so the closure struct has to
+						// be cast back out of it before the same `call_ref` dance as above.
+						const narrowedWtype = typeOf(narrowedTypeOf(e.callee, ctx));
+						if (narrowedWtype && typeof narrowedWtype !== 'string' && 'closure' in narrowedWtype) {
+							const sig = narrowedWtype.closure;
+							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
+							emitExpr(e.callee, ctx);
+							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, narrowedWtype);
+							ctx.emit(I.ref.cast(structTypeIndex), I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
+							emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 							ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
 							return sig.result;
 						}

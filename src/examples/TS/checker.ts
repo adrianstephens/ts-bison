@@ -135,9 +135,17 @@ function shapedHint(t: Type | undefined, scope: Scope): Type | undefined {
 function applyContextualParams(params: JS.Param<Type>[], expected: Type | undefined, scope: Scope) {
 	const sig = expected && resolveFnMember(expected, scope);
 	if (sig) {
+		// Past the declared fixed parameters it is the REST that covers them, so its ELEMENT is the
+		// contextual type -- `(_, a, b) => ...` against `(substring: string, ...args: any[]) => string`,
+		// which is every `String.replace` callback. Written shape first: resolving `Array<T>` expands it
+		// to the class's own object shape and loses the element.
+		const restAnn	= sig.rest?.typeAnnotation;
+		const asArray	= (t: Type | undefined) => t && t.type === 'array' ? t.element
+			: t && t.type === 'ref' && t.name === 'Array' && t.typeArgs?.length === 1 ? t.typeArgs[0] : undefined;
+		const restElem	= asArray(restAnn) ?? asArray(restAnn && T.resolveOwn(restAnn, scope));
 		params.forEach((p, j) => {
-			if (!p.typeAnnotation && sig.params[j]?.typeAnnotation)
-				p.typeAnnotation = sig.params[j].typeAnnotation;
+			if (!p.typeAnnotation)
+				p.typeAnnotation = sig.params[j]?.typeAnnotation ?? restElem;
 		});
 	}
 	return sig || undefined;

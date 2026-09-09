@@ -210,9 +210,9 @@ export class String {
 		const m: RegExpMatch | null = regexp.exec(s);
 		return m === null ? -1 : m.index;
 	}
-	// `$1`.."$9"/`$&`/`$$` substitution (see regexp.ts's `expandReplacement`) -- the function-replacer
-	// overload real JS also has is out of scope. Honors `g` (all matches) vs first-only.
-	replace(regexp: RegExp, replacement: string): string {
+	// `$1`.."$9"/`$&`/`$$` substitution (see regexp.ts's `expandReplacement`), or the FUNCTION replacer,
+	// which real JS calls as `(match, ...captures, offset, input)`. Honors `g` (all matches) vs first-only.
+	replace(regexp: RegExp, replacement: string | ((substring: string, ...args: any[]) => string)): string {
 		const s: string = this as unknown as string;
 		let result = '';
 		let last = 0;
@@ -223,7 +223,20 @@ export class String {
 			if (m === null) {
 				go = false;
 			} else {
-				result = result.concat(s.slice(last, m.index)).concat(expandReplacement(replacement, m));
+				let piece = '';
+				if (typeof replacement === 'string') {
+					piece = expandReplacement(replacement, m);
+				} else {
+					// A group that did not participate is `undefined` in real JS, not the empty string
+					// `group` itself returns -- callers routinely test the arguments with `!== undefined`.
+					const args: any[] = [];
+					for (let i = 1; i < m.length; i++)
+						args.push(m.groupStart(i) === -1 ? undefined : m.group(i));
+					args.push(m.index);
+					args.push(s);
+					piece = replacement(m.group(0), ...args);
+				}
+				result = result.concat(s.slice(last, m.index)).concat(piece);
 				last = m.groupEnd(0);
 				if (!regexp.global)
 					go = false;
