@@ -3568,6 +3568,26 @@ async function main() {
 			`,
 		}, 'main');
 		check('function type: a namespace-qualified interface that extends another', viaNamespace(), 3);
+
+		// A NAMESPACE-qualified read (`import * as L`) of an exported module-level const resolves that
+		// const against the module's own EXPORT scope -- which has no entry at all for a NON-EXPORTED
+		// sibling its initializer reads. js-parser.ts's `import_attributes` is exactly that, and every
+		// `JS.import_declaration` rule ts-parser.ts has is built from it. `topLevelVars` is keyed per
+		// MODULE now (it was entry-only), and the binding's type comes from the checker when the export
+		// scope cannot supply one.
+		const { privateSibling } = await compileMulti({
+			lib: `
+				function makeList(a: number, b: number): number[] { return [a, b]; }
+				export function pick(xs: number[], i: number): number { return xs[i]; }
+				const part: number[] = makeList(1, 2);
+				export const whole: number[] = makeList(pick(part, 0) + 10, pick(part, 1) + 20);
+			`,
+			main: `
+				import * as L from './lib';
+				export function privateSibling(): number { return L.pick(L.whole, 0) * 100 + L.pick(L.whole, 1); }
+			`,
+		}, 'main');
+		check('a namespace-qualified const reads a NON-EXPORTED sibling of its own module', privateSibling(), 1122);
 	}
 
 	{

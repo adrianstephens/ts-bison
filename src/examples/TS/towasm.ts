@@ -1718,7 +1718,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	const stmtHomeModule		= new Map<TS.Stmt, string>();
 	// The entry module's top-level `const`/`let` declarators, by name -- see the `moduleBodies` scan's own
 	// comment on why `Scope.decl` can't answer this for the entry module.
-	const topLevelVars			= new Map<string, { stmt: TS.Stmt; d: JS.Var<Type> }>();
+	const topLevelVars			= new Map<string, { stmt: TS.Stmt; d: JS.Var<Type> }>();	// keyed by `homeKey(module, name)`
 	// An `enum`'s members, keyed `homeKey(module, 'Enum.member')`. An enum is a COMPILE-TIME
 	// declaration here: it has no runtime object, so a member read folds to its constant (see
 	// `case 'member'`) and the declaration itself emits nothing. `enumNames` is the set of names that
@@ -1778,7 +1778,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// needs a capture slot. `hoist` deliberately doesn't hoist a plain top-level `var_decl` into a
 			// scope, so `resolveDecl` above cannot see one -- `topLevelVars` is where they live, and without
 			// this a closure referencing one read as a free variable ("unresolved identifier 'LIB_DIR'").
-			|| (homeModule === '.' && topLevelVars.has(name));
+			|| topLevelVars.has(homeKey(homeModule, name));
 	}
 
 	const worklist:			(()=>void)[] = [];
@@ -2054,7 +2054,9 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		if (existing)
 			return existing;
 
-		const checkedType = declScope.value(name);
+		// An imported module's scope only carries its EXPORTS, so a non-exported module-level binding has
+		// no declared type there -- ask the checker for its initializer's instead, in that same scope.
+		const checkedType = declScope.value(name) ?? (d.init && checkerTypeOf(d.init, declScope));
 		// `typeOf` has no answer for a bare anonymous object shape (only a named class, an index signature
 		// or an all-call-signature one) -- give it the same synthesized struct an object literal targeting
 		// that shape already gets, or a `const D: {a: number} = {...}` has no representation to cache into.
@@ -2120,12 +2122,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// `Scope.decl` answers for an imported module, `topLevelVars` for the entry module (`hoist` deliberately
 	// doesn't hoist a plain top-level `var_decl`, so it never reaches a scope) -- the same pair `lazyGlobalFor`
 	// uses. `seen` guards a self- or mutually-referential chain (`const A = B; const B = A;`).
-	function classAliasTarget(name: string, scope: Scope, seen = new Set<string>()): { name: string; scope: Scope } | undefined {
+	function classAliasTarget(name: string, scope: Scope, seen = new Set<string>(), homeModule = '.'): { name: string; scope: Scope } | undefined {
 		if (seen.has(name))
 			return undefined;
 		seen.add(name);
 		const varStmt	= scope.decl(name);
-		const d			= varStmt?.type === 'var_decl' ? varStmt.declarations.find(v => v.name === name) : topLevelVars.get(name)?.d;
+		const d			= varStmt?.type === 'var_decl' ? varStmt.declarations.find(v => v.name === name) : topLevelVars.get(homeKey(homeModule, name))?.d;
 		return d?.init ? classRefTarget(d.init, scope, seen) : undefined;
 	}
 
@@ -2136,7 +2138,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		const varStmt	= scope.decl(name);
 		const own		= varStmt?.type === 'var_decl'
 			? { stmt: varStmt as TS.Stmt, d: varStmt.declarations.find(d => d.name === name) }
-			: scope === ctx.scope ? topLevelVars.get(name) : undefined;
+			: scope === ctx.scope ? topLevelVars.get(homeKey(ctx.homeModule, name)) : undefined;
 		if (!own?.d) {
 			// A module-level binding in a STATIC lib file (`LIB_AST`). Those files are never in
 			// `moduleBodies`, so they have no `stmtHomeModule` entry and are absent from `topLevelVars` --
@@ -9534,12 +9536,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				for (const d of s.declarations) {
 					if (typeof d.name !== 'string' || !d.init)
 						continue;
-					// The entry module's own top-level declarators, so a plain READ of one can find its real
-					// initializer. Only `exportScope` (an IMPORTED module's shape) stamps `Scope.addDecl` for a
-					// var_decl, so `ctx.scope.decl(name)` -- what the cross-module path uses -- finds nothing at
-					// all here. Entry-only, matching the eager/promoted handling right below.
-					if (moduleId === '.')
-						topLevelVars.set(d.name, { stmt: s, d });
+					// Every module's own top-level declarators, so a plain READ of one can find its real
+					// initializer. Only `exportScope` stamps `Scope.addDecl` for a var_decl, and only for an
+					// EXPORTED one -- so a non-exported module-level `const` in an imported module (js-parser.ts's
+					// own `import_attributes`, which its exported `import_declaration` is built from) was in
+					// neither and resolved nowhere. Keyed per module: two modules may each declare the name.
+					topLevelVars.set(homeKey(moduleId, d.name), { stmt: s, d });
 					if (s.kind === 'const' && (d.init.type === 'arrow' || d.init.type === 'function')) {
 						functionDeclByName.set(homeKey(moduleId, d.name), arrowOrFunctionToDecl(d.name, d.init));
 						if (moduleId === '.')
