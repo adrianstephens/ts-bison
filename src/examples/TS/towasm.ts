@@ -5365,6 +5365,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					let spreadIndex = 0;
 					for (const p of e.properties) {
 						if (p.type === 'spread') {
+							// A spread source whose own fields are STATICALLY KNOWN -- a plain object or class,
+							// not another dynamic object -- needs no runtime key walk: its keys are known right
+							// here, so each becomes an ordinary `set`. The code below assumed every spread
+							// operand was itself Map-backed and coerced it to the map's own type, which simply
+							// could not convert (`{...base, k: v}` with a plain `base`, and `ts-parser.ts`'s own
+							// `rules: {...JS.rules, ...}` against `Record<string, Rules<any>>`).
+							const srcCls = ownerOf(p.operand, ctx);
+							if (srcCls && srcCls.decl.name !== 'Map') {
+								const srcName	= `#spread$${n}$${spreadIndex++}`;
+								const srcLocal	= ctx.declareValue(srcName, srcCls.thisWtype!, srcCls.thisTsType!);
+								emitAs(p.operand, ctx, srcCls.thisWtype!);
+								ctx.emit(I.local.set(srcLocal.index));
+								for (const key of srcCls.fieldIndex.keys()) {
+									ctx.emit(I.local.get(mapLocal.index));
+									emitMethodCall(owner, 'set', [{ type: 'literal', value: key }, { type: 'member', object: { type: 'identifier', name: srcName }, property: key }] as Expr[], ctx);
+								}
+								continue;
+							}
 							const spreadName	= `#spread$${n}$${spreadIndex}`;
 							const kName			= `#spreadkey$${n}$${spreadIndex++}`;
 							const spreadLocal	= ctx.declareValue(spreadName, owner.thisWtype!, owner.thisTsType!);

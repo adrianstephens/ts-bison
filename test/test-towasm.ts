@@ -1473,6 +1473,25 @@ async function main() {
 				.some(x => /does not exist/.test(x)), true);
 		// ...and a bare `[]` with no context at all is still `any[]`, not an error.
 		checkTypeChecks('a bare empty literal is unconstrained', `const a = []; a.push(1); a.push('x');`);
+		// Spreading a STATICALLY-SHAPED object into a dynamic-object literal (`Record<string, V>`, which
+		// routes to a real `Map`). The spread path assumed every operand was itself Map-backed and
+		// coerced it to the map's own type, which cannot convert -- `ts-parser.ts`'s own
+		// `rules: {...JS.rules, ...}` against `Record<string, Rules<any>>` is the real instance.
+		const { spreadStatic, spreadLastWins, spreadDynamic } = await compile(`
+			const base = { a: 5 };
+			function take(r: Record<string, number>): number { return r["a"] + r["b"]; }
+			export function spreadStatic(): number { return take({ ...base, b: 6 }); }
+			const over = { a: 50 };
+			function first(r: Record<string, number>): number { return r["a"]; }
+			export function spreadLastWins(): number { return first({ a: 1, ...over }); }
+			export function spreadDynamic(): number {
+				const d: Record<string, number> = { a: 5 };
+				return take({ ...d, b: 6 });
+			}
+		`);
+		check('a statically-shaped spread into a dynamic object', spreadStatic(), 11);
+		check('...and a later spread still overwrites an earlier field', spreadLastWins(), 50);
+		check('...while a dynamic-object spread keeps its runtime key walk', spreadDynamic(), 11);
 		check('an optional param omitted beside a non-literal sibling default', omitted(), 9);
 		check('...and the same call with every argument supplied', passed(), 12);
 
