@@ -50,6 +50,27 @@ export function splitTestFile(source: string, defaultName: string) {
 
 export const isSource = (name: string) => /\.tsx?$/.test(name) && !name.endsWith('.d.ts');
 
+// The real compiler's output for each test is baselined in tests/baselines/reference/. A test that
+// produces any diagnostic gets a `NAME.errors.txt` (or `NAME(opt=val).errors.txt` per config
+// variant); no such baseline means it is expected to compile clean. Basenames are globally unique
+// across compiler/ + conformance/ and the baseline dir is flat, so basename is the key.
+// We only act on the clean set -- an ERROR there is our checker rejecting code tsc accepts; whether
+// we also reject what tsc rejects is not measured. (Rare stale baselines exist, so the clean signal
+// is slightly lenient; the false-positive list gets eyeballed anyway.)
+export async function expectsErrorsSet(): Promise<Set<string>> {
+	const dir = path.join(TS_REPO, 'tests/baselines/reference');
+	const out = new Set<string>();
+	for (const f of await fs.readdir(dir)) {
+		const m = /^(.*?)(?:\([^)]*\))?\.errors\.txt$/.exec(f);
+		if (m)
+			out.add(m[1]);
+	}
+	return out;
+}
+
+export const expectsErrors = (set: Set<string>, filename: string) =>
+	set.has(path.basename(filename).replace(/\.tsx?$/, ''));
+
 // Every corpus source file, sorted -- the ordering is what makes a fixed-size slice of it a stable,
 // comparable sample across runs. Adding a file to the TS checkout can shift the slice; that is
 // visible as a baseline change, which is the intended behaviour, not a false alarm.
