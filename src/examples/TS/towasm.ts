@@ -4786,20 +4786,38 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// zero-capture trampoline per function name instead: same shape `emitClosureLiteral`'s own
 	// zero-capture case builds (`env` ignored, `envBase` reused directly, no distinct env type), just
 	// forwarding straight through to the real, already-compiled (or newly compiled here) function.
-	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl, homeModule = '.'): { info: FuncInfo; structTypeIndex: number } {
+	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl, homeModule = '.', want?: WasmType): { info: FuncInfo; structTypeIndex: number } {
 		const key = homeKey(homeModule, name);
 		const existing = functionValueWrappers.get(key);
 		if (existing) {
 			const { structTypeIndex } = ensureClosureType({ params: existing.params, result: existing.result, hasRest: existing.hasRest });
 			return { info: existing, structTypeIndex };
 		}
-		const target = funcs.get(key) ?? compileFunc(name, decl, homeModule);
+		// A GENERIC function used as a VALUE has no call site to infer from, so its type parameters
+		// erase to their bounds -- exactly what `closureSigParts` already does for a generic function
+		// TYPE, and what the value's own declared type (`CommonAction<C> = <T>(value: T, ...) => any`)
+		// erases to on the other side of the assignment. One instantiation, since the erasure is fixed.
+		const erased	= decl.typeParams?.length
+			? new Map(decl.typeParams.map(p => [p.name, (p.constraint ?? T.ANY) as Type]))
+			: undefined;
+		const target	= funcs.get(key) ?? (erased
+			? compileFunc(genericKey(name, decl.typeParams!, erased, global), { ...substituteTypeParams(decl, erased), typeParams: undefined }, homeModule, name)
+			: compileFunc(name, decl, homeModule));
 		if (!target)
 			throw `'${name}' can't be used as a value`;
 
 		const sig: FuncSig = { params: target.params, result: target.result, hasRest: target.hasRest };
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 		const { funcIndex, typeIndex } = registerFuncAtType(funcTypeIndex);
+		// Erasure answers only where the WANTED signature is itself erased (`CommonAction<C> =
+		// <T>(value: T, ...) => any`). A concrete one needs the real instantiation, which nothing here
+		// can infer -- `want` is physical and carries no type arguments -- so say that rather than let
+		// it surface as an `internal: cannot convert (ref:any)=>ref:any to (f64)=>f64` further out.
+		if (erased && want && typeof want !== 'string' && 'closure' in want
+			&& want.closure.params.length === sig.params.length
+			&& !want.closure.params.every((p, i) => wasmTypeEq(p, sig.params[i])))
+			throw `generic function '${name}' as a value only erases to its bounds -- a concrete instantiation is not supported`;
+
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex, defaults: target.defaults };
 		closureLiterals.push(info);
 		functionValueWrappers.set(key, info);
@@ -5135,7 +5153,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					}
 				}
 				if (fnDecl && fnDecl.type === 'function_decl' && fnDecl.body) {
-					const { info, structTypeIndex } = ensureFunctionValueWrapper(fnName, fnDecl, fnModule);
+					const { info, structTypeIndex } = ensureFunctionValueWrapper(fnName, fnDecl, fnModule, want);
 					ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
 					return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
 				}

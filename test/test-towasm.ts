@@ -2958,6 +2958,25 @@ async function main() {
 		// contextually type one. This is tison's own `Rules<T>(...alts: [(self: () => Rules<T>) =>
 		// Rules<T>] | Rules<T>)`, whose `self => [...]` callback every grammar rule is built from.
 		// Asserted as a REJECTION: an untyped `self` is `any`, which produces no error either way.
+		// A GENERIC function used as a VALUE (not called) has no call site to infer from, so its type
+		// parameters erase to their bounds -- the same rule `closureSigParts` already applies to a
+		// generic function TYPE. tison's own `makeRule<any>(stampPos)` is this, and `stampPos` is what
+		// every ts-parser.ts/js-parser.ts grammar rule reaches through.
+		const { genericValue } = await compile(`
+			type Common = <T>(value: T, n: number) => any;
+			function stamp<T>(t: T, n: number): T { return t; }
+			function useIt(c: Common, v: number): number { return c(v, 1) as number; }
+			export function genericValue(): number { return useIt(stamp, 42); }
+		`);
+		check('a generic function used as a value erases to its bounds', genericValue(), 42);
+		// ...but only where the WANTED signature is erased too. A concrete one needs the real
+		// instantiation, which nothing here can infer, and saying so beats an `internal:` cast error.
+		await checkThrows('a generic function value at a CONCRETE signature is rejected', () => compile(`
+			function identity<T>(t: T): T { return t; }
+			function apply(f: (x: number) => number, v: number): number { return f(v); }
+			export function main(): number { return apply(identity, 7); }
+		`), /only erases to its bounds/);
+
 		check('a callback in the TUPLE arm of a union rest is contextually typed',
 			typeErrors(`type Items = number[];
 				declare function Build(...alts: [(self: () => Items) => Items] | Items): Items;
