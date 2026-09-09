@@ -1438,6 +1438,30 @@ async function main() {
 				mismatch = `${JSON.stringify(str)} -> ${quoteString(str)}`;
 		}
 		check('quoteString matches JSON.stringify (escapes + 2000 fuzz strings)', mismatch, '');
+	}
+
+	{
+		// An OPTIONAL parameter's implicit default is a synthesized bare `undefined`
+		// (`defaultsWithImplicitUndefined`). `isReemittableDefault` rejected it -- the AST has a `null`
+		// literal but no `undefined` one, so it can only arrive as an identifier -- which sent the call
+		// down the earlier-parameter-referencing path and hit `internal: ... no resolved parameter info`
+		// whenever a SIBLING default was non-literal. That was the survey's top cause at 21 declarations.
+		// CROSS-MODULE on purpose: the internal branch is only reached when the callee has no resolved
+		// parameter info, which a same-file declaration always has.
+		const { omitted, passed } = await compileMulti({
+			lib: `
+				export function f(a: number, b: number = a * 2, c?: number): number {
+					return a + b + (c === undefined ? 0 : c);
+				}
+			`,
+			main: `
+				import { f } from './lib';
+				export function omitted(): number { return f(3); }
+				export function passed(): number { return f(3, 4, 5); }
+			`,
+		}, 'main');
+		check('an optional param omitted beside a non-literal sibling default', omitted(), 9);
+		check('...and the same call with every argument supplied', passed(), 12);
 
 		// ...and the contextual return type is only a hint when it carries STRUCTURE. A bare, still-
 		// unsolved type parameter says nothing about the body, and threading one through perturbed real

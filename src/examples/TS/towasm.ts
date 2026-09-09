@@ -7209,6 +7209,12 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 	function isReemittableDefault(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
 		return e.type === 'literal'
+			// `undefined` is a language CONSTANT, not a name to resolve: self-contained and
+			// side-effect-free, which is the property this predicate actually tests. The AST has a `null`
+			// literal but no `undefined` one, so it can only arrive as an identifier -- and
+			// `defaultsWithImplicitUndefined` synthesizes exactly this node for every optional parameter,
+			// so rejecting it made an optional parameter's own implicit default unusable.
+			|| (e.type === 'identifier' && e.name === 'undefined')
 			|| closureDefaultIsSelfContained(e, earlierNames)
 			|| (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el, earlierNames)))
 			// Same reasoning as the array case, and `{}` -- an all-defaults options bag -- is the common one.
