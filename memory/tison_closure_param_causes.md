@@ -20,7 +20,7 @@ not contextually type this callback** — the interesting question is always *wh
 Instrument it by printing `want` at the throw: `want=closure,...` means the expected type arrived and
 something else is wrong; `want=ref`/`want=arr` means the wrong signature was selected upstream.
 
-## `self` (18) -- a rest parameter typed as a UNION CONTAINING A TUPLE
+## CLOSED `000c3b5`: `self` -- a rest parameter typed as a UNION CONTAINING A TUPLE
 
 	export function Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>): Rules<T>;
 
@@ -86,3 +86,29 @@ the tuple ARM of a union REST, indexed per argument. Next target.
 Two new rows appeared where those declarations landed: `14 | towasm.ts | 'typeAnnotation' needs
 an explicit number/boolean/object type` and `4 | js-parser.ts | 'any' (ref:TextPos) cannot be
 used as a boolean condition`.
+
+## ALL THREE CLOSED as of `000c3b5` (2026-09-09)
+
+`self` was the last, and it was TWO independent halves -- the reason it looked like one message:
+
+- **The checker** computed an argument's declared type as `sig.params[i]?.typeAnnotation` and
+  stopped. A callee with NO fixed parameters gives `undefined` for every argument, so
+  `applyContextualParams` received nothing. `restArgType` (checker.ts, next to `resolveFnMember`)
+  now answers for a REST position: an array's element, a tuple's element AT THAT POSITION, or --
+  for a union -- every arm that can answer, combined, so `resolveFnMember` finds the function.
+- **towasm** took a rest's physical type from `typeOf(annotation)`. A union of tuple and array has
+  no array type of its own, so it came back a boxed ref and `emitCallArgs` threw `internal: 'X'
+  rest param has a non-array type`. **A rest is physically ALWAYS one array**, whatever the
+  declared type says; `restParamWtype` combines element types across the arms and builds it.
+  Routed through ALL FIVE sites that resolve a rest's wtype -- a declaration and its call sites
+  disagreeing here is a silent miscompile, not a diagnostic.
+
+**34 declarations moved.** `closure parameter 'self'` is gone from the cause table; the top row is
+now `17 | ts-parser.ts | generic function 'stampPos' is not supported`, which is where they landed.
+`compiled` held at 56 (the denominator went 270 -> 271 because `restArgType` is itself a new
+top-level declaration in a surveyed file).
+
+**A test-design trap worth keeping**: asserting on the CALL'S RESULT proves nothing here.
+`Build(self => ...)` returns `Items` whether or not `self` was contextually typed, so that test
+passed identically at the parent. The assertion has to observe `self` ITSELF -- pass it to a
+differently-typed parameter and require the mismatch.
