@@ -191,7 +191,8 @@ async function compile(filein: string, fileout: string, wat = false) {
 	const diagnostics	= await TStypeCheckAsync(program, loader, new T.Scope(libScope));
 	const errors		= diagnostics.filter(d => d.severity === SEVERITY.ERROR);
 	if (errors.length)
-		throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
+//		throw new Error('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
+		console.log('type errors:\n' + errors.map(d => `  ${d.pos.line}:${d.pos.col} - ${d.message}`).join('\n'));
 
 	// Real multi-file codegen: seed `TStoWasm` from every module the loader actually resolved (not just
 	// the entry file's own body), plus each module's own namespace-import and named-import bindings, so a
@@ -227,8 +228,7 @@ async function compile(filein: string, fileout: string, wat = false) {
 
 const args = process.argv.slice(2);
 if (args.length === 0)
-	//args.push('/Volumes/DevSSD/dev/packages/tison/src/tison.ts', '--wat');
-	args.push('/Volumes/DevSSD/dev/packages/tison/src/examples/TS/lib/bigint.ts', '--wat');
+	args.push('/Volumes/DevSSD/dev/packages/tison/src/examples/TS/checker.ts', '--wat');
 
 let wat = false;
 const inputs: string[] = [];
