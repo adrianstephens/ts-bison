@@ -1425,6 +1425,21 @@ async function main() {
 				declare const m: Mod;
 				const bad: number = m.name;`)
 				.some(x => /not assignable to type 'number'/.test(x)), true);
+		// `typeof`-narrowing a path containing a LITERAL index. `pathKey` stopped at the first `index`
+		// node and returned undefined, so `a[0].k` had no narrowing key at all and the guard did nothing.
+		check('narrowing reaches a literal-indexed path',
+			typeErrors(`type BT = string | { a: number };
+				declare function takes(name: string): void;
+				function outer(fn: { params: { key: BT }[] }) {
+					if (typeof fn.params[0]?.key === "string") { const k = fn.params[0].key; takes(k); }
+				}`).length, 0);
+		// ...but a COMPUTED index must not: the index can evaluate differently between guard and read.
+		check('narrowing does NOT reach a computed-index path',
+			typeErrors(`type BT = string | { a: number };
+				declare function takes(name: string): void;
+				function outer(fn: { params: { key: BT }[] }, i: number, j: number) {
+					if (typeof fn.params[i].key === "string") takes(fn.params[j].key);
+				}`).some(x => /not assignable to parameter/.test(x)), true);
 		check('a conditional over an unbound type param stays deferred',
 			typeErrors(`type R<T> = T extends number ? number : string;
 				function f<T extends number | string>(v: T): R<T> { return v as any; }

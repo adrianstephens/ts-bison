@@ -2243,6 +2243,14 @@ export function pathKey(e: Expr): string | undefined {
 			const k = pathKey(e.object);
 			return k && k + '.' + e.property;
 		}
+		// A LITERAL index names one fixed element, so `a[0].k` is as stable a path as `a.b.k` and narrows
+		// the same way (real TS narrows element access on a literal index too). A COMPUTED one must not:
+		// the index expression can evaluate differently between the guard and the read.
+		case 'index': {
+			const k = pathKey(e.object);
+			const i = e.index.type === 'literal' && (typeof e.index.value === 'number' || typeof e.index.value === 'string') ? e.index.value : undefined;
+			return k !== undefined && i !== undefined ? `${k}[${typeof i === 'string' ? JSON.stringify(i) : i}]` : undefined;
+		}
 		default:			return undefined;
 	}
 }
