@@ -1383,6 +1383,18 @@ async function main() {
 		`);
 		check('Map: inferred through a .map() call, not just a literal', fromMapped(), 22);
 
+		// A SELF-REFERENTIAL function type -- one that takes itself as a parameter -- overflowed the
+		// stack: `typeOf` -> `closureSigParts` -> `params.map` -> `typeOf` on the same annotation, with
+		// nothing to break the loop (`T.resolve`'s cycle guard never sees it; each parameter resolves
+		// fine alone). This is checker.ts's own `checkStmt(s, scope, typeOf, checkStmt)` shape, and it
+		// took out all 25 of that file's declarations at once.
+		const { selfRef } = await compile(`
+			type Visit = (n: number, next: Visit) => number;
+			function run(v: Visit): number { return v(1, v); }
+			export function selfRef(): number { return run((n: number, next: Visit) => n + 1); }
+		`);
+		check('a function type that takes itself has a representation', selfRef(), 2);
+
 		// ...and the contextual return type is only a hint when it carries STRUCTURE. A bare, still-
 		// unsolved type parameter says nothing about the body, and threading one through perturbed real
 		// inference (`after<V, R>(v: V, then: (value: Awaited<V>) => R)` in the binary package).

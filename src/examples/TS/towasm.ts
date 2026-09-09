@@ -2436,7 +2436,25 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		return ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
 	}
 
+	// A SELF-REFERENTIAL type has no single physical shape, so re-entering `typeOf` on one already being
+	// computed boxes as `any` -- the same answer the union case below gives a member it cannot represent.
+	// The loop is between `typeOf` calls, not inside any one of them, so `T.resolve`'s own cycle guard
+	// never sees it: every individual member/parameter resolves perfectly well on its own.
+	// The real shape is a function type that takes itself (checker.ts's `checkStmt(s, scope, typeOf,
+	// checkStmt)`): `typeOf` -> `case 'function'` -> `closureSigParts` -> `params.map` -> `typeOf` on the
+	// very same annotation. That overflowed the stack for all 25 of checker.ts's declarations at once.
+	const typeOfActive = new Set<Type>();
 	function typeOf(t: Type): WasmType | undefined {
+		if (typeOfActive.has(t))
+			return REF_ANY;
+		typeOfActive.add(t);
+		try {
+			return typeOfUncached(t);
+		} finally {
+			typeOfActive.delete(t);
+		}
+	}
+	function typeOfUncached(t: Type): WasmType | undefined {
 		if (t.type === 'ref' && t.typeArgs?.length) {
 			const name = READONLY_ALIAS[t.name] ?? t.name;
 			const decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
