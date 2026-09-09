@@ -2248,8 +2248,10 @@ export function pathKey(e: Expr): string | undefined {
 		// the index expression can evaluate differently between the guard and the read.
 		case 'index': {
 			const k = pathKey(e.object);
-			const i = e.index.type === 'literal' && (typeof e.index.value === 'number' || typeof e.index.value === 'string') ? e.index.value : undefined;
-			return k !== undefined && i !== undefined ? `${k}[${typeof i === 'string' ? JSON.stringify(i) : i}]` : undefined;
+			if (k === undefined || e.index.type !== 'literal')
+				return undefined;
+			const v = e.index.value;
+			return typeof v === 'number' ? `${k}[${v}]` : typeof v === 'string' ? `${k}["${v}"]` : undefined;
 		}
 		default:			return undefined;
 	}
