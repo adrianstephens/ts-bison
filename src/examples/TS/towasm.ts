@@ -397,10 +397,10 @@ function wTypeKey(type: wasm.SubType): string|undefined {
 // (`resolveParams`'s own comment) rather than standing alone as a literal. Set for a real user
 // function/method/constructor, and for a function TYPE that carries defaults of its own -- which one
 // can, since a type derived from a declaration (`typeof f`, a method's type) keeps them.
-interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean; defaults?: (Expr | undefined)[]; resolvedParams?: ResolvedParam[] }
-// A signature with `hasRest`/`defaults` definitely settled -- but `resolvedParams` genuinely absent
-// when no default needs it, which is what `emitCallArgs` tests, so it stays optional through `Required`.
-type FullSig = Required<Omit<FuncSig, 'resolvedParams'>> & Pick<FuncSig, 'resolvedParams'>;
+interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean; defaults?: (Expr | undefined)[]; resolvedParams?: ResolvedParam[]; restElem?: ResolvedParam }
+// A signature with `hasRest`/`defaults` definitely settled -- but `resolvedParams`/`restElem` are
+// genuinely absent (no params at all, no rest), so they stay optional through `Required`.
+type FullSig = Required<Omit<FuncSig, 'resolvedParams' | 'restElem'>> & Pick<FuncSig, 'resolvedParams' | 'restElem'>;
 interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; reassignsThis?: boolean }
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
@@ -2322,18 +2322,23 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			return !p.default && hasMod(p, 'optional') ? nullableWtype(boxed) : boxed;
 		});
 		const defaults = defaultsWithImplicitUndefined(func.params);
-		// Only a default that reads an earlier parameter needs these, and only then does the memo key below
-		// have to distinguish parameter NAMES -- the substitution `emitCallArgs` does is by name.
-		const resolvedParams = func.params.some(p => p.default && !isReemittableDefault(p.default))
-			? func.params.map((p, i) => ({ key: p.key, wtype: params[i], tsType: p.typeAnnotation! }))
-			: undefined;
+		// Always built: an UNANNOTATED closure parameter takes its type from the callee's declared
+		// signature (`emitClosureLiteral`), which needs the TS type and not just the physical one.
+		const resolvedParams = func.params.map((p, i) => ({ key: p.key, wtype: params[i], tsType: p.typeAnnotation! }));
 		let hasRest = false;
+		// The rest ELEMENT as well as the array: a closure literal with more parameters than the
+		// signature has fixed ones takes each extra one from here, and binds it out of the rest array.
+		let restElem: ResolvedParam | undefined;
 		if (func.rest?.typeAnnotation) {
 			const wt = typeOf(func.rest.typeAnnotation);
 			if (!wt || wt === 'void')
 				throw "a function type's rest parameter needs an explicit array type";
 			params.push(wt);
 			hasRest = true;
+			const element = arrayPartOf(func.rest.typeAnnotation)?.element;
+			const ewt = element && typeOf(element);
+			if (element && ewt)
+				restElem = { key: func.rest.key, wtype: ewt === 'void' ? REF_ANY : ewt, tsType: element };
 		}
 		let result = func.returnType ? typeOf(func.returnType) : 'void';
 		// A function TYPE's return position (as opposed to a value's own inferred type -- `typeOf`'s
@@ -2355,7 +2360,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		}
 		if (!result)
 			return undefined;
-		return { params, result, hasRest, defaults, resolvedParams };
+		return { params, result, hasRest, defaults, resolvedParams, restElem };
 	}
 
 	// A genuinely overloaded VALUE type (every member of an object type is a 'call' signature, e.g. real
@@ -2572,11 +2577,14 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				// Parameter NAMES join the key only when a default reads one: `emitCallArgs` substitutes those
 				// references by name, so two otherwise-identical signatures whose parameters are named
 				// differently must not share an entry. Omitted otherwise, to keep the cache from fragmenting.
-				const names = parts.resolvedParams ? `[${parts.resolvedParams.map(p => describeBinding(p.key)).join(',')}]` : '';
+				// Only a default that READS an earlier parameter makes names significant (`emitCallArgs`
+				// substitutes by name); folding them in always would fragment this cache for nothing.
+				const names = resolved.params.some(p => p.default && !isReemittableDefault(p.default))
+					? `[${parts.resolvedParams!.map(p => describeBinding(p.key)).join(',')}]` : '';
 				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${hasRest ? '...' : ''}${defaults.map(d => d ? `?${T.exprKey(d)}` : '.').join('')}${names}`;
 				let wt = closureWasmTypes.get(key);
 				if (!wt)
-					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest, defaults, resolvedParams: parts.resolvedParams } });
+					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest, defaults, resolvedParams: parts.resolvedParams, restElem: parts.restElem } });
 				return wt;
 			}
 		}
@@ -4575,16 +4583,27 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// the two physical wtypes are equivalent here anyway (this compiler's whole "upcast is free"
 		// contract) -- and if a *later*, different use of the same closure value ever wants a genuinely
 		// different (but still compatible) signature, `coerceTop`'s own wrapper mechanism still applies.
-		const result = (want && typeof want !== 'string' && 'closure' in want ? want.closure.result : undefined) ?? (e.returnType ? typeOf(e.returnType) : 'void');
+		const wantSig	= want && typeof want !== 'string' && 'closure' in want ? want.closure : undefined;
+		const result	= wantSig?.result ?? (e.returnType ? typeOf(e.returnType) : 'void');
 		if (!result)
 			throw 'closure has an unsupported return type';
 
-		const params = e.params.map((p): ResolvedParam => {
+		// Parameters past the callee's fixed ones are covered by its REST, which is physically a single
+		// array -- so they are not wasm params at all; `restBound` names them and the prologue below
+		// binds each from `restArray[k]`. `(_, a, b) => ...` against `(s: string, ...args: any[])`.
+		const fixedCount	= wantSig?.hasRest ? wantSig.params.length - 1 : e.params.length;
+		const restBound		= wantSig?.hasRest && !e.rest ? e.params.slice(fixedCount) : [];
+		const ownParams		= restBound.length ? e.params.slice(0, fixedCount) : e.params;
+
+		const params = ownParams.map((p, i): ResolvedParam => {
 			if (p.default)
 				throw `closure parameter '${describeBinding(p.key)}' cannot have a default value`;
+			// An UNANNOTATED parameter takes the callee's declared one, for the same reason `result` does
+			// above -- `Rules<T>(self => [...])` and every `Rule([...], $ => ...)` can name it no other way.
+			const ctx = p.typeAnnotation ? undefined : wantSig?.resolvedParams?.[i];
 			// See `closureFuncSigType`'s own identical comment -- box a real but wasm-unrepresentable
 			// `void` as `any` rather than reject otherwise-valid source.
-			const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
+			const wt = p.typeAnnotation ? typeOf(p.typeAnnotation) : ctx?.wtype;
 			const boxed = wt === 'void' ? REF_ANY : wt;
 			if (!boxed)
 				throw `closure parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
@@ -4593,8 +4612,16 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// (`closureFuncSigType`'s `defaults`, built from the field/variable's own declared TYPE, not
 			// this literal), since nothing ever calls this literal's own compiled function directly while
 			// skipping an argument; `call_ref` always supplies a real value for every physical param.
-			return {key: p.key, wtype: hasMod(p, 'optional') ? nullableWtype(boxed) : boxed, tsType: p.typeAnnotation! };
+			return {key: p.key, wtype: hasMod(p, 'optional') ? nullableWtype(boxed) : boxed, tsType: (p.typeAnnotation ?? ctx?.tsType)! };
 		});
+		// The callee's own rest array becomes this literal's last physical parameter, whether or not the
+		// literal spelled a rest -- the two must agree on the physical signature.
+		if (restBound.length) {
+			const restType = wantSig!.restElem;
+			if (!restType)
+				throw `closure parameter '${describeBinding(restBound[0].key)}' needs an explicit number/boolean/object type`;
+			params.push({ key: '#rest', wtype: wantSig!.params[fixedCount], tsType: TS.ArrayType(restType.tsType) });
+		}
 		if (e.rest?.typeAnnotation) {
 			const wt = typeOf(e.rest.typeAnnotation);
 			if (!wt || wt === 'void')
@@ -4646,7 +4673,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			}) } });
 		}
 
-		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest };
+		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length };
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 		const { funcIndex, typeIndex }	= registerFuncAtType(funcTypeIndex);
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex };
@@ -4657,6 +4684,10 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			// Env param first (real wasm param index 0), then this literal's own params -- `toFuncBody`'s `numParams` assumes the first `1 + params.length` declared locals are the real wasm params, in order.
 			const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
 			const pending	= fnCtx.declareParams(params);
+			// Each parameter the callee's rest covers, read back out of that one array -- synthesized as
+			// real `let x = #rest[k]` statements so the ordinary indexing path types and emits them.
+			pending.unshift(...restBound.flatMap((p, k) =>
+				patternBindings('let', p.key, { type: 'index', object: { type: 'identifier', name: '#rest' }, index: Literal(k) } as Expr)));
 			// The cast-down env local (or, with no captures, just the param itself) is declared after the real params, so it's a genuine local, not mistaken for one more wasm param.
 			let envLocal	= envParam;
 			if (fields) {

@@ -2903,6 +2903,22 @@ async function main() {
 				return g();
 			}
 		`), /'this' inside a function expression/);
+
+		// A closure literal may declare MORE parameters than the callee has fixed ones -- the extras are
+		// covered by its REST, which is physically a single array here, so they cannot be wasm parameters
+		// of their own and bind out of `rest[k]` in the prologue instead. Every `String.replace` callback
+		// is this shape. An UNANNOTATED parameter also takes its type from the callee's signature, the way
+		// the return type already did.
+		const { restToParams, restPartial, restAny } = await compile(`
+			function apply(f: (first: number, ...rest: number[]) => number): number { return f(1, 2, 3); }
+			function applyAny(f: (first: string, ...rest: any[]) => number): number { return f('x', 7, 8); }
+			export function restToParams(): number { return apply((p, q, r) => p + q + r); }
+			export function restPartial(): number { return apply((p, q) => p * 10 + q); }
+			export function restAny(): number { return applyAny((s, p, q) => s.length + (p as number) + (q as number)); }
+		`);
+		check('a closure literal binds extra parameters out of the callee\'s rest', restToParams(), 6);
+		check('...and may declare fewer than the rest actually supplies', restPartial(), 12);
+		check('...including an `any[]` rest, the String.replace callback shape', restAny(), 16);
 	}
 
 	{
