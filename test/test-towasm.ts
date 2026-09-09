@@ -1460,6 +1460,19 @@ async function main() {
 				export function passed(): number { return f(3, 4, 5); }
 			`,
 		}, 'main');
+		// `x ?? []` typed as `Spec[] | any[]`: the empty literal ignored its context and the `any[]` in
+		// the union left member lookup nothing to offer, so a `.map` callback's parameter got no type at
+		// all. Real tsc gives `Spec[]` here. Two halves -- `??`'s right operand is contextually typed by
+		// the LEFT's non-nullish type, and an empty literal takes an array context instead of `any[]`.
+		// Asserted as a REJECTION, not an absence of errors: an `any` result type produces no error
+		// either way, so only a wrong-on-purpose target tells the two apart.
+		check('an empty literal takes its `??` context, so the callback parameter is the element type',
+			typeErrors(`interface Spec { local: string }
+				declare const specs: Spec[] | undefined;
+				const bad = (specs ?? []).map(s => s.nope);`)
+				.some(x => /does not exist/.test(x)), true);
+		// ...and a bare `[]` with no context at all is still `any[]`, not an error.
+		checkTypeChecks('a bare empty literal is unconstrained', `const a = []; a.push(1); a.push('x');`);
 		check('an optional param omitted beside a non-literal sibling default', omitted(), 9);
 		check('...and the same call with every argument supplied', passed(), 12);
 

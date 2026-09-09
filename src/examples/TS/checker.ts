@@ -1186,8 +1186,12 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				}
 				if (wantTuple)
 					return { type: 'tuple', elements: elems };
+				// An EMPTY literal has no elements to infer from, so context is the only information there
+				// is: `const a: Spec[] = []` and `specs ?? []` both want `Spec[]`, not `any[]` -- and an
+				// `any[]` in a union (`Spec[] | any[]`) leaves member lookup with nothing to offer, which
+				// is how a `.map` callback's parameter ended up with no type at all.
 				if (!elems.length)
-					return TS.ArrayType(T.ANY);
+					return resolvedExpected?.type === 'array' ? resolvedExpected : TS.ArrayType(T.ANY);
 				// LITERAL WIDENING, as real TS does it: `[1, 2, 3]` is `number[]`, not `(1|2|3)[]` -- an
 				// array literal is MUTABLE, so keeping the initialiser's literal types made `a[0] = 5` a
 				// type error ("Type '5' is not assignable to type '1 | 2 | 3'"). It also leaked into
@@ -1749,7 +1753,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// far more exactly than its widened form would (`5 && b` can see `5` is unconditionally truthy and drop
 					// the falsy branch entirely; widened to `number` it couldn't). `typeOf`'s own final wrap widens the whole
 					// combined result once, if the caller wants that -- there's nothing left for this case to decide itself.
-					const rt	= typeOf(e.right, e.operator === '&&' ? narrow(e.left, scope, true) : e.operator === '||' ? narrow(e.left, scope, false) : scope, false, undefined, yieldCollector, err);
+					// `??`'s right operand is contextually typed by the LEFT's own non-nullish type: that is
+					// what the whole expression yields, and it is what lets an empty literal on the right
+					// take the shape rather than collapsing to `any[]`. `specs ?? []` is `Spec[]`, as real
+					// tsc gives -- not `Spec[] | any[]`, whose `.map` then had no callback type to offer,
+					// which is how a closure parameter ended up with no representation at all.
+					// Only `??`: `&&`/`||` yield a value of either side, so the left is no guide to the right.
+					const rightExpected = e.operator === '??' ? T.nonNullable(lt, scope) : undefined;
+					const rt	= typeOf(e.right, e.operator === '&&' ? narrow(e.left, scope, true) : e.operator === '||' ? narrow(e.left, scope, false) : scope, false, rightExpected, yieldCollector, err);
 					const r		= T.resolveOwn(lt, scope);
 					const other = T.isOther(e.operator[0]);
 
