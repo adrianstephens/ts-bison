@@ -2280,6 +2280,31 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// physical signature reuses this identical generic-substitution/optional-param/anon-return-type logic,
 	// not a second copy of it. Returns `undefined` only when the return type genuinely can't be represented
 	// at all (never silently drops a param -- an unrepresentable param type still throws, same as before).
+	// The element types a REST parameter can hold, across every shape its annotation may take. A rest is
+	// physically ALWAYS one array -- `...alts: [(self: () => R) => R] | R[]` is a single array at runtime --
+	// but a tuple, or a union of tuple and array, has no array type of its own for `typeOf` to answer with.
+	function restElementTypes(t: Type, out: Type[] = [], depth = 4): Type[] {
+		const r = T.resolveOwn(t, global);
+		if (r.type === 'array')
+			out.push(r.element);
+		else if (r.type === 'ref' && r.name === 'Array' && r.typeArgs?.length === 1)
+			out.push(r.typeArgs[0]);
+		else if (r.type === 'tuple')
+			out.push(...r.elements.map(el => el.type === 'labeled' || el.type === 'optional' ? el.element : el.type === 'spread' ? el.argument : el));
+		else if (r.type === 'union' && depth > 0)
+			r.types.forEach(m => restElementTypes(m, out, depth - 1));
+		return out;
+	}
+
+	// A rest parameter's own physical type, which must be an array or `emitCallArgs` cannot pack into it.
+	function restParamWtype(t: Type): WasmType | undefined {
+		const wt = typeOf(t);
+		if (wt && typeof wt !== 'string' && 'arr' in wt)
+			return wt;
+		const elems = restElementTypes(t);
+		return elems.length ? typeOf(TS.ArrayType(T.combineTypes(elems))) : wt;
+	}
+
 	function closureSigParts(sig: TS.CallSig): FullSig | undefined {
 		// See `emitClosureLiteral`'s own identical comment (this is the type-annotation-side twin of that
 		// expression-side case, e.g. a `const redo: <T extends U>(t?: T) => T` binding, or a generic closure
@@ -2330,7 +2355,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// signature has fixed ones takes each extra one from here, and binds it out of the rest array.
 		let restElem: ResolvedParam | undefined;
 		if (func.rest?.typeAnnotation) {
-			const wt = typeOf(func.rest.typeAnnotation);
+			const wt = restParamWtype(func.rest.typeAnnotation);
 			if (!wt || wt === 'void')
 				throw "a function type's rest parameter needs an explicit array type";
 			params.push(wt);
@@ -4638,7 +4663,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			params.push({ key: '#rest', wtype: wantSig!.params[fixedCount], tsType: TS.ArrayType(restType.tsType) });
 		}
 		if (e.rest?.typeAnnotation) {
-			const wt = typeOf(e.rest.typeAnnotation);
+			const wt = restParamWtype(e.rest.typeAnnotation);
 			if (!wt || wt === 'void')
 				throw "a closure's rest parameter needs an explicit array type";
 			params.push({key: e.rest.key, wtype: wt, tsType: e.rest.typeAnnotation });
@@ -7517,7 +7542,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 			const params	= resolveParams(decl.params);
 			if (decl.rest?.typeAnnotation)
-				params.push({key: decl.rest.key, wtype: typeOf(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
+				params.push({key: decl.rest.key, wtype: restParamWtype(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
 
 			const {funcIndex, typeIndex} = registerFunc(toParams2(params), toResults(result));
 			const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation};
@@ -8727,7 +8752,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 		const params		= resolveParams(ctor.params);
 		if (ctor.rest?.typeAnnotation)
-			params.push({key: ctor.rest.key, wtype: typeOf(ctor.rest.typeAnnotation)!, tsType: ctor.rest.typeAnnotation});
+			params.push({key: ctor.rest.key, wtype: restParamWtype(ctor.rest.typeAnnotation)!, tsType: ctor.rest.typeAnnotation});
 
 		//const thisWtype	= ownerThisType(cls);
 		const thisWtype		= cls.thisWtype!;
@@ -8918,7 +8943,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 
 		const params		= resolveParams(decl.params);
 		if (decl.rest?.typeAnnotation)
-			params.push({key: decl.rest.key, wtype: typeOf(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
+			params.push({key: decl.rest.key, wtype: restParamWtype(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
 
 		const isStatic		= decl.modifiers?.includes('static');
 		const reassignsThis = !isStatic && assignsToThis(decl.body);

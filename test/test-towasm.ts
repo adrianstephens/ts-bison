@@ -2944,6 +2944,26 @@ async function main() {
 		check('String.replace with a function replacer', replFn(), 4);
 		check('...a non-global regexp replaces only the first match', replFirst(), 4);
 		check('...and a non-participating capture group arrives as undefined', replOptionalGroup(), 2);
+
+		// A REST parameter typed as a UNION containing a TUPLE. Physically a rest is always ONE array,
+		// whatever the declared type says, so the element type is combined across the arms (boxed when
+		// they differ) rather than taken from an array type the union doesn't have.
+		const { unionRest } = await compile(`
+			function take(...xs: [number] | number[]): number { return 42; }
+			function takeT(...xs: [string, number] | number[]): number { return 7; }
+			export function unionRest(): number { return take(1) + take(1, 2, 3) + takeT('a', 5); }
+		`);
+		check('a rest parameter declared as a union containing a tuple', unionRest(), 91);
+		// ...and the TUPLE arm is what names a callback argument, so it is the only thing that can
+		// contextually type one. This is tison's own `Rules<T>(...alts: [(self: () => Rules<T>) =>
+		// Rules<T>] | Rules<T>)`, whose `self => [...]` callback every grammar rule is built from.
+		// Asserted as a REJECTION: an untyped `self` is `any`, which produces no error either way.
+		check('a callback in the TUPLE arm of a union rest is contextually typed',
+			typeErrors(`type Items = number[];
+				declare function Build(...alts: [(self: () => Items) => Items] | Items): Items;
+				declare function want(n: number): void;
+				const r = Build(self => { want(self); return self(); });`)
+				.some(x => /'\(\) => Items' is not assignable to parameter/.test(x)), true);
 	}
 
 	{
