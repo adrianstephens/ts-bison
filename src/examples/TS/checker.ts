@@ -763,8 +763,9 @@ function hoist(stmts: Stmt[], scope: Scope) {
 			scope.addType(stmt.name, T.stampScope(stmt.value, scope), stmt.typeParams);
 		} else if (stmt.type === 'interface_decl') {
 			const obj = T.stampScope(TS.ObjectType(stmt.body), scope);
-			// own members first: lookupMember's first match implements override precedence
-			scope.mergeType(stmt.name, stmt.extendsClause?.length ? T.intersectTypes([obj, ...stmt.extendsClause.map(e => T.stampScope(e, scope))]) : obj, stmt.typeParams, true);
+			// Inherited parts FIRST, own members LAST -- the concreteness order `mergeType` also uses, and
+			// what `lookupMember`'s and `collectMembers`' reversal turns into a working member override.
+			scope.mergeType(stmt.name, stmt.extendsClause?.length ? T.intersectTypes([...stmt.extendsClause.map(e => T.stampScope(e, scope)), obj]) : obj, stmt.typeParams, true);
 		}
 	}
 	for (let stmt of stmts) {

@@ -1588,6 +1588,47 @@ async function main() {
 			typeErrors(`type R<T> = T extends number ? number : string;
 				function f<T extends number | string>(v: T): R<T> { return v as any; }
 				const n: number = f(1);`).length, 0);
+		// A derived interface's member OVERRIDES the base's rather than joining an overload set behind
+		// it. `interface Polynomial<C> extends PolynomialN<C>` redeclares `mul` with a `Polynomial<C>`
+		// return; the base's `mul(b: PolynomialN<C>): PolynomialN<C>` fits the same call and, being tried
+		// first, won -- so every member the derived type adds read as missing from then on.
+		check('a derived interface member overrides the base signature',
+			typeErrors(`interface Base<C> { mul(b: Base<C>): Base<C>; }
+				interface Derived<C> extends Base<C> { mul(b: Derived<C>): Derived<C>; sub(b: Derived<C>): Derived<C>; }
+				declare const x: Derived<number>;
+				const ok = x.mul(x).sub(x);`).length, 0);
+		// ...and it really is the derived RETURN type, not an `any` that would accept anything.
+		check('...returning the derived type, not a lenient any',
+			typeErrors(`interface Base<C> { m(): Base<C>; }
+				interface Derived<C> extends Base<C> { m(): Derived<C>; extra: C; }
+				declare const x: Derived<number>;
+				const bad: string = x.m().extra;`)
+				.some(x => /not assignable to type 'string'/.test(x)), true);
+		// The same precedence for an INDEX SIGNATURE -- `NodeListOf<TNode>`'s `[index: number]: TNode`
+		// over the `[index: number]: Node` it inherits from `NodeList`, which is why `querySelectorAll`'s
+		// result indexed to an element had none of that element's own members.
+		check('a derived interface index signature overrides the base',
+			typeErrors(`interface ListBase { readonly length: number; [index: number]: { tag: string }; }
+				interface ListOf<T> extends ListBase { [index: number]: T; }
+				declare const l: ListOf<{ tag: string; extra: number }>;
+				function at(i: number): number { return l[i].extra; }`).length, 0);
+		// Inherited CALL signatures are ordered by inheritance DEPTH, not depth-first through each base
+		// in turn: with `C extends C1, C2` a depth-first walk reaches C2's inherited catch-all
+		// `(key: string): void` before C1's own `(x: 'C1'): number[]`, and "first fit wins" answered
+		// every specialized call with `void` (the official suite's own
+		// `inheritedOverloadedSpecializedSignatures`).
+		check('inherited call signatures are ordered by inheritance depth',
+			typeErrors(`interface A { (key: string): void; }
+				interface B extends A { (x: 'B2'): string[]; }
+				interface C1 extends B { (x: 'C1'): number[]; }
+				interface C2 extends B { (x: 'C2'): boolean[]; }
+				interface C extends C1, C2 { (x: 'C'): string; }
+				declare const c: C;
+				const x1: string[] = c('B2');
+				const x6: number[] = c('C1');
+				const x7: boolean[] = c('C2');
+				const x8: string = c('C');
+				const x9: void = c('generic');`).length, 0);
 	}
 
 	{

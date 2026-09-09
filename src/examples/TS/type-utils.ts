@@ -1327,9 +1327,26 @@ export function mergeIntersection(t: Type): Type {
 	]), ...nonObject]);
 }
 
+// LEVEL-ORDER (real TS orders inherited call signatures by inheritance depth, and resolution here is
+// "first fit wins"): depth-first buries a derived signature behind a SIBLING base's inherited catch-all.
 export function collectMembers(t: Type, scope: Scope): TS.TypeMember[] {
-	const r = resolveOwn(t, scope);
-	return r.type === 'object' ? r.members : r.type === 'intersection' ? r.types.flatMap(t => collectMembers(t, scope)) : [];
+	const out: TS.TypeMember[] = [];
+	const seen = new Set<Type>();
+	for (let level = [t]; level.length; ) {
+		const next: Type[] = [];
+		for (const p of level) {
+			if (seen.has(p))
+				continue;
+			seen.add(p);
+			const r = resolveOwn(p, scope);
+			if (r.type === 'object')
+				out.push(...r.members);
+			else if (r.type === 'intersection')
+				next.push(...[...r.types].reverse());
+		}
+		level = next;
+	}
+	return out;
 }
 
 export function isNullish(t: Type, scope: Scope): boolean {
@@ -1582,7 +1599,9 @@ export function indexSignatureOf(t: Type, scope: Scope, depth = 6): Type | undef
 	if (r.type === 'object')
 		return r.members.find((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index' && isNumberLike(m.paramType, scope))?.typeAnnotation;
 	if (r.type === 'intersection') {
-		for (const part of r.types) {
+		// Last part first, as every producer of an intersection here puts the more concrete declaration
+		// last: `NodeListOf<T>`'s `[index: number]: T` must beat the `Node` it inherits from `NodeList`.
+		for (const part of [...r.types].reverse()) {
 			const found = indexSignatureOf(part, scope, depth - 1);
 			if (found)
 				return found;
@@ -1692,7 +1711,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				if (!matches.length) {
 					if (skipObjectFallback)
 						return undefined;
-					for (const part of t.types) {
+					for (const part of [...t.types].reverse()) {
 						const r = resolveOwn(part, scope);
 						const idx = r.type === 'object' ? r.members.find(m => m.type === 'index') : undefined;
 						if (idx)
