@@ -1433,7 +1433,8 @@ async function main() {
 				mismatch ||= `${JSON.stringify(c)} -> ${quoteString(c)}`;
 		for (let n = 0; n < 2000 && !mismatch; n++) {
 			let str = '';
-			for (let i = 0; i < 12; i++) str += F(Math.floor(Math.random() * 768));
+			for (let i = 0; i < 12; i++)
+				str += F(Math.floor(Math.random() * 768));
 			if (quoteString(str) !== JSON.stringify(str))
 				mismatch = `${JSON.stringify(str)} -> ${quoteString(str)}`;
 		}
@@ -1489,6 +1490,22 @@ async function main() {
 				return take({ ...d, b: 6 });
 			}
 		`);
+		// A HOMOMORPHIC mapped type over an array/tuple maps its ELEMENTS and keeps its array/tuple-ness,
+		// as real TS does. The literal-keys path could never answer one (an array's keys aren't literals),
+		// so it stayed opaque -- and tison's own `ValuesOf<readonly GrammarSym[]>`, hence every grammar
+		// `Action` parameter, had no representation at all.
+		check('a mapped type over an array maps its element',
+			typeErrors(`type Box<S> = S extends string ? number : boolean;
+				type MapAll<T extends readonly unknown[]> = {[K in keyof T]: Box<T[K]>};
+				declare const a: MapAll<readonly string[]>;
+				const bad: string = a[0];`)
+				.some(x => /not assignable/.test(x)), true);
+		check('...and over a tuple maps each position',
+			typeErrors(`type Box<S> = S extends string ? number : boolean;
+				type MapAll<T extends readonly unknown[]> = {[K in keyof T]: Box<T[K]>};
+				declare const b: MapAll<[string, number]>;
+				const ok: number = b[0];
+				const alsoOk: boolean = b[1];`).length, 0);
 		check('a statically-shaped spread into a dynamic object', spreadStatic(), 11);
 		check('...and a later spread still overwrites an earlier field', spreadLastWins(), 50);
 		check('...while a dynamic-object spread keeps its runtime key walk', spreadDynamic(), 11);

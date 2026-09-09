@@ -993,6 +993,23 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 					const parts = unionMembers(x, scope).map(m => resolve(scope, m)).map(m => isLiteral(m, 'string') ? m.value : undefined);
 					return parts.length && parts.every((p): p is string => p !== undefined) ? parts : undefined;
 				};
+				// A HOMOMORPHIC mapped type over an ARRAY or TUPLE maps its ELEMENTS and keeps its
+				// array/tuple-ness -- real TS's own rule. `{[K in keyof T]: F<T[K]>}` with `T = string[]`
+				// is `F<string>[]`, never an object keyed by numeric indices, so the literal-keys path
+				// below can never answer it and the whole mapped type stayed opaque. That is how tison's
+				// own `ValuesOf<readonly GrammarSym[]>` -- and with it every grammar `Action`'s parameter
+				// -- ended up with no representation at all.
+				if (!t.nameType && t.constraint.type === 'keyof') {
+					const src = resolve(scope, t.constraint.argument, depth - 1);
+					// `T[K]` is what the value type actually reads, so `K` binds to the INDEX: `number` for
+					// an array (every position has the same element type), each position's own literal for
+					// a tuple.
+					const atKey = (k: Type) => resolve(scope, substituteType(t.valueType, new Map([[t.keyName, k]])), depth - 1, stopAtRef);
+					if (src.type === 'array')
+						return TS.ArrayType(atKey(NUMBER), src.readonly);
+					if (src.type === 'tuple')
+						return { type: 'tuple', elements: src.elements.map((el, i) => tupleElementType(el) ? atKey(Literal(i)) : el) };
+				}
 				const constraintParts	= t.constraint.type === 'intersection' ? t.constraint.types : [t.constraint];
 				const resolvedParts	= constraintParts.map(m => resolve(scope, m, depth - 1));
 				const constraint	= resolvedParts.find(m => literalKeys(m)) ?? resolvedParts[0];
