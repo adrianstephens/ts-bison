@@ -117,9 +117,31 @@ function typePrecedence(type: Type): number {
 	}
 }
 
+// A double-quoted JS string literal, replacing `JSON.stringify` -- this compiler's own lib has no
+// `JSON`, and quoting a string is all these call sites ever wanted from it. Same escape set JSON uses
+// (quote, backslash, the C0 controls), which is exactly what a JS string literal needs.
+// `charCodeAt`/`slice` rather than `for...of` or `s[i]`: iterating or indexing a string are both
+// listed towasm gaps, and this file is a self-hosting target.
+export function quoteString(s: string): string {
+	let out = '"';
+	for (let i = 0; i < s.length; i++) {
+		const c = s.charCodeAt(i);
+		out +=	c === 34 ? '\\"'
+			:	c === 92 ? '\\\\'
+			:	c === 10 ? '\\n'
+			:	c === 13 ? '\\r'
+			:	c === 9  ? '\\t'
+			:	c === 8  ? '\\b'
+			:	c === 12 ? '\\f'
+			:	c < 32   ? '\\u00' + (c < 16 ? '0' : '') + c.toString(16)
+			:	s.slice(i, i + 1);
+	}
+	return out + '"';
+}
+
 function typeMemberName(key: JS.Key<Type>): string {
 	return typeof key === 'string'
-		? (isValidIdentifier(key) ? key : JSON.stringify(key))
+		? (isValidIdentifier(key) ? key : quoteString(key))
 		: '[' + JS.ExprToDottedName(key.computed) + ']';
 }
 
@@ -375,7 +397,7 @@ export class Output {
 				return poss(type.asserts, 'asserts ') + type.paramName + maybe(type.assertedType, type => ' is ' + this.type(type));
 
 			case 'import':
-				return 'import(' + maybe(type.source, source => JSON.stringify(source)) + maybe(type.name, name => this.comma + name) + ')';
+				return 'import(' + maybe(type.source, source => quoteString(source)) + maybe(type.name, name => this.comma + name) + ')';
 
 			default:
 				throw new Error(`Unknown type: ${(type as any).type}`);
@@ -507,7 +529,7 @@ export class Output {
 
 			case 'import':
 				if (!stmt.default && !stmt.namespace && !stmt.specifiers?.length)
-					return 'import ' + JSON.stringify(stmt.source) + ';';
+					return 'import ' + quoteString(stmt.source) + ';';
 
 				return 'import ' + typeOnly(stmt.typeOnly)
 					+	maybe(stmt.default, def => def + ((stmt.namespace || stmt.specifiers?.length) ? ', ' : ''))
@@ -517,7 +539,7 @@ export class Output {
 								stmt.specifiers!.map(s => typeOnly(s.typeOnly) + s.imported + maybe(s.local !== s.imported, () => ' as ' + s.local)).join(this.comma)
 							, true))
 						)
-					+	' from ' + JSON.stringify(stmt.source) + ';';
+					+	' from ' + quoteString(stmt.source) + ';';
 
 			case 'export':
 				if (stmt.default)
@@ -527,7 +549,7 @@ export class Output {
 					+ (stmt.specifiers
 						? this.curlyIndented(() => stmt.specifiers!.map(s => typeOnly(s.typeOnly) + s.local + maybe(s.exported !== s.local, ()=> ' as ' + s.exported)).join(this.comma))
 						: ('*' + maybe(stmt.namespace, ns => 'as ' + ns + ' '))
-					) + maybe(stmt.source, source => ' from ' + JSON.stringify(source));
+					) + maybe(stmt.source, source => ' from ' + quoteString(source));
 
 			case 'export_decl':
 				return 'export ' + this.statement(stmt.declaration);
@@ -590,7 +612,7 @@ export class Output {
 
 	memberKey(key: JS.Key<any>): string {
 		return typeof key === 'string'
-			? isValidIdentifier(key) ? key : JSON.stringify(key)
+			? isValidIdentifier(key) ? key : quoteString(key)
 			: '[' + this.expr(key.computed, 2) + ']';
 	}
 	// ===================================================================
@@ -604,7 +626,7 @@ export class Output {
 	literal(expr: Literal<any>) {
 		switch (typeof expr.value) {
 			case 'string':
-				return JSON.stringify(expr.value);
+				return quoteString(expr.value);
 
 			case 'bigint':
 				return expr.value.toString() + 'n';

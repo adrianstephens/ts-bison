@@ -506,6 +506,16 @@ function decodeEntry(row: number[], cursor: { i: number }): ActionEntry {
 // 'error'/'ignore' entries are never anything but `fillAlwaysEntries`'s own default (see its comment) --
 // skip them here, `deserializeTables` regenerates them instead of storing millions of redundant entries
 // for grammars with large `alwaysTerminals`/`alwaysSkip` sets.
+// A structural identity for an `ActionEntry`, replacing `JSON.stringify` -- this compiler's own lib
+// has no `JSON`, and only equality is wanted here, never the text. Total over the union, and unlike
+// `JSON.stringify` it does not depend on property insertion order.
+function entryKey(e: ActionEntry): string {
+	return	e.kind === 'shift'		? 's' + e.state
+		:	e.kind === 'reduce'		? 'r' + e.rule
+		:	e.kind === 'conflict'	? 'c(' + e.entries.map(entryKey).join(',') + ')'
+		:	e.kind;
+}
+
 export function serializeTables(g: GrammarBuilder, tables: ParseTables): SerializedTables {
 	const termIndex	= new Map(terminalsByIndex(g).map((t, i) => [t, i]));
 	const ntIndex	= indexNonTerminals(g);
@@ -513,7 +523,7 @@ export function serializeTables(g: GrammarBuilder, tables: ParseTables): Seriali
 		action: tables.action.map(row => {
 			const real = [...row]
 				.filter(([, entry]) => entry.kind !== 'error' && entry.kind !== 'ignore')
-				.map(([term, entry]) => ({ idx: termIndex.get(term)!, entry, key: JSON.stringify(entry) }));
+				.map(([term, entry]) => ({ idx: termIndex.get(term)!, entry, key: entryKey(entry) }));
 			if (!real.length)
 				return [];
 
@@ -533,7 +543,7 @@ export function serializeTables(g: GrammarBuilder, tables: ParseTables): Seriali
 				if (c.count > best.count)
 					best = c;
 			}
-			const defaultKey = JSON.stringify(best.entry);
+			const defaultKey = entryKey(best.entry);
 
 			const out: number[] = [];
 			encodeEntry(out, best.entry);

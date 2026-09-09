@@ -6,6 +6,7 @@ import v8 from 'v8';
 import * as TS from '../src/examples/TS/ts-parser';
 import * as T from '../src/examples/TS/type-utils';
 import { TStoWasm, makeLibScope } from '../src/examples/TS/towasm';
+import { quoteString } from '../src/examples/TS/tocode';
 import { TStypeCheck, TStypeCheckAsync } from '../src/examples/TS/transform';
 import { ModuleLoader, collectModules } from '../src/examples/TS/module-loader';
 import { SEVERITY } from '../src/examples/TS/checker';
@@ -1417,6 +1418,26 @@ async function main() {
 		`);
 		check("a ternary's 'undefined' branch stays 'undefined', not 'any'", ternaryUndef(), 7);
 		check("...and through a function's own INFERRED return type", bareUndef(), 53);
+	}
+
+	{
+		// `tocode.ts`'s own string quoting, which replaced `JSON.stringify` (this compiler's lib has no
+		// `JSON`, and `tocode.ts` is a self-hosting target). Checked directly against `JSON.stringify`,
+		// since matching it exactly is the whole contract -- every escape it produces, plus fuzz over the
+		// range where the C0 controls and the `\u00xx` fallback live.
+		const F = String.fromCharCode;
+		const escapes = [F(34), F(92), F(10), F(13), F(9), F(8), F(12), F(0), F(1), F(31), F(127), F(233)];
+		let mismatch = '';
+		for (const c of [...escapes, '', 'plain', './path.ts', 'a' + F(34) + 'b'])
+			if (quoteString(c) !== JSON.stringify(c))
+				mismatch ||= `${JSON.stringify(c)} -> ${quoteString(c)}`;
+		for (let n = 0; n < 2000 && !mismatch; n++) {
+			let str = '';
+			for (let i = 0; i < 12; i++) str += F(Math.floor(Math.random() * 768));
+			if (quoteString(str) !== JSON.stringify(str))
+				mismatch = `${JSON.stringify(str)} -> ${quoteString(str)}`;
+		}
+		check('quoteString matches JSON.stringify (escapes + 2000 fuzz strings)', mismatch, '');
 
 		// ...and the contextual return type is only a hint when it carries STRUCTURE. A bare, still-
 		// unsolved type parameter says nothing about the body, and threading one through perturbed real
