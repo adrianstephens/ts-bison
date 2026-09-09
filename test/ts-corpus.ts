@@ -71,6 +71,19 @@ export async function expectsErrorsSet(): Promise<Set<string>> {
 export const expectsErrors = (set: Set<string>, filename: string) =>
 	set.has(path.basename(filename).replace(/\.tsx?$/, ''));
 
+// The subset of the above whose baseline carries a SYNTACTIC (TS1xxx) diagnostic -- tsc could not
+// parse it either. TS1xxx, not merely "has a baseline": a type error says nothing about parseability.
+export async function syntaxErrorsSet(): Promise<Set<string>> {
+	const dir = path.join(TS_REPO, 'tests/baselines/reference');
+	const out = new Set<string>();
+	await Promise.all((await fs.readdir(dir)).map(async f => {
+		const m = /^(.*?)(?:\([^)]*\))?\.errors\.txt$/.exec(f);
+		if (m && /error TS1\d{3}:/.test(await fs.readFile(path.join(dir, f), 'utf8')))
+			out.add(m[1]);
+	}));
+	return out;
+}
+
 // Every corpus source file, sorted -- the ordering is what makes a fixed-size slice of it a stable,
 // comparable sample across runs. Adding a file to the TS checkout can shift the slice; that is
 // visible as a baseline change, which is the intended behaviour, not a false alarm.

@@ -16,10 +16,9 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as TS from '../src/examples/TS/ts-parser';
-import { corpusFiles, corpusPresent, readSource, splitTestFile, isSource, TS_REPO } from './ts-corpus';
+import { corpusFiles, corpusPresent, readSource, splitTestFile, isSource, syntaxErrorsSet, TS_REPO } from './ts-corpus';
 
 const BASELINE	= path.join(__dirname, 'ts-corpus-gate-baseline.json');
-const EXCLUDED	= path.join(__dirname, '../../assistant/ts-official-known-excluded.txt');
 // No sampling: the whole corpus parses in well under 10s, so the gate is complete rather than a
 // slice -- which also means adding files to the TS checkout can't silently shift what's measured.
 interface Baseline { files: number; failed: number; note: string }
@@ -30,14 +29,10 @@ interface Baseline { files: number; failed: number; note: string }
 		return;
 	}
 
-	// Deliberately-invalid and out-of-scope fixtures, shared with the full corpus run. A missing list
-	// is not fatal; it just makes the sample stricter, which shows up as a baseline mismatch.
-	let excluded = new Set<string>();
-	try {
-		excluded = new Set((await fs.readFile(EXCLUDED, 'utf8')).split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#')));
-	} catch { /* no list -- fall through */ }
-
-	const files	= (await corpusFiles()).filter(f => !excluded.has(path.basename(f)) && !excluded.has(f));
+	// Deliberately-invalid fixtures, by tsc's OWN baseline reporting a syntactic (TS1xxx) diagnostic:
+	// it could not parse them either, so failing to is not a gap here. Derived, not a curated list.
+	const excluded	= await syntaxErrorsSet();
+	const files		= (await corpusFiles()).filter(f => !excluded.has(path.basename(f).replace(/\.tsx?$/, '')));
 	const parser = TS.make();
 
 	const t0 = Date.now();
@@ -61,7 +56,7 @@ interface Baseline { files: number; failed: number; note: string }
 
 	const failed = failures.length;
 	if (process.argv.includes('--update')) {
-		const next: Baseline = { files: files.length, failed, note: 'corpus files that fail to PARSE (no checker); lower is better' };
+		const next: Baseline = { files: files.length, failed, note: 'corpus files that fail to PARSE (no checker), excluding fixtures tsc itself reports a TS1xxx syntax error on; lower is better' };
 		await fs.writeFile(BASELINE, JSON.stringify(next, null, '\t') + '\n');
 		console.log(`baseline updated: ${failed} failures in ${files.length} files (${elapsed}ms)`);
 		return;
