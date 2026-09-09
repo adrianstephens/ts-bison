@@ -1494,6 +1494,21 @@ async function main() {
 		// as real TS does. The literal-keys path could never answer one (an array's keys aren't literals),
 		// so it stayed opaque -- and tison's own `ValuesOf<readonly GrammarSym[]>`, hence every grammar
 		// `Action` parameter, had no representation at all.
+		// A PRIMITIVE never satisfies a real class. Classes only started reaching this comparison as refs
+		// once `resolve` began keeping them nominal, and fell through a leniency meant for names the
+		// checker cannot look up at all -- so `string extends RegExp` was UNDECIDABLE and
+		// `string extends R2<number>[]` answered TRUE, which stalled `ElemValue`'s whole conditional chain.
+		check('a primitive is not assignable to a class',
+			typeErrors(`class C { foo(): number { return 1; } }
+				declare const s: string;
+				const bad: C = s;`).some(x => /not assignable/.test(x)), true);
+		// ...but its own boxed wrapper still is, and an UNRESOLVED name stays lenient.
+		checkTypeChecks('a primitive is assignable to its boxed wrapper', `declare const s: string; const ok: String = s;`);
+		check('a conditional chain over a primitive decides every arm',
+			typeErrors(`interface R2<T> { v: T }
+				type Chain<S> = S extends R2<infer U>[] ? U : S extends RegExp ? number : S extends string ? S : unknown;
+				declare const a: Chain<string>;
+				const bad: number = a;`).some(x => /not assignable/.test(x)), true);
 		check('a mapped type over an array maps its element',
 			typeErrors(`type Box<S> = S extends string ? number : boolean;
 				type MapAll<T extends readonly unknown[]> = {[K in keyof T]: Box<T[K]>};

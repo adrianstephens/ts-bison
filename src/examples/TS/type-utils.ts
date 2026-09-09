@@ -1404,7 +1404,10 @@ export function isStringLike(t: Type, scope: Scope): boolean {
 function isLiteralOnly(t: Type, scope: Scope, depth = 6): boolean | undefined {
 	switch (t.type) {
 		case 'literal':	return true;
-		case 'ref':		return ALL_PRIMITIVES.has(t.name) ? false : undefined;
+		// A CLASS is definitively not a literal union -- `undefined` here means "could not look the name
+		// up", which stopped being true for classes once `resolve` began keeping them nominal, and left
+		// `string extends RegExp` undecidable in `case 'conditional'`.
+		case 'ref':		return ALL_PRIMITIVES.has(t.name) || isClassRef(t, scope) ? false : undefined;
 		case 'union':
 			if (depth >= 0) {
 				const parts = t.types.map(m => isLiteralOnly(resolveOwn(m, scope), scope, depth - 1));
@@ -1928,6 +1931,19 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 					return !dst.typeArgs || !src.typeArgs || src.typeArgs.length !== dst.typeArgs.length || src.typeArgs.every((a, i) => recurse(a, dst.typeArgs![i], depth - 1));
 				if (src.name === 'void' && dst.name === 'undefined')
 					return true;	// this checker's own bare-`return` inference produces `void`
+				// A PRIMITIVE never satisfies a real CLASS: a `string` is not a `RegExp`, and not an
+				// `Array<T>` either (`normalizeArray` turns an array destination into exactly that ref).
+				// The leniency below is for a name this checker could not look up AT ALL -- not for a
+				// class it knows. Classes only started arriving here as refs once `resolve` began keeping
+				// them nominal, so they fell straight through to the lenient `true`, which made
+				// `string extends RegExp` undecidable and `string extends R2<number>[]` answer TRUE.
+				// The boxed wrapper is the exception, matching the `dst.type === 'object'` case above.
+				// `BOXED_PRIMITIVE`, not `ALL_PRIMITIVES`: only a primitive with a real wrapper is definitely
+				// not a class instance. `undefined`/`null`/`void`/`any` are primitives here too, and this
+				// checker is deliberately lenient about those -- rejecting them against a class cost 10
+				// real diagnostics on code tsc accepts.
+				if (BOXED_PRIMITIVE[src.name] && isClassRef(dst, dstScope))
+					return BOXED_PRIMITIVE[src.name] === dst.name;
 				return !(ALL_PRIMITIVES.has(src.name) && ALL_PRIMITIVES.has(dst.name));	// distinct primitives: no; unresolved names: lenient
 			}
 			// `Array`/`ReadonlyArray` are well-known structural shapes, not "some unresolved generic" -- a plain

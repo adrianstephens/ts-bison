@@ -2416,10 +2416,15 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 		// Matched on the part's own written shape, never through `T.resolve`: with `Array` declared in the
 		// lib scope, resolving `Array<string>` expands it to the class's own object shape and loses the very
 		// thing being looked for.
+		const elementOf = (x: Type) => x.type === 'array' ? x.element
+			: x.type === 'ref' && x.typeArgs?.length === 1 && (READONLY_ALIAS[x.name] ?? x.name) === 'Array' ? x.typeArgs[0]
+			: undefined;
 		const arrays = parts.flatMap(part => {
-			const element = part.type === 'array' ? part.element
-				: part.type === 'ref' && part.typeArgs?.length === 1 && (READONLY_ALIAS[part.name] ?? part.name) === 'Array' ? part.typeArgs[0]
-				: undefined;
+			// A part whose array-ness is one resolution step away -- an alias, or a mapped type over an
+			// array (`WithTextPos<ValuesOf<...>>`, tison's own grammar-action parameter). Tried ONLY when
+			// the written shape did not already answer, so a plain `Array<string>` still never goes
+			// through `resolve` and keeps the identity the note above is about.
+			const element = elementOf(part) ?? elementOf(T.resolve(global, part));
 			return element ? [{ part, element }] : [];
 		});
 		return arrays.length && new Set(arrays.map(a => T.typeKey(a.element))).size === 1 ? arrays[0] : undefined;
