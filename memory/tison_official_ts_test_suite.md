@@ -43,18 +43,29 @@ in ~10s and fails if failures rise above the committed baseline in
 1,519 above). `--list` shows offenders, `--update` re-baselines. Run it before committing parser work;
 it catches in seconds what took two commits and a codegen survey to notice last time.
 
-**Two things this suite still needs:**
-- **A denominator.** Partly addressed by the tsc-clean/tsc-errors split above (2/3 of throws are on
-  files tsc rejects too). The residual `tsc-clean` throws still mix real gaps with
-  deliberately-invalid-but-unbaselined fixtures and the known-excluded list is still growing.
+**The gate's DENOMINATOR is now derived, not curated (2026-09-09).** It excludes every fixture whose
+own tsc baseline carries a **syntactic (TS1xxx)** diagnostic — tsc could not parse it either, so
+failing to is not a gap here. `ts-corpus.ts`'s `syntaxErrorsSet()`; the gate reads no list file at all.
+**Baseline moved 1565/11949 -> 1065/11012** and is not comparable across that change: every one of the
+1065 is now a file tsc parses CLEANLY that we do not, which is the denominator this section used to
+ask for. TS1xxx specifically, not "has a baseline" — a type error says nothing about parseability
+(that broader filter would have excluded 977 files instead of 675 of the failing ones).
+
+**Why it is derived**: the previous `assistant/ts-official-known-excluded.txt` was hand-curated, 264
+files, gitignored — and a TRACKED test read it. An `assistant/` cleanup deleted it and it was
+unrecoverable (in no repo's history, written by nothing, no snapshot). It was also incomplete: the
+derived criterion catches 675 failing files where the curated list had 264. **Never let a tracked
+test depend on a file under `assistant/`** — derive it, or commit it under `test/`.
+
+**One thing this suite still needs:**
 - **A stronger oracle.** "Did it throw" missed item 48's `3.e5` misparsing as `(3.).e5`, caught only by
   dumping the AST. A round-trip check (parse → tocode → reparse → compare) over a sample would cover
   that class.
 
 **Priority, stated by the user (2026-08-24):** parse all *legitimate, modern* code. Weigh "would real
 current code ever hit this" before chasing a cluster. A deliberately-invalid or legacy-only fixture is
-a reason to add it to `assistant/ts-official-known-excluded.txt` and move on, not to pursue TSC
-parity. Angle-bracket type assertions were DROPPED entirely on this basis (~130+ files).
+a reason to let the derived TS1xxx exclusion drop it and move on, not to pursue TSC parity.
+Angle-bracket type assertions were DROPPED entirely on this basis (~130+ files).
 
 **Method that works:** cluster the failures by message signature first — identical-looking messages
 across many files usually share one root cause, and fixing that unlocks the whole cluster. This has

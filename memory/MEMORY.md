@@ -34,6 +34,7 @@
 - [self-hosting instruments](tison_towasm_self_hosting_plan.md) — `difftest.sh` (differential codegen, green = gate), `selfhost-survey.sh` (now reports declarations MOVED, not just compiled), `corpus-ab.sh` (checker A/B in one command)
 - [SELF-HOSTING PLAN](tison_towasm_self_hosting_plan.md) — **current focus**: run `assistant/selfhost-survey.sh`, work its cause table. At `5e148b7`: **56/270 compile, towasm.ts:193 CLEAR, tocode.ts COMPLETE at 18/18**. Read the MOVED delta and the REGRESSED line, never the flat total; merge cause rows by shape; probe a declaration when a row looks meaningless
 - [checker perf debugging](tison_checker_perf_debugging.md) — `--prof` misled twice; macOS `sample <pid>` was right both times
+- [interface inheritance](tison_interface_inheritance.md) — `extends` IS an intersection; last part = most concrete, and all four consumers must read it backwards
 - [checker inference](tison_checker_inference.md) — distributive conditionals, contextual callback returns, provisional bindings, the missing `undefined` binding
 - [nominal class refs](tison_nominal_class_refs.md) — **`resolve` keeps class refs nominal; `resolveMembers` is the opt-out** (4 sites); replaced 8 per-site guards
 - [checker narrowing plan](tison_checker_narrowing_plan.md) — user plans integer/range narrowing in the checker (not started as of 2026-07-31)
