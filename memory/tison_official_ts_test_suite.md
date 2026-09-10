@@ -71,9 +71,10 @@ Angle-bracket type assertions were DROPPED entirely on this basis (~130+ files).
 cleanly, so no TS1xxx fires. With the real TS parser as oracle (`TypeAssertionExpression`,
 `assistant/angle-cast-count.ts` / `angle-cast-fp.ts`): **225 of the gate's 1065 failures** (220 files)
 contain one, and 0 passing files do (no silent misparse); in test-ts-official, 157 of 1382 false
-positives (all `threw`). The lost curated list presumably held these. Fix awaits the user's choice:
-a tsc-derived exclusion needs `typescript` in a tracked test (tison has no devDeps), or commit a
-generated list under `test/`.
+positives (all `threw`). The lost curated list presumably held these. **DONE (user chose the
+tsc-derived route)**: `ts-corpus.ts`'s `usesUnsupportedSyntax` is asked only of a fixture we FAIL to
+parse; both harnesses use it. Gate re-baselined 1065 -> 840; official false positives 1382 -> 1225.
+Add any other deliberately-unsupported syntax THERE, derived from tsc's AST, never as a list.
 
 **Method that works:** cluster the failures by message signature first — identical-looking messages
 across many files usually share one root cause, and fixing that unlocks the whole cluster. This has

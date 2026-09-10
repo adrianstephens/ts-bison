@@ -150,6 +150,24 @@ kept part is purely nullish; the checker's per-member logic is `T.logicalLeftPar
   called before its textual position: towasm doesn't hoist nested function declarations); `parseInt`
   (8, js-parser -- the wasm lib has only `Number.parseInt`/`parseFloat`, no global functions).
 
+## Nested function hoisting -- `emitStmts` (2026-09-10, late)
+
+`uncached` is closed. A nested `function` was only materialised at its own statement, so a call above
+it (`resolve`'s `const result = uncached(); ... function uncached()`) was an unknown function. Every
+statement-list site now goes through `emitStmts`: a pending nested function is created just before the
+FIRST statement in its list whose free names mention it (`collectFreeVars`, computed only while
+something is pending), pulling in pending siblings it mentions first. Not at block start: closures
+capture by value, and creating it at first mention means its captures already exist; forward holders
+(`ensureForwardHolder`) cover a later `const`/`let` sibling.
+- **OPEN: mutual recursion between nested functions** (`isEven`/`isOdd`) -- `ensureForwardHolder`
+  scans only `var_decl` siblings, not function declarations. The fix is to extend it to them.
+- An old `checkThrows` test PINNED "no hoisting" as expected behaviour -- exactly what
+  [[feedback_no_unimplemented_throws_tests]] forbids; it is now a value check.
+- Survey: `uncached` (19) and `call to unknown function 'recurse'` (4) gone, 23 moved, nothing
+  regressed (57/275). They landed in `'a?.hitDepthLimit(...)' is not supported -- returns 'void'`
+  (2 -> 19: `this.parent?.hitDepthLimit(fn)`, an optional call to a `void` method used only as a
+  statement) and `unresolved identifier 'recurse'` (2 -- probably the mutual-recursion case above).
+
 ## The `Parser<any> -> Parser<{...}>` row (22 decls) -- one root, partly characterised
 
 21 of the 22 are tiny towasm.ts helpers: towasm.ts imports ts-parser.ts, whose module-level
