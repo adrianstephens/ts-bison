@@ -46,7 +46,7 @@ async function tryLoadFile(full: string): Promise<string | undefined> {
 }
 
 export interface LoadedModule {
-	program:	TS.Program;
+	program:	TS.Module;
 	canonical:	string;	// relative import *inside* that module must resolve relative to where the module really lives
 	filename?:	string;	// the real file this came from -- what CommonJS derives a module's own `__filename`/`__dirname` from
 }
@@ -181,7 +181,7 @@ class NodeModules {
 	protected registerDeclaredModules(body: TS.Stmt[]) {
 		for (const s of body) {
 			if (s.type === 'module_decl' && s.ambient)
-				this.imported.set(s.name, { program: { type: 'program', body: s.body }, canonical: s.name });
+				this.imported.set(s.name, { program: { type: 'module', body: s.body }, canonical: s.name });
 		}
 	}
 
@@ -235,7 +235,7 @@ class NodeModules {
 			}
 			const body = await this.withReferences(res.code, res.canonical, new Set());
 			this.registerDeclaredModules(body);
-			const fileEntry = { program: { type: 'program' as const, body }, canonical: res.canonical };
+			const fileEntry = { program: { type: 'module' as const, body }, canonical: res.canonical };
 			this.imported.set(res.canonical, fileEntry);
 			// `registerDeclaredModules` may have just registered an ambient `declare module '<mod>' { ... }` found *inside* this
 			// file under the exact key `mod` (e.g. `@types/vscode`'s `index.d.ts` is just `declare module 'vscode' { ... }`) --
@@ -353,7 +353,7 @@ export class ModuleLoader {
 // (matching every real import in this monorepo's own self-hosting target files) -- a re-exporting
 // `export ... from` isn't resolved here, a real, narrower, separate gap if one is ever found in practice.
 export async function collectModules(entryBody: TS.Stmt[], loader: ModuleLoader) {
-	const modules = new Map<string, TS.Program>();
+	const modules = new Map<string, TS.Module>();
 	const namedImports = new Map<string, Map<string, { module: string; name: string }>>();
 	const seen = new Set<string>(['.']);
 

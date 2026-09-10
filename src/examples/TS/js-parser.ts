@@ -221,7 +221,7 @@ export type Stmt<T, X = never> = Declaration<T>
 	| ExportDecl<T>
 	| Import
 
-export interface Program<T = any> { type: 'program'; body: Stmt<T>[]; }
+export interface Module<T = any> { type: 'module'; body: Stmt<T>[]; }
 
 
 // ===================================================================
@@ -1151,9 +1151,9 @@ export const module_item = Rules(
 	}),
 );
 
-export const program = Rules<Program<any>>(
-	Rule([],										_ => ({ type: 'program', body: [] })),
-	Rule([List(module_item)],						$ => ({ type: 'program', body: $[0] })),
+export const program = Rules<Module<any>>(
+	Rule([],										_ => ({ type: 'module', body: [] })),
+	Rule([List(module_item)],						$ => ({ type: 'module', body: $[0] })),
 );
 
 // ===================================================================

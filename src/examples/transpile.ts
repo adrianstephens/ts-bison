@@ -53,7 +53,7 @@ const UNARY: Partial<Record<JS.unaryOps, PY.unaryOps>> = {
 const bindName	= (b: JS.BindingTarget): string 	=> typeof b === 'string' ? b : pyUnsupported('destructuring');
 const isVarDecl	= (x: JS.ForInit<TS.Type>): x is JS.VarDecl<TS.Type> => x.type === 'var_decl';
 
-function TS2PY(ts: TS.Program) {
+function TS2PY(ts: TS.Module) {
 	// [~] the one piece of context the translation needs: Python's `super().__init__` / explicit-base
 	// call has no direct JS counterpart, so the enclosing class's base name is threaded down.
 	let superName: string | undefined;
@@ -1047,7 +1047,7 @@ export async function cpp2ts(source: string, opts?: TSOptions, cppOpts?: CPP.Opt
 // coverage is the INTERSECTION of both stages' `unsupported()` sets, not a new union of its own.
 export async function cpp2py(source: string, opts?: PYOptions, cppOpts?: CPP.Options): Promise<string> {
 	const unit = await CPP.parse(source, cppOpts);
-	return new PYOutput(opts).toCode(TS2PY({type: 'program', body: CPP2TS(unit)}));
+	return new PYOutput(opts).toCode(TS2PY({type: 'module', body: CPP2TS(unit)}));
 }
 
 // ===================================================================
@@ -1095,7 +1095,7 @@ function cppClassDecl(name: string, baseName: string | undefined, body: CPP.Clas
 //  PoC: TypeScript AST -> C++ AST -> C++ source.
 // ===================================================================
 
-function TS2CPP(ts: TS.Program) {
+function TS2CPP(ts: TS.Module) {
 	const TS_CPPTYPE: Record<string, string> = { number: 'double',
 		string:		'std::string',
 		boolean:	'bool',

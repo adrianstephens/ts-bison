@@ -1682,7 +1682,7 @@ export function makeLibScope(): Scope {
 // down with it -- which is exactly what made the self-hosting survey attribute ~35 declarations to
 // whichever module-level statement happened to fail first. Omitted (the CLI's case) it rethrows, since a
 // module whose initialisation silently didn't run is not something to hand back without comment.
-export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Program>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
+export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new TSWError('ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
@@ -1714,7 +1714,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Program>, nam
 	// `LIB_AST` is a flat concatenation with no per-file identity, and the `moduleId === '.'` special
 	// cases in the scan below are all entry-only by design.
 	const LIB_MODULE			= '#lib';
-	const moduleBodies			= new Map<string, TS.Program>([['.', ast], ...(modules ?? [])]);
+	const moduleBodies			= new Map<string, TS.Module>([['.', ast], ...(modules ?? [])]);
 	// That module's own scope, straight off its record -- the entry's from its own `Program`, an imported
 	// one put there by `makeScope` from `exportScope`'s `inner` (see `compileFunc`'s own note on why a
 	// module body needs one at all).

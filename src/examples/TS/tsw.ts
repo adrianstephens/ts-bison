@@ -187,7 +187,7 @@ async function compile(filein: string, fileout: string, wat = false) {
 	const loader		= new ModuleLoader(path.dirname(filein), options);
 	const program		= parser.parse(src);
 	// This module's own `__filename`/`__dirname` -- CommonJS derives them per module from exactly this.
-	(program as TS.Program & { filename?: string }).filename = path.resolve(filein);
+	program.filename = path.resolve(filein);
 	const diagnostics	= await TStypeCheckAsync(program, loader, new T.Scope(libScope));
 	const errors		= diagnostics.filter(d => d.severity === SEVERITY.ERROR);
 	if (errors.length)

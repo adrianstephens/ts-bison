@@ -198,7 +198,7 @@ function attrToFields(attr: Attribute<any>[]) {
 
 // Lowers JSX to the same calls real tsc's transform emits -- `jsx`/`jsxs` (automatic) or `factory` (classic) --
 // and, for automatic, prepends the implicit `jsx-runtime` import tsc synthesizes per file.
-export function lower(program: JS.Program, options: typeof OptionsDefault) {
+export function lower(program: JS.Module, options: typeof OptionsDefault) {
 	const lower: ((jsx: Element<any>)=>JS.Expr) | undefined = 
 		options.jsx === 'react-jsx' || options.jsx === 'react-jsxdev' ? jsx => {
 			const props = attrToFields(jsx.attributes);

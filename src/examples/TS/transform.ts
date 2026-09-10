@@ -496,7 +496,7 @@ export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget,
 
 const dropOptional = (p: JS.Param<any>) => dropMod(p, 'optional');
 
-export function TStoJS(ast: TS.Program) {
+export function TStoJS(ast: TS.Module) {
 	return walk(ast, 
 		//onStatement
 		(stmt, process) => {
@@ -654,7 +654,7 @@ function pushDepthExhaustionGap(depthHits: Map<string, number>, diagnostics: Dia
 // that consumer doesn't need to re-check the program a second time just to see those declarations from
 // a scope its own code actually reaches. Optional and defaults to a bare `T.makeGlobal()`, unchanged
 // from before, for callers with no such consumer (e.g. `TStoDecl`-only or checker-only use).
-export function TStypeCheck(ast: TS.Program, global: Scope): Diagnostic[] {
+export function TStypeCheck(ast: TS.Module, global: Scope): Diagnostic[] {
 	const depthExhaustion = new Map<string, number>();
 	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
 
@@ -723,7 +723,7 @@ export async function loadLib(loader: ModuleLoader, libs: string[]): Promise<T.S
 // ancestor on top of whatever `options.lib` already loads (not merged with it); no current caller needs
 // both a real module-loaded lib set *and* a `TStoWasm`-style `libScope` at once, so a real combination
 // (e.g. copying `libScope`'s own bindings into the loaded scope) is left for whenever one actually does.
-export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader, global: Scope) {
+export async function TStypeCheckAsync(program: TS.Module, loader: ModuleLoader, global: Scope) {
 	const diagnostics: Diagnostic[] = [];
 
 	// Resolves one `import` into `importScope` (shared by `makeScope` and the entry program); return value feeds
@@ -995,7 +995,7 @@ function resolveTypes(entryScope: Scope, importScope: Scope | undefined) {
 	};
 }
 
-export function TStoDecl(program: TS.Program, opts?: Partial<typeof OutputOptionsDefault>): TS.Program {
+export function TStoDecl(program: TS.Module, opts?: Partial<typeof OutputOptionsDefault>): TS.Module {
 	const options		= {...OutputOptionsDefault, ...opts};
 	const importScope	= program.scope as Scope | undefined;
 
