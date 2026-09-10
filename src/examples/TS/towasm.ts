@@ -5928,6 +5928,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emit(I.local.tee(leftLocal.index));
 						emitTruthyOf(leftWtype, checkerTypeOf(unwrapAs(left), ctx.scope), ctx);
 						const keepLeft = () => {
+							// Only the left's falsy (`&&`) / truthy (`||`) part is ever kept. When that is just null/undefined (an
+							// object is never falsy) the result is the result type's own undefined, not the left's physical value.
+							if (T.isNullish(T.logicalLeftPart(checkerTypeOf(unwrapAs(left), ctx.scope), operator, ctx.scope), ctx.scope)) {
+								emitAs({ type: 'identifier', name: 'undefined' }, ctx, wtype);
+								return;
+							}
 							ctx.emit(I.local.get(leftLocal.index));
 							coerceTop(leftWtype, ctx, wtype);
 						};

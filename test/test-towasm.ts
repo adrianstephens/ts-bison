@@ -6022,6 +6022,16 @@ async function main() {
 		check('&& in a condition still just branches', r.asCondition(), 2);
 		check('|| in a condition still just branches', r.orCondition(), 1);
 		check('&& short-circuits its right operand', r.shortCircuits(), 0);
+
+		// An object is never falsy, so `n && ...` on an object-typed nullable keeps only `undefined` from its left:
+		// the result is `boolean | undefined`, and the left's own struct ref must not be converted into it.
+		const r2 = await compile(`
+			interface Tok { type: number; name: string }
+			function andIface(n: Tok | undefined) { return n && n.type === 2; }
+			export function objTrue(): number { return andIface({ type: 2, name: 'x' }) ? 1 : 0; }
+			export function objUndef(): number { return andIface(undefined) === undefined ? 1 : 0; }
+		`);
+		check('&& on an object-typed nullable keeps only undefined from its left', r2.objTrue() * 10 + r2.objUndef(), 11);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 

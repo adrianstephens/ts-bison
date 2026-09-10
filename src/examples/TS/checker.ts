@@ -1809,25 +1809,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// Only `??`: `&&`/`||` yield a value of either side, so the left is no guide to the right.
 					const rightExpected = e.operator === '??' ? T.nonNullable(lt, scope) : undefined;
 					const rt	= typeOf(e.right, e.operator === '&&' ? narrow(e.left, scope, true) : e.operator === '||' ? narrow(e.left, scope, false) : scope, false, rightExpected, yieldCollector, err);
-					const r		= T.resolveOwn(lt, scope);
-					const other = T.isOther(e.operator[0]);
-
-					return T.combineTypes([
-						...(r.type === 'union' ? r.types : [r]).map(m => {
-							const p = T.resolveOwn(m, scope);
-							if (other(p, scope))
-								return undefined;
-							// a plain boolean only survives `||` as true, `&&` as false
-							if (e.operator !== '??' && T.isBoolean(p))
-								return Literal(e.operator === '||');
-							// `&&`'s false path narrows a plain string/number to its one falsy literal (`""`/`0`) -- `||`'s truthy path has no
-							// single such value (any non-empty string, any non-zero number), so only `&&` narrows here.
-							if (e.operator === '&&')
-								return T.makeNullish(p);
-							return m;
-						}).filter(t => !!t),
-						rt,
-					]);
+					return T.combineTypes([T.logicalLeftPart(lt, e.operator, scope), rt]);
 				}
 				const rt = recurse(e.right);
 				if (COMPARISON_OPS.has(e.operator))

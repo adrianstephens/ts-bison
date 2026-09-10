@@ -1427,6 +1427,21 @@ export function isOther(op: string) {
 	return op === '?' ? isNullish : op === '|' ? isFalsy : isTruthy;
 }
 
+// What `a && b` / `a || b` / `a ?? b` yields from `a` when it short-circuits: a boolean survives `||` only as true and
+// `&&` only as false, and `&&` narrows a string/number to its one falsy literal (`||`'s truthy side has no single value).
+export function logicalLeftPart(t: Type, op: string, scope: Scope): Type {
+	const r		= resolveOwn(t, scope);
+	const other	= isOther(op[0]);
+	return combineTypes((r.type === 'union' ? r.types : [r]).flatMap(m => {
+		const p = resolveOwn(m, scope);
+		if (other(p, scope))
+			return [];
+		if (op !== '??' && isBoolean(p))
+			return [Literal(op === '||')];
+		return [op === '&&' ? makeNullish(p) : m];
+	}));
+}
+
 // The non-nullish remainder of `t` -- `t` itself, unchanged, unless it resolves to a union with at least
 // one (but not every) nullish member, in which case those members are dropped. Shared by anything
 // implementing optional-chaining semantics (`?.`/`??`), which only ever cares about the non-nullish part
