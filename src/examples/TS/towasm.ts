@@ -6363,35 +6363,20 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							return sig.result;
 						}
 					}
-					// A cross-module (or same-module, non-entry) `const X = someFactory(...)` -- not a
-					// `function_decl`, so nothing above ever finds it. `ctx.scope` (correctly rooted at this
-					// function's own declaring module, see `compileFunc`'s `homeScope`) resolves it via the
-					// same `Scope.decl` mechanism `ensureClass`'s own `declScope` param already uses for a
-					// non-entry class. `ensureLazyGlobal` computes the real value once, lazily, on first call
-					// (the pervasive `Rule([...], ...)`/`terminal(...)`/`Rules(...)` idiom this whole grammar-
-					// spec pair is built from); the result is then called through the ordinary closure
-					// `call_ref` mechanism, same as any other closure value.
+					// A module-level `const X = someFactory(...)` holding a closure (`Rule = makeRule(...)`): found by the
+					// same lookup a plain READ of it uses -- entry, imported and lib modules alike -- then called as a closure.
 					{
-						const calleeName = e.callee.name;
-						const varStmt = ctx.scope.decl(calleeName);
-						if (varStmt?.type === 'var_decl') {
-							const d = varStmt.declarations.find(d => d.name === calleeName);
-							if (d) {
-								// `ctx.homeModule` is the CALLER's own home module, not necessarily where this
-								// value is actually declared -- `stmtHomeModule` recovers the real one.
-								const wrapper = ensureLazyGlobal(calleeName, stmtHomeModule.get(varStmt) ?? ctx.homeModule, d, ctx.scope);
-								const calleeWtype = wrapper?.result;
-								if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
-									const sig = calleeWtype.closure;
-									const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
-									ctx.emit(I.call(wrapper!.funcIndex));
-									const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
-									ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
-									emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
-									ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
-									return sig.result;
-								}
-							}
+						const lazy = lazyGlobalFor(e.callee.name, ctx);
+						const calleeWtype = lazy?.wrapper.result;
+						if (lazy && calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
+							const sig = calleeWtype.closure;
+							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
+							ctx.emit(I.call(lazy.wrapper.funcIndex));
+							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
+							ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
+							emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
+							ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+							return sig.result;
 						}
 					}
 					// One-shot: consumed here (for this call's own generic type-param inference, if it applies)

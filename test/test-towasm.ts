@@ -6053,6 +6053,15 @@ async function main() {
 			export function noPrev(): number { const p: LP = { offset: 0, line: 2 }; return after(p) ? 1 : 0; }
 		`);
 		check('a field read through a receiver narrowed by the same && chain tests truthy', r3.withPrev() * 10 + r3.noPrev(), 10);
+
+		// An ENTRY-module const holding a closure a factory returned, called by name (js-parser.ts's
+		// `Rule = makeRule(...)`): the call path looked only in imported modules' scopes.
+		const r4 = await compile(`
+			function mk(k: number) { return (x: number) => x + k; }
+			const R = mk(1);
+			export function factoryConst(): number { return R(41); }
+		`);
+		check('an entry-module const holding a factory-made closure is callable by name', r4.factoryConst(), 42);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 
