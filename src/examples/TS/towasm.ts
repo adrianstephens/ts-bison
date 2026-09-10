@@ -2759,12 +2759,40 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 			: undefined;
 	}
 
+	// A spread operand's own keys, resolved exactly as `case 'object'` resolves it to BUILD the spread --
+	// `ownerOf` first, then the anonymous shape -- so matching and construction cannot disagree about
+	// which fields a spread supplies.
+	function spreadKeys(operand: Expr, ctx: FunctionContext): string[] | undefined {
+		const cls = ownerOf(operand, ctx);
+		if (cls)
+			return cls.fields.map(f => f.name);
+		const t = T.resolve(ctx.scope, narrowedTypeOf(operand, ctx));
+		return t.type === 'object' && !indexSignatureValueType(t)
+			? t.members.flatMap(m => m.type === 'property' && typeof m.key === 'string' ? [m.key] : [])
+			: undefined;
+	}
+
 	function matchObjectShape(e: JS.ObjectExpr<Type>, ctx: FunctionContext): ClassInfo | undefined {
-		const props = new Map<string, Expr>();
+		// `props`: every key the literal PROVIDES, so a candidate's required fields can be satisfied by a
+		// spread. `explicit`: only the fields actually WRITTEN -- real TS never excess-property-checks a
+		// spread, so a spread's extra keys must not disqualify a candidate that lacks them.
+		const props		= new Map<string, Expr>();
+		const explicit	= new Set<string>();
 		for (const p of e.properties) {
+			if (p.type === 'spread') {
+				const keys = spreadKeys(p.operand, ctx);
+				if (!keys)
+					return undefined;
+				// Last source wins, in written order, as it does at runtime. A spread-sourced value is never
+				// a literal, so such a key simply takes no part in the discriminant tiebreak below.
+				for (const k of keys)
+					props.set(k, p.operand);
+				continue;
+			}
 			if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
 				return undefined;
 			props.set(p.key, p.value);
+			explicit.add(p.key);
 		}
 		// A literal may legitimately omit any of a candidate's own *optional* fields (real TS object-literal-
 		// against-interface semantics) -- so this isn't an exact field-SET match, it's "the literal names no
@@ -2776,7 +2804,7 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 		// its structurally identical anonymous shape share one -- see `ensureObjectShape`), and counting it
 		// twice made the "exactly one candidate" test below fail for a shape that has exactly one.
 		const candidates = [...new Set(classes.values())].filter(cls =>
-			cls.typeIndex !== -1 && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
+			cls.typeIndex !== -1 && [...explicit].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
 		);
 		if (candidates.length === 1)
 			return candidates[0];

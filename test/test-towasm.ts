@@ -3652,6 +3652,22 @@ async function main() {
 			}
 		`);
 		check('...and through a UNION receiver, via a ref.test cascade', expandoUnion(), 30);
+
+		// An object literal with a SPREAD, whose target has to be matched structurally (here it is boxed
+		// `any`). `matchObjectShape` refused any non-field property outright, so a spread was never
+		// matchable however well its operand's type was known. Its keys now count toward the candidate's
+		// REQUIRED fields but never disqualify one: real TS does not excess-property-check a spread, so
+		// `{...params, returnType}` still matches `CallSig` although `params` might carry more.
+		const { spreadMatch } = await compile(`
+			interface Params { params: number[] }
+			interface CallSig extends Params { returnType?: number }
+			function wrap(p: Params): CallSig { const r: any = { ...p, returnType: 7 }; return r as CallSig; }
+			export function spreadMatch(): number {
+				const s = wrap({ params: [1, 2, 3] });
+				return s.params.length * 10 + (s.returnType ?? 0);
+			}
+		`);
+		check('an object literal with a spread finds its target structurally', spreadMatch(), 37);
 	}
 
 	{
