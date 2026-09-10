@@ -16,7 +16,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as TS from '../src/examples/TS/ts-parser';
-import { corpusFiles, corpusPresent, readSource, splitTestFile, isSource, syntaxErrorsSet, TS_REPO } from './ts-corpus';
+import { corpusFiles, corpusPresent, readSource, splitTestFile, isSource, syntaxErrorsSet, usesUnsupportedSyntax, TS_REPO } from './ts-corpus';
 
 const BASELINE	= path.join(__dirname, 'ts-corpus-gate-baseline.json');
 // No sampling: the whole corpus parses in well under 10s, so the gate is complete rather than a
@@ -37,6 +37,7 @@ interface Baseline { files: number; failed: number; note: string }
 
 	const t0 = Date.now();
 	const failures: string[] = [];
+	let unsupported = 0;
 	for (const file of files) {
 		const source = readSource(await fs.readFile(file));
 		for (const virtual of splitTestFile(source, file)) {
@@ -45,7 +46,10 @@ interface Baseline { files: number; failed: number; note: string }
 			try {
 				parser.parse(virtual.content);
 			} catch {
-				failures.push(`${path.relative(TS_REPO, file)}${virtual.name === file ? '' : ` [${virtual.name}]`}`);
+				if (usesUnsupportedSyntax(virtual.name, virtual.content))
+					unsupported++;
+				else
+					failures.push(`${path.relative(TS_REPO, file)}${virtual.name === file ? '' : ` [${virtual.name}]`}`);
 			}
 		}
 	}
@@ -56,7 +60,7 @@ interface Baseline { files: number; failed: number; note: string }
 
 	const failed = failures.length;
 	if (process.argv.includes('--update')) {
-		const next: Baseline = { files: files.length, failed, note: 'corpus files that fail to PARSE (no checker), excluding fixtures tsc itself reports a TS1xxx syntax error on; lower is better' };
+		const next: Baseline = { files: files.length, failed, note: 'corpus files that fail to PARSE (no checker), excluding fixtures tsc itself reports a TS1xxx syntax error on, and ones using syntax deliberately unsupported (legacy <T>expr casts); lower is better' };
 		await fs.writeFile(BASELINE, JSON.stringify(next, null, '\t') + '\n');
 		console.log(`baseline updated: ${failed} failures in ${files.length} files (${elapsed}ms)`);
 		return;
@@ -77,7 +81,7 @@ interface Baseline { files: number; failed: number; note: string }
 		process.exit(1);
 	}
 
-	console.log(`corpus gate: ${failed} failures in ${files.length} files, baseline ${base.failed} (${elapsed}ms)`);
+	console.log(`corpus gate: ${failed} failures in ${files.length} files, baseline ${base.failed} (${elapsed}ms); ${unsupported} more use deliberately unsupported syntax`);
 	if (failed > base.failed) {
 		console.log(`\nFAIL: ${failed - base.failed} more file(s) fail to parse than the baseline.`);
 		console.log(`Re-run with --list to see them. If this is a deliberate scope change, --update.`);

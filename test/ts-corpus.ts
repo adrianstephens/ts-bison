@@ -4,6 +4,7 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import * as ts from 'typescript';
 
 // Checked out separately on this machine; not part of this repo. Consumers must handle its absence.
 export const TS_REPO = '/Volumes/DevSSD/dev/github/TypeScript';
@@ -82,6 +83,22 @@ export async function syntaxErrorsSet(): Promise<Set<string>> {
 			out.add(m[1]);
 	}));
 	return out;
+}
+
+// Syntax tsc accepts that this parser deliberately never will: the legacy `<T>expr` type assertion (`as` is the
+// modern form), which no TS1xxx baseline catches. Asked only of a fixture we FAIL to parse; tsc's parser decides.
+export function usesUnsupportedSyntax(name: string, content: string): boolean {
+	if (name.endsWith('.tsx'))
+		return false;
+	// Iterative: some fixtures nest expressions deeper than the JS stack.
+	const stack: ts.Node[] = [ts.createSourceFile(name, content, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS)];
+	while (stack.length) {
+		const n = stack.pop()!;
+		if (n.kind === ts.SyntaxKind.TypeAssertionExpression)
+			return true;
+		ts.forEachChild(n, c => { stack.push(c); });
+	}
+	return false;
 }
 
 // Every corpus source file, sorted -- the ordering is what makes a fixed-size slice of it a stable,

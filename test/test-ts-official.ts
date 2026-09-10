@@ -8,7 +8,7 @@ import { ModuleLoader } from '../src/examples/TS/module-loader';
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { TS_REPO, readSource, splitTestFile, expectsErrorsSet, expectsErrors } from './ts-corpus';
+import { TS_REPO, readSource, splitTestFile, expectsErrorsSet, expectsErrors, usesUnsupportedSyntax } from './ts-corpus';
 
 const parser = TS.make();
 JSX.add();
@@ -26,7 +26,7 @@ const lib = (async () => {
 // bucket is the one that matters: an ERROR (or throw) there is our checker rejecting source tsc
 // accepts. The `expectErr` bucket is informational -- we don't try to match tsc's rejections.
 const sev = { clean: [] as number[], expectErr: [] as number[] };
-let failed = { clean: 0, expectErr: 0 }, tested = 0;
+let failed = { clean: 0, expectErr: 0 }, tested = 0, unsupported = 0;
 const falsePositives: string[] = [];			// clean-bucket files where we emit an ERROR or throw
 
 let errset: Set<string>;
@@ -53,6 +53,11 @@ async function testFile(filename: string) {
 					falsePositives.push(`${path.relative(TS_REPO, filename)}\t${d.pos.line}:${d.pos.col}\t${d.message.split('\n')[0]}`);
 			}
 		} catch (e) {
+			// Syntax tsc accepts but this parser deliberately never will: neither a gap nor a false positive.
+			if (usesUnsupportedSyntax(virtual.name, virtual.content)) {
+				++unsupported;
+				continue;
+			}
 			++failed[bucket];
 			if (bucket === 'clean')
 				falsePositives.push(`${path.relative(TS_REPO, filename)}\tthrew\t${e instanceof Error ? e.message.split('\n')[0] : e}`);
@@ -85,7 +90,7 @@ async function testDir(dir: string) {
 	const line = (label: string, f: number, s: number[]) =>
 		`${label.padEnd(12)} threw ${String(f).padStart(5)}   ` + names.map((n, i) => `${n} ${String(s[i] ?? 0).padStart(6)}`).join('   ');
 
-	console.log(`\n${tested} virtual files tested`);
+	console.log(`\n${tested} virtual files tested (${unsupported} use deliberately unsupported syntax, not counted)`);
 	console.log(line('tsc-clean', failed.clean, sev.clean));
 	console.log(line('tsc-errors', failed.expectErr, sev.expectErr));
 	console.log(`\n${falsePositives.length} ERROR/throw on tsc-clean files (our false positives):`);
