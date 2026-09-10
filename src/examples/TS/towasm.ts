@@ -1586,7 +1586,28 @@ function containsDefineProperty(body: Stmt[]): boolean {
 // at all (`ensureClassExtension`'s own comment).
 function collectDefinePropertyTargets(body: Stmt[]): Map<string, string[] | 'dynamic'> {
 	const targets = new Map<string, string[] | 'dynamic'>();
+	const add = (name: string, key: string | undefined) => {
+		const existing = targets.get(name);
+		if (existing === 'dynamic')
+			return;
+		if (key === undefined)
+			return targets.set(name, 'dynamic'), undefined;
+		const keys = existing ?? [];
+		if (!keys.includes(key))
+			keys.push(key);
+		targets.set(name, keys);
+	};
 	walkB(body, undefined, (e, process) => {
+		// Any property WRITE to a plain local, whatever route the source took to make it legal --
+		// `(s as any).scope = scope`, an index signature, a declaration-merged shape. Collected
+		// indiscriminately here and filtered at the DECLARATION against the class's real fields, which
+		// is the first point types are known: whatever is left over the checker accepted and the class
+		// does not have, so it is an expando and needs a slot exactly as `Object.defineProperty` does.
+		if (e.type === 'assign' && e.target.type === 'member') {
+			const recv = unwrapAs(e.target.object);
+			if (recv.type === 'identifier')
+				add(recv.name, e.target.property);
+		}
 		if (isDefinePropertyCall(e)) {
 			const target = e.arguments[0];
 			if (target?.type === 'identifier') {
@@ -4431,10 +4452,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 			};
 
 		} else if (target.type === 'member') {
-			const cls = ownerOf(target.object, ctx);
+			const base = ownerOf(target.object, ctx);
 
 			// A `set` accessor -- checked before the ordinary struct-field write, mirroring the read side's getter-probe in `case 'member'`
-			if (cls?.setterNames?.has(target.property)) {
+			if (base?.setterNames?.has(target.property)) {
+				const cls = base;
 				const setSig = methodSig(cls, accessorKey('set', target.property), ctx);
 				if (!setSig)
 					throw `internal: setter '${target.property}' has no signature`;
@@ -4461,6 +4483,11 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 				};
 			}
 
+			// A property the CHECKER accepted that is not a real field of the receiver's class is an
+			// expando; its slot lives on the class's own `$ext` subclass, which the declaration site
+			// already allocated. `ownerOf` answers from the TS type and so only ever sees the base.
+			const ext		= base && base.fieldIndex.get(target.property) === undefined ? classExtensions.get(base.name) : undefined;
+			const cls		= ext?.fieldIndex.has(target.property) ? ext : base;
 			const fieldIdx	= cls?.fieldIndex.get(target.property);
 			if (!cls || fieldIdx === undefined)
 				throw `unknown field '${target.property}'`;
@@ -6693,10 +6720,24 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 					// reached this way for the first time gets the accurate shape immediately, not a
 					// placeholder later calls would need to somehow patch.
 					if (wtype && typeof d.name === 'string' && typeof wtype !== 'string' && 'ref' in wtype) {
-						const keys = ctx.definePropertyTargets?.get(d.name);
-						if (keys) {
+						const written = ctx.definePropertyTargets?.get(d.name);
+						if (written) {
 							const base = ensureClass(wtype.ref);
-							if (base) {
+							// Only the keys the class does not really declare: an ordinary `c.x = 1` is a
+							// plain field write and must not drag in an extension subclass.
+							const keys = base && written !== 'dynamic'
+								? written.filter(k => !base.fieldIndex.has(k) && !base.setterNames?.has(k) && !base.methodDecls.has(k))
+								: written;
+							if (base && keys !== undefined && (keys === 'dynamic' || keys.length)) {
+								// An extension is a real wasm SUBTYPE, and the only way a value acquires it is
+								// being ALLOCATED as one -- `ref.cast` is a type test on the existing object, it
+								// copies nothing. An object literal is built field-by-field against the target
+								// shape and so can be built extended; a `new` goes through the class's own
+								// compiled constructor, which `struct.new`s the BASE and has no extended twin
+								// (`ensureClassExtension` gives the subclass no `methodDecls`). Rejected here
+								// rather than emitting a cast that always traps at runtime.
+								if (d.init.type === 'new')
+									throw `'${d.name}' has a property added to it, but a class constructed with 'new' can't carry extra properties yet -- only an object literal can`;
 								const prior = pendingExtensions.get(base.name);
 								pendingExtensions.set(base.name, prior === 'dynamic' || keys === 'dynamic' ? 'dynamic' : [...new Set([...(prior ?? []), ...keys])]);
 								wtype = ensureClassExtension(base).thisWtype!;

@@ -3588,6 +3588,43 @@ async function main() {
 			`,
 		}, 'main');
 		check('a namespace-qualified const reads a NON-EXPORTED sibling of its own module', privateSibling(), 1122);
+
+		// An EXPANDO property -- one the CHECKER accepted that the receiver's class does not really
+		// declare. `Object.defineProperty` already allocated the class's `$ext` subclass for these; a
+		// plain WRITE is the same operation spelled differently and now does too. The trigger is not the
+		// `as any` syntax but the field simply not being real, so an ordinary `p.x = 1` is untouched.
+		const { expandoWrite, expandoDefine, realFieldUntouched } = await compile(`
+			interface P { x: number }
+			export function expandoWrite(): number {
+				const p: P = { x: 1 };
+				(p as any).scope = 5;
+				return ((p as any).scope as number) + p.x;
+			}
+			export function expandoDefine(): number {
+				const p: P = { x: 1 };
+				Object.defineProperty(p, 'scope', { value: 5, enumerable: false, configurable: true, writable: false });
+				return ((p as any).scope as number) + p.x;
+			}
+			export function realFieldUntouched(): number {
+				const p: P = { x: 1 };
+				p.x = 7;
+				return p.x;
+			}
+		`);
+		check('a plain expando property WRITE gets a slot', expandoWrite(), 6);
+		check('...as Object.defineProperty already did', expandoDefine(), 6);
+		check('...and a write to a REAL field is still an ordinary field write', realFieldUntouched(), 7);
+		// A `new`-constructed class cannot carry one: `ref.cast` is a type test on the existing object and
+		// copies nothing, so the value would have to have been ALLOCATED extended -- and the extension
+		// subclass has no constructor. Rejected outright rather than emitting a cast that always traps.
+		await checkThrows('an expando on a `new`-constructed class is rejected, not left to trap', () => compile(`
+			class C { x: number; constructor(x: number) { this.x = x; } }
+			export function main(): number {
+				const c = new C(1);
+				(c as any).scope = 5;
+				return c.x;
+			}
+		`), /can't carry extra properties/);
 	}
 
 	{
