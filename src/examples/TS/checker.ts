@@ -948,23 +948,21 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 // own resolved file. So they are bound into the module's own scope, never the lib scope -- a global would
 // give every module the same answer, which is exactly what they are not. Only the two this compiler can
 // actually supply; `require`/`module`/`exports` are deliberately still unbound.
-export function bindModuleNames(body: Stmt[], scope: Scope) {
-	if ((body as Stmt[] & { filename?: string }).filename) {
+export function bindModuleNames(filename: string | undefined, scope: Scope) {
+	if (filename) {
 		scope.addValue('__filename', T.STRING);
 		scope.addValue('__dirname', T.STRING);
 	}
 }
 
-export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; alias?: Type } {
+export function exportScope(body: Stmt[], parent: Scope, filename?: string): { scope: Scope; inner: Scope; alias?: Type } {
 	// `hoist` + `hoistVars` (not full `checkBlock`): only top-level declaration *types* are needed, not a full check of a body checked separately.
 	const inner = new Scope(parent);
 	hoist(body, inner);
-	// Stamped on the body, the same way a checked `Program` carries its own `.scope` -- an imported
-	// module's INTERNAL scope is otherwise built here and thrown away, and towasm.ts (which receives these
-	// exact arrays, never a `Program`) has no other way to resolve a name declared in the module it is
-	// compiling. `scope` below is the export-only VIEW; this is the full one.
-	(body as Stmt[] & { scope?: Scope }).scope ??= inner;
-	bindModuleNames(body, inner);
+	// `inner` is RETURNED, not stamped on the body array: an imported module's INTERNAL scope is
+	// otherwise built here and thrown away, and towasm needs it to resolve a name declared in the module
+	// it is compiling. The caller puts it on the module record. `scope` below is the export-only VIEW.
+	bindModuleNames(filename, inner);
 
 	// Infers top-level `var`/`const`/`let` types only -- muted, since this just resolves what a module *exposes*; its own real (unmuted)
 	// check happens when it's the direct entry point. Without muting, every importer would re-diagnose the same exports from scratch (no cross-run cache).
@@ -987,6 +985,7 @@ export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; alias?
 	const assign = body.find(s => s.type === 'export_assignment');
 	if (assign) {
 		return {
+			inner,
 			scope: inner.namespace(assign.expr) ?? new Scope(),
 			alias: inner.value(assign.expr) ?? T.ANY,
 		};
@@ -1035,7 +1034,7 @@ export function exportScope(body: Stmt[], parent: Scope): { scope: Scope; alias?
 		// Ambient `.d.ts` convention: a body with no `export` keyword anywhere implicitly exports every top-level declaration.
 		scope.copyAll(inner);
 	}
-	return { scope };
+	return { scope, inner };
 }
 
 // ---- lazy return-type inference -------------------------------------------------------------

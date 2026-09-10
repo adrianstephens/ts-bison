@@ -714,7 +714,7 @@ export async function loadLib(loader: ModuleLoader, libs: string[]): Promise<T.S
 	for (const spec of libs!) {
 		const lib = await loader.get(spec, '.');
 		if (lib)
-			checkBlock(lib.body, global);
+			checkBlock(lib.program.body, global);
 	}
 	return global;
 }
@@ -768,12 +768,15 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 			return existing;
 
 		const importScope = new Scope(global);
-		const cached = Promise.all(src.body.filter(s => s.type === 'import').map(s => resolveImport(src, importScope, s, src.canonical))).then(async imports => {
+		const cached = Promise.all(src.program.body.filter(s => s.type === 'import').map(s => resolveImport(src, importScope, s, src.canonical))).then(async imports => {
 			let tainted = imports.some(clean => !clean);
-			const { scope, alias } = exportScope(src.body, importScope);
+			const { scope, inner, alias } = exportScope(src.program.body, importScope, src.program.filename);
+			// The module RECORD carries its full internal scope -- towasm resolves names declared in the
+			// module it is compiling through this, and it is the only place that scope survives.
+			src.program.scope ??= inner;
 			// Recorded before the (possibly cyclic) re-export loop awaits anything -- see `ownScopeSettled` for why placement matters.
 			ownScopeSettled.set(src, { scope, alias });
-			for (const stmt of src.body) {
+			for (const stmt of src.program.body) {
 				if (stmt.type !== 'export' || !stmt.source)
 					continue;
 				const target = await loader.get(stmt.source, src.canonical);
@@ -814,7 +817,7 @@ export async function TStypeCheckAsync(program: TS.Program, loader: ModuleLoader
 	}
 
 	// The entry program never goes through `makeScope` (nothing imports it) -- just its own stable identity for `wouldDeadlock`'s bookkeeping.
-	const entrySrc: LoadedModule = { body: program.body, canonical: '.' };
+	const entrySrc: LoadedModule = { program, canonical: '.' };
 	const entryScope = new Scope(global);
 	// A SCRIPT (no top-level import/export) declares into the global space -- see `Scope.globalSpace`.
 	entryScope.globalSpace = !program.body.some(s => s.type === 'import' || s.type === 'export' || s.type === 'export_decl' || s.type === 'export_assignment');

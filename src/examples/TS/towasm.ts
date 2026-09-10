@@ -1682,7 +1682,7 @@ export function makeLibScope(): Scope {
 // down with it -- which is exactly what made the self-hosting survey attribute ~35 declarations to
 // whichever module-level statement happened to fail first. Omitted (the CLI's case) it rethrows, since a
 // module whose initialisation silently didn't run is not something to hand back without comment.
-export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
+export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Program>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new TSWError('ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
@@ -1714,19 +1714,18 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// `LIB_AST` is a flat concatenation with no per-file identity, and the `moduleId === '.'` special
 	// cases in the scan below are all entry-only by design.
 	const LIB_MODULE			= '#lib';
-	const moduleBodies			= new Map<string, TS.Stmt[]>([['.', ast.body], ...(modules ?? [])]);
-	// That module's own scope: the entry carries it on its `Program`, an imported body gets it stamped by
-	// `exportScope` (see `compileFunc`'s own note on why a body needs one at all).
+	const moduleBodies			= new Map<string, TS.Program>([['.', ast], ...(modules ?? [])]);
+	// That module's own scope, straight off its record -- the entry's from its own `Program`, an imported
+	// one put there by `makeScope` from `exportScope`'s `inner` (see `compileFunc`'s own note on why a
+	// module body needs one at all).
 	function moduleScopeOf(homeModule: string): Scope | undefined {
-		return homeModule === '.' ? global : (moduleBodies.get(homeModule) as (TS.Stmt[] & { scope?: Scope }) | undefined)?.scope;
+		return homeModule === '.' ? global : moduleBodies.get(homeModule)?.scope as Scope | undefined;
 	}
 
-	// Where each module really lives: the loader stamps it on an imported body (`collectModules`), and the
-	// ENTRY's own comes off the `Program`, which its caller stamps the same way it already stamps `scope`.
+	// Where each module really lives -- `collectModules` puts it on the record, and the ENTRY's own comes
+	// off its own `Program`, which its caller sets the same way.
 	function moduleFilename(homeModule: string): string | undefined {
-		return homeModule === '.'
-			? (ast as TS.Program & { filename?: string }).filename
-			: (moduleBodies.get(homeModule) as (TS.Stmt[] & { filename?: string }) | undefined)?.filename;
+		return moduleBodies.get(homeModule)?.filename;
 	}
 	const namedImportsByModule = namedImports ?? new Map<string, Map<string, { module: string; name: string }>>();
 	// Recovers a top-level statement's own home module string -- `Scope.decl(name)` (via `declScope`, or via
@@ -1760,7 +1759,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// Keyed by module: the binding is that module's own, exactly like a top-level function's.
 	const moduleAsmBuiltins = new Map<string, Builtin<Inline>>();
 	for (const [moduleId, body] of moduleBodies) {
-		for (let s of body) {
+		for (let s of body.body) {
 			if (s.type === 'export_decl')
 				s = s.declaration;
 			if (s.type !== 'var_decl')
@@ -9539,7 +9538,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// `TStoWasm`'s own header comment), so `class_decl`/scalar `var_decl` promotion below stays entry-only,
 	// exactly as before multi-file support existed.
 	for (const [moduleId, body] of moduleBodies) {
-		for (let s of body) {
+		for (let s of body.body) {
 			if (s.type === 'export_decl')
 				s = s.declaration;
 			stmtHomeModule.set(s, moduleId);
@@ -9642,7 +9641,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// under-approximate" comment above; walking a module that turns out unreached just adds a few
 	// harmless extra names to `reached`.
 	for (const body of moduleBodies.values())
-		collectNames(body);
+		collectNames(body.body);
 
 	while (pending.length) {
 		const name = pending.shift()!;
@@ -9658,7 +9657,7 @@ export function TStoWasm(ast: TS.Program, modules?: Map<string, TS.Stmt[]>, name
 	// declaring `import { path_open } from 'wasi_snapshot_preview1'` now registers it exactly as a lib file
 	// does. Deduped by name: the same host function imported by two modules is still ONE wasm import.
 	const hostImports = [...new Map(
-		[...LIB_HOST_IMPORTS, ...[...moduleBodies.values()].flatMap(hostImportsIn)].map(hi => [hi.name, hi] as const)
+		[...LIB_HOST_IMPORTS, ...[...moduleBodies.values()].flatMap(m => hostImportsIn(m.body))].map(hi => [hi.name, hi] as const)
 	).values()];
 
 	mod.imports = hostImports.filter(hi => reached.has(hi.name)).map(hi => {

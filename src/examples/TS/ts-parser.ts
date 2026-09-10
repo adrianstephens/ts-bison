@@ -130,7 +130,7 @@ export type ClassMember		= JS.ClassMember<Type>	| { type: 'index_signature'; par
 // way a TS-only declaration is legal in every NESTED statement position too (a block, an if branch, a
 // loop body), which is what it actually is -- `while (x) { type A = B; }` is real TypeScript.
 export type Stmt = JS.Stmt<Type, Declaration>;
-export interface Program { type: 'program'; body: Stmt[]; scope?: unknown }
+export interface Program { type: 'program'; body: Stmt[]; scope?: unknown; filename?: string }
 
 // ===================================================================
 //  terminals

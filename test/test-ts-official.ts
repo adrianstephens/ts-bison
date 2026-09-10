@@ -18,7 +18,7 @@ const lib = (async () => {
 	const global	= T.makeGlobal();
 	const loader	= new ModuleLoader(__dirname, {});
 	const lib		= await loader.get('typescript/lib/lib.esnext.full', '.');
-	checkBlock(lib!.body, global);
+	checkBlock(lib!.program.body, global);
 	return global;
 })();
 
