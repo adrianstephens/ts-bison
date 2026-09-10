@@ -1344,12 +1344,13 @@ function substituteTypeParams<N extends Walkable>(node: N, map: ReadonlyMap<stri
 const builtinTypes: Record<string, { wtype: WasmType; class?: string }> = {
 	void:		{ wtype: 'void' },
 	// No `class` -- `any` has no single owner to dispatch a method call against (`ensureAnyDispatch` handles
-	// that dynamically); this entry only gives a genuinely `any`-typed local/param/field a real `WasmType` (`REF_ANY`) so it doesn't fail to compile the moment it's declared.
-	any:		{ wtype: REF_ANY },
+	// that dynamically); this entry only gives a genuinely `any`-typed local/param/field a real `WasmType`.
+	// NULLABLE: an `any` can hold `undefined` (a missing rest arg, an unmatched regex group), which is `ref.null`.
+	any:		{ wtype: REF_ANY_NULLABLE },
 	// `unknown` has no dedicated physical representation of its own -- same boxed storage as `any` (the
 	// checker's own `T.isAny` already treats the two alike), just without `any`'s implicit-assignability
 	// laxness on the *checking* side, which doesn't affect codegen at all.
-	unknown:	{ wtype: REF_ANY },
+	unknown:	{ wtype: REF_ANY_NULLABLE },
 	boolean:	{ wtype: 'i32', 			class: 'Boolean' },
 	Boolean:	{ wtype: 'i32', 			class: 'Boolean' },
 	number:		{ wtype: 'f64', 			class: 'Number' },
@@ -2636,7 +2637,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// `narrowedTypeOf` only fills in where `ctx.scope` has no answer at all: a read off a receiver
 		// narrowed out of `T | undefined` (`if (!r) return; r.min`) comes back `any` there.
 		const base = checkerTypeOf(unwrapAs(e), ctx.scope);
-		return typeOf(T.isAny(base) ? narrowedTypeOf(e, ctx) : base);
+		if (!T.isAny(base))
+			return typeOf(base);
+		// A narrowing to just null/undefined (`a = undefined`) says nothing about the slot, which is still `any`.
+		const narrowed = narrowedTypeOf(e, ctx);
+		return typeOf(T.isNullish(narrowed, ctx.scope) ? base : narrowed);
 	}
 
 	// Like `checkerTypeOf(e, ctx.scope)`, but for a receiver whose *unnarrowed* type is a real union,

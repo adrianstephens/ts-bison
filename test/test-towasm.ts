@@ -6081,6 +6081,16 @@ async function main() {
 			export function factoryConst(): number { return R(41); }
 		`);
 		check('an entry-module const holding a factory-made closure is callable by name', r4.factoryConst(), 42);
+
+		// An `any` can HOLD undefined (a missing rest arg, an unmatched regex group), so its slot is nullable;
+		// and a narrowing to just `undefined` (`a = undefined`) says nothing about that slot.
+		const r5 = await compile(`
+			function f(...args: any[]): number { const h = args[0]; return h !== undefined ? 1 : 0; }
+			export function restAny(): number { return f(undefined) * 10 + f(3); }
+			export function reassigned(): number { let a: any = 5; a = undefined; return a === undefined ? 1 : 0; }
+		`);
+		check('an any compared to undefined', r5.restAny(), 1);
+		check('an any local reassigned to undefined', r5.reassigned(), 1);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 
