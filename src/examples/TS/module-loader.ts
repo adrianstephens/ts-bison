@@ -398,8 +398,7 @@ export async function collectModules(entryBody: TS.Stmt[], loader: ModuleLoader)
 		if (visiting.has(key))
 			return undefined;
 		visiting.add(key);
-		const body = module === '.' ? entryBody : modules.get(module)?.body;
-		if (body?.some(s => declares(s.type === 'export_decl' ? s.declaration : s, name)))
+		if ((module === '.' ? entryBody : modules.get(module)?.body)?.some(s => declares(s.type === 'export_decl' ? s.declaration : s, name)))
 			return { module, name };
 		for (const { stmt, module: target } of reexports.get(module) ?? []) {
 			if (stmt.namespace)
