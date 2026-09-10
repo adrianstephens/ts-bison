@@ -3049,13 +3049,15 @@ async function main() {
 		`);
 		check('nested function declaration: recursion combined with an outer capture', recursiveWithCapture(), 6);
 
-		await checkThrows('nested function declaration: a call above its own declaration point is rejected (no hoisting)', () => compile(`
+		// Hoisted, as in JS: callable above its own declaration point (type-utils.ts's `resolve` calls `uncached` so).
+		const { forwardRef } = await compile(`
 			export function forwardRef(): number {
 				const r = helper(1);
 				function helper(x: number): number { return x + 1; }
 				return r;
 			}
-		`), /unknown function 'helper'/);
+		`);
+		check('nested function declaration: a call above its own declaration point (hoisted)', forwardRef(), 2);
 	}
 
 	{

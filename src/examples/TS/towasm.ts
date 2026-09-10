@@ -4788,7 +4788,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 			pending.forEach(st => emitStmt(st, fnCtx));
 			if (Array.isArray(body)) {
-				body.forEach(st => emitStmt(st, fnCtx));
+				emitStmts(body, fnCtx);
 				emitTrailingUnreachable(fnCtx, result);
 			} else {
 				emitStmt({ type: 'return', argument: body }, fnCtx);
@@ -6639,6 +6639,39 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 	}
 
+	// A nested `function` declaration is hoisted: callable before its own line. It is created just before the first
+	// statement in its list that mentions it -- closure creation has no side effects, and forward holders cover later siblings.
+	function emitStmts(stmts: readonly Stmt[], ctx: FunctionContext) {
+		const pending = new Map(stmts.flatMap(s => s.type === 'function_decl' && s.body ? [[s.name, s] as const] : []));
+		const freeNames = (s: Stmt) => {
+			const free = new Set<string>();
+			collectFreeVars(new Set(), [s], free);
+			return free;
+		};
+		const materialize = (fn: Extract<Stmt, { type: 'function_decl' }>) => {
+			pending.delete(fn.name);
+			const free = freeNames(fn);
+			for (const other of [...pending.values()])
+				if (pending.has(other.name) && free.has(other.name))
+					materialize(other);
+			emitStmt(fn, ctx);
+		};
+		for (const st of stmts) {
+			if (pending.size) {
+				const free = freeNames(st);
+				for (const fn of [...pending.values()])
+					if (fn !== st && pending.has(fn.name) && free.has(fn.name))
+						materialize(fn);
+			}
+			if (st.type === 'function_decl' && st.body) {
+				if (pending.has(st.name))
+					materialize(st);
+				continue;
+			}
+			emitStmt(st, ctx);
+		}
+	}
+
 	function emitStmt(s: Stmt, ctx: FunctionContext): void {
 		ctx.stmtScope = (s as any).scope as Scope ?? ctx.stmtScope;
 		switch (s.type) {
@@ -6646,7 +6679,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				return;
 
 			case 'block':
-				ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
+				ctx.inScope(() => emitStmts(s.body, ctx));
 				return;
 
 			case 'var_decl':
@@ -7058,7 +7091,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							for (let k = 0; k < n; k++) {
 								ctx.exitLabel();
 								ctx.out = [I.block(undefined, content)];
-								s.cases[k].consequent.forEach(st => emitStmt(st, ctx));
+								emitStmts(s.cases[k].consequent, ctx);
 								content = ctx.out;
 							}
 							ctx.exitBreakTarget();
@@ -7098,7 +7131,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					for (let i = 0; i < n; i++) {
 						ctx.exitLabel();
 						ctx.out = [I.block(undefined, content)];
-						s.cases[i].consequent.forEach(st => emitStmt(st, ctx));
+						emitStmts(s.cases[i].consequent, ctx);
 						content = ctx.out;
 					}
 					ctx.exitBreakTarget();
@@ -7141,7 +7174,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (!s.finalizer) {
 					const saved			= ctx.swapOut();
 					ctx.enterLabel(3);
-					ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
+					ctx.inScope(() => emitStmts(s.body, ctx));
 					
 					ctx.emit(I.br(2));	//ctx.depth - $after
 					ctx.exitLabel();
@@ -7158,7 +7191,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						} else {
 							ctx.emit(I.drop);
 						}
-						s.handlers[0].body.forEach(st => emitStmt(st, ctx));
+						emitStmts(s.handlers[0].body, ctx);
 					});
 
 					ctx.exitLabel();
@@ -7231,7 +7264,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// A's own exceptions: our single project-wide tag is the only thing this compiler ever throws, so the ordinary tag-catch below already covers 'try' exhaustively --
 						// no 'catch_all_ref' needed on *this* try_table (unlike the one below, for B).
 						ctx.enterLabel(2);			// $catchLand, try_table (A)'s own implicit level
-						ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
+						ctx.inScope(() => emitStmts(s.body, ctx));
 						ctx.emit(I.br(ctx.depth - afterDepth));
 						ctx.exitLabel();
 						ctx.emit(I.try_table(undefined, [wasm.Catch.tag(ensureExceptionTag(), 0)], ctx.swapOut()));
@@ -7256,7 +7289,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							// guarantees every exception B might throw is caught before 'finally' needs to run.
 							const catchHandlerSaved = ctx.swapOut();
 							ctx.enterLabel();			// try_table (B)'s own implicit level
-							s.handlers[0].body.forEach(st => emitStmt(st, ctx));
+							emitStmts(s.handlers[0].body, ctx);
 						ctx.closeScope();
 
 						ctx.emit(I.br(ctx.depth - afterDepth));
@@ -7266,7 +7299,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					} else {
 						// No 'catch' clause -- 'finally' alone needs only the safety net around A itself.
 						ctx.enterLabel();			// try_table's own implicit level
-						ctx.inScope(() => s.body.forEach(st => emitStmt(st, ctx)));
+						ctx.inScope(() => emitStmts(s.body, ctx));
 						ctx.emit(I.br(ctx.depth - afterDepth));
 						ctx.exitLabel();
 						ctx.emit(I.try_table(undefined, [wasm.Catch.allRef(ctx.depth - catchAllDepth)], ctx.swapOut()));
@@ -7285,7 +7318,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					ctx.exitLabel();				// exit $land
 					ctx.emit(I.block(undefined, ctx.swapOut(saved)));
 
-					ctx.inScope(() => s.finalizer!.forEach(st => emitStmt(st, ctx)));
+					ctx.inScope(() => emitStmts(s.finalizer!, ctx));
 
 					// Re-dispatch: exactly one of these ever actually fires per call (the action codes above
 					// are mutually exclusive), each gated by its own 'if' so the validator only ever checks
@@ -7617,7 +7650,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 				ctx.ownBody = decl.body!;
 				ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
-				decl.body!.forEach(st => emitStmt(st, ctx));
+				emitStmts(decl.body!, ctx);
 				emitTrailingUnreachable(ctx, result);
 				info.body		= ctx.toFuncBody(params.length, toValType);
 			}));
@@ -7814,7 +7847,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					const sentField = sentBindings.get(id);
 					if (sentField !== undefined)
 						fnCtx.emit(I.local.get(frameLocal.index), I.local.get(sentParam.index), I.struct.set(frameTypeIndex, sentField));
-					machine.segments[id].stmts.forEach(st => emitStmt(st, fnCtx));
+					emitStmts(machine.segments[id].stmts, fnCtx);
 				},
 				(next, resumeId) => {
 					if (next.kind !== 'yield')
@@ -8018,7 +8051,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						coerceTop(REF_ANY, fnCtx, sentField.wtype);
 						fnCtx.emit(I.struct.set(frameTypeIndex, sentField.index));
 					}
-					machine.segments[id].stmts.forEach(st => emitStmt(st, fnCtx));
+					emitStmts(machine.segments[id].stmts, fnCtx);
 				},
 				(next, resumeId, loopMark) => {
 					if (next.kind !== 'await')
@@ -8831,7 +8864,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// `cls`'s own `thisWtype`/`typeIndex` already say so; ordinary statement compilation does the right thing once `ctx.ctorThis` is unset.
 			const last = ctor.body?.at(-1);
 			if (last?.type === 'return' && last.argument) {
-				ctor.body!.forEach(st => emitStmt(st, ctx));
+				emitStmts(ctor.body!, ctx);
 
 			// Defaultability is a whole-struct-type property, not per-field -- one object-typed field forces the collect-then-`struct.new` path for the whole class.
 			} else if (cls.fields.some(f => typeof f.wtype !== 'string')) {
@@ -9026,7 +9059,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 			ctx.ownBody = decl.body!;
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
-			decl.body!.forEach(st => emitStmt(st, ctx));
+			emitStmts(decl.body!, ctx);
 			emitTrailingUnreachable(ctx, result);
 			info.body = ctx.toFuncBody((isStatic ? 0 : 1) + params.length, toValType);
 		}, key));
