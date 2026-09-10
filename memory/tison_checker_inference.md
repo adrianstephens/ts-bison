@@ -49,4 +49,18 @@ four were TRUE POSITIVES that TypeScript's own `.errors.txt` baselines require (
 `assistant/corpus-errdump.ts` and check the TS baseline before believing a regression. See
 [[tison_corpus_errdump]].
 
+**Const contexts and template literals (`87e2045`, 2026-09-10).** `as const` / a `const` type
+param's argument make a READONLY TUPLE (`CONST_CONTEXT` travels as the expected type, so the
+`recurseCache` stays sound). Making `E4 = [...] as const` a real tuple exposed two older gaps:
+`inferTypeArgs` fixed `T` from a tuple's FIRST element against `readonly T[]` (now pools and unions
+every element), and template literal types were NEVER evaluated -- a `Literal` whose value is a
+parts array, which `isLiteral(t, 'string')` also accepts. `resolve` now expands finite ones to their
+cross product (`expandTemplate`); unexpandable ones match as a regex (`templatePattern`).
+
+**Probe traps found doing it**: (1) `isAssignable(string, 'x')` is TRUE by design (widened-source
+leniency) and declarations widen their init first, so `const f: 'x' = 'q'` is SILENT -- a probe on a
+literal mismatch needs `as const` or a non-literal source. (2) A read of a missing member on an
+OPAQUE type is silently `any`, so a "does this key exist" probe proves nothing; assert the member's
+TYPE (`const bad: string = s.yx` must error). (3) test-ts-parser prints its errors to STDERR.
+
 Related: [[tison_nominal_class_refs]], [[tison_towasm_self_hosting_plan]].
