@@ -2,7 +2,7 @@ import * as path from 'path';
 import { makeRule, Rules, terminal, OneOf, List, Forward, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
-import { Literal, Identifier, Unary, UnaryPost, Binary, Assign, stampPos } from '../common';
+import { Module, Literal, Identifier, Unary, UnaryPost, Binary, Assign, stampPos } from '../common';
 import type * as Common from '../common';
 
 // ===================================================================
@@ -200,7 +200,6 @@ export interface ParamList<P = ParameterDecl>		{ params: P[]; variadic?: boolean
 
 export interface FunctionDef<D = Declarator, X = never, E = never, S = never>		{ type: 'function_def'; specifiers: DeclarationSpec<X>; declarator: D; body: Block<D, X, E, S>; }
 export type Definition<D = Declarator, X = never, E = never, S = never>			= Declaration<D, X, E> | TypedefDecl<D, X, E> | FunctionDef<D, X, E, S>;
-export interface TranslationUnit<D = Declarator, X = never, E = never, S = never>	{ type: 'translation_unit'; body: Definition<D, X, E, S>[]; }
 
 export interface Block<D = Declarator, X = never, E = never, S = never>			{ type: 'block'; body: Stmt<D, X, E, S>[]; }
 export interface ForClauses<D = Declarator, X = never, E = never>		{ init: Expr<E> | Declaration<D, X, E> | TypedefDecl<D, X, E> | undefined; test?: Expr<E>; update?: Expr<E>; }
@@ -564,8 +563,8 @@ external_definition = Rules<Definition>(
 	Rule([function_definition], 								$ => $[0]),
 ),
 
-translation_unit = Rules<TranslationUnit>(self => [
-	Rule([external_definition], 								$ => ({ type: 'translation_unit', body: [$[0]] })),
+translation_unit = Rules<Module<Definition>>(self => [
+	Rule([external_definition], 								$ => ({ type: 'module', body: [$[0]] })),
 	Rule([self, external_definition], 							$ => ({ ...$[0], body: [...$[0].body, $[1]] })),
 ]);
 

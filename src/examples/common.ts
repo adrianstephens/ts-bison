@@ -146,6 +146,8 @@ export interface Labeled<B>			{ type: 'labeled'; label: string; body: B }
 export interface Handler<S, P = unknown>	{ param?: P; body: S[] }
 export interface Try<S, P = unknown>		{ type: 'try'; body: S[]; handlers: Handler<S, P>[]; finalizer?: S[] }
 
+export interface Module<S> 			{ type: 'module'; body: S[]; scope?: unknown; filename?: string }
+
 // ===================================================================
 //  Body access
 // ===================================================================

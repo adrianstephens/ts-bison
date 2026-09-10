@@ -1,5 +1,6 @@
 import * as TS from './ts-parser';
 import * as fs from 'fs/promises';
+import {Module} from '../common';
 import * as path from 'path';
 
 export const OptionsDefault = {
@@ -46,7 +47,7 @@ async function tryLoadFile(full: string): Promise<string | undefined> {
 }
 
 export interface LoadedModule {
-	program:	TS.Module;
+	program:	Module<TS.Stmt>;
 	canonical:	string;	// relative import *inside* that module must resolve relative to where the module really lives
 	filename?:	string;	// the real file this came from -- what CommonJS derives a module's own `__filename`/`__dirname` from
 }
@@ -353,7 +354,7 @@ export class ModuleLoader {
 // (matching every real import in this monorepo's own self-hosting target files) -- a re-exporting
 // `export ... from` isn't resolved here, a real, narrower, separate gap if one is ever found in practice.
 export async function collectModules(entryBody: TS.Stmt[], loader: ModuleLoader) {
-	const modules = new Map<string, TS.Module>();
+	const modules = new Map<string, Module<TS.Stmt>>();
 	const namedImports = new Map<string, Map<string, { module: string; name: string }>>();
 	const seen = new Set<string>(['.']);
 

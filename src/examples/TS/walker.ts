@@ -1,8 +1,8 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
+import { Literal, Module } from '../common';
 import * as W from '../walker';
 import {mapObject, mapArray, mapArrayA, mapDefined, makeProcess, makeProcessB} from '../walker';
-import { Literal } from '../common';
 
 // ===================================================================
 //  Type Guards
@@ -15,7 +15,7 @@ export function guard<R>(types: string[]) {
 
 const stmts = ['block', 'var_decl', 'expression', 'empty', 'if', 'do_while', 'while', 'for', 'for_in', 'continue', 'break', 'return', 'with', 'labeled', 'switch', 'throw', 'try', 'debugger', 'function_decl', 'import', 'export', 'export_decl', 'class_decl'];
 
-export const isModule			= guard<TS.Module|JS.Module<any>>(['module']);
+export const isModule			= guard<Module<any>>(['module']);
 const typeTags = guard<Type>(['ref', 'literal', 'range', 'template_literal', 'this', 'array', 'tuple', 'union', 'intersection', 'function', 'constructor', 'object', 'keyof', 'typeof', 'indexed_access', 'conditional', 'infer', 'mapped', 'predicate']);
 // 'object'/'array'/'function' are real tags shared with JS.Expr's object/array-literal and function-expression
 // nodes (same string, different shape: Type has members/element/no body, Expr has properties/elements/body), so
@@ -29,8 +29,8 @@ export const isJsStatement		= guard<TS.Stmt>(stmts);
 type Type	= TS.Type;
 type Expr	= TS.Expr;
 type Stmt	= TS.Stmt;
-export type Walkable0 = Stmt | Expr | Type;
-export type Walkable = Stmt | Expr | Type | TS.Module | Stmt[];
+export type Walkable0	= Stmt | Expr | Type;
+export type Walkable	= Walkable0 | Module<Stmt> | Stmt[];
 
 //-----------------------------------------------------------------------------
 // Constant folding

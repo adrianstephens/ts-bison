@@ -1,5 +1,6 @@
 import * as C from './c-parser';
 import * as CPP from './cpp-parser';
+import { Module } from '../common';
 import { isTranslationUnit, isDefinition, isStatementOnly, isExpr, isClassMember, isDeclarator, isPackParameter } from './walker';
 
 type Definition			= CPP.Definition;
@@ -99,7 +100,7 @@ export class Output {
 		this.comma		= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: C.TranslationUnit | Definition | Stmt | Expr | ClassMember): string {
+	toCode(ast: Module<Definition> | Definition | Stmt | Expr | ClassMember): string {
 		if (isTranslationUnit(ast))
 			return ast.body.map(d => this.definition(d)).join(this.opts.newline);
 		if (isClassMember(ast))

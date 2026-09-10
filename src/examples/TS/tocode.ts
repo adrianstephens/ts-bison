@@ -1,6 +1,6 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
-import { Literal, hasMod } from '../common';
+import { Module, Literal, hasMod } from '../common';
 import { isModule, isType, isJsStatement, guard, isTsDeclaration } from './walker';
 
 type Type	= TS.Type;
@@ -162,7 +162,7 @@ export class Output {
 		this.comma		= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: JS.Module<unknown> | TS.Module | TS.Stmt | Type | Expr | TS.Stmt[]) {
+	toCode(ast: Module<any> | TS.Stmt | Type | Expr | TS.Stmt[]) {
 		if (Array.isArray(ast))
 			return ast.map(s => this.statement(s)).join(this.opts.newline);
 		if (isModule(ast))

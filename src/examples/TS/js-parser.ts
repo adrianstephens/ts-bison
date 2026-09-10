@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { type RecoveryCallback, type MergeValues, type Token, type LALRParser, type TermLike, makeRule, Rules, terminal, Manual, makeParser, Forward, List, Maybe, OneOf, ForceFork, WithPrec } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
-import { Literal, Identifier, Unary, UnaryPost, Binary, Assign, Await, mergeMods, withDefault, stampPos } from '../common';
+import { Literal, Identifier, Unary, UnaryPost, Binary, Assign, Await } from '../common';
 import * as Common from '../common';
 
 // ===================================================================
@@ -221,9 +221,6 @@ export type Stmt<T, X = never> = Declaration<T>
 	| ExportDecl<T>
 	| Import
 
-export interface Module<T = any> { type: 'module'; body: Stmt<T>[]; }
-
-
 // ===================================================================
 //  terminals
 // ===================================================================
@@ -311,9 +308,7 @@ const REGEX_LITERAL = terminal('regex',
 //  Grammar
 // ===================================================================
 
-export type { Location } from '../common';
-
-export const Rule = makeRule<any>(stampPos);
+export const Rule = makeRule<any>(Common.stampPos);
 
 // `=` has no base operator; every other form drops its trailing `=` ONCE, here, so nothing downstream
 // has to slice a string to find it again.
@@ -475,9 +470,9 @@ export const parameter = Rules<Param<any>>(
 	optional_binding_name,
 	ForceFork(Rule([optional_binding_name, '=', fwd_assignment_expression],	$ => ({ ...$[0], default: $[2] } as const))),
 	Rule([object_pattern],													$ => Param($[0])),
-	Rule([object_pattern, '=', fwd_assignment_expression],					$ => withDefault(Param($[0]), $[2])),
+	Rule([object_pattern, '=', fwd_assignment_expression],					$ => Common.withDefault(Param($[0]), $[2])),
 	Rule([array_pattern],													$ => Param($[0])),
-	Rule([array_pattern, '=', fwd_assignment_expression],					$ => withDefault(Param($[0]), $[2])),
+	Rule([array_pattern, '=', fwd_assignment_expression],					$ => Common.withDefault(Param($[0]), $[2])),
 	// Parameter decorators (`method(@dec x) {}`) are wired up near the bottom of the file (see `DECORATED_PARAMETER`),
 	// once `decorator_list`/`skip` both exist -- via `Manual()`, not a direct rule reaching this widely-shared
 	// nonterminal from a new position (that shape corrupts unrelated ASI recovery via LALR state-sharing, see
@@ -924,11 +919,11 @@ export const class_member_name = Rules<KeyMods<any>>(
 
 export const class_member_body = Rules<Method<any> | Field<any>>(
 	Rule([class_member_name, parameter_clause, '{', function_body, '}'], 				$ => Method('method', $[0].key, $[1], $[3], $[0].modifiers)),
-	Rule(['*', class_member_name, parameter_clause, '{', function_body, '}'], 			$ => Method('method', $[1].key, $[2], $[4], mergeMods($[1].modifiers, ['generator']))),
+	Rule(['*', class_member_name, parameter_clause, '{', function_body, '}'], 			$ => Method('method', $[1].key, $[2], $[4], Common.mergeMods($[1].modifiers, ['generator']))),
 	Rule([GET, property_name_computed, '(', ')', '{', function_body, '}'], 				$ => Method('get', $[1], {params: []}, $[5])),
 	Rule([SET, property_name_computed, '(', IDENT, ')', '{', function_body, '}'], 		$ => Method('set', $[1], {params: [{key: $[3]}]}, $[6])),
-	Rule([ASYNC, class_member_name, parameter_clause, '{', function_body, '}'], 		$ => Method('method', $[1].key, $[2], $[4], mergeMods($[1].modifiers, ['async']))),
-	Rule([ASYNC, '*', class_member_name, parameter_clause, '{', function_body, '}'],	$ => Method('method', $[2].key, $[3], $[5], mergeMods($[2].modifiers, ['async', 'generator']))),
+	Rule([ASYNC, class_member_name, parameter_clause, '{', function_body, '}'], 		$ => Method('method', $[1].key, $[2], $[4], Common.mergeMods($[1].modifiers, ['async']))),
+	Rule([ASYNC, '*', class_member_name, parameter_clause, '{', function_body, '}'],	$ => Method('method', $[2].key, $[3], $[5], Common.mergeMods($[2].modifiers, ['async', 'generator']))),
 	Rule([class_member_name, ';'], 														$ => Field($[0].key, undefined, undefined, $[0].modifiers)),
 	Rule([class_member_name, '=', assignment_expression, ';'], 							$ => Field($[0].key, $[2], undefined, $[0].modifiers)),
 );
@@ -1151,7 +1146,7 @@ export const module_item = Rules(
 	}),
 );
 
-export const program = Rules<Module<any>>(
+export const program = Rules<Common.Module<Stmt<any>>>(
 	Rule([],										_ => ({ type: 'module', body: [] })),
 	Rule([List(module_item)],						$ => ({ type: 'module', body: $[0] })),
 );

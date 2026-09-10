@@ -1,4 +1,5 @@
 import * as PY from './py-parser';
+import { Module } from '../common';
 import * as W from '../walker';
 import {mapObject, mapArrayA, mapDefined, makeProcess, makeProcessB} from '../walker';
 
@@ -25,7 +26,7 @@ const stmtTags = [
 	'try', 'funcdef', 'classdef',
 ];
 
-export const isModule	= guard<PY.Module>(['module']);
+export const isModule	= guard<Module<PY.Stmt>>(['module']);
 export const isExpr		= guard<PY.Expr>(exprTags);
 // `for` / `if` are also comprehension-clause tags -- those never appear as standalone nodes (only
 // inside a comprehension's `gens`), so they're walked inline and left out of `stmtTags`.
@@ -34,7 +35,7 @@ export const isStmt		= guard<PY.Stmt>(stmtTags);
 type Expr = PY.Expr;
 type Stmt = PY.Stmt;
 export type Walkable0 = Stmt | Expr;
-export type Walkable = Walkable0 | PY.Module | Stmt[];
+export type Walkable = Walkable0 | Module<PY.Stmt> | Stmt[];
 
 // ===================================================================
 //  Constant folding

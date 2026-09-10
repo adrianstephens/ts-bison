@@ -1,4 +1,5 @@
 import * as PY from './py-parser';
+import { Literal, Module } from '../common';
 import { isModule, isStmt } from './walker';
 
 type Expr = PY.Expr;
@@ -87,7 +88,7 @@ export class Output {
 		this.comma	= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: PY.Module | Stmt | Stmt[] | Expr): string {
+	toCode(ast: Module<Stmt> | Stmt | Stmt[] | Expr): string {
 		if (isModule(ast))
 			return ast.body.map(s => this.statement(s)).join(this.newline);
 		if (Array.isArray(ast))

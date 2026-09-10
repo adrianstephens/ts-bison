@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-unused-expressions */
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
-import { Literal, hasMod } from '../common';
+import { Literal, hasMod, Location } from '../common';
 import { isTsDeclaration, walkB } from './walker';
 import * as T from './type-utils';
 
@@ -11,7 +11,7 @@ export const SEVERITY = {
 	ERROR:		2,
 } as const;
 export type SEVERITY = (typeof SEVERITY)[keyof typeof SEVERITY];
-export type Err = (sev: SEVERITY, pos: JS.Location) => (strings: TemplateStringsArray, ...values: any[]) => void;
+export type Err = (sev: SEVERITY, pos: Location) => (strings: TemplateStringsArray, ...values: any[]) => void;
 
 type Type		= TS.Type;
 type Expr		= TS.Expr;
@@ -754,7 +754,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 
 // Tries `T.isAssignable` strict then lax; a GAP means strict failed only due to an opaque type (keyof/conditional/infer/mapped).
 // Every real assignability check should go through this, not `T.isAssignable` directly. `dstScope` resolves `dst`'s own structure.
-function checkAssignable(src: Type, dst: Type, scope: Scope, pos: JS.Location, dstScope: Scope, err: Err): boolean {
+function checkAssignable(src: Type, dst: Type, scope: Scope, pos: Location, dstScope: Scope, err: Err): boolean {
 	if (T.isAssignable(src, dst, scope, dstScope, true))
 		return true;
 	const lax = T.isAssignable(src, dst, scope, dstScope, false);
@@ -764,7 +764,7 @@ function checkAssignable(src: Type, dst: Type, scope: Scope, pos: JS.Location, d
 };
 
 // A fresh object literal assigned to a fully-known object type may not introduce unknown keys
-function checkExcessProps(lit: Expr, target: Type, pos: JS.Location, targetScope: Scope, err: Err) {
+function checkExcessProps(lit: Expr, target: Type, pos: Location, targetScope: Scope, err: Err) {
 	if (lit.type !== 'object')
 		return;
 
@@ -1041,7 +1041,7 @@ export function exportScope(body: Stmt[], parent: Scope, filename?: string): { s
 
 // Instantiates `sig` against `argTs`, substituting type params through params/return type. Pure -- doesn't validate (see `argsFit`).
 // `restElementTs`: a spread argument's element type(s), since `argTs` leaves a spread position `undefined` (arity unknown statically).
-function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, pos: JS.Location, restElementTs?: Type[], expected?: Type, err?: Err): TS.CallSig {
+function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, pos: Location, restElementTs?: Type[], expected?: Type, err?: Err): TS.CallSig {
 	let returnType	= sig.returnType ?? T.ANY;
 	let params		= sig.params;
 

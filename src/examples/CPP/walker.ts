@@ -1,7 +1,8 @@
 import * as C from './c-parser';
 import * as CPP from './cpp-parser';
+import { Module } from '../common';
 import * as W from '../walker';
-import {mapObject, mapArray, mapArrayA, mapDefined, makeProcess, makeProcessB} from '../walker';
+import { mapObject, mapArray, mapArrayA, mapDefined, makeProcess, makeProcessB } from '../walker';
 
 type Definition			= CPP.Definition;
 type Stmt				= CPP.Stmt;
@@ -37,7 +38,7 @@ const classMemberTags	= ['struct_member', 'member_typedef', 'access_label', 'con
 const declaratorTags	= ['identifier', 'pointer', 'array', 'function', 'reference', 'rvalue_reference'];
 const packParamTags	= ['parameter']; // both ParameterDecl and PackParameter use this tag; distinguished by `pack`
 
-export const isTranslationUnit	= guard<C.TranslationUnit>(['translation_unit']);
+export const isTranslationUnit	= guard<Module<Definition>>(['module']);
 export const isDefinition		= guard<Definition>(definitionTags);
 export const isStatementOnly	= guard<Stmt>(statementOnlyTags);
 export const isExpr				= guard<Expr>(exprTags);
@@ -50,7 +51,7 @@ export const isPackParameter	= (p: ParamDecl): p is CPP.PackParameter => !!packP
 //-----------------------------------------------------------------------------
 
 export type Walkable0 = Definition | Stmt | Expr | ClassMember;
-export type Walkable = C.TranslationUnit | Definition | Stmt | Expr | ClassMember | Stmt[] | Definition[] | ClassMember[];
+export type Walkable = Walkable0 | Walkable0[] | Module<Definition>;
 
 type Recurse		= W.Recurse<Walkable0>;
 type OnAST<U>		= W.OnAST<U, Recurse>;
@@ -333,7 +334,7 @@ export function walk<T extends Walkable>(ast: T,
 type RecurseB		= W.RecurseB<Walkable>
 type OnASTB<U>		= W.OnASTB<U, RecurseB>;
 
-export function walkB<T extends C.TranslationUnit | Definition | Stmt | Expr | ClassMember | Stmt[] | Definition[] | ClassMember[]>(ast: T,
+export function walkB<T extends Walkable>(ast: T,
 	onDefinition?:	OnASTB<Definition>,
 	onStatement?:	OnASTB<Stmt>,
 	onExpression?:	OnASTB<Expr>,

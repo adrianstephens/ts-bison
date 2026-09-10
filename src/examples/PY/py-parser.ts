@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { terminal, OneOf, List, MaybeList, Forward, Rules, makeRule, Terminal, type RecoveryCallback } from '../../tison';
 import { makeCachedParser } from '../../tableCache';
-import { Literal, Identifier, Unary, Binary, stampPos } from '../common';
+import { Module, Literal, Identifier, Unary, Binary, stampPos } from '../common';
 import type * as Common from '../common';
 
 // ===================================================================
@@ -288,8 +288,6 @@ export interface WithItem { context: Expr; optional_vars?: Expr }
 export interface ExceptHandler extends Common.Handler<Stmt, string> { star: boolean; type?: Expr }
 // `orelse` is the `else:` clause -- Python-only, so `Try` is extended rather than aliased.
 export interface TryStmt extends Common.Try<Stmt, string> { handlers: ExceptHandler[]; orelse: Stmt[]; finalizer: Stmt[] }
-
-export interface Module { type: 'module'; body: Stmt[] }
 
 interface DictEntry { key: Expr | null; value: Expr }
 interface CommaList { items: Expr[]; trailing: boolean }
@@ -876,7 +874,7 @@ stmt = Rules<Stmt[]>(
 	Rule([compound_stmt],			$ => [$[0]]),
 ),
 
-file_input = Rules<Module>(
+file_input = Rules<Module<Stmt>>(
 	Rule([],						() => ({ type: 'module', body: [] })),
 	Rule([stmts],					$ => ({ type: 'module', body: $[0] })),
 );
@@ -920,6 +918,6 @@ export const parser = makeCachedParser({
 	recover,
 }, path.join(__dirname, '../../../.tables-cache/py-parser.json.gz'));
 
-export function parse(code: string): Module {
+export function parse(code: string): Module<Stmt> {
 	return parser.parse(code, newCtx());
 }

@@ -10,7 +10,7 @@ import { Output as PYOutput, Options as PYOptions } from './PY/tocode';
 import { Output as TSOutput, Options as TSOptions } from './TS/tocode';
 import { Output as CPPOutput, Options as CPPOptions } from './CPP/tocode';
 import { isExpr as isCppExprNode, isPackParameter as isCppPackParameter } from './CPP/walker';
-import { bodyOf, Identifier, Literal, Unary, UnaryPost, Binary, Call, Member, Index, Conditional, Spread, Sequence, Assign, Await, Yield, ExprStmt, Return, Throw, If, While, DoWhile } from './common';
+import { Module, bodyOf, Identifier, Literal, Unary, UnaryPost, Binary, Call, Member, Index, Conditional, Spread, Sequence, Assign, Await, Yield, ExprStmt, Return, Throw, If, While, DoWhile } from './common';
 
 const pyUnsupported		= (what: string): never => { throw new Error(`transpile: ${what} has no Python equivalent`); };
 const tsUnsupported		= (what: string): never => { throw new Error(`transpile: ${what} has no TypeScript equivalent`); };
@@ -50,10 +50,9 @@ const UNARY: Partial<Record<JS.unaryOps, PY.unaryOps>> = {
 	'!':	'not'
 };
 
-const bindName	= (b: JS.BindingTarget): string 	=> typeof b === 'string' ? b : pyUnsupported('destructuring');
-const isVarDecl	= (x: JS.ForInit<TS.Type>): x is JS.VarDecl<TS.Type> => x.type === 'var_decl';
+const isJSVarDecl	= (x: JS.ForInit<TS.Type>): x is JS.VarDecl<TS.Type> => x.type === 'var_decl';
 
-function TS2PY(ts: TS.Module) {
+function TS2PY(ts: Module<TS.Stmt>) {
 	// [~] the one piece of context the translation needs: Python's `super().__init__` / explicit-base
 	// call has no direct JS counterpart, so the enclosing class's base name is threaded down.
 	let superName: string | undefined;
@@ -80,6 +79,7 @@ function TS2PY(ts: TS.Module) {
 	const fstring	= (parts: JS.TemplatePart<TS.Expr>[]): PY.FStringLit =>
 		({ type: 'fstring', parts: parts.map(p => ({ text: p.str, field: p.exp && { expr: expr(p.exp) } })) });
 
+	const bindName	= (b: JS.BindingTarget): string 	=> typeof b === 'string' ? b : pyUnsupported('destructuring');
 	const keyExpr	= (k: JS.Key): PY.Expr				=> typeof k === 'string' ? Literal(k) : expr(k.computed);
 	const keyName	= (k: JS.Key): string				=> typeof k !== 'string' ? pyUnsupported('computed member name') : k === 'constructor' ? '__init__' : k;
 	const param		= (p: JS.Param<TS.Type>): PY.Param	=> ({ name: bindName(p.key), default: p.default && expr(p.default) });
@@ -90,7 +90,7 @@ function TS2PY(ts: TS.Module) {
 	const nonEmpty	= (body: PY.Stmt[]): PY.Stmt[] => body.length ? body : [{ type: 'pass' }];
 	const orelse	= (b: TS.Stmt | readonly TS.Stmt[] | undefined): PY.Stmt[] => b === undefined ? [] : body(b);
 
-	const forTarget	= (init: JS.ForInit<TS.Type>): PY.Expr => isVarDecl(init) ? Identifier(bindName(init.declarations[0].name)) : expr(init);
+	const forTarget	= (init: JS.ForInit<TS.Type>): PY.Expr => isJSVarDecl(init) ? Identifier(bindName(init.declarations[0].name)) : expr(init);
 
 	// [~] type annotations are a whole separate AST domain; only the simplest refs carry over
 	const PYTYPE: Record<string, string> = { number: 'float', string: 'str', boolean: 'bool', void: 'None', any: 'object', unknown: 'object' };
@@ -214,7 +214,7 @@ function TS2PY(ts: TS.Module) {
 					orelse:		[],
 					is_async:	false }
 				] :	s.kind === 'normal' ? [
-					...(s.init ? isVarDecl(s.init) ? stmt(s.init) : [exprStmt(s.init)] : []),
+					...(s.init ? isJSVarDecl(s.init) ? stmt(s.init) : [exprStmt(s.init)] : []),
 					While(s.test ? expr(s.test) : Literal(true),[...body(s.body), ...(s.update ? [exprStmt(s.update)] : [])]),
 				] :	pyUnsupported(`for kind '${s.kind}'`);
 
@@ -302,7 +302,7 @@ export function ts2py(source: string, opts?: PYOptions): string {
 //  Same [=]/[~] convention as the section above; `pyUnsupported` plays the same role as `unsupported`.
 // ===================================================================
 
-const isSuperCall = (e: PY.Expr): boolean => e.type === 'call' && e.callee.type === 'identifier' && e.callee.name === 'super' && e.arguments.length === 0;
+const isPYSuperCall = (e: PY.Expr): boolean => e.type === 'call' && e.callee.type === 'identifier' && e.callee.name === 'super' && e.arguments.length === 0;
 const PY_BINARY = reverse(BINARY);
 const PY_UNARY = reverse(UNARY);
 
@@ -323,7 +323,7 @@ class PYScopes {
 	pop() { this.scopes.pop(); }
 }
 
-function PY2TS(py: PY.Module) {
+function PY2TS(py: Module<PY.Stmt>) {
 
 	//const PY_COMPARE1 = reverse(COMPARE);
 	const PY_COMPARE: Partial<Record<PY.compareOps, JS.compareOps>> = {
@@ -441,11 +441,11 @@ function PY2TS(py: PY.Module) {
 
 			// [~] `super().__init__(...)` / `super().m(...)` -> TS's `super(...)` / `super.m(...)`
 			case 'call': {
-				if (e.callee.type === 'member' && isSuperCall(e.callee.object))
+				if (e.callee.type === 'member' && isPYSuperCall(e.callee.object))
 					return e.callee.property === '__init__'
 						?	Call({ type: 'super' } as TS.Expr, args(e.arguments))
 						:	Call(Member({ type: 'super' } as TS.Expr, e.callee.property), args(e.arguments));
-				if (isSuperCall(e))
+				if (isPYSuperCall(e))
 					return tsUnsupported('bare `super()` (only `super().x(...)` translates)');
 				return Call(expr(e.callee), args(e.arguments));
 			}
@@ -639,7 +639,7 @@ export function py2ts(source: string, opts?: TSOptions): string {
 //  other two directions do.
 // ===================================================================
 
-function CPP2TS(cpp: CPP.TranslationUnit) {
+function CPP2TS(cpp: Module<CPP.Definition>) {
 
 	// [~] tison's GLR engine forks on a genuine ambiguity (e.g. `T(x)` as a call vs. a functional-style
 	// cast) and, when neither branch dies, leaves BOTH survivors behind as an array instead of one node --
@@ -1095,7 +1095,7 @@ function cppClassDecl(name: string, baseName: string | undefined, body: CPP.Clas
 //  PoC: TypeScript AST -> C++ AST -> C++ source.
 // ===================================================================
 
-function TS2CPP(ts: TS.Module) {
+function TS2CPP(ts: Module<TS.Stmt>) {
 	const TS_CPPTYPE: Record<string, string> = { number: 'double',
 		string:		'std::string',
 		boolean:	'bool',
@@ -1212,6 +1212,8 @@ function TS2CPP(ts: TS.Module) {
 			: expr(e);
 	}
 
+	const bindName	= (b: JS.BindingTarget): string 	=> typeof b === 'string' ? b : cppUnsupported('destructuring');
+
 	function varToCpp(v: JS.Var<TS.Type>): CPP.Stmt {
 		const name = bindName(v.name);
 		const type = v.typeAnnotation ? typeToSimple(v.typeAnnotation) : v.init ? SimpleRef('auto') : cppUnsupported('variable with neither a type annotation nor an initializer');
@@ -1242,10 +1244,10 @@ function TS2CPP(ts: TS.Module) {
 
 			case 'for':
 				if (s.kind === 'normal') {
-					const init = !s.init ? undefined : isVarDecl(s.init) ? s.init.declarations.map(varToCpp)[0] as unknown as C.Declaration : expr(s.init);
+					const init = !s.init ? undefined : isJSVarDecl(s.init) ? s.init.declarations.map(varToCpp)[0] as unknown as C.Declaration : expr(s.init);
 					return [{ type: 'for', init, test: s.test && expr(s.test), update: s.update && expr(s.update), body: block(s.body) }];
 				}
-				if (!isVarDecl(s.init) || s.init.declarations.length !== 1)
+				if (!isJSVarDecl(s.init) || s.init.declarations.length !== 1)
 					return cppUnsupported('`for`/`for-of` over an existing (non-declared) binding');
 				return [{ type: 'range_for', specifiers: simpleDeclSpec(typeToSimple(s.init.declarations[0].typeAnnotation)), declarator: Identifier(bindName(s.init.declarations[0].name)), range: expr(s.right), body: block(s.body) }];
 
@@ -1355,7 +1357,7 @@ function TS2CPP(ts: TS.Module) {
 	return ts.body.flatMap(topLevel);
 }
 export function ts2cpp(source: string, opts?: CPPOptions): string {
-	return new CPPOutput(opts).toCode({ type: 'translation_unit', body: TS2CPP(TS.parse(source)) } as unknown as C.TranslationUnit);
+	return new CPPOutput(opts).toCode({ type: 'module', body: TS2CPP(TS.parse(source)) });
 }
 
 // ===================================================================
@@ -1363,7 +1365,7 @@ export function ts2cpp(source: string, opts?: CPPOptions): string {
 //  Unlike ts2cpp, C++ genuinely supports multiple typed `catch` clauses, so `try`/`except` maps
 //  directly instead of needing the `instanceof` if/else-if desugaring `pyTry` (py2ts) uses.
 // ===================================================================
-function PY2CPP(py: PY.Module) {
+function PY2CPP(py: Module<PY.Stmt>) {
 
 	const PY_CPPTYPE: Record<string, string> = {
 		float:	'double',
@@ -1471,11 +1473,11 @@ function PY2CPP(py: PY.Module) {
 			// [~] `super().__init__(...)` only converts as a constructor's leading statement (see `pyClassMemberToCpp`);
 			// `super().m(...)` becomes an explicit qualified call, `Base::m(...)` (C++ has no `super` keyword)
 			case 'call': {
-				if (e.callee.type === 'member' && isSuperCall(e.callee.object))
+				if (e.callee.type === 'member' && isPYSuperCall(e.callee.object))
 					return e.callee.property === '__init__'
 						?	cppUnsupported("`super().__init__(...)` only converts as a constructor's first statement")
 						:	{ type: 'call', callee: { type: 'qualified', parts: [currentBase ?? cppUnsupported('`super()` outside a derived class'), e.callee.property] }, arguments: args(e.arguments) };
-				if (isSuperCall(e))
+				if (isPYSuperCall(e))
 					return cppUnsupported('bare `super()`');
 				return { type: 'call', callee: expr(e.callee), arguments: args(e.arguments) };
 			}
@@ -1596,7 +1598,7 @@ function PY2CPP(py: PY.Module) {
 		if (s.type !== 'expression' || s.expression.type !== 'call')
 			return undefined;
 		const call = s.expression;
-		if (call.callee.type !== 'member' || call.callee.property !== '__init__' || !isSuperCall(call.callee.object))
+		if (call.callee.type !== 'member' || call.callee.property !== '__init__' || !isPYSuperCall(call.callee.object))
 			return undefined;
 		return call.arguments.map(a => a.kind === 'pos' ? a.value : cppUnsupported("non-positional argument to 'super().__init__(...)'"));
 	}
@@ -1727,5 +1729,5 @@ function PY2CPP(py: PY.Module) {
 }
 
 export function py2cpp(source: string, opts?: CPPOptions): string {
-	return new CPPOutput(opts).toCode({ type: 'translation_unit', body: PY2CPP(PY.parse(source)) } as unknown as C.TranslationUnit);
+	return new CPPOutput(opts).toCode({ type: 'module', body: PY2CPP(PY.parse(source)) });
 }

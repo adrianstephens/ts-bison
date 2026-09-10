@@ -3,7 +3,8 @@ import * as path from 'path';
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
-import { Literal, Binary, Assign, Member, hasMod } from '../common';
+import * as Common from '../common';
+import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
 import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
 import { Walkable, walk, walkB } from './walker';
 import { Output } from './tocode';
@@ -126,6 +127,7 @@ import * as WAT from '../wat-parser';
 type Expr			= TS.Expr;
 type Type			= TS.Type;
 type Stmt			= TS.Stmt;
+type Module			= Common.Module<Stmt>;
 type BindingTarget	= JS.BindingTarget;
 type FunctionDecl	= JS.FunctionDecl<Type>;
 type MethodMember	= JS.Method<Type>;
@@ -138,7 +140,7 @@ const tocode = new Output({newline:'', indent:'', spaceAfterColon: false, spaceA
 
 class TSWError {
 	msg:	string;
-	pos?:	JS.Location;
+	pos?:	Location;
 	scope:	string[] = [];
 	constructor(err: string|TSWError, node?: any, ...scope: string[]) {
 		if (err instanceof TSWError) {
@@ -1633,7 +1635,7 @@ export function makeLibScope(): Scope {
 // down with it -- which is exactly what made the self-hosting survey attribute ~35 declarations to
 // whichever module-level statement happened to fail first. Omitted (the CLI's case) it rethrows, since a
 // module whose initialisation silently didn't run is not something to hand back without comment.
-export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
+export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
 		throw new TSWError('ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
@@ -1665,7 +1667,7 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 	// `LIB_AST` is a flat concatenation with no per-file identity, and the `moduleId === '.'` special
 	// cases in the scan below are all entry-only by design.
 	const LIB_MODULE			= '#lib';
-	const moduleBodies			= new Map<string, TS.Module>([['.', ast], ...(modules ?? [])]);
+	const moduleBodies			= new Map<string, Module>([['.', ast], ...(modules ?? [])]);
 	// That module's own scope, straight off its record -- the entry's from its own `Program`, an imported
 	// one put there by `makeScope` from `exportScope`'s `inner` (see `compileFunc`'s own note on why a
 	// module body needs one at all).

@@ -1,13 +1,12 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
-import { Identifier, Literal, Binary, Conditional, Assign, Await, Member, ExprStmt, hasMod, dropMod, If, While } from '../common';
+import { Module, Location, Identifier, Literal, Binary, Conditional, Assign, Await, Member, ExprStmt, hasMod, dropMod, If, While } from '../common';
 import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
 import { Output } from './tocode';
 
-type Location		= JS.Location;
 type Expr			= JS.Expr;
 type Stmt			= TS.Stmt;
 type BindingTarget	= JS.BindingTarget;
@@ -496,7 +495,7 @@ export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget,
 
 const dropOptional = (p: JS.Param<any>) => dropMod(p, 'optional');
 
-export function TStoJS(ast: TS.Module) {
+export function TStoJS(ast: Module<Stmt>) {
 	return walk(ast, 
 		//onStatement
 		(stmt, process) => {
@@ -628,7 +627,7 @@ function makeDiagnostic(func: (d: Diagnostic) => void): Err {
 	const clip		= (s: string, max = 60)	=> s.length > max ? s.slice(0, max - 3) + '...' : s;
 	const toString	= (v: any) => v === undefined ? '' : typeof v === 'string' ? v : renderer.toCode(v);
 
-	return (severity: SEVERITY, pos: JS.Location) => (strings: TemplateStringsArray, ...values: any[]) => func({
+	return (severity: SEVERITY, pos: Location) => (strings: TemplateStringsArray, ...values: any[]) => func({
 		severity,
 		message: ['GAP', 'WRN', 'ERR'][severity] + ': ' + strings.map((s, i) => s + clip(toString(values[i]))).join(''),
 		pos
@@ -654,7 +653,7 @@ function pushDepthExhaustionGap(depthHits: Map<string, number>, diagnostics: Dia
 // that consumer doesn't need to re-check the program a second time just to see those declarations from
 // a scope its own code actually reaches. Optional and defaults to a bare `T.makeGlobal()`, unchanged
 // from before, for callers with no such consumer (e.g. `TStoDecl`-only or checker-only use).
-export function TStypeCheck(ast: TS.Module, global: Scope): Diagnostic[] {
+export function TStypeCheck(ast: Module<Stmt>, global: Scope): Diagnostic[] {
 	const depthExhaustion = new Map<string, number>();
 	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
 
@@ -723,7 +722,7 @@ export async function loadLib(loader: ModuleLoader, libs: string[]): Promise<T.S
 // ancestor on top of whatever `options.lib` already loads (not merged with it); no current caller needs
 // both a real module-loaded lib set *and* a `TStoWasm`-style `libScope` at once, so a real combination
 // (e.g. copying `libScope`'s own bindings into the loaded scope) is left for whenever one actually does.
-export async function TStypeCheckAsync(program: TS.Module, loader: ModuleLoader, global: Scope) {
+export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoader, global: Scope) {
 	const diagnostics: Diagnostic[] = [];
 
 	// Resolves one `import` into `importScope` (shared by `makeScope` and the entry program); return value feeds
@@ -995,7 +994,7 @@ function resolveTypes(entryScope: Scope, importScope: Scope | undefined) {
 	};
 }
 
-export function TStoDecl(program: TS.Module, opts?: Partial<typeof OutputOptionsDefault>): TS.Module {
+export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOptionsDefault>): Module<Stmt> {
 	const options		= {...OutputOptionsDefault, ...opts};
 	const importScope	= program.scope as Scope | undefined;
 

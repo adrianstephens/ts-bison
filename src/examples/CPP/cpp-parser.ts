@@ -2,7 +2,7 @@ import * as path from 'path';
 import { makeRule, Rules, List, OneOf, termOneOf, terminal, WithPrec, removeRules, ForceFork} from '../../tison';
 import { makeCachedParser } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
-import { Literal, Identifier, stampPos } from '../common';
+import { Module, Literal, Identifier, stampPos } from '../common';
 import type * as Common from '../common';
 import * as C from './c-parser';
 
@@ -168,8 +168,6 @@ export type Definition = C.Definition<Declarator, TypeSpecifierExt, Expr, Stmt>
 	| OutOfClassDtor
 	| OperatorDef
 	| StaticMemberDef;
-
-export type TranslationUnit = C.TranslationUnit<Declarator, TypeSpecifierExt, Expr, Stmt>;
 
 // ===================================================================
 //  The TYPE_SCOPE lexer hack
@@ -1219,7 +1217,7 @@ const RIGHT_SHIFT_ASSIGN	= terminal('>>=', />>=/,	(_, ctx: CppCtx) => ctx.templa
 // c-parser.ts built (cpp's own productions are `.push()`ed onto `external_definition`, which this
 // reaches transitively), just seen here at cpp's own (widened) `TranslationUnit` type instead of C's
 // bare default -- this is what makes `CPP.parse()`'s return type cpp's own `TranslationUnit`.
-const translation_unit = C.translation_unit as unknown as Rules<TranslationUnit>;
+const translation_unit = C.translation_unit as unknown as Rules<Module<Definition>>;
 
 export const parser = makeCachedParser({
 	// On top of C's skips: attributes (`[[nodiscard]]`), `alignas(...)`, and MS calling-convention attributes are

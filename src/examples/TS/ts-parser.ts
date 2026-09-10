@@ -3,7 +3,7 @@ import { Rules, Forward, Maybe, List, MaybeList, OneOf, terminal, ForceFork } fr
 import { makeCachedParser } from '../../tableCache';
 import * as JS from './js-parser';
 import { IDENT, NUM, STR, EXPORT_KW, unquoteString, Rule } from './js-parser';
-import { Literal, UnaryPost, mergeMods, withDefault } from '../common';
+import * as Common from '../common';
 
 // ===================================================================
 //  TypeScript Parser -- an extension of js-parser
@@ -85,7 +85,7 @@ export function  Predicate(paramName: string, assertedType?: Type, asserts?: boo
 
 export type Type =
 	| RefType
-	| Literal<string | number | boolean | null | JS.TemplatePart<Type>[]>
+	| Common.Literal<string | number | boolean | null | JS.TemplatePart<Type>[]>
 	| RangeType
 	| ArrayType
 	| UnionType
@@ -130,7 +130,6 @@ export type ClassMember		= JS.ClassMember<Type>	| { type: 'index_signature'; par
 // way a TS-only declaration is legal in every NESTED statement position too (a block, an if branch, a
 // loop body), which is what it actually is -- `while (x) { type A = B; }` is real TypeScript.
 export type Stmt = JS.Stmt<Type, Declaration>;
-export interface Module { type: 'module'; body: Stmt[]; scope?: unknown; filename?: string }
 
 // ===================================================================
 //  terminals
@@ -408,14 +407,14 @@ const primary_type = Rules<Type>(
 	Rule([dotted_path, type_arguments],					$ => RefType($[0], $[1])),
 	Rule(['unique', 'symbol'],							_ => RefType('unique symbol')),
 	Rule(['this'],										_ => ({ type: 'this' } as const)),
-	Rule(['null'],										_ => Literal(null)),
-	Rule(['true'],										_ => Literal(true)),
-	Rule(['false'],										_ => Literal(false)),
-	Rule([STR],											$ => Literal(unquoteString($[0]))),
-	Rule([NUM],											$ => Literal(parseTypeNumber($[0]))),
+	Rule(['null'],										_ => Common.Literal(null)),
+	Rule(['true'],										_ => Common.Literal(true)),
+	Rule(['false'],										_ => Common.Literal(false)),
+	Rule([STR],											$ => Common.Literal(unquoteString($[0]))),
+	Rule([NUM],											$ => Common.Literal(parseTypeNumber($[0]))),
 	// Negative numeric literal type (`-1`) -- the only place TypeScript allows a unary-minus type at all, so it's a `primary_type` alternative, not a general unary operator.
-	Rule(['-', NUM],									$ => Literal(-parseTypeNumber($[1]))),
-	Rule(['`', List(type_template_literal_part), '`'],	$ => Literal($[1])),//({ type: 'template_literal', parts: $[1] } as const)),
+	Rule(['-', NUM],									$ => Common.Literal(-parseTypeNumber($[1]))),
+	Rule(['`', List(type_template_literal_part), '`'],	$ => Common.Literal($[1])),//({ type: 'template_literal', parts: $[1] } as const)),
 	Rule(['typeof', dotted_path, type_arguments],		$ => ({ type: 'typeof', name: $[1], typeArgs: $[2] } as const)),
 	Rule(['typeof', 'import', '(', STR, ')'],			$ => ({ type: 'typeof', name: '', source: unquoteString($[3]) } as const)),
 	Rule(['typeof', 'import', '(', STR, ')', '.', dotted_path],	$ => ({ type: 'typeof', name: $[6], source: unquoteString($[3]) } as const)),
@@ -669,15 +668,15 @@ JS.optional_binding_name.push(
 );
 JS.parameter.push(
 	// Parameter properties (`constructor(public x: number)`) are accepted anywhere a parameter is, not just in a constructor -- a known simplification.
-	Rule([param_modifier_list, JS.optional_binding_name],								$ => ({...$[1], modifiers: mergeMods($[0], $[1].modifiers)})),
+	Rule([param_modifier_list, JS.optional_binding_name],								$ => ({...$[1], modifiers: Common.mergeMods($[0], $[1].modifiers)})),
 	// Typed destructured parameters. `forceFork`: an arrow's `(` is also reachable as a plain expression, so `{a}` as `object_pattern` vs. a plain
 	// object literal only resolves once the following `:` is seen, one token past this table's default lookahead.
 	ForceFork(Rule([JS.object_pattern, ':', type],										$ => JS.Param($[0], $[2]))),
-	ForceFork(Rule([JS.object_pattern, ':', type, '=', assignment_expression],			$ => withDefault(JS.Param($[0], $[2]), $[4]))),
+	ForceFork(Rule([JS.object_pattern, ':', type, '=', assignment_expression],			$ => Common.withDefault(JS.Param($[0], $[2]), $[4]))),
 	ForceFork(Rule([JS.array_pattern, ':', type],										$ => JS.Param($[0], $[2]))),
-	ForceFork(Rule([JS.array_pattern, ':', type, '=', assignment_expression],			$ => withDefault(JS.Param($[0], $[2]), $[4]))),
+	ForceFork(Rule([JS.array_pattern, ':', type, '=', assignment_expression],			$ => Common.withDefault(JS.Param($[0], $[2]), $[4]))),
 	// Default-valued parameter property (`protected offset = 0`). Uses `ASSIGN_OP`, not `'='`, to avoid the lexer tie-break race `ASSIGN_OP` fixes.
-	Rule([param_modifier_list, JS.optional_binding_name, '=', assignment_expression],	$ => ({...$[1], modifiers: mergeMods($[0], $[1].modifiers), default: $[3] } as const)),
+	Rule([param_modifier_list, JS.optional_binding_name, '=', assignment_expression],	$ => ({...$[1], modifiers: Common.mergeMods($[0], $[1].modifiers), default: $[3] } as const)),
 );
 
 // ===================================================================
@@ -829,8 +828,8 @@ for (const [relational, member, call] of [
 		Rule([relational, 'satisfies', type],				$ => ({ type: 'satisfies', expression: $[0], typeAnnotation: $[2] } as const)),
 	);
 	call.push(
-		Rule([member, '!'],									$ => UnaryPost('!', $[0])),
-		Rule([call, '!'],									$ => UnaryPost('!', $[0])),
+		Rule([member, '!'],									$ => Common.UnaryPost('!', $[0])),
+		Rule([call, '!'],									$ => Common.UnaryPost('!', $[0])),
 		Rule([member, call_type_arguments, JS.arguments_],	$ => JS.Call($[0], $[2], undefined, $[1])),
 		Rule([call, call_type_arguments, JS.arguments_],	$ => JS.Call($[0], $[2], undefined, $[1])),
 		// Bare instantiation expression (TS 4.7+): `expr<T,U>` pins a generic function's type params without calling it.
@@ -862,7 +861,7 @@ JS.relational_expression_noin.push(
 export function make() {
 	return makeCachedParser({
 		skip:		JS.skip,
-		start:		JS.program as Rules<Module>,
+		start:		JS.program as Rules<Common.Module<Stmt>>,
 		// these are only needed for debugging
 		rules: {
 			...JS.rules,
