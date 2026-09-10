@@ -2420,7 +2420,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// Matched on the part's own written shape, never through `T.resolve`: with `Array` declared in the
 		// lib scope, resolving `Array<string>` expands it to the class's own object shape and loses the very
 		// thing being looked for.
+		// A TUPLE part is physically the same `arr:ref`, its element the union of every position -- every grammar
+		// action's `$` (`WithTextPos<ValuesOf<R>>`) is one once a `const R` infers as a tuple.
 		const elementOf = (x: Type) => x.type === 'array' ? x.element
+			: x.type === 'tuple' ? T.combineTypes(x.elements.map(el => T.tupleElementType(el) ?? T.ANY))
 			: x.type === 'ref' && x.typeArgs?.length === 1 && (READONLY_ALIAS[x.name] ?? x.name) === 'Array' ? x.typeArgs[0]
 			: undefined;
 		const arrays = parts.flatMap(part => {

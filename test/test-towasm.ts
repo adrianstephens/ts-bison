@@ -1521,6 +1521,27 @@ async function main() {
 				declare const b: MapAll<[string, number]>;
 				const ok: number = b[0];
 				const alsoOk: boolean = b[1];`).length, 0);
+		// CONST CONTEXT (`as const`, or a `const` type parameter's argument): a READONLY TUPLE whose elements keep their literals.
+		check('`as const` keeps each position',
+			typeErrors(`const E = ['x', 'y'] as const; const bad: 'y' = E[0];`).some(x => /not assignable/.test(x)), true);
+		check('...and so does a `const` type parameter',
+			typeErrors(`declare function f<const T extends readonly string[]>(x: T): T; const r = f(['a', 'b']); const bad: 'a' = r[1];`)
+				.some(x => /not assignable/.test(x)), true);
+		// A tuple argument against a `readonly T[]` parameter offers EVERY element as a candidate for `T`, unioned.
+		checkTypeChecks('a tuple into `readonly T[]` infers from every element',
+			`declare function one<const T extends string>(names: readonly T[]): T; const X = ['a', 'b'] as const; const ok: 'a' | 'b' = one(X);`);
+		// A template literal type over finite interpolations EXPANDS to its cross product, so a mapped type keyed by one
+		// (the maths package's swizzles, `{[K in \`${E}${E}\`]: T2}`) has real properties.
+		check('a mapped type keyed by a template literal',
+			typeErrors(`type S<E extends string> = {[K in \`\${E}\${E}\`]: number}; declare const s: S<'x' | 'y'>; const bad: string = s.yx;`)
+				.some(x => /not assignable/.test(x)), true);
+		check('...whose keys are exactly the cross product',
+			typeErrors(`type S<E extends string> = {[K in \`\${E}\${E}\`]: number}; declare const s: S<'x' | 'y'>; const bad = s.xz;`)
+				.some(x => /does not exist/.test(x)), true);
+		// ...and one that cannot expand (`${string}`) is matched as a PATTERN.
+		checkTypeChecks('a literal matching a template pattern', `const k = 'abc' as const; const ok: \`a\${string}\` = k;`);
+		check('...and one that does not',
+			typeErrors(`const k = 'xbc' as const; const bad: \`a\${string}\` = k;`).some(x => /not assignable/.test(x)), true);
 		check('a statically-shaped spread into a dynamic object', spreadStatic(), 11);
 		check('...and a later spread still overwrites an earlier field', spreadLastWins(), 50);
 		check('...while a dynamic-object spread keeps its runtime key walk', spreadDynamic(), 11);

@@ -433,7 +433,7 @@ export function ownScope(t: Type, scope: Scope) {
 // still need the exact same physical representation, so those callers pass `true` to widen through it.
 export function widenLiterals(t: Type, keepBoolean = false, ignoreFrozen = false): Type {
 	return	(t.type === 'literal' || t.type === 'range') && t.frozen && !ignoreFrozen ? t
-		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(typeof t.value)
+		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(literalType(t))
 		:	t.type === 'range' ? TS.RefType(t.base)
 		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean, ignoreFrozen)))
 		:	t.type === 'array' ? TS.ArrayType(widenLiterals(t.element, keepBoolean, ignoreFrozen), t.readonly)
@@ -853,6 +853,20 @@ export function isClassRef(t: Type, scope: Scope): boolean {
 	return ((t.declScope as Scope ?? scope).lookupScope(parts)?.decl(name))?.type === 'class_decl';
 }
 
+// `X[i]`, reduced ONE step to the element it names when `X` is a tuple or array -- the element itself left exactly
+// as written, so a named ref inside stays a ref. Anything else is returned untouched.
+function oneStepIndexed(t: Type, scope: Scope): Type {
+	if (t.type !== 'indexed_access')
+		return t;
+	const obj = resolveOwn(t.object, scope);
+	const idx = resolveOwn(t.index, scope);
+	if (obj.type === 'tuple' && idx.type === 'literal' && typeof idx.value === 'number')
+		return (obj.elements[idx.value] && tupleElementType(obj.elements[idx.value])) || t;
+	if (obj.type === 'array' && isNumberLike(idx, scope))
+		return obj.element;
+	return t;
+}
+
 // Does `t` mention an unbound type parameter anywhere reachable? `isAbstract` only answers for a bare
 // ref; a conditional's decidability also depends on one buried in an object member or a type argument
 // (`{type: T}`, `Node<T>`). Exported for `instantiate`, which uses it to tell a real inference result
@@ -925,6 +939,53 @@ export function resolveMembers(t: Type, scope: Scope, depth = 10): Type {
 		: entry.type, depth - 1);
 }
 
+// The text each member of a template interpolation contributes, or undefined when some member isn't a finite literal.
+function templateTexts(t: Type, scope: Scope): string[] | undefined {
+	const out: string[] = [];
+	for (const m of unionMembers(t, scope).map(m => resolve(scope, m))) {
+		if (m.type === 'literal' && !Array.isArray(m.value))
+			out.push(String(m.value));
+		else if (m.type === 'range' && m.min !== undefined && m.min === m.max)
+			out.push(String(m.min));
+		else if (isRefNamed(m, 'boolean'))
+			out.push('false', 'true');
+		else if (isRefNamed(m, 'null') || isRefNamed(m, 'undefined'))
+			out.push(isRefNamed(m, 'null') ? 'null' : 'undefined');
+		else
+			return undefined;
+	}
+	return out;
+}
+
+// A template literal type whose interpolations are all finite is the union of its cross product -- what gives a mapped
+// type over `${E}${E}` real keys. tsc refuses past 100,000 members; this leaves such a type unexpanded instead.
+function expandTemplate(parts: JS.TemplatePart<Type>[], scope: Scope): Type | undefined {
+	let acc = [''];
+	for (const p of parts) {
+		const texts = p.exp ? templateTexts(p.exp, scope) : [''];
+		if (!texts || acc.length * texts.length > 100000)
+			return undefined;
+		acc = acc.flatMap(a => texts.map(x => a + p.str + x));
+	}
+	return combineTypes(acc.map(x => Literal(x)));
+}
+
+// A regex matching every string an unexpanded template literal type denotes; an interpolation it can't pin down matches anything.
+function templatePattern(parts: JS.TemplatePart<Type>[], scope: Scope): string {
+	const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	const part = (t: Type): string => {
+		const texts = templateTexts(t, scope);
+		if (texts)
+			return `(?:${texts.map(esc).join('|')})`;
+		const r = resolve(scope, t);
+		return isRefNamed(r, 'number') ? '(?:[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:e[-+]?\\d+)?|NaN|-?Infinity)'
+			: isRefNamed(r, 'bigint') ? '-?\\d+'
+			: r.type === 'literal' && Array.isArray(r.value) ? `(?:${templatePattern(r.value, scope)})`
+			: '[\\s\\S]*';
+	};
+	return parts.map(p => esc(p.str) + (p.exp ? part(p.exp) : '')).join('');
+}
+
 export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): Type {
 	const idx = stopAtRef ? 1 : 0;
 	const slot = scope.resolveCache?.get(t);
@@ -954,6 +1015,9 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 
 	function uncached(): Type {
 		switch (t.type) {
+			case 'literal':
+				return Array.isArray(t.value) ? expandTemplate(t.value, scope) ?? t : t;
+
 			// An array's own element never got resolved recursively at all before this case existed -- e.g. `Record<string,
 			// number>['string']`-shaped indexed access (a mapped type's homomorphic value collapsing down to a plain
 			// index-signature's own value type, per `case 'indexed_access'` above) stayed opaque forever once tucked
@@ -990,7 +1054,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				// union but leaves its MEMBERS alone, so `WasmScalarI | 'i8' | 'ref'` arrives with one
 				// member still an alias to a further union and a flat `every(isLiteral)` test fails on it.
 				const literalKeys = (x: Type) => {
-					const parts = unionMembers(x, scope).map(m => resolve(scope, m)).map(m => isLiteral(m, 'string') ? m.value : undefined);
+					const parts = unionMembers(x, scope).map(m => resolve(scope, m)).map(m => isLiteral(m, 'string') && !Array.isArray(m.value) ? m.value : undefined);
 					return parts.length && parts.every((p): p is string => p !== undefined) ? parts : undefined;
 				};
 				// A HOMOMORPHIC mapped type over an ARRAY or TUPLE maps its ELEMENTS and keeps its
@@ -1161,12 +1225,15 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 			case 'conditional': {
 				// Only once `checkType` is concrete -- real TS also defers a conditional type until its naked check type is instantiated.
 				const check = resolve(scope, t.checkType, depth - 1);
+				// An INDEXED ACCESS carries no identity worth keeping raw, and raw it matches nothing: a mapped type over a
+				// tuple instantiates `ElemValue<[Box<number>, ':'][0]>`, which must see `Box<number>`.
+				const checkType = oneStepIndexed(t.checkType, scope);
 				if (!isAny(check) && !isAbstract(check, scope)) {
 					if (containsInfer(t.extendsType)) {
 						const bindings = new Map<string, Type>();
-						// `t.checkType`, not the already-resolved `check` -- resolving would eagerly expand a named type, losing the identity
+						// Not the already-resolved `check` -- resolving would eagerly expand a named type, losing the identity
 						// `matchInfer`'s `ref`-typeArgs case needs to match `Promise<infer R>`. Gets its own fresh budget, not `resolve`'s `depth`.
-						const r = matchInfer(t.extendsType, t.checkType, scope, bindings);
+						const r = matchInfer(t.extendsType, checkType, scope, bindings);
 						if (r !== undefined)
 							return resolve(scope, r ? substituteType(t.trueType, bindings) : t.falseType, depth - 1, stopAtRef);
 					} else {
@@ -1177,7 +1244,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 						// `t.checkType`, not the already-resolved `check` -- same reasoning as `containsInfer` above: eagerly resolving loses
 						// the ref identity `isAssignable`'s same-name fast path needs to confirm "does this class extend itself" cheaply.
 						if (lit !== undefined)
-							return resolve(scope, lit || !isAssignable(t.checkType, extendsType, scope) ? t.falseType : t.trueType, depth - 1, stopAtRef);
+							return resolve(scope, lit || !isAssignable(checkType, extendsType, scope) ? t.falseType : t.trueType, depth - 1, stopAtRef);
 					}
 				} else if (!containsInfer(t.extendsType)) {
 					// `checkType` is a genuinely abstract, unbound type param -- any real instantiation picks exactly one branch, never a
@@ -1884,15 +1951,20 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				src = sr.base === 'bigint' ? BIGINT : NUMBER;
 		}
 
+		// A template literal type still here didn't expand (see `expandTemplate`): as a target it's a pattern, as a source a `string`.
+		if (dst.type === 'literal' && Array.isArray(dst.value)) {
+			if (isLiteral(src, 'string') && !Array.isArray(src.value))
+				return new RegExp(`^${templatePattern(dst.value, dstScope)}$`).test(src.value);
+			return isLiteral(src, 'string') || isRefNamed(src, 'string');	// widened source: lenient
+		}
+		if (src.type === 'literal' && Array.isArray(src.value))
+			return recurse(STRING, dst, depth - 1);
 		if (dst.type === 'literal')
 			return src.type === 'literal'
-				? src.value === dst.value	// TODO: check template_literal equality
+				? src.value === dst.value
 				: src.type === 'ref' && dst.value !== null && src.name === typeof dst.value;	// widened source: lenient
 		if (src.type === 'literal')
 			return dst.type === 'ref' && (!ALL_PRIMITIVES.has(dst.name) || dst.name === (src.value === null ? 'null' : typeof src.value));
-//		if (src.type === 'template_literal' || dst.type === 'template_literal')
-//			return (src.type === 'template_literal' || isString(src))
-//				&& (dst.type === 'template_literal' || isString(dst));
 
 		// `dst`/`src` can no longer be `'array'` here -- `normalizeArray` plus `resolve()` above already expanded that into the real
 		// lib.es5 structural body. Only tuple-vs-tuple is left to handle structurally.
@@ -2007,7 +2079,15 @@ export function argsFit(sig: TS.CallSig, argTs: (Type | undefined)[], scope: Sco
 // position) is unaffected and keeps today's immediate, first-wins behavior regardless -- omitting
 // `deferred` (every caller except `instantiate()`) reproduces the exact old behavior throughout.
 export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<string, TS.TypeParam>, out: Map<string, Type>, scope: Scope, declScope: Scope = scope, deferred?: { paramT: Type; argT: Type }[]): void {
+	let pooled: Map<string, Type[]> | undefined;
 	return recurse(paramT, argT, 6);
+
+	function found(name: string, t: Type) {
+		if (pooled)
+			pooled.set(name, [...pooled.get(name) ?? [], t]);
+		else
+			out.set(name, t);
+	}
 
 	function recurse(paramT: Type, argT: Type, depth: number) {
 		if (depth < 0)
@@ -2017,7 +2097,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				const tp = tparams.get(paramT.name)!;
 				// Widening a literal argument (`'string'` -> `string`) is the usual default, but not when the type param's constraint is
 				// itself a union of literals (`K extends 'string' | 'number'`) -- the widened form would fall outside the constraint.
-				out.set(paramT.name, tp.const || tp.constraint?.type === 'keyof' || (!!tp.constraint && isLiteralOnly(resolveOwn(tp.constraint, scope), scope) === true) ? argT : widenLiterals(argT));
+				found(paramT.name, tp.const || tp.constraint?.type === 'keyof' || (!!tp.constraint && isLiteralOnly(resolveOwn(tp.constraint, scope), scope) === true) ? argT : widenLiterals(argT));
 			}
 			return;
 		}
@@ -2026,11 +2106,17 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 			if (a.type === 'array') {
 				recurse(paramT.element, a.element, depth - 1);
 			} else if (a.type === 'tuple') {
+				// Every element is a candidate, unioned -- `readonly T[]` from `['a', 'b'] as const` is `'a' | 'b'`, not the first alone.
+				const outer = pooled;
+				pooled = new Map();
 				a.elements.forEach(el => {
 					const t = tupleElementType(el);
 					if (t)
-						recurse(paramT.type === 'array' ? paramT.element : ANY, t, depth - 1);
+						recurse(paramT.element, t, depth - 1);
 				});
+				const got = pooled;
+				pooled = outer;
+				got.forEach((ts, name) => found(name, combineTypes(ts)));
 			// e.g. an argument built from `x ?? y` where both branches independently resolve to compatible-but-not-deduplicated array types
 			// (`number[] | number[]`) -- distribute over the union rather than giving up (the first member to actually match wins, per `out`'s guard).
 			} else if (a.type === 'union') {

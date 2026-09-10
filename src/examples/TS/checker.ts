@@ -116,6 +116,11 @@ function resolveFnMember(t: Type, scope: Scope): TS.CallSig | undefined {
 	return undefined;
 }
 
+// A CONST CONTEXT travels as the expected type (`as const`'s own annotation), which keeps it cache-safe:
+// `recurseCache` keys on (node, expected), so a node seen both inside and outside one cannot poison either.
+const CONST_CONTEXT: Type = TS.RefType('const');
+const isConstContext = (t: Type | undefined) => t?.type === 'ref' && t.name === 'const' && !t.typeArgs;
+
 // The declared type of the argument sitting at REST position `k`. Usually just the rest's own element,
 // but a TUPLE rest names each position separately -- and a UNION of the two shapes names a callback in
 // only ONE arm (`Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>)`), so every arm that
@@ -1200,6 +1205,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// array regardless of context (real TS: `[1, 2]` alone is `number[]`; contextually
 				// tuple-typed, it's `[number, number]`), which is wrong both for later assignability
 				// and (via `wasmTypeOf`) for codegen's own physical representation of it.
+				// CONST CONTEXT: a READONLY TUPLE whose elements keep their literals and pass the context down. As a plain
+				// array, `Rule<T, const R ...>`'s `ValuesOf<R>` has no positions and every `$[i]` is the union of all of them.
+				if (isConstContext(expected) && e.elements.every(el => el && el.type !== 'spread'))
+					return { type: 'tuple', readonly: true, elements: e.elements.map(el => T.freeze(recurse(el!, expected))) };
 				const resolvedExpected	= expected && T.resolveOwn(expected, scope);
 				const wantTuple			= resolvedExpected?.type === 'tuple';
 				const elems: Type[] = [];
@@ -1554,6 +1563,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						if (a.type === 'function' || a.type === 'arrow' || a.type === 'spread')
 							return undefined;
 						const declared = sig!.params[i]?.typeAnnotation;
+						// A `const` type parameter (TS 5.0) infers from its argument AS IF it were written `as const`.
+						if (declared?.type === 'ref' && !declared.typeArgs && sig!.typeParams?.some(p => p.name === declared.name && p.const))
+							return recurse(a, CONST_CONTEXT);
 						const generic  = declared && !!sig!.typeParams?.some(p => T.mentionsTypeParam(declared, p.name));
 						// A CALL argument gets it too: that is how the shape reaches a callback nested inside
 						// it (`new Map(xs.map(x => [a, b]))`). The inner call reverse-matches its own `U`
@@ -1895,7 +1907,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// never auto-widens either, matching real TS. Survives being embedded in a later-widened container
 				// (`[1, x as const]`) or passed through `satisfies`/a comma/a spread, unlike a shape-based check on
 				// `e` itself would (that only ever sees the *top-level* expression `typeOf` was originally called on).
-				return T.freeze(anno.type === 'ref' && anno.name === 'const' ? recurse(e.expression) : anno);
+				return T.freeze(isConstContext(anno) ? recurse(e.expression, anno) : anno);
 			}
 			case 'satisfies': {
 				const anno = e.typeAnnotation;
