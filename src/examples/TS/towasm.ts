@@ -3735,7 +3735,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				: I.if('i32', [I.i32.const(1)], ctx.swapOut(_old)));
 			return;
 		}
-		emitTruthyOf(emitExpr(e, ctx), checkerTypeOf(unwrapAs(e), ctx.scope), ctx);
+		emitTruthyOf(emitExpr(e, ctx), narrowedTypeOf(e, ctx), ctx);
 	}
 
 	// The truthiness test for a value ALREADY on the stack, of physical type `got` and checker type `t`.
@@ -5828,7 +5828,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const isAnd	= operator === '&&';
 						const cur	= ctx.declareLocal(`$logical$assign$${optionalTempCounter++}`, wtype);
 						ctx.emit(I.local.tee(cur.index));
-						emitTruthyOf(wtype, checkerTypeOf(target, ctx.scope), ctx);
+						emitTruthyOf(wtype, narrowedTypeOf(target, ctx), ctx);
 						const _old = ctx.swapOut();
 						// The truthy arm assigns for `&&=` and keeps the old value for `||=`; the falsy arm
 						// is the mirror. `emitValue()` is only reached in the arm that actually assigns,
@@ -5926,11 +5926,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const leftLocal = ctx.declareLocal(`$logic$left$${optionalTempCounter++}`, leftWtype);
 						emitAs(left, ctx, leftWtype);
 						ctx.emit(I.local.tee(leftLocal.index));
-						emitTruthyOf(leftWtype, checkerTypeOf(unwrapAs(left), ctx.scope), ctx);
+						emitTruthyOf(leftWtype, narrowedTypeOf(left, ctx), ctx);
 						const keepLeft = () => {
 							// Only the left's falsy (`&&`) / truthy (`||`) part is ever kept. When that is just null/undefined (an
 							// object is never falsy) the result is the result type's own undefined, not the left's physical value.
-							if (T.isNullish(T.logicalLeftPart(checkerTypeOf(unwrapAs(left), ctx.scope), operator, ctx.scope), ctx.scope)) {
+							if (T.isNullish(T.logicalLeftPart(narrowedTypeOf(left, ctx), operator, ctx.scope), ctx.scope)) {
 								emitAs({ type: 'identifier', name: 'undefined' }, ctx, wtype);
 								return;
 							}

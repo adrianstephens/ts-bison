@@ -6032,6 +6032,18 @@ async function main() {
 			export function objUndef(): number { return andIface(undefined) === undefined ? 1 : 0; }
 		`);
 		check('&& on an object-typed nullable keeps only undefined from its left', r2.objTrue() * 10 + r2.objUndef(), 11);
+
+		// A truthiness test on a field read through a receiver narrowed by the same `&&` chain (`lex.prev.pos`
+		// under `lex.prev &&`) needs the narrowed scope's type: in the baseline scope that read is `any`.
+		const r3 = await compile(`
+			interface TP { offset: number; line: number }
+			interface Tk { pos: TP; name: string }
+			interface LP extends TP { prev?: Tk }
+			function after(lex: LP) { return !!(lex.prev && lex.prev.pos && lex.line > lex.prev.pos.line); }
+			export function withPrev(): number { const p: LP = { offset: 0, line: 2, prev: { pos: { offset: 0, line: 1 }, name: 'x' } }; return after(p) ? 1 : 0; }
+			export function noPrev(): number { const p: LP = { offset: 0, line: 2 }; return after(p) ? 1 : 0; }
+		`);
+		check('a field read through a receiver narrowed by the same && chain tests truthy', r3.withPrev() * 10 + r3.noPrev(), 10);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 
