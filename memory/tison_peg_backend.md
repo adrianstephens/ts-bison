@@ -7,9 +7,16 @@ metadata:
 
 Added 2026-09-04 (tison commit `1e8e513`). `makePegParser(spec, options?)` in `tison/src/peg.ts`
 reads the *same* `GrammarSpec` value `makeParser` takes, as a PEG: packrat recursive descent,
-alternatives as ordered choice. Re-exported from `tison.ts` via a trailing `export * from './peg'`
-(deliberate: the CJS cycle is benign because peg.ts only touches tison bindings inside function
-bodies, and the re-export is the last statement).
+alternatives as ordered choice.
+
+**2026-09-10: the `tison.ts`↔`peg.ts`/`lalr.ts` cycle this used to describe is gone.** The shared
+foundation (grammar spec types, lexer, `GrammarBuilder`) moved out of `tison.ts` into `src/core.ts`,
+which has zero imports of its own. `lalr.ts` and `peg.ts` now import from `./core` instead of
+`./tison`; `tison.ts` is just the barrel (`export * from './core'/'./lalr'/'./peg'`) and remains the
+package entry point (`main: dist/tison.js`). Every other consumer (`tableCache.ts`, `rrule.ts`,
+`examples/*`, tests) still imports from `./tison`/`../tison` unchanged, since the barrel re-exports
+the full combined API. If you add a fourth module that both `core.ts` and a back end need, put it
+in `core.ts` too rather than reintroducing a back-import into `tison.ts`.
 
 Design calls made, with the reasoning that isn't in the code:
 

@@ -5,7 +5,7 @@
 import {
 	GrammarBuilder, NonTerminal, InternalPredicate, Terminal, EOF, ERROR, ACCEPT, identityAction, nextToken, getTextPos,
 	type ActionEntry, type GrammarSpec, type InternalRule, type InternalSym, type TextPos, type Token, type Parser, type MergeValues, type PrecEntry, type LexPosition,
-} from './tison';
+} from './core';
 
 export interface ConflictReport {
 	state:		number;

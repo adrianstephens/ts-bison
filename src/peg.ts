@@ -24,7 +24,7 @@
 import {
 	GrammarBuilder, NonTerminal, InternalPredicate, Terminal, EOF, ERROR, nextToken, getTextPos,
 	type ActionEntry, type GrammarSpec, type InternalRule, type InternalSym, type TextPos, type Token, type Parser,
-} from './tison';
+} from './core';
 
 // ===================================================================
 //  Static grammar analysis
