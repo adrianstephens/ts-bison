@@ -146,3 +146,40 @@ primitive` refusal, `typeof s === 'function' ? s(4)` still failing with "call to
   for locals, but a name declared inside a narrowed branch loses its checker-visible type afterwards.
 
 Worth doing -- it is the root under several worked-around symptoms -- but budget it as a project.
+
+## EXPANDO properties -- CLOSED 2026-09-09 (`80316bd`, `6247fa2`)
+
+`(s as any).scope ??= scope` is legal TypeScript and the checker's own idiom, so towasm has to
+compile it. It now does, for a local, a `new`-constructed class, a PARAMETER, and a UNION receiver.
+
+**The decision is per SHAPE and made UP FRONT.** `collectExpandoFields` (towasm.ts) walks every
+module body before any struct type exists, resolves each property write and `Object.defineProperty`
+to its receiver's shape (every member, for a union), and anything the shape does not already
+declare becomes an ordinary optional `REF_ANY` field ON THAT SHAPE (`addExpandoFields`).
+
+**Why up front, and why not a subclass.** WasmGC fixes an object's type at `struct.new`: there is no
+type mutation, no rewrap, and `ref.cast` only TESTS. So the field must be there at allocation. The
+old `ensureClassExtension` built a `$ext` SUBCLASS instead, decided at the local's DECLARATION --
+which meant it could only ever reach a local, `ref.cast` into it trapped whenever the object was
+allocated as the base (`const c = new C(1)` + `Object.defineProperty` trapped at runtime for as long
+as the mechanism existed), and a PARAMETER was unreachable in principle. Deciding early deleted all
+of it: `ensureClassExtension`, `classExtensions`, `collectDefinePropertyTargets` and
+`FunctionContext.definePropertyTargets` are gone, net -30 lines.
+
+**A local and a parameter type DIFFERENTLY**, which the pre-pass has to handle: a parameter `p: P`
+is `ref:P`, but `const p: P = {x:1}` types as the literal's expanded `object:{x:number}` -- the
+checker keeps the inferred shape and the NAME is gone. towasm's own local wtype comes from the
+annotation for this reason, so the pre-pass tracks declared annotations too. Over-approximating is
+safe (an unused optional field costs a slot).
+
+**A union receiver needs a WRITE cascade.** `ensureAnyFieldWrite` mirrors `ensureAnyField`:
+`ref.test` each reachable class declaring the field, cast, `struct.set`; no match traps.
+
+**THE SURVEY CANNOT SEE ANY OF THIS.** Its per-declaration probe compiles `{...program, body}` with
+one declaration only, which removes the WRITE that justifies the field -- so the read fails and
+`unknown field 'scope'` reads 9 in the cause table however well it works. Same blind spot as
+cross-module bugs. Judge it by `test-towasm`'s `expando*` cases, which run the wasm.
+
+**Still not representable**: a property on an ARRAY. WasmGC arrays have no fields at all. The one
+real instance (`exportScope` stamping `.scope` on a `Stmt[]`) was removed at the source instead --
+see [[tison_module_records]].
