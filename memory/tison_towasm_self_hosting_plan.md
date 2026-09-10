@@ -1,6 +1,6 @@
 ---
 name: tison-towasm-self-hosting-plan
-description: "towasm.ts self-hosting (compile+run its own implementation) — current measured state, the instruments, and the causes that gate everything; 45/263 at `c3c208e`, plus a parked finding: a static lib file can't hold shared top-level state its own methods can read (found fixing Promise microtask ordering)."
+description: "towasm.ts self-hosting (compile+run its own implementation, WITHOUT adapting the source) — current measured state, the instruments and their traps (the survey was nondeterministic until `935a4e1`), and the causes that gate everything; 56/274 at `935a4e1`."
 metadata: 
   node_type: memory
   type: project
@@ -75,6 +75,67 @@ watch the error move. Use the survey only to confirm the cluster moved.
 **Re-run after every fix and diff the table. The delta is the unit of progress.** A fix that moves
 one row by one is evidence you fixed a symptom, not a cause — pull the cluster's sibling sites out of
 the JSON first and require them all to go away.
+
+## 2026-09-10 (later): THE SURVEY WAS NONDETERMINISTIC -- an import-cycle race (`935a4e1`)
+
+**Symptom**: probe-decl and the survey disagreed on js-parser.ts at the same commit (`'param 'lex' needs
+an explicit type` vs `cannot convert ref:Token`), and re-running the SAME probe flipped between the two
+about half the time. Not contamination between probes -- a race.
+
+**Cause**: `TStypeCheckAsync` resolved imports with `Promise.all`. tison.ts <-> lalr.ts (and peg.ts) is
+an import cycle, and tableCache.ts enters it from the lalr side, so WHICH edge `wouldDeadlock` cut
+depended on I/O timing. Cutting tison's `export * from './lalr'` left js-parser's `RecoveryCallback`
+unresolved (silently -- unresolved names are lenient), so `recover`'s params lost their contextual
+types. `ownScopeSettled`'s comment "imports never need re-exports" is the false assumption.
+**Fix**: imports resolve one at a time, in source order. Corpus byte-identical. The 18-block `lex` row
+vanished; every declaration in it moved to a real blocker (`Parser<any>` 11->22, `TextPos` 5->9).
+
+**Trap**: before trusting a survey delta, check the instrument is deterministic -- run one probe 3-5x.
+Deltas before `935a4e1` for anything importing tison.ts (js-parser, ts-parser, towasm...) carry noise.
+
+**probe-decl now matches the survey**: it had un-exported exported CONSTS too, which changes which
+blocker is hit first. New env: `WHOLE_FIRST=1|check` (the survey's stage-2a run first), `SHOW=<const>`
+(that const's arrow params as the checker left them, and its declared type resolved).
+
+## `&&` on an object-typed nullable -- `T.logicalLeftPart` (2026-09-10)
+
+`n && n.type === 2` with `n: Tok | undefined` is `boolean | undefined` (an object is never falsy); the
+checker already said so for an interface, but codegen's `keepLeft` converted the left's struct ref into
+the result box (`internal: cannot convert ref:Tok to typeIndex:N`). It now emits `undefined` when the
+kept part is purely nullish; the checker's per-member logic is `T.logicalLeftPart`, shared by both.
+
+- **OPEN (checker)**: for a CLASS left the checker still says `Tok | undefined | boolean` -- `isTruthy`
+  never sees a nominal class ref as an object. Fix per [[tison_nominal_class_refs]]: `resolveMembers`.
+- **CLOSED `20d8c28`**: `'any' (ref:TextPos) cannot be used as a boolean condition` -- truthiness tests
+  read `t` from `ctx.scope`, so `lex.prev.pos` under `lex.prev &&` was `any`. All four sites now use
+  `narrowedTypeOf`. Survey: TextPos row gone, 12 moved, 57/275.
+
+## Calling a module-level factory-made closure const (`Rule = makeRule(...)`) -- 2026-09-10
+
+- **Call path**: `case 'call'`'s factory-const branch looked only in `ctx.scope.decl`, which answers for
+  IMPORTED modules; an ENTRY module's top-level consts live in `topLevelVars`. It now uses
+  `lazyGlobalFor`, the same lookup a plain read already used. (`const R = mk(1); R(41)` threw
+  `call to unknown function 'R'`; a LOCAL const, or a module-level arrow literal, always worked.)
+- **Latent bug it exposed**: `coerceTop` sent two closure types differing ONLY in nullability through
+  the closure coercion wrapper, which wrapped a nullable ref: invalid wasm (`struct.new[0] expected
+  (ref N), found (ref null N)`). Reachable without the call path too (`const g = R; g(41)`) -- every
+  closure-typed lazy global's slot is a nullable closure of the same signature. Now the ref/arr rule.
+- Survey: the `Rule` row (10) gone, 13 moved, 57/275. They landed mostly in **`comparing to 'null'/
+  'undefined' needs a nullable object-typed value`, now the #1 row (26, js-parser/towasm/type-utils)**
+  -- js-parser's `startsPropertyName` hits it at 350:26. Start there next session, then the object-
+  literal alias row (24) and `Parser<any>` (22, below).
+
+## The `Parser<any> -> Parser<{...}>` row (22 decls) -- one root, partly characterised
+
+21 of the 22 are tiny towasm.ts helpers: towasm.ts imports ts-parser.ts, whose module-level
+`const parser = make()` fails, and an IMPORTED module's init is not recoverable the way the entry's is.
+A real blocker, not an artifact -- compiled towasm needs that parser. The error carries no position.
+- Plain nested inference is NOT it: `outer<T>(spec: Spec<T>): P<T> { return inner(spec); }` compiles.
+  The `any` comes from somewhere in `makeCachedParser`'s real shape (options spread, try/catch, the
+  `LALRParser<T>` return of `makeParser`) -- bisect that next, from `assistant/repro/parser1.ts`.
+- **A sibling gap found on the way**: an interface that `extends` another can't be converted to its
+  base at the SAME type argument -- `LP<{a}> -> P<{a}>` is `internal: cannot convert`. `LALRParser<T>
+  extends Parser<T>` is exactly that shape. See [[tison_interface_inheritance]] before touching it.
 
 ## Measured state (clean survey at `c3c208e`, 2026-09-07) -- 45/263, `assistant/survey-c3c208e.txt`
 
