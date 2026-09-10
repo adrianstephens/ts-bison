@@ -3614,17 +3614,27 @@ async function main() {
 		check('a plain expando property WRITE gets a slot', expandoWrite(), 6);
 		check('...as Object.defineProperty already did', expandoDefine(), 6);
 		check('...and a write to a REAL field is still an ordinary field write', realFieldUntouched(), 7);
-		// A `new`-constructed class cannot carry one: `ref.cast` is a type test on the existing object and
-		// copies nothing, so the value would have to have been ALLOCATED extended -- and the extension
-		// subclass has no constructor. Rejected outright rather than emitting a cast that always traps.
-		await checkThrows('an expando on a `new`-constructed class is rejected, not left to trap', () => compile(`
+		// A `new`-constructed class carries one too, and a PARAMETER whose object was allocated in
+		// another function entirely -- which is the shape the checker's own `(s as any).scope ??= scope`
+		// has. Neither is reachable from a declaration site: the field is decided per SHAPE, before the
+		// struct type exists, so every instance simply has the slot and nothing is ever cast.
+		const { expandoNew, expandoParam } = await compile(`
 			class C { x: number; constructor(x: number) { this.x = x; } }
-			export function main(): number {
+			interface Q { x: number }
+			function stamp(q: Q): void { (q as any).scope = 5; }
+			export function expandoNew(): number {
 				const c = new C(1);
 				(c as any).scope = 5;
-				return c.x;
+				return ((c as any).scope as number) + c.x;
 			}
-		`), /can't carry extra properties/);
+			export function expandoParam(): number {
+				const q: Q = { x: 1 };
+				stamp(q);
+				return ((q as any).scope as number) + q.x;
+			}
+		`);
+		check('...on a `new`-constructed class', expandoNew(), 6);
+		check('...and on a PARAMETER, written in another function', expandoParam(), 6);
 	}
 
 	{

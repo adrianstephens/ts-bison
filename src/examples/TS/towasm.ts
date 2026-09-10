@@ -552,9 +552,6 @@ class FunctionContext {
 	// names (not full scope-aware identity like `widenedTypes`, an accepted simplification) ever used
 	// as `Object.defineProperty`'s own target argument anywhere later in this same function body, so
 	// that specific declarator can allocate its class's own extension subclass instead of the plain
-	// base (`ensureClassExtension`'s own comment) -- not every value of that class, only the one
-	// actually extended.
-	definePropertyTargets?: Map<string, string[] | 'dynamic'>;
 
 	// This function's own top-level statement list (not descending into a nested closure's own body,
 	// same boundary `ownBoundNames`/`collectFreeVars` already use) -- set once, right after construction,
@@ -1583,52 +1580,6 @@ function containsDefineProperty(body: Stmt[]): boolean {
 // `Object.defineProperty`'s own target argument anywhere in this function body, together with the
 // literal keys ever defineProperty'd onto each -- `'dynamic'` once any one of them isn't a compile-
 // time-literal string, since a non-enumerable key set can't be given real, individually-named fields
-// at all (`ensureClassExtension`'s own comment).
-function collectDefinePropertyTargets(body: Stmt[]): Map<string, string[] | 'dynamic'> {
-	const targets = new Map<string, string[] | 'dynamic'>();
-	const add = (name: string, key: string | undefined) => {
-		const existing = targets.get(name);
-		if (existing === 'dynamic')
-			return;
-		if (key === undefined)
-			return targets.set(name, 'dynamic'), undefined;
-		const keys = existing ?? [];
-		if (!keys.includes(key))
-			keys.push(key);
-		targets.set(name, keys);
-	};
-	walkB(body, undefined, (e, process) => {
-		// Any property WRITE to a plain local, whatever route the source took to make it legal --
-		// `(s as any).scope = scope`, an index signature, a declaration-merged shape. Collected
-		// indiscriminately here and filtered at the DECLARATION against the class's real fields, which
-		// is the first point types are known: whatever is left over the checker accepted and the class
-		// does not have, so it is an expando and needs a slot exactly as `Object.defineProperty` does.
-		if (e.type === 'assign' && e.target.type === 'member') {
-			const recv = unwrapAs(e.target.object);
-			if (recv.type === 'identifier')
-				add(recv.name, e.target.property);
-		}
-		if (isDefinePropertyCall(e)) {
-			const target = e.arguments[0];
-			if (target?.type === 'identifier') {
-				const existing = targets.get(target.name);
-				if (existing !== 'dynamic') {
-					const keyExpr = e.arguments[1];
-					if (keyExpr?.type === 'literal' && typeof keyExpr.value === 'string') {
-						const keys = existing ?? [];
-						if (!keys.includes(keyExpr.value))
-							keys.push(keyExpr.value);
-						targets.set(target.name, keys);
-					} else {
-						targets.set(target.name, 'dynamic');
-					}
-				}
-			}
-		}
-		return process(e);
-	});
-	return targets;
-}
 
 // Builds the `Scope` holding every lib declaration `TStoWasm` needs (`String`, `RegExpMatch`, ...),
 // rooted in a fresh `T.makeGlobal()`, not in any particular user program's own scope -- callers pass
@@ -2257,8 +2208,6 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 	// `ensureClassExtension` reads this lazily, the first time this specific base class's own extension
 	// is ever needed, keyed the same bare-name way `everExtended` itself is.
 	const pendingExtensions = new Map<string, string[] | 'dynamic'>();
-	// One synthesized extension subclass per base class name, memoized -- `ensureClassExtension`'s own comment.
-	const classExtensions	= new Map<string, ClassInfo>();
 
 	// Whether *any* class textually declared anywhere in the program, transitively extending `className`,
 	// declares its own (non-static) `methodName` member -- decided purely from `directSubclasses` (whole-
@@ -4482,11 +4431,9 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 				};
 			}
 
-			// A property the CHECKER accepted that is not a real field of the receiver's class is an
-			// expando; its slot lives on the class's own `$ext` subclass, which the declaration site
-			// already allocated. `ownerOf` answers from the TS type and so only ever sees the base.
-			const ext		= base && base.fieldIndex.get(target.property) === undefined ? classExtensions.get(base.name) : undefined;
-			const cls		= ext?.fieldIndex.has(target.property) ? ext : base;
+			// An EXPANDO field is an ordinary field of the shape itself (`addExpandoFields`), so nothing
+			// special is needed here -- `collectExpandoFields` decided it before the struct type existed.
+			const cls		= base;
 			const fieldIdx	= cls?.fieldIndex.get(target.property);
 			if (!cls || fieldIdx === undefined)
 				throw `unknown field '${target.property}'`;
@@ -6709,40 +6656,7 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 					if (T.isAny(tsType) && !(s as any).scope)
 						tsType = narrowedTypeOf(d.init, ctx);
 
-					let wtype = typeOf(tsType);
-					// This declarator is itself later the target of a real Object.defineProperty call
-					// somewhere in this same function body (`ctx.definePropertyTargets`'s own comment) --
-					// allocate its class's own extension subclass instead of the plain base
-					// (`ensureClassExtension`'s own comment), so the write actually has a real field (or
-					// catch-all `Map`) to land in. `pendingExtensions` is updated with this specific
-					// declarator's own real keys *before* the extension is ever built, so a base class
-					// reached this way for the first time gets the accurate shape immediately, not a
-					// placeholder later calls would need to somehow patch.
-					if (wtype && typeof d.name === 'string' && typeof wtype !== 'string' && 'ref' in wtype) {
-						const written = ctx.definePropertyTargets?.get(d.name);
-						if (written) {
-							const base = ensureClass(wtype.ref);
-							// Only the keys the class does not really declare: an ordinary `c.x = 1` is a
-							// plain field write and must not drag in an extension subclass.
-							const keys = base && written !== 'dynamic'
-								? written.filter(k => !base.fieldIndex.has(k) && !base.setterNames?.has(k) && !base.methodDecls.has(k))
-								: written;
-							if (base && keys !== undefined && (keys === 'dynamic' || keys.length)) {
-								// An extension is a real wasm SUBTYPE, and the only way a value acquires it is
-								// being ALLOCATED as one -- `ref.cast` is a type test on the existing object, it
-								// copies nothing. An object literal is built field-by-field against the target
-								// shape and so can be built extended; a `new` goes through the class's own
-								// compiled constructor, which `struct.new`s the BASE and has no extended twin
-								// (`ensureClassExtension` gives the subclass no `methodDecls`). Rejected here
-								// rather than emitting a cast that always traps at runtime.
-								if (d.init.type === 'new')
-									throw `'${d.name}' has a property added to it, but a class constructed with 'new' can't carry extra properties yet -- only an object literal can`;
-								const prior = pendingExtensions.get(base.name);
-								pendingExtensions.set(base.name, prior === 'dynamic' || keys === 'dynamic' ? 'dynamic' : [...new Set([...(prior ?? []), ...keys])]);
-								wtype = ensureClassExtension(base).thisWtype!;
-							}
-						}
-					}
+					const wtype = typeOf(tsType);
 					if (!wtype) {
 						// Let the actual lowering throw its own more specific error first (e.g. indexing a `string`) -- only fall back to this generic message if it didn't.
 						emitExpr(d.init, ctx);
@@ -7610,7 +7524,6 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 			worklist.push(withCatch(() => {
 				const ctx	= new FunctionContext(name, new Scope(homeScope ?? libGlobal), plainReturn(result), undefined, homeModule);
 				ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
-				ctx.definePropertyTargets = collectDefinePropertyTargets(decl.body!);
 				ctx.ownBody = decl.body!;
 				ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
 				decl.body!.forEach(st => emitStmt(st, ctx));
@@ -8164,6 +8077,28 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 			: undefined;
 	}
 
+	// The expando fields `collectExpandoFields` found for this shape, appended before its struct type is
+	// finalized. `optional`, because no construction site ever supplies one: real source cannot spell
+	// `#ext` at all, and a statically-named one (`scope`, `pos`) is only ever written after the fact.
+	// A field on the shape ITSELF, not on a subtype -- the decision is known before the type exists, so
+	// there is nothing to cast into and every instance simply has the slot.
+	function addExpandoFields(info: ClassInfo, name: string) {
+		const spec = pendingExtensions.get(name);
+		if (!spec)
+			return;
+		if (spec === 'dynamic') {
+			const map = ensureClass('Map', [TS.RefType('string'), T.ANY]);
+			if (!map)
+				throw `internal: 'Map' isn't available for '${name}''s own dynamic expando`;
+			info.fieldIndex.set('#ext', info.fields.length);
+			info.fields.push({ name: '#ext', wtype: { ...(map.thisWtype! as { ref: string }), nullable: true }, optional: true });
+		} else {
+			for (const key of spec)
+				if (!info.fieldIndex.has(key))
+					addField(info, key, T.ANY, true);
+		}
+	}
+
 	function addField(info: ClassInfo, key: string, typeAnnotation?: Type, optional = false) {
 		// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as `any` rather than reject otherwise-valid source.
 		const rawWt = typeAnnotation && typeOf(typeAnnotation);
@@ -8240,6 +8175,7 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 			}
 		}
 
+		addExpandoFields(info, declName);
 		types[info.typeIndex] = {
 			final: everFinal,
 			supertypes: [], type: {
@@ -8603,6 +8539,7 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 		// constructor's scalar/array result needs nothing more here; the ordinary struct case just needs
 		// its real field list patched into the placeholder type registered earlier.
 		if (!returnType) {
+			addExpandoFields(info, name);
 			types[info.typeIndex] = {
 				final:		!everExtended.has(name),
 				supertypes: info.superClass ? [info.superClass.typeIndex] : [],
@@ -8662,49 +8599,6 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 	// through some *other*, earlier, unrelated reference (found the hard way: `const p: Point = {...}`
 	// textually before the generic call that turns out to need `Point`'s own extension). Patched
 	// retroactively below as a safety net for exactly that case -- safe because `types` is still a
-	// plain, mutable in-memory array at this point, not yet serialized into anything.
-	function ensureClassExtension(base: ClassInfo): ClassInfo {
-		const existing = classExtensions.get(base.name);
-		if (existing)
-			return existing;
-		everExtended.add(base.name);
-		const baseType = types[base.typeIndex];
-		if (typeof baseType === 'object' && 'final' in baseType && baseType.final)
-			baseType.final = false;
-		const spec = pendingExtensions.get(base.name);
-		// `optional: true` on every synthesized field -- real source syntax can never construct one of
-		// these (`#ext` can't be spelled at all; a statically-enumerable key like `pos` is real, but no
-		// object-literal construction site ever supplies it directly either), so `case 'object'`'s own
-		// per-field loop must fall back to a default for all of them, not throw "missing property".
-		const extraFields: { name: string; wtype: WasmType; optional: true }[] = spec && spec !== 'dynamic'
-			? spec.map(key => ({ name: key, wtype: REF_ANY, optional: true as const }))
-			// The catch-all field is nullable specifically so `emitDefaultValue` can give it a plain
-			// `ref.null` at construction time (a non-nullable ref field would need a real `struct.new`-
-			// time constructor call instead, extra machinery this compiler's existing "nullable field,
-			// lazily filled in" idiom already avoids elsewhere) -- `Object.defineProperty`'s own write
-			// path (`emitObjectDefineProperty`) lazily allocates the real `Map` on first use.
-			: [{ name: '#ext', wtype: { ...(ensureClass('Map', [TS.RefType('string'), T.ANY]) ?? (() => { throw `internal: 'Map' isn't available for '${base.name}''s own dynamic extension`; })()).thisWtype! as { ref: string }, nullable: true }, optional: true as const }];
-		const name = `${base.name}$ext`;
-		const fields = [...base.fields, ...extraFields];
-		const info: ClassInfo = {
-			decl:			base.decl,
-			name,
-			thisTsType:		base.thisTsType,
-			typeIndex:		addType({
-				final: true,
-				supertypes: [base.typeIndex],
-				type: { kind: 'struct', fields: fields.map(f => ({ type: toValType(f.wtype), mut: true })) },
-			}),
-			thisWtype:		{ ref: name },
-			fields,
-			fieldIndex:		new Map([...base.fieldIndex, ...extraFields.map((f, i): [string, number] => [f.name, base.fields.length + i])]),
-			methodDecls:	new Map(),
-			superClass:		base,
-		};
-		classes.set(name, info);
-		classExtensions.set(base.name, info);
-		return info;
-	}
 
 	// Emits a constructor body statement-by-statement, same as an ordinary `stmts.forEach(st => emitStmt(st,
 	// ctx))` -- except a `super(...)` call is recognized and *inlined*: the superclass's own constructor
@@ -9531,6 +9425,72 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 	const mod		= new wasm.WasmModule();
 
 	const promotedConsts = new Set<string>();
+
+	// EXPANDO fields, decided whole-program and UP FRONT. A property write the checker accepted that the
+	// receiver's shape does not declare adds a field to that shape -- and a shape's wasm struct type is
+	// built the first time anything mentions it, so the field list has to be complete before then. Nothing
+	// discovered while compiling a body can be applied retroactively: a struct type is fixed once created,
+	// wasm-GC has no way to change an allocated object's type, and `ref.cast` only TESTS one.
+	// Keyed by SHAPE, not by local, which is what makes a write through a PARAMETER work -- the object was
+	// allocated in some other function, or some other module, and the declaration site never sees it.
+	function collectExpandoFields() {
+		// A local's own declared ANNOTATION, by name. A PARAMETER types as its annotation already, but a
+		// `const p: P = {...}` types as the literal's own inferred shape -- the name is gone, and the name
+		// is the only thing that identifies which shape to grow. towasm's own local wtype comes from the
+		// annotation for exactly this reason. Not scope-precise: over-approximating adds an unused
+		// optional field to a shape, which costs a slot and breaks nothing.
+		const annots = new Map<string, Type>();
+		const note = (recv: Expr, key: string | undefined, scope: Scope) => {
+			// The RAW type, never `T.resolve`'s: resolving a ref expands it to its object shape and loses
+			// the NAME. Resolved only to discover a union hiding behind an alias.
+			const bare	= unwrapAs(recv);
+			const raw	= (bare.type === 'identifier' ? annots.get(bare.name) : undefined) ?? checkerTypeOf(bare, scope);
+			const uni	= raw.type === 'union' ? raw : T.resolveOwn(raw, scope);
+			// Every member of a union gets the slot: the write lands on whichever one it turns out to be
+			// at runtime. A shape with no name (an inline object type), a generic instantiation, or a
+			// non-`ref` (an array, a primitive) has nowhere to put one.
+			for (const part of uni.type === 'union' ? uni.types : [raw]) {
+				if (part.type !== 'ref' || part.typeArgs?.length)
+					continue;
+				const prior = pendingExtensions.get(part.name);
+				if (prior === 'dynamic')
+					continue;
+				if (key === undefined)
+					pendingExtensions.set(part.name, 'dynamic');
+				else if (!T.lookupMember(part, key, scope))
+					pendingExtensions.set(part.name, [...new Set([...(prior ?? []), key])]);
+			}
+		};
+		for (const [moduleId, m] of moduleBodies) {
+			const modScope = moduleScopeOf(moduleId);
+			if (!modScope)
+				continue;
+			// The checker stamps its scope on STATEMENTS, so the enclosing statement's is what types the
+			// receiver -- a parameter or a local is resolvable there and nowhere else. Tracked down the
+			// statement walk; the module scope is only the outermost fallback.
+			let scope = modScope;
+			walkB(m.body,
+				(st, process) => {
+					const saved = scope;
+					scope = (st as unknown as { scope?: Scope }).scope ?? scope;
+					if (st.type === 'var_decl')
+						for (const d of st.declarations)
+							if (typeof d.name === 'string' && d.typeAnnotation)
+								annots.set(d.name, d.typeAnnotation);
+					const r = process(st);
+					scope = saved;
+					return r;
+				},
+				(e, process) => {
+					if (e.type === 'assign' && e.target.type === 'member')
+						note(e.target.object, e.target.property, scope);
+					else if (isDefinePropertyCall(e) && e.arguments[0])
+						note(e.arguments[0], e.arguments[1]?.type === 'literal' && typeof e.arguments[1].value === 'string' ? e.arguments[1].value : undefined, scope);
+					return process(e);
+				});
+		}
+	}
+	collectExpandoFields();
 
 	// Seed with every exported (real, user-level top-level) function and reserve every class name eagerly.
 	// Only *functions* are seeded across every module this way -- a non-entry module's own classes/scalar
