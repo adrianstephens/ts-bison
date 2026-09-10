@@ -167,6 +167,22 @@ capture by value, and creating it at first mention means its captures already ex
   regressed (57/275). They landed in `'a?.hitDepthLimit(...)' is not supported -- returns 'void'`
   (2 -> 19: `this.parent?.hitDepthLimit(fn)`, an optional call to a `void` method used only as a
   statement) and `unresolved identifier 'recurse'` (2 -- probably the mutual-recursion case above).
+- **CLOSED**: `a?.m()` as a STATEMENT on a `void` method -- `want === 'void'` lowers to a guarded call
+  with nothing to yield. `hitDepthLimit` row 19 -> 0; they moved to `unknown method 'isArray'` (7 -> 25).
+- **`Array.isArray`** is a lib static: `typeof x !== 'string' && __asm('ref.test (ref array)')` -- a
+  string shares the `i16[]` wasm form. The asm grammar needs `ref.test (ref <heap>)`, not a bare name.
+  Declared `x is any[]`, so the checker narrows through it: that ALSO removed four checker false
+  positives in type-utils.ts. Survey: `isArray` 25 -> 0, `removeRules` newly compiles -> **58/275**.
+- **Top rows after this session**: object-literal alias (24), `Parser<any>` (22), `find` (17, below),
+  getter `a?.length` (13), `typeof` used as a VALUE (6, `unsupported unary operator 'typeof'`).
+- **NEXT: `unknown method 'find'`** (type-utils.ts:1079, `resolve` lands here). One target: calling a
+  METHOD on a generic method's array RESULT. Repros `tison/assistant/repro/find1-4.ts`; controls:
+  `.map(...).length` on a union receiver works (the result IS an array), and `.find` directly on a
+  plain `number[]` works (`find` itself is fine). Only method dispatch on the `.map` result fails:
+  - UNION receiver (`readonly T[] | T[]`) -> `unknown method 'find'`: no owner. The survey's row.
+  - PLAIN `number[]` -> `internal: cannot convert arr:f64:false to arr:ref:false`: the result is
+    physically `arr:f64` but resolves to the collapsed `Array<any>` -- the recorded "a generic method's
+    `U[]` result stays `arr:ref`" limitation (see the `Array<T>` collapse section below).
 
 ## The `Parser<any> -> Parser<{...}>` row (22 decls) -- one root, partly characterised
 
