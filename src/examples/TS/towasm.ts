@@ -383,9 +383,9 @@ function wTypeKey(type: wasm.SubType): string|undefined {
 		: comp.kind === 'array' ? `array(${storageTypeKey(comp.field.type)}:${comp.field.mut})`
 		// Field MUTABILITY is part of a struct's identity in wasm, exactly as it already is for an array
 		// above -- omitting it silently merged two genuinely different types. It bit as soon as a scalar
-		// cell (`ensureCellType`, one mutable f64 field) appeared: identical to the immutable `f64` BOX
-		// (`ensureBoxType`) under the old key, so a cell became a box and `ref.test` for `typeof x ===
-		// 'number'` started matching cells too. `final`/`supertypes` likewise: a subtype is not its base.
+		// holder (`ensureHolderType`, one mutable f64 field) appeared: identical to the immutable `f64` BOX
+		// (`ensureBoxType`) under the old key, so a holder became a box and `ref.test` for `typeof x ===
+		// 'number'` started matching holders too. `final`/`supertypes` likewise: a subtype is not its base.
 		: comp.kind === 'struct' ? `struct(${comp.fields.map(f => `${storageTypeKey(f.type)}:${f.mut}`).join(',')})${'final' in type && type.final ? ':final' : ''}${'supertypes' in type && type.supertypes.length ? ':<' + type.supertypes.join(',') : ''}`
 		: undefined;
 }
@@ -457,14 +457,14 @@ interface ClassInfo extends MethodOwner {
 	superClass?:	ClassInfo;
 }
 
-// `cellInner`: set only for a name `ensureForwardCell` had to promote into a shared, heap-allocated
-// "cell" (a real closure/local forward-referenced by an EARLIER sibling closure in the same block,
+// `holderInner`: set only for a name `ensureForwardHolder` had to promote into a shared, heap-allocated
+// "holder" (a real closure/local forward-referenced by an EARLIER sibling closure in the same block,
 // e.g. walker.ts's own `mapStatementC` capturing `mapStatement`, declared several statements later) --
-// `wtype` itself is then the *cell's* own physical type (what this storage slot really, physically
-// is), and `cellInner` is the logical value's own real type once unboxed. Left `undefined` for the
+// `wtype` itself is then the *holder's* own physical type (what this storage slot really, physically
+// is), and `holderInner` is the logical value's own real type once unboxed. Left `undefined` for the
 // overwhelmingly common case (an ordinary local/capture, never forward-referenced), where `wtype`
 // alone is the whole story, exactly as before.
-interface Local			{ wtype: WasmType, index: number; cellInner?: WasmType; }
+interface Local			{ wtype: WasmType, index: number; holderInner?: WasmType; }
 interface Global extends Local {init: Expr, mut: boolean}
 
 interface ResolvedParam { key: BindingTarget; wtype: WasmType; tsType: Type }
@@ -557,12 +557,12 @@ class FunctionContext {
 
 	// This function's own top-level statement list (not descending into a nested closure's own body,
 	// same boundary `ownBoundNames`/`collectFreeVars` already use) -- set once, right after construction,
-	// alongside `widenedTypes`. Consulted only by `ensureForwardCell`, to find a sibling `const`/`let`
+	// alongside `widenedTypes`. Consulted only by `ensureForwardHolder`, to find a sibling `const`/`let`
 	// declared LATER in this same body that an EARLIER closure literal needs to forward-reference.
 	ownBody?:			Stmt[];
 
-	// `collectCapturedMutables(ownBody)`, computed on first use -- see `needsCell`.
-	cellNames?:			Set<string>;
+	// `collectCapturedMutables(ownBody)`, computed on first use -- see `needsHolder`.
+	holderNames?:			Set<string>;
 
 	// Updated by `emitStmt`'s own entry point, from each statement's own `(stmt as any).scope` checker
 	// stamp (`scopeOfStmt`'s comment) -- `scope` itself stays the one static, whole-function scope set at
@@ -700,19 +700,19 @@ class FunctionContext {
 	}
 
 	// The WasmType a name's real, logical VALUE has -- real local/closureEnv field, or (see `Local`'s own
-	// comment) a forward-cell's own inner type once unboxed. This is what any ordinary consumer of a
+	// comment) a forward-holder's own inner type once unboxed. This is what any ordinary consumer of a
 	// name's type wants (e.g. deciding how to *call* it) -- `rawWtype`, below, is the one exception.
 	resolvedWtype(name: string): WasmType | undefined {
 		const captured = this.closureEnv?.fields.get(name);
 		if (captured)
-			return captured.cellInner ?? captured.wtype;
+			return captured.holderInner ?? captured.wtype;
 		const local = this.lookup(name);
-		return local?.cellInner ?? local?.wtype;
+		return local?.holderInner ?? local?.wtype;
 	}
-	// The WasmType a name's own physical STORAGE slot has -- a forward-cell's own boxed type, never
+	// The WasmType a name's own physical STORAGE slot has -- a forward-holder's own boxed type, never
 	// unboxed. Only ever needed by `emitClosureLiteral`'s own env-capture step: capturing a forward-
-	// cell's real (shared, mutable) storage into an outer closure's env is the one place that needs the
-	// cell ITSELF, not the value it currently (or eventually) holds.
+	// holder's real (shared, mutable) storage into an outer closure's env is the one place that needs the
+	// holder ITSELF, not the value it currently (or eventually) holds.
 	rawWtype(name: string): WasmType | undefined {
 		return this.closureEnv?.fields.get(name)?.wtype ?? this.lookup(name)?.wtype;
 	}
@@ -926,30 +926,30 @@ function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<stri
 }
 
 // Names this body declares that a nested closure captures AND something assigns -- the locals that must
-// become shared heap cells rather than plain wasm locals. A closure captures a BINDING in JS, not a
+// become shared heap holders rather than plain wasm locals. A closure captures a BINDING in JS, not a
 // value: `let n = 1; const f = () => n + 1; n = 4;` must have `f()` see 4, and a write inside the
 // closure must be visible outside it (the counter idiom). Copying the value into the env struct gives
-// neither. `ensureForwardCell` already builds exactly the right thing -- and `emitClosureLiteral`
-// already captures the CELL rather than its contents -- but only ever fired for a name used before its
+// neither. `ensureForwardHolder` already builds exactly the right thing -- and `emitClosureLiteral`
+// already captures the HOLDER rather than its contents -- but only ever fired for a name used before its
 // own declaration ran, so a local declared before the closure was silently captured by value.
 // Deliberately over-approximate: a name assigned anywhere at all (including only inside the closure, or
-// only before it is ever captured) is celled, and an outer-scope name reaching the set is harmless
-// because the answer is only ever consulted when DECLARING a local of that name here. A needless cell
+// only before it is ever captured) is holder-backed, and an outer-scope name reaching the set is harmless
+// because the answer is only ever consulted when DECLARING a local of that name here. A needless holder
 // costs an allocation and an indirection; a missing one is a wrong answer.
 // Not yet applied to a captured+mutated PARAMETER, which has the same problem and no `var_decl` to hang
-// the cell off.
+// the holder off.
 function collectCapturedMutables(body: Stmt[]): Set<string> {
 	const captured	= new Set<string>();
 	const assigned	= new Set<string>();
 	// A `for (let i = ...)` binding is PER-ITERATION in JS: every iteration gets a fresh one, so each
 	// closure created in the loop captures its own. Copying the value into the env -- what capture already
-	// did -- is therefore already right, and one shared cell is actively wrong: every closure would then
+	// did -- is therefore already right, and one shared holder is actively wrong: every closure would then
 	// see the loop's final value. `Promise.all`'s own `promises[i].then(v => { values[i] = v; })` is
-	// exactly this, and a shared cell had it writing past the end of `values`.
+	// exactly this, and a shared holder had it writing past the end of `values`.
 	// (A body that REASSIGNS the variable after creating the closure still isn't modelled -- that needs a
-	// fresh cell per iteration, which is the real general answer.)
+	// fresh holder per iteration, which is the real general answer.)
 	// `var` is the exact opposite and must NOT be listed here: it is function-scoped, so the whole loop
-	// shares ONE binding and every closure sees its final value -- the shared cell is the correct answer
+	// shares ONE binding and every closure sees its final value -- the shared holder is the correct answer
 	// there, and copying by value gave `for (var i...) fs.push(() => i)` a 0 where JS says 3.
 	const perIteration = new Set<string>();
 	walkB(body,
@@ -1859,19 +1859,19 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// A real, shared, mutable one-field struct wrapping `wt` (nullable, so it can start empty) -- used
-	// only by `ensureForwardCell` for a name forward-referenced by an earlier sibling closure. Unlike
-	// `ensureBoxType` (an immutable, unboxes-a-scalar-into-`anyref` box), this cell's own field is `mut`
+	// only by `ensureForwardHolder` for a name forward-referenced by an earlier sibling closure. Unlike
+	// `ensureBoxType` (an immutable, unboxes-a-scalar-into-`anyref` box), this holder's own field is `mut`
 	// and can hold any wtype (including an already-reference-typed one, e.g. a closure) -- what makes it
-	// a real shared cell is that both the enclosing function's own later write (its var_decl) and every
+	// a real shared holder is that both the enclosing function's own later write (its var_decl) and every
 	// closure that captured a reference to this same struct instance see the identical storage.
-	// Memoized by `registerType`'s own structural key, same as any other type here -- one physical cell
+	// Memoized by `registerType`'s own structural key, same as any other type here -- one physical holder
 	// type per distinct inner wtype, regardless of how many different forward-referenced names share it.
-	// The field has to be DEFAULTABLE (`struct.new_default` allocates the cell empty, before the
+	// The field has to be DEFAULTABLE (`struct.new_default` allocates the holder empty, before the
 	// declaration that fills it has run), which for a reference means nullable. A scalar is already
-	// defaultable and must stay RAW: `nullableWtype` would box it, and then `cellInner` -- which every
-	// read and write of a celled name trusts as the logical type -- would describe the box rather than
-	// the value. Only ever reference cells existed until captured mutables started using these.
-	function ensureCellType(wt: WasmType): number {
+	// defaultable and must stay RAW: `nullableWtype` would box it, and then `holderInner` -- which every
+	// read and write of a holder-backed name trusts as the logical type -- would describe the box rather than
+	// the value. Only ever reference holders existed until captured mutables started using these.
+	function ensureHolderType(wt: WasmType): number {
 		return registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: toValType(typeof wt === 'string' ? wt : nullableWtype(wt)), mut: true }] } });
 	}
 
@@ -1881,9 +1881,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// this (the reference is only ever actually read once the closure is CALLED, well after every
 	// sibling has initialized) -- but the ordinary "copy the CURRENT value into this closure's own env
 	// struct at CREATION time" capture (`emitRawSlot`) has no value to copy yet. Generates the missing
-	// local right here, on demand (not a whole-block pre-scan), as a real `ensureCellType` cell instead
-	// of a plain local: both this closure's own capture (holding a reference to the cell) and the name's
-	// own real var_decl (writing into the cell once it runs, `case 'var_decl'`'s own check) end up
+	// local right here, on demand (not a whole-block pre-scan), as a real `ensureHolderType` holder instead
+	// of a plain local: both this closure's own capture (holding a reference to the holder) and the name's
+	// own real var_decl (writing into the holder once it runs, `case 'var_decl'`'s own check) end up
 	// sharing the exact same storage, so the value becomes visible the moment it's actually assigned --
 	// correct regardless of which order the two statements happen to compile in.
 	// `ctx.scope` (towasm's own, incrementally-built scope -- unlike the checker's, which already knows
@@ -1894,7 +1894,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// declarator is handled (a destructured forward reference is a separate, rarer case, not attempted).
 	// Returns `undefined` (leaving the existing "unresolved identifier" throw to fire) for a name that
 	// isn't a sibling declaration at all -- a genuinely unresolvable name, not a forward reference.
-	function ensureForwardCell(ctx: FunctionContext, name: string): Local | undefined {
+	function ensureForwardHolder(ctx: FunctionContext, name: string): Local | undefined {
 		const d = ctx.ownBody?.flatMap(s => s.type === 'var_decl' ? s.declarations : []).find(d => d.name === name);
 		if (!d)
 			return undefined;
@@ -1902,42 +1902,42 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!tsType)
 			return undefined;
 		const wt = typeOf(tsType);
-		return wt ? declareCell(ctx, name, wt, tsType) : undefined;
+		return wt ? declareHolder(ctx, name, wt, tsType) : undefined;
 	}
 
-	// Reads a cell's contents, given the cell reference already on the stack. A reference cell's field is
-	// nullable because `struct.new_default` has to be able to allocate it empty, but `cellInner` is the
+	// Reads a holder's contents, given the holder reference already on the stack. A reference holder's field is
+	// nullable because `struct.new_default` has to be able to allocate it empty, but `holderInner` is the
 	// logical (non-null) type every consumer works with -- so the read unwraps. Sound by the same
-	// contract forward cells already rely on: the declaration that fills the cell always runs before any
+	// contract forward holders already rely on: the declaration that fills the holder always runs before any
 	// read of the name can.
-	function emitCellRead(cellType: number, inner: WasmType, ctx: FunctionContext) {
-		ctx.emit(I.struct.get(cellType, 0));
+	function emitHolderRead(holderType: number, inner: WasmType, ctx: FunctionContext) {
+		ctx.emit(I.struct.get(holderType, 0));
 		if (typeof inner !== 'string' && !inner.nullable)
 			ctx.emit(I.ref.as_non_null);
 	}
 
-	// Promotes `name` to a shared, heap-allocated one-field cell -- the physical form a captured BINDING
+	// Promotes `name` to a shared, heap-allocated one-field holder -- the physical form a captured BINDING
 	// needs, so that a write from either side of the capture is seen by the other.
-	function declareCell(ctx: FunctionContext, name: string, wt: WasmType, tsType: Type): Local {
-		if (process.env.DBGCELL)
-			console.error(`CELL ${ctx.name}.${name}`);
-		const cellTypeIndex = ensureCellType(wt);
-		const local = ctx.declareValue(name, { typeIndex: cellTypeIndex, nullable: false }, tsType);
-		local.cellInner = wt;
-		ctx.emit(I.struct.new_default(cellTypeIndex), I.local.set(local.index));
+	function declareHolder(ctx: FunctionContext, name: string, wt: WasmType, tsType: Type): Local {
+		if (process.env.DBGHOLDER)
+			console.error(`HOLDER ${ctx.name}.${name}`);
+		const holderTypeIndex = ensureHolderType(wt);
+		const local = ctx.declareValue(name, { typeIndex: holderTypeIndex, nullable: false }, tsType);
+		local.holderInner = wt;
+		ctx.emit(I.struct.new_default(holderTypeIndex), I.local.set(local.index));
 		return local;
 	}
 
 	// Memoized per function: which of this body's own locals a nested closure captures AND something
-	// assigns (`collectCapturedMutables`). Those must be cells, not plain wasm locals.
-	function needsCell(ctx: FunctionContext, name: string): boolean {
+	// assigns (`collectCapturedMutables`). Those must be holders, not plain wasm locals.
+	function needsHolder(ctx: FunctionContext, name: string): boolean {
 		// Never at module scope: a top-level binding is already shared by construction (a real wasm global,
 		// or `ensureLazyGlobal`'s slot), and every function reads it that way rather than through any
-		// capture. Celling one there would leave the global and the cell as two separate storages.
+		// capture. Giving one a holder there would leave the global and the holder as two separate storages.
 		if (!ctx.ownBody || ctx.ownBody === ast.body)
 			return false;
-		ctx.cellNames ??= collectCapturedMutables(ctx.ownBody);
-		return ctx.cellNames.has(name);
+		ctx.holderNames ??= collectCapturedMutables(ctx.ownBody);
+		return ctx.holderNames.has(name);
 	}
 
 	function toResults(result: WasmType): wasm.ValType[] {
@@ -4364,15 +4364,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const envLocal		= ctx.closureEnv!.envLocal;
 				const envTypeIndex	= ctx.closureEnv!.envTypeIndex;
 				const getField		= () => ctx.emit(I.local.get(envLocal.index), I.struct.get(envTypeIndex, index));
-				// A captured CELL holds the binding, not a copy of it, so a write from in here has to go
-				// through the cell -- that is the whole reason the capture is a cell (`declareCell`). The
+				// A captured HOLDER holds the binding, not a copy of it, so a write from in here has to go
+				// through the holder -- that is the whole reason the capture is a holder (`declareHolder`). The
 				// env field itself is never rebound.
-				if (captured.cellInner) {
-					const cellType = (wtype as { typeIndex: number }).typeIndex;
+				if (captured.holderInner) {
+					const holderType = (wtype as { typeIndex: number }).typeIndex;
 					return {
-						wtype: captured.cellInner,
-						old: captureOld(captured.cellInner, () => { getField(); emitCellRead(cellType, captured.cellInner!, ctx); }),
-						write: makeWrite(captured.cellInner, val => { getField(); ctx.emit(I.local.get(val), I.struct.set(cellType, 0)); }),
+						wtype: captured.holderInner,
+						old: captureOld(captured.holderInner, () => { getField(); emitHolderRead(holderType, captured.holderInner!, ctx); }),
+						write: makeWrite(captured.holderInner, val => { getField(); ctx.emit(I.local.get(val), I.struct.set(holderType, 0)); }),
 					};
 				}
 				return {
@@ -4406,14 +4406,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				throw `unresolved identifier '${name}'`;
 			}
 			const { wtype, index } = loc;
-			// Same for this function's own celled local (`needsCell`): the wasm local holds the cell, and
+			// Same for this function's own holder-backed local (`needsHolder`): the wasm local holds the holder, and
 			// every read and write of the NAME goes through it, or a closure capturing it sees a stale value.
-			if (loc.cellInner) {
-				const cellType = (wtype as { typeIndex: number }).typeIndex;
+			if (loc.holderInner) {
+				const holderType = (wtype as { typeIndex: number }).typeIndex;
 				return {
-					wtype: loc.cellInner,
-					old: captureOld(loc.cellInner, () => { ctx.emit(I.local.get(index)); emitCellRead(cellType, loc.cellInner!, ctx); }),
-					write: makeWrite(loc.cellInner, val => ctx.emit(I.local.get(index), I.local.get(val), I.struct.set(cellType, 0))),
+					wtype: loc.holderInner,
+					old: captureOld(loc.holderInner, () => { ctx.emit(I.local.get(index)); emitHolderRead(holderType, loc.holderInner!, ctx); }),
+					write: makeWrite(loc.holderInner, val => ctx.emit(I.local.get(index), I.local.get(val), I.struct.set(holderType, 0))),
 				};
 			}
 			return {
@@ -4565,9 +4565,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// Reads `name`'s own physical storage slot (captured field or real local) exactly as-is -- never
-	// unboxing a forward-cell, unlike the ordinary identifier-read case (`case 'identifier'`). The one
+	// unboxing a forward-holder, unlike the ordinary identifier-read case (`case 'identifier'`). The one
 	// caller that needs this: `emitClosureLiteral`'s own env-capture step, which must capture a forward-
-	// cell's real, shared storage itself (so a later write through it, from wherever the name's own
+	// holder's real, shared storage itself (so a later write through it, from wherever the name's own
 	// var_decl actually runs, stays visible), never a snapshot of whatever it holds right now.
 	function emitRawSlot(ctx: FunctionContext, name: string): void {
 		const captured = ctx.closureEnv?.fields.get(name);
@@ -4710,7 +4710,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// Module-scoped, so `resolvesGlobally` can never see them; the read site substitutes a constant.
 			if ((name === '__dirname' || name === '__filename') && moduleFilename(ctx.homeModule))
 				continue;
-			if (!ctx.resolvesName(name) && !resolvesGlobally(ctx.homeModule, name) && !ensureForwardCell(ctx, name))
+			if (!ctx.resolvesName(name) && !resolvesGlobally(ctx.homeModule, name) && !ensureForwardHolder(ctx, name))
 				throw `unresolved identifier '${name}'`;
 		}
 
@@ -4721,18 +4721,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// from any other function's body, regardless of this closure's own lexical nesting.
 		const envBase		= ensureEnvBase();
 		const capturedNames = [...free].filter(name => ctx.resolvesName(name));
-		const fields		= capturedNames.length ? new Map<string, { index: number; wtype: WasmType; cellInner?: WasmType }>() : undefined;
+		const fields		= capturedNames.length ? new Map<string, { index: number; wtype: WasmType; holderInner?: WasmType }>() : undefined;
 		let envTypeIndex	= envBase;
 		if (fields) {
-			// `rawWtype` (not `resolvedWtype`) -- a forward-cell's own real, physical storage type is
-			// exactly what needs capturing here (the SHARED, mutable cell itself, so a later write
+			// `rawWtype` (not `resolvedWtype`) -- a forward-holder's own real, physical storage type is
+			// exactly what needs capturing here (the SHARED, mutable holder itself, so a later write
 			// through it -- from wherever its own var_decl actually runs -- stays visible to this
-			// capture); `cellInner`, copied alongside, lets every READ of this captured field later know
+			// capture); `holderInner`, copied alongside, lets every READ of this captured field later know
 			// to unbox it back to the logical value (`case 'identifier'`'s own read path).
 			envTypeIndex = addType({ final: true, supertypes: [envBase], type: { kind: 'struct', fields: capturedNames.map((name, i) => {
 				const wt = ctx.rawWtype(name)!;
-				const cellInner = ctx.closureEnv?.fields.get(name)?.cellInner ?? ctx.lookup(name)?.cellInner;
-				fields.set(name, { index: i, wtype: wt, cellInner });
+				const holderInner = ctx.closureEnv?.fields.get(name)?.holderInner ?? ctx.lookup(name)?.holderInner;
+				fields.set(name, { index: i, wtype: wt, holderInner });
 				return { type: toValType(wt), mut: true };
 			}) } });
 		}
@@ -4787,9 +4787,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		// Creation site: `struct.new` pops fields in declaration order (`ensureClosureType`'s `[code,
 		// env]`), so the code pointer goes on the stack before the env struct. Each captured value is
-		// read raw (`emitRawSlot`, not the ordinary identifier-read case) -- a forward-cell must be
-		// captured as the cell itself (see `rawWtype`'s own comment just above), never unboxed here; a
-		// capture-of-a-capture (an ordinary, non-cell name) resolves identically either way.
+		// read raw (`emitRawSlot`, not the ordinary identifier-read case) -- a forward-holder must be
+		// captured as the holder itself (see `rawWtype`'s own comment just above), never unboxed here; a
+		// capture-of-a-capture (an ordinary, non-holder name) resolves identically either way.
 		ctx.emit(I.ref.func(funcIndex));
 		for (const name of capturedNames) {
 			if (name === 'this')
@@ -5111,21 +5111,21 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const captured = ctx.closureEnv?.fields.get(name);
 				if (captured) {
 					ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index), I.struct.get(ctx.closureEnv!.envTypeIndex, captured.index));
-					// A forward-cell's captured field holds the cell itself (`emitRawSlot`'s own comment) --
+					// A forward-holder's captured field holds the holder itself (`emitRawSlot`'s own comment) --
 					// unbox it back to the real, logical value here, the one place an ordinary read of this
 					// name (as opposed to `emitClosureLiteral`'s own raw capture) actually wants.
-					if (captured.cellInner) {
-						emitCellRead((captured.wtype as { typeIndex: number }).typeIndex, captured.cellInner, ctx);
-						return captured.cellInner;
+					if (captured.holderInner) {
+						emitHolderRead((captured.wtype as { typeIndex: number }).typeIndex, captured.holderInner, ctx);
+						return captured.holderInner;
 					}
 					return captured.wtype;
 				}
 				const local = ctx.lookup(name);
 				if (local) {
 					ctx.emit(I.local.get(local.index));
-					if (local.cellInner) {
-						emitCellRead((local.wtype as { typeIndex: number }).typeIndex, local.cellInner, ctx);
-						return local.cellInner;
+					if (local.holderInner) {
+						emitHolderRead((local.wtype as { typeIndex: number }).typeIndex, local.holderInner, ctx);
+						return local.holderInner;
 					}
 					return local.wtype;
 				}
@@ -6740,26 +6740,26 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emit(I.struct.set(ctx.closureEnv!.envTypeIndex, hoisted.index));
 					} else {
 						// An EARLIER sibling closure may already have forward-referenced this exact name
-						// (`ensureForwardCell`, from `emitClosureLiteral`'s own free-var check) -- but so may
+						// (`ensureForwardHolder`, from `emitClosureLiteral`'s own free-var check) -- but so may
 						// `d.init` ITSELF, compiled next (a self-recursive arrow, e.g. walker.ts's own
 						// `mapBindingTarget`, calling its own not-yet-declared name from inside its own body).
-						// Either way a plain `declareValue` after the fact would silently shadow the cell with
+						// Either way a plain `declareValue` after the fact would silently shadow the holder with
 						// a second, independent local, leaving whatever captured it forever empty -- so the
-						// check for an existing cell has to happen AFTER `d.init` compiles, not before, and
-						// the value goes through a scratch local first (`struct.set` needs the cell's own ref
+						// check for an existing holder has to happen AFTER `d.init` compiles, not before, and
+						// the value goes through a scratch local first (`struct.set` needs the holder's own ref
 						// pushed before the value, but the value is what's already on the stack at this point).
-						// A local a nested closure captures and something assigns has to BE a cell from the
-						// start, not a value copied into the env (`needsCell`). Declared before `d.init`
-						// compiles so a closure inside the initializer captures the cell too, and so the
+						// A local a nested closure captures and something assigns has to BE a holder from the
+						// start, not a value copied into the env (`needsHolder`). Declared before `d.init`
+						// compiles so a closure inside the initializer captures the holder too, and so the
 						// store below goes through the same path a forward reference already took.
-						if (!ctx.lookup(d.name)?.cellInner && needsCell(ctx, d.name))
-							declareCell(ctx, d.name, wtype, tsType);
+						if (!ctx.lookup(d.name)?.holderInner && needsHolder(ctx, d.name))
+							declareHolder(ctx, d.name, wtype, tsType);
 						emitAs(d.init, ctx, wtype);
-						const forwardCell = ctx.lookup(d.name);
-						if (forwardCell?.cellInner) {
+						const forwardHolder = ctx.lookup(d.name);
+						if (forwardHolder?.holderInner) {
 							const scratch = ctx.temp(`$fwd$${d.name}`, wtype);
-							ctx.emit(I.local.set(scratch), I.local.get(forwardCell.index), I.local.get(scratch));
-							ctx.emit(I.struct.set((forwardCell.wtype as { typeIndex: number }).typeIndex, 0));
+							ctx.emit(I.local.set(scratch), I.local.get(forwardHolder.index), I.local.get(scratch));
+							ctx.emit(I.struct.set((forwardHolder.wtype as { typeIndex: number }).typeIndex, 0));
 						} else {
 							ctx.emit(I.local.set(ctx.declareValue(d.name, wtype, tsType).index));
 						}

@@ -214,7 +214,7 @@ that were left both had a precise structural trigger:
   `DataView` -- written, never wired up.
 - **`collectCapturedMutables` listed every `for`-init binding as PER-ITERATION.** True for
   `let`/`const`; `var` is function-scoped, one binding for the whole loop, so it is precisely the
-  case that NEEDS the shared cell. One condition on the declaration's own `kind`.
+  case that NEEDS the shared holder. One condition on the declaration's own `kind`.
 
 Both have committed regression tests in `test-towasm` (difftest lives in the gitignored
 `packages/assistant/`, so it protects nothing across a clone).

@@ -1788,7 +1788,7 @@ substantial new feature (forward-referenced/mutually-recursive local closures) b
 more real dotted-ref resolution gap fixed -- both verified via `test-towasm.ts` (458/458), `test-tison.ts`,
 eslint (0 errors) after every change.**
 
-**Forward-cell mechanism, DONE.** Root cause confirmed precisely before designing anything: `mapStatementC`
+**Forward-holder mechanism, DONE.** Root cause confirmed precisely before designing anything: `mapStatementC`
 (`const mapStatementC = (stmt: TS.Statement) => mapStatement(stmt) ...`) references `mapStatement`, a
 SIBLING `const` declared several statements LATER in `walk()`'s own body. Real JS/TS allows this (the
 reference is only ever actually READ once `mapStatementC` is later CALLED, well after every sibling has
@@ -1801,31 +1801,31 @@ local patch -- **the user's own steer, mid-investigation, mattered directly**: a
 could be generated "when a closure is being created" rather than via a whole-block pre-scan, which is
 exactly the on-demand trigger point landed (`emitClosureLiteral`'s own free-var check, not a separate pass
 over the enclosing block).
-- **Design**: a forward-referenced name gets a real, shared, mutable **one-field "cell" struct**
-  (`ensureCellType`, wrapping `nullableWtype(wt)` so it can start empty) instead of a plain local --
-  generated lazily, right where `emitClosureLiteral`'s own free-var loop first needs it (`ensureForwardCell`),
+- **Design**: a forward-referenced name gets a real, shared, mutable **one-field "holder" struct**
+  (`ensureHolderType`, wrapping `nullableWtype(wt)` so it can start empty) instead of a plain local --
+  generated lazily, right where `emitClosureLiteral`'s own free-var loop first needs it (`ensureForwardHolder`),
   found via a shallow scan of `ctx.ownBody` (the enclosing function's own top-level statement list, new
   field alongside the already-existing `widenedTypes`/`definePropertyTargets`, same "populated once at
   compile-entry" pattern, added at all 5 real call sites) for a `var_decl` declaring that name -- `ctx.scope`
   itself (towasm's own, incrementally built as statements compile, unlike the checker's) doesn't know about
   a not-yet-reached sibling either, so this can't just ask the checker.
-- The closure's own env-capture step (`emitClosureLiteral`) must capture the CELL ITSELF (so a later write
+- The closure's own env-capture step (`emitClosureLiteral`) must capture the HOLDER ITSELF (so a later write
   through it stays visible), never the value it holds right now -- a new `rawWtype`/`emitRawSlot` pair
   (bypassing the ordinary, UNBOXING identifier-read path) handles this; `resolvedWtype` itself now unboxes
-  (`cellInner`, a new optional field on `Local`/`ClosureEnv.fields`) for every ORDINARY consumer (an
+  (`holderInner`, a new optional field on `Local`/`ClosureEnv.fields`) for every ORDINARY consumer (an
   identifier read, or `case 'call'`'s bare-callee dispatch, which needs the real closure type to call
   through).
-- The sibling's own real var_decl, once reached, must WRITE THROUGH the existing cell rather than shadow it
-  with a second, independent local -- found the hard way that the check for an existing cell has to run
+- The sibling's own real var_decl, once reached, must WRITE THROUGH the existing holder rather than shadow it
+  with a second, independent local -- found the hard way that the check for an existing holder has to run
   AFTER the initializer compiles, not before: a SELF-referencing case (`mapBindingTarget`, a genuinely
   separate real bug hit immediately after `mapStatementC`/`mapStatement` worked -- `const mapBindingTarget =
   (t) => { ...mapBindingTarget(...)... }`, calling its own not-yet-declared name from inside its own body)
-  only creates its own cell WHILE its initializer (the arrow literal) is being compiled, so checking
-  beforehand always saw "no cell yet" and threw "redeclared" once the post-hoc declareValue collided with
-  the cell `ensureForwardCell` had just created mid-compile. Fixed by compiling the initializer into the
-  stack first, THEN checking for a cell, using a scratch local to reorder onto `struct.set`'s own
+  only creates its own holder WHILE its initializer (the arrow literal) is being compiled, so checking
+  beforehand always saw "no holder yet" and threw "redeclared" once the post-hoc declareValue collided with
+  the holder `ensureForwardHolder` had just created mid-compile. Fixed by compiling the initializer into the
+  stack first, THEN checking for a holder, using a scratch local to reorder onto `struct.set`'s own
   ref-then-value stack convention.
-- Confirmed via direct testing that `mapStatement`'s own capture now resolves through the shared cell (no
+- Confirmed via direct testing that `mapStatement`'s own capture now resolves through the shared holder (no
   more "unresolved identifier"), and `mapBindingTarget`'s self-recursive capture compiles cleanly too.
 
 **Real dotted-ref resolution gap, CLOSED.** Immediately after, hit `"function type parameter 'p' needs an

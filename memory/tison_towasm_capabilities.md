@@ -102,22 +102,22 @@ failures. That is the signal to look for, not an anomaly — see [[tison-towasm-
 ## CLOSED: closures capture a binding, not a value (`f33ebd0`)
 
 `let n = 1; const f = () => n + 1; n = 4; f()` gave 2; the counter idiom left `n` at 0. Found by
-`difftest.sh`'s language matrix. `ensureForwardCell` already built the right thing (a shared heap cell,
+`difftest.sh`'s language matrix. `ensureForwardHolder` already built the right thing (a shared heap holder,
 captured by reference) but only fired for a name used BEFORE its declaration ran; `collectCapturedMutables`
-now cells any local a nested closure captures and something assigns.
+now gives a holder to any local a nested closure captures and something assigns.
 
 **Three traps worth keeping:**
 - A `for (let i = ...)` binding is **per-iteration**, so capture-by-value was already correct there and a
-  shared cell is actively WRONG -- `Promise.all`'s own `promises[i].then(v => { values[i] = v; })` wrote
+  shared holder is actively WRONG -- `Promise.all`'s own `promises[i].then(v => { values[i] = v; })` wrote
   past the end of `values`, and the whole towasm suite died on it. Excluded. Still open: a body that
-  reassigns the variable mid-iteration needs a fresh cell per pass.
-- `ensureCellType` boxed a scalar via `nullableWtype`, so `cellInner` described the box, not the value.
-  Only reference cells had ever existed.
+  reassigns the variable mid-iteration needs a fresh holder per pass.
+- `ensureHolderType` boxed a scalar via `nullableWtype`, so `holderInner` described the box, not the value.
+  Only reference holders had ever existed.
 - **`wTypeKey` left field MUTABILITY out of a struct's identity** (arrays already had it), so a mutable
-  scalar cell and the immutable scalar BOX deduped to one type -- which would also make `ref.test` for
-  `typeof x === 'number'` match cells. `final`/`supertypes` folded in too. Latent, general bug.
+  scalar holder and the immutable scalar BOX deduped to one type -- which would also make `ref.test` for
+  `typeof x === 'number'` match holders. `final`/`supertypes` folded in too. Latent, general bug.
 
-**Debugging note**: the failure looked like cross-test contamination for a long while (one cell created
+**Debugging note**: the failure looked like cross-test contamination for a long while (one holder created
 in module A, a trap in module B) -- it wasn't. The trap module simply came later in the same run and the
 printed WAT of the PREVIOUS module was what the stack trace appeared to point at. Reproduce the failing
 case ALONE before assuming shared state.
