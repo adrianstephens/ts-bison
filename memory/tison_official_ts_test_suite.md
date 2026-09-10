@@ -67,6 +67,14 @@ current code ever hit this" before chasing a cluster. A deliberately-invalid or 
 a reason to let the derived TS1xxx exclusion drop it and move on, not to pursue TSC parity.
 Angle-bracket type assertions were DROPPED entirely on this basis (~130+ files).
 
+**But the derived TS1xxx exclusion does NOT cover them** (measured 2026-09-10): tsc parses `<T>expr`
+cleanly, so no TS1xxx fires. With the real TS parser as oracle (`TypeAssertionExpression`,
+`assistant/angle-cast-count.ts` / `angle-cast-fp.ts`): **225 of the gate's 1065 failures** (220 files)
+contain one, and 0 passing files do (no silent misparse); in test-ts-official, 157 of 1382 false
+positives (all `threw`). The lost curated list presumably held these. Fix awaits the user's choice:
+a tsc-derived exclusion needs `typescript` in a tracked test (tison has no devDeps), or commit a
+generated list under `test/`.
+
 **Method that works:** cluster the failures by message signature first — identical-looking messages
 across many files usually share one root cause, and fixing that unlocks the whole cluster. This has
 paid off repeatedly. Verify each fix two ways: a targeted canary of every new *and* pre-existing
