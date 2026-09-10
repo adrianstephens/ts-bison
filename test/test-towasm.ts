@@ -3589,6 +3589,18 @@ async function main() {
 		}, 'main');
 		check('a namespace-qualified const reads a NON-EXPORTED sibling of its own module', privateSibling(), 1122);
 
+		// A namespace-qualified FUNCTION read as a VALUE (`makeRule(Common.stampPos)`): calls through the namespace
+		// always compiled, but a bare read produced no closure to pass.
+		const { nsFnValue } = await compileMulti({
+			lib: `export function twice(x: number): number { return x * 2; }`,
+			main: `
+				import * as L from './lib';
+				function apply(f: (x: number) => number, x: number): number { return f(x); }
+				export function nsFnValue(): number { return apply(L.twice, 21); }
+			`,
+		}, 'main');
+		check('a namespace-qualified function passed as a value', nsFnValue(), 42);
+
 		// An EXPANDO property -- one the CHECKER accepted that the receiver's class does not really
 		// declare. `Object.defineProperty` already allocated the class's `$ext` subclass for these; a
 		// plain WRITE is the same operation spelled differently and now does too. The trigger is not the

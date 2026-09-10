@@ -5215,6 +5215,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							ctx.emit(I.call(lazy.wrapper.funcIndex));
 							return lazy.wrapper.result;
 						}
+						// `NS.someFunction` read as a VALUE (`makeRule(Common.stampPos)`): the same function-value
+						// wrapper a bare reference gets, resolved in the target module exactly as a namespace-
+						// qualified CALL resolves it. Without this the read fell through to treating the namespace
+						// itself as an object, and tried to represent every function it exports.
+						const nsDecl	= ns.decl(e.property);
+						const nsTarget	= nsDecl && stmtHomeModule.get(nsDecl);
+						const fnDecl	= nsTarget !== undefined ? functionDeclByName.get(homeKey(nsTarget, e.property)) : undefined;
+						if (fnDecl?.type === 'function_decl' && fnDecl.body) {
+							const { info, structTypeIndex } = ensureFunctionValueWrapper(e.property, fnDecl, nsTarget, want);
+							ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
+							return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
+						}
 					}
 				}
 
