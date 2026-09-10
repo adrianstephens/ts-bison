@@ -3652,6 +3652,15 @@ async function main() {
 			}
 		}
 
+		// A closure-typed module-level const caches into a NULLABLE slot of the same signature; converting
+		// between the two went through the closure coercion wrapper and wrapped a nullable ref: invalid wasm.
+		const { closureConstRead } = await compile(`
+			function mk(k: number) { return (x: number) => x + k; }
+			const R = mk(1);
+			export function closureConstRead(): number { const g = R; return g(41); }
+		`);
+		check('a closure-typed module-level const read as a value', closureConstRead(), 42);
+
 		// An EXPANDO property -- one the CHECKER accepted that the receiver's class does not really
 		// declare. `Object.defineProperty` already allocated the class's `$ext` subclass for these; a
 		// plain WRITE is the same operation spelled differently and now does too. The trigger is not the

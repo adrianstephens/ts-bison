@@ -3306,6 +3306,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// than `want` offers) still falls through to the "cannot convert" throw below, same as any other
 		// genuinely incompatible shape. See `ensureClosureCoercionWrapper`'s own comment.
 		if (typeof got !== 'string' && typeof want !== 'string' && 'closure' in got && 'closure' in want) {
+			// The same signature differing only in nullability is the same value, as for a ref or array below.
+			if (wasmTypeEq({ ...got, nullable: false }, { ...want, nullable: false })) {
+				if (got.nullable && !want.nullable)
+					ctx.emit(I.ref.as_non_null);
+				return;
+			}
 			const gotSig = got.closure, wantSig = want.closure;
 			// A shared param may DIFFER, so long as adapting it is a reference narrowing the wrapper can do
 			// with a cast: `Array<T>`'s methods are compiled at `T = any` for every non-scalar element (one
