@@ -6063,6 +6063,25 @@ async function main() {
 		check("capture: '++' through the holder", r.incr(), 2);
 		check('capture: two closures share one binding', r.twoClosures(), 20);
 		check('capture: a reference-typed binding', r.refHolder(), 3);
+
+		// `let x: T;` with no initializer. Definite assignment means the starting value is never read, so a
+		// defaultable type starts at its default; a non-nullable ref has none, and starts as an empty holder.
+		const u = await compile(`
+			class P { constructor(public v: number) {} }
+			export function scalar(c: boolean): number { let x: number; if (c) x = 1; else x = 2; return x; }
+			export function nullable(c: boolean): number { let p: P | undefined; if (c) p = new P(7); return p ? p.v : -1; }
+			export function nonNull(c: boolean): number { let p: P; if (c) p = new P(3); else p = new P(4); return p.v; }
+			export function captured(): number { let n: number; const f = () => { n = 5; }; f(); return n; }
+			export function forward(): number { const f = () => q.v; let q: P; q = new P(8); return f(); }
+			function* gen(): Generator<number, number, number> { let x: number; x = 6; yield x; return x + 1; }
+			export function hoisted(): number { const g = gen(); return g.next(0).value * 10 + g.next(0).value; }
+		`);
+		check('uninitialized let: scalar', u.scalar(1) * 10 + u.scalar(0), 12);
+		check('uninitialized let: nullable', u.nullable(1) * 10 + u.nullable(0), 69);
+		check('uninitialized let: non-nullable ref', u.nonNull(1) * 10 + u.nonNull(0), 34);
+		check('uninitialized let: captured and assigned by a closure', u.captured(), 5);
+		check('uninitialized let: forward-referenced by an earlier closure', u.forward(), 8);
+		check('uninitialized let: hoisted into a generator frame', u.hoisted(), 67);
 		check('capture: through a doubly-nested closure', r.nested(), 6);
 		check('capture: a for-let binding stays per-iteration', r.perIteration(), 123);
 		check('capture: a for-var binding is ONE shared binding', r.varShared(), 303);

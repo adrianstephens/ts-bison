@@ -6613,6 +6613,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		};
 	}
 
+	// `let x: T;` -- definite assignment guarantees a write before any read, so the starting value is never observed.
+	// A non-nullable ref has no default at all, so it starts as an empty holder, exactly as a forward reference does.
+	function emitUninitialized(name: string, tsType: Type, ctx: FunctionContext) {
+		const wtype = typeOf(tsType);
+		if (!wtype || wtype === 'void')
+			throw `local '${name}' has an unsupported type`;
+		const defaultable = typeof wtype === 'string' || wtype.nullable || ('ref' in wtype && wtype.ref === 'any');
+		const hoisted = ctx.closureEnv?.fields.get(name);
+		if (hoisted) {
+			if (defaultable) {
+				ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index));
+				emitDefaultValue(wtype, ctx);
+				ctx.emit(I.struct.set(ctx.closureEnv!.envTypeIndex, hoisted.index));
+			}
+		} else if (ctx.lookup(name)?.holderInner) {
+			// an earlier sibling closure's forward reference already made the (empty) holder
+		} else if (!defaultable || needsHolder(ctx, name)) {
+			declareHolder(ctx, name, wtype, tsType);
+		} else {
+			emitDefaultValue(wtype, ctx);
+			ctx.emit(I.local.set(ctx.declareValue(name, wtype, tsType).index));
+		}
+	}
+
 	function emitStmt(s: Stmt, ctx: FunctionContext): void {
 		ctx.stmtScope = (s as any).scope as Scope ?? ctx.stmtScope;
 		switch (s.type) {
@@ -6625,8 +6649,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 			case 'var_decl':
 				for (const d of s.declarations) {
-					if (!d.init)
-						throw `local '${describeBinding(d.name)}' needs an initializer`;
+					if (!d.init) {
+						if (typeof d.name !== 'string')
+							throw `local '${describeBinding(d.name)}' needs an initializer`;
+						emitUninitialized(d.name, d.typeAnnotation ?? ctx.widenedTypes?.get(d) ?? T.ANY, ctx);
+						continue;
+					}
 					if (typeof d.name !== 'string') {
 						// Materializes `d.init` into a hidden scratch local once (`#destructure$<n>`), then
 						// desugars into plain `var_decl`s reading their own piece back off it -- emitted
