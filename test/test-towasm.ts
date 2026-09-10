@@ -3622,6 +3622,36 @@ async function main() {
 		}, 'main');
 		check('a namespace-qualified function passed as a value', nsFnValue(), 42);
 
+		// An `export *` inside an import cycle (tison.ts <-> lalr.ts) must bind whatever order the cycle's modules load in.
+		// Imports resolved concurrently let a slow `./p` decide, and `a`'s `export * from './b'` was cut.
+		{
+			class SlowLoader extends ModuleLoader {
+				async get(mod: string, from: string) {
+					if (mod === './p')
+						await new Promise(r => setTimeout(r, 50));
+					return super.get(mod, from);
+				}
+			}
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'towasm-cycle-'));
+			try {
+				const files: Record<string, string> = {
+					p:		`export const P = 1;`,
+					a:		`export * from './p';\nexport * from './b';`,
+					b:		`import { P } from './a';\nexport type CB = (x: number) => number;\nexport const B = P;`,
+					c:		`import { B } from './b';\nexport const C = B;`,
+					main:	`import { C } from './c';\nimport { type CB } from './a';\nexport const f: CB = x => x + C;`,
+				};
+				for (const [name, src] of Object.entries(files))
+					await fs.writeFile(path.join(dir, name + '.ts'), src);
+				const program = parser.parse(files.main);
+				await TStypeCheckAsync(program, new SlowLoader(dir, {}), new T.Scope(libScope));
+				const x = (program.body[2] as any).declaration.declarations[0].init.params[0].typeAnnotation;
+				check('an export * inside an import cycle binds whatever order its modules load in', x && T.typeKey(x), 'number');
+			} finally {
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		}
+
 		// An EXPANDO property -- one the CHECKER accepted that the receiver's class does not really
 		// declare. `Object.defineProperty` already allocated the class's `$ext` subclass for these; a
 		// plain WRITE is the same operation spelled differently and now does too. The trigger is not the

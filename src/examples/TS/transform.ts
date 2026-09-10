@@ -759,6 +759,16 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 		return !resolved.tainted;
 	};
 
+	// One at a time, in source order: resolved concurrently, WHICH edge of an import cycle got cut depended on I/O
+	// timing, so an `export * from` could be dropped on one run and a re-exported name bound on the next.
+	const resolveImports = async (waiter: LoadedModule, importScope: Scope, body: readonly Stmt[], from: string) => {
+		const clean: boolean[] = [];
+		for (const s of body)
+			if (s.type === 'import')
+				clean.push(await resolveImport(waiter, importScope, s, from));
+		return clean;
+	};
+
 	// Returns `src`'s exported symbols as one `Scope`; also resolves `export ... from` re-exports here, since only
 	// this has the loader that `checker.exportScope` doesn't.
 	async function makeScope(src: LoadedModule): Promise<ModuleShape> {
@@ -767,7 +777,7 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 			return existing;
 
 		const importScope = new Scope(global);
-		const cached = Promise.all(src.program.body.filter(s => s.type === 'import').map(s => resolveImport(src, importScope, s, src.canonical))).then(async imports => {
+		const cached = resolveImports(src, importScope, src.program.body, src.canonical).then(async imports => {
 			let tainted = imports.some(clean => !clean);
 			const { scope, inner, alias } = exportScope(src.program.body, importScope, src.program.filename);
 			// The module RECORD carries its full internal scope -- towasm resolves names declared in the
@@ -820,7 +830,7 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 	const entryScope = new Scope(global);
 	// A SCRIPT (no top-level import/export) declares into the global space -- see `Scope.globalSpace`.
 	entryScope.globalSpace = !program.body.some(s => s.type === 'import' || s.type === 'export' || s.type === 'export_decl' || s.type === 'export_assignment');
-	await Promise.all(program.body.filter(s => s.type === 'import').map(s => resolveImport(entrySrc, entryScope, s, '.')));
+	await resolveImports(entrySrc, entryScope, program.body, '.');
 
 	const depthExhaustion = new Map<string, number>();
 	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
