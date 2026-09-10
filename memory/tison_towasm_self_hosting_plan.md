@@ -125,6 +125,31 @@ kept part is purely nullish; the checker's per-member logic is `T.logicalLeftPar
   -- js-parser's `startsPropertyName` hits it at 350:26. Start there next session, then the object-
   literal alias row (24) and `Parser<any>` (22, below).
 
+## 2026-09-10 (evening): re-export barrels, and `any` is NULLABLE
+
+- **`b1d5692` (the user's)**: tison.ts is now a pure re-export barrel over core.ts/lalr.ts/peg.ts, so the
+  cycle behind the survey race is gone. `assistant/selfhost-survey.ts`'s TARGETS now include core.ts --
+  without it the 12 declarations that moved there silently dropped out of the denominator.
+- **`0c586b2`**: `collectModules` walks `export ... from` and resolves each named import through the
+  re-export chain to the DECLARING module; a namespace import through a barrel only needed the loading
+  (the checker's scope already had the declaration, just no home module). Without it the barrel broke
+  everything reaching js-parser (`call to unknown function 'terminal'`). Survey-neutral. Remaining
+  edge: a NAMESPACE access to a RENAMED re-export (`NS.dbl` via `export {twice as dbl}`) -- the two
+  `nsTarget` sites look up by the public name, not `nsDecl.name`.
+- **nullable `any`**: `builtinTypes.any`/`unknown` were the non-null `REF_ANY`, so an `any` could never
+  hold `undefined` and `x !== undefined` on one was refused. Now `REF_ANY_NULLABLE`, plus `wtypeOf`
+  keeps the slot's type when the narrowing is nullish-only (`a = undefined`). **The null-comparison
+  row (26) is gone**, moved to `uncached` (1 -> 19) and `parseInt` (0 -> 8); zero blast radius in
+  test-towasm and difftest (measured behind an in-place toggle before flipping the default).
+- **TRAP, hit here**: that toggle read `process.env` INSIDE towasm.ts -- which is itself a SURVEYED
+  file. The toggle-on survey compiled the toggle too: a fake 29-block `unresolved identifier 'process'`
+  row, which masked the `Parser<any>` row and made it look cleared, and a bogus "54 moved". Remove every
+  toggle from a surveyed file before surveying, and diff the cause TABLES against the last clean run.
+- **Next session's top rows**: the object-literal alias row (24); `Parser<any>` (22, below -- NOT
+  cleared); `call to unknown function 'uncached'` (19, type-utils -- a nested `function` declaration
+  called before its textual position: towasm doesn't hoist nested function declarations); `parseInt`
+  (8, js-parser -- the wasm lib has only `Number.parseInt`/`parseFloat`, no global functions).
+
 ## The `Parser<any> -> Parser<{...}>` row (22 decls) -- one root, partly characterised
 
 21 of the 22 are tiny towasm.ts helpers: towasm.ts imports ts-parser.ts, whose module-level
