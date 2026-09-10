@@ -3635,6 +3635,23 @@ async function main() {
 		`);
 		check('...on a `new`-constructed class', expandoNew(), 6);
 		check('...and on a PARAMETER, written in another function', expandoParam(), 6);
+		// A UNION receiver has no single struct to write to, so it gets the same `ref.test` cascade the
+		// READ side already used -- `ensureAnyFieldWrite`. This is precisely the checker's own
+		// `(s as any).scope ??= scope`, where `s` is a `Stmt` parameter and `Stmt` is a wide union.
+		const { expandoUnion } = await compile(`
+			interface A { kind: 'a'; a: number }
+			interface B { kind: 'b'; b: number }
+			type Node = A | B;
+			function stamp(n: Node, v: number): void { (n as any).scope = v; }
+			export function expandoUnion(): number {
+				const a: A = { kind: 'a', a: 1 };
+				const b: B = { kind: 'b', b: 2 };
+				stamp(a, 10);
+				stamp(b, 20);
+				return ((a as any).scope as number) + ((b as any).scope as number);
+			}
+		`);
+		check('...and through a UNION receiver, via a ref.test cascade', expandoUnion(), 30);
 	}
 
 	{

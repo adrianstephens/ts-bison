@@ -1761,6 +1761,7 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 	// `ensureAnyField`'s own cache -- same "every class ever reached" candidate set as `anyInFuncs`, so the
 	// field name alone keys it too.
 	const anyFieldFuncs		= new Map<string, FuncInfo>();
+	const anyFieldWriteFuncs = new Map<string, FuncInfo>();
 	// `ensureUnionFieldDispatch`'s own cache -- keyed by field name + the exact, bounded member set (not
 	// "every class ever reached" like `anyDispatchFuncs`), so a real union type's own field access never
 	// silently succeeds via some unrelated third class that happens to share the same field name.
@@ -4431,12 +4432,27 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 				};
 			}
 
-			// An EXPANDO field is an ordinary field of the shape itself (`addExpandoFields`), so nothing
-			// special is needed here -- `collectExpandoFields` decided it before the struct type existed.
+			// An EXPANDO field is an ordinary field of the shape itself (`addExpandoFields`), so a concrete
+			// receiver needs nothing special here. A UNION or `any` one has no single struct to write to,
+			// and gets the same `ref.test` cascade the READ side already uses (`ensureAnyFieldWrite`) --
+			// which is how the checker's own `(s as any).scope ??= scope` on a `Stmt` parameter lands.
 			const cls		= base;
 			const fieldIdx	= cls?.fieldIndex.get(target.property);
-			if (!cls || fieldIdx === undefined)
+			if (!cls || fieldIdx === undefined) {
+				const prop = target.property;
+				if ([...classes.values()].some(c => c.fieldIndex.has(prop) && c.typeIndex !== -1)) {
+					const dispatch = ensureAnyFieldWrite(prop, ctx);
+					return {
+						wtype: REF_ANY,
+						old: captureOld(REF_ANY, () => { emitAs(target.object, ctx, REF_ANY); ctx.emit(I.call(ensureAnyField(prop, ctx).funcIndex)); }),
+						write: makeWrite(REF_ANY, val => {
+							emitAs(target.object, ctx, REF_ANY);
+							ctx.emit(I.local.get(val), I.call(dispatch.funcIndex));
+						}),
+					};
+				}
 				throw `unknown field '${target.property}'`;
+			}
 
 			const wtype = cls.fields[fieldIdx].wtype;
 
@@ -9067,6 +9083,60 @@ export function TStoWasm(ast: TS.Module, modules?: Map<string, TS.Module>, named
 			}
 			dctx.emit(...buildArm(0));
 			info.body = dctx.toFuncBody(1, toValType);
+		});
+		return info;
+	}
+
+	// `x.name = v` where `x`'s static type is a UNION or `any` -- the WRITE sibling of `ensureAnyField`,
+	// and the same `ref.test` cascade. Only struct-backed candidates: a field write needs a real
+	// `struct.set` target, so a boxed scalar or an array-backed owner is not one (neither can gain a
+	// field, and neither is ever an expando receiver -- `collectExpandoFields` only ever names a `ref`).
+	// The value arrives boxed as `REF_ANY`, which is what every expando field holds.
+	function ensureAnyFieldWrite(name: string, ctx: FunctionContext): FuncInfo {
+		const existing = anyFieldWriteFuncs.get(name);
+		if (existing)
+			return existing;
+
+		const { funcIndex, typeIndex } = registerFunc(toParams2([
+			{ key: 'recv', wtype: REF_ANY, tsType: T.ANY },
+			{ key: 'value', wtype: REF_ANY, tsType: T.ANY },
+		]), toResults('void'));
+		const info: FuncInfo = { params: [REF_ANY, REF_ANY], result: 'void', funcIndex, typeIndex };
+		anyFieldWriteFuncs.set(name, info);
+		funcs.set(`<any field write>.${name}`, info);
+
+		lateWorklist.push(() => {
+			const dctx	= new FunctionContext(`field_set_${name}`, new Scope(libGlobal), plainReturn('void'), undefined);
+			const recv	= dctx.declareLocal('$recv', REF_ANY);
+			const value	= dctx.declareLocal('$value', REF_ANY);
+
+			const seen = new Set<wasm.HeapType>();
+			const candidates: { heap: wasm.HeapType; typeIndex: number; index: number; wtype: WasmType }[] = [];
+			for (const cls of classes.values()) {
+				const idx = cls.fieldIndex.get(name);
+				if (idx === undefined || cls.typeIndex === -1 || seen.has(cls.typeIndex))
+					continue;
+				seen.add(cls.typeIndex);
+				candidates.push({ heap: cls.typeIndex, typeIndex: cls.typeIndex, index: idx, wtype: cls.fields[idx].wtype });
+			}
+			if (!candidates.length)
+				throw `no reachable class declares a field '${name}' -- a dynamic write on 'any' needs at least one real candidate`;
+
+			// A receiver matching nothing traps, same as the read cascade: there is no honest place to put
+			// the value, and silently dropping a write is the one outcome that could corrupt a program.
+			function buildArm(i: number): wasm.Instr[] {
+				if (i >= candidates.length)
+					return [I.unreachable];
+				const c = candidates[i];
+				dctx.emit(I.local.get(recv.index), I.ref.test(c.heap));
+				const _cond = dctx.swapOut();
+				dctx.emit(I.local.get(recv.index), I.ref.cast(c.heap), I.local.get(value.index));
+				coerceTop(REF_ANY, dctx, c.wtype);
+				dctx.emit(I.struct.set(c.typeIndex, c.index));
+				return [..._cond, I.if(undefined, dctx.swapOut(), buildArm(i + 1))];
+			}
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(2, toValType);
 		});
 		return info;
 	}
