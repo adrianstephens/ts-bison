@@ -28,6 +28,11 @@ export class Array<T> {
 			result[i] = i.toString();
 		return result;
 	}
+	// A string shares the wasm array form (`i16[]`), so "is any wasm array" alone would call `'abc'` an array.
+	// Typed arrays are structs here, so they correctly are not.
+	static isArray(x: any): x is any[] {
+		return typeof x !== 'string' && __asm<[any], boolean>('ref.test (ref array)')(x);
+	}
 	private static _fill<T>(dst: T[], start: i32, val: T, len: i32): void {
 		return __asm<[T[], i32, T, i32], void>('array.fill TYPEINDEX("T[]")')(dst, start, val, len);
 	}

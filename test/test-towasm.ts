@@ -6102,6 +6102,18 @@ async function main() {
 			export function optVoidNull(): number { const c = new Cnt(); c.hit(); return c.n; }
 		`);
 		check('a?.m() on a void method, as a statement', r6.optVoid() * 10 + r6.optVoidNull(), 221);
+
+		// `Array.isArray` on a boxed `any`: a string shares the wasm array form, so it must answer false.
+		const r7 = await compile(`
+			export function isArr(): number {
+				const a: any = [1, 2];
+				const s: any = 'abc';
+				const o: any = { a: 1 };
+				const u: any = undefined;
+				return (Array.isArray(a) ? 1000 : 0) + (Array.isArray(s) ? 100 : 0) + (Array.isArray(o) ? 10 : 0) + (Array.isArray(u) ? 1 : 0);
+			}
+		`);
+		check('Array.isArray: true for an array, false for a string/object/undefined', r7.isArr(), 1000);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 
