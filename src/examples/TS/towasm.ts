@@ -6410,6 +6410,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const method = ensureMethod(owner, methodName, e.arguments, ctx, typeArgs);
 						if (!method)
 							throw `'a?.${methodName}(...)' is not supported -- only a plain user-defined method (not a 'Math'/prelude intrinsic) can be guarded by '?.' in this pass`;
+						// As a statement the value is discarded, so a `void` method needs no `void | undefined`: just the guarded call.
+						if (want === 'void') {
+							emitAs(objExpr, ctx, objWtype);
+							const objLocal = ctx.declareLocal(`$optcall$${optionalTempCounter++}`, objWtype);
+							ctx.emit(I.local.tee(objLocal.index), I.ref.is_null, I.i32.eqz);
+							const _old = ctx.swapOut();
+							ctx.emit(I.local.get(objLocal.index), I.ref.as_non_null);
+							if (emitMethodCall(owner, methodName, e.arguments, ctx, typeArgs) !== 'void')
+								ctx.emit(I.drop);
+							ctx.emit(I.if(undefined, ctx.swapOut(_old)));
+							return 'void';
+						}
 						if (method.result === 'void')
 							throw `'a?.${methodName}(...)' is not supported -- '${methodName}' returns 'void', which can't become 'void | undefined'`;
 						emitAs(objExpr, ctx, objWtype);

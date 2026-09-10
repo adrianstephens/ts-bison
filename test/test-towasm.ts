@@ -6093,6 +6093,15 @@ async function main() {
 		`);
 		check('an any compared to undefined', r5.restAny(), 1);
 		check('an any local reassigned to undefined', r5.reassigned(), 1);
+
+		// `a?.m()` as a STATEMENT on a `void` method (type-utils.ts's `this.parent?.hitDepthLimit(fn)`):
+		// the value is discarded, so no `void | undefined` is needed -- only the guarded call.
+		const r6 = await compile(`
+			class Cnt { n = 0; parent?: Cnt; hit(): void { this.n++; this.parent?.hit(); } }
+			export function optVoid(): number { const c = new Cnt(); c.parent = new Cnt(); c.hit(); c.hit(); return c.parent.n * 10 + c.n; }
+			export function optVoidNull(): number { const c = new Cnt(); c.hit(); return c.n; }
+		`);
+		check('a?.m() on a void method, as a statement', r6.optVoid() * 10 + r6.optVoidNull(), 221);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 
