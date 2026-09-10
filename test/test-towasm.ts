@@ -3622,6 +3622,25 @@ async function main() {
 		}, 'main');
 		check('a namespace-qualified function passed as a value', nsFnValue(), 42);
 
+		// Imports through a re-export barrel (tison.ts has been one since b1d5692): the named-import map pointed
+		// at the barrel, which declares nothing, and the re-exported modules were never even loaded.
+		const { viaStar, viaRenamed, viaNsStar } = await compileMulti({
+			core:	`export function twice(x: number): number { return x * 2; }`,
+			star:	`export * from './core';`,
+			named:	`export { twice as dbl } from './core';`,
+			main: `
+				import { twice } from './star';
+				import { dbl } from './named';
+				import * as S from './star';
+				export function viaStar(): number { return twice(21); }
+				export function viaRenamed(): number { return dbl(20); }
+				export function viaNsStar(): number { return S.twice(10); }
+			`,
+		}, 'main');
+		check('a named import through export * from', viaStar(), 42);
+		check('a renamed import through export {x as y} from', viaRenamed(), 40);
+		check('a namespace import through export * from', viaNsStar(), 20);
+
 		// An `export *` inside an import cycle (tison.ts <-> lalr.ts) must bind whatever order the cycle's modules load in.
 		// Imports resolved concurrently let a slow `./p` decide, and `a`'s `export * from './b'` was cut.
 		{
