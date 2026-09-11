@@ -347,7 +347,7 @@ export function bindingNames(t: BindingTarget): string[] {
 
 // De-dupes structurally-identical types and folds what's left into a `union`
 export function combineTypes(types: Type[]): Type {
-	const seen = new Set<string>();
+	const seen = new Map<string, number>();
 	const unique: Type[] = [];
 	const add = (t: Type) => {
 		if (t.type === 'union') {
@@ -2409,10 +2409,10 @@ export function chooseInference(co: Type[], contra: Type[], scope: Scope, fromLi
 		// TS's getCommonSupertype: with strictNullChecks, `null`/`undefined` stand aside while the supertype is chosen, then join it.
 		const nullish	= scope.strictNullChecks() ? members.filter(m => isNullish(m, scope)) : [];
 		const primary	= nullish.length ? co.map(t => combineTypes(unionMembers(t, scope).filter(m => !isNullish(m, scope)))).filter(t => !isRef(t, 'never')) : co;
-		const supertype	= primary.length ? primary.reduce((s, t) => s !== t && isAssignable(s, t, scope) ? t : s) : NEVER;
+		const supertype	= primary.length ? primary.reduce((s, t) => s !== t && isAssignable(s, t, scope, scope, false, 10, true) ? t : s) : NEVER;
 		return nullish.length ? combineTypes([supertype, ...nullish]) : supertype;
 	}
-	return contra.length ? contra.reduce((s, t) => s !== t && isAssignable(t, s, scope) ? t : s) : undefined;
+	return contra.length ? contra.reduce((s, t) => s !== t && isAssignable(t, s, scope, scope, false, 10, true) ? t : s) : undefined;
 }
 
 // The parameter types of every signature `t` offers a callback (a function, a call member, each member of a union).
