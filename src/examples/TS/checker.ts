@@ -66,6 +66,33 @@ function alwaysThrows(stmt: Stmt | undefined): boolean {
 	}
 }
 
+// Control never reaches the statement after this switch through a clause: none `break`s out, and the last clause exits
+// (return/throw/continue). Falling out of the switch then means no case matched.
+function clausesNeverFallOut(stmt: Stmt & { type: 'switch' }): boolean {
+	const exitsPast = (s: Stmt): boolean => s.type === 'return' || s.type === 'throw' || s.type === 'continue'
+		|| (s.type === 'block' && s.body.length > 0 && exitsPast(s.body[s.body.length - 1]))
+		|| (s.type === 'if' && !!s.alternate && exitsPast(s.consequent) && exitsPast(s.alternate));
+	// A `break` inside a nested loop or switch targets that, not this switch; any other one (labelled too) leaves it.
+	const breaksOut = (s: Stmt): boolean => {
+		switch (s.type) {
+			case 'break':		return true;
+			case 'block':		return s.body.some(breaksOut);
+			case 'if':			return breaksOut(s.consequent) || (!!s.alternate && breaksOut(s.alternate));
+			case 'try':			return s.body.some(breaksOut) || s.handlers.some(h => h.body.some(breaksOut)) || !!s.finalizer?.some(breaksOut);
+			case 'labeled':		return breaksOut(s.body);
+			default:			return false;
+		}
+	};
+	const last = stmt.cases[stmt.cases.length - 1];
+	return !!last?.consequent.length && exitsPast(last.consequent[last.consequent.length - 1]) && !stmt.cases.some(c => c.consequent.some(breaksOut));
+}
+
+// The test under which no case of `stmt` matched: every case test negated, ANDed; undefined without cases.
+function noCaseMatched(stmt: Stmt & { type: 'switch' }): Expr | undefined {
+	return stmt.cases.flatMap(c => c.test ? [{ type: 'unary', operator: '!', operand: { type: 'binary', operator: '===', left: stmt.discriminant, right: c.test } } as Expr] : [])
+		.reduce<Expr | undefined>((acc, t) => acc ? { type: 'binary', operator: '&&', left: acc, right: t } : t, undefined);
+}
+
 // Conservative "this statement never falls through" -- powers guard-clause narrowing
 function alwaysExits(stmt: Stmt): boolean {
 	switch (stmt.type) {
@@ -450,6 +477,20 @@ function throughSources(e: Expr, scope: Scope): Expr {
 	return out;
 }
 
+// `e` (holding when `sense`) as "`typeof operand` is not `kind`", or undefined.
+function typeofExclusion(e: Expr, sense: boolean): { operand: Expr; kind: string } | undefined {
+	if (e.type !== 'binary' || !['===', '==', '!==', '!='].includes(e.operator))
+		return undefined;
+	const [t, k] = e.left.type === 'unary' && e.left.operator === 'typeof' ? [e.left, e.right] : [e.right, e.left];
+	return (e.operator === '===' || e.operator === '==') !== sense && t.type === 'unary' && t.operator === 'typeof' && T.isLiteral(k, 'string') ? { operand: t.operand, kind: k.value } : undefined;
+}
+
+// Every result `typeof` can give for a value of `m`: a non-primitive `object` may be a function. Undefined when unknown.
+function typeofNames(m: Type, scope: Scope): string[] | undefined {
+	const name = T.typeofName(m, scope);
+	return name ? [name] : T.isRef(T.resolveOwn(m, scope), 'object') ? ['object', 'function'] : undefined;
+}
+
 export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 	const aliasing = new Set<string>();
 	return recurse(scope.hasSources() ? throughSources(test, scope) : test, scope, sense);
@@ -570,8 +611,39 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 			case 'binary': {
 				// `a && b`'s true branch / `a || b`'s false branch: both conjuncts hold (or both fail),
 				// so each narrowing applies on top of the other -- sequential/conjunctive narrowing.
-				if ((test.operator === '&&' && sense) || (test.operator === '||' && !sense))
-					return recurse(test.right, recurse(test.left, scope, sense), sense);
+				if ((test.operator === '&&' && sense) || (test.operator === '||' && !sense)) {
+					// A conjunction's `typeof` exclusions on one reference apply TOGETHER, as TS narrows `switch (typeof x)`: an
+					// `object` is gone only once both 'object' and 'function' are excluded, which neither exclusion alone can say.
+					const parts: [Expr, boolean][] = [];
+					const flatten = (e: Expr, s: boolean): void => {
+						if (e.type === 'binary' && ((e.operator === '&&' && s) || (e.operator === '||' && !s))) {
+							flatten(e.left, s);
+							flatten(e.right, s);
+						} else if (e.type === 'unary' && e.operator === '!') {
+							flatten(e.operand, !s);
+						} else {
+							parts.push([e, s]);
+						}
+					};
+					flatten(test, sense);
+					const excluded = new Map<string, { operand: Expr; kinds: Set<string> }>();
+					const unrelated = parts.filter(([e, s]) => {
+						const x = typeofExclusion(e, s);
+						const key = x && T.pathKey(x.operand);
+						if (!x || !key)
+							return true;
+						const group = excluded.get(key) ?? { operand: x.operand, kinds: new Set<string>() };
+						group.kinds.add(x.kind);
+						excluded.set(key, group);
+						return false;
+					});
+					let narrowed = scope;
+					for (const { operand, kinds } of excluded.values())
+						narrowed = narrowKey(operand, m => { const names = typeofNames(m, scope); return !names || !names.every(k => kinds.has(k)); }, narrowed) ?? narrowed;
+					for (const [e, s] of unrelated)
+						narrowed = recurse(e, narrowed, s);
+					return narrowed;
+				}
 				// `a || b`'s true branch: only *one* disjunct is known to hold, but a variable BOTH sides narrow (`typeof icon === 'string' ||
 				// icon instanceof Uri`) can be narrowed to the union of what each side alone would narrow it to (disjunctive/union narrowing).
 				if ((test.operator === '||' && sense) || (test.operator === '&&' && !sense)) {
@@ -597,7 +669,13 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 				if (eq || test.operator === '!==' || test.operator === '!=') {
 					const keepMatch	= eq === sense;		// keep the members that match the compared value
 					const loose		= test.operator === '==' || test.operator === '!=';
+					// The compared value when it is one unit type: a literal, or a name typed as one (`Kind.A`, a `const k = 'a'`) -- TS narrows by either.
+					const unitOf = (x: Expr): { value: string | number | bigint | boolean } | undefined => {
+						const t = x.type === 'literal' ? x : T.pathKey(x) !== undefined ? T.resolveOwn(typeOf(x, scope, false), scope) : undefined;
+						return t?.type === 'literal' && t.value !== null && !Array.isArray(t.value) ? { value: t.value as string | number | bigint | boolean } : undefined;
+					};
 					for (const [l, r] of [[test.left, test.right], [test.right, test.left]] as const) {
+						const unit = unitOf(r);
 						// typeof x === 'kind' (x may be a dotted path, e.g. `typeof options.layer === 'number'`)
 						if (l.type === 'unary' && l.operator === 'typeof' && T.isLiteral(r, 'string')) {
 							const kind = r.value;
@@ -620,44 +698,48 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 								return s;
 						}
 						// x === literal: literal members must match; non-literal members might
-						if (l.type === 'identifier' && r.type === 'literal' && r.value !== null)
-							return narrowValue(scope, l.name, m => {
+						// Which members of the compared reference's own type survive: literal members must match; non-literal members might.
+						const unitKeep = unit && ((raw: Type): boolean | Type => {
+							const m = T.resolveOwn(raw, scope);
 								if (m.type === 'literal')
-									return (m.value === r.value) === keepMatch;
+									return (m.value === unit.value) === keepMatch;
 								// `boolean` has exactly two inhabitants -- real TS narrows it as `true | false`, so `x === false`
 								// narrows the other branch down to literal `true` instead of leaving `boolean` unsplit.
-								if (m.type === 'ref' && m.name === 'boolean' && typeof r.value === 'boolean')
-									return Literal(keepMatch ? r.value : !r.value);
+								if (m.type === 'ref' && m.name === 'boolean' && typeof unit.value === 'boolean')
+									return Literal(keepMatch ? unit.value : !unit.value);
 								// A plain (or already range-narrowed) number/bigint pins down to exactly `r.value` on the matching
 								// branch -- intersected with whatever's already known, so an equality that contradicts an
 								// earlier bound (`x > 10` then `x === 3`) correctly narrows to `never`, not just `3`.
 								// The excluding branch can only special-case "was already pinned to this exact value".
-								if (typeof r.value === 'number' || typeof r.value === 'bigint') {
+								const v = unit.value;
+								if (typeof v === 'number' || typeof v === 'bigint') {
 									const mr = T.toRange(m);
-									if (mr && mr.base === typeof r.value) {
+									if (mr && mr.base === typeof v) {
 										if (keepMatch) {
-											const merged = T.rangeIntersect(mr, { base: mr.base, min: r.value, max: r.value, integer: typeof r.value === 'bigint' || Number.isInteger(r.value) });
+											const merged = T.rangeIntersect(mr, { base: mr.base, min: v, max: v, integer: typeof v === 'bigint' || Number.isInteger(v) });
 											return merged ? T.rangeToType(merged) : false;
 										}
-										return mr.min !== undefined && mr.min === mr.max && mr.min === r.value ? false : true;
+										return mr.min !== undefined && mr.min === mr.max && mr.min === v ? false : true;
 									}
 								}
 								return true;
 							});
+						if (l.type === 'identifier' && unitKeep)
+							return narrowValue(scope, l.name, unitKeep);
 						// x.prop === literal (discriminated union): `narrowByDiscriminant` splits a compound member to its matching
 						// sub-variant(s) instead of keeping/discarding it whole; `l.object` may itself be a dotted path.
 						// `x[0] === literal` discriminates too -- a tuple's position, or an interface's numeric key.
 						const discKey = l.type === 'member' ? l.property
 							: l.type === 'index' && (T.isLiteral(l.index, 'number') || T.isLiteral(l.index, 'string')) ? String(l.index.value)
 							: undefined;
-						if ((l.type === 'member' || l.type === 'index') && discKey !== undefined && r.type === 'literal') {
+						if ((l.type === 'member' || l.type === 'index') && discKey !== undefined && unit) {
 							// `x?.prop === literal` truly holding also implies `x` itself is non-nullish -- a nullish `x` would
 							// short-circuit the whole expression to `undefined`, which a non-nullish literal can never equal.
 							// Only sound when this branch asserts the equality actually held (`keepMatch`): the excluding branch
 							// (`x?.prop !== literal`) is satisfied by a nullish `x` just as well, so no such inference there.
 
 							const prop = discKey;
-							const target = r.value;
+							const target = unit.value;
 
 							// Narrows `m` by a discriminant-property equality test, recursing into `m`'s structure to split a compound member down
 							// to its matching sub-variant(s) rather than keep/discard it whole.
@@ -692,6 +774,12 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 							}
 
 							const s = narrowKey(l.object, narrowByDiscriminant, keepMatch && l.optional ? narrowKey(l.object, m => !T.isNullish(m, scope)) : scope);
+							// The compared path is itself a reference TS narrows too (`value.type` over a `Partial<...>` no discriminant can split).
+							const key = T.pathKey(l);
+							if (key && unitKeep) {
+								const base = s ?? scope;
+								return narrowValue(base, key, unitKeep, base.value(key) ?? typeOf(l, base));
+							}
 							if (s)
 								return s;
 						}
@@ -913,6 +1001,10 @@ function hoist(stmts: Stmt[], scope: Scope) {
 				);
 				scope.addType(stmt.name, T.combineTypes(memberTypes));
 				scope.addValue(stmt.name, TS.ObjectType(stmt.members.map((m, i) => TS.TypeProperty(m.name, memberTypes[i]))));
+				// Each member is a type too (`kind: Kind.A`), reached as a dotted name through the enum's own namespace; merged declarations share it.
+				const members = scope.ownNamespace(stmt.name) ?? new Scope(scope);
+				stmt.members.forEach((m, i) => members.addType(m.name, memberTypes[i]));
+				scope.addNamespace(stmt.name, members);
 				break;
 			}
 			case 'namespace_decl': {
@@ -996,6 +1088,15 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 		// also narrows through what its initializer itself would narrow (`narrow()`'s `case 'identifier'` reads this).
 		if (!widen && d.init)
 			scope.addAlias(d);
+		// TS's assignment narrowing: a union-typed `const` reads as the declared members its initializer can be (`const e: E = E.ONE`
+		// is `E.ONE`). Only for `const` -- narrowings are never invalidated by reassignment, so a `let` would stay narrowed wrongly.
+		if (!widen && d.init && typeAnnotation) {
+			const declared = T.unionMembers(typeAnnotation, scope);
+			const init = declared.length > 1 ? T.unionMembers(typeOf(d.init, scope, false, typeAnnotation), scope) : [];
+			const kept = declared.filter(m => init.some(i => T.isAssignable(i, m, scope)));
+			if (kept.length && kept.length < declared.length)
+				scope.addNarrowing(d.name, T.combineTypes(kept));
+		}
 	} else {
 		const t = typeAnnotation ?? (d.init && T.widenNullish(typeOf(d.init, scope, widen, undefined, undefined, err), scope));
 		if (t)
@@ -2360,6 +2461,13 @@ export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), chec
 					}
 				}
 				break;
+			case 'switch': {
+				// An exhaustive switch whose every clause exits: the rest of the block runs only when no case matched.
+				const none = !s.cases.some(c => !c.test) && clausesNeverFallOut(s) ? noCaseMatched(s) : undefined;
+				if (none)
+					scope = narrow(none, scope, true);
+				break;
+			}
 		}
 	}
 }
@@ -2459,8 +2567,7 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 			// A `case` with no body falls through to the next -- reuse `if`'s discriminated-union narrowing by synthesizing that binary
 			// test per case, OR-ing fallthrough cases together. `default` runs when NO case matched: the negation of every test, ANDed.
 			const caseTest	= (test: Expr): Expr => ({ type: 'binary', operator: '===', left: stmt.discriminant, right: test });
-			const none		= stmt.cases.flatMap(c => c.test ? [{ type: 'unary', operator: '!', operand: caseTest(c.test) } as Expr] : [])
-				.reduce<Expr | undefined>((acc, t) => acc ? { type: 'binary', operator: '&&', left: acc, right: t } : t, undefined);
+			const none		= noCaseMatched(stmt);
 			let pending: Expr[] = [];
 			for (const c of stmt.cases) {
 				if (c.test) {

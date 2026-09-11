@@ -1584,8 +1584,8 @@ export function isNumberLike(t: Type, scope: Scope): boolean {
 
 export function isStringLike(t: Type, scope: Scope): boolean {
 	const r = resolveOwn(t, scope);
-	return isString(t)
-		|| isLiteral(t, 'string')
+	return isString(r)
+		|| isLiteral(r, 'string')
 		|| (r.type === 'union' && r.types.some(t => isStringLike(t, scope)));
 }
 
@@ -1931,8 +1931,10 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				if (allSigs)
 					return TS.ObjectType(sigs.map((s): TS.TypeMember => ({ type: 'call', params: s.params, rest: s.rest, returnType: s.returnType, typeParams: s.typeParams })));
 				// A plain property narrowed by more than one part at once (`SomeUnion & {kind:'x'}`'s own `kind`) needs every part's
-				// constraint applied together -- unlike class-inheritance override, `&`'s parts have no such order.
-				return TS.IntersectionType(distinct);
+				// constraint applied together -- unlike class-inheritance override, `&`'s parts have no such order. A part made of unit
+				// types (`kind: Kind` under an extending `kind: Kind.A`) reduces the whole to its units every part admits, as TS does.
+				const units = distinct.map(m => unionMembers(m, scope)).find(ms => ms.every(u => resolveOwn(u, scope).type === 'literal'));
+				return units ? combineTypes(units.filter(u => distinct.every(p => isAssignable(u, p, scope)))) : TS.IntersectionType(distinct);
 			}
 			case 'union': {
 				const parts = t.types.map(p => lookupMember(p, prop, scope, depth - 1));
@@ -1959,6 +1961,32 @@ export function sealed(t: Type, scope: Scope, depth = 6): boolean {
 	}
 	t = resolveOwn(t, scope);
 	return t.type === 'object' || (t.type === 'intersection' && t.types.every(p => sealed(p, scope, depth - 1)));
+}
+
+// `t`'s union constituents, resolved, with `boolean` as `true | false`.
+function constituents(t: Type, scope: Scope): Type[] {
+	return unionMembers(t, scope).flatMap(m => {
+		const r = resolveOwn(m, scope);
+		return isRefNamed(r, 'boolean') ? [Literal(true), Literal(false)] : [r];
+	});
+}
+const isUnit = (t: Type) => t.type === 'literal' || isRefNamed(t, 'undefined') || isRefNamed(t, 'null');
+
+// `src` once per combination of its discriminant properties' constituents (a property `dst`'s members discriminate on by a
+// unit type), as TS relates an object to a discriminated union; undefined when nothing splits or past TS's 25 combinations.
+function splitDiscriminants(src: TS.ObjectType, dst: TS.UnionType, scope: Scope): Type[] | undefined {
+	const isDiscriminant = (key: string) => dst.types.some(t => { const p = lookupMember(t, key, scope); return !!p && constituents(p, scope).every(isUnit); });
+	const splits: { i: number; prop: TS.TypeMember & { type: 'property' }; units: Type[] }[] = [];
+	src.members.forEach((prop, i) => {
+		const units = prop.type === 'property' && typeof prop.key === 'string' && isDiscriminant(prop.key) ? constituents(prop.typeAnnotation, scope) : [];
+		if (prop.type === 'property' && units.length > 1)
+			splits.push({ i, prop, units });
+	});
+	if (!splits.length || splits.reduce((n, s) => n * s.units.length, 1) > 25)
+		return undefined;
+	return splits.reduce<TS.TypeMember[][]>((variants, { i, prop, units }) => variants.flatMap(members =>
+		units.map(u => members.map((x, j) => j === i ? TS.TypeProperty(prop.key, u, prop.modifiers) : x))
+	), [src.members]).map(members => TS.ObjectType(members));
 }
 
 // `dstScope` resolves names in `dst`'s own structure (distinct from `scope`, which resolves `src`'s) -- same scope almost
@@ -2037,7 +2065,10 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			// `dst` to one candidate first -- fall back to trying each of `src`'s parts against the full, unnarrowed `dst` union.
 			if (src.type === 'intersection' && src.types.some(t => recurse(t, dst, depth - 1)))
 				return true;
-			return false;
+			// TS's discriminated assignability: `{ kind: A | B, ... }` fits `{ kind: A, ... } | { kind: B, ... }` when each
+			// discriminant value, taken alone, fits some member.
+			const split = src.type === 'object' ? splitDiscriminants(src, dst, scope) : undefined;
+			return !!split && split.every(s => dst.types.some(t => recurse(s, t, depth - 1)));
 		}
 
 		if (dst.type === 'intersection')
