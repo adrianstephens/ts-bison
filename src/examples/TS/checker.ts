@@ -443,8 +443,11 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 		// wider original shape -- the whole point of a type guard is to say more than the union member's
 		// declared type alone does (e.g. `Literal<TypeOfMap[K]>` pinning `.value` past a real AST literal
 		// node's own wide `value` union). A plain boolean `keep` would silently discard that.
+		// A member WIDER than the target (`Lit<string | number>` guarded to `Lit<string>`) narrows to it too, as in TS.
 		if (r.type === 'union' && !T.isAny(target))
-			return narrowValue(scope, name, m => T.isAssignable(m, target, scope) === sense ? (sense ? target : true) : false, t);
+			return narrowValue(scope, name, sense
+				? m => T.isAssignable(m, target, scope) || T.isAssignable(target, m, scope) ? target : false
+				: m => !T.isAssignable(m, target, scope), t);
 		if (!sense)
 			return scope;
 		const s = new Scope(scope);
@@ -742,8 +745,9 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 							const names = new Map(sig.typeParams.map(p => [p.name, p] as const));
 							test.arguments.forEach((a, i) => {
 								const p = sig.params[i];
+								// Unwidened, as a call's own arguments are: `isLiteral(t, 'string')`'s `K` is the literal `'string'`.
 								if (a.type !== 'spread' && p?.typeAnnotation)
-									T.inferTypeArgs(p.typeAnnotation, typeOf(a, scope), names, map, scope);
+									T.inferTypeArgs(p.typeAnnotation, typeOf(a, scope, false), names, map, scope);
 							});
 							// An uninferred type param must not leave a dangling `{type:'ref', name:'T'}` in `target`, or every other assignability
 							// check (which treats an unresolvable ref as "unrelated") would silently narrow the guard to nothing at all.
