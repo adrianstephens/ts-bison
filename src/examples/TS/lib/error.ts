@@ -22,3 +22,11 @@ class Error {
 		return this.message.length ? this.name + ': ' + this.message : this.name;
 	}
 }
+
+// `name` set by the constructor, not redeclared: a subclass may not redeclare an inherited field here.
+class RangeError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'RangeError';
+	}
+}

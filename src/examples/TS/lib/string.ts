@@ -66,6 +66,28 @@ export class String {
 		String._setChar(result, 0, c);
 		return result;
 	}
+	// Each code point above 0xFFFF is its UTF-16 surrogate pair; an invalid one is a RangeError, as in JS.
+	static fromCodePoint(...codePoints: number[]): string {
+		let n = 0;
+		for (let i = 0; i < codePoints.length; i++) {
+			const c = codePoints[i];
+			if (c < 0 || c > 0x10ffff || c !== Math.floor(c))
+				throw new RangeError('Invalid code point ' + c);
+			n += c > 0xffff ? 2 : 1;
+		}
+		const result = String._alloc(n);
+		let j = 0;
+		for (let i = 0; i < codePoints.length; i++) {
+			const c = codePoints[i];
+			if (c > 0xffff) {
+				String._setChar(result, j++, 0xd800 + ((c - 0x10000) >> 10));
+				String._setChar(result, j++, 0xdc00 + ((c - 0x10000) & 0x3ff));
+			} else {
+				String._setChar(result, j++, c);
+			}
+		}
+		return result;
+	}
 	// One `array.new_default` up front, then a straight fill -- the point is precisely to avoid
 	// `concat`'s per-call fresh-array-and-copy-both-sides cost when a caller has `len` bytes in hand.
 	static fromCharCodesAt(ptr: i32, len: i32): string {
