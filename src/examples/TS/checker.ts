@@ -597,7 +597,21 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 	}
 
 
+	function nonNullChainRoots(e: Expr, scope: Scope): Scope {
+		for (let x: Expr = e; x.type === 'member' || x.type === 'index' || x.type === 'call'; x = x.type === 'call' ? x.callee : x.object) {
+			const root = x.optional ? (x.type === 'call' ? x.callee : x.object) : undefined;
+			const key = root && T.pathKey(root);
+			if (key)
+				scope = narrowValue(scope, key, m => !T.isNullish(m, scope), scope.value(key) ?? typeOf(root!, scope));
+		}
+		return scope;
+	}
+
 	function recurse(test: Expr, scope: Scope, sense: boolean): Scope {
+		// A truthy optional chain (`a?.b.c(x)`) has every object before a `?.` in it non-nullish: a nullish one short-circuits the
+		// whole chain to `undefined`. Only the truthy branch knows it -- `!a?.b` holds for a nullish `a` as well.
+		if (sense && (test.type === 'member' || test.type === 'index' || test.type === 'call'))
+			scope = nonNullChainRoots(test, scope);
 		const truthy: (m: Type) => boolean = sense ? m => !T.isFalsy(m, scope) : m => !T.isTruthy(m, scope);
 		const narrowKey = (target: Expr, keep: (m: Type) => boolean | Type, base = scope) => {
 			const key = T.pathKey(target);
@@ -624,13 +638,8 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 			// Truthiness-narrows a dotted property path (`if (icon.color)`), keyed by the whole path -- no alias-following, since `scope.alias`
 			// only tracks plain-identifier `const` initializers, not member chains.
 			case 'member': {
-				// `x?.y` truthy also implies `x` itself is non-nullish -- a nullish `x` would make the whole optional-chain
-				// expression evaluate to `undefined`, which is falsy. Only sound for the truthy branch: `!x?.y` doesn't pin `x`
-				// down at all (it could be nullish, or defined with a falsy `y`). Narrowed first so the composite-path
-				// narrowing below builds on top of it, rather than the two ending up as unrelated sibling scopes.
-				const base = test.optional && sense ? narrowKey(test.object, m => !T.isNullish(m, scope)) : undefined;
 				const key	= T.pathKey(test);
-				return (key ? narrowValue(base ?? scope, key, truthy, scope.value(key) ?? typeOf(test, scope)) : base) ?? scope;
+				return key ? narrowValue(scope, key, truthy, scope.value(key) ?? typeOf(test, scope)) : scope;
 			}
 			// `if ((x = e))` narrows x by truthiness
 			case 'assign':
