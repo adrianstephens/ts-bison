@@ -100,7 +100,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - arrayMethod's `map` model must stay until a type alias union (`Ty | Lit`) is flattened where towasm reads it;
   removing it broke towasm. `reduce` is now TS's real three overloads (6ee71c9).
 - var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked.
-- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits.
+- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372.
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested
   generics go exponential (7z.ts hit 4 GB). Diagnostics print types within a budget (0d84298).
@@ -126,6 +126,12 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - towasm: an anonymous object type with overloaded methods cannot be a method receiver ("field 'X' redeclares an inherited
   field" from buildObjectShape); `Object` intrinsics are recognised by name (objectIntrinsic), not by resolution.
   towasm lib.d.ts has no `Iterable`, so TS's `Object.fromEntries` cannot be declared yet.
+- towasm lib's `Promise.then(onFulfilled: (value: T) => void): void` returns void and does not chain, so
+  `cached = resolveImports(...).then(async ...)` (transform.ts makeScope) is `void`; TS's returns `Promise<TResult1 | TResult2>`.
+- `let r = cond ? typeOf(x) : 'void'` (towasm 2386) passes tsc through LET ASSIGNMENT NARROWING -- a let's flow type after its
+  declaration is the unwidened initializer type -- not literal freshness (tsc: a fresh 'void' is NOT absorbed by a regular
+  one; `let r = c ? t() : 'void'` is `string | undefined`). Literal freshness (widen only literals written as expressions)
+  is the root of `[c]` widening a declared `{ type: 'fn' }` (checker 1866/2094).
 - Real tsc for probes: `node_modules/.bin/tsc --ignoreConfig --noEmit --strict --target es2022 file.ts` (TS 6.0.3 refuses
   files alongside a tsconfig otherwise). Check TS semantics this way before modeling them.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
