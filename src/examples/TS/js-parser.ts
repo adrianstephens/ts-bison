@@ -83,9 +83,9 @@ export function  FunctionExpr<T>(sig: CallSig<T>, body: Stmt<T>[], more?: Partia
 export interface Arrow<T> extends CallSig<T> { type: 'arrow'; body: Expr | Stmt<T>[]; modifiers?: string[] }
 export function  Arrow<T>(sig: CallSig<T>, body: Expr | Stmt<T>[], more?: Partial<Arrow<T>>): Arrow<T> { return { body, ...sig, ...more, type: 'arrow'}; }
 
-export interface Method<T> extends CallSig<T> { type: 'method' | 'get' | 'set'; key: Key<T>; body?: Stmt<T>[], modifiers?: string[] }
+export interface Method<T> extends CallSig<T> { type: 'method' | 'get' | 'set'; key: Key<T>; body?: Stmt<T>[], modifiers?: string[]; decorators?: Expr[] }
 export function  Method<T>(type: 'method' | 'get' | 'set', key: Key<T>, sig: CallSig<T>, body?: Stmt<T>[], modifiers?: string[]): Method<T> { return { type, key, body, modifiers, ...sig }; }
-export interface Field<T> { type: 'field'; key: Key<T>; value?: Expr; typeAnnotation?: T; modifiers?: string[] }
+export interface Field<T> { type: 'field'; key: Key<T>; value?: Expr; typeAnnotation?: T; modifiers?: string[]; decorators?: Expr[] }
 export function  Field<T>(key: Key<T>, value?: Expr<T>, typeAnnotation?: T, modifiers?: string[]): Field<T> { return { type: 'field', key, value, typeAnnotation, modifiers }; }
 
 export type ObjectProperty<T> = Method<T> | Field<T> | Spread<T>;

@@ -589,7 +589,8 @@ export class Output {
 
 		// `'optional'` renders as a trailing `?`, not a prefix keyword like the rest (`public`/`static`/...).
 		const memberPrefix = member.modifiers?.filter(m => m !== 'optional' && m !== 'definite' && m !== 'generator');
-		const result = maybe(memberPrefix?.length, () => memberPrefix!.join(' ') + ' ');
+		const result = this.decorators(member.type !== 'index_signature' ? member.decorators : undefined)
+			+ maybe(memberPrefix?.length, () => memberPrefix!.join(' ') + ' ');
 
 		switch (member.type) {
 			case 'field':
