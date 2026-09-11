@@ -167,6 +167,13 @@ function shapedHint(t: Type | undefined, scope: Scope): Type | undefined {
 	return t && T.resolveOwn(t, scope).type !== 'ref' ? t : undefined;
 }
 
+// TS's getReferenceCandidate: an assignment narrows as what it assigns to (`(x = next()) !== null`), a comma as its last operand.
+function referenceOf(e: Expr): Expr {
+	return	e.type === 'assign' && (!e.operator || e.operator === '??' || e.operator === '&&' || e.operator === '||') ? referenceOf(e.target)
+		:	e.type === 'sequence' ? referenceOf(e.expressions[e.expressions.length - 1])
+		:	e;
+}
+
 // A callback with an unannotated parameter takes its parameter types from its context (TS's `isContextSensitive`).
 function isContextSensitive(a: Expr): a is Expr & { type: 'function' | 'arrow' } {
 	return (a.type === 'function' || a.type === 'arrow') && a.params.some(p => !p.typeAnnotation);
@@ -621,7 +628,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 			scope = nonNullChainRoots(test, scope);
 		const truthy: (m: Type) => boolean = sense ? m => !T.isFalsy(m, scope) : m => !T.isTruthy(m, scope);
 		const narrowKey = (target: Expr, keep: (m: Type) => boolean | Type, base = scope) => {
-			const key = T.pathKey(target);
+			const key = T.pathKey(referenceOf(target));
 			return key ? narrowValue(base, key, keep, base.value(key) ?? typeOf(target, base)) : undefined;
 		};
 
@@ -650,9 +657,8 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 			}
 			// `if ((x = e))` narrows x by truthiness
 			case 'assign':
-				return !test.operator && test.target.type === 'identifier'
-					? narrowValue(scope, test.target.name, truthy)
-					: scope;
+			case 'sequence':
+				return narrowKey(test, truthy) ?? scope;
 
 			case 'binary': {
 				// `a && b`'s true branch / `a || b`'s false branch: both conjuncts hold (or both fail),
@@ -675,7 +681,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 					const excluded = new Map<string, { operand: Expr; kinds: Set<string> }>();
 					const unrelated = parts.filter(([e, s]) => {
 						const x = typeofExclusion(e, s);
-						const key = x && T.pathKey(x.operand);
+						const key = x && T.pathKey(referenceOf(x.operand));
 						if (!x || !key)
 							return true;
 						const group = excluded.get(key) ?? { operand: x.operand, kinds: new Set<string>() };
