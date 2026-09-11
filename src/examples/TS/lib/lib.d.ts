@@ -364,6 +364,24 @@ declare type Float64Array = TypedArray<f64>;
 declare type BigInt64Array = TypedArray<i64>;
 declare type BigUint64Array = TypedArray<u64>;
 
+// The values `new Uint8Array(...)` resolves against, as TS's `Uint8ArrayConstructor`: the constructors `lib/typedarray.ts` implements.
+interface TypedArrayConstructor<A> {
+	new (length: number): A;
+	new (elements: number[]): A;
+	new (buffer: ArrayBuffer, byteOffset?: number, length?: number): A;
+}
+declare var Int8Array: TypedArrayConstructor<Int8Array>;
+declare var Uint8Array: TypedArrayConstructor<Uint8Array>;
+declare var Uint8ClampedArray: TypedArrayConstructor<Uint8ClampedArray>;
+declare var Int16Array: TypedArrayConstructor<Int16Array>;
+declare var Uint16Array: TypedArrayConstructor<Uint16Array>;
+declare var Int32Array: TypedArrayConstructor<Int32Array>;
+declare var Uint32Array: TypedArrayConstructor<Uint32Array>;
+declare var Float32Array: TypedArrayConstructor<Float32Array>;
+declare var Float64Array: TypedArrayConstructor<Float64Array>;
+declare var BigInt64Array: TypedArrayConstructor<BigInt64Array>;
+declare var BigUint64Array: TypedArrayConstructor<BigUint64Array>;
+
 //declare var TypedArray: {
 //	new (length: number): TypedArray<any>;
 //	new (buffer: ArrayBuffer, byteOffset?: number, length?: number): TypedArray<any>;

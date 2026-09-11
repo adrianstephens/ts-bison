@@ -1797,6 +1797,12 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					}
 				}
 
+				// An `any` callee is called (or constructed) as TS does: the result is `any`, and every argument is still checked.
+				if (T.isRef(T.resolveOwn(calleeT, scope), 'any')) {
+					for (const a of e.arguments)
+						recurse(a.type === 'spread' ? a.operand : a);
+					return T.ANY;
+				}
 				let overloads: TS.CallSig[] | undefined;
 				const parts = calleeT.type === 'intersection' ? calleeT.types.map(p => T.resolveOwn(p, scope)) : [calleeT];
 				// A bare `constructor` part is NOT taken for a plain call here any more -- it used to be, which
@@ -2011,7 +2017,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// call's return needs it substituted in here, using the receiver expression's own type.
 					return T.optional(e.callee.type === 'member' ? T.substituteThisType(result, calleeObjT ?? recurse(e.callee.object)) : result, calleeOptional);
 				}
-				return e.type === 'new' && e.callee.type === 'identifier' ? TS.RefType(e.callee.name, typeArgs) : T.ANY;
+				return T.ANY;
 			}
 
 			// `expr<T,U>` (TS 4.7+): pins a generic function/constructor's type params without calling it. An overloaded callee keeps every

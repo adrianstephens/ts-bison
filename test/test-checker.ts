@@ -84,6 +84,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['an IIFE parameter with no argument is optional', '((a) => a)(); (({ x = 1 }) => x)(); (function (a, b: number) {})();', ['Expected 2 arguments, but got 0']],
 	['any absorbs a union, unknown the rest', 'declare const a: unknown, b: string, c: any; const u = Math.random() > 0.5 ? a : b; const v = Math.random() > 0.5 ? b : c; const q: number = [u]; const p: number = [v];', ["Type 'unknown[]' is not assignable to type 'number'", "Type 'any[]' is not assignable to type 'number'"]],
 	['a union of signatures is callable',	'declare const f: ((x: number) => string) | ((x: number) => number); const r: boolean = f(1); declare const g: ((a?: {x: number}, ...b: {x: number}[]) => void) | ((a?: {y: number}) => void); g({x: 0, y: 0}, {x: 0});', [NOT_ASSIGNABLE('string | number', 'boolean')]],
+	['an any callee still checks its arguments', 'declare const k: any; const r = new k(); const q: number = r; k(() => { const s: string = 1; });', [NOT_ASSIGNABLE('number', 'string')]],
 	['a function type inside call type arguments', 'declare function g<T>(x?: T): T; const r: number = g<() => string>();', [NOT_ASSIGNABLE('() => string', 'number')]],
 	['reduce with and without a seed',		'const r: string = [1, 2].reduce((a, v) => a + v, ""); const s: boolean = [1, 2].reduce((a, v) => a + v);', [NOT_ASSIGNABLE('number', 'boolean')]],
 	['functions have Function members',		'function f(a: number) {} f.call(null, 1); const n: string = f.length;',					[NOT_ASSIGNABLE('number', 'string')]],
