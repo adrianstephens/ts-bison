@@ -750,24 +750,16 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 	if (prop === 'flat' && elem.type === 'array')
 		return { type: 'function', params: [], rest: { key: 'args', typeAnnotation: { type: 'array', element: NUMBER } }, returnType: { type: 'array', element: elem.element } };
 
-	// Real overloads (bare 1-arg form defaults the accumulator to `elem`, seeded 2-arg form to `initialValue`'s own type) collapse
-	// into one signature with `initialValue` optional and `U` defaulting to `elem` -- an approximation, not exact for every case.
+	// TS's own three overloads, exactly: no seed (the accumulator is the element type), a seed of the element type, a seed of U.
 	// Freshly-named per call, same reasoning as `map`'s own `U` above.
 	if (prop === 'reduce' || prop === 'reduceRight') {
-		const U = TS.RefType(freshTypeParamName('U'));
-		return TS.FunctionType(
-			[
-				JS.Param('callback', TS.FunctionType([
-					JS.Param('acc', U),
-					JS.Param('v', elem),
-					JS.Param('i', NUMBER),
-					JS.Param('arr', TS.ArrayType(elem))
-				], U)),
-				JS.Param('initialValue', U, ['optional']),
-			],
-			U,
-			[{ name: U.name, default: elem }]
-		);
+		const U		= TS.RefType(freshTypeParamName('U'));
+		const cb	= (acc: Type) => JS.Param('callback', TS.FunctionType([JS.Param('acc', acc), JS.Param('v', elem), JS.Param('i', NUMBER), JS.Param('arr', TS.ArrayType(elem))], acc));
+		return TS.ObjectType([
+			TS.TypeCall(TS.CallSig({ params: [cb(elem)] }, elem)),
+			TS.TypeCall(TS.CallSig({ params: [cb(elem), JS.Param('initialValue', elem)] }, elem)),
+			TS.TypeCall(TS.CallSig({ params: [cb(U), JS.Param('initialValue', U)] }, U, [{ name: U.name }])),
+		]);
 	}
 
 	// Collapsed into one rest-based signature: this checker's overload picker always fails whenever any argument is a spread

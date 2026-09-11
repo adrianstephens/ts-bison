@@ -247,6 +247,14 @@ function narrowMath(func: string, params: TS.Param[]): Type | undefined {
 	}
 }
 
+// Writes an inferred return type onto the node it was inferred for, recorded so a later check tells it from a declared one:
+// a callback typed again (an overload trial first, then in context) re-infers rather than taking the first guess as declared.
+const inferredReturns = new WeakSet<object>();
+function inferredReturn(fn: { returnType?: Type }, t: Type | undefined) {
+	fn.returnType = t;
+	inferredReturns.add(fn);
+}
+
 // `instance`	is `new C(...)`/`this`'s type;
 // `value`		is the class binding's type (construct sig ∩ static members).
 // `scope`:		the class's declaring scope, stamped onto every result `ref` so a member resolved elsewhere still uses it.
@@ -270,7 +278,7 @@ function lazyReturnType(sig: TS.CallSig, decl: { returnType?: Type }, scope: Sco
 			if (value)
 				T.stampScope(value = fold(value), scope);
 			Object.defineProperty(sig, 'returnType', { value, writable: true, configurable: true, enumerable: true });
-			decl.returnType = value;
+			inferredReturn(decl, value);
 		},
 	});
 }
@@ -2243,7 +2251,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		return;
 
 	// A declared return type is never replaced by inference, even one (`any`, a generator's) that checks nothing.
-	const declaredReturn = fn.returnType;
+	const declaredReturn = inferredReturns.has(fn) ? undefined : fn.returnType;
 	// A declared generator's body is checked against what it iterates: `return x` against its TReturn, `yield`s against Y and N.
 	const generatorTypes = generator && declaredReturn ? T.iterationTypes(declaredReturn, scope, async, undefined, true) : undefined;
 	let expected = generator ? generatorTypes?.return : declaredReturn;
@@ -2412,9 +2420,9 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			const returnType = retDef.length ? T.widenNullish(T.combineTypes(retDef), inner) : alwaysThrows(body[body.length - 1]) ? T.NEVER : T.VOID;
 
 			if (!declaredReturn) {
-				fn.returnType = generator
+				inferredReturn(fn, generator
 					? TS.RefType(async ? 'AsyncGenerator' : 'Generator', [yields!.length ? T.combineTypes(yields!) : T.NEVER, returnType, T.ANY])
-					: T.wrapReturnIfAsync(inferredPredicate(body.length === 1 && body[0].type === 'return' ? body[0].argument : undefined, returnType), inner, async);
+					: T.wrapReturnIfAsync(inferredPredicate(body.length === 1 && body[0].type === 'return' ? body[0].argument : undefined, returnType), inner, async));
 			}
 		}
 	} else {
@@ -2426,7 +2434,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
 				err(SEVERITY.ERROR, (body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
 		} else if (!isPredicate && !declaredReturn) {
-			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(widenForContext(t, inferHint, inner), inner)), inner, async);
+			inferredReturn(fn, T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(widenForContext(t, inferHint, inner), inner)), inner, async));
 		}
 	}
 }
