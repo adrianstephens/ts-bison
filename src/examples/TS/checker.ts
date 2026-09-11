@@ -1957,7 +1957,9 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 	// otherwise never walk the body at all, silently skipping `applyContextualParams`'s side effect on an
 	// unannotated callback param below (found via `lib/map.ts`'s `entries()`, whose `.map()` callback
 	// params never got typed) -- so the very first walk still has to run, even muted.
-	if (expected && !err && fn.scope)
+	// "Already walked" is read off the BODY's stamp: a `function_decl`'s own `.scope` is also its statement
+	// stamp, set before this runs, so on its own it made a muted pass skip every top-level function body.
+	if (expected && !err && fn.scope && (!Array.isArray(body) || !body.length || (body[0] as any).scope || scope.isGenericTemplate()))
 		return;
 
 	const inner = new Scope(scope);
@@ -2211,6 +2213,13 @@ export const checkStmt1 = (err?: Err): checkStmt => (s, scope, typeOf, self) => 
 	checkStmt(s, scope, typeOf, self, err);
 };
 
+// A muted, stamping check of statements already HOISTED into `scope` -- an imported module, which `exportScope` only hoists.
+export function checkHoisted(stmts: Stmt[], scope: Scope) {
+	const check = checkStmt1();
+	for (const s of stmts)
+		check(s, scope, typeOf1(), check);
+}
+
 export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), checkStmt: checkStmt = checkStmt1()) {
 	hoist(stmts, scope);
 
@@ -2268,6 +2277,9 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 			// type when resolving its own self-referential `String.alloc(...)` call).
 			const pos = (stmt as any).pos;
 			for (const d of stmt.declarations) {
+				// Like a signature's: a module-private type named by a local (`let c: CacheFile`) must resolve where it was written.
+				if (d.typeAnnotation)
+					T.stampScope(d.typeAnnotation, scope);
 				if (err && d.typeAnnotation && d.init) {
 					const anno = d.typeAnnotation;
 					const init = typeOf(d.init, scope, anno);
