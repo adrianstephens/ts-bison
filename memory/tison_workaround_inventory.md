@@ -147,21 +147,22 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   forcing a class's lazy field-initializer getters mid-`hoist` -- lib `String.charCodeAt = __asm<[i32], i32>(...)` was
   inferred before `__asm` was bound and memoized `any`. `joinTypes` (flatten + identity dedupe) is the merge-time join.
   Any new eager walk of a class shape during hoisting will reintroduce this class of bug.
-- Intersection normalization (TS getIntersectionType) is WRITTEN but PARKED, not committed: it fixes tocode 497
-  (`NonNullable<ForInit<Type>>` never became a union, so `init.type === 'var_decl'` could not narrow) and 2 corpus FPs,
-  but ADDS ~6 FPs, so it must not land as-is. Code kept in `assistant/type-utils.with-intersection.ts` (+ the block alone in
-  `assistant/intersection-block.ts.txt`): `domainOf`/`unitOf`/`reduceIntersection` plus a `case 'intersection'` in `resolve`.
-  tsc 6.0.3 facts (probes assistant/tsc-probe/{l,l-neg,p1,p2}.ts): `X & any` is `any`; `T & unknown` and `{}` beside an object
-  type drop out; `never` from disjoint domains (`string & number`, `object & string`, `symbol & string`), a nullish member beside
-  an object (`undefined & {}`, `null & {x:1}`), distinct units (`'a' & 'b'`), and conflicting literal discriminants
-  (`{type:'a'} & {type:'b'}`); `'a' & string` is `'a'`; `{a:string} & {a:number}` is NOT never; `undefined & void` is not never.
-  TS DOES distribute over a union member (that is how `NonNullable<A|B|undefined>` drops `undefined`) but DISPLAYS the
-  undistributed origin (`(A|B) & T`, `(A|B) & {z:1}`), and narrowing sees through the intersection either way.
-  The ~6 new FPs are a RELATION gap distribution exposes, not a normalization error: relating `T & U` to a distributed
-  `(A|B) & T & U` needs the CONSTRAINT of an intersection of type parameters (`T extends 1|2`, `U extends 2|3` -> `2`), which
-  `isAssignable` does not compute. Fix that first (typeParameterExtendsUnionConstraintDistributed), then re-measure the other
-  new FPs: excessPropertyCheckingIntersectionWithConditional, instantiateContextualTypes (`Handler<any, number & never>`),
-  inheritedFunctionAssignmentCompatibility, numericIndexerTyping2.
+- Intersection normalization (TS getIntersectionType) is IN: `domainOf`/`unitOf`/`reduceIntersection` plus `resolve`'s
+  `case 'intersection'`. It fixed tocode 497 (`NonNullable<ForInit<Type>>` never became a union, so `init.type ===
+  'var_decl'` could not narrow). tsc 6.0.3 rules (probes assistant/tsc-probe/{l,l-neg,p1..p5}.ts): `X & any` is `any`;
+  `T & unknown` and `{}` beside an object type drop out; `never` from disjoint domains (`string & number`, `object & string`),
+  a nullish member beside an object (`undefined & {}`), distinct units (`'a' & 'b'`) and conflicting literal discriminants
+  (`{type:'a'} & {type:'b'}`); `'a' & string` is `'a'`; `{a:string} & {a:number}` is NOT never. TS distributes over a union
+  member (how `NonNullable<A|B|undefined>` drops `undefined`) but DISPLAYS the undistributed origin.
+- Reductions that DISCARD a part must read the part AS WRITTEN, never as resolved: `resolve` answers `any`/`unknown` when it
+  gives up (a deferred conditional `Foo<K>`, a depth bail), and dropping such a part turns "couldn't evaluate" into a
+  reduction -- it cost a real corpus FP (excessPropertyCheckingIntersectionWithConditional) before the rule was written.
+- Distribution exposed three RELATION gaps, each fixed rather than worked around: an intersection of type parameters relates
+  by its own constraint (`intersectionConstraint`, TS's getBaseConstraintOfType: `T & U` with `T extends 1|2`, `U extends 2|3`
+  is `2`); a function's apparent type is the global `Function` interface, so a lambda satisfies an interface extending it
+  (isAssignable's function-vs-object case now looks members up instead of rejecting any required member); and an intersection
+  holding `never` IS `never` at instantiation (`reduceInstantiated`), which is what makes a phantom parameter
+  (`type ActionType<P> = string & { hack?: P & never }`) infer nothing for `P` instead of `X & never`.
 - Real tsc for probes: `node_modules/.bin/tsc --ignoreConfig --noEmit --strict --target es2022 file.ts` (TS 6.0.3 refuses
   files alongside a tsconfig otherwise). Check TS semantics this way before modeling them.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
