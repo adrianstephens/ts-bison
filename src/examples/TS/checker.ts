@@ -2486,6 +2486,10 @@ function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; ri
 	}
 
 	if (st.type === 'if' && st.alternate) {
+		// A branch that always exits (throw/return/break) never reaches what follows, so it contributes nothing to the merge.
+		const aExits = alwaysExits(st.consequent), bExits = alwaysExits(st.alternate);
+		if (aExits || bExits)
+			return aExits && bExits ? undefined : aExits ? assignRights(st.alternate, narrow(st.test, scope, false), name) : assignRights(st.consequent, narrow(st.test, scope, true), name);
 		const a = assignRights(st.consequent, narrow(st.test, scope, true), name);
 		const b = a && assignRights(st.alternate, narrow(st.test, scope, false), a.name);
 		return b && { name: a.name, rights: [...a.rights, ...b.rights] };
