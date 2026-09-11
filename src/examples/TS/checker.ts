@@ -761,6 +761,10 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 					};
 					for (const [l, r] of [[test.left, test.right], [test.right, test.left]] as const) {
 						const unit = unitOf(r);
+						// An optional chain equal to a non-nullish value (`ns?.decl(k)?.type === 'class_decl'`) did not short-circuit, so every
+						// object before a `?.` in it is non-nullish -- only on the matching branch, as with a truthy chain.
+						if (unit && keepMatch && (l.type === 'member' || l.type === 'index' || l.type === 'call'))
+							scope = nonNullChainRoots(l, scope);
 						// typeof x === 'kind' (x may be a dotted path, e.g. `typeof options.layer === 'number'`)
 						const text = staticText(r);
 						if (l.type === 'unary' && l.operator === 'typeof' && text !== undefined) {
