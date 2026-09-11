@@ -1808,6 +1808,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				let sig: TS.CallSig|undefined = e.type === 'new'
 					? parts.find(p => p.type === 'constructor') ?? parts.find(p => p.type === 'function')
 					: parts.find(p => p.type === 'function');
+				sig ??= T.unionSignature(calleeT, e.type === 'new' ? 'construct' : 'call', scope);
 				if (!sig) {
 					// `new` prefers a construct signature, a plain call a bare call signature -- each falls back to the other when its preferred
 					// kind is absent (real TS wouldn't allow that cross-fallback), matching this checker's existing leniency.

@@ -554,6 +554,58 @@ export function mergeIdenticalSignatures(t: Type): Type {
 	return rest.every(same) ? first : t;
 }
 
+// The signatures of `kind` a value of type `t` is invoked through: a function/constructor type, or an object's (and an
+// intersection's) call/construct members.
+export function signaturesOf(t: Type, kind: 'call' | 'construct', scope: Scope): TS.CallSig[] {
+	const r			= resolveOwn(t, scope);
+	const fnKind	= kind === 'call' ? 'function' : 'constructor';
+	const parts		= r.type === 'intersection' ? r.types.map(p => resolveOwn(p, scope)) : [r];
+	return [
+		...parts.flatMap(p => p.type === fnKind ? [p as TS.CallSig] : []),
+		...collectMembers(r, scope).flatMap(m => m.type === kind ? [m] : []),
+	];
+}
+
+// TS's resolveUnionSignature: invoking a union invokes whichever member the value is, so an argument must suit every
+// member and the result is any of their returns. For members with one signature each, none generic; TS stops at about
+// the same. The parameters combine pairwise as TS's combineUnionParameters does.
+export function unionSignature(t: Type, kind: 'call' | 'construct', scope: Scope): TS.CallSig | undefined {
+	const r = resolveOwn(t, scope);
+	if (r.type !== 'union')
+		return undefined;
+	const sigs = r.types.map(m => signaturesOf(m, kind, scope));
+	if (sigs.some(s => s.length !== 1 || s[0].typeParams?.length))
+		return undefined;
+	const each = sigs.map(s => s[0]);
+	const combined = each.slice(1).reduce((a, b) => combineUnionParameters(a, b, scope), each[0]);
+	return { params: combined.params, rest: combined.rest, returnType: combineTypes(each.map(s => s.returnType ?? ANY)) };
+}
+
+// Each position takes the intersection of both signatures' types there (a missing one constrains nothing), and is optional
+// only where both allow no argument. The longer one's rest stays a rest; a rest only the shorter has becomes an extra one.
+function combineUnionParameters(left: TS.CallSig, right: TS.CallSig, scope: Scope): TS.CallSig {
+	const count		= (s: TS.CallSig) => s.params.length + (s.rest ? 1 : 0);
+	const required	= (s: TS.CallSig) => s.params.reduce((n, p, i) => hasMod(p, 'optional') ? n : i + 1, 0);
+	const typeAt	= (s: TS.CallSig, i: number) => i < s.params.length ? s.params[i].typeAnnotation
+		: s.rest?.typeAnnotation && restArgType(s.rest.typeAnnotation, i - s.params.length, scope);
+	const both		= (a: Type | undefined, b: Type | undefined) => !a ? b ?? ANY : !b ? a : intersectTypes([a, b]);
+	const [longest, shorter] = count(left) >= count(right) ? [left, right] : [right, left];
+	const n			= count(longest);
+	const extraRest	= !longest.rest && !!shorter.rest;
+	const params: TS.Param[] = [];
+	let rest: TS.CallSig['rest'];
+	for (let i = 0; i < n; i++) {
+		const type = both(typeAt(longest, i), typeAt(shorter, i));
+		if (longest.rest && i === n - 1)
+			rest = JS.Rest(longest.rest.key, TS.ArrayType(type));
+		else
+			params.push(JS.Param((longest.params[i] ?? shorter.params[i]).key, type, i >= required(longest) && i >= required(shorter) ? ['optional'] : []));
+	}
+	if (extraRest)
+		rest = JS.Rest(shorter.rest!.key, TS.ArrayType(typeAt(shorter, n) ?? ANY));
+	return { params, rest };
+}
+
 // A union of arrays/tuples as ONE array of the combined element type -- what real TS (5.2+) calls a
 // method on when the union's own signatures don't merge (`(Ty[] | Lit[]).map`).
 export function arrayUnionAsArray(t: Type, scope: Scope): TS.ArrayType | undefined {
