@@ -616,7 +616,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 			const root = x.optional ? (x.type === 'call' ? x.callee : x.object) : undefined;
 			const key = root && T.pathKey(root);
 			if (key)
-				scope = narrowValue(scope, key, m => !T.isNullish(m, scope), scope.value(key) ?? typeOf(root!, scope));
+				scope = narrowValue(scope, key, m => !T.isNullish(m, scope), scope.value(key) ?? typeOf(root!, scope, false));
 		}
 		return scope;
 	}
@@ -629,7 +629,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 		const truthy: (m: Type) => boolean = sense ? m => !T.isFalsy(m, scope) : m => !T.isTruthy(m, scope);
 		const narrowKey = (target: Expr, keep: (m: Type) => boolean | Type, base = scope) => {
 			const key = T.pathKey(referenceOf(target));
-			return key ? narrowValue(base, key, keep, base.value(key) ?? typeOf(target, base)) : undefined;
+			return key ? narrowValue(base, key, keep, base.value(key) ?? typeOf(target, base, false)) : undefined;
 		};
 
 		switch (test.type) {
@@ -653,7 +653,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 			// only tracks plain-identifier `const` initializers, not member chains.
 			case 'member': {
 				const key	= T.pathKey(test);
-				return key ? narrowValue(scope, key, truthy, scope.value(key) ?? typeOf(test, scope)) : scope;
+				return key ? narrowValue(scope, key, truthy, scope.value(key) ?? typeOf(test, scope, false)) : scope;
 			}
 			// `if ((x = e))` narrows x by truthiness
 			case 'assign':
@@ -830,7 +830,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 							const key = T.pathKey(l);
 							if (key && unitKeep) {
 								const base = s ?? scope;
-								return narrowValue(base, key, unitKeep, base.value(key) ?? typeOf(l, base));
+								return narrowValue(base, key, unitKeep, base.value(key) ?? typeOf(l, base, false));
 							}
 							if (s)
 								return s;
@@ -862,7 +862,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 								return true;
 							const merged = T.rangeClamp(mr, bound, isUpper, strict);
 							return !merged ? false : T.rangeToType(merged);
-						}, base.value(key) ?? typeOf(target, base));
+						}, base.value(key) ?? typeOf(target, base, false));
 					};
 
 					return applyBound(
@@ -873,7 +873,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 				} else if (test.operator === 'instanceof') {
 					const key = T.pathKey(test.left);
 					if (key) {
-						const cur = scope.value(key) ?? typeOf(test.left, scope);
+						const cur = scope.value(key) ?? typeOf(test.left, scope, false);
 						return test.right.type === 'identifier' && scope.type(test.right.name)
 							? narrowTo(scope, key, TS.RefType(test.right.name), sense, cur)
 							// unknown class: trust the guard, stop tracking the binding
@@ -912,7 +912,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 							// The false branch can only exclude "known-integer" -- a non-integer range still might
 							// contain integers, so it's left unnarrowed rather than guessed at.
 							return sense ? T.rangeToType({ ...mr, integer: true }) : mr.integer ? false : true;
-						}, scope.value(key) ?? typeOf(test.arguments[0], scope));
+						}, scope.value(key) ?? typeOf(test.arguments[0], scope, false));
 					}
 				}
 				// user-defined type guards: `f(x)` with `x is T` narrows x; `o.m()` with `this is T` narrows o
@@ -964,7 +964,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 							sig.typeParams.forEach(p => { if (!map.has(p.name)) map.set(p.name, p.constraint ?? p.default ?? T.ANY); });
 							target = T.substituteType(target, map);
 						}
-						return narrowTo(scope, key, target, sense, scope.value(key) ?? typeOf(arg, scope));
+						return narrowTo(scope, key, target, sense, scope.value(key) ?? typeOf(arg, scope, false));
 					}
 				}
 				return scope;
