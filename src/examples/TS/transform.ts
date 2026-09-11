@@ -3,7 +3,7 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import { Module, Location, Identifier, Literal, Binary, Conditional, Assign, Await, Member, ExprStmt, hasMod, dropMod, If, While } from '../common';
 import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
-import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, inferReturn } from './checker';
+import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, typeOf1, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
 import { Output } from './tocode';
 
@@ -658,7 +658,9 @@ export function TStypeCheck(ast: Module<Stmt>, global: Scope): Diagnostic[] {
 	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
 
 	const diagnostics: Diagnostic[] = [];
-	checkBlock(ast.body, global, undefined, checkStmt1(makeDiagnostic(d => diagnostics.push(d))));
+	// The expressions a statement holds report through the same `err` as the statement itself, top level included.
+	const err = makeDiagnostic(d => diagnostics.push(d));
+	checkBlock(ast.body, global, typeOf1(err), checkStmt1(err));
 	pushDepthExhaustionGap(depthExhaustion, diagnostics);
 	ast.scope = global;
 	return diagnostics;
@@ -834,7 +836,8 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 
 	const depthExhaustion = new Map<string, number>();
 	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
-	checkBlock(program.body, entryScope, undefined, checkStmt1(makeDiagnostic(d => diagnostics.push(d))));
+	const err = makeDiagnostic(d => diagnostics.push(d));
+	checkBlock(program.body, entryScope, typeOf1(err), checkStmt1(err));
 	pushDepthExhaustionGap(depthExhaustion, diagnostics);
 	program.scope = entryScope;
 	return diagnostics;

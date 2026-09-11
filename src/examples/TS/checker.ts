@@ -1391,7 +1391,7 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 
 // `widen: false` gives an expression's precise type -- what an assignability check compares, as TS checks a fresh literal.
 type typeOf = (e: Expr, scope: Scope, expected?: Type, widen?: boolean)=>Type;
-function typeOf1(err?: Err): typeOf {
+export function typeOf1(err?: Err): typeOf {
 	return (e, scope, expected, widen = true) => typeOf(e, scope, widen, expected, undefined, err);
 }
 
