@@ -580,8 +580,8 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'class':				return walkExpression(e.superClass) || (e.body as TS.ClassMember[]).some(walkClassMember) || !!e.implements?.some(t => walkType(t as Type));
 			case 'instantiation':		return walkExpression(e.expression) || e.typeArgs.some(t => walkType(t as Type));
 			case 'as':
-			case 'satisfies': return walkExpression(e.expression) || walkType(e.typeAnnotation as Type);
-			case 'jsx':			return e.attributes.some(p => walkExpression(p.value)) || e.children.some(walkExpression);
+			case 'satisfies':			return walkExpression(e.expression) || walkType(e.typeAnnotation as Type);
+			case 'jsx':					return e.attributes.some(p => walkExpression(p.value)) || e.children.some(walkExpression);
 			case 'this':
 			case 'super':
 			case 'identifier':			return false;

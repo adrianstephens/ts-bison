@@ -185,19 +185,13 @@ export const    Return  = Common.Return;
 export const    Throw   = Common.Throw;
 export const    ExprStmt = Common.ExprStmt;
 export function For<S>(init: ForInit<any>|undefined, test: Expr|undefined, update: Expr|undefined, body: S) { return { type: 'for' as const, kind: 'normal' as const, init, test, update, body }; }
-//export function If<S>(test: Expr, consequent: S, alternate?: S) { return {type: 'if' as const, test, consequent, alternate }; }
-//export function While<S>(test: Expr, body: S) { return {type: 'while' as const, test, body }; }
-//export function DoWhile<S>(body: S, test: Expr) { return {type: 'do_while' as const, body, test }; }
 
-// `X`: the statement extension seam -- defaults to `never` (plain JS), ts-parser instantiates it with
-// its own `Declaration` so a TS-only declaration (`type A = B`, `interface`, `enum`, `namespace`) can
-// appear in every NESTED statement position -- a block, an if branch, a loop body, a switch case, a
-// try -- without a cast. Mirrors c-parser.ts's own `Statement<D, X>` seam.
+// `X`: the statement extension seam -- defaults to `never` (plain JS), ts-parser instantiates it with its own `Declaration`
+// so a TS-only declaration (`type A = B`, `interface`, `enum`, `namespace`) can appear in every NESTED statement position
+// -- a block, an if branch, a loop body, a switch case, a try -- without a cast. Mirrors c-parser.ts's own `Statement<D, X>` seam.
 //
-// Residual narrowness, deliberate: the bodies reached through `Declaration<T>` (a `function_decl`'s
-// own body, a class method's) stay `Statement<T>`. Threading `X` that far would drag it through
-// `Expr<T>` as well, since a function EXPRESSION is an expression -- far more surface than the
-// nesting these consumers actually build.
+// Residual narrowness, deliberate: the bodies reached through `Declaration<T>` (a `function_decl`'s own body, a class method's) stay `Statement<T>`.
+// Threading `X` that far would drag it through `Expr<T>` as well, since a function EXPRESSION is an expression -- far more surface than the nesting these consumers actually build.
 export type Stmt<T, X = never> = Declaration<T>
 	| X
 	| Common.Block<Stmt<T, X>>

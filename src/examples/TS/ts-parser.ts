@@ -126,9 +126,9 @@ export type ClassMethod		= JS.Method<Type>
 export type ClassMember0	= JS.Method<Type> | JS.Field<Type> | { type: 'index_signature'; paramName: string; paramType: Type; typeAnnotation: Type; modifiers?: string[] };
 export type ClassMember		= JS.ClassMember<Type>	| { type: 'index_signature'; paramName: string; paramType: Type; typeAnnotation: Type; modifiers?: string[] };
 
-// `Declaration` goes in through js-parser's `X` seam rather than being unioned on the outside: that
-// way a TS-only declaration is legal in every NESTED statement position too (a block, an if branch, a
-// loop body), which is what it actually is -- `while (x) { type A = B; }` is real TypeScript.
+// `Declaration` goes in through js-parser's `X` seam rather than being unioned on the outside:
+// that way a TS-only declaration is legal in every NESTED statement position too (a block, an if branch, a loop body),
+// which is what it actually is -- `while (x) { type A = B; }` is real TypeScript.
 export type Stmt = JS.Stmt<Type, Declaration>;
 
 // ===================================================================

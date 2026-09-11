@@ -76,9 +76,6 @@ function TS2PY(ts: Module<TS.Stmt>) {
 	const call		= (fn: string, ...args: PY.Expr[]): PY.Expr => Call<PY.Expr, PY.Arg>(Identifier(fn), args.map(pos));
 
 	const base		= () => Identifier(superName ?? pyUnsupported('`super` outside a derived class'));
-	// [~] template literal -> f-string
-	const fstring	= (parts: JS.TemplatePart<TS.Expr>[]): PY.FStringLit =>
-		({ type: 'fstring', parts: parts.map(p => ({ text: p.str, field: p.exp && { expr: expr(p.exp) } })) });
 
 	const bindName	= (b: JS.BindingTarget): string 	=> typeof b === 'string' ? b : pyUnsupported('destructuring');
 	const keyExpr	= (k: JS.Key): PY.Expr				=> typeof k === 'string' ? Literal(k) : expr(k.computed);
@@ -105,7 +102,7 @@ function TS2PY(ts: Module<TS.Stmt>) {
 		switch (e.type) {
 			// [=] identical shapes -- these are the payoff
 			case 'identifier':	return e.name === 'undefined' ? Literal(null) : e;
-			case 'literal':		return	Array.isArray(e.value)			? fstring(e.value)
+			case 'literal':		return	Array.isArray(e.value)			? Literal(e.value.map(p => ({ text: p.str, field: p.exp && { expr: expr(p.exp) } })))
 									:	e.value instanceof RegExp		? pyUnsupported('regex literal')
 									:	Literal(typeof e.value === 'bigint' ? Number(e.value) : e.value);
 			case 'member':		return Member(expr(e.object), e.property);
@@ -400,7 +397,12 @@ function PY2TS(py: Module<PY.Stmt>) {
 		switch (e.type) {
 			// [=] identical shapes
 			case 'identifier':	return e.name === self ? { type: 'this' } : e;
-			case 'literal':		return Literal(e.value);
+			case 'literal':
+				if (!Array.isArray(e.value))
+					return Literal(e.value);
+				// [~] f-string -> template literal; format spec (`:.2f` etc.) and `!r`/`=` self-documenting forms are dropped
+				return Literal(e.value.map(p => ({ str: p.text, exp: p.field && expr(p.field.expr) })));
+
 			case 'member':		return Member(expr(e.object), e.property);
 			case 'conditional':	return Conditional(expr(e.test), expr(e.consequent), expr(e.alternate));
 			case 'spread':		return Spread(expr(e.operand));
@@ -464,9 +466,6 @@ function PY2TS(py: Module<PY.Stmt>) {
 
 			// [~] `yield from x` (delegation) <-> `yield* x` (same idea, spelled with a flag vs a field)
 			case 'yield':		return { type: 'yield', operand: e.from ? expr(e.from) : e.operand && expr(e.operand), delegate: !!e.from };
-
-			// [~] f-string -> template literal; format spec (`:.2f` etc.) and `!r`/`=` self-documenting forms are dropped
-			case 'fstring':		return Literal(e.parts.map(p => ({ str: p.text, exp: p.field && expr(p.field.expr) }))) as TS.Expr;
 
 			default:			return tsUnsupported(`expression '${(e as PY.Expr).type}'`);
 		}
@@ -1412,24 +1411,24 @@ function PY2CPP(py: Module<PY.Stmt>) {
 		return args.map(a => a.kind === 'star' ? Spread(expr(a.value)) : a.kind === 'pos' ? expr(a.value) : cppUnsupported(`'${a.kind}' argument`));
 	}
 
-	function fstring(parts: PY.FStringPart[]) {
-		let result: CPP.Expr | undefined;
-		for (const p of parts) {
-			if (p.text)
-				result = result ? Binary('+', result, Literal(p.text)) : Literal(p.text);
-			if (p.field) {
-				const e = expr(p.field.expr);
-				result = result ? Binary('+', result, e) : e;
-			}
-		}
-		return result ?? Literal('');
-	}
-
 	function expr(e: PY.Expr): CPP.Expr {
 		switch (e.type) {
 			// [~] a bare `self` reference converts to `this` (a POINTER in C++, hence `pointer_member` for `.` access below)
 			case 'identifier':	return e.name === self ? { type: 'this' } : e;
-			case 'literal':		return e.value === null ? { type: 'null_literal' } : Literal(typeof e.value === 'bigint' ? Number(e.value) : e.value as number | string | boolean);
+			case 'literal':
+				if (Array.isArray(e.value)) {
+					let result: CPP.Expr | undefined;
+					for (const p of e.value) {
+						if (p.text)
+							result = result ? Binary('+', result, Literal(p.text)) : Literal(p.text);
+						if (p.field) {
+							const e = expr(p.field.expr);
+							result = result ? Binary('+', result, e) : e;
+						}
+					}
+					return result ?? Literal('');
+				}
+				return e.value === null ? { type: 'null_literal' } : Literal(typeof e.value === 'bigint' ? Number(e.value) : e.value as number | string | boolean);
 			case 'imaginary':	return cppUnsupported('imaginary literal');
 			case 'ellipsis':	return cppUnsupported('`...` literal');
 			case 'conditional':	return Conditional(expr(e.test), expr(e.consequent), expr(e.alternate));
@@ -1498,7 +1497,6 @@ function PY2CPP(py: Module<PY.Stmt>) {
 			case 'dictcomp':		return cppUnsupported(`comprehension ('${e.type}')`);
 			case 'await':
 			case 'yield':			return cppUnsupported(`'${e.type}' (no direct C++ coroutine equivalent modeled)`);
-			case 'fstring':			return fstring(e.parts);
 
 			default:				return cppUnsupported(`expression '${(e as PY.Expr).type}'`);
 		}

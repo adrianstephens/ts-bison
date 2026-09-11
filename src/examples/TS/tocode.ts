@@ -205,6 +205,10 @@ export class Output {
 		}
 		return '{' + this.indented(() => this.newline + f()) + this.newline + '}';
 	}
+	
+	private decorators(list?: Expr[]): string {
+		return list ? list.map(d => '@' + this.expr(d) + this.newline).join('') : '';
+	}
 
 	typeAnnotation(type?: Type) {
 		return maybe(type, type => this.colon + this.type(type));
@@ -236,7 +240,8 @@ export class Output {
 		const parts = params.map(param => {
 			// `'optional'` renders as a trailing `?`, not a prefix keyword like the rest (`public`/`readonly`/...).
 			const prefix = param.modifiers?.filter(m => m !== 'optional');
-			return	(prefix?.length ? prefix.join(' ') + ' ' : '')
+			return	this.decorators(param.decorators)
+				+	(prefix?.length ? prefix.join(' ') + ' ' : '')
 				+	this.bindingTarget(param.key)
 				+	optional(hasMod(param, 'optional'))
 				+	this.typeAnnotation(param.typeAnnotation as Type)
@@ -563,7 +568,8 @@ export class Output {
 				return 'export ' + this.statement(stmt.declaration);
 
 			case 'class_decl':
-				return declare(stmt.ambient)
+				return this.decorators(stmt.decorators)
+					+ declare(stmt.ambient)
 					+ poss(stmt.abstract, 'abstract ')
 					+ 'class ' + stmt.name
 					+ this.typeParams(stmt.typeParams as TS.TypeParam[])
