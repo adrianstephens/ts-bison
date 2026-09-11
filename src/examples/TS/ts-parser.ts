@@ -198,6 +198,9 @@ function looksLikeBalancedGenericArgs(textAfterLt: string, followedBy: RegExp): 
 			// A literal type's text is opaque: a `<` or `>` in it (`Binary<Expr, '<'>(...)`) is no bracket.
 			if ((i = skipQuoted(textAfterLt, i)) < 0)
 				return false;
+		} else if (c === '=' && textAfterLt[i + 1] === '>') {
+			// A function type's arrow (`Map<string, () => void>(...)`): its `>` closes nothing.
+			i++;
 		} else if (c === '<') {
 			depth++;
 		} else if (c === '>') {

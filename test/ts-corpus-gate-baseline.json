@@ -1,5 +1,5 @@
 {
 	"files": 11012,
-	"failed": 840,
+	"failed": 838,
 	"note": "corpus files that fail to PARSE (no checker), excluding fixtures tsc itself reports a TS1xxx syntax error on, and ones using syntax deliberately unsupported (legacy <T>expr casts); lower is better"
 }

@@ -82,6 +82,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['an alias is transparent to inference', 'type MP<T> = T | Promise<T>; declare function f<D>(m: (x: number) => MP<D>): D; const r = f(u => u as number | string); const q: boolean = r;', [NOT_ASSIGNABLE('number | string', 'boolean')]],
 	['shared subtrees are walked once',		`declare function d<T>(x: T): { a: T; b: T }; declare function id<U>(u: U, f?: <V>(v: V) => V): U; const x = id(${'d('.repeat(40)}1${')'.repeat(40)}); const q: number = x.a.b;`, ["is not assignable to type 'number'"]],
 	['an IIFE parameter with no argument is optional', '((a) => a)(); (({ x = 1 }) => x)(); (function (a, b: number) {})();', ['Expected 2 arguments, but got 0']],
+	['a function type inside call type arguments', 'declare function g<T>(x?: T): T; const r: number = g<() => string>();', [NOT_ASSIGNABLE('() => string', 'number')]],
 	['reduce with and without a seed',		'const r: string = [1, 2].reduce((a, v) => a + v, ""); const s: boolean = [1, 2].reduce((a, v) => a + v);', [NOT_ASSIGNABLE('number', 'boolean')]],
 	['functions have Function members',		'function f(a: number) {} f.call(null, 1); const n: string = f.length;',					[NOT_ASSIGNABLE('number', 'string')]],
 	['an expando assignment declares, not narrows', 'const E = function () {}; E.prop = { x: 2 }; E.prop = { y: "" }; const n = E.prop.x || 0;', []],
