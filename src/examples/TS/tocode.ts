@@ -329,7 +329,7 @@ export class Output {
 				return type.name + this.typeArgs(type.typeArgs);
 
 			case 'literal':
-				return this.literal(type);
+				return this.literal(type, t => this.type(t));
 
 			// Not real TS syntax -- narrowing-only. A degenerate (min === max) range is how a bigint literal is
 			// represented (`Literal` has no bigint value of its own), and prints back out as one (`10n`); anything
@@ -619,11 +619,12 @@ export class Output {
 	//  Expressions
 	// ===================================================================
 
-	templateParts(parts: JS.TemplatePart<any>[]): string {
-		return '`' + parts.map(p => p.str + maybe(p.exp, exp => '${' + this.toCode(exp) + '}')).join('') + '`';
+	// `print`: how a substitution prints -- an expression's, or (a template literal TYPE) a type's; the node kinds overlap (`conditional`).
+	templateParts(parts: JS.TemplatePart<any>[], print: (x: any) => string = x => this.expr(x)): string {
+		return '`' + parts.map(p => p.str + maybe(p.exp, exp => '${' + print(exp) + '}')).join('') + '`';
 	}
 
-	literal(expr: Literal<any>) {
+	literal(expr: Literal<any>, print?: (x: any) => string) {
 		switch (typeof expr.value) {
 			case 'string':
 				return quoteString(expr.value);
@@ -634,7 +635,7 @@ export class Output {
 			case 'object':
 				return  expr.value === null ? 'null'
 					: expr.value instanceof RegExp	? '/' + expr.value.source + '/' + (expr.value.flags || '')
-					: Array.isArray(expr.value)		?  this.templateParts(expr.value)
+					: Array.isArray(expr.value)		?  this.templateParts(expr.value, print)
 					: '?';
 			default:
 				return String(expr.value);
