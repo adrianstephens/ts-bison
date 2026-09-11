@@ -1522,8 +1522,9 @@ export function logicalLeftPart(t: Type, op: string, scope: Scope): Type {
 // of a value's type -- e.g. `lookupMember`'s own union case requires *every* member to have the property
 // looked up, which a bare `null`/`undefined` member never does, so a `?.` member lookup needs this run on
 // the object type first (see `checker.ts`'s own `'member'` case) or it always misses, falling back to `any`.
+// `nonNullable = false` keeps `t` whole -- unless `strictNullChecks` is off, where no value is ever treated as possibly nullish.
 export function nonNullable(t: Type, scope: Scope, nonNullable = true): Type {
-	if (!nonNullable)
+	if (!nonNullable && scope.strictNullChecks())
 		return t;
 	const r = resolveOwn(t, scope);
 	if (r.type !== 'union')
@@ -1532,6 +1533,20 @@ export function nonNullable(t: Type, scope: Scope, nonNullable = true): Type {
 	const members	= unionMembers(r, scope);
 	const kept		= members.filter(m => !isNullish(m, scope));
 	return kept.length === 0 || kept.length === members.length ? t : combineTypes(kept);
+}
+
+function isNullOrUndefined(t: Type): boolean {
+	return t.type === 'literal' ? t.value === null : t.type === 'ref' && (t.name === 'null' || t.name === 'undefined');
+}
+
+// An inferred declaration or return type, as TS widens one without `strictNullChecks`: `null`/`undefined` leave a union and
+// alone become `any`. Identity when strict.
+export function widenNullish(t: Type, scope: Scope): Type {
+	if (scope.strictNullChecks())
+		return t;
+	const members	= unionMembers(t, scope);
+	const kept		= members.filter(m => !isNullOrUndefined(resolveOwn(m, scope)));
+	return !kept.length ? ANY : kept.length === members.length ? t : combineTypes(kept);
 }
 
 export function isFalsy(t: Type, scope: Scope): boolean {
@@ -2003,6 +2018,8 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 
 		if (src === dst || isAny(src) || isAny(dst))
 			return true;
+		if (isNullOrUndefined(src) && !scope.strictNullChecks())
+			return true;
 
 		if (src.type === 'ref' && (src.name === 'never' || !ALL_PRIMITIVES.has(src.name)))
 			return true;		// unresolved named source (import/global/type parameter): lenient
@@ -2100,11 +2117,10 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 					// `lookupMember` gets its own fresh budget, not `recurse`'s remaining `depth` -- same reasoning as
 					// `lookupMember`'s own `resolve()` call.
 					const got = lookupMember(src, m.key, scope);
-					// an optional property also accepts undefined; absence only counts against a sealed source
-					return got ? recurse(got,
-						hasMod(m, 'optional') ? TS.UnionType([m.typeAnnotation, UNDEFINED]) : m.typeAnnotation, depth - 1) : hasMod(m, 'optional') || !sealed(src, scope) || recurse(UNDEFINED, m.typeAnnotation,
-						depth - 1
-					);
+					// An optional property also accepts undefined. A missing required one is an error even when its type admits
+					// `undefined` (TS: "Property is missing") -- absence only counts against a sealed source.
+					return got ? recurse(got, hasMod(m, 'optional') ? TS.UnionType([m.typeAnnotation, UNDEFINED]) : m.typeAnnotation, depth - 1)
+						: hasMod(m, 'optional') || !sealed(src, scope);
 				});
 			return false;
 		}
@@ -2574,9 +2590,13 @@ export class Scope {
 	// Set on a function body's own scope: whether that function is `async` -- `yield`/`yield*` in an async generator await/iterate asynchronously.
 	functionAsync?: boolean;
 
+	// `false` on a program's scope: `strictNullChecks` off, so `null`/`undefined` belong to every type. Unset inherits; the root is strict.
+	nullChecks?: boolean;
+
 	constructor(public parent?: Scope, private genericTemplate?: boolean) {}
 
 	inAsyncFunction(): boolean						{ return this.functionAsync ?? !!this.parent?.inAsyncFunction(); }
+	strictNullChecks(): boolean						{ return this.nullChecks ?? this.parent?.strictNullChecks() ?? true; }
 
 	hitDepthLimit(fn: string): void					{ this.parent?.hitDepthLimit(fn); }
 

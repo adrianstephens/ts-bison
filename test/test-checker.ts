@@ -10,7 +10,8 @@ import { ModuleLoader } from '../src/examples/TS/module-loader';
 
 const NOT_ASSIGNABLE = (from: string, to: string) => `Type '${from}' is not assignable to type '${to}'`;
 
-const cases: [name: string, code: string, errors: string[]][] = [
+// `nonStrict`: checked with `strictNullChecks` off (tsc's default; the corpus's unless a test says `@strict`).
+const cases: [name: string, code: string, errors: string[], nonStrict?: true][] = [
 	// iteration protocol: every consumer reads `[Symbol.iterator]().next()`
 	['for-of over Map.keys()',		'for (const x of new Map([[1, "a"]]).keys()) { const q: string = x; }',					[NOT_ASSIGNABLE('number', 'string')]],
 	['for-of destructures entries',	'for (const [k, v] of new Map([[1, "a"]])) { const q: boolean = k; }',					[NOT_ASSIGNABLE('number', 'boolean')]],
@@ -28,6 +29,12 @@ const cases: [name: string, code: string, errors: string[]][] = [
 	// unannotated class members infer their return types at every use
 	['method and getter returns',	'class B { m() { return 1; } get g() { return "s"; } } const x: string = new B().m(); const y: number = new B().g;', [NOT_ASSIGNABLE('number', 'string'), NOT_ASSIGNABLE('string', 'number')]],
 	['static member returns its class', 'class A { static self = A; static make() { return A; } static me() { return this; } } const q: number = A.make();', [NOT_ASSIGNABLE('typeof A', 'number')]],
+
+	// strictNullChecks off: null/undefined belong to every type, and inferred null/undefined widen to `any`
+	['non-strict null is in every type', 'let x = null; x = 5; function f() { return null; } const s: string = f(); declare const o: { a?: number } | undefined; const n: number = o.a;', [], true],
+	['non-strict: missing property still errs', 'type A = { a: string }; const x: A = 42;', ["Type 'number' is not assignable to type 'A'"], true],
+	['a missing required property errs',	'const z: { a: string | undefined } = {};',												["Type '{}' is not assignable to type '{"]],
+
 ];
 
 (async () => {
@@ -36,7 +43,8 @@ const cases: [name: string, code: string, errors: string[]][] = [
 	checkBlock(lib!.program.body, global);
 	const parser	= TS.make();
 	let failures = 0;
-	for (const [name, code, expected] of cases) {
+	for (const [name, code, expected, nonStrict] of cases) {
+		global.nullChecks = !nonStrict;
 		const diags		= await TStypeCheckAsync(parser.parse(code), new ModuleLoader(__dirname, {}), global);
 		const errors	= diags.filter(d => d.severity === SEVERITY.ERROR).map(d => String(d.message));
 		const ok		= errors.length === expected.length && expected.every((e, i) => errors[i].includes(e));

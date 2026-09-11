@@ -400,7 +400,7 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 				const raw = Array.isArray(init)
 					? T.combineTypes(init.map(e => typeOf(e, initScope) ?? T.ANY))
 					: typeOf(init, initScope) ?? T.ANY;
-				const t = T.stampScope(T.widenLiterals(selfRefs(raw)), scope);
+				const t = T.stampScope(T.widenNullish(T.widenLiterals(selfRefs(raw)), scope), scope);
 				Object.defineProperty(prop, 'typeAnnotation', { value: t, writable: true, enumerable: true, configurable: true });
 				return t;
 			},
@@ -991,13 +991,13 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 		scope.addValue(d.name, typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs && typeAnnotation.declScope
 			? T.resolve(typeAnnotation.declScope as Scope, typeAnnotation, undefined, stopAtPseudoType)
 			: typeAnnotation ? T.resolve(scope, typeAnnotation, undefined, stopAtPseudoType)
-			: d.init ? typeOf(d.init, scope, widen, undefined, undefined, err) : T.ANY);
+			: d.init ? T.widenNullish(typeOf(d.init, scope, widen, undefined, undefined, err), scope) : T.ANY);
 		// TS 4.4 aliased conditions: a `const`'s initializer stays true for its whole lifetime, so narrowing the const
 		// also narrows through what its initializer itself would narrow (`narrow()`'s `case 'identifier'` reads this).
 		if (!widen && d.init)
 			scope.addAlias(d);
 	} else {
-		const t = typeAnnotation ?? (d.init && typeOf(d.init, scope, widen, undefined, undefined, err));
+		const t = typeAnnotation ?? (d.init && T.widenNullish(typeOf(d.init, scope, widen, undefined, undefined, err), scope));
 		if (t)
 			bindPattern(scope, d.name, t, d.init, !widen, err);
 		else
@@ -2145,7 +2145,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		if (err && dt && anno && !checkAssignable(dt, anno, inner, (p as any).pos, inner, err))
 			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
 		if (typeof p.key === 'string') {
-			inner.addValue(p.key, anno ? T.optional(anno, hasMod(p, 'optional') && !p.default) : dt ?? T.ANY);
+			inner.addValue(p.key, anno ? T.optional(anno, hasMod(p, 'optional') && !p.default) : dt ? T.widenNullish(dt, inner) : T.ANY);
 		} else {
 			// The whole argument, under a name no source can spell, is the pattern's source -- so a destructured
 			// discriminated union correlates as a `const` one does, unless the body reassigns one of its names.
@@ -2227,7 +2227,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 					body.push({type: 'return', argument: Identifier('undefined')});
 */
 			}
-			const returnType = retDef.length ? T.combineTypes(retDef) : alwaysThrows(body[body.length - 1]) ? T.NEVER : T.VOID;
+			const returnType = retDef.length ? T.widenNullish(T.combineTypes(retDef), inner) : alwaysThrows(body[body.length - 1]) ? T.NEVER : T.VOID;
 
 			if (generator) {
 				fn.returnType = TS.RefType(async ? 'AsyncGenerator' : 'Generator', [
@@ -2248,7 +2248,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
 				err(SEVERITY.ERROR, (body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
 		} else if (!isPredicate) {
-			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenLiterals(t)), inner, async);
+			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(T.widenLiterals(t), inner)), inner, async);
 		}
 	}
 }

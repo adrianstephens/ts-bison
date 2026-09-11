@@ -49,6 +49,14 @@ export function splitTestFile(source: string, defaultName: string) {
 	}));
 }
 
+// A test's compiler options, as `// @name: value` directives (a comma list names config variants; the first is taken).
+// `strictNullChecks` follows `@strict` unless set itself; the harness default, like tsc's, is off.
+export function testOptions(source: string): { strictNullChecks: boolean } {
+	const opts = new Map([...source.matchAll(/^\/\/[ \t]*@(\w+)[ \t]*:[ \t]*([^\r\n,]*)/gm)].map(m => [m[1].toLowerCase(), m[2].trim().toLowerCase()]));
+	const flag = (name: string) => opts.has(name) ? opts.get(name) === 'true' : undefined;
+	return { strictNullChecks: flag('strictnullchecks') ?? flag('strict') ?? false };
+}
+
 export const isSource = (name: string) => /\.tsx?$/.test(name) && !name.endsWith('.d.ts');
 
 // The real compiler's output for each test is baselined in tests/baselines/reference/. A test that
