@@ -3159,6 +3159,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return undefined;
 		const props = new Map<string, Expr>();
 		for (const p of e.properties) {
+			// A spread is never excess-checked (as in TS): only the fields written out must fit and discriminate.
+			if (p.type === 'spread')
+				continue;
 			if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
 				return undefined;
 			props.set(p.key, p.value);
@@ -4799,7 +4802,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length };
 		// Captured now: the body compiles later, once this literal's own context (`Rule<CallSig>`'s action) is gone.
-		const fnContext		= ctx.contextualReturn && T.resolve(ctx.typeScope, ctx.contextualReturn);
+		// The checker's own contextual type wins: it saw the chosen OVERLOAD, where `ctx` only has the implementation's.
+		const contextFn		= (e as { contextualType?: Type }).contextualType ?? ctx.contextualReturn;
+		const fnContext		= contextFn && T.resolve(ctx.typeScope, contextFn);
 		const returnContext	= fnContext?.type === 'function' ? fnContext.returnType : undefined;
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 		const { funcIndex, typeIndex }	= registerFuncAtType(funcTypeIndex);

@@ -253,6 +253,13 @@ the action's context is `Action<any, any>` -- only the CHECKER's chosen overload
 step: stamp the callback node with its checker-side contextual type (the substituted `declared` at
 `applyContextualParams`, checker.ts `case 'call'`), and have `emitClosureLiteral` fall back to it. Care:
 the same call is typed more than once, with and without context, so first-wins may keep the worse one.
+LATER 2026-09-11: the checker now stamps a callback node's `contextualType` (only once fully determined,
+defaulted type params filled), rest ARGUMENTS are contextually typed (`declaredArg` in the pre-pass), and
+`matchContextualUnionMember` skips spreads. Repro `assistant/ov1.ts` (overloaded `Rule` + push into
+`Rule<CS>[]`) now picks `CS` and compiles -- but traps `illegal cast` at runtime: the non-generic
+IMPLEMENTATION builds `{rhs, action}` with `action: ($) => any`, read back as `Rule<CS>`. And ts-parser.ts:600
+itself still reports no context: `assistant/ctx-probe.ts` (LINES=...) showed NO stamp on its arrow -- unexplained
+(the probe's line filter was flaky); start by confirming whether that call's checker pass has `expected`.
 NOTE: the lazy checker-call-type fallback (`() => checkerTypeOf(e, ctx.scope)`) does NOT help here -- the
 checker types the call in isolation, without push's expected type, so it too answers `Rule<{literal}>`.
 Second site, type-utils.ts:448 (`freeze`): `{ ...t, frozen: true }` with `t: Literal | RangeType` -- a

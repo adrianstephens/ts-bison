@@ -1580,10 +1580,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						const r = T.resolveOwn(t, scope);
 						return r.type === 'tuple' || (r.type === 'array' && T.resolveOwn(r.element, scope).type === 'tuple');
 					};
+					// Past the fixed parameters the REST names the argument -- and where the rest is a tuple
+					// (or a union with one), that position's own element is the only thing that names a callback.
+					const declaredArg = (i: number) => sig!.params[i]?.typeAnnotation
+						?? (sig!.rest?.typeAnnotation && restArgType(sig!.rest.typeAnnotation, i - sig!.params.length, scope));
 					const preArgTs = e.arguments.map((a, i) => {
 						if (a.type === 'function' || a.type === 'arrow' || a.type === 'spread')
 							return undefined;
-						const declared = sig!.params[i]?.typeAnnotation;
+						const declared = declaredArg(i);
 						// A `const` type parameter (TS 5.0) infers from its argument AS IF it were written `as const`.
 						if (declared?.type === 'ref' && !declared.typeArgs && sig!.typeParams?.some(p => p.name === declared.name && p.const))
 							return recurse(a, CONST_CONTEXT);
@@ -1610,14 +1614,17 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							T.inferTypeArgs(sig.returnType, expected, names, preMap, scope, declScope);
 					}
 
-					// Past the fixed parameters the REST names the argument -- and where the rest is a tuple
-					// (or a union with one), that position's own element is the only thing that names a callback.
-					const declaredArg = (i: number) => sig!.params[i]?.typeAnnotation
-						?? (sig!.rest?.typeAnnotation && restArgType(sig!.rest.typeAnnotation, i - sig!.params.length, scope));
 					e.arguments.forEach((a, i) => {
 						if (a.type === 'function' || a.type === 'arrow') {
-							const declared	= declaredArg(i);
-							applyContextualParams(a.params, declared && preMap?.size ? T.substituteType(declared, preMap) : declared, scope);
+							const declared		= declaredArg(i);
+							const contextual	= declared && preMap?.size ? T.substituteType(declared, preMap) : declared;
+							applyContextualParams(a.params, contextual, scope);
+							// For codegen, which compiles an overload's IMPLEMENTATION and so never sees this. Only once fully
+							// determined: the same call is also typed without context, which leaves the signature's own params open.
+							const defaults	= new Map(sig!.typeParams?.filter(p => p.default && !preMap?.has(p.name)).map(p => [p.name, p.default!] as const));
+							const settled	= contextual && defaults.size ? T.substituteType(contextual, defaults) : contextual;
+							if (settled && !sig!.typeParams?.some(p => T.mentionsTypeParam(settled, p.name)))
+								(a as any).contextualType ??= T.stampScope(settled, scope);
 						}
 					});
 
