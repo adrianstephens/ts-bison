@@ -838,13 +838,12 @@ function arrayMember(elem: Type, prop: string, scope: Scope, depth: number): Typ
 		: withReturnType(declared, ret) ?? TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(ANY)) }, ret);
 }
 
-// `Object.prototype`'s members, for object types that don't declare their own override -- `hasOwnProperty`/`isPrototypeOf`/
-// `propertyIsEnumerable` take `ANY` (not the real `PropertyKey`) to stay lenient rather than modeling a `string|number|symbol` union.
-function objectPrototypeMember(prop: string): Type | undefined {
-	return	prop === 'toString' || prop === 'toLocaleString'	? TS.FunctionType([], STRING)
-		:	prop === 'valueOf'									? TS.FunctionType([], ANY)
-		:	prop === 'hasOwnProperty' || prop === 'isPrototypeOf' || prop === 'propertyIsEnumerable' ? TS.FunctionType([JS.Param('v', ANY)], BOOLEAN)
-		:	undefined;
+// `Object.prototype`'s members, for object types that don't declare their own: the global `Object` interface's, as the lib declares them.
+function objectPrototypeMember(prop: string, scope: Scope): Type | undefined {
+	let root = scope;
+	while (root.parent)
+		root = root.parent;
+	return root.type('Object') ? lookupMember(TS.RefType('Object'), prop, root, 4, true) : undefined;
 }
 
 // `T[]` really is `Array<T>` (a `readonly: true` one `ReadonlyArray<T>`) -- turns the structural `'array'` node into the real named
@@ -1861,8 +1860,6 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 			return TS.RangeType('number', 0, 0x7fffffff, true);
 		if (prop === 'length' && t.type === 'array')
 			return NUMBER;
-		if (prop === 'constructor')
-			return ANY;		// every object has one; its shape isn't modeled
 
 		switch (t.type) {
 			// `arrayMethod` first: for `filter`/`find`/`findLast`/`every` it's genuinely more precise than the real 2-overload lib.es5
@@ -1908,7 +1905,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				// silently misrouting overload resolution (`isAssignable`'s own `dst.type === 'object'` case). A *string*
 				// index signature is untouched -- it always did (and still does) cover every named key, correctly.
 				// A numeric key prefers the numeric signature, which real TS requires to be the more specific of the two.
-				return indexSignatureFor(t.members, prop, scope) ?? objectPrototypeMember(prop);
+				return indexSignatureFor(t.members, prop, scope) ?? objectPrototypeMember(prop, scope);
 			}
 			case 'intersection': {
 				const matches: Type[] = [];
@@ -1928,7 +1925,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 						if (idx)
 							return idx;
 					}
-					return objectPrototypeMember(prop);
+					return objectPrototypeMember(prop, scope);
 				}
 				if (matches.length === 1)
 					return matches[0];

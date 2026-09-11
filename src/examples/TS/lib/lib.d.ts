@@ -130,7 +130,15 @@ interface PropertyDescriptorMap {
 // receiver's real runtime type, not just its static one). `defineProperty` only supports a plain value
 // descriptor (`{value: ...}`, real `enumerable`/`configurable`/`writable` flags accepted but with no
 // observable effect) and a literal string `key` -- see `emitObjectDefineProperty` in towasm.ts.
-interface Object {}
+interface Object {
+	constructor: Function;
+	toString(): string;
+	toLocaleString(): string;
+	valueOf(): Object;
+	hasOwnProperty(v: PropertyKey): boolean;
+	isPrototypeOf(v: Object): boolean;
+	propertyIsEnumerable(v: PropertyKey): boolean;
+}
 declare var Object: {
 	entries<T>(x: T): [string, any][];
 	values<T>(x: T): any[];
