@@ -22,7 +22,7 @@ const Scope		= T.Scope;
 // ===================================================================
 //  TStypeCheck -- structural type checking of a parsed TS AST
 // ===================================================================
-// Deliberately partial -- every gap errs lenient (no diagnostic, often surfaced instead as a `SEVERITY.GAP`) rather than risking a false positive.
+// Partial. An unmodeled case reports `SEVERITY.GAP`; the old silent-`any` leniency is being removed (memory/tison_workaround_inventory.md), never extended.
 // Known gaps: 
 //  - generic inference is structural-argument-matching only (no bidirectional/contravariant/contextual)
 //  - narrowing covers identifiers/dotted paths only (no CFG/reassignment invalidation)
