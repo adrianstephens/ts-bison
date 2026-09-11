@@ -240,7 +240,7 @@ const REF_EXN:			WasmType = { ref: 'exn', nullable: true };
 // `undefined` for anything else (a real class/array/closure).
 // None of these has a declaration of its own: a readonly view is a checker-only distinction over the
 // very same physical container, which is the treatment `ownerFor` has always given `ReadonlyArray`.
-const READONLY_ALIAS: Record<string, string> = { ReadonlyArray: 'Array', ReadonlyMap: 'Map', ReadonlySet: 'Set' };
+const READONLY_ALIAS = new Map([['ReadonlyArray', 'Array'], ['ReadonlyMap', 'Map'], ['ReadonlySet', 'Set']]);
 
 function scalarKind(wtype: WasmType | undefined): WasmScalar | undefined {
 	return typeof wtype === 'string' ? (wtype !== 'void' ? wtype : undefined) : wtype && unboxedPrimitive(wtype)?.kind;
@@ -307,8 +307,8 @@ function nullLiteralKind(e: Expr): 'null' | 'undefined' | undefined {
 
 // Checks builtinTypes before T.resolve to avoid expanding a hoisted class name and losing it.
 function wasmTypeOf(t: Type, global: Scope): WasmType | undefined {
-	if (t.type === 'ref' && !t.typeArgs && t.name in builtinTypes)
-		return builtinTypes[t.name].wtype;
+	if (t.type === 'ref' && !t.typeArgs && builtinTypes.has(t.name))
+		return builtinTypes.get(t.name)!.wtype;
 	if (t.type === 'range' && t.base === 'number')
 		return t.integer && t.min !== undefined && t.max !== undefined ? intWasmType(t.min as number, t.max as number) : 'f64';
 	// rangeToType collapses a single-value range to a Literal -- needs the same bounds check or it widens to f64.
@@ -333,7 +333,7 @@ function wasmTypeOf(t: Type, global: Scope): WasmType | undefined {
 		return ARR_WTYPE.ref;
 
 	if (w.type === 'ref')
-		return builtinTypes[w.name]?.wtype;
+		return builtinTypes.get(w.name)?.wtype;
 
 	return undefined;
 }
@@ -1341,33 +1341,34 @@ function substituteTypeParams<N extends Walkable>(node: N, map: ReadonlyMap<stri
 //
 // `class` names which real lib class backs a primitive-level type, resolved lazily through `ensureClass`
 // (`builtinTypeOwner`) for all of them alike; `Boolean` simply has none (no decl exists at all).
-const builtinTypes: Record<string, { wtype: WasmType; class?: string }> = {
-	void:		{ wtype: 'void' },
+// Maps, not objects, here and below: indexed by names from source, where `constructor`/`toString` must not find `Object.prototype`'s.
+const builtinTypes = new Map<string, { wtype: WasmType; class?: string }>([
+	['void',		{ wtype: 'void' }],
 	// No `class` -- `any` has no single owner to dispatch a method call against (`ensureAnyDispatch` handles
 	// that dynamically); this entry only gives a genuinely `any`-typed local/param/field a real `WasmType`.
 	// NULLABLE: an `any` can hold `undefined` (a missing rest arg, an unmatched regex group), which is `ref.null`.
-	any:		{ wtype: REF_ANY_NULLABLE },
+	['any',		{ wtype: REF_ANY_NULLABLE }],
 	// `unknown` has no dedicated physical representation of its own -- same boxed storage as `any` (the
 	// checker's own `T.isAny` already treats the two alike), just without `any`'s implicit-assignability
 	// laxness on the *checking* side, which doesn't affect codegen at all.
-	unknown:	{ wtype: REF_ANY_NULLABLE },
-	boolean:	{ wtype: 'i32', 			class: 'Boolean' },
-	Boolean:	{ wtype: 'i32', 			class: 'Boolean' },
-	number:		{ wtype: 'f64', 			class: 'Number' },
-	Number:		{ wtype: 'f64', 			class: 'Number' },
-	string:		{ wtype: ARR_WTYPE.i16,		class: 'String' },
-	String:		{ wtype: ARR_WTYPE.i16,		class: 'String' },
-	bigint:		{ wtype: ARR_WTYPE.i32,		class: 'BigInt' },
+	['unknown',	{ wtype: REF_ANY_NULLABLE }],
+	['boolean',	{ wtype: 'i32', 			class: 'Boolean' }],
+	['Boolean',	{ wtype: 'i32', 			class: 'Boolean' }],
+	['number',		{ wtype: 'f64', 			class: 'Number' }],
+	['Number',		{ wtype: 'f64', 			class: 'Number' }],
+	['string',		{ wtype: ARR_WTYPE.i16,		class: 'String' }],
+	['String',		{ wtype: ARR_WTYPE.i16,		class: 'String' }],
+	['bigint',		{ wtype: ARR_WTYPE.i32,		class: 'BigInt' }],
 	// Pseudo-types from `lib.d.ts` (`declare type i32 = number`, etc) -- real wasm value types, for a field/method whose storage isn't the usual `number`->`f64` mapping (see `lib/typedarray.ts`'s `Uint8Array`).
 	// `class: 'Number'` because that is exactly what each one is an alias OF: without it a value that
 	// happened to get a storage refinement had no method owner at all, so `let i = 0; i.toString()`
 	// failed as "unknown method" where `const n: number = 0; n.toString()` worked.
-	i32:		{ wtype: 'i32',				class: 'Number' },
-	i64:		{ wtype: 'i64',				class: 'Number' },
-	f32:		{ wtype: 'f32',				class: 'Number' },
-	f64:		{ wtype: 'f64',				class: 'Number' },
-	u32:		{ wtype: 'u32',				class: 'Number' },
-};
+	['i32',		{ wtype: 'i32',				class: 'Number' }],
+	['i64',		{ wtype: 'i64',				class: 'Number' }],
+	['f32',		{ wtype: 'f32',				class: 'Number' }],
+	['f64',		{ wtype: 'f64',				class: 'Number' }],
+	['u32',		{ wtype: 'u32',				class: 'Number' }],
+]);
 
 const UNARY_OP_NAMES = {
 	'-':	'neg',
@@ -1400,16 +1401,16 @@ const BINARY_OP_NAMES = {
 
 // Every entry is a real callable (a plain lib function hands back its own `FunctionDecl`, see `emitCall`).
 // `Math.abs`/`Array.alloc`/etc aren't here -- registered into each owner's own `inlineMethods` instead (`builtinOwner`).
-const builtins: Record<string, Builtin> = {
-	...Object.fromEntries(LIB_DECLS.filter(d => d.type === 'function_decl').filter(d => d.body).map(d => [d.name, () => d])),
-	...Object.fromEntries(LIB_DECLS.filter(d => d.type === 'var_decl').map(d => {
-		const name = d.name as string;
+const builtins = new Map<string, Builtin>([
+	...LIB_DECLS.filter(d => d.type === 'function_decl').filter(d => d.body).map(d => [d.name, () => d] as const),
+	...LIB_DECLS.filter(d => d.type === 'var_decl').flatMap(d => {
 		if (isAsm(d.init)) {
 			const builtin = makeAsm(d.init, {});
-			return builtin && [name, builtin] as const;
+			return builtin ? [[d.name as string, builtin] as const] : [];
 		}
-	}).filter(e => !!e)),
-};
+		return [];
+	}),
+]);
 
 interface AssignTarget { wtype: WasmType; old?: number; write(tee: boolean): number }
 
@@ -1992,7 +1993,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	function builtinTypeOwner(name: string) {
-		const bt = builtinTypes[name];
+		const bt = builtinTypes.get(name);
 		return bt?.class ? ensureClass(bt.class) : undefined;
 	}
 
@@ -2441,7 +2442,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// action's `$` (`WithTextPos<ValuesOf<R>>`) is one once a `const R` infers as a tuple.
 		const elementOf = (x: Type) => x.type === 'array' ? x.element
 			: x.type === 'tuple' ? T.combineTypes(x.elements.map(el => T.tupleElementType(el) ?? T.ANY))
-			: x.type === 'ref' && x.typeArgs?.length === 1 && (READONLY_ALIAS[x.name] ?? x.name) === 'Array' ? x.typeArgs[0]
+			: x.type === 'ref' && x.typeArgs?.length === 1 && (READONLY_ALIAS.get(x.name) ?? x.name) === 'Array' ? x.typeArgs[0]
 			: undefined;
 		const arrays = parts.flatMap(part => {
 			// A part whose array-ness is one resolution step away -- an alias, or a mapped type over an
@@ -2491,7 +2492,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 	function typeOfUncached(t: Type): WasmType | undefined {
 		if (t.type === 'ref' && t.typeArgs?.length) {
-			const name = READONLY_ALIAS[t.name] ?? t.name;
+			const name = READONLY_ALIAS.get(t.name) ?? t.name;
 			const decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
 			if (decl?.type === 'class_decl' && decl.typeParams?.length) {
 				const cls = ensureClass(name, t.typeArgs);
@@ -3105,7 +3106,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// Same fast path `wasmTypeOf` needs, for the same reason -- a hoisted `builtinTypes` name would
 		// otherwise fully expand via its own `declScope` before reaching the `w.type === 'ref'` check below.
 		if (t.type === 'ref') {
-			if (t.name in builtinTypes)
+			if (builtinTypes.has(t.name))
 				return builtinTypeOwner(t.name);
 /*
 			if (t.typeArgs?.length) {
@@ -3152,8 +3153,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				return ensureClass('Array', [w.element]);
 
 			case 'ref':
-				if (READONLY_ALIAS[w.name])
-					return ensureClass(READONLY_ALIAS[w.name], w.typeArgs);
+				const mutable = READONLY_ALIAS.get(w.name);
+				if (mutable)
+					return ensureClass(mutable, w.typeArgs);
 				if (w.name === 'Array')
 					return ensureClass('Array', w.typeArgs);
 				// A plain lib class (or alias -- `resolveClassAlias`) not yet reached through the raw-`t.name`
@@ -4247,7 +4249,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// declaring file's own top level, not the caller's.
 	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Expected, homeModule: string = ctx.homeModule): WasmType {
 		let decl;
-		const builtin = builtins[name] ?? moduleAsmBuiltins.get(homeKey(homeModule, name));
+		const builtin = builtins.get(name) ?? moduleAsmBuiltins.get(homeKey(homeModule, name));
 		if (builtin) {
 			const result = builtin(args.map(a => operandInfo(a, ctx)), ctx);
 			if ('inline' in result)
@@ -5107,7 +5109,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					? { params: ['f32', 'f32'], result: 'f32', inline: [I.f32.div] }
 					: { params: ['f64', 'f64'], result: 'f64', inline: [I.f64.div] };
 			case 'mod':
-				return builtins.__towasm_mod!([{wtype: t}], ctx) as Inline;
+				return builtins.get('__towasm_mod')!([{wtype: t}], ctx) as Inline;
 			case 'and': case 'or': case 'xor': case 'shl': case 'shr_s':
 				return { params: ['i32', 'i32'], result: 'i32', inline: [I.i32[method]] };
 			case 'shr_u':
@@ -6635,7 +6637,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (owner)
 							return emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
 						const name = `${obj.name}.${e.callee.property}`;
-						if (name in builtins)
+						if (builtins.has(name))
 							return emitCall(name, e.arguments, ctx);
 					}
 					const owner = ownerOf(obj, ctx);

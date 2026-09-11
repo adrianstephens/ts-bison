@@ -86,6 +86,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a union of signatures is callable',	'declare const f: ((x: number) => string) | ((x: number) => number); const r: boolean = f(1); declare const g: ((a?: {x: number}, ...b: {x: number}[]) => void) | ((a?: {y: number}) => void); g({x: 0, y: 0}, {x: 0});', [NOT_ASSIGNABLE('string | number', 'boolean')]],
 	['an any callee still checks its arguments', 'declare const k: any; const r = new k(); const q: number = r; k(() => { const s: string = 1; });', [NOT_ASSIGNABLE('number', 'string')]],
 	['an assignment narrows as its target',	'declare function next(): string | null; let s; while ((s = next()) !== null) { const n: string = s; } let t: string | null; if (typeof (t = next()) === "string") { const w: string = t; }', []],
+	['names never reach Object.prototype',	'declare const v: constructor; const n = v.solutionRead; declare const w: toString | number; const m = w.valueOf;', []],
 	['a function type inside call type arguments', 'declare function g<T>(x?: T): T; const r: number = g<() => string>();', [NOT_ASSIGNABLE('() => string', 'number')]],
 	['reduce with and without a seed',		'const r: string = [1, 2].reduce((a, v) => a + v, ""); const s: boolean = [1, 2].reduce((a, v) => a + v);', [NOT_ASSIGNABLE('number', 'boolean')]],
 	['functions have Function members',		'function f(a: number) {} f.call(null, 1); const n: string = f.length;',					[NOT_ASSIGNABLE('number', 'string')]],

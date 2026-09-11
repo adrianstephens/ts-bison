@@ -26,7 +26,8 @@ const OPAQUE		= new Set(['keyof', 'indexed_access', 'conditional', 'infer', 'map
 // In `strict` mode below, either side being one of these fails the comparison instead of auto-passing it.
 const OPAQUE_GAP	= new Set(['keyof', 'indexed_access', 'conditional', 'infer', 'mapped']);
 
-const BOXED_PRIMITIVE: Record<string, string> = { string: 'String', number: 'Number', boolean: 'Boolean', bigint: 'BigInt', symbol: 'Symbol' };
+// A Map, not an object: it is indexed by names from source, and `constructor`/`toString` must not find `Object.prototype`'s.
+const BOXED_PRIMITIVE = new Map([['string', 'String'], ['number', 'Number'], ['boolean', 'Boolean'], ['bigint', 'BigInt'], ['symbol', 'Symbol']]);
 
 export const tocode = new Output({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
 export function typeKey(t: Type) { return tocode.type(t); }
@@ -2073,7 +2074,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 			// A primitive value auto-boxes for member access (`"x".toUpperCase()`) -- delegates to its boxed lib.es5 interface, same
 			// idea as `array` delegating to `Array<T>` above.
 			case 'ref': {
-				const boxed = BOXED_PRIMITIVE[t.name];
+				const boxed = BOXED_PRIMITIVE.get(t.name);
 				return boxed ? lookupMember(TS.RefType(boxed), prop, scope, depth - 1) : undefined;
 			}
 			default:
@@ -2289,7 +2290,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			if (src.type === 'ref') {
 				// A primitive auto-boxes for structural checks too, not just member access -- otherwise `string` could never
 				// structurally satisfy `Iterable<T>`/`ArrayLike<T>` (e.g. `Array.from(str)`).
-				const boxed = BOXED_PRIMITIVE[src.name];
+				const boxed = BOXED_PRIMITIVE.get(src.name);
 				return boxed ? recurse(TS.RefType(boxed), dst, depth - 1) : !ALL_PRIMITIVES.has(src.name);	// unresolved nominal: lenient
 			}
 			if (src.type === 'function' || src.type === 'constructor')
@@ -2330,8 +2331,8 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				// not a class instance. `undefined`/`null`/`void`/`any` are primitives here too, and this
 				// checker is deliberately lenient about those -- rejecting them against a class cost 10
 				// real diagnostics on code tsc accepts.
-				if (BOXED_PRIMITIVE[src.name] && (isClassRef(dst, dstScope) || dst.name === 'Array' || dst.name === 'ReadonlyArray'))
-					return BOXED_PRIMITIVE[src.name] === dst.name;
+				if (BOXED_PRIMITIVE.has(src.name) && (isClassRef(dst, dstScope) || dst.name === 'Array' || dst.name === 'ReadonlyArray'))
+					return BOXED_PRIMITIVE.get(src.name) === dst.name;
 				return !(ALL_PRIMITIVES.has(src.name) && ALL_PRIMITIVES.has(dst.name));	// distinct primitives: no; unresolved names: lenient
 			}
 			// `Array`/`ReadonlyArray` are well-known structural shapes, not "some unresolved generic" -- a plain
@@ -3089,7 +3090,7 @@ export class Scope {
 
 export function makeGlobal() {
 	const global = new Scope();
-	for (const [r, n] of Object.entries(BOXED_PRIMITIVE))
+	for (const [r, n] of BOXED_PRIMITIVE)
 		global.addValue(n, TS.FunctionType([JS.Param('value', ANY, ['optional'])], TS.RefType(r)));
 
 	global.addValue('undefined',	UNDEFINED);
