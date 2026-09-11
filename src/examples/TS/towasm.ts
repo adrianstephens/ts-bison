@@ -2821,6 +2821,83 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			: undefined;
 	}
 
+	// A literal whose SHAPE is a runtime fact: a spread of a union (`{ ...e }`, `e: Expr`), or a written discriminant
+	// whose value is a union of literals (`{ type, ...sig }`, `type: 'call' | 'construct'`). The deciding value is
+	// evaluated once, then one arm per possibility rebuilds the literal with it pinned -- a typed local for the
+	// spread, the literal itself for the discriminant -- so ordinary shape matching picks that arm's struct.
+	// Only when every earlier property is effect-free, so evaluating the deciding one first reorders nothing.
+	function emitUnionShapedLiteral(e: JS.ObjectExpr<Type>, ctx: FunctionContext, want: WasmType | undefined): WasmType | undefined {
+		const pure = (x: Expr): boolean => x.type === 'literal' || x.type === 'identifier' || x.type === 'this' || (x.type === 'member' && pure(x.object));
+		const result: WasmType = want && typeof want === 'object' && 'ref' in want && want.ref === 'any' ? want : REF_ANY;
+		// What `f` emits, as instructions, leaving the context's own buffer as it was.
+		const capture = (f: () => void): wasm.Instr[] => {
+			const outer = ctx.swapOut();
+			f();
+			return ctx.swapOut(outer);
+		};
+		interface Arm { test: () => void; build: () => void }
+		const cascade = ([arm, ...rest]: Arm[]): wasm.Instr[] => arm
+			? [...capture(arm.test), I.if(toValType(result), capture(arm.build), cascade(rest))]
+			: [I.unreachable];
+		const emitArms = (arms: Arm[]) => {
+			ctx.emit(...cascade(arms));
+			return result;
+		};
+		const withProp = (i: number, q: JS.ObjectExpr<Type>['properties'][number]) => ({ ...e, properties: e.properties.map((p, j) => j === i ? q : p) }) as Expr;
+		for (const [i, p] of e.properties.entries()) {
+			if (!e.properties.slice(0, i).every(q => q.type === 'spread' ? pure(q.operand) : q.type === 'field' && (!q.value || pure(q.value))))
+				break;
+			if (p.type === 'spread') {
+				const members	= T.unionMembers(T.resolve(ctx.typeScope, narrowedTypeOf(p.operand, ctx)), ctx.typeScope).filter(m => !T.isNullish(m, ctx.typeScope));
+				const owners	= members.map(m => ownerFor(m));
+				if (members.length < 2 || !owners.every(o => o && o.typeIndex !== -1))
+					continue;
+				const n		= optionalTempCounter++;
+				const src	= ctx.declareLocal(`$usrc$${n}`, REF_ANY_NULLABLE);
+				emitAs(p.operand, ctx, REF_ANY_NULLABLE);
+				ctx.emit(I.local.set(src.index));
+				return emitArms(owners.map((o, k) => ({
+					test: () => ctx.emit(I.local.get(src.index), I.ref.test(o!.typeIndex)),
+					build: () => {
+						const name	= `$uvar$${n}$${k}`;
+						ctx.emit(I.local.get(src.index), I.ref.cast(o!.typeIndex), I.local.set(ctx.declareValue(name, o!.thisWtype!, members[k]).index));
+						coerceTop(emitExpr(withProp(i, { type: 'spread', operand: { type: 'identifier', name } as Expr }), ctx), ctx, result);
+					},
+				})));
+			}
+			if (p.type === 'field' && p.value && typeof p.key === 'string') {
+				// Unwidened: the question is which LITERALS it can hold (`narrowedTypeOf` widens, for physical representation).
+				const precise	= checkerTypeOf(unwrapAs(p.value), ctx.stmtScope ?? ctx.scope, false);
+				const values	= T.unionMembers(T.resolve(ctx.typeScope, precise), ctx.typeScope).map(m => T.resolveOwn(m, ctx.typeScope));
+				if (values.length < 2 || !values.every(v => v.type === 'literal'))
+					continue;
+				const name	= `$udisc$${optionalTempCounter++}`;
+				const wt	= wtypeOf(p.value, ctx) ?? REF_ANY;
+				emitAs(p.value, ctx, wt);
+				ctx.emit(I.local.set(ctx.declareValue(name, wt, precise).index));
+				return emitArms(values.map(v => ({
+					test: () => { emitAs({ type: 'binary', operator: '===', left: { type: 'identifier', name }, right: v } as Expr, ctx, 'i32'); },
+					build: () => coerceTop(emitExpr(withProp(i, { ...p, value: v as unknown as Expr }), ctx), ctx, result),
+				})));
+			}
+		}
+		return undefined;
+	}
+
+	// `{ ...t, returnType: r }`: a spread operand with ONE known shape that already has every written key IS the
+	// literal's shape, as in TS (its type is the operand's own, with those keys replaced).
+	function spreadOwner(e: JS.ObjectExpr<Type>, ctx: FunctionContext): ClassInfo | undefined {
+		const written = e.properties.flatMap(p => p.type === 'field' && typeof p.key === 'string' ? [p.key] : []);
+		for (const p of e.properties) {
+			if (p.type !== 'spread')
+				continue;
+			const cls = ownerOf(p.operand, ctx);
+			if (cls && cls.typeIndex !== -1 && written.every(k => cls.fieldIndex.has(k)))
+				return cls;
+		}
+		return undefined;
+	}
+
 	function matchObjectShape(e: JS.ObjectExpr<Type>, ctx: FunctionContext): ClassInfo | undefined {
 		// `props`: every key the literal PROVIDES, so a candidate's required fields can be satisfied by a
 		// spread. `explicit`: only the fields actually WRITTEN -- real TS never excess-property-checks a
@@ -3202,7 +3279,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				return !vals || vals.includes(value.value);
 			});
 		});
-		return matches.length === 1 ? ownerFor(matches[0].raw) ?? matchObjectShapeByType(matches[0].objT) : undefined;
+		const owners = matches.map(m => ownerFor(m.raw) ?? matchObjectShapeByType(m.objT));
+		if (owners.length === 1)
+			return owners[0];
+		// Several fit (`{params, rest}` for `CallSig | Params`): the one that is a SUBTYPE of all the others is
+		// acceptable to every consumer (`interface CallSig extends Params` makes its struct a `Params` too).
+		return owners.find(o => o && owners.every(q => q && isSubclassOf(o.name, q.name)));
 	}
 
 	// A union's own members can themselves resolve to a further union (e.g. a re-exported cross-module
@@ -3944,8 +4026,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 	}
 
-	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElementI, typeIndex: number, elementTsType?: Type): void {
-		const emitElement = (el: Expr) => withContext(ctx, elementTsType, () => emitAs(el, ctx, want));
+	// `elementTsType` may name each position separately -- a TUPLE rest parameter's arguments.
+	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElementI, typeIndex: number, elementTsType?: Type | ((i: number) => Type | undefined)): void {
+		const contextAt		= (el: Expr) => typeof elementTsType === 'function' ? elementTsType(elements.indexOf(el)) : elementTsType;
+		const emitElement	= (el: Expr) => withContext(ctx, contextAt(el), () => emitAs(el, ctx, want));
 		if (elements.some(el => el?.type === 'spread')) {
 			// A `[...]` array literal with at least one spread element. Every element is evaluated exactly once, in
 			// source order, into a scratch local before anything is allocated (side effects must not run twice). The real array is then `array.new_default`-allocated to the true runtime total and filled in a second pass.
@@ -4148,8 +4232,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const kind = restArrWtype.arr;
 			if (kind === 'i16' || kind === 'i8')
 				throw `'${label}' rest param: a 'string[]'/packed-byte-array element is not supported`;
-			const restT = resolvedParams?.[fixedCount]?.tsType && T.resolve(ctx.typeScope, resolvedParams[fixedCount].tsType);
-			emitArrayElements(args.slice(fixedCount), ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind), restT?.type === 'array' ? restT.element : undefined);
+			const restTs = resolvedParams?.[fixedCount]?.tsType;
+			emitArrayElements(args.slice(fixedCount), ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind), restTs && (k => T.restArgType(restTs, k, ctx.typeScope)));
 		}
 	}
 
@@ -5534,7 +5618,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// is a generic callback's own return value, boxed as `any` per `typeOf`'s own union case).
 				const owner = (typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined)
 					?? matchContextualUnionMember(e, ctx)
+					?? spreadOwner(e, ctx)
 					?? matchObjectShape(e, ctx);
+				if (!owner) {
+					const variants = emitUnionShapedLiteral(e, ctx, want);
+					if (variants)
+						return variants;
+				}
 				if (!owner)
 					throw "an object literal needs a known target type (e.g. a 'const x: Point = {...}' with a plain 'type Point = {...}' alias) -- not supported here";
 
@@ -7605,7 +7695,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// module" to track the way `T.declScopeOf` exists for (a cross-module signature, which nothing here
 	// ever is).
 	type Expected = Type | (() => Type);
-	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, returnType?: Type): Map<string, Type> {
+	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, returnType?: Type, rest?: JS.Rest<Type>): Map<string, Type> {
 		const map = new Map<string, Type>();
 		if (typeArgs) {
 			typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
@@ -7616,6 +7706,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const p = params[i];
 				if (p?.typeAnnotation && a.type !== 'spread')
 					T.inferTypeArgs(p.typeAnnotation, checkerTypeOf(a, scope), names, map, libGlobal, libGlobal, deferred);
+				// `sig(...args)` with `args: CallSigParams<number>` against `...args: CallSigParams<T>`: the spread IS the rest.
+				else if (a.type === 'spread' && i === params.length && rest?.typeAnnotation)
+					T.inferTypeArgs(rest.typeAnnotation, checkerTypeOf(a.operand, scope), names, map, libGlobal, libGlobal, deferred);
 			});
 			// Where the result is going also REPLACES an `any` the arguments left: the instantiation built has to be
 			// the one its destination can hold, and the checker's own type for the call already solved it.
@@ -7647,7 +7740,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// (`identity<number>(5)`) are honored too, same as a class's are.
 	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, homeModule = '.'): FuncInfo {
 		const typeParams	= decl.typeParams!;
-		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, scope, expected, decl.returnType as Type | undefined);
+		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, scope, expected, decl.returnType as Type | undefined, decl.rest);
 		// Bare (unmangled) composite key -- `compileFunc` applies `homeKey` itself when it caches, so this
 		// must match without a second wrapping here.
 		const key			= genericKey(name, typeParams, map, global);
@@ -8454,8 +8547,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 		// `interface X extends Y` puts Y's fields first, so X's struct can be a wasm SUBTYPE of Y's: an X then IS a Y.
 		const top		= T.resolve(scope, ref);
+		// An alias of a named shape IS that shape (`type CallSig = JS.CallSig<Type>`): same struct, same supertype.
+		if (top.type === 'ref' && top.name !== name) {
+			const target = ensureClassRef(top);
+			if (target) {
+				classes.set(key, target);
+				return target;
+			}
+		}
 		const baseRef	= top.type === 'intersection' && top.types[0].type === 'ref' ? top.types[0] : undefined;
-		const base		= baseRef && ensureObjectShape(baseRef.name, baseRef.typeArgs, T.ownScope(baseRef, scope));
+		const base		= baseRef && ensureClassRef({ ...baseRef, declScope: baseRef.declScope ?? scope });
 		const reached	= classes.get(key);
 		if (reached)
 			return reached;
@@ -9107,7 +9208,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// exact same per-piece substitution for a signature), the body still through `substituteTypeParams`
 		// (a plain `Statement[]`, which `walk` does accept directly).
 		if (decl.typeParams?.length) {
-			const map = inferTypeArgMap(decl.typeParams, decl.params, args, typeArgs, callerCtx.scope);
+			const map = inferTypeArgMap(decl.typeParams, decl.params, args, typeArgs, callerCtx.scope, undefined, undefined, decl.rest);
 			key		= genericKey(key, decl.typeParams, map, global);
 			decl	= {
 				...decl,

@@ -121,29 +121,6 @@ function resolveFnMember(t: Type, scope: Scope): TS.CallSig | undefined {
 const CONST_CONTEXT: Type = TS.RefType('const');
 const isConstContext = (t: Type | undefined) => t?.type === 'ref' && t.name === 'const' && !t.typeArgs;
 
-// The declared type of the argument sitting at REST position `k`. Usually just the rest's own element,
-// but a TUPLE rest names each position separately -- and a UNION of the two shapes names a callback in
-// only ONE arm (`Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>)`), so every arm that
-// can answer contributes and `resolveFnMember` picks the function out of the combined result.
-function restArgType(rest: Type, k: number, scope: Scope, depth = 4): Type | undefined {
-	const r = T.resolveOwn(rest, scope);
-	if (r.type === 'array')
-		return r.element;
-	if (r.type === 'ref' && r.name === 'Array' && r.typeArgs?.length === 1)
-		return r.typeArgs[0];
-	if (r.type === 'tuple') {
-		const el = r.elements[k];
-		return !el ? undefined
-			: el.type === 'labeled' || el.type === 'optional' ? el.element
-			: el.type === 'spread' ? restArgType(el.argument, 0, scope, depth - 1)
-			: el;
-	}
-	if (r.type === 'union' && depth > 0) {
-		const parts = r.types.map(t => restArgType(t, k, scope, depth - 1)).filter((t): t is Type => !!t);
-		return parts.length ? T.combineTypes(parts) : undefined;
-	}
-	return undefined;
-}
 
 // Contextual parameter typing: an unannotated arrow/function (`x => x.foo`, whether a call argument, an object-literal
 // property value, or the RHS of a typed `var_decl`/`satisfies`) would otherwise type its own params as `any`. Fills
@@ -1679,7 +1656,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// Past the fixed parameters the REST names the argument -- and where the rest is a tuple
 					// (or a union with one), that position's own element is the only thing that names a callback.
 					const declaredArg = (i: number) => sig!.params[i]?.typeAnnotation
-						?? (sig!.rest?.typeAnnotation && restArgType(sig!.rest.typeAnnotation, i - sig!.params.length, scope));
+						?? (sig!.rest?.typeAnnotation && T.restArgType(sig!.rest.typeAnnotation, i - sig!.params.length, scope));
 					const preArgTs = e.arguments.map((a, i) => {
 						if (a.type === 'function' || a.type === 'arrow' || a.type === 'spread')
 							return undefined;

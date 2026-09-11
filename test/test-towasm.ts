@@ -6243,6 +6243,28 @@ async function main() {
 			export function ctxArg(): number { const b: B = { x: 7 }; add(rule(() => ({ x: 5 }))); const c = rules[0].make(); return c.x * 10 + b.x; }
 		`);
 		check('an argument and a callback return are built for their context', r14.ctxArg(), 57);
+
+		// A literal whose shape is a runtime fact: a spread of a union, or a written discriminant holding a union
+		// of literals -- one arm per possibility (type-utils.ts's `freeze`, ts-parser.ts's `TypeMember`).
+		const r15 = await compile(`
+			interface Lit { type: 'literal'; value: number; frozen?: boolean }
+			interface Rng { type: 'range'; min: number; frozen?: boolean }
+			interface Ref { type: 'ref'; name: string }
+			type Ty = Lit | Rng | Ref;
+			function freeze(t: Ty): Ty { return t.type === 'literal' || t.type === 'range' ? { ...t, frozen: true } : t; }
+			function copy(t: Ty): Ty { const out: any = { ...t }; return out; }
+			interface Sig { params: number[] }
+			type Member = ({ type: 'call' } & Sig) | ({ type: 'construct' } & Sig);
+			function member(type: 'call' | 'construct', sig: Sig): Member { return { type, ...sig }; }
+			export function unionShaped(): number {
+				const a = freeze({ type: 'literal', value: 5 }); const b = freeze({ type: 'range', min: 2 }); const c = freeze({ type: 'ref', name: 'x' });
+				const fa = a.type === 'literal' && a.frozen ? a.value : -1; const fb = b.type === 'range' && b.frozen ? b.min : -1; const fc = c.type === 'ref' ? c.name.length : -1;
+				const d = copy({ type: 'range', min: 9 }); const fd = d.type === 'range' ? d.min : -1;
+				const m = member('construct', { params: [1, 2, 3] }); const fm = (m.type === 'construct' ? 100 : 0) + m.params.length;
+				return fa * 10000 + fb * 1000 + fc * 100 + fd + fm * 100000;
+			}
+		`);
+		check('an object literal shaped by a union spread or a union-of-literals discriminant', r15.unionShaped(), 10352109);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 

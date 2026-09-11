@@ -491,6 +491,30 @@ function avoidCapture(sig: TS.CallSig, map: Map<string, Type>): TS.CallSig {
 	};
 }
 
+// The declared type of the argument sitting at REST position `k`. Usually just the rest's own element,
+// but a TUPLE rest names each position separately -- and a UNION of the two shapes names a callback in
+// only ONE arm (`Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>)`), so every arm that
+// can answer contributes and `resolveFnMember` picks the function out of the combined result.
+export function restArgType(rest: Type, k: number, scope: Scope, depth = 4): Type | undefined {
+	const r = resolveOwn(rest, scope);
+	if (r.type === 'array')
+		return r.element;
+	if (r.type === 'ref' && r.name === 'Array' && r.typeArgs?.length === 1)
+		return r.typeArgs[0];
+	if (r.type === 'tuple') {
+		const el = r.elements[k];
+		return !el ? undefined
+			: el.type === 'labeled' || el.type === 'optional' ? el.element
+			: el.type === 'spread' ? restArgType(el.argument, 0, scope, depth - 1)
+			: el;
+	}
+	if (r.type === 'union' && depth > 0) {
+		const parts = r.types.map(t => restArgType(t, k, scope, depth - 1)).filter((t): t is Type => !!t);
+		return parts.length ? combineTypes(parts) : undefined;
+	}
+	return undefined;
+}
+
 // A union of signatures identical up to their own type-parameter names is ONE signature (real TS's
 // `getUnionSignatures`). `(readonly T[] | T[]).map` is that shape: each part minted its own fresh `U`.
 export function mergeIdenticalSignatures(t: Type): Type {
