@@ -245,6 +245,14 @@ globals already are:
    before the deferred callback-return inference can bind it to the literal's own type.
 2. A closure literal whose context is a function type should give its `return`s / concise body that
    type's `returnType` as context (`emitClosureLiteral`, towasm.ts ~4644; `case 'return'` ~6965).
+DONE 2026-09-11 (both hops, `withContext`: `emitCallArgs` per argument; `plainReturn(result, context)` for
+closures -- captured at the literal, the body compiles later -- plain functions and methods). Line 599 now
+compiles; line 600 does not, and the reason is OVERLOADS: `Rule` has two generic overload signatures and a
+NON-generic implementation `Rule(rhs, action?: Action<any, any>)`. Codegen compiles the implementation, so
+the action's context is `Action<any, any>` -- only the CHECKER's chosen overload knows `T = CallSig`. Next
+step: stamp the callback node with its checker-side contextual type (the substituted `declared` at
+`applyContextualParams`, checker.ts `case 'call'`), and have `emitClosureLiteral` fall back to it. Care:
+the same call is typed more than once, with and without context, so first-wins may keep the worse one.
 NOTE: the lazy checker-call-type fallback (`() => checkerTypeOf(e, ctx.scope)`) does NOT help here -- the
 checker types the call in isolation, without push's expected type, so it too answers `Rule<{literal}>`.
 Second site, type-utils.ts:448 (`freeze`): `{ ...t, frozen: true }` with `t: Literal | RangeType` -- a

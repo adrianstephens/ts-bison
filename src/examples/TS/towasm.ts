@@ -4086,6 +4086,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 			return params[i];
 		};
+		// Each argument's parameter type is its context: a literal or generic call there builds what the callee reads.
+		const emitArg = (i: number, a: Expr) => withContext(ctx, resolvedParams?.[i]?.tsType, () => emitAs(a, ctx, wantForArg(i, a)));
 		if (!hasRest) {
 			if (args.some(a => a.type === 'spread'))
 				args = expandTupleSpreads(args, ctx);
@@ -4128,7 +4130,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 				args = [...args, ...missing as Expr[]];
 			}
-			args.forEach((a, i) => emitAs(a, ctx, wantForArg(i, a)));
+			args.forEach((a, i) => emitArg(i, a));
 		} else {
 			const fixedCount = params.length - 1;
 			if (args.length < fixedCount)
@@ -4136,14 +4138,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const fixedArgs = args.slice(0, fixedCount);
 			if (fixedArgs.some(a => a.type === 'spread'))
 				throw `'${label}': a spread argument can only appear among the trailing rest arguments -- its length isn't known at compile time, so it can't fill a fixed parameter position`;
-			fixedArgs.forEach((a, i) => emitAs(a, ctx, wantForArg(i, a)));
+			fixedArgs.forEach((a, i) => emitArg(i, a));
 			const restArrWtype = params[fixedCount];
 			if (typeof restArrWtype === 'string' || !('arr' in restArrWtype))
 				throw `internal: '${label}' rest param has a non-array type`;
 			const kind = restArrWtype.arr;
 			if (kind === 'i16' || kind === 'i8')
 				throw `'${label}' rest param: a 'string[]'/packed-byte-array element is not supported`;
-			emitArrayElements(args.slice(fixedCount), ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind));
+			const restT = resolvedParams?.[fixedCount]?.tsType && T.resolve(ctx.typeScope, resolvedParams[fixedCount].tsType);
+			emitArrayElements(args.slice(fixedCount), ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind), restT?.type === 'array' ? restT.element : undefined);
 		}
 	}
 
@@ -4795,13 +4798,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 
 		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length };
+		// Captured now: the body compiles later, once this literal's own context (`Rule<CallSig>`'s action) is gone.
+		const fnContext		= ctx.contextualReturn && T.resolve(ctx.typeScope, ctx.contextualReturn);
+		const returnContext	= fnContext?.type === 'function' ? fnContext.returnType : undefined;
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 		const { funcIndex, typeIndex }	= registerFuncAtType(funcTypeIndex);
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex };
 		closureLiterals.push(info);
 
 		worklist.push(withCatch(() => {
-			const fnCtx		= new FunctionContext(e.name ?? '<anonymous>', new Scope(libGlobal), plainReturn(result), undefined, ctx.homeModule);
+			const fnCtx		= new FunctionContext(e.name ?? '<anonymous>', new Scope(libGlobal), plainReturn(result, returnContext), undefined, ctx.homeModule);
 			// Env param first (real wasm param index 0), then this literal's own params -- `toFuncBody`'s `numParams` assumes the first `1 + params.length` declared locals are the real wasm params, in order.
 			const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
 			const pending	= fnCtx.declareParams(params);
@@ -6640,7 +6646,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// holds) and a bare omitted argument (what a caller with no meaningful `WasmType` at all, e.g. a
 	// resumable step function, passes) -- normalized to `undefined` right here, once, rather than
 	// trusting every caller to already agree on which spelling they're using.
-	function plainReturn(result?: WasmType): ReturnHandler {
+	// `context`: the returned value's TS target, so a literal or generic call there builds what the caller reads.
+	function plainReturn(result?: WasmType, context?: Type): ReturnHandler {
 		if (result === 'void')
 			result = undefined;
 		return {
@@ -6670,7 +6677,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						emitExpr(argument, ctx, 'void');
 						emitDefaultValue(result, ctx);
 					} else {
-						emitAs(argument, ctx, result);
+						withContext(ctx, context, () => emitAs(argument, ctx, result));
 					}
 				}
 				ctx.emit(I.return);
@@ -7719,7 +7726,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation};
 			funcs.set(homeKey(homeModule, name), info);
 			worklist.push(withCatch(() => {
-				const ctx	= new FunctionContext(name, new Scope(homeScope ?? libGlobal), plainReturn(result), undefined, homeModule);
+				const ctx	= new FunctionContext(name, new Scope(homeScope ?? libGlobal), plainReturn(result, decl.returnType as Type | undefined), undefined, homeModule);
 				ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 				ctx.ownBody = decl.body!;
 				ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
@@ -9144,7 +9151,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		funcs.set(key, info);
 		worklist.push(withCatch(() => {
 			// See `ensureCtor`'s own note -- a method body resolves against its class's declaring module too.
-			const ctx	= new FunctionContext(key, new Scope(owner.declScope ?? libGlobal), plainReturn(result), owner, owner.homeModule);
+			const ctx	= new FunctionContext(key, new Scope(owner.declScope ?? libGlobal), plainReturn(result, decl.returnType as Type | undefined), owner, owner.homeModule);
 			if (!isStatic)
 				ctx.declareValue('this', thisWtype, owner.thisTsType);
 			if (reassignsThis) {

@@ -6230,6 +6230,19 @@ async function main() {
 			main: `import { load, load2 } from './tcmod'; export function main(): number { return load(true) * 1000 + load(false) * 100 + load2(true) * 10 + load2(false); }`,
 		}, 'main');
 		check("an imported module's local annotated with its own private interface", r13.main(), 2030);
+
+		// An argument sees its parameter's type, and a callback's return sees the callback's contextual return type:
+		// `rule(() => ({ x: 5 }))` passed as `R<C>` builds `R<C>` and a `C`, not the literal's own ambiguous shape.
+		const r14 = await compile(`
+			interface B { x: number; y?: number }
+			interface C { x: number; w?: string }
+			interface R<T> { make: () => T }
+			function rule<T>(make: () => T): R<T> { return { make }; }
+			const rules: R<C>[] = [];
+			function add(r: R<C>): number { rules.push(r); return rules.length; }
+			export function ctxArg(): number { const b: B = { x: 7 }; add(rule(() => ({ x: 5 }))); const c = rules[0].make(); return c.x * 10 + b.x; }
+		`);
+		check('an argument and a callback return are built for their context', r14.ctxArg(), 57);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 
