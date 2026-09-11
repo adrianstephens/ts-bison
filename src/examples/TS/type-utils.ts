@@ -1705,7 +1705,16 @@ export function isTruthy(t: Type, scope: Scope): boolean {
 		:	r.type === 'range'			? !rangeIncludesZero(r)
 		:	r.type === 'union'			? r.types.every(m => isTruthy(m, scope))
 		:	r.type === 'intersection'	? r.types.some(m => isTruthy(m, scope))
+		:	r.type === 'ref'			? isObjectRef(r, scope)
 		:	['object', 'array', 'tuple', 'function', 'constructor'].includes(r.type);
+}
+// A class or interface instance is an object, never falsy -- TS's object type facts. Not an empty shape (`{}`, `Object`),
+// which a primitive satisfies, nor anything unresolved.
+function isObjectRef(r: TS.RefType, scope: Scope): boolean {
+	if (ALL_PRIMITIVES.has(r.name))
+		return false;
+	const m = resolveMembers(r, scope);
+	return m.type === 'object' ? m.members.length > 0 : m.type === 'intersection' && m.types.some(p => p.type === 'object' && p.members.length > 0);
 }
 
 export function isBigint(t: Type, scope: Scope): boolean {
