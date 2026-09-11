@@ -623,9 +623,8 @@ export interface Diagnostic {
 }
 
 function makeDiagnostic(func: (d: Diagnostic) => void): Err {
-	const renderer	= new Output;
 	const clip		= (s: string, max = 60)	=> s.length > max ? s.slice(0, max - 3) + '...' : s;
-	const toString	= (v: any) => v === undefined ? '' : typeof v === 'string' ? v : renderer.toCode(v);
+	const toString	= (v: any) => v === undefined ? '' : typeof v === 'string' ? v : new Output({ typeBudget: 4096 }).toCode(v);
 
 	return (severity: SEVERITY, pos: Location) => (strings: TemplateStringsArray, ...values: any[]) => func({
 		severity,

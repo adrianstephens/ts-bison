@@ -19,6 +19,9 @@ const DefaultOptions = {
 	spaceAroundOps:		true,
 	spaceAfterColon:	true,
 	spaceAfterComma:	true,
+	// Characters of type text to print before eliding the rest as `...`: a diagnostic shows only a prefix, and a type
+	// built from shared subtrees can print exponentially larger than it is.
+	typeBudget:			Infinity,
 };
 
 export type Options = Partial<typeof DefaultOptions>;
@@ -154,6 +157,7 @@ export class Output {
 	// is a real, uncaught checker gap (no cycle detection during inference yet), so a genuinely cyclic Type object
 	// can reach here. Printing it is diagnostic-only, so a placeholder beats an unbounded recursive stack overflow.
 	private printing = new Set<Type>();
+	private typeSpent = 0;
 
 	constructor(opts: Options = {}) {
 		this.opts		= {...DefaultOptions, ...opts};
@@ -308,9 +312,13 @@ export class Output {
 	type(type: Type, minPrec = 0): string {
 		if (this.printing.has(type))
 			return '<circular>';
+		if (this.typeSpent > this.opts.typeBudget)
+			return '...';
 		this.printing.add(type);
 		try {
-			return withParens(this.typeBody(type), typePrecedence(type) < minPrec);
+			const r = withParens(this.typeBody(type), typePrecedence(type) < minPrec);
+			this.typeSpent += r.length;
+			return r;
 		} finally {
 			this.printing.delete(type);
 		}
