@@ -119,6 +119,10 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - Destructuring a union binds each member's own position (7b10acf); an equality with a literal drops members not comparable
   with it (640074a) -- but the literal is not boxed, so `'a'` vs `{ length: number }` is dropped where TS keeps it; an
   inferred return adds `undefined` only when the end is reachable (`endsFunction`, 0dda90c).
+- towasm lib's Map/Set/WeakMap values are the classes' own generic constructors, not TS's constructor shapes: TS's
+  `MapConstructor` has a non-generic first `new (): Map<any, any>` (and `new Set()` is `Set<unknown>`), which is why
+  `(this.aliases ??= new Map()).set(d.name, ...)` passes tsc (type-utils addAlias). An ambient `declare var Map` would merge
+  as an intersection whose class `constructor` part `new` picks first -- needs an ambient-first rule for class+var merges.
 - Real tsc for probes: `node_modules/.bin/tsc --ignoreConfig --noEmit --strict --target es2022 file.ts` (TS 6.0.3 refuses
   files alongside a tsconfig otherwise). Check TS semantics this way before modeling them.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
