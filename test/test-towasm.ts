@@ -6166,6 +6166,24 @@ async function main() {
 		check('=== on a boxed any compares strings and numbers by value', r9.anyEq(), 2047);
 		check('=== on a boxed any: NaN, mixed kinds, undefined, objects, includes, switch', r9.anyEqEdges(), 2047);
 		check('indexOf/includes on a string array compare by value', r9.strIndexOf(), 11);
+
+		// type-utils.ts's `resolve`: `substituteType(t, new Map([[k, Literal(key)]]))`, then `isLiteral` guards.
+		const r10 = await compile(`
+			interface TM { string: string; number: number; boolean: boolean }
+			interface Lit<T> { type: 'literal'; value: T; frozen?: boolean }
+			interface Rf { type: 'ref'; name: string }
+			type Ty = Lit<string | number | boolean | null> | Rf;
+			function rf(name: string): Rf { return { type: 'ref', name }; }
+			function sub(m: Map<string, Ty>): number { const x = m.get('a'); return m.size * 10 + (x && x.type === 'ref' ? x.name.length : 0); }
+			export function mapArg(): number { const k = 'a'; return sub(new Map([[k, rf('xy')]])); }
+			export function mapDecl(): number { const k: string = 'a'; const m: Map<string, Ty> = new Map([[k, rf('xyz')]]); return sub(m); }
+			function lt(t: Lit<any>): keyof TM { return typeof t.value === 'string' ? 'string' : typeof t.value === 'number' ? 'number' : 'boolean'; }
+			function isL<K extends keyof TM>(t: Ty, k: K): t is Lit<TM[K]> { return t.type === 'literal' && lt(t) === k; }
+			function strOrNum(named: Ty): number { if (!isL(named, 'string') && !isL(named, 'number')) return -1; return String(named.value).length; }
+			export function guards(): number { return strOrNum({ type: 'literal', value: 'abc' }) * 100 + strOrNum({ type: 'literal', value: 12345 }) * 10 + strOrNum({ type: 'ref', name: 'x' }) + 1; }
+		`);
+		check('new Map([[k, v]]) built at the Map type it is headed for', r10.mapArg() * 100 + r10.mapDecl(), 1213);
+		check('a generic type guard narrows a wider member; its instantiations share one struct', r10.guards(), 350);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 

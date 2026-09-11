@@ -2669,7 +2669,25 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!ctx.stmtScope || !(T.isAny(base) || T.resolve(ctx.scope, base).type === 'union'))
 			return base;
 		const narrowed = checkerTypeOf(unwrapped, ctx.stmtScope);
-		return T.isAny(narrowed) ? base : narrowed;
+		return T.isAny(narrowed) ? base : backToDeclaredMembers(narrowed, base, ctx.scope);
+	}
+
+	// A guard can refine a union member past anything physical (`Lit<string>` out of `Lit<string | number>`),
+	// but a value's struct is fixed when it is built: each refined part maps back to the one member it came from.
+	function backToDeclaredMembers(narrowed: Type, base: Type, scope: Scope): Type {
+		const r = T.resolve(scope, base);
+		if (r.type !== 'union')
+			return narrowed;
+		const members	= T.unionMembers(r, scope);
+		const declared	= new Set(members.map(m => T.typeKey(m)));
+		const refined	= T.unionMembers(T.resolve(scope, narrowed), scope);
+		const parts		= refined.map(p => {
+			if (declared.has(T.typeKey(p)))
+				return p;
+			const from = members.filter(m => T.isAssignable(p, m, scope));
+			return from.length === 1 ? from[0] : p;
+		});
+		return parts.some((p, i) => p !== refined[i]) ? T.combineTypes(parts) : narrowed;
 	}
 
 	// Emit `fn` with `ctx.stmtScope` refined by `test` holding (or failing), for a ternary's or logical
@@ -2695,9 +2713,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// the contextual one filling an `any`, because for some real call site each is the only one that knows.
 	// Learning nothing from either deliberately falls through to `ensureClass`'s own "needs N explicit type
 	// argument(s)" throw, rather than silently building an `any`-typed instance.
-	function newTypeArgs(name: string, explicit: Type[] | undefined, e: Expr, ctx: FunctionContext): Type[] | undefined {
+	function newTypeArgs(name: string, explicit: Type[] | undefined, e: Expr, ctx: FunctionContext, want?: WasmType): Type[] | undefined {
 		if (explicit?.length)
 			return explicit;
+		// Headed for another instantiation of this same class (`Map<string, Ty>` from `[[k, lit]]`): build that
+		// one. Two instantiations are two different structs, so the checker's narrower answer could never convert.
+		const dest = typeof want === 'object' && 'ref' in want ? classes.get(want.ref)?.thisTsType : undefined;
+		if (dest?.type === 'ref' && dest.name === name && dest.typeArgs?.length)
+			return dest.typeArgs;
 		// Through a union, because an optional field's own read type is `C<...> | undefined` -- that still
 		// contextually types a `new C` written into it.
 		const argsFor = (t: Type | undefined): Type[] | undefined =>
@@ -6260,7 +6283,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					?? (e.callee.type === 'identifier' ? { name: e.callee.name, scope: ctx.scope } : undefined);
 				if (!target)
 					throw `'new' is only supported for a known class`;
-				const cls = ensureClass(target.name, newTypeArgs(target.name, e.typeArgs, e, ctx), target.scope);
+				const cls = ensureClass(target.name, newTypeArgs(target.name, e.typeArgs, e, ctx, want), target.scope);
 				if (!cls)
 					throw `'new' is only supported for a known class`;
 				const ctor = ensureCtor(cls, e.arguments, ctx);
@@ -8384,9 +8407,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return shared;
 		}
 		const info = buildObjectShape(key, resolved.members, ref, name, !everExtended.has(name));
-		if (info)
-			classes.set(structural, info);
+		classes.set(structural, info);
+		if (!typeArgs?.length)
+			return info;
+		// Two instantiations of one generic shape with the same physical layout (`Lit<any>`, `Lit<string | null>`)
+		// are one struct: a JS value has no type arguments, so TS lets either stand for the other.
+		const layout	= `${name}#${info.fields.map(f => `${f.name}${f.optional ? '?' : ''}:${wasmTypeKey(f.wtype)}`).join(',')}`;
+		const twin		= classes.get(layout);
+		if (!twin) {
+			classes.set(layout, info);
+		} else if (!types.slice(info.typeIndex + 1).some(t => mentionsTypeIndex(t, info.typeIndex))) {
+			classes.set(key, twin);
+			classes.set(structural, twin);
+			return twin;
+		}
 		return info;
+	}
+
+	function mentionsTypeIndex(t: wasm.SubType, index: number): boolean {
+		const comp = 'type' in t ? t.type : t;
+		const is = (v: unknown) => typeof v === 'object' && v !== null && 'ref' in v && (v as { ref: unknown }).ref === index;
+		return ('supertypes' in t && t.supertypes.includes(index))
+			|| (comp.kind === 'struct' ? comp.fields.some(f => is(f.type))
+			: comp.kind === 'array' ? is(comp.field.type)
+			: comp.kind === 'func' && (comp.params.some(p => is(p.type)) || comp.results.some(is)));
 	}
 
 	// An anonymous inline object-type annotation (`{value: T; consumed: number}` as a return/field/param
