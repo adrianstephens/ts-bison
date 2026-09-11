@@ -2626,6 +2626,12 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 				// Like a signature's: a module-private type named by a local (`let c: CacheFile`) must resolve where it was written.
 				if (d.typeAnnotation)
 					T.stampScope(d.typeAnnotation, scope);
+				// A block-scoped name is bound for its whole block, so a closure in its own initializer (`const f = (n): R => f(n - 1)`)
+				// reaches it, not a same-named outer binding: as its annotation, else a function expression's written signature, else
+				// `any`, as TS types a name read inside its own unannotated initializer. `hoistVar` then binds the real type.
+				if (typeof d.name === 'string' && d.init && !stmt.ambient)
+					scope.addValue(d.name, d.typeAnnotation ? T.resolve(scope, d.typeAnnotation)
+						: d.init.type === 'function' || d.init.type === 'arrow' ? { type: 'function', ...T.FixSig(d.init, T.ANY) } : T.ANY);
 				if (err && d.typeAnnotation && d.init) {
 					const anno = d.typeAnnotation;
 					// Widened until `let` assignment narrowing exists (inventory C1): a precise `let` union read later is only its declared type.
