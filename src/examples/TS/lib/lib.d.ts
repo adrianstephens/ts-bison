@@ -151,7 +151,11 @@ declare var Object: {
 	values<T>(x: T): any[];
 	keys<T>(x: T): string[];
 	is<A, B>(a: A, b: B): boolean;
-	assign<T>(target: T, ...sources: any[]): T;
+	// TS's own overloads (lib.es2015.core): the result carries every source's members.
+	assign<T extends {}, U>(target: T, source: U): T & U;
+	assign<T extends {}, U, V>(target: T, source1: U, source2: V): T & U & V;
+	assign<T extends {}, U, V, W>(target: T, source1: U, source2: V, source3: W): T & U & V & W;
+	assign(target: object, ...sources: any[]): any;
 	defineProperty<T>(target: T, key: PropertyKey, descriptor: PropertyDescriptor): T;
 };
 
