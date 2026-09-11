@@ -6114,6 +6114,31 @@ async function main() {
 			}
 		`);
 		check('Array.isArray: true for an array, false for a string/object/undefined', r7.isArr(), 1000);
+
+		// A method on a generic method's result (type-utils.ts's `resolvedParts.find`). A union receiver's `map`
+		// is two signatures differing only in their fresh `U`, or (mixed elements) is called on one combined array.
+		const r8 = await compile(`
+			interface Lit { type: 'lit'; v: number }
+			interface Inter { type: 'inter'; types: Ty[] }
+			type Ty = Lit | Inter;
+			function mixed(c: Ty): number {
+				const parts = c.type === 'inter' ? c.types : [c];
+				const hit = parts.map(m => m).find(m => m.type === 'lit');
+				return hit && hit.type === 'lit' ? hit.v : -1;
+			}
+			export function mixedUnion(): number { return mixed({ type: 'inter', types: [{ type: 'inter', types: [] }, { type: 'lit', v: 7 }] }) * 10 + mixed({ type: 'lit', v: 3 }); }
+			type TA = ['aa', number];
+			type TB = ['bb', string];
+			function tupleDisc(c: TA | TB): number { return c[0] === 'aa' ? c[1] : c[1].length; }
+			export function tupleUnion(): number { return tupleDisc(['aa', 5]) * 10 + tupleDisc(['bb', 'xyz']); }
+			function viaUnion(a: readonly number[] | number[]): number { const parts = a.map(x => x + 1); return parts.find(x => x > 2) ?? 0; }
+			function viaPlain(a: number[]): number { const parts = a.map(x => x * 10); return parts.find(x => x > 15) ?? 0; }
+			function strs(a: readonly string[] | string[]): number { const parts = a.map(s => s + '!'); return (parts.find(s => s.length > 3) ?? '').length; }
+			export function findOnMapped(): number { return viaUnion([1, 2, 3]) * 1000 + viaPlain([1, 2, 3]) * 10 + strs(['a', 'bb', 'ccc']); }
+		`);
+		check('a method on a .map() result, on a union and a plain receiver', r8.findOnMapped(), 3204);
+		check('a method on a union of arrays with different element types', r8.mixedUnion(), 73);
+		check('a union of tuples: a literal index reads per position and discriminates', r8.tupleUnion(), 53);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 

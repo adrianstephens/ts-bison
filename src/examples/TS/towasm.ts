@@ -2966,7 +2966,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// `Uint8Array`'s transiently-`i32` reads) -- with a raw array's own physical element kind as the
 			// next fallback, and the checker's type only as the last resort (a ref-kind element -- a class
 			// or `string` -- has no narrower physical kind than what the checker already gives it).
-			const t		= checkerTypeOf(unwrapAs(e), ctx.scope);
+			const t		= narrowedTypeOf(e, ctx);
 			const owner	= T.isAny(t) ? undefined : ownerFor(t);
 
 			const cls = classOfForIndexing(e.object, ctx);
@@ -2980,7 +2980,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (!T.isAny(t))
 				return { wtype: typeOf(t), owner };
 		}
-		const t = checkerTypeOf(unwrapAs(e), ctx.scope);
+		const t = narrowedTypeOf(e, ctx);
 		return { wtype: typeOf(t), owner: ownerFor(t) };
 	}
 
@@ -6776,7 +6776,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// it for the method body's own signature (the declaring class's own type, not any more
 						// specific receiver type the checker's own call-site inference might know about; this
 						// bypass path doesn't have that available, matching its existing generic-lib-method tradeoff).
-						const methodReturn = (methodOwner.decl.body.find(m => m.type === 'method' && m.key === methodName) as MethodMember)?.returnType;
+						const method		= methodOwner.decl.body.find(m => m.type === 'method' && m.key === methodName) as MethodMember | undefined;
+						// A return naming the method's OWN type parameter (`map<U>(...): U[]`) is only known from call-site inference.
+						const methodReturn	= method?.returnType && !method.typeParams?.some(p => T.mentionsTypeParam(method.returnType!, p.name)) ? method.returnType : undefined;
 						const substituted = methodReturn && T.substituteThisType(methodReturn, methodOwner.thisTsType);
 						tsType = substituted && calleeOptional ? T.combineTypes([substituted, T.UNDEFINED]) : substituted;
 					}
