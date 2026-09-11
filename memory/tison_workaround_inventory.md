@@ -37,7 +37,7 @@ Probe results: silent unless noted.
    `string|number`, calling an uncallable non-object all type `any` silently (checker 1436-1438, 1495-1498,
    1600-1603; type-utils 2093). Fix: three-valued lookup; primitives (via boxed), literals, unions (every
    member), class refs and functions are sealed.
-4. **Tagged templates** (checker 1963) only handle a bare function type: an overloaded tag -> any. Fix: route
+4. **DONE f6ed5bb.** **Tagged templates** (checker 1963) only handle a bare function type: an overloaded tag -> any. Fix: route
    through the call path with `(TemplateStringsArray, ...exprs)`.
 5. **DONE 3a99a0e.** **`yield` result** is always any (1979); `checkStmt` overwrites an annotated generator's
    `decl.returnType` with N forced to any. towasm dodges it twice (7904-7911 reads the hoisted snapshot;
@@ -59,6 +59,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
    return false here.
 2. Construct-only value called (checker 1597-1599): `C()` accepted. TS 2348.
 3. Overload no-fit -> WARNING, args unchecked (1628). TS 2769; needs exact overload resolution first.
+   (Overloaded class members no longer expose their implementation, 3f23a8a, so this now fires where TS errs.)
 4. isAssignable skips methods/call/index members (2087), function params (2070), missing returns (2069):
    `{ f() { return "x" } }` into `{ f(): number }` and `(x: number) => x` into `(x: string) => number`
    accepted. Fix: methods as function types (method bivariance), function-typed props contravariant.
@@ -93,6 +94,13 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - `?.` on a `never`/nullish-only receiver reports nothing (TS 2339 on never).
 - Object rest in a destructuring pattern binds `any` (bindPattern); an array-literal initializer gets no
   contextual type from its binding pattern (TS's implied type) -> GAPs on `var [x, [y]] = [1, ["a"]]`.
+- **Expando declared types**: a function's `f.p = v` declares `p` (94949aa) but the declared type -- the union of
+  ALL assignments, object literals normalized (`{x} | {y}` -> `{x, y?: undefined} | {y, x?: undefined}`) -- isn't
+  built, so `f.p` reads fall to B3's untyped absence and assignment narrowing is skipped for expandos.
+- arrayMethod's `map` model must stay until a type alias union (`Ty | Lit`) is flattened where towasm reads it;
+  removing it broke towasm. `reduce` is now TS's real three overloads (6ee71c9).
+- var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked.
+- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
   tests count as "clean"; difftest's TS side is transpile-only, so invalid-TS cases slipped in (3 fixed).
 
