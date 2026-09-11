@@ -432,7 +432,19 @@ export function ownScope(t: Type, scope: Scope) {
 // towasm.ts picking a value's wasm storage kind) have no such use for it: a frozen and non-frozen `'foo'`
 // still need the exact same physical representation, so those callers pass `true` to widen through it.
 // `shallow`: only the value's own literal (or union of them) widens, not literals nested in an array or object it holds.
+// Memoized per type object (and flags): a DAG rewritten once per node, not once per path.
+const widenCache = new Map<number, WeakMap<Type, Type>>();
 export function widenLiterals(t: Type, keepBoolean = false, ignoreFrozen = false, shallow = false): Type {
+	const flags = (keepBoolean ? 1 : 0) | (ignoreFrozen ? 2 : 0) | (shallow ? 4 : 0);
+	let cache = widenCache.get(flags);
+	if (!cache)
+		widenCache.set(flags, cache = new WeakMap());
+	let r = cache.get(t);
+	if (!r)
+		cache.set(t, r = widen(t, keepBoolean, ignoreFrozen, shallow));
+	return r;
+}
+function widen(t: Type, keepBoolean: boolean, ignoreFrozen: boolean, shallow: boolean): Type {
 	return	(t.type === 'literal' || t.type === 'range') && t.frozen && !ignoreFrozen ? t
 		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(literalType(t))
 		:	t.type === 'range' ? TS.RefType(t.base)
@@ -556,6 +568,27 @@ export function arrayUnionAsArray(t: Type, scope: Scope): TS.ArrayType | undefin
 	return TS.ArrayType(combineTypes(elements), readonly);
 }
 
+// A type is a DAG -- one subtree reached through many parents -- so a walk over it visits each node once, or its cost
+// is the number of paths, exponential in how deeply generic instantiations nest. For a search, a node seen before is no hit.
+function searchOnce<X extends object, P, R>(on: (x: X, process: P, recurse: R) => boolean) {
+	const seen = new Set<X>();
+	return (x: X, process: P, recurse: R) => {
+		if (seen.has(x))
+			return false;
+		seen.add(x);
+		return on(x, process, recurse);
+	};
+}
+// For a rewrite, a node seen before maps to what it mapped to, which also keeps the shared subtree shared in the result.
+function rewriteOnce<X extends object, P, R>(on: (x: X, process: P, recurse: R) => X | undefined) {
+	const done = new Map<X, X | undefined>();
+	return (x: X, process: P, recurse: R) => {
+		if (!done.has(x))
+			done.set(x, on(x, process, recurse));
+		return done.get(x);
+	};
+}
+
 // Chained generic method calls (a builder returning `TableBuilder<T & X>`, called repeatedly) each
 // substitute the *previous* call's own already-substituted return type back in as `T` -- without sharing,
 // every step embeds a full fresh copy of everything before it, so the resulting type's own node count
@@ -605,7 +638,7 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 
 	function uncached(): Type {
 		return walk(t, undefined, undefined,
-			(x, process) => {
+			rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) => {
 				if (x.type === 'ref' && !x.typeArgs && map.has(x.name))
 					return map.get(x.name);
 				if (x.type === 'function' || x.type === 'constructor') {
@@ -615,12 +648,12 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 						return shadowed;
 				}
 				return process(x);
-			},
+			}),
 			// An interface/class method's own generic signature (`Array<T>.map<U>`) is a `TypeMember` node
 			// (`method`/`call`/`construct`), not a `Type` one -- `avoidCapture` needs the same treatment here,
 			// or a method's own type parameter only gets capture-avoidance when it's reachable through a bare
 			// `function`/`constructor` type, missing every interface/class member signature (the common case).
-			(m, process) => {
+			rewriteOnce((m: TS.TypeMember, process: <T extends TS.TypeMember>(x: T) => T) => {
 				if (m.type === 'method' || m.type === 'call' || m.type === 'construct') {
 					m = { ...m, ...avoidCapture(m, map) };
 					const shadowed = substituteShadowed(m, map);
@@ -628,7 +661,7 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 						return shadowed;
 				}
 				return process(m);
-			}
+			})
 		) ?? t;
 	}
 }
@@ -648,19 +681,29 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 // first means a type with no 'this' anywhere -- the overwhelming majority -- comes back as the exact
 // same object, no rebuild, and every object-identity-keyed cache downstream keeps working normally.
 function containsThis(t: Type): boolean {
-	return walkB(t, undefined, undefined, (x, process) => x.type === 'this' || process(x));
+	return walkB(t, undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'this' || process(x)));
 }
 
 export function substituteThisType(t: Type, thisType: Type): Type {
-	return containsThis(t) ? walk(t, undefined, undefined, (x, process) =>
+	return containsThis(t) ? walk(t, undefined, undefined, rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) =>
 		x.type === 'this' ? thisType : process(x)
-	) ?? t : t;
+	)) ?? t : t;
 }
 
 // Whether `name` occurs somewhere `inferTypeArgs` would actually descend into -- tells "no argument could ever determine
 // this" apart from "an argument should have but didn't" (a real gap). Mirrors `inferTypeArgs`'s recursion shape, not a blanket walk.
+const mentionsCache = new WeakMap<Type, Map<string, boolean>>();
 export function mentionsTypeParam(t: Type, name: string): boolean {
-	return walkB(t, undefined, undefined, (t, process, recurse) => {
+	let byName = mentionsCache.get(t);
+	if (!byName)
+		mentionsCache.set(t, byName = new Map());
+	let r = byName.get(name);
+	if (r === undefined)
+		byName.set(name, r = mentions(t, name));
+	return r;
+}
+function mentions(t: Type, name: string): boolean {
+	return walkB(t, undefined, undefined, searchOnce((t: Type, process: (x: Type) => boolean, recurse: (x: Type | undefined) => boolean) => {
 		switch (t.type) {
 			case 'ref':				return t.typeArgs ? process(t) : t.name === name;
 			case 'function':
@@ -676,11 +719,11 @@ export function mentionsTypeParam(t: Type, name: string): boolean {
 			// `keyof`/`indexed_access`/`mapped`/`typeof`/`this`/`template_literal`/`infer`: not positions `inferTypeArgs` inverts.
 			default:				return false;
 		}
-	});
+	}));
 }
 
 function containsInfer(t: Type): boolean {
-	return walkB(t, undefined, undefined, (x, process) => x.type === 'infer' || process(x));
+	return walkB(t, undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'infer' || process(x)));
 }
 
 // An un-annotated parameter's type, inferred from its default. Widened, matching both real TS
@@ -880,7 +923,7 @@ function findTypeMember(members: TS.TypeMember[], key: string): TS.TypeMember & 
 // registers them, not permanently baked to the hoisting pass's outer scope.
 export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<string>): T {
 	walkB(t, undefined, undefined,
-		(x, process) => {
+		searchOnce((x: Type, process: (x: Type) => boolean) => {
 			// Primitives resolve the same everywhere -- stamping them would only add dead weight and dedup-key noise for no gain.
 			if (x.type === 'ref') {
 				if (!x.declScope && !ALL_PRIMITIVES.has(x.name) && !exclude?.has(x.name))
@@ -895,12 +938,12 @@ export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<str
 				x.declScope ??= scope;
 			}
 			return process(x);
-		},
-		(m, process) => {
+		}),
+		searchOnce((m: TS.TypeMember | TS.ClassMember, process: (x: TS.TypeMember | TS.ClassMember) => boolean) => {
 			if (m.type === 'method' || m.type === 'call' || m.type === 'construct')
 				m.declScope ??= scope;
 			return process(m);
-		}
+		})
 	);
 	return t;
 }
