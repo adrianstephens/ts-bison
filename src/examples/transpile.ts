@@ -26,7 +26,8 @@ function reverse<X extends string, Y extends string>(map: Partial<Record<X, Y>>)
 // ===================================================================
 //  PoC: TypeScript AST -> Python AST -> TypeScript source.
 // ===================================================================
-// [~] operator spelling
+// [=] both parsers spell every one of these operators the same way now (py-parser stores
+// `and`/`or`/`not` as `&&`/`||`/`!`); the map's job is just to say which ops carry across.
 const BINARY: Partial<Record<JS.binaryOps, PY.binaryOps>> = {
 	'+':	'+',
 	'-':	'-',
@@ -39,15 +40,15 @@ const BINARY: Partial<Record<JS.binaryOps, PY.binaryOps>> = {
 	'^':	'^',
 	'<<':	'<<',
 	'>>':	'>>',
-	'&&':	'and',
-	'||':	'or',
+	'&&':	'&&',
+	'||':	'||',
 };
 
 const UNARY: Partial<Record<JS.unaryOps, PY.unaryOps>> = {
 	'-':	'-',
 	'+':	'+',
 	'~':	'~',
-	'!':	'not'
+	'!':	'!'
 };
 
 const isJSVarDecl	= (x: JS.ForInit<TS.Type>): x is JS.VarDecl<TS.Type> => x.type === 'var_decl';
@@ -186,7 +187,7 @@ function TS2PY(ts: Module<TS.Stmt>) {
 			return { type: 'assign', targets: [expr(e.target)], value: expr(e.value) };
 		const op = BINARY[e.operator];
 		// `&&=`/`||=`/`??=` short-circuit, so they are NOT `x = x and y` -- left unsupported rather than wrong
-		return op && op !== 'and' && op !== 'or'
+		return op && op !== '&&' && op !== '||'
 			? { type: 'augassign', target: expr(e.target), op: op + '=', value: expr(e.value) }
 			: pyUnsupported(`compound assignment '${e.operator}='`);
 	}
@@ -219,7 +220,7 @@ function TS2PY(ts: Module<TS.Stmt>) {
 				] :	pyUnsupported(`for kind '${s.kind}'`);
 
 			// [~] do-while -> while True with a trailing guard
-			case 'do_while':	return [While(Literal(true), [...body(s.body), If(Unary('not', expr(s.test)), [{ type: 'break' }], [])])];
+			case 'do_while':	return [While(Literal(true), [...body(s.body), If(Unary('!', expr(s.test)), [{ type: 'break' }], [])])];
 
 			// [=] try converged in an earlier commit: same body/handlers[]/finalizer
 			case 'try':			return [{
@@ -326,7 +327,7 @@ class PYScopes {
 function PY2TS(py: Module<PY.Stmt>) {
 
 	//const PY_COMPARE1 = reverse(COMPARE);
-	const PY_COMPARE: Partial<Record<PY.compareOps, JS.compareOps>> = {
+	const COMPARE: Partial<Record<PY.compareOps, JS.compareOps>> = {
 		'<':	'<',
 		'>':	'>',
 		'<=':	'<=',
@@ -337,7 +338,7 @@ function PY2TS(py: Module<PY.Stmt>) {
 		'is':	'===',
 		'is not': '!==',
 	};
-	const PY_TSTYPE: Record<string, string> = {
+	const TYPE: Record<string, string> = {
 		float:	'number',
 		int:	'number',
 		str:	'string',
@@ -361,7 +362,7 @@ function PY2TS(py: Module<PY.Stmt>) {
 			return Unary('!', Binary('in', left, right));
 		if (op === 'in')
 			return Binary('in', left, right);
-		const m = PY_COMPARE[op];
+		const m = COMPARE[op];
 		return m ? Binary(m, left, right) : tsUnsupported(`comparison '${op}'`);
 	}
 
@@ -373,7 +374,7 @@ function PY2TS(py: Module<PY.Stmt>) {
 		if (t.type === 'literal' && t.value === null)
 			return { type: 'ref', name: 'null' };
 		if (t.type === 'identifier')
-			return { type: 'ref', name: PY_TSTYPE[t.name] ?? t.name };
+			return { type: 'ref', name: TYPE[t.name] ?? t.name };
 		if (t.type === 'index') {
 			const base = t.object.type === 'identifier' ? t.object.name : undefined;
 			const args = t.index.type === 'tuple' ? t.index.elements : [t.index];
@@ -1437,16 +1438,13 @@ function PY2CPP(py: Module<PY.Stmt>) {
 
 			case 'unary': {
 				const op = e.operator;
-				return	op === '+' || op === '-' || op === '~'	? Unary(op, expr(e.operand))
-					:	op === 'not'						? Unary('!', expr(e.operand))
+				return	op === '+' || op === '-' || op === '~' || op === '!'	? Unary(op, expr(e.operand))
 					:	cppUnsupported(`unary '${op}'`);
 			}
 			// [~] Python has no `//`/`@`; a floor-div/matrix-mul call would need a real numeric library, so left unsupported
 			case 'binary': {
 				const op = e.operator;
-				return	op === 'and'	? Binary('&&', expr(e.left), expr(e.right))
-					:	op === 'or'		? Binary('||', expr(e.left), expr(e.right))
-					:	op === '//' || op === '@'	? cppUnsupported(`'${op}' operator`)
+				return	op === '//' || op === '@'	? cppUnsupported(`'${op}' operator`)
 					:	Binary(op as C.binaryOps, expr(e.left), expr(e.right));
 			}
 			// [~] a chained comparison (`a < b < c`) has no single-expression C++ form without a temporary this level can't introduce

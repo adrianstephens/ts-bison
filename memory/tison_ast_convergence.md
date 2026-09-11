@@ -112,6 +112,15 @@ the message TEXT (line numbers shift and make a line-keyed diff useless), e.g.
 **Gate used:** `tison/assistant/ast-gate.sh` (gitignored) — tsc for src/examples and test/, then
 js/ts/py/c parser suites, towasm, vsdg, and the cpp corpus count.
 
+**Operator-spelling convergence extended to `and`/`or`/`not` (2026-09-10).** py-parser's `Binary`/
+`Unary` nodes now store Python's `and`/`or`/`not` as the common `&&`/`||`/`!` spellings (matching
+js-parser/c-parser), not the Python keywords — `binaryOps`/`unaryOps` in py-parser.ts changed
+accordingly. `tocode.ts` and `walker.ts` (constant folding) updated to match, and `tocode.ts`'s
+printer maps `&&`/`||` back to the word forms with hard-coded surrounding spaces (word operators
+need spaces regardless of the `spaceAroundOps` option). `transpile.ts`'s `BINARY`/`UNARY` operator
+maps (JS<->PY) became identity for these three entries as a result — kept as-is since they still
+gate which operators carry across, just no longer translate spelling for these ops.
+
 **Known pre-existing gaps found while probing, all unrelated and left alone:** plain `c-parser` has
 no zero-argument *call* rule (`f()` as an expression doesn't parse; only cpp-parser adds it);
 `CPP/tocode.ts` has no case for cpp's `decl_condition` (`if (int v = x)`); `catch (...)` isn't in the

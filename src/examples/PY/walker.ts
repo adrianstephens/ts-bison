@@ -46,7 +46,7 @@ export type Walkable = Walkable0 | Module<PY.Stmt> | Stmt[];
 
 export function calcUnary(op: PY.unaryOps, x: unknown) {
 	switch (op) {
-		case 'not':	return !x;
+		case '!':	return !x;
 		case '+':	return typeof x === 'number' || typeof x === 'bigint' ? x : undefined;
 		case '-':	return typeof x === 'number' ? -x : typeof x === 'bigint' ? -x : undefined;
 		case '~':	return typeof x === 'bigint' ? ~x : Number.isInteger(x) ? ~(x as number) : undefined;
@@ -60,9 +60,9 @@ const backToNum = (n: bigint) => n >= BigInt(Number.MIN_SAFE_INTEGER) && n <= Bi
 
 export function calcBinary(op: PY.binaryOps, a: unknown, b: unknown): unknown {
 	// `and`/`or` yield an operand (not a bool) in Python -- JS `&&`/`||` do the same.
-	if (op === 'and')
+	if (op === '&&')
 		return a && b;
-	if (op === 'or')
+	if (op === '||')
 		return a || b;
 
 	if (op === '&' || op === '|' || op === '^' || op === '<<' || op === '>>') {

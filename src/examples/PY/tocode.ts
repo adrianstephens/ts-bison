@@ -24,8 +24,8 @@ const LAMBDA = 1, TERNARY = 2, OR = 3, AND = 4, NOT = 5, COMPARE = 6, BOR = 7;
 const BXOR = 8, BAND = 9, SHIFT = 10, ADD = 11, MUL = 12, UNARY = 13, POW = 14, AWAIT = 15, POSTFIX = 16, ATOM = 17;
 
 const BINARY_PREC: Record<string, number> = {
-	or: 	OR,
-	and: 	AND,
+	'||':	OR,
+	'&&':	AND,
 	'|': 	BOR,
 	'^': 	BXOR,
 	'&': 	BAND,
@@ -49,7 +49,7 @@ function exprPrecedence(e: Expr): number {
 		case 'conditional':		return TERNARY;
 		case 'binary':			return BINARY_PREC[e.operator] ?? ATOM;
 		case 'compare':			return COMPARE;
-		case 'unary':			return e.operator === 'not' ? NOT : UNARY;
+		case 'unary':			return e.operator === '!' ? NOT : UNARY;
 		case 'spread':			return UNARY;
 		case 'await':			return AWAIT;
 		case 'call':
@@ -261,11 +261,12 @@ export class Output {
 					: String(e.value);
 			case 'imaginary':		return String(e.value) + 'j';
 			case 'ellipsis':		return '...';
-			case 'unary':			return e.operator === 'not' ? 'not ' + this.expr(e.operand, NOT) : e.operator + this.expr(e.operand, UNARY);
+			case 'unary':			return e.operator === '!' ? 'not ' + this.expr(e.operand, NOT) : e.operator + this.expr(e.operand, UNARY);
 			case 'binary': {
 				const prec = BINARY_PREC[e.operator] ?? ATOM;
 				const rightAssoc = e.operator === '**';
-				return this.expr(e.left, rightAssoc ? prec + 1 : prec) + this.op(e.operator) + this.expr(e.right, rightAssoc ? prec : prec + 1);
+				const opStr = e.operator === '&&' ? ' and ' : e.operator === '||' ? ' or ' : this.op(e.operator);
+				return this.expr(e.left, rightAssoc ? prec + 1 : prec) + opStr + this.expr(e.right, rightAssoc ? prec : prec + 1);
 			}
 			case 'compare':			return this.expr(e.left, BOR)
 				+ e.ops.map((o, i) => ' ' + o + ' ' + this.expr(e.comparators[i], BOR)).join('');

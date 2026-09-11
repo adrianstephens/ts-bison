@@ -32,8 +32,10 @@ import type * as Common from '../common';
 //
 // Leaf expression nodes are the shared `../common` shapes (`Identifier`, `Literal`, `Unary`,
 // `Binary`) -- the same vocabulary c-parser.ts and js-parser.ts emit -- so a single walker /
-// analysis / codegen pass can span all three. `and`/`or` are nested `Binary`; only chained
-// comparison keeps a Python-specific `Compare` node (CPython's AST does the same).
+// analysis / codegen pass can span all three. `and`/`or`/`not` are nested `Unary`/`Binary`
+// carrying the common `!`/`&&`/`||` operator spellings (not the Python keywords) so all three
+// parsers' operator sets line up; only chained comparison keeps a Python-specific `Compare` node
+// (CPython's AST does the same).
 //
 // Known simplifications:
 //   * `match`/`case`/`type` are ordinary identifiers (no soft keywords).
@@ -199,15 +201,15 @@ const BANG			= terminal('!', /!/);
 // js-parser.ts build -- so cross-language tooling sees one vocabulary:
 //   `Identifier`  { type:'identifier', name }
 //   `Literal<T>`  { type:'literal', value }   -- numbers, strings (raw, not unescaped), True/False/None
-//   `Unary`       { type:'unary', operator, operand }
-//   `Binary`      { type:'binary', operator, left, right }   -- includes `and`/`or`, nested left-assoc
+//   `Unary`       { type:'unary', operator, operand }   -- `not` stored as `!`
+//   `Binary`      { type:'binary', operator, left, right }   -- `and`/`or` stored as `&&`/`||`, nested left-assoc
 // Chained comparison genuinely has no `Binary` form, so `Compare` stays its own node (CPython's AST
 // likewise never emits a comparison as a plain binary op).
-export type unaryOps	= '+' | '-' | '~' | 'not';
+export type unaryOps	= '+' | '-' | '~' | '!';
 export type binaryOps	=
 	| '+' | '-' | '*' | '/' | '//' | '%' | '@' | '**'
 	| '&' | '|' | '^' | '<<' | '>>'
-	| 'and' | 'or';
+	| '&&' | '||';
 export type compareOps	= '<' | '>' | '<=' | '>=' | '==' | '!=' | '<>' | 'in' | 'not in' | 'is' | 'is not';
 
 export interface Imaginary	{ type: 'imaginary'; value: number }
@@ -550,17 +552,17 @@ comparison = Rules<Expr>(self => [
 ]),
 not_test = Rules<Expr>(self => [
 	comparison,
-	Rule(['not', self],		$ => PyUnary('not', $[1])),
+	Rule(['not', self],		$ => PyUnary('!', $[1])),
 ]),
 and_test = Rules<Expr>(self => [
 	not_test,
-	Rule([self, 'and', not_test],	$ => PyBinary('and', $[0], $[2])),
+	Rule([self, 'and', not_test],	$ => PyBinary('&&', $[0], $[2])),
 ]),
 // `or_test` is the top of the cascade -- it stops short of the ternary and `lambda` (which `test`
 // adds) so `x for x in xs if cond` stays unambiguous.
 or_test = Rules<Expr>(self => [
 	and_test,
-	Rule([self, 'or', and_test],	$ => PyBinary('or', $[0], $[2])),
+	Rule([self, 'or', and_test],	$ => PyBinary('||', $[0], $[2])),
 ]),
 
 test = Rules<Expr>(self => [
