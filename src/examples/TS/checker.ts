@@ -110,6 +110,23 @@ function alwaysExits(stmt: Stmt): boolean {
 	}
 }
 
+// Control never reaches the end of a function body ending with `stmt`: every path returns or throws (TS's unreachable end point,
+// which alone adds an implicit `undefined` return).
+function endsFunction(stmt: Stmt | undefined): boolean {
+	if (!stmt)
+		return false;
+	switch (stmt.type) {
+		case 'return':
+		case 'throw':	return true;
+		case 'block':	return endsFunction(stmt.body[stmt.body.length - 1]);
+		case 'if':		return !!stmt.alternate && endsFunction(stmt.consequent) && endsFunction(stmt.alternate);
+		case 'try':		return !!stmt.finalizer && endsFunction(stmt.finalizer[stmt.finalizer.length - 1])
+							|| endsFunction(stmt.body[stmt.body.length - 1]) && stmt.handlers.every(h => endsFunction(h.body[h.body.length - 1]));
+		case 'switch':	return stmt.cases.some(c => !c.test) && clausesNeverFallOut(stmt);
+		default:		return false;
+	}
+}
+
 // Conservative "this statement never falls through" -- powers guard-clause narrowing
 function alwaysReturns(stmt: JS.Stmt<any> | undefined): boolean {
 	if (!stmt)
@@ -2481,7 +2498,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 
 			const retDef		= returns.map(r => r.type).filter(r => !!r);
 
-			if (retDef.length && (retDef.length < returns.length || !alwaysReturns(body[body.length - 1]))) {
+			if (retDef.length && (retDef.length < returns.length || !endsFunction(body[body.length - 1]))) {
 				retDef.push(T.UNDEFINED);
 				/*returns.forEach(r => {
 					if (!r.s.argument)
