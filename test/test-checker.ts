@@ -88,6 +88,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['an assignment narrows as its target',	'declare function next(): string | null; let s; while ((s = next()) !== null) { const n: string = s; } let t: string | null; if (typeof (t = next()) === "string") { const w: string = t; }', []],
 	['names never reach Object.prototype',	'declare const v: constructor; const n = v.solutionRead; declare const w: toString | number; const m = w.valueOf;', []],
 	['a function type inside call type arguments', 'declare function g<T>(x?: T): T; const r: number = g<() => string>();', [NOT_ASSIGNABLE('() => string', 'number')]],
+	['null stands aside for the supertype',	'declare function g<T>(a: T, b: T): T; const s: boolean = g(1, null); declare function f<U>(x: U[]): U; declare const b: boolean; const r = f(b ? [1] : [undefined]); const q: boolean = r;', [NOT_ASSIGNABLE('number | null', 'boolean'), NOT_ASSIGNABLE('number | undefined', 'boolean')]],
 	['reduce with and without a seed',		'const r: string = [1, 2].reduce((a, v) => a + v, ""); const s: boolean = [1, 2].reduce((a, v) => a + v);', [NOT_ASSIGNABLE('number', 'boolean')]],
 	['functions have Function members',		'function f(a: number) {} f.call(null, 1); const n: string = f.length;',					[NOT_ASSIGNABLE('number', 'string')]],
 	['an expando assignment declares, not narrows', 'const E = function () {}; E.prop = { x: 2 }; E.prop = { y: "" }; const n = E.prop.x || 0;', []],

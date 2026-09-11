@@ -2364,9 +2364,13 @@ export function chooseInference(co: Type[], contra: Type[], scope: Scope, fromLi
 	if (co.length) {
 		const members	= co.flatMap(t => unionMembers(t, scope).map(m => resolveOwn(m, scope)));
 		const base		= (m: Type) => m.type === 'literal' ? literalType(m) : undefined;
-		return members.every(m => base(m) !== undefined && base(m) === base(members[0]))
-			? combineTypes(co)
-			: co.reduce((s, t) => s !== t && isAssignable(s, t, scope) ? t : s);
+		if (members.every(m => base(m) !== undefined && base(m) === base(members[0])))
+			return combineTypes(co);
+		// TS's getCommonSupertype: with strictNullChecks, `null`/`undefined` stand aside while the supertype is chosen, then join it.
+		const nullish	= scope.strictNullChecks() ? members.filter(m => isNullish(m, scope)) : [];
+		const primary	= nullish.length ? co.map(t => combineTypes(unionMembers(t, scope).filter(m => !isNullish(m, scope)))).filter(t => !isRef(t, 'never')) : co;
+		const supertype	= primary.length ? primary.reduce((s, t) => s !== t && isAssignable(s, t, scope) ? t : s) : NEVER;
+		return nullish.length ? combineTypes([supertype, ...nullish]) : supertype;
 	}
 	return contra.length ? contra.reduce((s, t) => s !== t && isAssignable(t, s, scope) ? t : s) : undefined;
 }
