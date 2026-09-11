@@ -1234,8 +1234,12 @@ function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: E
 	const narrowed	= (e: Expr | undefined) => { const k = e && T.pathKey(e); return k ? scope.value(k) : undefined; };
 	const correlate	= constant && r.type === 'union' && !!source && T.pathKey(source) !== undefined;
 	if (target.type === 'array_pattern') {
-		const elem	= r.type === 'tuple' ? undefined : iterationOrReport(t, scope, getPos(target)!, err).yield;
-		const at	= (i: number) => r.type === 'tuple' ? T.tupleElementType(r.elements[i]) ?? T.ANY : elem!;
+		// Each member answers for itself, as TS destructures a union: a tuple's own position, anything else its iterated element.
+		// Iterated once per member, so a non-iterable one is reported once, not once per position.
+		const members	= T.unionMembers(r, scope).map(m => T.resolveOwn(m, scope));
+		const elems		= members.map(m => m.type === 'tuple' ? undefined : iterationOrReport(m, scope, getPos(target)!, err).yield);
+		const at		= (i: number) => T.combineTypes(members.map((m, j) => m.type === 'tuple' ? T.tupleElementType(m.elements[i]) ?? T.ANY : elems[j]!));
+		const restOf	= (m: Type, j: number) => m.type === 'tuple' ? T.combineTypes(m.elements.slice(target.elements.length).map(el => T.tupleElementType(el) ?? T.ANY)) : elems[j]!;
 		target.elements.forEach((el, i) => {
 			const sub	= el && source ? { type: 'index', object: source, index: { type: 'literal', value: i } } as Expr : undefined;
 			const et	= el && (narrowed(sub) ?? at(i));
@@ -1243,9 +1247,7 @@ function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: E
 				bindPattern(scope, el.target, el.default ? T.nonNullable(et!, scope) : et!, sub, constant, err);
 		});
 		if (target.rest)
-			bindPattern(scope, target.rest, TS.ArrayType(r.type === 'tuple'
-				? T.combineTypes(r.elements.slice(target.elements.length).map(el => T.tupleElementType(el) ?? T.ANY))
-				: elem!), undefined, false, err);
+			bindPattern(scope, target.rest, TS.ArrayType(T.combineTypes(members.map(restOf))), undefined, false, err);
 	} else {
 		for (const p of target.properties) {
 			const sub	= typeof p.key === 'string' && source ? { type: 'member', object: source, property: p.key } as Expr : undefined;
