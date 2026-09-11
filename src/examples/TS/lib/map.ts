@@ -14,7 +14,7 @@ class Map<K, V> {
 	private keys_: K[] = [];
 	private values_: V[] = [];
 
-	constructor(entries: [K, V][] = []) {
+	constructor(entries: readonly (readonly [K, V])[] = []) {
 		const n = entries.length;
 		for (let i = 0; i < n; i++)
 			this.set(entries[i][0], entries[i][1]);
@@ -90,7 +90,7 @@ class Map<K, V> {
 class Set<T> {
 	private items_: T[] = [];
 
-	constructor(values: T[] = []) {
+	constructor(values: readonly T[] = []) {
 		const n = values.length;
 		for (let i = 0; i < n; i++)
 			this.add(values[i]);
@@ -154,7 +154,7 @@ class Set<T> {
 class WeakMap<K, V> {
 	private map_: Map<K, V>;
 
-	constructor(entries: [K, V][] = []) {
+	constructor(entries: readonly (readonly [K, V])[] = []) {
 		this.map_ = new Map<K, V>(entries);
 	}
 
