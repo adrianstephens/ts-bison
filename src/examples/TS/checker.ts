@@ -1979,7 +1979,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// TBD: check if callee if pure
 
 					if (err && !argTs.some(t => t === undefined)) {	// no spread args
-						const required	= params.filter(p => !hasMod(p, 'optional')).length;
+						// TS's minimum argument count runs through the last required parameter -- and in an immediately-invoked function
+						// expression, an unannotated parameter no argument reaches is optional.
+						const iife		= e.type === 'call' && (e.callee.type === 'function' || e.callee.type === 'arrow') ? e.callee : undefined;
+						const required	= params.reduce((n, p, i) => hasMod(p, 'optional') || (iife && i >= argTs.length && !iife.params[i]?.typeAnnotation) ? n : i + 1, 0);
 						const max		= sig.rest ? Infinity : params.length;
 						if (argTs.length < required || argTs.length > max)
 							err(SEVERITY.ERROR, pos)`Expected ${required === max ? required : required + '-' + (max === Infinity ? 'more' : max)} arguments, but got ${argTs.length} in '${e}'`;
