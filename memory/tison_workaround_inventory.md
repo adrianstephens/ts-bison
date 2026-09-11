@@ -39,7 +39,7 @@ Probe results: silent unless noted.
    member), class refs and functions are sealed.
 4. **Tagged templates** (checker 1963) only handle a bare function type: an overloaded tag -> any. Fix: route
    through the call path with `(TemplateStringsArray, ...exprs)`.
-5. **`yield` result** is always any (1979); `checkStmt` overwrites an annotated generator's
+5. **DONE 3a99a0e.** **`yield` result** is always any (1979); `checkStmt` overwrites an annotated generator's
    `decl.returnType` with N forced to any. towasm dodges it twice (7904-7911 reads the hoisted snapshot;
    7951-7957 passes N separately). Fix: `yield` types as the declared TNext; never overwrite an annotated
    return type; delete both towasm dodges.
@@ -62,13 +62,17 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 4. isAssignable skips methods/call/index members (2087), function params (2070), missing returns (2069):
    `{ f() { return "x" } }` into `{ f(): number }` and `(x: number) => x` into `(x: string) => number`
    accepted. Fix: methods as function types (method bivariance), function-typed props contravariant.
-5. isAssignable passes any unresolved/nominal ref (1995-1996, 2080, 2123, 2132): unrelated classes
+5. **MOSTLY DONE 86ea3d8** (class refs compared by members; truly unresolved names still pass; a type-parameter
+   DESTINATION is still checked through its constraint -- TS keeps T opaque; variadicTuples1 lost 5 real errors).
+   isAssignable passes any unresolved/nominal ref (1995-1996, 2080, 2123, 2132): unrelated classes
    `const x: A = new B()` accepted. Fix: classes compare structurally (+ private/protected nominality);
    an unresolvable name is a TS 2304 at its reference, so no downstream leniency is needed.
 6. narrowByDiscriminant keeps a member on an unresolvable discriminant (599, 617) -- falls out of B3.
 
 ## D. towasm-specific
-1. `resolveOverload` (towasm 8347) re-resolves overloads itself, with an exact-match tie-break justified by
+1. **RESOLVED 86ea3d8 differently**: multi-body overloads exist only in towasm's bundled lib, where the checker picks
+   AMBIENT signatures with no body, so a chosen-overload stamp cannot apply; the tie-break is gone (first-fit,
+   the checker's rule). `resolveOverload` (towasm 8347) re-resolves overloads itself, with an exact-match tie-break justified by
    `ArrayBuffer -> number[]` being assignable -- the checker now rejects that. Fix: the checker stamps its
    chosen signature on the call node (like `contextualType`); towasm reads it. One source of truth.
 2. `as unknown as` casts (2141, 2880, 8881, 9910) and `new TSWError(e as any, ...)` (catch var): widen the
@@ -79,7 +83,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - Class methods/getters typed `any` at every call until checked -- FIXED a229210 (`lazyReturnType`).
 - strictNullChecks-off mode -- DONE bf4c532. Enum member types, unit narrowing, discriminated
   assignability, const assignment narrowing -- DONE f774537. typeof result sets, clause exclusion -- 27d98c9.
-- **Generic call inference is implemented TWICE** (checker `instantiate`, towasm `inferTypeArgMap`), both
+- **DONE e43c96c/227a0c2** (`T.Inference`, shared). **Generic call inference is implemented TWICE** (checker `instantiate`, towasm `inferTypeArgMap`), both
   first-wins. TS: covariant candidates -> common supertype (`getSupertypeOrUnion`: same-base literals
   UNION), contravariant (callback param positions) only when no covariant, and type params FIXED as each
   context-sensitive callback is typed, left to right. Needs ONE shared implementation with polarity.
