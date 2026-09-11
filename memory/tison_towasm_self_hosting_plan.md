@@ -232,6 +232,24 @@ STATEMENT before `checkFunctionBody` runs, and that is the same property as `fn.
 (the lib's too) skipped every top-level function body as "already walked". "Walked" is now read off the
 body's first statement. Corpus: GAP -3, nothing else moved. Local `var_decl` annotations are stamped too.
 
+## NEXT (diagnosed 2026-09-11, not started): the object-literal row (25) is MISSING CONTEXT, not a shape gap
+
+First site, ts-parser.ts:599, `parameter_clause.push(Rule([...], $ => ({ ...$[0], returnType: $[2] } as const)))`:
+the literal is a callback's return with `want` = boxed `any` and NO `ctx.contextualReturn`, so
+`matchObjectShape` sees several fits (`CallSig<any>` plus all-optional `Partial<...>` shapes) and refuses to
+guess -- rightly: a heuristic tiebreak (e.g. prefer non-"weak" types) would build a struct the consumer may
+not cast to. Context is dropped at two hops; thread it with `withContext`, as fields/array elements/lazy
+globals already are:
+1. `emitCallArgs`: each argument should get its parameter's TS type as context (a rest arg: the element).
+   Then `Rule(...)` inside `push(...)` sees `Rule<CallSig>`, and `inferTypeArgMap`'s `expected` binds `T`
+   before the deferred callback-return inference can bind it to the literal's own type.
+2. A closure literal whose context is a function type should give its `return`s / concise body that
+   type's `returnType` as context (`emitClosureLiteral`, towasm.ts ~4644; `case 'return'` ~6965).
+NOTE: the lazy checker-call-type fallback (`() => checkerTypeOf(e, ctx.scope)`) does NOT help here -- the
+checker types the call in isolation, without push's expected type, so it too answers `Rule<{literal}>`.
+Second site, type-utils.ts:448 (`freeze`): `{ ...t, frozen: true }` with `t: Literal | RangeType` -- a
+spread of a UNION needs a runtime `ref.test` cascade building each member's struct. A separate feature.
+
 ## The `Parser<any> -> Parser<{...}>` row (22 decls) -- one root, partly characterised
 
 21 of the 22 are tiny towasm.ts helpers: towasm.ts imports ts-parser.ts, whose module-level
