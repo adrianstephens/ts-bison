@@ -103,7 +103,64 @@ export function basename(p: string, ext: string = ''): string {
 export function extname(p: string): string {
 	const base = basename(p);
 	const i = base.lastIndexOf('.');
-	return i <= 0 ? '' : base.slice(i);
+	return i <= 0 || base === '..' ? '' : base.slice(i);
+}
+
+export const delimiter = ':';
+
+export function isAbsolute(p: string): boolean {
+	return p.length > 0 && p.charCodeAt(0) === 47;
+}
+
+export function normalize(p: string): string {
+	if (p.length === 0)
+		return '.';
+	const absolute = p.charCodeAt(0) === 47;
+	const trailingSlash = p.charCodeAt(p.length - 1) === 47;
+	let result = normalizeSegments(splitSegments(p), absolute).join('/');
+	if (result.length === 0 && !absolute)
+		result = '.';
+	if (result.length > 0 && trailingSlash)
+		result = result + '/';
+	return absolute ? '/' + result : result;
+}
+
+export function relative(from: string, to: string): string {
+	const f = splitSegments(resolve(from)), t = splitSegments(resolve(to));
+	let common = 0;
+	while (common < f.length && common < t.length && f[common] === t[common])
+		common++;
+	const up: string[] = [];
+	for (let i = common; i < f.length; i++)
+		up.push('..');
+	return up.concat(t.slice(common)).join('/');
+}
+
+export interface ParsedPath { root: string; dir: string; base: string; ext: string; name: string }
+
+export function parse(p: string): ParsedPath {
+	const root = isAbsolute(p) ? '/' : '';
+	let end = p.length;
+	while (end > 1 && p.charCodeAt(end - 1) === 47)
+		end--;
+	let start = end;
+	while (start > 0 && p.charCodeAt(start - 1) !== 47)
+		start--;
+	const base = p.slice(start, end);
+	const ext = base === '/' ? '' : extname(base);
+	return {
+		root,
+		dir:	start > 1 ? p.slice(0, start - 1) : root,
+		base:	base === '/' ? '' : base,
+		ext,
+		name:	base === '/' ? '' : base.slice(0, base.length - ext.length),
+	};
+}
+
+export function format(p: { root?: string; dir?: string; base?: string; name?: string; ext?: string }): string {
+	const dir = p.dir || p.root || '';
+	const base = p.base || (p.name || '') + (p.ext ? (p.ext.charCodeAt(0) === 46 ? p.ext : '.' + p.ext) : '');
+	return !dir ? base : dir === p.root ? dir + base : dir + '/' + base;
 }
 
 // No `process.cwd()` exists in this runtime: a non-absolute argument list resolves against '/'
