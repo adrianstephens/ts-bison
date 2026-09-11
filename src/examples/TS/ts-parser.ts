@@ -783,10 +783,10 @@ JS.variable_declaration_noin.push(
 const implements_clause = Rules(
 	Rule(['implements', type_list], $ => $[1]),
 );
-// Parsed then discarded -- `Statement`'s `class_decl`/`class` have no slot for a superclass's own instantiation, only its own `typeParams`.
+// A generic superclass (`extends Base<X>`) is an instantiation expression, so its members see `X`, not their own parameters.
 const class_extends_target = Rules(
 	JS.left_hand_side_expression,
-	Rule([JS.left_hand_side_expression, genericExtendsOpen, type_list, '>'], $ => $[0]),
+	Rule([JS.left_hand_side_expression, genericExtendsOpen, type_list, '>'], $ => ({ type: 'instantiation', expression: $[0], typeArgs: $[2] } as const)),
 );
 
 // The `<T>`/`implements` combinations are pushed onto js-parser.ts's shared `class_heritage`, reaching every class shape (declarations, expressions,
