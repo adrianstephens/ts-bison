@@ -175,14 +175,34 @@ capture by value, and creating it at first mention means its captures already ex
   positives in type-utils.ts. Survey: `isArray` 25 -> 0, `removeRules` newly compiles -> **58/275**.
 - **Top rows after this session**: object-literal alias (24), `Parser<any>` (22), `find` (17, below),
   getter `a?.length` (13), `typeof` used as a VALUE (6, `unsupported unary operator 'typeof'`).
-- **NEXT: `unknown method 'find'`** (type-utils.ts:1079, `resolve` lands here). One target: calling a
-  METHOD on a generic method's array RESULT. Repros `tison/assistant/repro/find1-4.ts`; controls:
-  `.map(...).length` on a union receiver works (the result IS an array), and `.find` directly on a
-  plain `number[]` works (`find` itself is fine). Only method dispatch on the `.map` result fails:
-  - UNION receiver (`readonly T[] | T[]`) -> `unknown method 'find'`: no owner. The survey's row.
-  - PLAIN `number[]` -> `internal: cannot convert arr:f64:false to arr:ref:false`: the result is
-    physically `arr:f64` but resolves to the collapsed `Array<any>` -- the recorded "a generic method's
-    `U[]` result stays `arr:ref`" limitation (see the `Array<T>` collapse section below).
+## 2026-09-11: the `find` row CLOSED (`d4c25a4`, `b669846`) -- and two SILENT miscompiles under it
+
+The row was a CHECKER gap, not codegen: `resolvedParts` is `(Ty[] | Lit[]).map(...)` and the call typed
+as `any` silently. My first repro (`readonly number[] | number[]`) was the WRONG shape -- same element
+type, so only the identical-signature merge applied; the survey said `find` 17 -> 20, not gone. **Probe
+the real declaration (`probe-decl`) before trusting a hand repro matches it.** Fixed, all general:
+- union of signatures identical up to type-param renaming = one signature (`T.mergeIdenticalSignatures`);
+- a method on a union of arrays is called on ONE array of the combined element (`T.arrayUnionAsArray`,
+  TS 5.2); indexing such a union reads the combined element (a desugared `for...of` got `any`);
+- a tuple's positions are real properties in `lookupMember` (`'0'`, `'1'`), so a literal index on a
+  tuple union reads per member AND `c[0] === 'aa'` narrows `c` (discriminant branch takes `index`);
+- a numeric key prefers the numeric index signature (was: first index signature that admitted it);
+- codegen: a `var_decl`'s method-call bypass read `map<U>(): U[]` raw -> `arr:ref` vs real `arr:f64`.
+Corpus A/B: +1, numericIndexerTyping2 -- a STALE baseline (no `.errors.txt`, but real tsc errors
+there; check with `npx tsc --noEmit --ignoreConfig` before believing a "false positive").
+Survey: 22 moved, `negValue` compiles, **59/277**. The next wall is `new Map([[t.keyName, Literal(key)]])`
+(`cannot convert ref:Map<any,...>`, 20, type-utils `resolve`).
+
+**Two silent WRONG RESULTS found by the regression test, both pre-existing -- fixed, not worked around:**
+- `operandInfo` read `ctx.scope`, not `narrowedTypeOf`: `hit.type === 'lit'` on `Ty | undefined` inside
+  `hit && ...` was `any`, so `===` became `ref.eq` -- string IDENTITY. `'lit' === hit.type` was right.
+- **`===` with a boxed `any` operand was `ref.eq`**: `anyStr === 'lit'`, `anyNum === anyNum2`, and
+  `['x','yy'].indexOf('y'+'y')` (-1!) / `includes`, since `Array<any>` compiles `this[i] === x`. Now
+  `ensureAnyStrictEq`: a late-built helper comparing strings (`String.eq`) and f64/i32/i64 boxes by value,
+  anything else by identity. Numbers always enter `any` as `f64` boxes (verified), so no int/float split.
+  NOT covered: bigint `i32[]` limbs -- `typeofHeapType` conflates them with `boolean[]` storage.
+- `toWAT` exists (`mod.toWAT({expandTypes, hexFloats})`, binary-libs wasm.ts) -- `assistant/wrun-wat.ts`
+  prints it with `WAT=1`. Read the WAT instead of reasoning about emitted code.
 
 ## The `Parser<any> -> Parser<{...}>` row (22 decls) -- one root, partly characterised
 
