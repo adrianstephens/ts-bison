@@ -1605,7 +1605,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 								break;
 							case 'field': {
 								// A literal stays literal where its context expects one (TS's isLiteralOfContextualType): `{ kind: "mod" }` as a `Mod`.
-								const _t = widenForContext(typeOf(p.value!, scope, false, expectedMember, yieldCollector, err), expectedMember, scope);
+								// Under `as const` every value is itself in the const context, and nothing widens.
+								const _t = isConstContext(expected) ? typeOf(p.value!, scope, false, expected, yieldCollector, err)
+									: widenForContext(typeOf(p.value!, scope, false, expectedMember, yieldCollector, err), expectedMember, scope);
 								if (key !== undefined)
 									push(TS.TypeProperty(p.key, _t));
 								break;
