@@ -24,7 +24,7 @@ tsc-rejected and tsc-precise snippets through `assistant/corpus-one.ts` (lib.esn
 
 ## B. Missing modeling -> silent `any` (hides errors AND forces towasm onto boxed/dynamic paths)
 Probe results: silent unless noted.
-1. **Iteration protocol.** No general iterated-type; `yield*` (checker 1970-1973) uses a NAME list
+1. **DONE a229210** (`T.iterationTypes`, `T.memberKey`). **Iteration protocol.** No general iterated-type; `yield*` (checker 1970-1973) uses a NAME list
    (`SINGLE_ELEMENT_ITERABLES`). `for (x of map.keys())` -> any; `yield* [1]` then for-of -> any;
    `new Set([1,2])` fails to infer T (GAP), so `[...set]`/`const [a] = set` are any. Fix: one
    `iteratedType(t)` via `[Symbol.iterator]().next()`'s IteratorResult, used by for-of, spread, array
@@ -53,7 +53,10 @@ Probe results: silent unless noted.
 Each removal will expose false positives -- those are the real bugs; fix them, never restore the leniency.
 Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 1. Widened source into a literal target (type-utils 2043, 2050): `const x: "a" = str` and
-   `` `a${number}` = str `` accepted. Return false; FPs expose literal-widening precision bugs.
+   `` `a${number}` = str `` accepted. ROOT CAUSE FOUND: the var_decl check types its initializer WIDENED
+   (`typeOf1` -> widen=true), so even a variable declared `{ kind: "b" }` reads as `{ kind: string }` and
+   the leniency is what keeps that passing. Fix both together: checks use the precise init type, then
+   return false here.
 2. Construct-only value called (checker 1597-1599): `C()` accepted. TS 2348.
 3. Overload no-fit -> WARNING, args unchecked (1628). TS 2769; needs exact overload resolution first.
 4. isAssignable skips methods/call/index members (2087), function params (2070), missing returns (2069):
@@ -70,6 +73,24 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
    chosen signature on the call node (like `contextualType`); towasm reads it. One source of truth.
 2. `as unknown as` casts (2141, 2880, 8881, 9910) and `new TSWError(e as any, ...)` (catch var): widen the
    helper/TSWError parameter types instead ([[feedback_avoid_unsafe_casts]] in the global store).
+
+## Found while fixing (2026-09-11, later)
+- Missing required property was accepted whenever `undefined` fit its type -- FIXED bf4c532.
+- Class methods/getters typed `any` at every call until checked -- FIXED a229210 (`lazyReturnType`).
+- strictNullChecks-off mode -- DONE bf4c532. Enum member types, unit narrowing, discriminated
+  assignability, const assignment narrowing -- DONE f774537. typeof result sets, clause exclusion -- 27d98c9.
+- **Generic call inference is implemented TWICE** (checker `instantiate`, towasm `inferTypeArgMap`), both
+  first-wins. TS: covariant candidates -> common supertype (`getSupertypeOrUnion`: same-base literals
+  UNION), contravariant (callback param positions) only when no covariant, and type params FIXED as each
+  context-sensitive callback is typed, left to right. Needs ONE shared implementation with polarity.
+  Blocks typeParameterFixingWithContextSensitiveArguments(5), unionOfEnumInference.
+- `let` assignment narrowing: narrowings are never invalidated by reassignment, so only `const` narrows
+  by its initializer. Needs assignment invalidation first.
+- `?.` on a `never`/nullish-only receiver reports nothing (TS 2339 on never).
+- Object rest in a destructuring pattern binds `any` (bindPattern); an array-literal initializer gets no
+  contextual type from its binding pattern (TS's implied type) -> GAPs on `var [x, [y]] = [1, ["a"]]`.
+- Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
+  tests count as "clean"; difftest's TS side is transpile-only, so invalid-TS cases slipped in (3 fixed).
 
 ## Order
 B1 -> D1 -> B5 -> B3 -> B2 -> B4/B6/B8 -> B7 -> C1..C5 -> A cleanup. B before C because B's `any`s both hide
