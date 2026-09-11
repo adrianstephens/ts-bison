@@ -1103,7 +1103,7 @@ function hoist(stmts: Stmt[], scope: Scope) {
 				let next = 0;
 				const memberTypes = stmt.members.map((m): Type => !m.init ? Literal(next++)
 					: T.isLiteral(m.init, 'number') ? Literal((next = m.init.value + 1, m.init.value))
-					: T.isLiteral(m.init, 'string') ? Literal(m.init.value)
+					: T.isLiteral(m.init, 'string') ? { ...Literal(m.init.value), fresh: true }
 					: T.NUMBER
 				);
 				scope.addType(stmt.name, T.combineTypes(memberTypes));
@@ -1533,7 +1533,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				}
 				switch (typeof e.value) {
 					case 'string':
-					case 'boolean':	return Literal(e.value);
+					case 'boolean':	return { ...Literal(e.value), fresh: true };
 					case 'number':	return TS.RangeType('number', e.value, e.value, e.value === (e.value | 0));
 					case 'bigint':	return TS.RangeType('bigint', e.value, e.value);
 					case 'object':	return e.value === null ? Literal(e.value) : T.REGEXP;

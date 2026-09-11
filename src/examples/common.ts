@@ -48,7 +48,9 @@ export function getPos(node: unknown): Location | undefined {
 // `frozen`: TS.Type-context only (this interface is shared with JS.Expr's own literal AST nodes, which never set it) --
 // marks a literal produced by an `as`/`as const` assertion, so `type-utils.ts`'s `widenLiterals` leaves it exactly as
 // asserted even once it's nested inside a container (an array/object/union) that's itself later widened.
-export interface Literal<T> { type: 'literal'; value: T; frozen?: boolean }
+// `fresh`: a literal TYPE produced by a literal expression, which widens where TS widens one (a `let`, an array element);
+// a literal named in a type annotation is regular and never widens. `frozen` (`as const`) never widens either.
+export interface Literal<T> { type: 'literal'; value: T; frozen?: boolean; fresh?: boolean }
 export function  Literal<T>(value: T): Literal<T> { return { type: 'literal', value }; }
 
 export interface Identifier {type: 'identifier', name: string}

@@ -358,13 +358,24 @@ export function combineTypes(types: Type[]): Type {
 			// or many" (`ownerFor` returned nothing at all for a `Stream | never` a branch merge produced).
 			// Same rule `unionMembers` already applies when it flattens.
 			const key = typeKey(t);
-			if (!seen.has(key)) {
-				seen.add(key);
+			const at = seen.get(key);
+			if (at === undefined) {
+				seen.set(key, unique.length);
 				unique.push(t);
+			} else if (t.type === 'literal' && t.fresh) {
+				unique[at] = t;	// a fresh twin is kept: it widens, as TS keeps the fresh one
 			}
 		}
 	};
 	types.forEach(add);
+	// TS's removeRedundantLiteralTypes: a literal (or one of this checker's ranges) whose primitive is a member adds nothing.
+	const primitives = new Set(unique.flatMap(t => t.type === 'ref' && !t.typeArgs && ['string', 'number', 'boolean', 'bigint'].includes(t.name) ? [t.name] : []));
+	if (primitives.size) {
+		const redundant = (t: Type) => t.type === 'literal' ? t.value !== null && primitives.has(literalType(t)) : t.type === 'range' && primitives.has(t.base);
+		for (let i = unique.length; i--; )
+			if (redundant(unique[i]))
+				unique.splice(i, 1);
+	}
 	// TS's union reduction: `any` absorbs every member, `unknown` every member but `any`.
 	return	unique.some(t => isRef(t, 'any')) ? ANY
 		:	unique.some(t => isRef(t, 'unknown')) ? UNKNOWN
@@ -468,7 +479,8 @@ export function widenLiterals(t: Type, keepBoolean = false, ignoreFrozen = false
 }
 function widen(t: Type, keepBoolean: boolean, ignoreFrozen: boolean, shallow: boolean): Type {
 	return	(t.type === 'literal' || t.type === 'range') && t.frozen && !ignoreFrozen ? t
-		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(literalType(t))
+		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean')
+			&& (t.fresh || ignoreFrozen || typeof t.value === 'number' || typeof t.value === 'bigint') ? TS.RefType(literalType(t))
 		:	t.type === 'range' ? TS.RefType(t.base)
 		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean, ignoreFrozen, shallow)))
 		:	shallow ? t
