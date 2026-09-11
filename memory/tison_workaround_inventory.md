@@ -100,7 +100,16 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - arrayMethod's `map` model must stay until a type alias union (`Ty | Lit`) is flattened where towasm reads it;
   removing it broke towasm. `reduce` is now TS's real three overloads (6ee71c9).
 - var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked.
-- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3.
+- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6.
+- Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
+  Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested
+  generics go exponential (7z.ts hit 4 GB). Diagnostics print types within a budget (0d84298).
+- Return-type inference outranks a callback's return: `f<D>(m: (x) => D): D` with `const r: boolean = f(u => ...)`
+  takes D from `boolean` (inferReturn); TS gives the return type the lowest priority.
+- Pre-existing, found 2026-09-11: msbuild/src/Solution.ts crashes the checker (`t.name.split is not a function`,
+  type-utils `ref` resolution); tison/test/test-tison.ts:96 fails to parse (`(_, ctx) => ({...ctx})` in `Rule(...)`).
+- towasm lib lacks what tison's sources call: `Object.assign` (TS: `T & U` overloads), `Object.fromEntries`,
+  `String.fromCodePoint`, `Uint8Array.set(array, offset)`, `new Map(map)` (Iterable entries).
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
   tests count as "clean"; difftest's TS side is transpile-only, so invalid-TS cases slipped in (3 fixed).
 
