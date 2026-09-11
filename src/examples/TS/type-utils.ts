@@ -364,7 +364,10 @@ export function combineTypes(types: Type[]): Type {
 		}
 	};
 	types.forEach(add);
-	return !unique.length ? NEVER : unique.length === 1 ? unique[0] : TS.UnionType(unique);
+	// TS's union reduction: `any` absorbs every member, `unknown` every member but `any`.
+	return	unique.some(t => isRef(t, 'any')) ? ANY
+		:	unique.some(t => isRef(t, 'unknown')) ? UNKNOWN
+		:	!unique.length ? NEVER : unique.length === 1 ? unique[0] : TS.UnionType(unique);
 }
 
 export function optional(type:Type, optional?: boolean) {
@@ -389,6 +392,9 @@ export function intersectTypes(types: Type[]): Type {
 		}
 	};
 	types.forEach(add);
+	// TS's intersection reduction: `any` absorbs every member.
+	if (unique.some(t => isRef(t, 'any')))
+		return ANY;
 	return unique.length === 1 ? unique[0] : TS.IntersectionType(unique);
 }
 
