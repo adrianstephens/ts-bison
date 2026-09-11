@@ -71,6 +71,9 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['typeof exclusions apply together', 'declare function assertNever(x: never): never; function f(x: number | object) { switch (typeof x) { case "number": return; case `function`: return; case "object": return; } assertNever(x); }', []],
 	['a repeated case is unreachable',	'declare function assertNever(x: never): never; function f(x: string | number) { switch (typeof x) { case "string": return 1; case "number": return 2; case "number": return assertNever(x); } }', []],
 	['discriminant values split',		'enum K { A = 1, B = 2 } type T = { kind: K.A, id?: number } | ({ kind: K.B } & ({ id?: undefined } | { id: number })); declare function take(t: T): void; function f(kind: K, id?: number) { take({ kind, id }); }', []],
+
+	// an implementation signature is invisible to callers when overloads exist
+	['overloads hide the implementation', 'class C { m(x: string): number; m(x: any) { return x; } } const r: string[] = ["a"].map(new C().m);', [NOT_ASSIGNABLE('number[]', 'string[]')]],
 ];
 
 (async () => {

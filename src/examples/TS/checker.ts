@@ -307,11 +307,15 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// Unannotated method/getter bodies: their return types are inferred lazily, like a hoisted function's (`lazyReturnType`).
 	const pendingReturns: { sig: TS.CallSig; decl: TS.ClassMethod }[] = [];
 
+	// A member with overload signatures (bodyless) hides its implementation's own signature, as TS does: only the overloads are callable.
+	const overloaded = new Set(c.body.flatMap(m => m.type === 'method' && !m.body ? [T.memberKey(m.key)] : []));
 	for (const m of c.body) {
 		if (m.type === 'index_signature') {
 			members.push(TS.TypeIndex(m.paramName, m.paramType, m.typeAnnotation));
 			continue;
 		}
+		if (m.type === 'method' && m.body && m.key !== 'constructor' && overloaded.has(T.memberKey(m.key)))
+			continue;
 		const key = 'key' in m && T.memberKey(m.key);
 		if (key === undefined || key === false)
 			continue;
@@ -338,7 +342,9 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 			}
 			case 'method':
 				if (m.key === 'constructor') {
-					ctorMembers.push(m);
+					// An overloaded constructor's implementation still declares its parameter properties, but not a signature.
+					if (!(m.body && overloaded.has('constructor')))
+						ctorMembers.push(m);
 					// A parameter-property modifier is anything but the unrelated `'optional'` tag.
 					for (const p of m.params)
 						if (p.modifiers?.some(x => x !== 'optional') && typeof p.key === 'string')
@@ -372,7 +378,7 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// body, not a nested closure's own assignments -- real TS looks wider, but this covers the shape that
 	// actually declares a field's type, without inferring from a callback that runs who-knows-when.
 	for (const { prop, key } of pendingCtorInit) {
-		for (const ctor of ctorMembers) {
+		for (const ctor of c.body.filter((m): m is TS.ClassMethod => m.type === 'method' && m.key === 'constructor' && !!m.body)) {
 			const inits = (ctor.body ?? []).flatMap(st =>
 				st.type === 'expression' && st.expression.type === 'assign' && !st.expression.operator
 				&& st.expression.target.type === 'member' && st.expression.target.object.type === 'this' && st.expression.target.property === key
