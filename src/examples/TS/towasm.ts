@@ -3158,7 +3158,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// separate lib declaration, it's a checker-only "readonly view" of the same structural shape.
 				return ensureClass('Array', [w.element]);
 
-			case 'ref':
+			case 'ref': {
 				const mutable = READONLY_ALIAS.get(w.name);
 				if (mutable)
 					return ensureClass(mutable, w.typeArgs);
@@ -3172,6 +3172,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// `Uint8Array` into its real generic form (`TypedArray<u8>`) by this point, and a generic class
 				// needs its type arguments to resolve at all, same as the `Array`/`ReadonlyArray` case just above.
 				return builtinTypeOwner(w.name) ?? ensureClass(w.name, w.typeArgs);
+			}
 
 			case 'object': {
 				const vt = indexSignatureValueType(w);
