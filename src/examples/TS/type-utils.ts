@@ -403,6 +403,10 @@ function reduceInstantiated(t: TS.UnionType | TS.IntersectionType): Type {
 	const flat = t.types.flatMap(m => m.type === t.type ? (m as TS.UnionType | TS.IntersectionType).types : [m]);
 	if (flat.some(m => isRef(m, 'any')))
 		return ANY;
+	// Nothing inhabits `never`, so an intersection holding one IS `never` -- as TS reduces it at construction, which is what makes
+	// a phantom parameter (`type ActionType<P> = string & { hack?: P & never }`) infer nothing for `P` instead of `X & never`.
+	if (t.type === 'intersection' && flat.some(m => isRef(m, 'never')))
+		return NEVER;
 	const kept = t.type === 'union'
 		? (flat.some(m => isRef(m, 'unknown')) ? [UNKNOWN] : flat.filter(m => !isRef(m, 'never')))
 		: flat.filter(m => !isRef(m, 'unknown'));
@@ -454,6 +458,122 @@ export function joinTypes(types: Type[]): Type {
 	types.forEach(add);
 	return parts.length === 1 ? parts[0] : TS.IntersectionType(parts);
 }
+
+// The disjoint domain of a resolved intersection member (TS's DisjointDomains, `void` counted as `undefined`), 'structural'
+// for an object type, undefined when unknown (a type parameter, an unresolved name).
+type Domain = NORMAL_PRIM | 'structural' | undefined;
+function domainOf(r: Type, scope: Scope): Domain {
+	switch (r.type) {
+		case 'literal':	return literalType(r) as Domain;
+		case 'range':	return r.base;
+		case 'object': case 'array': case 'tuple': case 'function': case 'constructor':
+			return 'structural';
+		case 'ref':		return r.name === 'void' ? 'undefined' : has(NORMAL_PRIM, r.name) ? r.name : isClassRef(r, scope) ? 'structural' : undefined;
+		default:		return undefined;
+	}
+}
+
+type Unit = string | number | bigint | boolean;
+const unitOf = (r: Type): Unit | undefined => r.type === 'literal' && !Array.isArray(r.value) && r.value !== null ? r.value
+	: r.type === 'range' && r.min !== undefined && r.min === r.max ? r.min : undefined;
+
+// An intersection of type parameters, at their constraints and normalized. Undefined when no part is abstract (nothing to gain)
+// or the bound came back unchanged, which would make `isAssignable` ask the same question again.
+function intersectionConstraint(t: TS.IntersectionType, scope: Scope): Type | undefined {
+	if (!t.types.some(p => isAbstract(p, scope)))
+		return undefined;
+	const bound = resolve(scope, TS.IntersectionType(t.types.map(p => isAbstract(p, scope) ? resolve(scope, p) : p)));
+	return bound.type === 'intersection' && bound.types.length === t.types.length && bound.types.every((b, i) => b === t.types[i]) ? undefined : bound;
+}
+
+// TS's intersection normalization (getIntersectionType): it distributes over a union member (`NonNullable<A | B>` is `A | B`);
+// `unknown`, a `{}` beside an object type and a primitive beside its own unit literal drop out; disjoint domains, a nullish member
+// beside an object type, distinct unit literals or conflicting literal discriminants make it `never`. Undefined when nothing
+// reduces. Members are kept as written (refs keep their names); one mentioning a type parameter stays opaque, as TS defers it.
+function reduceIntersection(t: TS.IntersectionType, scope: Scope, depth: number): Type | undefined {
+	const raw: Type[] = [], res: Type[] = [];
+	// `d`: depth left at each nesting level; once spent a member stays as written, never meeting `resolve`'s bail to `any`.
+	const add = (p: Type, d: number) => {
+		const r = d < 0 || isAbstract(p, scope) ? p : resolve(scope, p, d);
+		if (r.type === 'intersection') {
+			r.types.forEach(q => add(q, d - 1));
+		} else {
+			raw.push(p);
+			res.push(r);
+		}
+	};
+	t.types.forEach(p => add(p, depth - 1));
+	// `any`/`unknown` must be the part AS WRITTEN: `resolve` answers `any`/`unknown` when it gives up (a deferred
+	// conditional, a depth bail), and discarding such a part would turn "couldn't evaluate" into a reduction.
+	if (res.some((r, i) => isRef(r, 'any') && isRef(raw[i], 'any')))
+		return ANY;
+	if (res.some(r => isRef(r, 'never')))
+		return NEVER;
+
+	const u = res.findIndex(r => r.type === 'union');
+	if (u >= 0) {
+		const lists = res.map((r, i) => r.type !== 'union' ? [raw[i]] : r === raw[i] ? r.types : unionMembers(raw[i], scope));
+		if (lists.reduce((n, l) => n * l.length, 1) > 100000)
+			return undefined;	// tsc refuses such a type as too complex to represent
+		return combineTypes(lists[u].map(m => {
+			const each = TS.IntersectionType(raw.map((p, i) => i === u ? m : p));
+			return reduceIntersection(each, scope, depth - 1) ?? each;
+		}));
+	}
+
+	const doms	= res.map(r => domainOf(r, scope));
+	const prims	= new Set(doms.filter(d => d && d !== 'structural'));
+	if (prims.size > 1 || ((prims.has('undefined') || prims.has('null')) && doms.includes('structural') && scope.strictNullChecks()))
+		return NEVER;
+	const units		= res.map(unitOf);
+	const values	= new Set(units.filter(v => v !== undefined));
+	if (values.size > 1)
+		return NEVER;
+
+	// A literal discriminant two object members both declare, read as written: resolving property types here would expand
+	// recursive types (`OwnerList<U> extends List<List<U>>`) and force a class's lazily inferred fields.
+	const objects = res.filter((r): r is TS.ObjectType => r.type === 'object');
+	if (objects.length > 1) {
+		const declared = new Map<string, number>();
+		for (const o of objects)
+			for (const m of o.members)
+				if (m.type === 'property' && typeof m.key === 'string')
+					declared.set(m.key, (declared.get(m.key) ?? 0) + 1);
+		const written = (a: Type): Unit[] | undefined => {
+			const vals: Unit[] = [];
+			for (const m of a.type === 'union' ? a.types : [a]) {
+				const v = unitOf(m);
+				if (v === undefined)
+					return undefined;
+				vals.push(v);
+			}
+			return vals;
+		};
+		const shared = new Map<string, Unit[]>();
+		for (const o of objects) {
+			for (const m of o.members) {
+				if (m.type !== 'property' || typeof m.key !== 'string' || declared.get(m.key)! < 2 || m.modifiers?.includes('optional'))
+					continue;
+				const vals = written(m.typeAnnotation);
+				if (!vals)
+					continue;
+				const prev	= shared.get(m.key);
+				const both	= prev ? prev.filter(v => vals.includes(v)) : vals;
+				if (!both.length)
+					return NEVER;
+				shared.set(m.key, both);
+			}
+		}
+	}
+
+	const isEmpty		= (r: Type) => r.type === 'object' && !r.members.length;
+	const hasObject		= res.some((r, i) => doms[i] === 'structural' && !isEmpty(r));
+	const unitDomain	= values.size ? domainOf(res[units.findIndex(v => v !== undefined)], scope) : undefined;
+	const kept			= raw.filter((_, i) => !(isRef(raw[i], 'unknown') || (hasObject && isEmpty(res[i])) || (unitDomain && units[i] === undefined && res[i].type === 'ref' && doms[i] === unitDomain)));
+
+	return kept.length === raw.length ? undefined : !kept.length ? UNKNOWN : kept.length === 1 ? kept[0] : TS.IntersectionType(kept);
+}
+
 
 export function makeNullish(type: Type) {
 	if (type.type === 'ref') {
@@ -1520,6 +1640,11 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 					v = lookupMember(v, parts[i], qScope);
 				return v ? resolve(qScope, v, depth - 1, stopAtRef) : ANY;
 			}
+			case 'intersection': {
+				const reduced = reduceIntersection(t, scope, depth);
+				return reduced ? resolve(scope, reduced, depth - 1, stopAtRef) : t;
+			}
+
 			case 'ref':
 				if (stopAtRef)
 					return t;
@@ -2294,8 +2419,14 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 
 		if (dst.type === 'intersection')
 			return dst.types.every(t => recurse(src, t, depth - 1));
-		if (src.type === 'intersection' && dst.type !== 'object')
-			return src.types.some(t => recurse(t, dst, depth - 1));
+		if (src.type === 'intersection' && dst.type !== 'object') {
+			if (src.types.some(t => recurse(t, dst, depth - 1)))
+				return true;
+			// TS's `getBaseConstraintOfType` for an intersection: every part at its own constraint, intersected and normalized
+			// (`T & U` with `T extends 1|2` and `U extends 2|3` is `2`). No part-wise match can see a bound only the combination implies.
+			const bound = intersectionConstraint(src, scope);
+			return !!bound && recurse(bound, dst, depth - 1);
+		}
 
 		// A `range` on either side is a narrowed `number`/`bigint`. When `dst` is itself genuinely number/bigint-shaped
 		// (another range, or a plain `number`/`bigint` ref), assignability is precise: does the whole span fit (and,
@@ -2361,7 +2492,14 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				return boxed ? recurse(TS.RefType(boxed), dst, depth - 1) : !ALL_PRIM.has(src.name);	// unresolved nominal: lenient
 			}
 			if (src.type === 'function' || src.type === 'constructor')
-				return  dst.members.every(m => (m.type !== 'property' && m.type !== 'method') || hasMod(m, 'optional'));
+				// A function's apparent type is the global `Function` interface, then `Object`'s -- which `lookupMember` already
+				// routes to -- so a lambda satisfies `Function` and an interface extending it, and anything else is truly missing.
+				return dst.members.every(m => {
+					if ((m.type !== 'property' && m.type !== 'method') || hasMod(m, 'optional') || typeof m.key !== 'string')
+						return true;
+					const got = lookupMember(src, m.key, scope);
+					return !!got && (m.type === 'method' || recurse(got, m.typeAnnotation, depth - 1));
+				});
 			if (src.type === 'object' || src.type === 'intersection' || src.type === 'tuple')
 				return dst.members.every(m => {
 					if (m.type !== 'property' || typeof m.key !== 'string')
