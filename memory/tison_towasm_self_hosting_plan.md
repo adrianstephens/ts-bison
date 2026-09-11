@@ -232,6 +232,26 @@ STATEMENT before `checkFunctionBody` runs, and that is the same property as `fn.
 (the lib's too) skipped every top-level function body as "already walked". "Walked" is now read off the
 body's first statement. Corpus: GAP -3, nothing else moved. Local `var_decl` annotations are stamped too.
 
+## 2026-09-11 (end): object-literal row 25 -> out of the top ten; 61/281. NEXT, in order:
+
+1. **Generic-shape PHYSICAL LAYOUT (the general fix, a rewrite).** Two instantiations of one generic
+   interface/alias are two structs (`Params<number>` vs `Params<any>`), so any `T` mismatch between the
+   builder and the reader traps at runtime -- repro `assistant/xmcs/` (three modules, `ROOT=assistant/xmcs
+   assistant/probe-run2.ts`): the literal is built `CallSig<number>`, `JS.sig(...args)` instantiates at
+   `T = any`, dispatch falls through to `unreachable`. The identical-layout TWIN merge only covers a subset.
+   Fix: ONE layout per generic shape, fields that depend on a type parameter stored ERASED (boxed
+   `anyref`), reads coerced to the instantiation's type -- then every instantiation shares a struct.
+2. **Inference across a namespace alias**: `CallSigParams<T>` vs `JS.CallSigParams<number>` -- the named
+   match compares ref NAMES, so a dotted alias misses and falls to structural unfolding.
+3. **Dynamic call on `any`** (`params[0](() => rules)`, core.ts `Rules`): row 22. Needs a uniform boxed
+   calling convention for closures (every closure reachable through `any` callable with boxed args).
+4. **Checker: `strictNullChecks` off** (TS's default): ~223 of ~845 corpus false positives are null/
+   undefined assignability in non-strict files. Option on the scope chain (default strict, so towasm is
+   unchanged); non-strict = nullish source assignable to anything, `memberOptional` adds nothing; harness
+   parses `// @strict` / `// @strictNullChecks` onto a per-file child of the shared lib scope.
+5. **Checker: iteration over an `Iterable`** is `any` (`for...of` element type handles only arrays and
+   strings); array-literal context from `Iterable<X>` and inference through it (Map's iterable overload).
+
 ## NEXT (diagnosed 2026-09-11, not started): the object-literal row (25) is MISSING CONTEXT, not a shape gap
 
 First site, ts-parser.ts:599, `parameter_clause.push(Rule([...], $ => ({ ...$[0], returnType: $[2] } as const)))`:
