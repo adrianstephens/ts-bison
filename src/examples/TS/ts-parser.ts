@@ -61,7 +61,7 @@ export type TypeMember =
 	| { type: 'construct' } & CallSig
 export function TypeMember(type: 'call'|'construct', sig: CallSig): TypeMember { return { type, ...sig }; }
 export function TypeProperty(key: Key, typeAnnotation: Type, modifiers?: string[]): TypeMember { return { type: 'property', key, typeAnnotation, modifiers }; }
-export function TypeMethod(key: Key, sig: CallSig, modifiers?: string[]): TypeMember { return { type: 'method', key, ...sig, modifiers }; }
+export function TypeMethod(key: Key, sig: CallSig, modifiers?: string[]): Extract<TypeMember, { type: 'method' }> { return { type: 'method', key, ...sig, modifiers }; }
 export function TypeIndex(paramName: string, paramType: Type, typeAnnotation: Type, modifiers?: string[]): TypeMember { return { type: 'index', paramName, paramType, typeAnnotation, modifiers }; }
 export function TypeCall(sig: CallSig)		{ return TypeMember('call', sig); }
 export function TypeConstruct(sig: CallSig)	{ return TypeMember('construct', sig); }

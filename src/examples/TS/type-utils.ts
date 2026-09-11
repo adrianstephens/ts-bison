@@ -834,9 +834,21 @@ export function wrapType(t: Type, names: Set<string>, name: string) {
 	return t.type === 'ref' && names.has(t.name) ? t : TS.RefType(name, [t]);
 }
 
+// A member key's static name: a string key as written, a literal computed key as its value, and one naming an entity
+// (`[Symbol.iterator]`) by that path, spelled as TS prints it. Any other computed key has no static name.
+export function memberKey(key: JS.Key<Type>): string | undefined {
+	if (typeof key === 'string')
+		return key;
+	const e = key.computed;
+	if (e.type === 'literal' && (typeof e.value === 'string' || typeof e.value === 'number'))
+		return String(e.value);
+	const path = e.type === 'identifier' || e.type === 'member' ? pathKey(e) : undefined;
+	return path && `[${path}]`;
+}
+
 // The `property`/`method` member (the only kinds carrying `modifiers`) named `key` in `members`, if any.
 function findTypeMember(members: TS.TypeMember[], key: string): TS.TypeMember & { modifiers?: string[] } | undefined {
-	return members.find(m => (m.type === 'property' || m.type === 'method') && m.key === key);
+	return members.find(m => (m.type === 'property' || m.type === 'method') && memberKey(m.key) === key);
 }
 
 // Tags every `ref`/signature reachable from `t` with `scope`, mutating in place (`mapObjectVoid`, freshly-built nodes only).
@@ -1819,7 +1831,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 			}
 
 			case 'object': {
-				const ms = t.members.filter(m => (m.type === 'property' || m.type === 'method') && m.key === prop);
+				const ms = t.members.filter(m => (m.type === 'property' || m.type === 'method') && memberKey(m.key) === prop);
 				if (ms.length > 1) {
 					// Real overloads (every member here must be a same-named `method`) group into one multi-signature callable,
 					// the same shape `hoist` builds for free-function overloads, so `typeOf`'s call/new handling resolves both identically.
@@ -2290,15 +2302,16 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 			}
 		} else if (paramT.type === 'object') {
 			for (const m of paramT.members) {
-				if ((m.type !== 'property' && m.type !== 'method') || typeof m.key !== 'string')
+				const key = (m.type === 'property' || m.type === 'method') ? memberKey(m.key) : undefined;
+				if (key === undefined)
 					continue;
 				if (m.type === 'property') {
-					const t = lookupMember(a, m.key, scope);
+					const t = lookupMember(a, key, scope);
 					if (t)
 						recurse(m.typeAnnotation, t, depth - 1);
 				} else if (m.type === 'method') {
 					// Same shape as `function`/`constructor` above -- `adapter0<T,D>`-style interfaces often carry `T`/`D` only in a method's own signature.
-					const t = lookupMember(a, m.key, scope);
+					const t = lookupMember(a, key, scope);
 					if (t?.type === 'function') {
 						m.params.forEach((p, i) => {
 							const q = t.params[i];
@@ -2410,6 +2423,46 @@ export function awaitType(t: Type, scope: Scope): Type {
 	return r;
 }
 
+export interface IterationTypes { yield: Type; return: Type }
+
+// What iterating `t` yields, and returns once done (TS's iteration types): read off its `[Symbol.iterator]()` iterator's
+// `next()` result (`for await` tries `[Symbol.asyncIterator]` first). Without the protocol (an ES5 lib) only arrays and strings iterate.
+export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6): IterationTypes | undefined {
+	const r = resolveOwn(t, scope);
+	if (isAny(r))
+		return { yield: ANY, return: ANY };
+	if (r.type === 'union' && depth > 0) {
+		const parts = r.types.map(m => iterationTypes(m, scope, async, depth - 1));
+		return parts.every(p => !!p) ? { yield: combineTypes(parts.map(p => p!.yield)), return: combineTypes(parts.map(p => p!.return)) } : undefined;
+	}
+	const protocol = (key: string): IterationTypes | undefined => {
+		const iterator	= findFunctionType(lookupMember(t, key, scope) ?? NEVER, scope)?.returnType;
+		const next		= iterator && findFunctionType(lookupMember(substituteThisType(iterator, t), 'next', scope) ?? NEVER, scope)?.returnType;
+		if (!next)
+			return undefined;
+		const yields: Type[] = [], returns: Type[] = [];
+		for (const m of unionMembers(key === '[Symbol.asyncIterator]' ? awaitType(next, scope) : next, scope)) {
+			const done = lookupMember(m, 'done', scope);
+			const d = done && resolveOwn(done, scope);
+			(d && isLiteral(d, 'boolean') && d.value === true ? returns : yields).push(lookupMember(m, 'value', scope) ?? UNDEFINED);
+		}
+		return { yield: combineTypes(yields), return: combineTypes(returns) };
+	};
+	if (async) {
+		const own = protocol('[Symbol.asyncIterator]');
+		if (own)
+			return own;
+		const sync = iterationTypes(t, scope, false, depth);
+		return sync && { yield: awaitType(sync.yield, scope), return: sync.return };
+	}
+	const found = protocol('[Symbol.iterator]');
+	if (found)
+		return found;
+	const direct = r.type === 'array' ? r.element
+		: arrayLikeElement(r) ?? (r.type === 'tuple' ? combineTypes(r.elements.map(tupleElementType).filter(x => !!x)) : isString(r) ? STRING : undefined);
+	return direct && { yield: direct, return: UNDEFINED };
+}
+
 export function unwrapIfAsync(t: Type, scope: Scope, async: boolean|undefined): Type {
 	return async ? awaitType(t, scope) : t;
 }
@@ -2518,7 +2571,12 @@ export class Scope {
 	// augments a same-named global one; a module's top level, and any block, is its own space instead.
 	globalSpace = false;
 
+	// Set on a function body's own scope: whether that function is `async` -- `yield`/`yield*` in an async generator await/iterate asynchronously.
+	functionAsync?: boolean;
+
 	constructor(public parent?: Scope, private genericTemplate?: boolean) {}
+
+	inAsyncFunction(): boolean						{ return this.functionAsync ?? !!this.parent?.inAsyncFunction(); }
 
 	hitDepthLimit(fn: string): void					{ this.parent?.hitDepthLimit(fn); }
 

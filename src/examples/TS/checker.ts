@@ -1,8 +1,8 @@
 /* eslint-disable @typescript-eslint/no-unused-expressions */
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
-import { Literal, hasMod, Location } from '../common';
-import { isTsDeclaration, walkB } from './walker';
+import { Literal, hasMod, Location, getPos } from '../common';
+import { isTsDeclaration, walk, walkB } from './walker';
 import * as T from './type-utils';
 
 export const SEVERITY = {
@@ -33,7 +33,6 @@ const Scope		= T.Scope;
 
 const COMPARISON_OPS 	= new Set(['==', '!=', '===', '!==', '<', '>', '<=', '>=', 'in', 'instanceof']);
 const LOGICAL_OPS		= new Set(['&&', '||', '??']);
-const SINGLE_ELEMENT_ITERABLES = new Set(['Array', 'ReadonlyArray', 'Set', 'ReadonlySet', 'Generator', 'Iterable', 'IterableIterator', 'Iterator']);
 
 const TYPED_ARRAY_RANGES = new Map<string, T.NumRange>([
 	['Int8Array',			{ base: 'number', min: -0x80, 					max: 0x7f, 					integer: true }],
@@ -218,6 +217,45 @@ function narrowMath(func: string, params: TS.Param[]): Type | undefined {
 // `instance`	is `new C(...)`/`this`'s type;
 // `value`		is the class binding's type (construct sig ∩ static members).
 // `scope`:		the class's declaring scope, stamped onto every result `ref` so a member resolved elsewhere still uses it.
+// Makes an unannotated body's `sig.returnType` a self-memoizing accessor: the first read infers it (muted, `infer`) and replaces
+// itself with the plain value, recorded on `decl` too -- the real declaration a compiler reads. A recursive read sees `any`, as in TS.
+function lazyReturnType(sig: TS.CallSig, decl: { returnType?: Type }, scope: Scope, infer: () => void, fold = (t: Type) => t) {
+	let resolving = false;
+	Object.defineProperty(sig, 'returnType', {
+		configurable: true,
+		enumerable: true,
+		get(): Type {
+			if (resolving)
+				return T.ANY;
+			resolving = true;
+			infer();
+			return sig.returnType ?? T.ANY;
+		},
+		// Stamped here, not at the read site, so it happens exactly once whoever triggers inference.
+		set(value: Type | undefined) {
+			if (value)
+				T.stampScope(value = fold(value), scope);
+			Object.defineProperty(sig, 'returnType', { value, writable: true, configurable: true, enumerable: true });
+			decl.returnType = value;
+		},
+	});
+}
+
+// The scopes a class's member bodies are checked in: instance members see `this` as the instance and the class's type params, static ones the constructor.
+function classBodyScopes(c: TS.Class, scope: Scope, instance: Type, value: Type): { inst: Scope; stat: Scope } {
+	// A generic class's instance scope is flagged (`Scope.isGenericTemplate`): its method bodies are one template shared by every instantiation.
+	const inst = new Scope(scope, !!c.typeParams?.length);
+	// prefer the named entry: declaration merging can extend it beyond this declaration's shape
+	inst.addValue('this', c.name && scope.type(c.name) ? { type: 'ref', name: c.name } : instance);
+	// `addTypeParam`, as `checkFunctionBody` registers its own: an unregistered `K` stays opaque to every member read through it.
+	for (const p of c.typeParams ?? [])
+		inst.addTypeParam(p.name, p.constraint ?? T.ANY);
+	// `typeof C` when named, as TS types it: the structural value holds this very member, so a static `return this` would make a cyclic type.
+	const stat = new Scope(scope);
+	stat.addValue('this', c.name && scope.value(c.name) ? { type: 'typeof', name: c.name } : value);
+	return { inst, stat };
+}
+
 function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type } {
 	const members:			TS.TypeMember[] = [];
 	const staticMembers:	TS.TypeMember[] = [];
@@ -232,13 +270,16 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// `this.x = ...`, which can't be read here because the constructor may come later in `c.body`. Resolved
 	// once the loop below has seen every member (`ctorMembers`), through the same lazy getter.
 	const pendingCtorInit: { prop: TS.TypeMember; key: string }[] = [];
+	// Unannotated method/getter bodies: their return types are inferred lazily, like a hoisted function's (`lazyReturnType`).
+	const pendingReturns: { sig: TS.CallSig; decl: TS.ClassMethod }[] = [];
 
 	for (const m of c.body) {
 		if (m.type === 'index_signature') {
 			members.push(TS.TypeIndex(m.paramName, m.paramType, m.typeAnnotation));
 			continue;
 		}
-		if (!('key' in m) || typeof m.key !== 'string')
+		const key = 'key' in m && T.memberKey(m.key);
+		if (key === undefined || key === false)
 			continue;
 
 		const list = hasMod(m, 'static') ? staticMembers : members;
@@ -250,7 +291,7 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 				if (!m.typeAnnotation && !m.value && !hasMod(m, 'static')) {
 					// `x;` -- real TS infers such a field from the assignments its own constructor makes to it.
 					const prop = TS.TypeProperty(m.key, T.ANY, m.modifiers);
-					pendingCtorInit.push({ prop, key: m.key });
+					pendingCtorInit.push({ prop, key });
 					list.push(prop);
 				} else if (m.typeAnnotation || lit || !m.value) {
 					list.push(TS.TypeProperty(m.key, m.typeAnnotation ?? (lit && T.widenLiterals(lit)) ?? T.ANY, m.modifiers));
@@ -271,14 +312,24 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 							// optional property; a default makes it always-assigned, so not optional then.
 							members.push(TS.TypeProperty(p.key, p.typeAnnotation ?? T.literalTypeOf(p.default) ?? T.ANY, p.default ? p.modifiers.filter(x => x !== 'optional') : p.modifiers));
 				} else {
-					list.push(TS.TypeMethod(m.key, T.withScope(T.FixSig(m, T.ANY), scope), m.modifiers));
+					const member = TS.TypeMethod(m.key, T.withScope(T.FixSig(m, T.ANY), scope), m.modifiers);
+					list.push(member);
+					if (!m.returnType && m.body)
+						pendingReturns.push({ sig: member, decl: m });
 				}
 				break;
-			case 'get':
-				list.push(TS.TypeProperty(m.key, m.returnType ?? T.ANY));
+			case 'get': {
+				const prop = TS.TypeProperty(m.key, m.returnType ?? T.ANY);
+				list.push(prop);
+				if (!m.returnType && m.body) {
+					const sig = T.FixSig(m, T.ANY);
+					pendingReturns.push({ sig, decl: m });
+					Object.defineProperty(prop, 'typeAnnotation', { get: () => sig.returnType, configurable: true, enumerable: true });
+				}
 				break;
+			}
 			case 'set':
-				if (!list.some(x => x.type === 'property' && x.key === m.key))
+				if (!list.some(x => x.type === 'property' && T.memberKey(x.key) === key))
 					list.push(TS.TypeProperty(m.key, m.params[0]?.typeAnnotation ?? T.ANY));
 				break;
 		}
@@ -326,6 +377,15 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	T.stampScope(instance, scope);
 	T.stampScope(value, scope);
 
+	// A member's inferred type naming its own class's shape (`static make() { return A; }`) names it as TS does (`typeof A`, `A`):
+	// the shape holds that very member, so embedding the shape itself would make the type cyclic.
+	const selfRefs = (t: Type): Type => {
+		const name = c.name;
+		if (!name || !walkB(t, undefined, undefined, (x, process) => x === value || x === instance || process(x)))
+			return t;
+		return walk(t, undefined, undefined, (x, process) => x === value ? { type: 'typeof', name } : x === instance ? ctorReturn : process(x)) ?? t;
+	};
+
 	// Installed only now, *after* the walks above -- a self-memoizing lazy getter
 	for (const { prop, init, inner } of pendingFieldInit) {
 		const initScope = inner ?? scope;
@@ -340,11 +400,19 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 				const raw = Array.isArray(init)
 					? T.combineTypes(init.map(e => typeOf(e, initScope) ?? T.ANY))
 					: typeOf(init, initScope) ?? T.ANY;
-				const t = T.stampScope(T.widenLiterals(raw), scope);
+				const t = T.stampScope(T.widenLiterals(selfRefs(raw)), scope);
 				Object.defineProperty(prop, 'typeAnnotation', { value: t, writable: true, enumerable: true, configurable: true });
 				return t;
 			},
 		});
+	}
+	let bodyScopes: { inst: Scope; stat: Scope } | undefined;
+	for (const { sig, decl } of pendingReturns) {
+		lazyReturnType(sig, decl, scope, () => {
+			bodyScopes ??= classBodyScopes(c, scope, instance, value);
+			const generator = hasMod(decl, 'generator');
+			checkFunctionBody(sig, decl.body, hasMod(decl, 'static') ? bodyScopes.stat : bodyScopes.inst, hasMod(decl, 'async'), generator, generator);
+		}, selfRefs);
 	}
 	return { instance, value };
 }
@@ -900,40 +968,8 @@ function hoist(stmts: Stmt[], scope: Scope) {
 		} else {
 			const d = chosen[0];
 			const t = TS.FunctionType(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope));
-			if (!d.returnType && d.body) {
-				// `t.returnType` is a self-memoizing accessor: first read infers it (muted) and replaces itself with a plain value.
-				// `resolving` guards a recursive read (the body calling itself) into seeing `ANY` instead of re-entering.
-				let resolving = false;
-				Object.defineProperty(t, 'returnType', {
-					configurable: true,
-					enumerable: true,
-					get(): Type {
-						if (resolving)
-							return T.ANY;
-						resolving = true;
-						checkFunctionBody(t, d.body, scope, hasMod(d, 'async'));
-						return t.returnType ?? T.ANY;
-					},
-					set(value: Type | undefined) {
-						// Stamped here (rather than at the read site) so it happens exactly once, regardless of who first triggers inference.
-						if (value)
-							T.stampScope(value, scope);
-						Object.defineProperty(t, 'returnType', { value, writable: true, configurable: true, enumerable: true });
-						// Also stamped onto the REAL declaration (`d`, reachable via `Scope.decl` -- the same
-						// object `functionDeclByName` holds) -- `t` itself is only ever a throwaway synthetic
-						// clone built fresh by `FixSig`, never seen again once `hoist()` returns. Without this, a
-						// consumer needing to actually COMPILE `d` (not just type-check a reference to it) has
-						// no way to see this inferred type at all -- `d.returnType` stays permanently unset even
-						// after real inference has already happened. Safe to stamp unconditionally: `t`'s own
-						// typeParams came from `d.typeParams` (via `FixSig`), so this represents the function's
-						// own template-level shape (in terms of its own still-abstract type params, if generic)
-						// either way -- the exact same shape an explicit annotation on `d` would already give,
-						// consistent regardless of which caller happens to trigger the inference first.
-						d.returnType = value;
-					},
-				});
-
-			}
+			if (!d.returnType && d.body)
+				lazyReturnType(t, d, scope, () => checkFunctionBody(t, d.body, scope, hasMod(d, 'async'), hasMod(d, 'generator'), hasMod(d, 'generator')));
 			scope.addValue(name, t);
 			scope.addDecl(name, d);
 		}
@@ -963,16 +999,33 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 	} else {
 		const t = typeAnnotation ?? (d.init && typeOf(d.init, scope, widen, undefined, undefined, err));
 		if (t)
-			bindPattern(scope, d.name, t, d.init, !widen);
+			bindPattern(scope, d.name, t, d.init, !widen, err);
 		else
 			T.bindingNames(d.name).forEach(n => scope.addValue(n, T.ANY));
 	}
 }
 
+// What iterating `t` yields and returns. A non-iterable is TS 2488 and then `any`, as in TS; a GAP rather than an error while `t` isn't fully known.
+function iterationOrReport(t: Type, scope: Scope, pos: Location, err?: Err, async = false): T.IterationTypes {
+	const it = T.iterationTypes(t, scope, async);
+	if (!it && err)
+		err(T.sealed(t, scope) ? SEVERITY.ERROR : SEVERITY.GAP, pos)`Type '${t}' must have a '[Symbol.iterator]()' method that returns an iterator`;
+	return it ?? { yield: T.ANY, return: T.ANY };
+}
+
+// The element context an iterable contextual type gives an array literal: what its iterable members yield (`any` gives none).
+function iteratedContext(t: Type, scope: Scope): Type | undefined {
+	const yields = T.unionMembers(t, scope).flatMap(m => {
+		const it = !T.isAny(T.resolveOwn(m, scope)) && T.iterationTypes(m, scope);
+		return it ? [it.yield] : [];
+	});
+	return yields.length ? T.combineTypes(yields) : undefined;
+}
+
 // Each name a destructuring pattern binds gets its own part of `t`: a tuple position, an array element, a member --
 // narrowed where the source path is (`const { bar } = aFoo` after `if (aFoo.bar)`). A `const` destructured from a
 // UNION at a stable path is recorded as that path (`scope.addSource`), so narrowing one name narrows the others (TS 4.6).
-function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: Expr, constant = false) {
+function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: Expr, constant = false, err?: Err) {
 	if (typeof target === 'string') {
 		scope.addValue(target, t);
 		return;
@@ -981,23 +1034,24 @@ function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: E
 	const narrowed	= (e: Expr | undefined) => { const k = e && T.pathKey(e); return k ? scope.value(k) : undefined; };
 	const correlate	= constant && r.type === 'union' && !!source && T.pathKey(source) !== undefined;
 	if (target.type === 'array_pattern') {
-		const at = (i: number) => r.type === 'tuple' ? T.tupleElementType(r.elements[i]) ?? T.ANY : r.type === 'array' ? r.element : T.ANY;
+		const elem	= r.type === 'tuple' ? undefined : iterationOrReport(t, scope, getPos(target)!, err).yield;
+		const at	= (i: number) => r.type === 'tuple' ? T.tupleElementType(r.elements[i]) ?? T.ANY : elem!;
 		target.elements.forEach((el, i) => {
 			const sub	= el && source ? { type: 'index', object: source, index: { type: 'literal', value: i } } as Expr : undefined;
 			const et	= el && (narrowed(sub) ?? at(i));
 			if (el)
-				bindPattern(scope, el.target, el.default ? T.nonNullable(et!, scope) : et!, sub, constant);
+				bindPattern(scope, el.target, el.default ? T.nonNullable(et!, scope) : et!, sub, constant, err);
 		});
 		if (target.rest)
-			bindPattern(scope, target.rest, r.type === 'array' ? r
-				: r.type === 'tuple' ? TS.ArrayType(T.combineTypes(r.elements.slice(target.elements.length).map(el => T.tupleElementType(el) ?? T.ANY)))
-				: T.ANY);
+			bindPattern(scope, target.rest, TS.ArrayType(r.type === 'tuple'
+				? T.combineTypes(r.elements.slice(target.elements.length).map(el => T.tupleElementType(el) ?? T.ANY))
+				: elem!), undefined, false, err);
 	} else {
 		for (const p of target.properties) {
 			const sub	= typeof p.key === 'string' && source ? { type: 'member', object: source, property: p.key } as Expr : undefined;
 			const m		= narrowed(sub)
 				?? (typeof p.key === 'string' ? T.optional(T.lookupMember(r, p.key, scope) ?? T.ANY, T.memberOptional(r, p.key, scope)) : T.ANY);
-			bindPattern(scope, p.value, p.default ? T.nonNullable(m, scope) : m, sub, constant);
+			bindPattern(scope, p.value, p.default ? T.nonNullable(m, scope) : m, sub, constant, err);
 			if (correlate && sub && typeof p.value === 'string' && !p.default)
 				scope.addSource(p.value, sub);
 		}
@@ -1284,17 +1338,16 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				const arrayLike			= contextual?.type === 'union' ? T.unionMembers(contextual, scope).map(m => T.resolveOwn(m, scope)).filter(m => m.type === 'tuple' || m.type === 'array') : [];
 				const resolvedExpected	= arrayLike.length === 1 ? arrayLike[0] : contextual;
 				const wantTuple			= resolvedExpected?.type === 'tuple';
+				// Otherwise an element's context is what the context iterates to (TS): an `Iterable<T>`'s `T` as much as an array's element.
+				const elemExpected		= wantTuple ? undefined : resolvedExpected?.type === 'array' ? resolvedExpected.element : contextual && iteratedContext(contextual, scope);
 				const elems: Type[] = [];
 				let i = 0;
 				for (const el of e.elements) {
 					if (el) {
-						if (el.type === 'spread') {
-							const t = T.resolveOwn(recurse(el.operand), scope);
-							elems.push(t.type === 'array' ? t.element : T.ANY);
-						} else {
-							elems.push(recurse(el, wantTuple ? T.tupleElementType(resolvedExpected.elements[i])
-								: resolvedExpected?.type === 'array' ? resolvedExpected.element : undefined));
-						}
+						if (el.type === 'spread')
+							elems.push(iterationOrReport(recurse(el.operand), scope, pos, err).yield);
+						else
+							elems.push(recurse(el, wantTuple ? T.tupleElementType(resolvedExpected.elements[i]) : elemExpected));
 					}
 					i++;
 				}
@@ -1305,7 +1358,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// `any[]` in a union (`Spec[] | any[]`) leaves member lookup with nothing to offer, which
 				// is how a `.map` callback's parameter ended up with no type at all.
 				if (!elems.length)
-					return resolvedExpected?.type === 'array' ? resolvedExpected : TS.ArrayType(T.ANY);
+					return resolvedExpected?.type === 'array' ? resolvedExpected : TS.ArrayType(elemExpected ?? T.ANY);
 				// LITERAL WIDENING, as real TS does it: `[1, 2, 3]` is `number[]`, not `(1|2|3)[]` -- an
 				// array literal is MUTABLE, so keeping the initialiser's literal types made `a[0] = 5` a
 				// type error ("Type '5' is not assignable to type '1 | 2 | 3'"). It also leaked into
@@ -1316,7 +1369,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// deliberate choice and outranks inference. `widenLiterals` keeps a `frozen` leaf as-is, so
 				// `[1, 2, 3] as const` still means exactly what it says.
 				const elem = T.combineTypes(elems);
-				return TS.ArrayType(resolvedExpected?.type === 'array' ? elem : T.widenLiterals(elem));
+				return TS.ArrayType(elemExpected ? elem : T.widenLiterals(elem));
 			}
 
 			case 'object': {
@@ -1325,8 +1378,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// and what lets a spread's own members participate (`{...X, key: override}` or `{key, ...X}`).
 				const byKey	= new Map<string, number>();
 				const push	= (m: TS.TypeMember) => {
-					if ('key' in m && typeof m.key === 'string') {
-						const i = byKey.get(m.key);
+					const key = 'key' in m ? T.memberKey(m.key) : undefined;
+					if (key !== undefined) {
+						const i = byKey.get(key);
 						if (i !== undefined) {
 							// A later OPTIONAL property does NOT erase an earlier one: at runtime an absent
 							// property leaves the earlier value in place, which is exactly what the
@@ -1339,11 +1393,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							// collapsing into it. Its `| undefined` is dropped too -- optionality is the
 							// modifier, and the absent case is precisely what the earlier member covers.
 							members[i] = m.type === 'property' && prev.type === 'property' && hasMod(m, 'optional')
-								? TS.TypeProperty(m.key, T.combineTypes([prev.typeAnnotation, T.nonNullable(T.resolveOwn(m.typeAnnotation, scope), scope)]), hasMod(prev, 'optional') ? ['optional'] : undefined)
+								? TS.TypeProperty(key, T.combineTypes([prev.typeAnnotation, T.nonNullable(T.resolveOwn(m.typeAnnotation, scope), scope)]), hasMod(prev, 'optional') ? ['optional'] : undefined)
 								: m;
 							return;
 						}
-						byKey.set(m.key, members.length);
+						byKey.set(key, members.length);
 					}
 					members.push(m);
 				};
@@ -1357,12 +1411,13 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						// A `satisfies`/annotated-`var_decl` `expected` type propagates member-by-member: an unannotated arrow/method
 						// value (`{read: (pe, data) => ...}`) otherwise types its own params as `any`, same gap `applyContextualParams`
 						// already closes for call arguments.
-						const expectedMember = expected && typeof p.key === 'string' ? T.lookupMember(expected, p.key, scope) : undefined;
+						const key				= T.memberKey(p.key);
+						const expectedMember	= expected && key !== undefined ? T.lookupMember(expected, key, scope) : undefined;
 						switch (p.type) {
 							case 'method':
 								applyContextualParams(p.params, expectedMember, scope);
 								checkFunctionBody(p, p.body, scope, hasMod(p, 'async'), hasMod(p, 'generator'), hasMod(p, 'generator'), err);
-								if (typeof p.key === 'string')
+								if (key !== undefined)
 									push(TS.TypeMethod(p.key, T.FixSig(p, T.ANY)));
 								break;
 							case 'get':
@@ -1374,7 +1429,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 								break;
 							case 'field': {
 								const _t = typeOf(p.value!, scope, true, expectedMember, yieldCollector, err);
-								if (typeof p.key === 'string')
+								if (key !== undefined)
 									push(TS.TypeProperty(p.key, _t));
 								break;
 							}
@@ -1651,7 +1706,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// Through a union too: Map's `entries?: readonly (readonly [K, V])[] | null`.
 					const tupleShaped = (t: Type): boolean => T.unionMembers(t, scope).some(m => {
 						const r = T.resolveOwn(m, scope);
-						return r.type === 'tuple' || (r.type === 'array' && T.resolveOwn(r.element, scope).type === 'tuple');
+						const el = r.type === 'tuple' ? r : r.type === 'array' ? r.element : !T.isAny(r) && T.iterationTypes(m, scope)?.yield;
+						return !!el && T.resolveOwn(el, scope).type === 'tuple';
 					});
 					// Past the fixed parameters the REST names the argument -- and where the rest is a tuple
 					// (or a union with one), that position's own element is the only thing that names a callback.
@@ -1964,19 +2020,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			}
 			case 'yield': {
 				const argT = e.operand ? recurse(e.operand) : T.VOID;
-				if (yieldCollector) {
-					if (e.delegate) {
-						const r		= T.resolveOwn(argT, scope);
-						yieldCollector.push(r.type === 'array' ? r.element
-							: r.type === 'tuple' ? T.combineTypes(r.elements.map(e => T.tupleElementType(e)).filter((e): e is Type => !!e))
-							: r.type === 'ref' && r.typeArgs?.length && SINGLE_ELEMENT_ITERABLES.has(r.name) ? r.typeArgs[0]
-							: T.ANY
-						);
-					} else {
-						yieldCollector.push(T.widenLiterals(argT));
-					}
-				}
-				return T.ANY;
+				// `yield* x` yields what `x` iterates to and evaluates to what its iterator returns.
+				const async		= scope.inAsyncFunction();
+				const delegated	= e.delegate ? iterationOrReport(argT, scope, pos, err, async) : undefined;
+				yieldCollector?.push(delegated ? delegated.yield : T.unwrapIfAsync(T.widenLiterals(argT), scope, async));
+				return delegated ? delegated.return : T.ANY;
 			}
 
 			case 'class':
@@ -2042,6 +2090,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		return;
 
 	const inner = new Scope(scope);
+	inner.functionAsync = async;
 	// `noStamp`: true only for the exact case the early-return above used to swallow entirely -- a muted
 	// (no `err`), declared-return-type, first-ever-walked (`fn.scope` unset, or this line wouldn't be
 	// reached at all) method belonging to a generic class's own instance scope
@@ -2181,7 +2230,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			const returnType = retDef.length ? T.combineTypes(retDef) : alwaysThrows(body[body.length - 1]) ? T.NEVER : T.VOID;
 
 			if (generator) {
-				fn.returnType = TS.RefType('Generator', [
+				fn.returnType = TS.RefType(async ? 'AsyncGenerator' : 'Generator', [
 					yields!.length ? T.combineTypes(yields!) : T.NEVER,
 					returnType,
 					T.ANY,
@@ -2205,27 +2254,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 }
 function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 	const { instance, value } = classShapes(c, scope);
-
-	// Flagged (`Scope.isGenericTemplate`) whenever this class itself declares type params: an instance
-	// method's body here is one shared template reused (via structural substitution, not a fresh check)
-	// across every later `K`/`V`-concrete instantiation -- see `checkFunctionBody`'s own use of the flag.
-	const instScope = new Scope(scope, !!c.typeParams?.length);
-	// prefer the named entry: declaration merging can extend it beyond this declaration's shape
-	const name = c.name;
-	instScope.addValue('this', name && scope.type(name) ? { type: 'ref', name } : instance);
-	// Each of this class's own type params gets registered into its instance-method scope, same
-	// reasoning and mechanism as `checkFunctionBody`'s own registration (`addTypeParam`, not `addType`)
-	// -- a bare, unregistered class type param (e.g. `K`/`V` of `Map<K,V>`) stays fully opaque for every
-	// reference inside an instance method body, including needing to *resolve* a field's own type
-	// (`this.keys_: K[]`) to look up a real member on it (`Array<K>.map`, needed to contextually type
-	// `this.keys_.map(...)`'s own callback params) -- silently tolerated, not actually verified, until
-	// now (found via `lib/map.ts`'s own `entries()`, whose `.map()` callback params never resolved at
-	// all). Not registered into `statScope`: a static member can never reference its own class's
-	// instance type params, matching real TS.
-	for (const p of c.typeParams ?? [])
-		instScope.addTypeParam(p.name, p.constraint ?? T.ANY);
-	const statScope = new Scope(scope);
-	statScope.addValue('this', value);
+	const { inst: instScope, stat: statScope } = classBodyScopes(c, scope, instance, value);
 
 	for (const m of c.body) {
 		switch (m.type) {
@@ -2414,14 +2443,10 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 				checkStmt(stmt.body, stmt.test ? narrow(stmt.test, inner, true) : inner, typeOf, checkStmt);
 
 			} else {
-				const rightT = T.resolveOwn(typeOf(stmt.right, inner), inner);
-				const elemT = stmt.kind === 'in' ? T.STRING
-					: rightT.type === 'array' ? rightT.element
-					: T.isString(rightT) ? T.STRING
-					: T.ANY;
+				const elemT = stmt.kind === 'in' ? (typeOf(stmt.right, inner), T.STRING) : iterationOrReport(typeOf(stmt.right, inner), inner, getPos(stmt.right)!, err, stmt.kind === 'of await').yield;
 				if (stmt.init.type === 'var_decl') {
 					for (const d of stmt.init.declarations)
-						hoistVar(inner, d, true, d.typeAnnotation ?? elemT);
+						hoistVar(inner, d, true, d.typeAnnotation ?? elemT, err);
 				} else {
 					typeOf(stmt.init, inner);
 				}
