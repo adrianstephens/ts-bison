@@ -9780,11 +9780,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// the NAME. Resolved only to discover a union hiding behind an alias.
 			const bare	= unwrapAs(recv);
 			const raw	= (bare.type === 'identifier' ? annots.get(bare.name) : undefined) ?? checkerTypeOf(bare, scope);
-			const uni	= raw.type === 'union' ? raw : T.resolveOwn(raw, scope);
 			// Every member of a union gets the slot: the write lands on whichever one it turns out to be
 			// at runtime. A shape with no name (an inline object type), a generic instantiation, or a
 			// non-`ref` (an array, a primitive) has nowhere to put one.
-			for (const part of uni.type === 'union' ? uni.types : [raw]) {
+			for (const part of T.unionMembers(raw, scope)) {
 				if (part.type !== 'ref' || part.typeArgs?.length)
 					continue;
 				const prior = pendingExtensions.get(part.name);

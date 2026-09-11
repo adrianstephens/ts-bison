@@ -1469,9 +1469,8 @@ export function isOther(op: string) {
 // What `a && b` / `a || b` / `a ?? b` yields from `a` when it short-circuits: a boolean survives `||` only as true and
 // `&&` only as false, and `&&` narrows a string/number to its one falsy literal (`||`'s truthy side has no single value).
 export function logicalLeftPart(t: Type, op: string, scope: Scope): Type {
-	const r		= resolveOwn(t, scope);
 	const other	= isOther(op[0]);
-	return combineTypes((r.type === 'union' ? r.types : [r]).flatMap(m => {
+	return combineTypes(unionMembers(t, scope).flatMap(m => {
 		const p = resolveOwn(m, scope);
 		if (other(p, scope))
 			return [];
@@ -1493,8 +1492,10 @@ export function nonNullable(t: Type, scope: Scope, nonNullable = true): Type {
 	const r = resolveOwn(t, scope);
 	if (r.type !== 'union')
 		return t;
-	const kept = r.types.filter(m => !isNullish(m, scope));
-	return kept.length === 0 || kept.length === r.types.length ? t : combineTypes(kept);
+	// Flattened: `Maybe<X> | undefined` hides `Maybe`'s own `null | undefined` one alias down.
+	const members	= unionMembers(r, scope);
+	const kept		= members.filter(m => !isNullish(m, scope));
+	return kept.length === 0 || kept.length === members.length ? t : combineTypes(kept);
 }
 
 export function isFalsy(t: Type, scope: Scope): boolean {
@@ -2191,6 +2192,9 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				// Checked on `argT`, not the resolved `a`: `resolveOwn` would expand a bare `Promise<X>` into its structural
 				// body, losing the ref identity `asPromiseRef` needs.
 				recurse(paramT.typeArgs[0], awaitType(argT, scope), depth - 1);
+			} else if (a.type === 'union' && !(argT.type === 'ref' && argT.name === paramT.name)) {
+				// `Rule<T>` against `Rule2<CallSig> = Rule<CallSig> | Rules<CallSig> | ...`: each member is a candidate, as in TS.
+				a.types.forEach(m => recurse(paramT, m, depth - 1));
 			} else {
 				// Prefer the argument's own (unresolved) named type over its fully-expanded structural shape -- `resolve()` eagerly substitutes a
 				// generic ref's type params into its body, losing the "this was Polynomial<number>" name/typeArgs identity `paramT` needs to match.
@@ -2469,6 +2473,7 @@ export class Scope {
 	private types		= new Map<string, TypeEntry>();
 	private narrowings?:	Map<string, Type>;	// control-flow refinements, consulted before declarations
 	private aliases?:		Map<string, Expr>;	// const initializers -- narrowing a const also narrows through its initializer (TS 4.4 aliased conditions)
+	private sources?:		Map<string, Expr>;	// a const destructured from a union (`const {kind, a} = x`) IS `x.kind`: narrowed and read through it (TS 4.6)
 	private namespaces?:	Map<string, Scope>;	// nested namespace/module scopes, keyed by their bound name -- consulted by `resolve` for a dotted type ref (`NS.Foo`)
 	// The real `function_decl`/`class_decl` statement a name resolves to, alongside its derived `value`/
 	// `type` entries -- a consumer that needs to actually COMPILE a declaration (not just type-check a
@@ -2499,6 +2504,8 @@ export class Scope {
 	type(name: string): TypeEntry | undefined		{ return this.types.get(name) ?? this.parent?.type(name); }
 	declared(name: string): Type | undefined		{ return this.values.get(name) ?? this.parent?.declared(name); }
 	alias(name: string): Expr | undefined			{ return this.aliases?.get(name) ?? (this.values.has(name) ? undefined : this.parent?.alias(name)); }
+	source(name: string): Expr | undefined			{ return this.sources?.get(name) ?? (this.values.has(name) ? undefined : this.parent?.source(name)); }
+	hasSources(): boolean							{ return !!this.sources || !!this.parent?.hasSources(); }
 	namespace(name: string): Scope | undefined		{ return this.namespaces?.get(name) ?? this.parent?.namespace(name); }
 	decl(name: string): TS.Stmt | undefined	{ return this.decls?.get(name) ?? this.parent?.decl(name); }
 
@@ -2556,7 +2563,9 @@ export class Scope {
 	addTypeParam(name: string, constraint: Type)	{ this.types.set(name, {type: constraint, isTypeParam: true}); }
 	addNarrowing(name: string, t: Type)				{ (this.narrowings ??= new Map()).set(name, t); }
 	addAlias(d: JS.Var<any>)						{ (this.aliases ??= new Map()).set(d.name, d.init); }
+	addSource(name: string, e: Expr)				{ (this.sources ??= new Map()).set(name, e); }
 	addNamespace(name: string, s: Scope)			{ (this.namespaces ??= new Map()).set(name, s); }
+	ownNamespace(name: string): Scope | undefined	{ return this.namespaces?.get(name); }
 	addDecl(name: string, stmt: TS.Stmt)		{ (this.decls ??= new Map()).set(name, stmt); }
 
 	mergeType(name: string, type: Type, typeParams: TS.TypeParam[] | undefined, augment = false) {

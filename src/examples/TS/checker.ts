@@ -380,9 +380,34 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 // Exported for towasm: only `ctx.stmtScope` carries narrowing into codegen, and the checker stamps a
 // scope on STATEMENTS only, so a narrowing a ternary's or `&&`'s own test introduces has no stamp to
 // read. Pure, so codegen re-deriving it reaches the same scope the check pass used.
+// Whether any of `names` is written anywhere in `body`: an assignment, or `++`/`--` on either side.
+function writesAny(body: JS.Stmt<any>[] | Expr, names: Set<string>): boolean {
+	let found = false;
+	walkB(body, undefined, (x: any, process: (x: any) => boolean) => {
+		if ((x.type === 'assign' && x.target.type === 'identifier' && names.has(x.target.name))
+			|| ((x.type === 'unary' || x.type === 'unary_post') && (x.operator === '++' || x.operator === '--') && x.operand.type === 'identifier' && names.has(x.operand.name)))
+			found = true;
+		return found || process(x);
+	});
+	return found;
+}
+
+// A name destructured from a union narrows as its source path (`kind` as `x.kind`), so the rest of `x` narrows with it.
+function throughSources(e: Expr, scope: Scope): Expr {
+	if (e.type === 'identifier')
+		return scope.source(e.name) ?? e;
+	const out: any = { ...e };
+	for (const k of ['left', 'right', 'operand', 'object', 'expression'])
+		if (out[k] && typeof out[k] === 'object' && 'type' in out[k])
+			out[k] = throughSources(out[k], scope);
+	if (Array.isArray(out.arguments))
+		out.arguments = out.arguments.map((a: any) => a && a.type !== 'spread' ? throughSources(a, scope) : a);
+	return out;
+}
+
 export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 	const aliasing = new Set<string>();
-	return recurse(test, scope, sense);
+	return recurse(scope.hasSources() ? throughSources(test, scope) : test, scope, sense);
 
 	// Refines `name`'s binding to the members `keep` accepts (`name` may be a dotted path key). `keep` returns `true` (keep),
 	// `false` (exclude), or a `Type` (replace with a narrower version) -- the last splits a compound member (see `narrowByDiscriminant`).
@@ -771,6 +796,9 @@ function checkAssignable(src: Type, dst: Type, scope: Scope, pos: Location, dstS
 	if (T.isAssignable(src, dst, scope, dstScope, true))
 		return true;
 	const lax = T.isAssignable(src, dst, scope, dstScope, false);
+	// The same type, written the same way, is assignable to itself however opaque it is (`Record<K, M[K]>`).
+	if (lax && (src === dst || T.typeKey(src) === T.typeKey(dst)))
+		return true;
 	if (lax)
 		err(SEVERITY.GAP, pos)`Assignability of '${src}' to '${dst}' could not be fully verified ('keyof'/conditional/'infer'/mapped types aren't evaluated)`;
 	return lax;
@@ -843,7 +871,15 @@ function hoist(stmts: Stmt[], scope: Scope) {
 				break;
 			}
 			case 'namespace_decl': {
-				const { scope: ns, alias } = exportScope(stmt.body, scope);
+				// Same-named blocks MERGE (lib.es5's `namespace Intl` holds `NumberFormat`; later lib files add to it): a
+				// later block sees the earlier one's names, and its own members merge into it, augmentations last.
+				const prior = scope.ownNamespace(stmt.name);
+				const { scope: block, inner, alias } = exportScope(stmt.body, prior ?? scope, undefined, prior && namespaceInner.get(prior));
+				if (prior)
+					prior.copyAll(block);
+				else
+					namespaceInner.set(block, inner);
+				const ns	= prior ?? block;
 				const value = alias ?? ns.toObject();
 				// A type-only namespace (empty value type) merged onto a same-named const/class here would clobber that name's real value with a
 				// sealed empty object before the sequential 'var_decl' walk assigns it, breaking an earlier-declared class's eager forward reference.
@@ -948,7 +984,48 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 		if (!widen && d.init)
 			scope.addAlias(d);
 	} else {
-		T.bindingNames(d.name).forEach(n => scope.addValue(n, T.ANY));
+		const t = typeAnnotation ?? (d.init && typeOf(d.init, scope, widen, undefined, undefined, err));
+		if (t)
+			bindPattern(scope, d.name, t, d.init, !widen);
+		else
+			T.bindingNames(d.name).forEach(n => scope.addValue(n, T.ANY));
+	}
+}
+
+// Each name a destructuring pattern binds gets its own part of `t`: a tuple position, an array element, a member --
+// narrowed where the source path is (`const { bar } = aFoo` after `if (aFoo.bar)`). A `const` destructured from a
+// UNION at a stable path is recorded as that path (`scope.addSource`), so narrowing one name narrows the others (TS 4.6).
+function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: Expr, constant = false) {
+	if (typeof target === 'string') {
+		scope.addValue(target, t);
+		return;
+	}
+	const r			= T.resolve(scope, t);
+	const narrowed	= (e: Expr | undefined) => { const k = e && T.pathKey(e); return k ? scope.value(k) : undefined; };
+	const correlate	= constant && r.type === 'union' && !!source && T.pathKey(source) !== undefined;
+	if (target.type === 'array_pattern') {
+		const at = (i: number) => r.type === 'tuple' ? T.tupleElementType(r.elements[i]) ?? T.ANY : r.type === 'array' ? r.element : T.ANY;
+		target.elements.forEach((el, i) => {
+			const sub	= el && source ? { type: 'index', object: source, index: { type: 'literal', value: i } } as Expr : undefined;
+			const et	= el && (narrowed(sub) ?? at(i));
+			if (el)
+				bindPattern(scope, el.target, el.default ? T.nonNullable(et!, scope) : et!, sub, constant);
+		});
+		if (target.rest)
+			bindPattern(scope, target.rest, r.type === 'array' ? r
+				: r.type === 'tuple' ? TS.ArrayType(T.combineTypes(r.elements.slice(target.elements.length).map(el => T.tupleElementType(el) ?? T.ANY)))
+				: T.ANY);
+	} else {
+		for (const p of target.properties) {
+			const sub	= typeof p.key === 'string' && source ? { type: 'member', object: source, property: p.key } as Expr : undefined;
+			const m		= narrowed(sub)
+				?? (typeof p.key === 'string' ? T.optional(T.lookupMember(r, p.key, scope) ?? T.ANY, T.memberOptional(r, p.key, scope)) : T.ANY);
+			bindPattern(scope, p.value, p.default ? T.nonNullable(m, scope) : m, sub, constant);
+			if (correlate && sub && typeof p.value === 'string' && !p.default)
+				scope.addSource(p.value, sub);
+		}
+		if (target.rest)
+			scope.addValue(target.rest, T.ANY);
 	}
 }
 
@@ -968,9 +1045,13 @@ export function bindModuleNames(filename: string | undefined, scope: Scope) {
 	}
 }
 
-export function exportScope(body: Stmt[], parent: Scope, filename?: string): { scope: Scope; inner: Scope; alias?: Type } {
+// A namespace's export view -> the scope its blocks hoist into, so a later same-named block merges into the first.
+const namespaceInner = new WeakMap<Scope, Scope>();
+
+export function exportScope(body: Stmt[], parent: Scope, filename?: string, into?: Scope): { scope: Scope; inner: Scope; alias?: Type } {
 	// `hoist` + `hoistVars` (not full `checkBlock`): only top-level declaration *types* are needed, not a full check of a body checked separately.
-	const inner = new Scope(parent);
+	// `into`: an earlier same-named namespace block's scope -- declarations MERGE there, so its own references see augmentations.
+	const inner = into ?? new Scope(parent);
 	hoist(body, inner);
 	// `inner` is RETURNED, not stamped on the body array: an imported module's INTERNAL scope is
 	// otherwise built here and thrown away, and towasm needs it to resolve a name declared in the module
@@ -1202,7 +1283,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				break;
 
 			case 'this':		return scope.value('this') ?? T.ANY;
-			case 'identifier':	return scope.value(e.name) ?? T.ANY;
+			case 'identifier':	{
+				// A name destructured from a union is its source path, read in the CURRENT (narrowed) scope.
+				const src = scope.source(e.name);
+				return src ? recurse(src) : scope.value(e.name) ?? T.ANY;
+			}
 
 			case 'array': {
 				// Contextual typing, same idea `case 'object'`'s own `expectedMember`/`T.lookupMember`
@@ -1217,7 +1302,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// array, `Rule<T, const R ...>`'s `ValuesOf<R>` has no positions and every `$[i]` is the union of all of them.
 				if (isConstContext(expected) && e.elements.every(el => el && el.type !== 'spread'))
 					return { type: 'tuple', readonly: true, elements: e.elements.map(el => T.freeze(recurse(el!, expected))) };
-				const resolvedExpected	= expected && T.resolveOwn(expected, scope);
+				// A union context contributes its one array-like member (Map's `readonly (readonly [K, V])[] | null`).
+				const contextual		= expected && T.resolveOwn(expected, scope);
+				const arrayLike			= contextual?.type === 'union' ? T.unionMembers(contextual, scope).map(m => T.resolveOwn(m, scope)).filter(m => m.type === 'tuple' || m.type === 'array') : [];
+				const resolvedExpected	= arrayLike.length === 1 ? arrayLike[0] : contextual;
 				const wantTuple			= resolvedExpected?.type === 'tuple';
 				const elems: Type[] = [];
 				let i = 0;
@@ -1551,7 +1639,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// look like it fits when the real (literal) argument wouldn't, picking the wrong candidate before the real one
 					// is even tried.
 					const trialArgTs = e.arguments.map(a => a.type === 'spread' ? undefined : typeOf(a, scope, false, undefined, yieldCollector, undefined));
-					sig = overloads!.find(c => T.argsFit(instantiate(c, trialArgTs, typeArgs, scope, pos), trialArgTs, scope, hasSpread));
+					// A literal's type depends on its context, so each candidate types it against its OWN parameter, as TS
+					// does: `new Map([['', true]])` fits `entries: readonly (readonly [K, V])[]` only as tuples.
+					const contextualTs = (c: TS.CallSig) => e.arguments.map((a, i) => a.type === 'array' || a.type === 'object'
+						? typeOf(a, scope, false, c.params[i]?.typeAnnotation, yieldCollector, undefined) : trialArgTs[i]);
+					sig = overloads!.find(c => {
+						const ts = contextualTs(c);
+						return T.argsFit(instantiate(c, ts, typeArgs, scope, pos), ts, scope, hasSpread);
+					});
 				}
 				if (overloads && !sig && err)
 					err(SEVERITY.WARNING, pos)`No overload of '${e.callee}' matches this call; arguments left unchecked`;
@@ -1576,10 +1671,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// types, where an unresolved ref is an inert hint. Without this the literal typed as a
 					// plain array and every entries-style generic constructor (`new Map([[k, v]])`)
 					// inferred `<any, any>`.
-					const tupleShaped = (t: Type) => {
-						const r = T.resolveOwn(t, scope);
+					// Through a union too: Map's `entries?: readonly (readonly [K, V])[] | null`.
+					const tupleShaped = (t: Type): boolean => T.unionMembers(t, scope).some(m => {
+						const r = T.resolveOwn(m, scope);
 						return r.type === 'tuple' || (r.type === 'array' && T.resolveOwn(r.element, scope).type === 'tuple');
-					};
+					});
 					// Past the fixed parameters the REST names the argument -- and where the rest is a tuple
 					// (or a union with one), that position's own element is the only thing that names a callback.
 					const declaredArg = (i: number) => sig!.params[i]?.typeAnnotation
@@ -1808,11 +1904,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						const key = T.pathKey(e.target);
 						if (key) {
 							// `x ??= y` leaves x holding its non-nullish members or y (and likewise for ||= / &&=)
-							const r		= T.resolveOwn(lt, scope);
 							const other = T.isOther(e.operator[0]);
 
 							scope.addNarrowing(key, T.combineTypes([
-								...(r.type === 'union' ? r.types : [r]).filter(m => !other(T.resolveOwn(m, scope), scope)),
+								...T.unionMembers(lt, scope).filter(m => !other(T.resolveOwn(m, scope), scope)),
 								T.widenLiterals(rt),
 							]));
 						}
@@ -2023,17 +2118,22 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		const dt = p.default && typeOf(p.default, inner, true, anno, undefined, err);
 		if (err && dt && anno && !checkAssignable(dt, anno, inner, (p as any).pos, inner, err))
 			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
-		if (typeof p.key === 'string')
+		if (typeof p.key === 'string') {
 			inner.addValue(p.key, anno ? T.optional(anno, hasMod(p, 'optional') && !p.default) : dt ?? T.ANY);
-		else
-			T.bindingNames(p.key).forEach(n => inner.addValue(n, T.ANY));
+		} else {
+			// The whole argument, under a name no source can spell, is the pattern's source -- so a destructured
+			// discriminated union correlates as a `const` one does, unless the body reassigns one of its names.
+			const hidden = `#param${fn.params.indexOf(p)}`;
+			inner.addValue(hidden, anno ?? dt ?? T.ANY);
+			bindPattern(inner, p.key, anno ?? dt ?? T.ANY, { type: 'identifier', name: hidden } as Expr, !writesAny(body, new Set(T.bindingNames(p.key))));
+		}
 	}
 	
 	if (fn.rest) {
 		if (typeof fn.rest.key === 'string')
 			inner.addValue(fn.rest.key, fn.rest.typeAnnotation ?? T.ANY);
 		else
-			T.bindingNames(fn.rest.key).forEach(n => inner.addValue(n, T.ANY));
+			bindPattern(inner, fn.rest.key, fn.rest.typeAnnotation ?? T.ANY);
 	}
 
 	// TS 5.5+ "inferred type predicates": a function whose single return path is itself a type guard (`x => x != null`) gets an inferred `x is T`
@@ -2355,12 +2455,17 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 		case 'switch': {
 			typeOf(stmt.discriminant, scope);
 			// A `case` with no body falls through to the next -- reuse `if`'s discriminated-union narrowing by synthesizing that binary
-			// test per case, OR-ing fallthrough cases together. A bare `default` needs "none of the others" narrowing, unmodeled -- body stays unnarrowed.
+			// test per case, OR-ing fallthrough cases together. `default` runs when NO case matched: the negation of every test, ANDed.
+			const caseTest	= (test: Expr): Expr => ({ type: 'binary', operator: '===', left: stmt.discriminant, right: test });
+			const none		= stmt.cases.flatMap(c => c.test ? [{ type: 'unary', operator: '!', operand: caseTest(c.test) } as Expr] : [])
+				.reduce<Expr | undefined>((acc, t) => acc ? { type: 'binary', operator: '&&', left: acc, right: t } : t, undefined);
 			let pending: Expr[] = [];
 			for (const c of stmt.cases) {
 				if (c.test) {
 					typeOf(c.test, scope);
-					pending.push({ type: 'binary', operator: '===', left: stmt.discriminant, right: c.test });
+					pending.push(caseTest(c.test));
+				} else if (none) {
+					pending.push(none);
 				}
 				if (c.consequent.length || !c.test) {
 					const test = pending.reduce<Expr | undefined>((acc, t) => acc ? { type: 'binary', operator: '||', left: acc, right: t } : t, undefined);
