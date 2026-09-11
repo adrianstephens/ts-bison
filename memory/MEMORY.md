@@ -11,6 +11,7 @@
 ## Semantic conformance (current method)
 
 - [conformance sweeps](tison_conformance_sweeps.md) — **start here for new work**: per-lib-area differential sweeps are the gate now, not the survey; 10 groups, 6 green, remaining divergences listed
+- [workaround inventory](tison_workaround_inventory.md) — 2026-09-11 audit: every `any`-fallback/leniency/cast site classified (TS-matching / silent-`any` modeling gap / accepts-bad-code / towasm), each with its proper fix and an order. All fixable
 - [corpus error dump](tison_corpus_errdump.md) — per-ERROR corpus A/B; `corpus-ab.sh` totals hide a false-positive-for-true-positive trade
 
 ## Engine and parsers
