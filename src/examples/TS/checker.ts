@@ -1987,12 +1987,22 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					const hasSpread = e.arguments.some(a => a.type === 'spread');
 					// Muted (`err` explicitly `undefined`, not `recurse`'s ambient one): a candidate not picked must report nothing. And
 					// precise (`widen: false`), as the final `argTs` are: a widened literal can fit a structurally narrow overload wrongly.
-					const trialArg		= (a: Expr) => a.type === 'spread' || isContextSensitive(a) ? undefined : typeOf(a, scope, false, undefined, yieldCollector, undefined);
-					let trialArgTs		= e.arguments.map(trialArg);
-					// A literal's type depends on its context, so each candidate types it against its OWN parameter, as TS
-					// does: `new Map([['', true]])` fits `entries: readonly (readonly [K, V])[]` only as tuples.
-					const contextualTs	= (c: TS.CallSig) => e.arguments.map((a, i) => a.type === 'array' || a.type === 'object'
-						? typeOf(a, scope, false, c.params[i]?.typeAnnotation, yieldCollector, undefined) : trialArgTs[i]);
+					// Each candidate types an argument against its OWN parameter, as TS does (checkExpressionWithContextualType): a
+					// literal's type depends on it (`new Map([['', true]])` fits `readonly (readonly [K, V])[]` only as tuples), and so
+					// does a nested call's -- its callback's return is fixed by the first context it is typed in. A parameter naming the
+					// candidate's own type parameters gives a non-literal no context yet. Typed once per distinct context.
+					const paramAt		= (c: TS.CallSig, i: number) => c.params[i]?.typeAnnotation ?? (c.rest?.typeAnnotation && T.restArgType(c.rest.typeAnnotation, i - c.params.length, scope));
+					const typedIn		= e.arguments.map(() => new Map<Type | undefined, Type>());
+					const contextualTs	= (c: TS.CallSig) => e.arguments.map((a, i) => {
+						if (a.type === 'spread' || isContextSensitive(a))
+							return undefined;
+						const p		= paramAt(c, i);
+						const ctx	= p && (a.type === 'array' || a.type === 'object' || !c.typeParams?.some(tp => T.mentionsTypeParam(p, tp.name))) ? p : undefined;
+						let t = typedIn[i].get(ctx);
+						if (!t)
+							typedIn[i].set(ctx, t = typeOf(a, scope, false, ctx, yieldCollector, undefined));
+						return t;
+					});
 					const fits			= (c: TS.CallSig) => {
 						const ts = contextualTs(c);
 						return T.argsFit(instantiate(c, ts, typeArgs, scope, pos), e.arguments.map((a, i) => isContextSensitive(a) ? ANY_FUNCTION : ts[i]), scope, hasSpread);
@@ -2004,7 +2014,6 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						if (!e.arguments.some(isContextSensitive) || !overloads!.slice(k + 1).some(fits))
 							return true;
 						const typed = settle(c, true);
-						trialArgTs = e.arguments.map(trialArg);
 						return T.argsFit(typed, typed.argTs, scope, hasSpread);
 					});
 				}
