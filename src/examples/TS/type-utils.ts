@@ -2477,6 +2477,10 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				a.types.forEach(m => recurse(paramT, m, depth - 1));
 			}
 		} else if (paramT.type === 'ref' && paramT.typeArgs) {
+			// A generic alias unfolded one level (`paramT.name` is declared in `declScope`, not `scope`).
+			const entry		= declScope.type(paramT.name);
+			const unfold	= () => substituteType(entry!.type, new Map(entry!.typeParams!.map((p, i) => [p.name, paramT.typeArgs![i] ?? p.default ?? ANY])));
+			const sameName	= argT.type === 'ref' && argT.name === paramT.name;
 			if (paramT.name === 'Array' && paramT.typeArgs.length === 1 && a.type === 'array') {
 				recurse(paramT.typeArgs[0], a.element, depth - 1);
 			} else if (paramT.name === 'PromiseLike' && paramT.typeArgs.length === 1 && (argT.type === 'union' ? argT.types : [argT]).some(m => asPromiseRef(m, scope))) {
@@ -2485,7 +2489,11 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				// Checked on `argT`, not the resolved `a`: `resolveOwn` would expand a bare `Promise<X>` into its structural
 				// body, losing the ref identity `asPromiseRef` needs.
 				recurse(paramT.typeArgs[0], awaitType(argT, scope), depth - 1);
-			} else if (a.type === 'union' && !(argT.type === 'ref' && argT.name === paramT.name)) {
+			} else if (!sameName && entry?.typeParams?.length && entry.type.type === 'union') {
+				// An alias is transparent, as in TS: `MaybePromise<D>` IS `D | Promise<D>`, so a union argument meets a union target and a
+				// bare `D` takes what the other members don't account for, whole -- not one candidate per argument member.
+				recurse(unfold(), argT, depth - 1);
+			} else if (a.type === 'union' && !sameName) {
 				// `Rule<T>` against `Rule2<CallSig> = Rule<CallSig> | Rules<CallSig> | ...`: each member is a candidate, as in TS.
 				a.types.forEach(m => recurse(paramT, m, depth - 1));
 			} else {
@@ -2502,10 +2510,9 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 					});
 				} else {
 					// A generic alias wrapping `T` (e.g. `Testable<T> = T extends primitive ? T : T & Equal<T>`) -- unfold one level and recurse,
-					// so whichever case below actually contains `T` gets a chance to match. `paramT.name` is declared in `declScope`, not `scope`.
-					const entry = declScope.type(paramT.name);
+					// so whichever case below actually contains `T` gets a chance to match.
 					if (entry?.typeParams?.length)
-						recurse(substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, paramT.typeArgs![i] ?? p.default ?? ANY]))), argT, depth - 1);
+						recurse(unfold(), argT, depth - 1);
 				}
 			}
 		} else if (paramT.type === 'tuple') {
