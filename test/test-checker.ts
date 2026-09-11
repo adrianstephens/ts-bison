@@ -55,6 +55,10 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['as const under a mutable context', 'const a = [1, 2] as const satisfies unknown[];',										[]],
 	['readonly tuple into a mutable array', 'declare const r: readonly [number]; const m: number[] = r;',						["is not assignable to type 'number[]'"]],
 
+	['a tagged template is a call',	'declare function tag(s: TemplateStringsArray): number; declare function tag(s: TemplateStringsArray, n: number): string; const r: boolean = tag`x${1}`;', [NOT_ASSIGNABLE('string', 'boolean')]],
+	['object literal candidates union', 'declare function f<T>(a: T, b: T): T; const r = f({ x: 1, z: 2 }, { x: 1, y: "" });',		[]],
+	['primitive candidates do not',	'declare function f<T>(x: { bar: T; baz: T }): T; f({ bar: 1, baz: "" });',						["is not assignable to parameter"]],
+
 	// equality narrows by any unit-typed operand, and enum members are types
 	['enum member discriminant',		'enum Kind { A, B } interface Base { kind: Kind } interface A extends Base { kind: Kind.A; yar: number } interface B extends Base { kind: Kind.B; gar: number } declare const foo: A | B; switch (foo.kind) { case Kind.A: const myA: A = foo; break; case Kind.B: const myB: B = foo; }', []],
 	['const-named unit narrows',		'declare const x: "a" | "b"; const k = "a"; if (x === k) { const q: "a" = x; }',		[]],

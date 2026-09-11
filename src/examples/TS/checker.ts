@@ -1885,8 +1885,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					if (inference) {
 						preArgTs.forEach((t, i) => {
 							const p = sig!.params[i];
+							const a = e.arguments[i];
 							if (t && p?.typeAnnotation)
-								inference.infer(p.typeAnnotation, t);
+								(a.type === 'object' || a.type === 'array' ? inference.inferFromLiteral : inference.infer).call(inference, p.typeAnnotation, t);
 						});
 						// A param no argument pins down may come from where the call's result is going (`new Promise<T>((resolve) => ...)`).
 						if (expected && sig.returnType)
@@ -2166,10 +2167,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			case 'spread':
 				return recurse(e.operand);
 
+			// TS types a tagged template as the call `tag(strings, ...substitutions)`: overloads, inference and argument checks alike.
 			case 'tagged_template': {
-				const t = T.resolveOwn(recurse(e.tag), scope);
-				e.quasi.forEach(p => p.exp && recurse(p.exp));
-				return t.type === 'function' ? t.returnType ?? T.ANY : T.ANY;
+				const at = <N extends object>(n: N) => Object.defineProperty(n, 'pos', { value: pos, enumerable: false });
+				const strings = at({ type: 'as', expression: at({ type: 'array', elements: [] }), typeAnnotation: TS.RefType('TemplateStringsArray') } as Expr);
+				return recurse(at({ type: 'call', callee: e.tag, arguments: [strings, ...e.quasi.flatMap(p => p.exp ? [p.exp] : [])] } as Expr), expected);
 			}
 			case 'yield': {
 				// A declared generator's Y is a plain `yield`'s context, and what is yielded must fit it.

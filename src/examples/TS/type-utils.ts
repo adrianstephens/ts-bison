@@ -2252,9 +2252,13 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 }
 
 
-// TS's choice among a type parameter's candidates: covariant ones if any -- literals of one primitive UNION, otherwise the
-// leftmost candidate every later one is a supertype of (`getSupertypeOrUnion`); else the contravariant ones' common subtype.
-export function chooseInference(co: Type[], contra: Type[], scope: Scope): Type | undefined {
+// TS's choice among a type parameter's candidates: covariant ones if any -- the object/array-literal ones first pooled into one
+// union (`unionObjectAndArrayLiteralCandidates`), then literals of one primitive UNION, otherwise the leftmost candidate every
+// later one is a supertype of (`getSupertypeOrUnion`); else the contravariant ones' common subtype.
+export function chooseInference(co: Type[], contra: Type[], scope: Scope, fromLiteral: (t: Type) => boolean = () => false): Type | undefined {
+	const literals = co.filter(fromLiteral);
+	if (literals.length > 1)
+		co = [...co.filter(t => !fromLiteral(t)), combineTypes(literals)];
 	if (co.length) {
 		const members	= co.flatMap(t => unionMembers(t, scope).map(m => resolveOwn(m, scope)));
 		const base		= (m: Type) => m.type === 'literal' ? literalType(m) : undefined;
@@ -2285,6 +2289,8 @@ export class Inference {
 	private readonly fixed		= new Map<string, Type>();
 	private readonly fromReturn	= new Map<string, Type>();
 	private readonly defaulted	= new Set<string>();
+	private readonly literal	= new Set<Type>();		// candidates inferred from an object/array literal argument
+	private feedingLiteral		= false;
 
 	constructor(typeParams: readonly TS.TypeParam[], readonly scope: Scope, readonly declScope: Scope) {
 		this.names = new Map(typeParams.map(p => [p.name, p]));
@@ -2292,6 +2298,9 @@ export class Inference {
 	// `inferTypeArgs` skips a name this reports: only a fixed one takes no more candidates.
 	has(name: string): boolean	{ return this.fixed.has(name); }
 	add(name: string, t: Type, contra: boolean) {
+		// Only a candidate that is itself an object/array literal's type pools (TS's isObjectOrArrayLiteralType), not a primitive inside one.
+		if (this.feedingLiteral && (t.type === 'object' || t.type === 'array' || t.type === 'tuple'))
+			this.literal.add(t);
 		const pool = contra ? this.contra : this.co;
 		pool.set(name, [...pool.get(name) ?? [], t]);
 	}
@@ -2303,6 +2312,12 @@ export class Inference {
 		for (const d of own)
 			this.infer(d.paramT, d.argT, undefined, d.contra, replays - 1);
 	}
+	// An argument written as an object/array literal: what it gives is a literal candidate, pooled into one union when chosen.
+	inferFromLiteral(paramT: Type, argT: Type) {
+		this.feedingLiteral = true;
+		this.infer(paramT, argT);
+		this.feedingLiteral = false;
+	}
 	// What the call's result must be (`expected` against the signature's return type): used only where nothing else speaks.
 	inferReturn(returnType: Type, expected: Type) {
 		const m = new Map<string, Type>();
@@ -2311,7 +2326,7 @@ export class Inference {
 	}
 	fix(name: string, t: Type)	{ this.fixed.set(name, t); }
 	fromCandidates(name: string): Type | undefined {
-		return this.fixed.get(name) ?? chooseInference(this.co.get(name) ?? [], this.contra.get(name) ?? [], this.scope);
+		return this.fixed.get(name) ?? chooseInference(this.co.get(name) ?? [], this.contra.get(name) ?? [], this.scope, t => this.literal.has(t));
 	}
 	inferred(name: string): Type | undefined	{ return this.fromCandidates(name) ?? this.fromReturn.get(name); }
 	returnHint(name: string): Type | undefined	{ return this.fromReturn.get(name); }
