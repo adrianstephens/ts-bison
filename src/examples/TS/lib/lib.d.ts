@@ -293,6 +293,9 @@ declare class Array<T> {
 	map<U>(callbackfn: (value: T, index: number, array: T[]) => U, thisArg?: any): U[];
 	filter<S extends T>(predicate: (value: T, index: number, array: T[]) => value is S, thisArg?: any): S[];
 	filter(predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any): T[];
+	find<S extends T>(predicate: (value: T, index: number, obj: T[]) => value is S, thisArg?: any): S | undefined;
+	find(predicate: (value: T, index: number, obj: T[]) => unknown, thisArg?: any): T | undefined;
+	findIndex(predicate: (value: T, index: number, obj: T[]) => unknown, thisArg?: any): number;
 	reduce(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T): T;
 	reduce(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T, initialValue: T): T;
 	reduce<U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number, array: T[]) => U, initialValue: U): U;
