@@ -7870,7 +7870,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// a suspend-boundary declarator's own init-derived type -- needed only for a generator's `const v =
 	// yield x;` (see `compileGeneratorFunc`'s own comment on why `checkerTypeOf` can't be trusted
 	// there); an async `await` needs no such override, so `compileAsyncFunc` never passes one.
-	function buildFrameFields(decl: FunctionDecl, params: ResolvedParam[], widenedTypes: Map<JS.Var<Type>, Type>, resumeValueType?: Type) {
+	function buildFrameFields(decl: FunctionDecl, params: ResolvedParam[], widenedTypes: Map<JS.Var<Type>, Type>) {
 		const hoisted		= collectHoistedLocals(decl.body!);
 		const localFields	= new Map<string, LocalField>();
 		const frameFields: wasm.FieldType[] = [{ type: 'i32', mut: true }];
@@ -7883,7 +7883,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				continue;	// already a param field -- real JS forbids a body-level redeclaration of a param name anyway
 			if (!d.init && !d.typeAnnotation)
 				throw `local '${localName}' needs an initializer or an explicit type`;
-			const tsType = d.typeAnnotation ?? widenedTypes.get(d) ?? (resumeValueType && d.init?.type === 'yield' ? resumeValueType : d.init && T.literalTypeOf(d.init)) ?? checkerTypeOf(d.init!, (stmt as any).scope as Scope ?? libGlobal);
+			const tsType = d.typeAnnotation ?? widenedTypes.get(d) ?? (d.init && T.literalTypeOf(d.init)) ?? checkerTypeOf(d.init!, (stmt as any).scope as Scope ?? libGlobal);
 			const wt = typeOf(tsType);
 			if (!wt || wt === 'void')
 				throw `local '${localName}' has an unsupported type`;
@@ -7908,15 +7908,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			throw `generic generator function '${name}' is not supported`;
 		const params = resolveResumableParams(decl);
 
-		// Read off `libGlobal`'s own hoisted function type, not `decl.returnType` directly: `checkStmt`'s
-		// own per-statement check (`case 'function_decl'`) re-derives and overwrites `decl.returnType`
-		// in place with `N` forced to `T.ANY` regardless of what's declared (`checkFunctionBody`'s
-		// `skipReturn` is unconditionally true for a generator) -- but that mutation happens *after*
-		// `hoist()` already snapshotted the real declared type into the scope value every call site
-		// (`countUp()`) actually resolves through, so the two disagree. Going through the same scope
-		// lookup a call site uses keeps this in sync with what callers see, sidestepping the mismatch
-		// rather than fighting it.
-		const rt = (global.value(name) as TS.FunctionType | undefined)?.returnType;
+		const rt = decl.returnType;
 		if (rt?.type !== 'ref' || rt.name !== 'Generator' || (rt.typeArgs?.length ?? 0) !== 3)
 			throw `unexpected inferred return type`;
 		const [Y, R, N] = rt.typeArgs!;
@@ -7945,23 +7937,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// creation site below must be a real subtype of it.
 		const envBase		= ensureEnvBase();
 		const STATE_FIELD	= 0;
-		// Same fallback chain `case 'var_decl'` itself uses to pick a hoisted local's *actual* write type
-		// (typeAnnotation, then a widened-reassignment-range override, then the initializer's own narrow
-		// literal type, e.g. a small integer literal defaults to 'i32' not 'f64') -- the frame field's
-		// declared type must agree with what the real write emits, or the field type mismatches its own
-		// initializer (confirmed the hard way: computing this independently via `checkerTypeOf` alone
-		// picked the checker's un-narrowed 'number' -> f64 while the actual `let i = 0` write picked the
-		// narrower i32, corrupting the very first assignment). Consistency matters here, not which of the
-		// two representations wins -- `emitAs`/`coerceTop` widen i32 -> f64 at every *use* site regardless
-		// (`yield i` against a 'number'-typed generator, `i < 3`, ...), so 'i32' is a completely valid,
-		// even cheaper choice for the field as long as the declaration and every write agree on it.
-		// `resumeValueType: N` -- 'const v = yield x;''s own checker type is always `T.ANY` (the same
-		// forced-any inference behind the `N`-in-`decl.returnType` workaround above, `checkFunctionBody`'s
-		// `skipReturn`), not the real declared/resolved `N` -- `buildFrameFields` reads `N` directly for
-		// that one case instead of trusting `checkerTypeOf`, or the field ends up `anyref`-typed against
-		// an `N`-typed write.
+		// A frame field takes the same type `case 'var_decl'` would give the local (annotation, widened range, literal, checker type):
+		// field and writes must agree -- the checker's plain `number` against an `i32` `let i = 0` write corrupted the first assignment.
 		const widenedTypes	= collectRangeWidenings(decl.body!, libGlobal);
-		const { localFields, frameFields } = buildFrameFields(decl, params, widenedTypes, N);
+		const { localFields, frameFields } = buildFrameFields(decl, params, widenedTypes);
 		const frameTypeIndex = addType({ final: true, supertypes: [envBase], type: { kind: 'struct', fields: frameFields } });
 		const machine		= BuildStateMachine(decl.body!);
 

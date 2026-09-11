@@ -245,15 +245,16 @@ function narrowMath(func: string, params: TS.Param[]): Type | undefined {
 // `value`		is the class binding's type (construct sig ∩ static members).
 // `scope`:		the class's declaring scope, stamped onto every result `ref` so a member resolved elsewhere still uses it.
 // Makes an unannotated body's `sig.returnType` a self-memoizing accessor: the first read infers it (muted, `infer`) and replaces
-// itself with the plain value, recorded on `decl` too -- the real declaration a compiler reads. A recursive read sees `any`, as in TS.
+// itself with the plain value, recorded on `decl` too -- the real declaration a compiler reads. While inferring it reads as absent
+// (so inference sees nothing declared); a recursive call's reader falls back to `any`, as TS types such a recursion.
 function lazyReturnType(sig: TS.CallSig, decl: { returnType?: Type }, scope: Scope, infer: () => void, fold = (t: Type) => t) {
 	let resolving = false;
 	Object.defineProperty(sig, 'returnType', {
 		configurable: true,
 		enumerable: true,
-		get(): Type {
+		get(): Type | undefined {
 			if (resolving)
-				return T.ANY;
+				return undefined;
 			resolving = true;
 			infer();
 			return sig.returnType ?? T.ANY;
@@ -1128,7 +1129,7 @@ function iterationOrReport(t: Type, scope: Scope, pos: Location, err?: Err, asyn
 	const it = T.iterationTypes(t, scope, async);
 	if (!it && err)
 		err(T.sealed(t, scope) ? SEVERITY.ERROR : SEVERITY.GAP, pos)`Type '${t}' must have a '[Symbol.iterator]()' method that returns an iterator`;
-	return it ?? { yield: T.ANY, return: T.ANY };
+	return it ?? { yield: T.ANY, return: T.ANY, next: T.ANY };
 }
 
 // The element context an iterable contextual type gives an array literal: what its iterable members yield (`any` gives none).
@@ -2124,12 +2125,18 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				return t.type === 'function' ? t.returnType ?? T.ANY : T.ANY;
 			}
 			case 'yield': {
-				const argT = e.operand ? recurse(e.operand) : T.VOID;
+				// A declared generator's Y is a plain `yield`'s context, and what is yielded must fit it.
+				const fnKind	= scope.enclosingFunction();
+				const async		= !!fnKind?.async;
+				const argT		= e.operand ? recurse(e.operand, e.delegate ? undefined : fnKind?.yield) : T.UNDEFINED;
 				// `yield* x` yields what `x` iterates to and evaluates to what its iterator returns.
-				const async		= scope.inAsyncFunction();
 				const delegated	= e.delegate ? iterationOrReport(argT, scope, pos, err, async) : undefined;
-				yieldCollector?.push(delegated ? delegated.yield : T.unwrapIfAsync(T.widenLiterals(argT), scope, async));
-				return delegated ? delegated.return : T.ANY;
+				const yielded	= delegated ? delegated.yield : T.unwrapIfAsync(argT, scope, async);
+				if (err && fnKind?.yield && !checkAssignable(yielded, fnKind.yield, scope, pos, scope, err))
+					err(SEVERITY.ERROR, pos)`Type '${yielded}' is not assignable to the yielded type '${fnKind.yield}'`;
+				yieldCollector?.push(delegated ? yielded : T.widenLiterals(yielded));
+				// `yield x` evaluates to what `next(v)` is given: the declared N, else `any` (as TS, which flags it under noImplicitAny).
+				return delegated ? delegated.return : fnKind?.next ?? T.ANY;
 			}
 
 			case 'class':
@@ -2171,15 +2178,19 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 	if (!body)
 		return;
 
-	let expected = fn.returnType;
-	if (expected && async) {
+	// A declared return type is never replaced by inference, even one (`any`, a generator's) that checks nothing.
+	const declaredReturn = fn.returnType;
+	// A declared generator's body is checked against what it iterates: `return x` against its TReturn, `yield`s against Y and N.
+	const generatorTypes = generator && declaredReturn ? T.iterationTypes(declaredReturn, scope, async, undefined, true) : undefined;
+	let expected = generator ? generatorTypes?.return : declaredReturn;
+	if (expected && async && !generator) {
 		const p = T.asPromiseRef(expected, scope);
 		expected = p ? p.typeArgs![0] : expected;
 	}
 	// A declared type predicate (`x is T`) is never checked against the body's boolean return, same as `any` -- but unlike `any`, it must
 	// not be *inferred over* either: the declared predicate is never a worse answer, so `fn.returnType` stays untouched below.
 	const isPredicate = expected?.type === 'predicate';
-	if (skipReturn || (expected && T.isAny(expected)) || isPredicate)
+	if ((skipReturn && !generator) || (expected && T.isAny(expected)) || isPredicate)
 		expected = undefined;
 
 	// A muted re-walk of a declared-return-type function is skipped ONLY once it's already been stamped
@@ -2195,7 +2206,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		return;
 
 	const inner = new Scope(scope);
-	inner.functionAsync = async;
+	inner.functionKind = { async, yield: generatorTypes?.yield, next: generatorTypes?.next };
 	// `noStamp`: true only for the exact case the early-return above used to swallow entirely -- a muted
 	// (no `err`), declared-return-type, first-ever-walked (`fn.scope` unset, or this line wouldn't be
 	// reached at all) method belonging to a generic class's own instance scope
@@ -2334,14 +2345,10 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			}
 			const returnType = retDef.length ? T.widenNullish(T.combineTypes(retDef), inner) : alwaysThrows(body[body.length - 1]) ? T.NEVER : T.VOID;
 
-			if (generator) {
-				fn.returnType = TS.RefType(async ? 'AsyncGenerator' : 'Generator', [
-					yields!.length ? T.combineTypes(yields!) : T.NEVER,
-					returnType,
-					T.ANY,
-				]);
-			} else {
-				fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body.length === 1 && body[0].type === 'return' ? body[0].argument : undefined, returnType), inner, async);
+			if (!declaredReturn) {
+				fn.returnType = generator
+					? TS.RefType(async ? 'AsyncGenerator' : 'Generator', [yields!.length ? T.combineTypes(yields!) : T.NEVER, returnType, T.ANY])
+					: T.wrapReturnIfAsync(inferredPredicate(body.length === 1 && body[0].type === 'return' ? body[0].argument : undefined, returnType), inner, async);
 			}
 		}
 	} else {
@@ -2352,7 +2359,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		if (expected) {
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
 				err(SEVERITY.ERROR, (body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
-		} else if (!isPredicate) {
+		} else if (!isPredicate && !declaredReturn) {
 			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(T.widenLiterals(t), inner)), inner, async);
 		}
 	}

@@ -2575,44 +2575,70 @@ export function awaitType(t: Type, scope: Scope): Type {
 	return r;
 }
 
-export interface IterationTypes { yield: Type; return: Type }
+export interface IterationTypes { yield: Type; return: Type; next: Type }
+
+// The GLOBAL iteration types whose type arguments ARE their iteration types (TS's getIterationTypesOfIterableFast): its own lib
+// declares them through the protocol, but a bundled lib may not (towasm's `Generator` has only `next`). A bare Iterator is only a
+// generator's return type, never something to iterate.
+const ITERABLES		= new Set(['Iterable', 'IterableIterator', 'IteratorObject', 'Generator']);
+const ASYNC_ITERABLES	= new Set(['AsyncIterable', 'AsyncIterableIterator', 'AsyncIteratorObject', 'AsyncGenerator']);
+function globalIterationTypes(t: Type, scope: Scope, async: boolean, generatorReturn: boolean): IterationTypes | undefined {
+	if (t.type !== 'ref' || !((async ? ASYNC_ITERABLES : ITERABLES).has(t.name) || (generatorReturn && t.name === (async ? 'AsyncIterator' : 'Iterator'))))
+		return undefined;
+	let root = scope;
+	while (root.parent)
+		root = root.parent;
+	const entry = ownScope(t, scope).lookupType(t.name);
+	if (!entry?.typeParams || entry !== root.type(t.name))
+		return undefined;
+	const [y, r, n] = entry.typeParams.map((p, i) => t.typeArgs?.[i] ?? p.default ?? UNKNOWN);
+	return { yield: y ?? UNKNOWN, return: r ?? ANY, next: n ?? ANY };
+}
+
 
 // What iterating `t` yields, and returns once done (TS's iteration types): read off its `[Symbol.iterator]()` iterator's
 // `next()` result (`for await` tries `[Symbol.asyncIterator]` first). Without the protocol (an ES5 lib) only arrays and strings iterate.
-export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6): IterationTypes | undefined {
+export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6, generatorReturn = false): IterationTypes | undefined {
+	const fast = globalIterationTypes(t, scope, async, generatorReturn);
+	if (fast)
+		return fast;
 	const r = resolveOwn(t, scope);
 	if (isAny(r))
-		return { yield: ANY, return: ANY };
+		return { yield: ANY, return: ANY, next: ANY };
 	if (r.type === 'union' && depth > 0) {
 		const parts = r.types.map(m => iterationTypes(m, scope, async, depth - 1));
-		return parts.every(p => !!p) ? { yield: combineTypes(parts.map(p => p!.yield)), return: combineTypes(parts.map(p => p!.return)) } : undefined;
+		return parts.every(p => !!p) ? { yield: combineTypes(parts.map(p => p!.yield)), return: combineTypes(parts.map(p => p!.return)), next: combineTypes(parts.map(p => p!.next)) } : undefined;
 	}
 	const protocol = (key: string): IterationTypes | undefined => {
 		const iterator	= findFunctionType(lookupMember(t, key, scope) ?? NEVER, scope)?.returnType;
-		const next		= iterator && findFunctionType(lookupMember(substituteThisType(iterator, t), 'next', scope) ?? NEVER, scope)?.returnType;
+		const nextSig	= iterator && findFunctionType(lookupMember(substituteThisType(iterator, t), 'next', scope) ?? NEVER, scope);
+		const next		= nextSig?.returnType;
 		if (!next)
 			return undefined;
+
 		const yields: Type[] = [], returns: Type[] = [];
 		for (const m of unionMembers(key === '[Symbol.asyncIterator]' ? awaitType(next, scope) : next, scope)) {
 			const done = lookupMember(m, 'done', scope);
 			const d = done && resolveOwn(done, scope);
 			(d && isLiteral(d, 'boolean') && d.value === true ? returns : yields).push(lookupMember(m, 'value', scope) ?? UNDEFINED);
 		}
-		return { yield: combineTypes(yields), return: combineTypes(returns) };
+		// `next`: what `next(v)` accepts, which a generator's `yield` evaluates to -- `next(...[value]: [] | [TNext])` spells it as a rest.
+		return { yield: combineTypes(yields), return: combineTypes(returns),
+			next: nextSig.params[0]?.typeAnnotation ?? (nextSig.rest?.typeAnnotation && restArgType(nextSig.rest.typeAnnotation, 0, scope)) ?? UNDEFINED };
 	};
 	if (async) {
 		const own = protocol('[Symbol.asyncIterator]');
 		if (own)
 			return own;
 		const sync = iterationTypes(t, scope, false, depth);
-		return sync && { yield: awaitType(sync.yield, scope), return: sync.return };
+		return sync && { ...sync, yield: awaitType(sync.yield, scope) };
 	}
 	const found = protocol('[Symbol.iterator]');
 	if (found)
 		return found;
 	const direct = r.type === 'array' ? r.element
 		: arrayLikeElement(r) ?? (r.type === 'tuple' ? combineTypes(r.elements.map(tupleElementType).filter(x => !!x)) : isString(r) ? STRING : undefined);
-	return direct && { yield: direct, return: UNDEFINED };
+	return direct && { yield: direct, return: UNDEFINED, next: UNDEFINED };
 }
 
 export function unwrapIfAsync(t: Type, scope: Scope, async: boolean|undefined): Type {
@@ -2723,15 +2749,16 @@ export class Scope {
 	// augments a same-named global one; a module's top level, and any block, is its own space instead.
 	globalSpace = false;
 
-	// Set on a function body's own scope: whether that function is `async` -- `yield`/`yield*` in an async generator await/iterate asynchronously.
-	functionAsync?: boolean;
+	// Set on a function body's own scope: whether it is `async` (an async generator's `yield`/`yield*` await and iterate asynchronously), and for
+	// a generator with a declared type what its `yield` must produce and evaluates to.
+	functionKind?: { async: boolean; yield?: Type; next?: Type };
 
 	// `false` on a program's scope: `strictNullChecks` off, so `null`/`undefined` belong to every type. Unset inherits; the root is strict.
 	nullChecks?: boolean;
 
 	constructor(public parent?: Scope, private genericTemplate?: boolean) {}
 
-	inAsyncFunction(): boolean						{ return this.functionAsync ?? !!this.parent?.inAsyncFunction(); }
+	enclosingFunction(): Scope['functionKind']		{ return this.functionKind ?? this.parent?.enclosingFunction(); }
 	strictNullChecks(): boolean						{ return this.nullChecks ?? this.parent?.strictNullChecks() ?? true; }
 
 	hitDepthLimit(fn: string): void					{ this.parent?.hitDepthLimit(fn); }
