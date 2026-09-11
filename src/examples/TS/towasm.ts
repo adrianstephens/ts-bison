@@ -5,7 +5,7 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import * as Common from '../common';
 import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
-import { checkBlock, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
+import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
 import { Walkable, walk, walkB } from './walker';
 import { Output } from './tocode';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary, patternBindings } from './transform';
@@ -1636,6 +1636,9 @@ export function makeLibScope(): Scope {
 // down with it -- which is exactly what made the self-hosting survey attribute ~35 declarations to
 // whichever module-level statement happened to fail first. Omitted (the CLI's case) it rethrows, since a
 // module whose initialisation silently didn't run is not something to hand back without comment.
+// Module-level, not per compile: a module record outlives one `TStoWasm` call, and its stamps are first-wins.
+const checkedModules = new WeakSet<Module>();
+
 export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
@@ -1669,6 +1672,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// cases in the scan below are all entry-only by design.
 	const LIB_MODULE			= '#lib';
 	const moduleBodies			= new Map<string, Module>([['.', ast], ...(modules ?? [])]);
+	// The checker only HOISTS an imported module; codegen needs its bodies' stamps (narrowing, local annotations).
+	for (const m of modules?.values() ?? []) {
+		if (m.scope && !checkedModules.has(m)) {
+			checkedModules.add(m);
+			checkHoisted(m.body, m.scope as Scope);
+		}
+	}
 	// That module's own scope, straight off its record -- the entry's from its own `Program`, an imported
 	// one put there by `makeScope` from `exportScope`'s `inner` (see `compileFunc`'s own note on why a
 	// module body needs one at all).
@@ -2061,7 +2071,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// `emitAs`. `if (slot === null) slot = <init>; return slot!;`
 			ctx.emit(I.global.get(g.index), I.ref.is_null);
 			const old = ctx.swapOut();
-			emitAs(d.init!, ctx, g.wtype);
+			// The declared type is the initializer's context, as for a local: `[{...}]` builds `Rules<Mod>`'s own shape.
+			withContext(ctx, checkedType, () => emitAs(d.init!, ctx, g.wtype));
 			ctx.emit(I.global.set(g.index));
 			ctx.emit(I.if(undefined, ctx.swapOut(old)));
 			// `coerceTop`, not a bare `ref.as_non_null`: `nullableWtype` BOXES a scalar slot, so for an
@@ -3319,9 +3330,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// ref type can't exist without that class having gone through `ensureClass` first) rather than taking
 	// `ClassInfo`s directly, since `coerceTop`'s callers only ever have the bare `WasmType`'s own ref name.
 	function isSubclassOf(subName: string, baseName: string): boolean {
+		const base = classes.get(baseName);
 		let cls = classes.get(subName);
 		while (cls) {
-			if (cls.name === baseName)
+			// By identity too: a shared object shape is reachable under more than one key.
+			if (cls.name === baseName || cls === base)
 				return true;
 			cls = cls.superClass;
 		}
@@ -4142,7 +4155,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// -- defaults to the calling function's own (`ctx.homeModule`); a namespace-qualified call site
 	// (`NS.foo(...)`) passes the *target* module explicitly instead, so `foo` resolves against the
 	// declaring file's own top level, not the caller's.
-	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Type, homeModule: string = ctx.homeModule): WasmType {
+	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Expected, homeModule: string = ctx.homeModule): WasmType {
 		let decl;
 		const builtin = builtins[name] ?? moduleAsmBuiltins.get(homeKey(homeModule, name));
 		if (builtin) {
@@ -5592,8 +5605,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
 							throw `object literal for '${owner.name}' can only have plain 'key: value' properties (no methods or computed keys)`;
 						ctx.emit(I.local.get(mapLocal.index));
-						emitMethodCall(owner, 'set', [{ type: 'literal', value: p.key }, p.value], ctx);
-						//ctx.emit(I.drop);
+						if (emitMethodCall(owner, 'set', [{ type: 'literal', value: p.key }, p.value], ctx) !== 'void')
+							ctx.emit(I.drop);
 					}
 					ctx.emit(I.local.get(mapLocal.index));
 					return owner.thisWtype!;
@@ -6426,7 +6439,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// `contextualReturn`'s own comment on why that would be wrong).
 					const contextualReturn = ctx.contextualReturn;
 					ctx.contextualReturn = undefined;
-					return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn);
+					return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn ?? (() => checkerTypeOf(e, ctx.scope)));
 				}
 
 				// `obj?.method(...)` -- the `?.` sits on the `member` callee (or a chain further out
@@ -7579,7 +7592,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// file ever has, same as `paramType`/`compileFunc` already assume elsewhere -- no separate "declaring
 	// module" to track the way `T.declScopeOf` exists for (a cross-module signature, which nothing here
 	// ever is).
-	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Type, returnType?: Type): Map<string, Type> {
+	type Expected = Type | (() => Type);
+	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, returnType?: Type): Map<string, Type> {
 		const map = new Map<string, Type>();
 		if (typeArgs) {
 			typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
@@ -7591,8 +7605,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (p?.typeAnnotation && a.type !== 'spread')
 					T.inferTypeArgs(p.typeAnnotation, checkerTypeOf(a, scope), names, map, libGlobal, libGlobal, deferred);
 			});
-			if (expected && returnType)
-				T.inferTypeArgs(returnType, expected, names, map, libGlobal);
+			// Where the result is going also REPLACES an `any` the arguments left: the instantiation built has to be
+			// the one its destination can hold, and the checker's own type for the call already solved it.
+			if (expected && returnType && typeParams.some(p => !map.has(p.name) || T.isAny(map.get(p.name)!))) {
+				const fromExpected = new Map<string, Type>();
+				T.inferTypeArgs(returnType, typeof expected === 'function' ? expected() : expected, names, fromExpected, libGlobal);
+				for (const [k, v] of fromExpected)
+					if (!map.has(k) || (T.isAny(map.get(k)!) && !T.isAny(v)))
+						map.set(k, v);
+			}
 			for (const { paramT, argT } of deferred)
 				T.inferTypeArgs(paramT, argT, names, map, libGlobal);
 			typeParams.forEach(p => {
@@ -7612,7 +7633,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// difference from a class reference: a function's type arguments are usually left implicit at the call
 	// site, inferred from the arguments (`inferTypeArgMap`, above). Explicit call-site type args
 	// (`identity<number>(5)`) are honored too, same as a class's are.
-	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Type, homeModule = '.'): FuncInfo {
+	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, homeModule = '.'): FuncInfo {
 		const typeParams	= decl.typeParams!;
 		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, scope, expected, decl.returnType as Type | undefined);
 		// Bare (unmangled) composite key -- `compileFunc` applies `homeKey` itself when it caches, so this
@@ -8419,8 +8440,23 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			classes.set(key, shared);
 			return shared;
 		}
-		const info = buildObjectShape(key, resolved.members, ref, name, !everExtended.has(name));
+		// `interface X extends Y` puts Y's fields first, so X's struct can be a wasm SUBTYPE of Y's: an X then IS a Y.
+		const top		= T.resolve(scope, ref);
+		const baseRef	= top.type === 'intersection' && top.types[0].type === 'ref' ? top.types[0] : undefined;
+		const base		= baseRef && ensureObjectShape(baseRef.name, baseRef.typeArgs, T.ownScope(baseRef, scope));
+		const reached	= classes.get(key);
+		if (reached)
+			return reached;
+		const basePos	= new Map(base?.fields.map((f, i) => [f.name, i]));
+		const at		= (m: TS.TypeMember) => ('key' in m && typeof m.key === 'string' ? basePos.get(m.key) : undefined) ?? Infinity;
+		const info		= buildObjectShape(key, base ? [...resolved.members].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name));
 		classes.set(structural, info);
+		const baseType = base && types[base.typeIndex];
+		if (base && baseType && 'final' in baseType && !baseType.final && base.fields.every((f, i) =>
+			info.fields[i]?.name === f.name && !!info.fields[i].optional === !!f.optional && wasmTypeEq(info.fields[i].wtype, f.wtype))) {
+			info.superClass = base;
+			(types[info.typeIndex] as { supertypes: number[] }).supertypes = [base.typeIndex];
+		}
 		if (!typeArgs?.length)
 			return info;
 		// Two instantiations of one generic shape with the same physical layout (`Lit<any>`, `Lit<string | null>`)
@@ -9932,6 +9968,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				directSubclasses.set(superName, [d]);
 		}
 	}
+	// An `extends`ed interface's shape must stay non-final, so the extending shape can name it as its supertype.
+	const markExtendedInterfaces = (body: readonly TS.Stmt[]): void => body.forEach(s => {
+		if (s.type === 'interface_decl')
+			s.extendsClause?.forEach(b => b.type === 'ref' && everExtended.add(b.name));
+		else if (s.type === 'export_decl')
+			markExtendedInterfaces([s.declaration as TS.Stmt]);
+		else if (s.type === 'namespace_decl' || s.type === 'module_decl')
+			markExtendedInterfaces(s.body as TS.Stmt[]);
+	});
+	markExtendedInterfaces(LIB_AST);
+	for (const m of moduleBodies.values())
+		markExtendedInterfaces(m.body);
 
 	//top level
 	const {funcIndex, typeIndex} = registerFunc([], []);

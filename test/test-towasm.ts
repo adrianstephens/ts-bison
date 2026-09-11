@@ -6200,6 +6200,36 @@ async function main() {
 			}
 		`);
 		check('x?.disc === lit on a union / nullable receiver from find()', r11.optDisc(), 202020);
+
+		// ts-parser.ts's `const parser = make()`: `makeCachedParser<T>(spec): Parser<T>` returns `makeParser`'s `LALRParser<T>`.
+		const r12 = await compile(`
+			interface Rule<T> { syms: string[]; action: ($: any[]) => T }
+			type Rules<T> = Rule<T>[];
+			interface Spec<T> { start: Rules<T>; skip?: string; rules?: Record<string, Rules<any>> }
+			interface P<T> { name: string; parse(s: string): T | undefined }
+			interface LP<T> extends P<T> { tables: number }
+			interface Mod { type: 'module'; body: number[] }
+			const base: Record<string, Rules<any>> = {};
+			const program: Rules<Mod> = [{ syms: [], action: $ => ({ type: 'module', body: [1, 2] }) }];
+			function makeParser<T>(spec: Spec<T>): LP<T> { return { name: spec.skip ?? 'p', tables: 0, parse: (s: string) => spec.start[0].action([s]) }; }
+			function cached<T>(spec: Spec<T>): P<T> { return makeParser(spec); }
+			function make() { return cached({ skip: 'ws', start: program as Rules<Mod>, rules: { ...base, extra: program } }); }
+			const parser = make();
+			export function parse(): number { const m = parser.parse('abc'); return parser.name.length * 10 + (m ? m.body.length : -1); }
+		`);
+		check('an extending interface upcasts to its base; a generic call is built for its destination', r12.parse(), 22);
+
+		// tableCache.ts's `let cached: CacheFile | undefined`: an imported module's bodies were never checked (only
+		// hoisted), so a local annotated with a module-private interface had no scope to resolve in.
+		const r13 = await compileMulti({
+			tcmod: `
+				interface CacheFile { fingerprint: string; tables: { a: number[][] } }
+				export function load<T>(v: T): number { let cached: CacheFile | undefined; if (v) cached = { fingerprint: 'xy', tables: { a: [[1]] } }; return cached ? cached.fingerprint.length : 0; }
+				export function load2(v: boolean): number { let cached: CacheFile | undefined; if (v) cached = { fingerprint: 'xyz', tables: { a: [[1]] } }; return cached ? cached.fingerprint.length : 0; }
+			`,
+			main: `import { load, load2 } from './tcmod'; export function main(): number { return load(true) * 1000 + load(false) * 100 + load2(true) * 10 + load2(false); }`,
+		}, 'main');
+		check("an imported module's local annotated with its own private interface", r13.main(), 2030);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 
