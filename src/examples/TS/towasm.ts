@@ -1566,9 +1566,15 @@ function collectRangeWidenings(body: Stmt[], scope: Scope): Map<JS.Var<Type>, Ty
 // own comment for how this compiles). Matched structurally (a `call` through `Object.defineProperty`
 // by name), not by any special-cased identifier elsewhere -- this is the one and only place that
 // shape is recognized.
+// A call to one of `Object`'s compiler intrinsics (lib.d.ts's `declare var Object`): compiled by its own emitter, never
+// through `Object` as a value -- which has no runtime shape to build an owner from.
+const OBJECT_INTRINSICS = new Set(['entries', 'keys', 'values', 'defineProperty']);
+function objectIntrinsic(e: Expr): string | undefined {
+	return e.type === 'call' && e.callee.type === 'member' && e.callee.object.type === 'identifier' && e.callee.object.name === 'Object'
+		&& OBJECT_INTRINSICS.has(e.callee.property) ? e.callee.property : undefined;
+}
 function isDefinePropertyCall(e: Expr): e is JS.Call<Type> & { callee: JS.Member<Type> } {
-	return e.type === 'call' && e.callee.type === 'member' && e.callee.object.type === 'identifier'
-		&& e.callee.object.name === 'Object' && e.callee.property === 'defineProperty';
+	return objectIntrinsic(e) === 'defineProperty';
 }
 
 // Whole-body presence check only -- used before a generic function's own substituted body ever starts
@@ -6616,10 +6622,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// `Object.entries` -- a known global intrinsic (see `emitObjectEntries`'s own comment for
 						// why this can't just be `namespaceOwner`/`ensureClass`-dispatched like an ordinary static
 						// method), checked before the generic paths below.
-						if (obj.name === 'Object' && (e.callee.property === 'entries' || e.callee.property === 'keys' || e.callee.property === 'values'))
-							return emitObjectEntries(e.arguments, ctx, e.callee.property);
-						if (obj.name === 'Object' && e.callee.property === 'defineProperty')
+						const intrinsic = objectIntrinsic(e);
+						if (intrinsic === 'defineProperty')
 							return emitObjectDefineProperty(e.arguments, ctx);
+						if (intrinsic)
+							return emitObjectEntries(e.arguments, ctx, intrinsic as 'entries' | 'keys' | 'values');
 						// A namespace-import-qualified call (`NS.foo(...)`, `import * as NS from '...'`) into
 						// another module -- checked before `namespaceOwner`, which only knows about real classes/
 						// lib namespaces (`Math`, `Array`), never an actual cross-file import; only takes this
@@ -6882,7 +6889,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// would still look nullable to `checkerTypeOf` here and member/call resolution could fail
 					// on it. Falls back to `ctx.scope` only if somehow unset (shouldn't happen post-`TStypeCheck`).
 					const stmtScope = (s as any).scope as Scope ?? ctx.scope;
-					const {methodOwner, methodName, calleeOptional} = d.init.type === 'call' && d.init.callee.type === 'member'
+					const {methodOwner, methodName, calleeOptional} = d.init.type === 'call' && d.init.callee.type === 'member' && !objectIntrinsic(d.init)
 						? {methodOwner: ownerOf(d.init.callee.object, ctx), methodName: d.init.callee.property, calleeOptional: d.init.callee.optional}
 						: {};
 
