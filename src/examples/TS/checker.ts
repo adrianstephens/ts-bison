@@ -788,7 +788,11 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 										return mr.min !== undefined && mr.min === mr.max && mr.min === v ? false : true;
 									}
 								}
-								return true;
+								// TS's areTypesComparable: on the matching branch a member the value is comparable with neither way (an object
+								// shape against a string) cannot be it.
+								// In this checker's own representation: a numeric unit is a one-value range, as a numeric literal types.
+								const lit: Type = typeof v === 'number' ? TS.RangeType('number', v, v, Number.isInteger(v)) : typeof v === 'bigint' ? TS.RangeType('bigint', v, v) : Literal(v);
+								return !keepMatch || T.isAssignable(lit, m, scope) || T.isAssignable(m, lit, scope);
 							});
 						if (l.type === 'identifier' && unitKeep)
 							return narrowValue(scope, l.name, unitKeep);
