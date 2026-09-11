@@ -1827,12 +1827,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// "Does this module already have this array type" WITHOUT creating it -- `ensureArrayType` would
 	// register one as a side effect, and a candidate scan asking speculative questions must not add types
 	// nothing uses. If the type is absent, no value of that kind exists to reach an `any` slot anyway.
-	function hasArrayType(kind: WasmElementI): boolean {
-		const key = wTypeKey(arrayTypeDesc(kind));
+	function hasType(desc: wasm.SubType): boolean {
+		const key = wTypeKey(desc);
 		return key !== undefined && typeMap.has(key);
 	}
+	function hasArrayType(kind: WasmElementI): boolean {
+		return hasType(arrayTypeDesc(kind));
+	}
+	const boxTypeDesc = (kind: WasmScalarI): wasm.SubType =>
+		({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } });
 	function ensureBoxType(kind: WasmScalarI): number {
-		return registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } });
+		return registerType(boxTypeDesc(kind));
 	}
 
 	// One project-wide exception tag, `(anyref) -> ()` -- JS/TS `catch(e)` is untyped and catches any thrown value regardless of its real TS type, so there's no reason for more than one tag
@@ -6129,6 +6134,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const leftInfo	= operandInfo(left, ctx);
 						const method	= BINARY_OP_NAMES[operator as keyof typeof BINARY_OP_NAMES];
 
+						// With a boxed `any` on either side, what `===` means is only known at runtime.
+						const isBoxedAny = (w: WasmType | undefined) => !!w && typeof w !== 'string' && 'ref' in w && w.ref === 'any';
+						if ((method === 'eq' || method === 'ne') && (isBoxedAny(leftInfo.wtype) || isBoxedAny(rightInfo.wtype))) {
+							emitAs(left, ctx, REF_ANY_NULLABLE);
+							emitAs(right, ctx, REF_ANY_NULLABLE);
+							ctx.emit(I.call(ensureAnyStrictEq().funcIndex));
+							if (method === 'ne')
+								ctx.emit(I.i32.eqz);
+							return 'i32';
+						}
+
 						// JS `+` is string CONCATENATION as soon as either operand is a string, whatever
 						// the other one is. Compiled as the equivalent template literal so it goes through
 						// exactly the `stringTemplate`/`.toString()` path `${x}` already does, rather than
@@ -6184,22 +6200,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 						if (method === 'eq' || method === 'ne') {
 							if (leftInfo.wtype && !scalarKind(leftInfo.wtype) && !scalarKind(rightInfo.wtype)) {
-								// `ref.eq` requires `eqref`-typed operands. A boxed-`any` value (a generic `T[]`'s
-								// own physical element representation when `T` substitutes to a ref type -- see
-								// `case 'array'`'s/`case 'index'`'s own comments on why that's always boxed
-								// `anyref`, regardless of what the substituted TS type claims) is only ever
-								// statically `anyref`, a strict supertype `ref.eq` rejects outright even though
-								// every real value it can hold here is always actually eq-comparable (this
-								// compiler never puts a `func`/`extern` value in one) -- narrow it with
-								// `ref.cast eq` first. A concrete class/array ref (not boxed `any`) is already a
-								// real subtype of `eqref` and reaches here unchanged.
-								const isBoxedAny = (w: WasmType) => typeof w !== 'string' && 'ref' in w && w.ref === 'any';
 								emitAs(left, ctx, leftInfo.wtype);
-								if (isBoxedAny(leftInfo.wtype))
-									ctx.emit(I.ref.cast('eq', true));
 								emitAs(right, ctx, leftInfo.wtype);
-								if (isBoxedAny(leftInfo.wtype))
-									ctx.emit(I.ref.cast('eq', true));
 								ctx.emit(I.ref.eq);
 								if (method === 'ne')
 									ctx.emit(I.i32.eqz);
@@ -9296,6 +9298,42 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				});
 			}
 			info.body = dctx.toFuncBody(1, toValType);
+		});
+		return info;
+	}
+
+	// JS `===` when either side is a boxed `any`: a string or boxed primitive compares by VALUE, anything else by
+	// identity. Only kinds whose wasm type exists are tested -- a value of an absent kind can't be in the slot.
+	let anyStrictEqFunc: FuncInfo | undefined;
+	function ensureAnyStrictEq(): FuncInfo {
+		if (anyStrictEqFunc)
+			return anyStrictEqFunc;
+		const param = (key: string) => ({ key, wtype: REF_ANY_NULLABLE, tsType: T.ANY });
+		const { funcIndex, typeIndex } = registerFunc(toParams2([param('a'), param('b')]), toResults('i32'));
+		const info: FuncInfo = anyStrictEqFunc = { params: [REF_ANY_NULLABLE, REF_ANY_NULLABLE], result: 'i32', funcIndex, typeIndex };
+		funcs.set('<any ===>', info);
+
+		lateWorklist.push(() => {
+			const dctx	= new FunctionContext('any_strict_eq', new Scope(libGlobal), plainReturn('i32'), undefined);
+			const a		= dctx.declareLocal('$a', REF_ANY_NULLABLE);
+			const b		= dctx.declareLocal('$b', REF_ANY_NULLABLE);
+			const arms: { heap: number; compare: wasm.Instr[] }[] = [];
+			if (hasArrayType('i16')) {
+				const heap = ensureArrayType('i16');
+				arms.push({ heap, compare: [I.local.get(a.index), I.ref.cast(heap), I.local.get(b.index), I.ref.cast(heap), I.call(ensureMethod(builtinTypeOwner('string')!, 'eq', [], dctx)!.funcIndex)] });
+			}
+			for (const [kind, eq] of [['f64', I.f64.eq], ['i32', I.i32.eq], ['i64', I.i64.eq]] as const) {
+				if (hasType(boxTypeDesc(kind))) {
+					const heap = ensureBoxType(kind);
+					const read = (l: number) => [I.local.get(l), I.ref.cast(heap), I.struct.get(heap, 0)];
+					arms.push({ heap, compare: [...read(a.index), ...read(b.index), eq] });
+				}
+			}
+			const buildArm = (i: number): wasm.Instr[] => i >= arms.length
+				? [I.local.get(a.index), I.ref.cast('eq', true), I.local.get(b.index), I.ref.cast('eq', true), I.ref.eq]
+				: [I.local.get(a.index), I.ref.test(arms[i].heap), I.local.get(b.index), I.ref.test(arms[i].heap), I.i32.and, I.if('i32', arms[i].compare, buildArm(i + 1))];
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(2, toValType);
 		});
 		return info;
 	}

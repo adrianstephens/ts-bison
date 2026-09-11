@@ -6139,6 +6139,33 @@ async function main() {
 		check('a method on a .map() result, on a union and a plain receiver', r8.findOnMapped(), 3204);
 		check('a method on a union of arrays with different element types', r8.mixedUnion(), 73);
 		check('a union of tuples: a literal index reads per position and discriminates', r8.tupleUnion(), 53);
+
+		// `===` with a boxed `any` operand compared by identity: two equal strings, or two boxes of one number,
+		// were unequal -- and so was `['x', 'yy'].indexOf('y' + 'y')`, since `Array<any>` compiles `this[i] === x`.
+		const r9 = await compile(`
+			function t(c: boolean, bit: number): number { return c ? bit : 0; }
+			class P { x = 1; }
+			export function anyEq(): number {
+				const s: any = 'lit'; const s2: any = 'li' + 't'; const n: any = 1.5; const n2: any = 3 / 2; const o: any = { a: 1 }; const o2: any = { a: 1 };
+				const str: string = 'lit'; const num: number = 1.5;
+				return t(s === 'lit', 1) + t(s === s2, 2) + t('lit' === s, 4) + t(s === str, 8) + t(str === s, 16)
+					+ t(n === 1.5, 32) + t(n === n2, 64) + t(n === num, 128) + t(num === n, 256)
+					+ t(o === o, 512) + t(o !== o2, 1024) + t(s !== 'lit', 2048) + t(n !== n2, 4096);
+			}
+			export function anyEqEdges(): number {
+				const nan: any = NaN; const one: any = 1; const tru: any = true; const s1: any = '1'; const u: any = undefined; const p = new P(); const ap: any = p;
+				const arr: any[] = [1, 'a', NaN, p];
+				let sw = 0;
+				const k: any = 'b' + '';
+				switch (k) { case 'a': sw = 1; break; case 'b': sw = 2; break; default: sw = 3; }
+				return t(nan !== nan, 1) + t(one !== tru, 2) + t(one !== s1, 4) + t(u !== one, 8) + t(ap === p, 16) + t(p === ap, 32)
+					+ t(arr.includes(NaN), 64) + t(arr.indexOf(NaN) === -1, 128) + t(arr.indexOf('a') === 1, 256) + t(arr.indexOf(p) === 3, 512) + t(sw === 2, 1024);
+			}
+			export function strIndexOf(): number { const a = ['x', 'yy', 'zzz']; const k = 'y' + 'y'; return a.indexOf(k) * 10 + (a.includes('zz' + 'z') ? 1 : 0); }
+		`);
+		check('=== on a boxed any compares strings and numbers by value', r9.anyEq(), 2047);
+		check('=== on a boxed any: NaN, mixed kinds, undefined, objects, includes, switch', r9.anyEqEdges(), 2047);
+		check('indexOf/includes on a string array compare by value', r9.strIndexOf(), 11);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 
