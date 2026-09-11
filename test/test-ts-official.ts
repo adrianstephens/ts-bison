@@ -29,6 +29,7 @@ const sev = { clean: [] as number[], expectErr: [] as number[] };
 let failed = { clean: 0, expectErr: 0 }, tested = 0, unsupported = 0;
 const falsePositives: string[] = [];			// clean-bucket files where we emit an ERROR or throw
 const gaps: string[] = [];						// clean-bucket GAP diagnostics, listed so an A/B can say WHICH moved
+const caught: string[] = [];					// expectErr-bucket ERRORs: an A/B diff shows real errors a change silenced
 
 let errset: Set<string>;
 
@@ -54,6 +55,8 @@ async function testFile(filename: string) {
 					falsePositives.push(`${path.relative(TS_REPO, filename)}\t${d.pos.line}:${d.pos.col}\t${d.message.split('\n')[0]}`);
 				if (bucket === 'clean' && d.severity === SEVERITY.GAP)
 					gaps.push(`${path.relative(TS_REPO, filename)}\t${d.pos.line}:${d.pos.col}\t${d.message.split('\n')[0]}`);
+				if (bucket === 'expectErr' && d.severity === SEVERITY.ERROR)
+					caught.push(`${path.relative(TS_REPO, filename)}\t${d.pos.line}:${d.pos.col}\t${d.message.split('\n')[0]}`);
 			}
 		} catch (e) {
 			// Syntax tsc accepts but this parser deliberately never will: neither a gap nor a false positive.
@@ -97,6 +100,7 @@ async function testDir(dir: string) {
 	console.log(line('tsc-clean', failed.clean, sev.clean));
 	console.log(line('tsc-errors', failed.expectErr, sev.expectErr));
 	gaps.sort().forEach(l => console.log(`  gap\t${l}`));
+	caught.sort().forEach(l => console.log(`  caught\t${l}`));
 	console.log(`\n${falsePositives.length} ERROR/throw on tsc-clean files (our false positives):`);
 
 	if (falsePositives.length) {
