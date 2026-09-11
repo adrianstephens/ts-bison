@@ -77,7 +77,14 @@ declare type u64 = number;
 declare var NaN: number;
 declare var Infinity: number;
 
-interface Function {}
+interface Function {
+	apply(this: Function, thisArg: any, argArray?: any): any;
+	call(this: Function, thisArg: any, ...argArray: any[]): any;
+	bind(this: Function, thisArg: any, ...argArray: any[]): any;
+	toString(): string;
+	readonly length: number;
+	readonly name: string;
+}
 interface CallableFunction {}
 interface NewableFunction {}
 interface IArguments {}

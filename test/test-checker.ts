@@ -77,6 +77,8 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a truthy optional chain narrows its roots', 'declare const f: (() => boolean) | undefined, x: string[] | undefined; if (f?.()) { const g: () => boolean = f; } if (x?.[0]) { const n: string[] = x; }', []],
 	['an exiting branch does not merge',	'declare const c: boolean; function f() { let y; if (c) y = "s"; else return; const q: number = y; }', [NOT_ASSIGNABLE('string', 'number')]],
 	['reduce with and without a seed',		'const r: string = [1, 2].reduce((a, v) => a + v, ""); const s: boolean = [1, 2].reduce((a, v) => a + v);', [NOT_ASSIGNABLE('number', 'boolean')]],
+	['functions have Function members',		'function f(a: number) {} f.call(null, 1); const n: string = f.length;',					[NOT_ASSIGNABLE('number', 'string')]],
+	['an expando assignment declares, not narrows', 'const E = function () {}; E.prop = { x: 2 }; E.prop = { y: "" }; const n = E.prop.x || 0;', []],
 ];
 
 (async () => {

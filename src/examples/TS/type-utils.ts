@@ -830,13 +830,17 @@ function arrayMember(elem: Type, prop: string, scope: Scope, depth: number): Typ
 		: withReturnType(declared, ret) ?? TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(ANY)) }, ret);
 }
 
-// `Object.prototype`'s members, for object types that don't declare their own: the global `Object` interface's, as the lib declares them.
-function objectPrototypeMember(prop: string, scope: Scope): Type | undefined {
+// A member a type gets from a global interface (`Object`, or `Function` for anything callable), as the lib declares it: the
+// apparent type TS reads members off when the type itself doesn't declare them.
+function globalInterfaceMember(name: 'Object' | 'Function', prop: string, scope: Scope): Type | undefined {
 	let root = scope;
 	while (root.parent)
 		root = root.parent;
-	return root.type('Object') ? lookupMember(TS.RefType('Object'), prop, root, 4, true) : undefined;
+	return root.type(name) ? lookupMember(TS.RefType(name), prop, root, 4, true) : undefined;
 }
+const objectPrototypeMember = (prop: string, scope: Scope) => globalInterfaceMember('Object', prop, scope);
+// Anything with call or construct signatures has `Function`'s members (`apply`/`call`/`bind`), then `Object`'s.
+const callablePrototypeMember = (prop: string, scope: Scope) => globalInterfaceMember('Function', prop, scope) ?? objectPrototypeMember(prop, scope);
 
 // `T[]` really is `Array<T>` (a `readonly: true` one `ReadonlyArray<T>`) -- turns the structural `'array'` node into the real named
 // ref wherever it's compared, instead of bridging two representations at every call site.
@@ -1897,8 +1901,12 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				// silently misrouting overload resolution (`isAssignable`'s own `dst.type === 'object'` case). A *string*
 				// index signature is untouched -- it always did (and still does) cover every named key, correctly.
 				// A numeric key prefers the numeric signature, which real TS requires to be the more specific of the two.
-				return indexSignatureFor(t.members, prop, scope) ?? objectPrototypeMember(prop, scope);
+				return indexSignatureFor(t.members, prop, scope)
+					?? (t.members.some(m => m.type === 'call' || m.type === 'construct') ? callablePrototypeMember : objectPrototypeMember)(prop, scope);
 			}
+			case 'function':
+			case 'constructor':
+				return callablePrototypeMember(prop, scope);
 			case 'intersection': {
 				const matches: Type[] = [];
 				for (const part of t.types) {

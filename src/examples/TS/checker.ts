@@ -2081,11 +2081,17 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				}
 
 				if (err && (e.target.type === 'identifier' || e.target.type === 'member' || e.target.type === 'index')) {
+					let expando = false;
 					if (e.target.type === 'identifier') {
 						lt = scope.declared(e.target.name) || lt;
 					} else if (e.target.type === 'member') {
 						const objT = recurse(e.target.object);
-						lt = T.optional(T.lookupMember(objT, e.target.property, scope) || lt, T.memberOptional(objT, e.target.property, scope));
+						// A property assigned to a function declaration, or a `const` holding a function expression, is DECLARED by that
+						// assignment (TS's expando, `foo.meta = 1`), not checked against the members `Function`/`Object` lend it.
+						const holder = e.target.object.type === 'identifier' ? e.target.object.name : undefined;
+						const init = holder !== undefined ? scope.alias(holder) : undefined;
+						expando = holder !== undefined && (scope.decl(holder)?.type === 'function_decl' || init?.type === 'function' || init?.type === 'arrow');
+						lt = expando ? rt : T.optional(T.lookupMember(objT, e.target.property, scope) || lt, T.memberOptional(objT, e.target.property, scope));
 					} else if (e.target.type === 'index') {
 						// A typed-array write accepts any real `number` (silently truncated/wrapped via the
 						// element's own real JS coercion, never a type error) -- unlike a read, so the narrow
@@ -2103,8 +2109,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							checkExcessProps(e.value, lt, pos, scope, err);
 							// Later statements see the assigned type, not the wider declared one. `pathKey`, not just an identifier: a
 							// dotted target narrows the same way a bare name does, via the same narrowings map.
+							// Not an expando: its type is the union of ALL its assignments (not collected yet), so one of them is too narrow.
 							const key = T.pathKey(e.target);
-							if (key)
+							if (key && !expando)
 								// Always widens for the narrowed-forward type, regardless of this call's own `widen` (a side effect
 								// on `scope`, not part of the return value) -- matches plain JS assignment semantics: `x = 5` narrows
 								// `x` to `number` from here on, not literal `5`, whether or not *this* expression's own answer is widened.
