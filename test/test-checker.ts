@@ -47,6 +47,14 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['superclass type arguments',		'declare class Base<P> { readonly props: Readonly<P>; } interface CP { ref?: () => void; } class X extends Base<CP> { m() { const a: number = this.props.ref; } }', ["is not assignable to type 'number'"]],
 	['numeric index answers numbers only', 'declare const s: String; const p = s.push;',												["Property 'push' does not exist"]],
 
+	// class references compare by their members; shadowing, tuple contexts and readonly are respected
+	['unrelated classes',				'class A { a = 1; } class B { b = ""; } const x: A = new B();',							["Type 'B' is not assignable to type 'A'"]],
+	['an array is not a number',		'const n: number = [1];',																["is not assignable to type 'number'"]],
+	['a method type parameter shadows', 'class G<T> { foo<T>(t: T): T { return t; } } declare const g: G<string>; const r: number = g.foo(1);', []],
+	['a union of tuples is a tuple context', "type TA = ['a', number]; type TB = ['b', string]; declare function f(c: TA | TB): void; f(['a', 5]); f(['b', 'x']);", []],
+	['as const under a mutable context', 'const a = [1, 2] as const satisfies unknown[];',										[]],
+	['readonly tuple into a mutable array', 'declare const r: readonly [number]; const m: number[] = r;',						["is not assignable to type 'number[]'"]],
+
 	// equality narrows by any unit-typed operand, and enum members are types
 	['enum member discriminant',		'enum Kind { A, B } interface Base { kind: Kind } interface A extends Base { kind: Kind.A; yar: number } interface B extends Base { kind: Kind.B; gar: number } declare const foo: A | B; switch (foo.kind) { case Kind.A: const myA: A = foo; break; case Kind.B: const myB: B = foo; }', []],
 	['const-named unit narrows',		'declare const x: "a" | "b"; const k = "a"; if (x === k) { const q: "a" = x; }',		[]],

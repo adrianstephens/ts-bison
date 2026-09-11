@@ -145,7 +145,13 @@ function resolveFnMember(t: Type, scope: Scope): TS.CallSig | undefined {
 // A CONST CONTEXT travels as the expected type (`as const`'s own annotation), which keeps it cache-safe:
 // `recurseCache` keys on (node, expected), so a node seen both inside and outside one cannot poison either.
 const CONST_CONTEXT: Type = TS.RefType('const');
-const isConstContext = (t: Type | undefined) => t?.type === 'ref' && t.name === 'const' && !t.typeArgs;
+// `as const` under a context with a mutable array-like member builds MUTABLE tuples, as TS does (`[1] as const satisfies unknown[]`).
+const MUTABLE_CONST_CONTEXT: Type = TS.RefType('const mutable');
+const isConstContext = (t: Type | undefined): t is TS.RefType => t?.type === 'ref' && (t.name === 'const' || t.name === 'const mutable') && !t.typeArgs;
+const hasMutableArrayLike = (t: Type, scope: Scope) => T.unionMembers(t, scope).some(m => {
+	const r = T.resolveOwn(m, scope);
+	return (r.type === 'array' || r.type === 'tuple') && !r.readonly || T.isRef(r, 'Array');
+});
 
 
 // Contextual parameter typing: an unannotated arrow/function (`x => x.foo`, whether a call argument, an object-literal
@@ -1434,12 +1440,16 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// CONST CONTEXT: a READONLY TUPLE whose elements keep their literals and pass the context down. As a plain
 				// array, `Rule<T, const R ...>`'s `ValuesOf<R>` has no positions and every `$[i]` is the union of all of them.
 				if (isConstContext(expected) && e.elements.every(el => el && el.type !== 'spread'))
-					return { type: 'tuple', readonly: true, elements: e.elements.map(el => T.freeze(recurse(el!, expected))) };
+					return { type: 'tuple', readonly: expected.name === 'const', elements: e.elements.map(el => T.freeze(recurse(el!, expected))) };
 				// A union context contributes its one array-like member (Map's `readonly (readonly [K, V])[] | null`).
 				const contextual		= expected && T.resolveOwn(expected, scope);
 				const arrayLike			= contextual?.type === 'union' ? T.unionMembers(contextual, scope).map(m => T.resolveOwn(m, scope)).filter(m => m.type === 'tuple' || m.type === 'array') : [];
 				const resolvedExpected	= arrayLike.length === 1 ? arrayLike[0] : contextual;
-				const wantTuple			= resolvedExpected?.type === 'tuple';
+				// A context with ANY tuple member makes the literal a tuple, as TS (`TA | TB` both tuples); each position's context
+				// is that position across them.
+				const tuples			= resolvedExpected?.type === 'tuple' ? [resolvedExpected] : arrayLike.filter((m): m is Type & { type: 'tuple' } => m.type === 'tuple');
+				const wantTuple			= tuples.length > 0;
+				const positionExpected	= (i: number) => T.combineTypes(tuples.flatMap(t => { const el = T.tupleElementType(t.elements[i]); return el ? [el] : []; }));
 				// Otherwise an element's context is what the context iterates to (TS): an `Iterable<T>`'s `T` as much as an array's element.
 				const elemExpected		= wantTuple ? undefined : resolvedExpected?.type === 'array' ? resolvedExpected.element : contextual && iteratedContext(contextual, scope);
 				const elems: Type[] = [];
@@ -1449,7 +1459,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						if (el.type === 'spread')
 							elems.push(iterationOrReport(recurse(el.operand), scope, pos, err).yield);
 						else
-							elems.push(recurse(el, wantTuple ? T.tupleElementType(resolvedExpected.elements[i]) : elemExpected));
+							elems.push(recurse(el, wantTuple ? positionExpected(i) : elemExpected));
 					}
 					i++;
 				}
@@ -2149,7 +2159,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// never auto-widens either, matching real TS. Survives being embedded in a later-widened container
 				// (`[1, x as const]`) or passed through `satisfies`/a comma/a spread, unlike a shape-based check on
 				// `e` itself would (that only ever sees the *top-level* expression `typeOf` was originally called on).
-				return T.freeze(isConstContext(anno) ? recurse(e.expression, anno) : anno);
+				return T.freeze(isConstContext(anno) ? recurse(e.expression, expected && hasMutableArrayLike(expected, scope) ? MUTABLE_CONST_CONTEXT : anno) : anno);
 			}
 			case 'satisfies': {
 				const anno = e.typeAnnotation;

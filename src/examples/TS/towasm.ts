@@ -5819,7 +5819,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// storage here when that contextual type is itself genuinely `any`/unknown, or unavailable
 				// (the same conservative default as before whenever there's nothing better to go on).
 				const wantArr = typeof want === 'object' && 'arr' in want ? want.arr : undefined;
-				const contextualArr = ctx.contextualReturn && T.resolve(ctx.scope, ctx.contextualReturn);
+				// A union context names the literal's own member, as the checker takes it (`string | number[]`): reads narrowed to that
+				// member expect its representation, whatever the union's storage.
+				const contextual	= ctx.contextualReturn && T.resolve(ctx.scope, ctx.contextualReturn);
+				const arrayMembers	= contextual?.type === 'union' ? T.unionMembers(contextual, ctx.scope).map(m => T.resolve(ctx.scope, m)).filter(m => m.type === 'array') : [];
+				const contextualArr = arrayMembers.length === 1 ? arrayMembers[0] : contextual;
 				const contextualElement = contextualArr?.type === 'array' ? contextualArr.element : undefined;
 				const contextForcesAny = !contextualElement || T.isAny(T.resolve(ctx.scope, contextualElement));
 				const kind = wantArr === 'ref' || (typeof want === 'object' && 'ref' in want && want.ref === 'any' && contextForcesAny) ? 'ref'
@@ -8336,18 +8340,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (args.some(a => a.type === 'spread'))
 			throw `spread arguments are not supported in a call to overloaded '${label}'`;
 		const argTs = args.map(a => checkerTypeOf(a, ctx.scope));
-		const fits	= decls.filter(d => d.body && T.argsFit(T.FixSig(d, T.ANY), argTs, ctx.scope));
-		// An EXACT parameter match wins over a merely-assignable one. `argsFit` is deliberately lenient
-		// (`isAssignable(ArrayBuffer, number[])` is `true`, since an `ArrayBuffer` has a numeric index
-		// signature), so plain first-fit picked `TypedArray`'s `constructor(elements: number[])` for
-		// `new Uint8Array(someBuffer)` and then failed to convert `arr:i8` to `arr:f64`. This is a
-		// tie-break, not a full specificity ordering: it only reorders candidates that ALL already fit.
-		const exact = fits.find(d => {
-			const params = T.FixSig(d, T.ANY).params;
-			return params.length === argTs.length
-				&& argTs.every((t, i) => t && params[i]?.typeAnnotation && T.typeKey(t) === T.typeKey(params[i].typeAnnotation!));
-		});
-		const found = exact ?? fits[0];
+		// The checker's own rule: the first body whose declared parameters fit the arguments.
+		const found	= decls.find(d => d.body && T.argsFit(T.FixSig(d, T.ANY), argTs, ctx.scope));
 		if (!found)
 			throw `no overload of '${label}' matches this call`;
 		return found;

@@ -1138,8 +1138,9 @@ async function main() {
 			}
 			class OptInner { v: number; constructor(v: number) { this.v = v; } }
 			class OptOuter { inner: OptInner | null; constructor(inner: OptInner | null) { this.inner = inner; } }
+			function noOuter(): OptOuter | null { return null; }
 			export function doubleOptNull(): number {
-				const o: OptOuter | null = null;
+				const o = noOuter();
 				return o?.inner?.v ?? -1;
 			}
 			export function doubleOptNonNull(): number {

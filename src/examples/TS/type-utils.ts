@@ -566,6 +566,23 @@ export function arrayUnionAsArray(t: Type, scope: Scope): TS.ArrayType | undefin
 // on every call (tried first; it relocated the exponential cost into printing instead of removing it).
 const substituteTypeCache = new WeakMap<Type, Map<string, WeakMap<Type, Type>>>();
 
+// A signature's own type parameters SHADOW the same outer names (`class G<T> { foo<T>(t: X<T>) }`: G's T never reaches foo's).
+// Undefined when nothing is shadowed; otherwise `sig` with only the outer names it doesn't redeclare substituted.
+function substituteShadowed<S extends TS.CallSig>(sig: S, map: Map<string, Type>): S | undefined {
+	const own = sig.typeParams;
+	if (!own?.some(p => map.has(p.name)))
+		return undefined;
+	const outer = new Map([...map].filter(([name]) => !own.some(p => p.name === name)));
+	const sub = <U extends Type | undefined>(t: U): U => (t && outer.size ? substituteType(t, outer) : t) as U;
+	return {
+		...sig,
+		params:		sig.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: sub(p.typeAnnotation) } : p),
+		rest:		sig.rest?.typeAnnotation ? { ...sig.rest, typeAnnotation: sub(sig.rest.typeAnnotation) } : sig.rest,
+		returnType:	sub(sig.returnType),
+		typeParams:	own.map(p => ({ ...p, constraint: sub(p.constraint), default: sub(p.default) })),
+	};
+}
+
 export function substituteType(t: Type, map: Map<string, Type>): Type {
 	if (map.size === 1) {
 		const [[name, arg]] = map;
@@ -589,8 +606,12 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 			(x, process) => {
 				if (x.type === 'ref' && !x.typeArgs && map.has(x.name))
 					return map.get(x.name);
-				if (x.type === 'function' || x.type === 'constructor')
+				if (x.type === 'function' || x.type === 'constructor') {
 					x = { ...x, ...avoidCapture(x, map) };
+					const shadowed = substituteShadowed(x, map);
+					if (shadowed)
+						return shadowed;
+				}
 				return process(x);
 			},
 			// An interface/class method's own generic signature (`Array<T>.map<U>`) is a `TypeMember` node
@@ -598,8 +619,12 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 			// or a method's own type parameter only gets capture-avoidance when it's reachable through a bare
 			// `function`/`constructor` type, missing every interface/class member signature (the common case).
 			(m, process) => {
-				if (m.type === 'method' || m.type === 'call' || m.type === 'construct')
+				if (m.type === 'method' || m.type === 'call' || m.type === 'construct') {
 					m = { ...m, ...avoidCapture(m, map) };
+					const shadowed = substituteShadowed(m, map);
+					if (shadowed)
+						return shadowed;
+				}
 				return process(m);
 			}
 		) ?? t;
@@ -1979,19 +2004,24 @@ const isUnit = (t: Type) => t.type === 'literal' || isRefNamed(t, 'undefined') |
 
 // `src` once per combination of its discriminant properties' constituents (a property `dst`'s members discriminate on by a
 // unit type), as TS relates an object to a discriminated union; undefined when nothing splits or past TS's 25 combinations.
-function splitDiscriminants(src: TS.ObjectType, dst: TS.UnionType, scope: Scope): Type[] | undefined {
+function splitDiscriminants(src: TS.ObjectType | Extract<Type, { type: 'tuple' }>, dst: TS.UnionType, scope: Scope): Type[] | undefined {
 	const isDiscriminant = (key: string) => dst.types.some(t => { const p = lookupMember(t, key, scope); return !!p && constituents(p, scope).every(isUnit); });
-	const splits: { i: number; prop: TS.TypeMember & { type: 'property' }; units: Type[] }[] = [];
-	src.members.forEach((prop, i) => {
-		const units = prop.type === 'property' && typeof prop.key === 'string' && isDiscriminant(prop.key) ? constituents(prop.typeAnnotation, scope) : [];
-		if (prop.type === 'property' && units.length > 1)
-			splits.push({ i, prop, units });
+	// A tuple's positions are its properties (`["a" | "b", 1]` against `["a", number] | ["b", number]`).
+	const slots: [key: string, t: Type | undefined][] = src.type === 'tuple'
+		? src.elements.map((el, i) => [String(i), el.type === 'spread' ? undefined : tupleElementType(el)])
+		: src.members.map(m => [m.type === 'property' && typeof m.key === 'string' ? m.key : '', m.type === 'property' ? m.typeAnnotation : undefined]);
+	const splits: { i: number; units: Type[] }[] = [];
+	slots.forEach(([key, t], i) => {
+		const units = t && key && isDiscriminant(key) ? constituents(t, scope) : [];
+		if (units.length > 1)
+			splits.push({ i, units });
 	});
 	if (!splits.length || splits.reduce((n, s) => n * s.units.length, 1) > 25)
 		return undefined;
-	return splits.reduce<TS.TypeMember[][]>((variants, { i, prop, units }) => variants.flatMap(members =>
-		units.map(u => members.map((x, j) => j === i ? TS.TypeProperty(prop.key, u, prop.modifiers) : x))
-	), [src.members]).map(members => TS.ObjectType(members));
+	const variants = splits.reduce<Type[][]>((vs, { i, units }) => vs.flatMap(v => units.map(u => v.map((x, j) => j === i ? u : x))), [slots.map(([, t]) => t ?? ANY)]);
+	return variants.map(v => src.type === 'tuple'
+		? { ...src, elements: src.elements.map((el, j) => el.type === 'spread' ? el : v[j]) }
+		: TS.ObjectType(src.members.map((m, j) => m.type === 'property' ? TS.TypeProperty(m.key, v[j], m.modifiers) : m)));
 }
 
 // `dstScope` resolves names in `dst`'s own structure (distinct from `scope`, which resolves `src`'s) -- same scope almost
@@ -2024,8 +2054,9 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 		// same leniency the old dedicated `dst.type === 'array'` branch had, just keyed off the ref's type arg instead of `.element`.
 		if (src.type === 'tuple') {
 			const el = arrayLikeElement(dst);
+			// A readonly tuple fits only a ReadonlyArray, as a readonly array does.
 			if (el)
-				return src.elements.every(e => { const t = tupleElementType(e); return !t || recurse(t, el, depth - 1); });
+				return !(src.readonly && isRefNamed(dst, 'Array')) && src.elements.every(e => { const t = tupleElementType(e); return !t || recurse(t, el, depth - 1); });
 		}
 		if (dst.type === 'tuple') {
 			// an inferred array literal has lost its element positions: compare loosely, either direction
@@ -2048,14 +2079,31 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 		// NOT `resolveOwn`: `src.type === 'intersection'` checks each part individually, never the combined shape -- known gap, unfixed.
 		src = resolve(scope, src);
 		dst = resolve(dstScope, dst);
+		// An alias that resolves to an array shape (`type Rules<T> = Rule<T>[]`) goes back through the Array-ref comparisons above.
+		if (src.type === 'array' || dst.type === 'array')
+			return recurse(src, dst, depth - 1);
 
 		if (src === dst || isAny(src) || isAny(dst))
 			return true;
 		if (isNullOrUndefined(src) && !scope.strictNullChecks())
 			return true;
 
-		if (src.type === 'ref' && (src.name === 'never' || !ALL_PRIMITIVES.has(src.name)))
-			return true;		// unresolved named source (import/global/type parameter): lenient
+		if (isRefNamed(src, 'never'))
+			return true;
+		// A class ref `resolve` keeps nominal is compared by its members, on either side (`number[]` is not a `number` just because
+		// `Array` is a class in codegen's lib). Only a name with no declaration at all stays unverifiable.
+		if (src.type === 'ref' && !ALL_PRIMITIVES.has(src.name)) {
+			const members = resolveMembers(src, scope);
+			return members.type === 'ref' || recurse(members, dst, depth - 1);
+		}
+		// (A primitive source keeps to the primitive rules below: no primitive but its own wrapper satisfies a class. A type
+		// parameter destination is opaque -- its constraint is an upper bound for what IT is, not for what fits it.)
+		if (dst.type === 'ref' && !ALL_PRIMITIVES.has(dst.name) && dst.name !== 'Array' && dst.name !== 'ReadonlyArray'
+			&& !(src.type === 'ref' && ALL_PRIMITIVES.has(src.name)) && !dstScope.type(dst.name)?.isTypeParam) {
+			const members = resolveMembers(dst, dstScope);
+			if (members.type !== 'ref')
+				return recurse(src, members, depth - 1);
+		}
 
 		if (OPAQUE.has(src.type) || OPAQUE.has(dst.type))
 			return !strict || (!OPAQUE_GAP.has(src.type) && !OPAQUE_GAP.has(dst.type));
@@ -2072,7 +2120,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				return true;
 			// TS's discriminated assignability: `{ kind: A | B, ... }` fits `{ kind: A, ... } | { kind: B, ... }` when each
 			// discriminant value, taken alone, fits some member.
-			const split = src.type === 'object' ? splitDiscriminants(src, dst, scope) : undefined;
+			const split = src.type === 'object' || src.type === 'tuple' ? splitDiscriminants(src, dst, scope) : undefined;
 			return !!split && split.every(s => dst.types.some(t => recurse(s, t, depth - 1)));
 		}
 
