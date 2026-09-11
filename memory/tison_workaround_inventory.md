@@ -100,7 +100,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - arrayMethod's `map` model must stay until a type alias union (`Ty | Lit`) is flattened where towasm reads it;
   removing it broke towasm. `reduce` is now TS's real three overloads (6ee71c9).
 - var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked.
-- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2.
+- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2 (16 with the parked intersection work).
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested
   generics go exponential (7z.ts hit 4 GB). Diagnostics print types within a budget (0d84298).
@@ -143,6 +143,25 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   a module-level `let`, or a property path (even `const o; o.p`, readonly or not). Probes: assistant/tsc-probe/{i,j}.ts.
 - Numbers have no freshness: a `0` from `n && x`'s falsy part (TS's regular zeroType) or a numeric literal type widens to
   `number` in a `let`, so a later `if (v)` cannot remove it (tsc keeps `0` and drops it). probe assistant/tsc-probe/h.ts.
+- Declaration merging must not WALK the merged types (c41ebae): `intersectTypes`' `typeKey` dedupe printed each part,
+  forcing a class's lazy field-initializer getters mid-`hoist` -- lib `String.charCodeAt = __asm<[i32], i32>(...)` was
+  inferred before `__asm` was bound and memoized `any`. `joinTypes` (flatten + identity dedupe) is the merge-time join.
+  Any new eager walk of a class shape during hoisting will reintroduce this class of bug.
+- Intersection normalization (TS getIntersectionType) is WRITTEN but PARKED, not committed: it fixes tocode 497
+  (`NonNullable<ForInit<Type>>` never became a union, so `init.type === 'var_decl'` could not narrow) and 2 corpus FPs,
+  but ADDS ~6 FPs, so it must not land as-is. Code kept in `assistant/type-utils.with-intersection.ts` (+ the block alone in
+  `assistant/intersection-block.ts.txt`): `domainOf`/`unitOf`/`reduceIntersection` plus a `case 'intersection'` in `resolve`.
+  tsc 6.0.3 facts (probes assistant/tsc-probe/{l,l-neg,p1,p2}.ts): `X & any` is `any`; `T & unknown` and `{}` beside an object
+  type drop out; `never` from disjoint domains (`string & number`, `object & string`, `symbol & string`), a nullish member beside
+  an object (`undefined & {}`, `null & {x:1}`), distinct units (`'a' & 'b'`), and conflicting literal discriminants
+  (`{type:'a'} & {type:'b'}`); `'a' & string` is `'a'`; `{a:string} & {a:number}` is NOT never; `undefined & void` is not never.
+  TS DOES distribute over a union member (that is how `NonNullable<A|B|undefined>` drops `undefined`) but DISPLAYS the
+  undistributed origin (`(A|B) & T`, `(A|B) & {z:1}`), and narrowing sees through the intersection either way.
+  The ~6 new FPs are a RELATION gap distribution exposes, not a normalization error: relating `T & U` to a distributed
+  `(A|B) & T & U` needs the CONSTRAINT of an intersection of type parameters (`T extends 1|2`, `U extends 2|3` -> `2`), which
+  `isAssignable` does not compute. Fix that first (typeParameterExtendsUnionConstraintDistributed), then re-measure the other
+  new FPs: excessPropertyCheckingIntersectionWithConditional, instantiateContextualTypes (`Handler<any, number & never>`),
+  inheritedFunctionAssignmentCompatibility, numericIndexerTyping2.
 - Real tsc for probes: `node_modules/.bin/tsc --ignoreConfig --noEmit --strict --target es2022 file.ts` (TS 6.0.3 refuses
   files alongside a tsconfig otherwise). Check TS semantics this way before modeling them.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
