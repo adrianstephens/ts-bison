@@ -1789,6 +1789,13 @@ export function indexSignatureOf(t: Type, scope: Scope, depth = 6): Type | undef
 // substitute for redoing the exact same structural walk. Types/scopes are immutable value objects here
 // (never mutated in place), so a `WeakMap` keyed on either never goes stale.
 
+// The index signature among `members` that covers key `prop`: a numeric one only a numeric-looking key (it is the more
+// specific, as TS requires), a string one every key. A numeric signature must not answer `'push'` for `String`'s `[i: number]`.
+function indexSignatureFor(members: TS.TypeMember[], prop: string, scope: Scope): Type | undefined {
+	const indexes = members.filter((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index');
+	return ((/^(0|[1-9]\d*)$/.test(prop) && indexes.find(m => isNumberLike(m.paramType, scope))) || indexes.find(m => !isNumberLike(m.paramType, scope)))?.typeAnnotation;
+}
+
 export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, skipObjectFallback = false): Type | undefined {
 	const key	= skipObjectFallback ? prop + '\0skip' : prop;
 	let keyMap	= scope.lookupMemberCache?.get(t);
@@ -1874,9 +1881,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				// silently misrouting overload resolution (`isAssignable`'s own `dst.type === 'object'` case). A *string*
 				// index signature is untouched -- it always did (and still does) cover every named key, correctly.
 				// A numeric key prefers the numeric signature, which real TS requires to be the more specific of the two.
-				const indexes	= t.members.filter((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index');
-				return ((/^(0|[1-9]\d*)$/.test(prop) && indexes.find(m => isNumberLike(m.paramType, scope))) || indexes.find(m => !isNumberLike(m.paramType, scope)))?.typeAnnotation
-					?? objectPrototypeMember(prop);
+				return indexSignatureFor(t.members, prop, scope) ?? objectPrototypeMember(prop);
 			}
 			case 'intersection': {
 				const matches: Type[] = [];
@@ -1892,9 +1897,9 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 						return undefined;
 					for (const part of [...t.types].reverse()) {
 						const r = resolveOwn(part, scope);
-						const idx = r.type === 'object' ? r.members.find(m => m.type === 'index') : undefined;
+						const idx = r.type === 'object' ? indexSignatureFor(r.members, prop, scope) : undefined;
 						if (idx)
-							return idx.typeAnnotation;
+							return idx;
 					}
 					return objectPrototypeMember(prop);
 				}
@@ -2144,7 +2149,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			if (src.type === 'object' || src.type === 'intersection' || src.type === 'tuple')
 				return dst.members.every(m => {
 					if (m.type !== 'property' || typeof m.key !== 'string')
-						return true;		// methods/call/index/computed: lenient
+						return true;		// methods/call/index/computed: unchecked (inventory C4)
 					// `lookupMember` gets its own fresh budget, not `recurse`'s remaining `depth` -- same reasoning as
 					// `lookupMember`'s own `resolve()` call.
 					const got = lookupMember(src, m.key, scope);
@@ -2177,7 +2182,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				// not a class instance. `undefined`/`null`/`void`/`any` are primitives here too, and this
 				// checker is deliberately lenient about those -- rejecting them against a class cost 10
 				// real diagnostics on code tsc accepts.
-				if (BOXED_PRIMITIVE[src.name] && isClassRef(dst, dstScope))
+				if (BOXED_PRIMITIVE[src.name] && (isClassRef(dst, dstScope) || dst.name === 'Array' || dst.name === 'ReadonlyArray'))
 					return BOXED_PRIMITIVE[src.name] === dst.name;
 				return !(ALL_PRIMITIVES.has(src.name) && ALL_PRIMITIVES.has(dst.name));	// distinct primitives: no; unresolved names: lenient
 			}
@@ -2199,6 +2204,96 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 	return recurse(src, dst, depth);
 }
 
+
+// TS's choice among a type parameter's candidates: covariant ones if any -- literals of one primitive UNION, otherwise the
+// leftmost candidate every later one is a supertype of (`getSupertypeOrUnion`); else the contravariant ones' common subtype.
+export function chooseInference(co: Type[], contra: Type[], scope: Scope): Type | undefined {
+	if (co.length) {
+		const members	= co.flatMap(t => unionMembers(t, scope).map(m => resolveOwn(m, scope)));
+		const base		= (m: Type) => m.type === 'literal' ? literalType(m) : undefined;
+		return members.every(m => base(m) !== undefined && base(m) === base(members[0]))
+			? combineTypes(co)
+			: co.reduce((s, t) => s !== t && isAssignable(s, t, scope) ? t : s);
+	}
+	return contra.length ? contra.reduce((s, t) => s !== t && isAssignable(t, s, scope) ? t : s) : undefined;
+}
+
+// The parameter types of every signature `t` offers a callback (a function, a call member, each member of a union).
+function callbackParamTypes(t: Type, scope: Scope, depth = 4): Type[] {
+	const r = resolveOwn(t, scope);
+	const sigParams = (sig: TS.CallSig) => [...sig.params.flatMap(p => p.typeAnnotation ? [p.typeAnnotation] : []), ...sig.rest?.typeAnnotation ? [sig.rest.typeAnnotation] : []];
+	return r.type === 'function' || r.type === 'constructor' ? sigParams(r)
+		: r.type === 'object' ? r.members.flatMap(m => m.type === 'call' ? sigParams(m) : [])
+		: r.type === 'union' && depth > 0 ? r.types.flatMap(m => callbackParamTypes(m, scope, depth - 1))
+		: [];
+}
+
+// TS's inference context for one generic call: each type parameter's candidates, covariant and contravariant apart; what
+// the call's destination implies (lowest priority); and the parameters FIXED -- read to give a callback its context --
+// whose later candidates are ignored.
+export class Inference {
+	readonly names:				ReadonlyMap<string, TS.TypeParam>;
+	private readonly co			= new Map<string, Type[]>();
+	private readonly contra		= new Map<string, Type[]>();
+	private readonly fixed		= new Map<string, Type>();
+	private readonly fromReturn	= new Map<string, Type>();
+	private readonly defaulted	= new Set<string>();
+
+	constructor(typeParams: readonly TS.TypeParam[], readonly scope: Scope, readonly declScope: Scope) {
+		this.names = new Map(typeParams.map(p => [p.name, p]));
+	}
+	// `inferTypeArgs` skips a name this reports: only a fixed one takes no more candidates.
+	has(name: string): boolean	{ return this.fixed.has(name); }
+	add(name: string, t: Type, contra: boolean) {
+		const pool = contra ? this.contra : this.co;
+		pool.set(name, [...pool.get(name) ?? [], t]);
+	}
+	// A callback's return is matched on a fresh depth budget: queued on `deferred` when the caller orders them itself, else
+	// replayed now -- one level: deeper ones share its budget, since each level multiplies through overload sets (`Promise.then`).
+	infer(paramT: Type, argT: Type, deferred?: Deferred[], contra = false, replays = 1) {
+		const own: Deferred[] = [];
+		inferTypeArgs(paramT, argT, this.names, this, this.scope, this.declScope, deferred ?? (replays > 0 ? own : undefined), contra);
+		for (const d of own)
+			this.infer(d.paramT, d.argT, undefined, d.contra, replays - 1);
+	}
+	// What the call's result must be (`expected` against the signature's return type): used only where nothing else speaks.
+	inferReturn(returnType: Type, expected: Type) {
+		const m = new Map<string, Type>();
+		inferTypeArgs(returnType, expected, this.names, m, this.scope, this.declScope);
+		m.forEach((t, name) => this.fromReturn.has(name) || this.fromReturn.set(name, t));
+	}
+	fix(name: string, t: Type)	{ this.fixed.set(name, t); }
+	fromCandidates(name: string): Type | undefined {
+		return this.fixed.get(name) ?? chooseInference(this.co.get(name) ?? [], this.contra.get(name) ?? [], this.scope);
+	}
+	inferred(name: string): Type | undefined	{ return this.fromCandidates(name) ?? this.fromReturn.get(name); }
+	returnHint(name: string): Type | undefined	{ return this.fromReturn.get(name); }
+	current(): Map<string, Type> {
+		const map = new Map<string, Type>();
+		for (const name of this.names.keys()) {
+			const t = this.inferred(name);
+			if (t)
+				map.set(name, t);
+		}
+		return map;
+	}
+	// Fixed with nothing inferred: the parameter's default, else its constraint, else `any` -- the call reports it as a GAP.
+	wasDefaulted(name: string): boolean	{ return this.defaulted.has(name); }
+	// `declared` as a callback's context: every parameter its own parameter types mention is FIXED at its current inference.
+	contextFor(declared: Type): Type {
+		const params = callbackParamTypes(declared, this.declScope);
+		for (const [name, tp] of this.names) {
+			if (this.fixed.has(name) || !params.some(p => mentionsTypeParam(p, name)))
+				continue;
+			const t = this.inferred(name);
+			if (!t)
+				this.defaulted.add(name);
+			this.fixed.set(name, t ?? tp.default ?? tp.constraint ?? ANY);
+		}
+		const map = this.current();
+		return map.size ? substituteType(declared, map) : declared;
+	}
+}
 
 // Does `argTs` fit `sig` (arity, then every provided argument assignable)? `hasSpread`: a spread argument's real element
 // count is unknowable statically, so an upper-bound arity mismatch is waived the same way a `rest` param waives it.
@@ -2222,15 +2317,25 @@ export function argsFit(sig: TS.CallSig, argTs: (Type | undefined)[], scope: Sco
 // type) has had first crack at the same type param. Every other case (a plain, non-callback param
 // position) is unaffected and keeps today's immediate, first-wins behavior regardless -- omitting
 // `deferred` (every caller except `instantiate()`) reproduces the exact old behavior throughout.
-export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<string, TS.TypeParam>, out: Map<string, Type>, scope: Scope, declScope: Scope = scope, deferred?: { paramT: Type; argT: Type }[]): void {
+export interface Deferred { paramT: Type; argT: Type; contra?: boolean }
+export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<string, TS.TypeParam>, out: Map<string, Type> | Inference, scope: Scope, declScope: Scope = scope, deferred?: Deferred[], contraStart = false): void {
 	let pooled: Map<string, Type[]> | undefined;
+	// Flipped at each callback parameter position: what a type parameter learns there is a contravariant candidate.
+	let contra = contraStart;
 	return recurse(paramT, argT, 6);
 
 	function found(name: string, t: Type) {
 		if (pooled)
 			pooled.set(name, [...pooled.get(name) ?? [], t]);
+		else if (out instanceof Inference)
+			out.add(name, t, contra);
 		else
 			out.set(name, t);
+	}
+	function flipped(inner: () => void) {
+		contra = !contra;
+		inner();
+		contra = !contra;
 	}
 
 	function recurse(paramT: Type, argT: Type, depth: number) {
@@ -2327,11 +2432,11 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 			// `'function'`/`'constructor'` node -- `flattenIntersection` finds the actual callable part, as `narrow()` also does.
 			const fn = flattenIntersection(a, scope).find(p => p.type === paramT.type) as typeof paramT;
 			if (fn) {
-				paramT.params.forEach((p, i) => {
+				flipped(() => paramT.params.forEach((p, i) => {
 					const q = fn.params[i];
 					if (p.typeAnnotation && q?.typeAnnotation)
 						recurse(p.typeAnnotation, q.typeAnnotation, depth - 1);
-				});
+				}));
 				// The one case `deferred` exists for: `fn.returnType` is the *argument's own*, independently
 				// inferred return type -- for a generic callback literal (`() => ({...})`) with no declared
 				// return-type annotation, that's whatever anonymous, non-nominal structural shape the checker's
@@ -2342,7 +2447,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				// afterward a safe no-op wherever contextual typing already succeeded.
 				if (paramT.returnType && fn.returnType) {
 					if (deferred)
-						deferred.push({ paramT: paramT.returnType, argT: fn.returnType });
+						deferred.push({ paramT: paramT.returnType, argT: fn.returnType, contra });
 					else
 						recurse(paramT.returnType, fn.returnType, depth - 1);
 				}
@@ -2360,14 +2465,14 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 					// Same shape as `function`/`constructor` above -- `adapter0<T,D>`-style interfaces often carry `T`/`D` only in a method's own signature.
 					const t = lookupMember(a, key, scope);
 					if (t?.type === 'function') {
-						m.params.forEach((p, i) => {
+						flipped(() => m.params.forEach((p, i) => {
 							const q = t.params[i];
 							if (p.typeAnnotation && q?.typeAnnotation)
 								recurse(p.typeAnnotation, q.typeAnnotation, depth - 1);
-						});
+						}));
 						if (m.returnType) {
 							if (deferred)
-								deferred.push({ paramT: m.returnType, argT: t.returnType ?? ANY });
+								deferred.push({ paramT: m.returnType, argT: t.returnType ?? ANY, contra });
 							else
 								recurse(m.returnType, t.returnType ?? ANY, depth - 1);
 						}

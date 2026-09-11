@@ -7700,31 +7700,38 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (typeArgs) {
 			typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
 		} else {
-			const names = new Map(typeParams.map(p => [p.name, p] as const));
-			const deferred: { paramT: Type; argT: Type }[] = [];
+			// The checker's own inference (`T.Inference`: candidates by polarity, TS's common supertype), fed the same way.
+			const inference	= new T.Inference(typeParams, libGlobal, libGlobal);
+			const deferred: T.Deferred[] = [];
+			const restArgs: Type[] = [];
 			args.forEach((a, i) => {
 				const p = params[i];
 				if (p?.typeAnnotation && a.type !== 'spread')
-					T.inferTypeArgs(p.typeAnnotation, checkerTypeOf(a, scope), names, map, libGlobal, libGlobal, deferred);
+					inference.infer(p.typeAnnotation, checkerTypeOf(a, scope), deferred);
 				// `sig(...args)` with `args: CallSigParams<number>` against `...args: CallSigParams<T>`: the spread IS the rest.
 				else if (a.type === 'spread' && i === params.length && rest?.typeAnnotation)
-					T.inferTypeArgs(rest.typeAnnotation, checkerTypeOf(a.operand, scope), names, map, libGlobal, libGlobal, deferred);
+					inference.infer(rest.typeAnnotation, checkerTypeOf(a.operand, scope), deferred);
+				else if (a.type !== 'spread' && i >= params.length && rest?.typeAnnotation)
+					restArgs.push(checkerTypeOf(a, scope));
 			});
+			// Positional rest arguments are one candidate, as the checker takes them.
+			if (restArgs.length && rest?.typeAnnotation)
+				inference.infer(rest.typeAnnotation.type === 'array' ? rest.typeAnnotation.element : rest.typeAnnotation, T.combineTypes(restArgs), deferred);
 			// Where the result is going also REPLACES an `any` the arguments left: the instantiation built has to be
 			// the one its destination can hold, and the checker's own type for the call already solved it.
-			if (expected && returnType && typeParams.some(p => !map.has(p.name) || T.isAny(map.get(p.name)!))) {
+			if (expected && returnType && typeParams.some(p => !inference.inferred(p.name) || T.isAny(inference.inferred(p.name)!))) {
 				const fromExpected = new Map<string, Type>();
-				T.inferTypeArgs(returnType, typeof expected === 'function' ? expected() : expected, names, fromExpected, libGlobal);
-				for (const [k, v] of fromExpected)
-					if (!map.has(k) || (T.isAny(map.get(k)!) && !T.isAny(v)))
-						map.set(k, v);
+				T.inferTypeArgs(returnType, typeof expected === 'function' ? expected() : expected, inference.names, fromExpected, libGlobal);
+				for (const [k, v] of fromExpected) {
+					const got = inference.inferred(k);
+					if (!got || (T.isAny(got) && !T.isAny(v)))
+						inference.fix(k, v);
+				}
 			}
-			for (const { paramT, argT } of deferred)
-				T.inferTypeArgs(paramT, argT, names, map, libGlobal);
-			typeParams.forEach(p => {
-				if (!map.has(p.name))
-					map.set(p.name, p.default ?? p.constraint ?? T.ANY);
-			});
+			for (const { paramT, argT, contra } of deferred)
+				inference.infer(paramT, argT, undefined, contra);
+			const inferred = inference.current();
+			typeParams.forEach(p => map.set(p.name, inferred.get(p.name) ?? p.default ?? p.constraint ?? T.ANY));
 		}
 		return map;
 	}

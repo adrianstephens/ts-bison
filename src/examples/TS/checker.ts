@@ -1284,7 +1284,20 @@ export function exportScope(body: Stmt[], parent: Scope, filename?: string, into
 
 // Instantiates `sig` against `argTs`, substituting type params through params/return type. Pure -- doesn't validate (see `argsFit`).
 // `restElementTs`: a spread argument's element type(s), since `argTs` leaves a spread position `undefined` (arity unknown statically).
-function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, pos: Location, restElementTs?: Type[], expected?: Type, err?: Err): TS.CallSig {
+// What the call's destination implies settles a parameter no argument spoke for -- before any callback's own return is heard,
+// since an unannotated callback returns whatever shape its body made (`Rule([...], $ => ({...}))` needs the array's element
+// type). A hint still naming the call's own placeholders only fills in if nothing else does.
+function settleFromReturn(inference: T.Inference, scope: Scope) {
+	for (const name of inference.names.keys()) {
+		const hint = inference.returnHint(name);
+		if (hint && !inference.fromCandidates(name) && !T.mentionsAbstract(hint, scope))
+			inference.fix(name, hint);
+	}
+}
+
+// `inference`: the call site's own, already fed its arguments and callbacks in TS's order (see `case 'call'`); a bare trial
+// (an overload fit, an instantiation expression) infers from `argTs` here.
+function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, pos: Location, restElementTs?: Type[], expected?: Type, err?: Err, inference?: T.Inference): TS.CallSig {
 	let returnType	= sig.returnType ?? T.ANY;
 	let params		= sig.params;
 
@@ -1293,68 +1306,38 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 		if (typeArgs) {
 			sig.typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
 		} else {
-			const names		= new Map(sig.typeParams.map(p => [p.name, p] as const));
-			const declScope	= T.declScopeOf(sig, scope);
-			// Collects a generic callback argument's own return-type inference (`T.inferTypeArgs`'s
-			// `function`/`constructor` case) instead of running it immediately -- an unannotated callback
-			// literal's own inferred return type is whatever anonymous, non-nominal structural shape its
-			// body happened to produce, not necessarily what the call actually wants (e.g. `Rule([...], $ =>
-			// ({type:'spread', ...}))`, where the real intent is only knowable from the surrounding array
-			// literal's own declared element type). Replayed below, after the contextual `expected` pass has
-			// had first crack at the same type params -- `out`'s own first-wins guard then makes replaying a
-			// safe no-op wherever contextual typing already succeeded, and an ordinary direct param (`x: T`,
-			// never queued at all) keeps resolving immediately, unaffected.
-			const deferred: { paramT: Type; argT: Type }[] = [];
-			argTs.forEach((t, i) => {
-				const p = params[i];
-				if (t && p?.typeAnnotation)
-					T.inferTypeArgs(p.typeAnnotation, t, names, map, scope, declScope, deferred);
-			});
-			if (sig.rest?.typeAnnotation && restElementTs?.length) {
-				const t		= sig.rest.typeAnnotation;
-				const elem	= t.type === 'array' ? t.element : t;
-				// Every rest argument is a candidate for the SAME type param, so they UNION:
-				// `new Array(false, 1, 'x')` is `T = boolean | number | string`. Inferring them all into
-				// one `map` instead let `inferTypeArgs`'s first-wins guard (right where a single union
-				// argument distributes over one parameter) stop at `false`, and every later argument was
-				// then reported as not assignable to it.
-				const perElem = restElementTs.map(at => {
-					const m = new Map<string, Type>();
-					T.inferTypeArgs(elem, at, names, m, scope, declScope, deferred);
-					return m;
+			// A callback's own return, when the callback wasn't typed in order by the call site: heard only after the destination.
+			const deferred: T.Deferred[] = [];
+			if (!inference) {
+				inference = new T.Inference(sig.typeParams, scope, T.declScopeOf(sig, scope));
+				argTs.forEach((t, i) => {
+					const p = params[i];
+					if (t && p?.typeAnnotation)
+						inference!.infer(p.typeAnnotation, t, deferred);
 				});
-				for (const name of new Set(perElem.flatMap(m => [...m.keys()]))) {
-					if (!map.has(name))
-						map.set(name, T.combineTypes(perElem.map(m => m.get(name)).filter(x => !!x)));
-				}
+				if (expected && sig.returnType)
+					inference.inferReturn(sig.returnType, expected);
+				settleFromReturn(inference, scope);
 			}
-			// Same reasoning as the `preMap` pass above: whatever's still unbound after arguments, try the call's own contextual
-			// expected type before falling back to a default/constraint/`any` guess below.
-			// Run into its own map first, because a binding read back this way can still MENTION an outer,
-			// not-yet-solved call's type params -- `new Map(xs.map(x => [x.a, x.b]))` reverse-matches
-			// `.map`'s own `U` to `[K, V]`, Map's two unsolved parameters. That is exactly the hint the
-			// callback's body needed (it is what made the literal a tuple), but adopting it as the ANSWER
-			// let `K`/`V` leak straight out as the result type. So a placeholder-bearing binding yields to
-			// the argument's own inferred type, and only fills in afterwards if nothing else pinned it.
-			const fromExpected = new Map<string, Type>();
-			if (expected && sig.returnType)
-				T.inferTypeArgs(sig.returnType, expected, names, fromExpected, scope, declScope);
-			for (const [k, v] of fromExpected)
-				if (!map.has(k) && !T.mentionsAbstract(v, scope))
-					map.set(k, v);
-			for (const { paramT, argT } of deferred)
-				T.inferTypeArgs(paramT, argT, names, map, scope, declScope);
-			for (const [k, v] of fromExpected)
-				if (!map.has(k))
-					map.set(k, v);
+			// Rest arguments are ONE candidate, as TS's synthesized array of them: `new Array(false, 1, 'x')` is `T = boolean | number | string`.
+			if (sig.rest?.typeAnnotation && restElementTs?.length) {
+				const t = sig.rest.typeAnnotation;
+				inference.infer(t.type === 'array' ? t.element : t, T.combineTypes(restElementTs), deferred);
+			}
+			for (const { paramT, argT, contra } of deferred)
+				inference.infer(paramT, argT, undefined, contra);
+			const inferred = inference.current();
 			sig.typeParams.forEach(p => {
-				if (!map.has(p.name)) {
-					map.set(p.name, p.default ?? p.constraint ?? T.ANY);
-					// A declared default is a correct, unremarkable fallback (real TS does it silently too) -- only worth flagging when
-					// some supplied argument's type actually mentions `p.name` and still couldn't pin it down.
-					if (err && !p.default && params.some((prm, i) => argTs[i] && prm.typeAnnotation && T.mentionsTypeParam(prm.typeAnnotation, p.name)))
-						err(SEVERITY.GAP, pos)`Type parameter '${p.name}' could not be inferred from the arguments; assumed '${map.get(p.name)}'`;
+				const t = inferred.get(p.name);
+				if (t && !inference!.wasDefaulted(p.name)) {
+					map.set(p.name, t);
+					return;
 				}
+				map.set(p.name, t ?? p.default ?? p.constraint ?? T.ANY);
+				// A declared default is a correct, unremarkable fallback (real TS does it silently too) -- only worth flagging when
+				// some supplied argument's type actually mentions `p.name` and still couldn't pin it down.
+				if (err && !p.default && params.some((prm, i) => argTs[i] && prm.typeAnnotation && T.mentionsTypeParam(prm.typeAnnotation, p.name)))
+					err(SEVERITY.GAP, pos)`Type parameter '${p.name}' could not be inferred from the arguments; assumed '${map.get(p.name)}'`;
 			});
 		}
 		params		= params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p);
@@ -1846,46 +1829,50 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						// from escaping as the answer.
 						return recurse(a, declared && (!generic || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared))) ? declared : undefined);
 					});
-					let preMap: Map<string, Type> | undefined;
-					if (sig.typeParams?.length) {
-						const names		= new Map(sig.typeParams.map(p => [p.name, p] as const));
-						preMap = new Map<string, Type>();
+					// TS's two passes: every non-callback argument feeds the inference first, then each callback in order -- its
+					// context FIXES the type parameters its own parameters read, and its return feeds only the ones still open.
+					// Explicit type arguments leave nothing to infer.
+					const explicit	= typeArgs && sig.typeParams?.length ? new Map(sig.typeParams.map((p, i) => [p.name, typeArgs![i] ?? p.default ?? T.ANY] as const)) : undefined;
+					const inference	= !explicit && sig.typeParams?.length ? new T.Inference(sig.typeParams, scope, declScope) : undefined;
+					if (inference) {
 						preArgTs.forEach((t, i) => {
 							const p = sig!.params[i];
 							if (t && p?.typeAnnotation)
-								T.inferTypeArgs(p.typeAnnotation, t, names, preMap!, scope, declScope);
+								inference.infer(p.typeAnnotation, t);
 						});
-						// A param not pinned down by a sibling argument may still come from where the whole call's result is going
-						// (`new Promise<T>((resolve) => ...)`'s `T` -- no argument gives it, only the declared type of the assignment target).
+						// A param no argument pins down may come from where the call's result is going (`new Promise<T>((resolve) => ...)`).
 						if (expected && sig.returnType)
-							T.inferTypeArgs(sig.returnType, expected, names, preMap, scope, declScope);
+							inference.inferReturn(sig.returnType, expected);
+						settleFromReturn(inference, scope);
 					}
 
-					e.arguments.forEach((a, i) => {
-						if (a.type === 'function' || a.type === 'arrow') {
-							const declared		= declaredArg(i);
-							const contextual	= declared && preMap?.size ? T.substituteType(declared, preMap) : declared;
-							applyContextualParams(a.params, contextual, scope);
-							// For codegen, which compiles an overload's IMPLEMENTATION and so never sees this. Only once fully
-							// determined: the same call is also typed without context, which leaves the signature's own params open.
-							const defaults	= new Map(sig!.typeParams?.filter(p => p.default && !preMap?.has(p.name)).map(p => [p.name, p.default!] as const));
-							const settled	= contextual && defaults.size ? T.substituteType(contextual, defaults) : contextual;
-							if (settled && !sig!.typeParams?.some(p => T.mentionsTypeParam(settled, p.name)))
-								(a as any).contextualType ??= T.stampScope(settled, scope);
-						}
-					});
+					// A callback whose parameters are all annotated isn't context-sensitive: TS infers from it in the first pass, unfixing.
+					const contextSensitive = (a: Expr): a is Expr & { type: 'function' | 'arrow' } => (a.type === 'function' || a.type === 'arrow') && a.params.some(p => !p.typeAnnotation);
+					const contextOf = (a: Expr, declared: Type | undefined) => declared && (explicit ? T.substituteType(declared, explicit)
+						: !inference ? declared : contextSensitive(a) ? inference.contextFor(declared) : T.substituteType(declared, inference.current()));
+					const typeCallback = (a: Expr & { type: 'function' | 'arrow' }, i: number) => {
+						const declared		= declaredArg(i);
+						const contextual	= contextOf(a, declared);
+						applyContextualParams(a.params, contextual, scope);
+						// For codegen, which compiles an overload's IMPLEMENTATION and so never sees this. Only once fully
+						// determined: the same call is also typed without context, which leaves the signature's own params open.
+						const defaults	= new Map(sig!.typeParams?.filter(p => p.default && !inference?.inferred(p.name)).map(p => [p.name, p.default!] as const));
+						const settled	= contextual && defaults.size ? T.substituteType(contextual, defaults) : contextual;
+						if (settled && !sig!.typeParams?.some(p => T.mentionsTypeParam(settled, p.name)))
+							(a as any).contextualType ??= T.stampScope(settled, scope);
+						// The same contextual signature handed to the body too: `xs.map(x => [a, b])` against a `[K, V][]`-shaped
+						// parameter can only produce a TUPLE if the callback's own return position is contextually typed.
+						const t = recurse(a, contextual);
+						if (inference && declared)
+							inference.infer(declared, t);
+						return t;
+					};
+					const annotated = new Map(e.arguments.flatMap((a, i) => (a.type === 'function' || a.type === 'arrow') && !contextSensitive(a) ? [[i, typeCallback(a, i)] as const] : []));
 
 					const restElementTs: Type[] = [];
 					const argTs = e.arguments.map((a, i) => {
-						if (a.type === 'function' || a.type === 'arrow') {
-							// The same contextual signature the loop above applied to the params, handed to
-							// the body too: `xs.map(x => [a, b])` against a `[K, V][]`-shaped parameter can
-							// only produce a TUPLE if the callback's own return position is contextually
-							// typed. `preMap` has already reverse-matched `U` from the outer expected type,
-							// so the substitution here is what carries that down.
-							const declared = declaredArg(i);
-							return recurse(a, declared && preMap?.size ? T.substituteType(declared, preMap) : declared);
-						}
+						if (a.type === 'function' || a.type === 'arrow')
+							return annotated.get(i) ?? typeCallback(a, i);
 						if (a.type !== 'spread')
 							return preArgTs[i];
 						const t		= T.resolveOwn(recurse(a.operand), scope);
@@ -1904,7 +1891,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							restElementTs.push(argTs[i]);
 					});
 
-					const { params, returnType } = instantiate(sig, argTs, typeArgs, scope, pos, restElementTs, expected, err);
+					const { params, returnType } = instantiate(sig, argTs, typeArgs, scope, pos, restElementTs, expected, err, inference);
 					
 					// TBD: check if callee if pure
 
