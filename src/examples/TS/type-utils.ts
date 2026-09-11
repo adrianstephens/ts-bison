@@ -371,6 +371,21 @@ export function combineTypes(types: Type[]): Type {
 		:	!unique.length ? NEVER : unique.length === 1 ? unique[0] : TS.UnionType(unique);
 }
 
+// The reductions an instantiation owes a rebuilt union or intersection -- members flattened, `never` dropped from a union,
+// `any` absorbing either, `unknown` a union and leaving an intersection -- without `combineTypes`'s structural dedupe, whose
+// `typeKey` per member costs as much as the types are large.
+function reduceInstantiated(t: TS.UnionType | TS.IntersectionType): Type {
+	const flat = t.types.flatMap(m => m.type === t.type ? (m as TS.UnionType | TS.IntersectionType).types : [m]);
+	if (flat.some(m => isRef(m, 'any')))
+		return ANY;
+	const kept = t.type === 'union'
+		? (flat.some(m => isRef(m, 'unknown')) ? [UNKNOWN] : flat.filter(m => !isRef(m, 'never')))
+		: flat.filter(m => !isRef(m, 'unknown'));
+	return !kept.length ? (t.type === 'union' ? NEVER : UNKNOWN) : kept.length === 1 ? kept[0]
+		: kept.length === t.types.length && kept.every((m, i) => m === t.types[i]) ? t
+		: t.type === 'union' ? TS.UnionType(kept) : TS.IntersectionType(kept);
+}
+
 export function optional(type:Type, optional?: boolean) {
 	return optional ? combineTypes([type, UNDEFINED]) : type;
 }
@@ -706,7 +721,9 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 					if (shadowed)
 						return shadowed;
 				}
-				return process(x);
+				// A rebuilt union or intersection is reduced as TS reduces an instantiated one: `T & U` at `{}` and `any` is `any`.
+				const r = process(x);
+				return r.type === 'union' || r.type === 'intersection' ? reduceInstantiated(r) : r;
 			}),
 			// An interface/class method's own generic signature (`Array<T>.map<U>`) is a `TypeMember` node
 			// (`method`/`call`/`construct`), not a `Type` one -- `avoidCapture` needs the same treatment here,
