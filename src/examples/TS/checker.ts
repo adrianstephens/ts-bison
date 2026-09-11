@@ -1138,6 +1138,39 @@ function iterationOrReport(t: Type, scope: Scope, pos: Location, err?: Err, asyn
 	return it ?? { yield: T.ANY, return: T.ANY, next: T.ANY };
 }
 
+// A union context narrowed to the members an object literal's literal-valued properties can match (TS's discriminateContextualType);
+// the whole union when none or all survive.
+function discriminateContext(t: Type, lit: Expr & { type: 'object' }, scope: Scope): Type {
+	const members = T.unionMembers(t, scope);
+	if (members.length < 2)
+		return t;
+	const literals = lit.properties.flatMap(p => p.type === 'field' && typeof p.key === 'string' && p.value?.type === 'literal' && !Array.isArray(p.value.value) ? [[p.key, p.value.value] as const] : []);
+	const kept = members.filter(m => literals.every(([key, value]) => {
+		const pt = T.lookupMember(m, key, scope);
+		const units = pt && T.unionMembers(pt, scope).map(u => T.resolveOwn(u, scope));
+		return !units || !units.every(u => u.type === 'literal') || units.some(u => u.type === 'literal' && u.value === value);
+	}));
+	return kept.length && kept.length < members.length ? T.combineTypes(kept) : t;
+}
+
+// A property's contextual type: its type in each member of the context that has it (TS: a union context maps over its members).
+function contextualMember(t: Type, key: string, scope: Scope): Type | undefined {
+	const parts = T.unionMembers(t, scope).flatMap(m => { const p = T.lookupMember(m, key, scope); return p ? [p] : []; });
+	return parts.length ? T.combineTypes(parts) : undefined;
+}
+
+// Whether a contextual type asks for literals: one of its members is a literal (an enum member, a literal union), so a fresh
+// literal checked against it keeps its literal type instead of widening.
+function contextKeepsLiteral(t: Type, scope: Scope): boolean {
+	return T.unionMembers(t, scope).some(m => T.resolveOwn(m, scope).type === 'literal');
+}
+
+// A fresh value's type widened as TS widens one: fully with no context; with one, its parts were already typed against their own
+// contexts, so only a top-level literal the context does not ask for widens (an inferred return, an object literal's property).
+function widenForContext(t: Type, context: Type | undefined, scope: Scope): Type {
+	return !context ? T.widenLiterals(t) : contextKeepsLiteral(context, scope) ? t : T.widenLiterals(t, false, false, true);
+}
+
 // The element context an iterable contextual type gives an array literal: what its iterable members yield (`any` gives none).
 function iteratedContext(t: Type, scope: Scope): Type | undefined {
 	const yields = T.unionMembers(t, scope).flatMap(m => {
@@ -1356,9 +1389,10 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 
 // ---- expressions ----------------------------------------------------------------------------
 
-type typeOf = (e: Expr, scope: Scope, expected?: Type)=>Type;
+// `widen: false` gives an expression's precise type -- what an assignability check compares, as TS checks a fresh literal.
+type typeOf = (e: Expr, scope: Scope, expected?: Type, widen?: boolean)=>Type;
 function typeOf1(err?: Err): typeOf {
-	return (e, scope, expected) => typeOf(e, scope, true, expected, undefined, err);
+	return (e, scope, expected, widen = true) => typeOf(e, scope, widen, expected, undefined, err);
 }
 
 // `expected`: the contextual type this expression is checked against, when known -- lets a generic call whose type params aren't
@@ -1485,6 +1519,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			}
 
 			case 'object': {
+				// A union context is first narrowed by this literal's own discriminant values, as TS does (`type: 'inter'` picks Inter).
+				const context = expected && discriminateContext(expected, e, scope);
 				const members: TS.TypeMember[] = [];
 				// A later property overrides an earlier one with the same key -- real JS object-literal semantics,
 				// and what lets a spread's own members participate (`{...X, key: override}` or `{key, ...X}`).
@@ -1524,7 +1560,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						// value (`{read: (pe, data) => ...}`) otherwise types its own params as `any`, same gap `applyContextualParams`
 						// already closes for call arguments.
 						const key				= T.memberKey(p.key);
-						const expectedMember	= expected && key !== undefined ? T.lookupMember(expected, key, scope) : undefined;
+						const expectedMember	= context && key !== undefined ? contextualMember(context, key, scope) : undefined;
 						switch (p.type) {
 							case 'method':
 								applyContextualParams(p.params, expectedMember, scope);
@@ -1540,7 +1576,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 								checkFunctionBody(p, p.body, scope, false, false, false, err);
 								break;
 							case 'field': {
-								const _t = typeOf(p.value!, scope, true, expectedMember, yieldCollector, err);
+								// A literal stays literal where its context expects one (TS's isLiteralOfContextualType): `{ kind: "mod" }` as a `Mod`.
+								const _t = widenForContext(typeOf(p.value!, scope, false, expectedMember, yieldCollector, err), expectedMember, scope);
 								if (key !== undefined)
 									push(TS.TypeProperty(p.key, _t));
 								break;
@@ -2267,9 +2304,11 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		// parameter's declared type, and without it an unannotated arrow default (`compareFn: (a: T, b: T)
 		// => number = (a, b) => ...`) typed its own params as `any`, so `Array.sort` could not be called
 		// without an explicit comparator at all.
-		const dt = p.default && typeOf(p.default, inner, true, anno, undefined, err);
-		if (err && dt && anno && !checkAssignable(dt, anno, inner, (p as any).pos, inner, err))
-			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${dt}' is not assignable to parameter type '${anno}'`;
+		// Checked precise; an unannotated parameter's own type is the widened one, as TS infers it.
+		const precise	= p.default && typeOf(p.default, inner, false, anno, undefined, err);
+		const dt		= precise && T.widenLiterals(precise);
+		if (err && precise && anno && !checkAssignable(precise, anno, inner, (p as any).pos, inner, err))
+			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${precise}' is not assignable to parameter type '${anno}'`;
 		if (typeof p.key === 'string') {
 			inner.addValue(p.key, anno ? T.optional(anno, hasMod(p, 'optional') && !p.default) : dt ? T.widenNullish(dt, inner) : T.ANY);
 		} else {
@@ -2332,12 +2371,12 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			const	returns: {s: (Stmt & {type: 'return'}), type?: Type}[] = [];
 			const	yields		= generator ? [] as Type[] : undefined;
 			checkBlock(body, inner,
-				(e: Expr, scope: Scope, expected?: Type) => typeOf(e, scope, true, expected, yields, err),
+				(e: Expr, scope: Scope, expected?: Type, widen = true) => typeOf(e, scope, widen, expected, yields, err),
 				(s, scope, typeOf1, checkStmt1) => {
 					stamp(s, scope);
 					checkStmt(s, scope, typeOf1, checkStmt1, err);
 					if (s.type === 'return')
-						returns.push({s, type: s.argument && typeOf(s.argument, scope, true, inferHint, undefined, err)});
+						returns.push({s, type: s.argument && widenForContext(typeOf(s.argument, scope, false, inferHint, undefined, err), inferHint, scope)});
 				}
 			);
 
@@ -2370,7 +2409,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
 				err(SEVERITY.ERROR, (body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
 		} else if (!isPredicate && !declaredReturn) {
-			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(T.widenLiterals(t), inner)), inner, async);
+			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(widenForContext(t, inferHint, inner), inner)), inner, async);
 		}
 	}
 }
@@ -2383,7 +2422,7 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 			case 'field':
 				if (m.value) {
 					const inner = hasMod(m, 'static') ? statScope : instScope;
-					const t		= typeOf(m.value, inner, true, undefined, undefined, err);
+					const t		= typeOf(m.value, inner, false, m.typeAnnotation, undefined, err);
 					if (m.typeAnnotation && err) {
 						if (!checkAssignable(t, m.typeAnnotation, inner, (m as any).pos, inner, err))
 							err(SEVERITY.ERROR, (m as any).pos)`Type '${t}' is not assignable to type '${m.typeAnnotation}'`;
@@ -2524,6 +2563,7 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 					T.stampScope(d.typeAnnotation, scope);
 				if (err && d.typeAnnotation && d.init) {
 					const anno = d.typeAnnotation;
+					// Widened until `let` assignment narrowing exists (inventory C1): a precise `let` union read later is only its declared type.
 					const init = typeOf(d.init, scope, anno);
 					if (!init)
 						checkExcessProps(d.init, anno, pos, scope, err);

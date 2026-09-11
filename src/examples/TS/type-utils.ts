@@ -431,11 +431,13 @@ export function ownScope(t: Type, scope: Scope) {
 // type (real TS semantics) -- callers computing a *physical* runtime representation instead (e.g.
 // towasm.ts picking a value's wasm storage kind) have no such use for it: a frozen and non-frozen `'foo'`
 // still need the exact same physical representation, so those callers pass `true` to widen through it.
-export function widenLiterals(t: Type, keepBoolean = false, ignoreFrozen = false): Type {
+// `shallow`: only the value's own literal (or union of them) widens, not literals nested in an array or object it holds.
+export function widenLiterals(t: Type, keepBoolean = false, ignoreFrozen = false, shallow = false): Type {
 	return	(t.type === 'literal' || t.type === 'range') && t.frozen && !ignoreFrozen ? t
 		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean') ? TS.RefType(literalType(t))
 		:	t.type === 'range' ? TS.RefType(t.base)
-		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean, ignoreFrozen)))
+		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean, ignoreFrozen, shallow)))
+		:	shallow ? t
 		:	t.type === 'array' ? TS.ArrayType(widenLiterals(t.element, keepBoolean, ignoreFrozen), t.readonly)
 		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, widenLiterals(m.typeAnnotation, keepBoolean, ignoreFrozen), m.modifiers) : m))
 		:	t;
@@ -2153,14 +2155,14 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 		if (dst.type === 'literal' && Array.isArray(dst.value)) {
 			if (isLiteral(src, 'string') && !Array.isArray(src.value))
 				return new RegExp(`^${templatePattern(dst.value, dstScope)}$`).test(src.value);
-			return isLiteral(src, 'string') || isRefNamed(src, 'string');	// widened source: lenient
+			return isLiteral(src, 'string') || isRefNamed(src, 'string');	// widened source: lenient (inventory C1)
 		}
 		if (src.type === 'literal' && Array.isArray(src.value))
 			return recurse(STRING, dst, depth - 1);
 		if (dst.type === 'literal')
 			return src.type === 'literal'
 				? src.value === dst.value
-				: src.type === 'ref' && dst.value !== null && src.name === typeof dst.value;	// widened source: lenient
+				: src.type === 'ref' && dst.value !== null && src.name === typeof dst.value;	// widened source: lenient (inventory C1)
 		if (src.type === 'literal')
 			return dst.type === 'ref' && (!ALL_PRIMITIVES.has(dst.name) || dst.name === (src.value === null ? 'null' : typeof src.value));
 
