@@ -573,13 +573,17 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 							});
 						// x.prop === literal (discriminated union): `narrowByDiscriminant` splits a compound member to its matching
 						// sub-variant(s) instead of keeping/discarding it whole; `l.object` may itself be a dotted path.
-						if (l.type === 'member' && r.type === 'literal') {
+						// `x[0] === literal` discriminates too -- a tuple's position, or an interface's numeric key.
+						const discKey = l.type === 'member' ? l.property
+							: l.type === 'index' && (T.isLiteral(l.index, 'number') || T.isLiteral(l.index, 'string')) ? String(l.index.value)
+							: undefined;
+						if ((l.type === 'member' || l.type === 'index') && discKey !== undefined && r.type === 'literal') {
 							// `x?.prop === literal` truly holding also implies `x` itself is non-nullish -- a nullish `x` would
 							// short-circuit the whole expression to `undefined`, which a non-nullish literal can never equal.
 							// Only sound when this branch asserts the equality actually held (`keepMatch`): the excluding branch
 							// (`x?.prop !== literal`) is satisfied by a nullish `x` just as well, so no such inference there.
 
-							const prop = l.property;
+							const prop = discKey;
 							const target = r.value;
 
 							// Narrows `m` by a discriminant-property equality test, recursing into `m`'s structure to split a compound member down
@@ -1391,6 +1395,13 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				recurse(e.index);
 				if (objT.type === 'array')
 					return T.optional(objT.element, chained);
+				// A literal index reads that property of each member: a tuple's position, an interface's `0:` key.
+				const atKey = objT.type !== 'tuple' && T.isLiteral(e.index, 'number') && T.lookupMember(objT, String(e.index.value), scope);
+				if (atKey)
+					return T.optional(atKey, chained);
+				const arrayUnion = !T.isLiteral(e.index, 'string') && T.arrayUnionAsArray(objT, scope);
+				if (arrayUnion)
+					return T.optional(arrayUnion.element, chained);
 				if (objT.type === 'tuple' && T.isLiteral(e.index, 'number')) {
 					const el = objT.elements[e.index.value];
 					if (err && !el)
@@ -1458,7 +1469,13 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// nullish strip-and-reattach below never ran for it: `(() => number) | undefined` isn't
 				// function-shaped, signature lookup found nothing, and the whole call typed as `any`.
 				const calleeOptional = (e.callee.type === 'member' && isOptionalChainLink(e.callee)) || !!(e as { optional?: boolean }).optional;
-				const calleeT		= T.resolveOwn(T.nonNullable(recurse(e.callee), scope, calleeOptional), scope);
+				let calleeT		= T.mergeIdenticalSignatures(T.resolveOwn(T.nonNullable(recurse(e.callee), scope, calleeOptional), scope));
+				if (calleeT.type === 'union' && calleeObjT && e.callee.type === 'member') {
+					const arr		= T.arrayUnionAsArray(T.nonNullable(calleeObjT, scope, calleeOptional), scope);
+					const method	= arr && T.lookupMember(arr, e.callee.property, scope);
+					if (method)
+						calleeT = T.resolveOwn(method, scope);
+				}
 				// Explicit call-site type args (`f<Foo>(...)`) are raw AST, never stamped like a declaration's own annotations --
 				// unstamped, a ref substituted into the callee's generic body would resolve against the callee's scope, not the caller's.
 				let typeArgs	= e.typeArgs?.map(t => T.stampScope(t, scope));

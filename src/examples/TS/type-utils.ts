@@ -491,6 +491,45 @@ function avoidCapture(sig: TS.CallSig, map: Map<string, Type>): TS.CallSig {
 	};
 }
 
+// A union of signatures identical up to their own type-parameter names is ONE signature (real TS's
+// `getUnionSignatures`). `(readonly T[] | T[]).map` is that shape: each part minted its own fresh `U`.
+export function mergeIdenticalSignatures(t: Type): Type {
+	if (t.type !== 'union')
+		return t;
+	const [first, ...rest] = t.types;
+	if (first.type !== 'function')
+		return t;
+	const names	= first.typeParams?.map(p => p.name) ?? [];
+	const key	= typeKey(first);
+	const same	= (f: Type) => {
+		if (f.type !== 'function' || (f.typeParams?.length ?? 0) !== names.length)
+			return false;
+		const renamed = names.length ? substituteType(f, new Map(f.typeParams!.map((p, i) => [p.name, TS.RefType(names[i])] as const))) as TS.FunctionType : f;
+		return typeKey({ ...renamed, typeParams: renamed.typeParams?.map((p, i) => ({ ...p, name: names[i] })) }) === key;
+	};
+	return rest.every(same) ? first : t;
+}
+
+// A union of arrays/tuples as ONE array of the combined element type -- what real TS (5.2+) calls a
+// method on when the union's own signatures don't merge (`(Ty[] | Lit[]).map`).
+export function arrayUnionAsArray(t: Type, scope: Scope): TS.ArrayType | undefined {
+	const r = resolve(scope, t);
+	if (r.type !== 'union')
+		return undefined;
+	const elements: Type[] = [];
+	let readonly = false;
+	for (const m of r.types.map(m => resolve(scope, m))) {
+		if (m.type === 'array')
+			elements.push(m.element);
+		else if (m.type === 'tuple')
+			elements.push(...m.elements.flatMap(el => tupleElementType(el) ?? []));
+		else
+			return undefined;
+		readonly ||= !!m.readonly;
+	}
+	return TS.ArrayType(combineTypes(elements), readonly);
+}
+
 // Chained generic method calls (a builder returning `TableBuilder<T & X>`, called repeatedly) each
 // substitute the *previous* call's own already-substituted return type back in as `T` -- without sharing,
 // every step embeds a full fresh copy of everything before it, so the resulting type's own node count
@@ -1746,6 +1785,10 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				return arrayMember(t.element, prop, scope, depth);
 
 			case 'tuple': {
+				// A tuple's positions are real properties (`'0'`, `'1'`, ...), which is what lets a union of tuples be indexed and discriminated.
+				const at = /^(0|[1-9]\d*)$/.test(prop) && !t.elements.slice(0, +prop).some(el => el.type === 'spread') ? tupleElementType(t.elements[+prop]) : undefined;
+				if (at)
+					return at;
 				const elem = combineTypes(t.elements.map(tupleElementType).filter(x => !!x));
 				return arrayMember(elem, prop, scope, depth);
 			}
@@ -1778,8 +1821,10 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				// `number[]` (itself index-signature-shaped) structurally satisfy a class it shares no real members with,
 				// silently misrouting overload resolution (`isAssignable`'s own `dst.type === 'object'` case). A *string*
 				// index signature is untouched -- it always did (and still does) cover every named key, correctly.
-				return t.members.find((m): m is Extract<TS.TypeMember, { type: 'index' }> =>
-					m.type === 'index' && (!isNumberLike(m.paramType, scope) || /^(0|[1-9]\d*)$/.test(prop)))?.typeAnnotation ?? objectPrototypeMember(prop);
+				// A numeric key prefers the numeric signature, which real TS requires to be the more specific of the two.
+				const indexes	= t.members.filter((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index');
+				return ((/^(0|[1-9]\d*)$/.test(prop) && indexes.find(m => isNumberLike(m.paramType, scope))) || indexes.find(m => !isNumberLike(m.paramType, scope)))?.typeAnnotation
+					?? objectPrototypeMember(prop);
 			}
 			case 'intersection': {
 				const matches: Type[] = [];
