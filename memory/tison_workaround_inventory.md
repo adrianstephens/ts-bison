@@ -100,7 +100,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - arrayMethod's `map` model must stay until a type alias union (`Ty | Lit`) is flattened where towasm reads it;
   removing it broke towasm. `reduce` is now TS's real three overloads (6ee71c9).
 - var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked.
-- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6.
+- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits.
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested
   generics go exponential (7z.ts hit 4 GB). Diagnostics print types within a budget (0d84298).
@@ -112,6 +112,12 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   ("cannot convert ref:ParsedPath to ref:{ root?: ... }", `path.format(path.parse(x))`).
 - towasm lib lacks what tison's sources call: `Object.assign` (TS: `T & U` overloads), `Object.fromEntries`,
   `String.fromCodePoint`, `Uint8Array.set(array, offset)`, `new Map(map)` (Iterable entries).
+- A const context is `const<inner>` (ceafbce): `inner` is the contextual type it replaces, and decides whether an array under
+  it is readonly (TS's checkArrayLiteral); it reaches only literals/array/object literals, not a conditional's branches.
+  Overload trials type each argument against the candidate's own parameter (4cd8e3b), since a nested callback is fixed by the
+  first context it is typed in. `as const` object properties are not yet marked readonly.
+- Real tsc for probes: `node_modules/.bin/tsc --ignoreConfig --noEmit --strict --target es2022 file.ts` (TS 6.0.3 refuses
+  files alongside a tsconfig otherwise). Check TS semantics this way before modeling them.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
   tests count as "clean"; difftest's TS side is transpile-only, so invalid-TS cases slipped in (3 fixed).
 
