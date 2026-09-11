@@ -167,6 +167,13 @@ function shapedHint(t: Type | undefined, scope: Scope): Type | undefined {
 	return t && T.resolveOwn(t, scope).type !== 'ref' ? t : undefined;
 }
 
+// A callback with an unannotated parameter takes its parameter types from its context (TS's `isContextSensitive`).
+function isContextSensitive(a: Expr): a is Expr & { type: 'function' | 'arrow' } {
+	return (a.type === 'function' || a.type === 'arrow') && a.params.some(p => !p.typeAnnotation);
+}
+// What a context-sensitive callback fits as before its context is chosen: any function (TS's `anyFunctionType`).
+const ANY_FUNCTION = TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(T.ANY)) }, T.ANY);
+
 // Returns the contextual signature it resolved, so a caller can also take its RETURN type -- an
 // unannotated callback needs that to type its own body (`xs.map(x => [a, b])` against a `[K, V][]`
 // parameter), not just its parameters.
@@ -247,14 +254,6 @@ function narrowMath(func: string, params: TS.Param[]): Type | undefined {
 	}
 }
 
-// Writes an inferred return type onto the node it was inferred for, recorded so a later check tells it from a declared one:
-// a callback typed again (an overload trial first, then in context) re-infers rather than taking the first guess as declared.
-const inferredReturns = new WeakSet<object>();
-function inferredReturn(fn: { returnType?: Type }, t: Type | undefined) {
-	fn.returnType = t;
-	inferredReturns.add(fn);
-}
-
 // `instance`	is `new C(...)`/`this`'s type;
 // `value`		is the class binding's type (construct sig ∩ static members).
 // `scope`:		the class's declaring scope, stamped onto every result `ref` so a member resolved elsewhere still uses it.
@@ -278,7 +277,7 @@ function lazyReturnType(sig: TS.CallSig, decl: { returnType?: Type }, scope: Sco
 			if (value)
 				T.stampScope(value = fold(value), scope);
 			Object.defineProperty(sig, 'returnType', { value, writable: true, configurable: true, enumerable: true });
-			inferredReturn(decl, value);
+			decl.returnType = value;
 		},
 	});
 }
@@ -1831,33 +1830,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					}
 				}
 
-				// Overload resolution: first arity+type fit wins, computed without contextual param typing (which signature to type a
-				// callback's params from isn't known yet). No fit stays lenient rather than guessing -- tried that, caused false positives.
-				if (overloads) {
-					const hasSpread = e.arguments.some(a => a.type === 'spread');
-					// Muted (`err` explicitly `undefined`, not `recurse`'s ambient one) and precise (`widen: false`): only *trying*
-					// candidate overloads here, not committing to one -- matches old code's `runMuted` wrap around this whole block
-					// (walking a rejected/not-yet-chosen candidate's arguments, e.g. a callback's body, must never report diagnostics
-					// for a signature that isn't picked), and must see the same precise per-argument types the final `argTs`/
-					// `preArgTs` below do -- a widened trial type can make a structurally narrow overload (e.g. `Symbol.split`-shaped)
-					// look like it fits when the real (literal) argument wouldn't, picking the wrong candidate before the real one
-					// is even tried.
-					const trialArgTs = e.arguments.map(a => a.type === 'spread' ? undefined : typeOf(a, scope, false, undefined, yieldCollector, undefined));
-					// A literal's type depends on its context, so each candidate types it against its OWN parameter, as TS
-					// does: `new Map([['', true]])` fits `entries: readonly (readonly [K, V])[]` only as tuples.
-					const contextualTs = (c: TS.CallSig) => e.arguments.map((a, i) => a.type === 'array' || a.type === 'object'
-						? typeOf(a, scope, false, c.params[i]?.typeAnnotation, yieldCollector, undefined) : trialArgTs[i]);
-					sig = overloads!.find(c => {
-						const ts = contextualTs(c);
-						return T.argsFit(instantiate(c, ts, typeArgs, scope, pos), ts, scope, hasSpread);
-					});
-				}
-				if (overloads && !sig && err)
-					err(SEVERITY.WARNING, pos)`No overload of '${e.callee}' matches this call; arguments left unchecked`;
-
 				// Contextual parameter typing: an unannotated callback argument (`arr.map(x => x.foo)`) would otherwise type its own params as `any`.
-				// Fills them in here from the matching declared (pre-substitution) param type -- mutates the AST node; must run before `argTs` below, which triggers `checkFunctionBody` on each argument.
-				if (sig) {
+				// Fills them in here from the matching declared (pre-substitution) param type -- mutates the AST node; must run before `argTs` below,
+				// which triggers `checkFunctionBody` on each argument. A `trial` reports nothing, but still FIXES a callback's parameters, as TS does.
+				const settle = (sig: TS.CallSig, trial: boolean) => {
+					const arg		= (a: Expr, exp?: Type) => trial ? typeOf(a, scope, false, exp, yieldCollector, undefined) : recurse(a, exp);
 					const declScope	= T.declScopeOf(sig, scope);
 
 					// First pass, non-callback arguments only (reused below in `argTs`, so nothing gets double-typed/reported): infers a type
@@ -1891,14 +1868,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						const declared = declaredArg(i);
 						// A `const` type parameter (TS 5.0) infers from its argument AS IF it were written `as const`.
 						if (declared?.type === 'ref' && !declared.typeArgs && sig!.typeParams?.some(p => p.name === declared.name && p.const))
-							return recurse(a, CONST_CONTEXT);
+							return arg(a, CONST_CONTEXT);
 						const generic  = declared && !!sig!.typeParams?.some(p => T.mentionsTypeParam(declared, p.name));
 						// A CALL argument gets it too: that is how the shape reaches a callback nested inside
 						// it (`new Map(xs.map(x => [a, b]))`). The inner call reverse-matches its own `U`
 						// from this, contextually types its callback's return, and the literal becomes a
 						// tuple -- see `instantiate`'s `fromExpected`, which keeps that placeholder binding
 						// from escaping as the answer.
-						return recurse(a, declared && (!generic || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared))) ? declared : undefined);
+						return arg(a, declared && (!generic || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared))) ? declared : undefined);
 					});
 					// TS's two passes: every non-callback argument feeds the inference first, then each callback in order -- its
 					// context FIXES the type parameters its own parameters read, and its return feeds only the ones still open.
@@ -1918,10 +1895,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						settleFromReturn(inference, scope);
 					}
 
-					// A callback whose parameters are all annotated isn't context-sensitive: TS infers from it in the first pass, unfixing.
-					const contextSensitive = (a: Expr): a is Expr & { type: 'function' | 'arrow' } => (a.type === 'function' || a.type === 'arrow') && a.params.some(p => !p.typeAnnotation);
 					const contextOf = (a: Expr, declared: Type | undefined) => declared && (explicit ? T.substituteType(declared, explicit)
-						: !inference ? declared : contextSensitive(a) ? inference.contextFor(declared) : T.substituteType(declared, inference.current()));
+						: !inference ? declared : isContextSensitive(a) ? inference.contextFor(declared) : T.substituteType(declared, inference.current()));
 					const typeCallback = (a: Expr & { type: 'function' | 'arrow' }, i: number) => {
 						const declared		= declaredArg(i);
 						const contextual	= contextOf(a, declared);
@@ -1930,16 +1905,16 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						// determined: the same call is also typed without context, which leaves the signature's own params open.
 						const defaults	= new Map(sig!.typeParams?.filter(p => p.default && !inference?.inferred(p.name)).map(p => [p.name, p.default!] as const));
 						const settled	= contextual && defaults.size ? T.substituteType(contextual, defaults) : contextual;
-						if (settled && !sig!.typeParams?.some(p => T.mentionsTypeParam(settled, p.name)))
+						if (!trial && settled && !sig.typeParams?.some(p => T.mentionsTypeParam(settled, p.name)))
 							(a as any).contextualType ??= T.stampScope(settled, scope);
 						// The same contextual signature handed to the body too: `xs.map(x => [a, b])` against a `[K, V][]`-shaped
 						// parameter can only produce a TUPLE if the callback's own return position is contextually typed.
-						const t = recurse(a, contextual);
+						const t = arg(a, contextual);
 						if (inference && declared)
 							inference.infer(declared, t);
 						return t;
 					};
-					const annotated = new Map(e.arguments.flatMap((a, i) => (a.type === 'function' || a.type === 'arrow') && !contextSensitive(a) ? [[i, typeCallback(a, i)] as const] : []));
+					const annotated = new Map(e.arguments.flatMap((a, i) => (a.type === 'function' || a.type === 'arrow') && !isContextSensitive(a) ? [[i, typeCallback(a, i)] as const] : []));
 
 					const restElementTs: Type[] = [];
 					const argTs = e.arguments.map((a, i) => {
@@ -1947,7 +1922,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							return annotated.get(i) ?? typeCallback(a, i);
 						if (a.type !== 'spread')
 							return preArgTs[i];
-						const t		= T.resolveOwn(recurse(a.operand), scope);
+						const t		= T.resolveOwn(arg(a.operand), scope);
 						const el	= t.type === 'array' ? t.element
 									: t.type === 'tuple' ? T.combineTypes(t.elements.map(el => T.tupleElementType(el)).filter(x => !!x))
 									: undefined;
@@ -1963,7 +1938,43 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							restElementTs.push(argTs[i]);
 					});
 
-					const { params, returnType } = instantiate(sig, argTs, typeArgs, scope, pos, restElementTs, expected, err, inference);
+					return { ...instantiate(sig, argTs, typeArgs, scope, pos, restElementTs, expected, trial ? undefined : err, inference), declScope, argTs };
+				};
+
+				// Overload resolution, TS's two passes. Every candidate is first tried with its context-sensitive callbacks untyped (which
+				// candidate types their parameters isn't known yet): they infer nothing and fit as TS's `anyFunctionType` does, anything
+				// that accepts a function. A candidate that fits then types them -- FIXING their parameters -- and must still fit with
+				// those types, or the next is tried with the callbacks as they now are. No fit at all stays a warning (inventory C3).
+				if (overloads) {
+					const hasSpread = e.arguments.some(a => a.type === 'spread');
+					// Muted (`err` explicitly `undefined`, not `recurse`'s ambient one): a candidate not picked must report nothing. And
+					// precise (`widen: false`), as the final `argTs` are: a widened literal can fit a structurally narrow overload wrongly.
+					const trialArg		= (a: Expr) => a.type === 'spread' || isContextSensitive(a) ? undefined : typeOf(a, scope, false, undefined, yieldCollector, undefined);
+					let trialArgTs		= e.arguments.map(trialArg);
+					// A literal's type depends on its context, so each candidate types it against its OWN parameter, as TS
+					// does: `new Map([['', true]])` fits `entries: readonly (readonly [K, V])[]` only as tuples.
+					const contextualTs	= (c: TS.CallSig) => e.arguments.map((a, i) => a.type === 'array' || a.type === 'object'
+						? typeOf(a, scope, false, c.params[i]?.typeAnnotation, yieldCollector, undefined) : trialArgTs[i]);
+					const fits			= (c: TS.CallSig) => {
+						const ts = contextualTs(c);
+						return T.argsFit(instantiate(c, ts, typeArgs, scope, pos), e.arguments.map((a, i) => isContextSensitive(a) ? ANY_FUNCTION : ts[i]), scope, hasSpread);
+					};
+					sig = overloads.find((c, k) => {
+						if (!fits(c))
+							return false;
+						// The last candidate that can fit needs no second pass: resolution settles on it either way.
+						if (!e.arguments.some(isContextSensitive) || !overloads!.slice(k + 1).some(fits))
+							return true;
+						const typed = settle(c, true);
+						trialArgTs = e.arguments.map(trialArg);
+						return T.argsFit(typed, typed.argTs, scope, hasSpread);
+					});
+				}
+				if (overloads && !sig && err)
+					err(SEVERITY.WARNING, pos)`No overload of '${e.callee}' matches this call; arguments left unchecked`;
+
+				if (sig) {
+					const { declScope, argTs, params, returnType } = settle(sig, false);
 					
 					// TBD: check if callee if pure
 
@@ -2258,7 +2269,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		return;
 
 	// A declared return type is never replaced by inference, even one (`any`, a generator's) that checks nothing.
-	const declaredReturn = inferredReturns.has(fn) ? undefined : fn.returnType;
+	const declaredReturn = fn.returnType;
 	// A declared generator's body is checked against what it iterates: `return x` against its TReturn, `yield`s against Y and N.
 	const generatorTypes = generator && declaredReturn ? T.iterationTypes(declaredReturn, scope, async, undefined, true) : undefined;
 	let expected = generator ? generatorTypes?.return : declaredReturn;
@@ -2427,9 +2438,9 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			const returnType = retDef.length ? T.widenNullish(T.combineTypes(retDef), inner) : alwaysThrows(body[body.length - 1]) ? T.NEVER : T.VOID;
 
 			if (!declaredReturn) {
-				inferredReturn(fn, generator
+				fn.returnType = generator
 					? TS.RefType(async ? 'AsyncGenerator' : 'Generator', [yields!.length ? T.combineTypes(yields!) : T.NEVER, returnType, T.ANY])
-					: T.wrapReturnIfAsync(inferredPredicate(body.length === 1 && body[0].type === 'return' ? body[0].argument : undefined, returnType), inner, async));
+					: T.wrapReturnIfAsync(inferredPredicate(body.length === 1 && body[0].type === 'return' ? body[0].argument : undefined, returnType), inner, async);
 			}
 		}
 	} else {
@@ -2441,7 +2452,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
 				err(SEVERITY.ERROR, (body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
 		} else if (!isPredicate && !declaredReturn) {
-			inferredReturn(fn, T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(widenForContext(t, inferHint, inner), inner)), inner, async));
+			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(widenForContext(t, inferHint, inner), inner)), inner, async);
 		}
 	}
 }
