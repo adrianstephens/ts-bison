@@ -6184,6 +6184,22 @@ async function main() {
 		`);
 		check('new Map([[k, v]]) built at the Map type it is headed for', r10.mapArg() * 100 + r10.mapDecl(), 1213);
 		check('a generic type guard narrows a wider member; its instantiations share one struct', r10.guards(), 350);
+
+		// towasm.ts's `hostImportsIn`: `body.find(...)` then `decl?.type === 'function_decl'`. Each of these trapped,
+		// failed to validate, or dispatched to structs the literals were never built as.
+		const r11 = await compile(`
+			interface FD { type: 'function_decl'; name: string; params: number[] }
+			interface VD { type: 'var_decl'; name: string }
+			interface MD { type: 'module_decl'; name: string; ambient: boolean; body: (FD | VD)[] }
+			const md: MD = { type: 'module_decl', name: 'm', ambient: true, body: [{ type: 'var_decl', name: 'v' }, { type: 'function_decl', name: 'g', params: [1, 2] }] };
+			function viaPredicate(s: string): number { const decl = md.body.find(d => d.type === 'function_decl' && d.name === s); return decl?.type === 'function_decl' ? decl.params.length : -1; }
+			function viaUnion(s: string): number { const decl = md.body.find(d => d.name === s); return decl?.type === 'function_decl' ? decl.params.length : -1; }
+			function direct(decl: FD | VD | undefined): number { return decl?.type === 'function_decl' ? decl.params.length : -1; }
+			export function optDisc(): number {
+				return (viaPredicate('g') * 10 + viaPredicate('zz') + 1) * 10000 + (viaUnion('g') * 10 + viaUnion('v') + 1) * 100 + direct(md.body[1]) * 10 + direct(undefined) + 1;
+			}
+		`);
+		check('x?.disc === lit on a union / nullable receiver from find()', r11.optDisc(), 202020);
 		check('&& as a statement runs for its effect', r.asStatement(), 5);
 	}
 

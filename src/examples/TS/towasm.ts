@@ -2684,7 +2684,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const parts		= refined.map(p => {
 			if (declared.has(T.typeKey(p)))
 				return p;
-			const from = members.filter(m => T.isAssignable(p, m, scope));
+			const from = members.filter(m => !T.isAny(m) && T.isAssignable(p, m, scope));
 			return from.length === 1 ? from[0] : p;
 		});
 		return parts.some((p, i) => p !== refined[i]) ? T.combineTypes(parts) : narrowed;
@@ -3918,13 +3918,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// anything without a known one (a tuple's own per-position type doesn't come through this path at
 	// all, and `new Uint8Array([...])` never has one either) -- every existing call site keeps working
 	// unchanged.
-	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElementI, typeIndex: number, elementTsType?: Type): void {
-		const emitElement = (el: Expr) => {
-			const saved = ctx.contextualReturn;
-			ctx.contextualReturn = elementTsType;
-			emitAs(el, ctx, want);
+	function withContext<R>(ctx: FunctionContext, contextual: Type | undefined, fn: () => R): R {
+		const saved = ctx.contextualReturn;
+		ctx.contextualReturn = contextual;
+		try {
+			return fn();
+		} finally {
 			ctx.contextualReturn = saved;
-		};
+		}
+	}
+
+	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElementI, typeIndex: number, elementTsType?: Type): void {
+		const emitElement = (el: Expr) => withContext(ctx, elementTsType, () => emitAs(el, ctx, want));
 		if (elements.some(el => el?.type === 'spread')) {
 			// A `[...]` array literal with at least one spread element. Every element is evaluated exactly once, in
 			// source order, into a scratch local before anything is allocated (side effects must not run twice). The real array is then `array.new_default`-allocated to the true runtime total and filled in a second pass.
@@ -5308,8 +5313,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (t.type === 'union') {
 						const owners = T.unionMembers(t, ctx.typeScope).filter(m => !T.isNullish(m, ctx.typeScope)).flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
 						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1)) {
+							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property, T.lookupMember(T.nonNullable(t, ctx.typeScope), e.property, ctx.typeScope));
+							if (isOptionalChainLink(e)) {
+								emitAs(e.object, ctx, REF_ANY_NULLABLE);
+								const resultWtype = nullableWtype(info.result);
+								return emitOptionalAccess(ctx, REF_ANY_NULLABLE, resultWtype, objLocal => {
+									ctx.emit(I.local.get(objLocal), I.ref.as_non_null, I.call(info.funcIndex));
+									coerceTop(info.result, ctx, resultWtype);
+								});
+							}
 							emitAs(e.object, ctx, REF_ANY);
-							const info = ensureUnionFieldDispatch(owners as ClassInfo[], e.property, T.lookupMember(t, e.property, ctx.typeScope));
 							ctx.emit(I.call(info.funcIndex));
 							return info.result;
 						}
@@ -5378,9 +5391,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// nested `if`s instead of one flat guard. Simpler to get right than flattening the whole
 				// chain into a single guard, and this file already leans "correct first" over "most compact".
 				if (isOptionalChainLink(e)) {
-					const objWtype = wtypeOf(e.object, ctx);
-					if (!objWtype)
-						throw `'a?.${e.property}' has an unsupported object type`;
+					// The class's own nullable ref, not the receiver's: an `any | undefined` local holds a boxed `anyref`.
+					const objWtype = nullableWtype(cls.thisWtype!);
 					emitAs(e.object, ctx, objWtype);
 					const resultWtype = nullableWtype(fieldWtype);
 					return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
@@ -5406,9 +5418,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (isOptionalChainLink(e)) {
 						if (sig.result === 'void')
 							throw "'a?.[i]' is not supported -- 'get' returns 'void', which can't become 'void | undefined'";
-						const objWtype = wtypeOf(e.object, ctx);
-						if (!objWtype)
-							throw "'a?.[i]' has an unsupported object type";
+						const objWtype = nullableWtype(cls.thisWtype!);
 						emitAs(e.object, ctx, objWtype);
 						const resultWtype = nullableWtype(sig.result);
 						return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
@@ -5633,7 +5643,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const rawWtype	= (src: FieldSource, name: string) => src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].wtype;
 				const emitOne	= (src: FieldSource, f: { name: string; wtype: WasmType }) => {
 					if (src.expr) {
-						emitAs(src.expr, ctx, f.wtype);
+						// The field's declared type is the value's context: a nested literal picks its union member from it.
+						withContext(ctx, fieldDeclaredType(owner, f.name), () => emitAs(src.expr!, ctx, f.wtype));
 					} else {
 						const idx = src.spreadCls!.fieldIndex.get(f.name)!;
 						ctx.emit(I.local.get(src.spreadLocal!.index), I.struct.get(src.spreadCls!.typeIndex, idx));
@@ -6157,9 +6168,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const leftInfo	= operandInfo(left, ctx);
 						const method	= BINARY_OP_NAMES[operator as keyof typeof BINARY_OP_NAMES];
 
-						// With a boxed `any` on either side, what `===` means is only known at runtime.
-						const isBoxedAny = (w: WasmType | undefined) => !!w && typeof w !== 'string' && 'ref' in w && w.ref === 'any';
-						if ((method === 'eq' || method === 'ne') && (isBoxedAny(leftInfo.wtype) || isBoxedAny(rightInfo.wtype))) {
+						// With a boxed `any` or a nullable ref on either side, what `===` means is only known at runtime --
+						// and a method dispatch (`String.eq`) would trap on a null receiver: `x?.type === 'a'`.
+						const isRuntimeEq = (w: WasmType | undefined) => !!w && typeof w !== 'string' && (('ref' in w && w.ref === 'any') || !!w.nullable);
+						if ((method === 'eq' || method === 'ne') && (isRuntimeEq(leftInfo.wtype) || isRuntimeEq(rightInfo.wtype))) {
 							emitAs(left, ctx, REF_ANY_NULLABLE);
 							emitAs(right, ctx, REF_ANY_NULLABLE);
 							ctx.emit(I.call(ensureAnyStrictEq().funcIndex));
@@ -6425,12 +6437,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (isOptionalChainLink(e.callee)) {
 						const objExpr		= e.callee.object;
 						const methodName	= e.callee.property;
-						const objWtype		= wtypeOf(objExpr, ctx);
-						if (!objWtype || typeof objWtype === 'string')
+						const physWtype		= wtypeOf(objExpr, ctx);
+						if (!physWtype || typeof physWtype === 'string')
 							throw `'a?.${methodName}(...)' needs an object-typed value on its left`;
 						const owner = ownerOf(objExpr, ctx);
 						if (!owner)
 							throw `unknown method '${methodName}'`;
+						const objWtype = owner.thisWtype && typeof owner.thisWtype !== 'string' ? nullableWtype(owner.thisWtype) : physWtype;
 						const typeArgs = e.typeArgs;
 						const method = ensureMethod(owner, methodName, e.arguments, ctx, typeArgs);
 						if (!method)
