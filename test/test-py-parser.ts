@@ -49,7 +49,7 @@ n: int = 5
 `);
 
 test('function def', `
-def greet(name, greeting="hello", *args, **kwargs) -> str:
+def greet(name: str, greeting="hello", *args: int, **kwargs: str) -> str:
     return greeting + ", " + name
 `);
 

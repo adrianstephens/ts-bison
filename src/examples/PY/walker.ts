@@ -121,9 +121,6 @@ export function walk<T extends Walkable>(ast: T,
 	const withItem		= (w: PY.WithItem): PY.WithItem => mapObject(w, {context: mapExpressionA, optional_vars: mapExpression});
 	const handler  		= (h: PY.ExceptHandler): PY.ExceptHandler => mapObject(h, {type: mapExpression, body: mapStmts});
 
-	const specPart 		= (s: PY.FStringSpecPart): PY.FStringSpecPart => 'expr' in s ? {expr: mapExpressionA(s.expr)} : s;
-	const fstringPart 	= (p: PY.FStringPart): PY.FStringPart => p.field ? {...p, field: mapObject(p.field, {expr: mapExpressionA, spec: mapArrayA(specPart)})} : p;
-
 	const expression = (e: Expr): Expr => {
 		switch (e.type) {
 			case 'unary':				return mapObject(e, {operand: mapExpressionA});
@@ -150,7 +147,11 @@ export function walk<T extends Walkable>(ast: T,
 			case 'setcomp':				return mapObject(e, {elt: mapExpressionA, gens: mapArrayA(compClause)});
 			case 'dictcomp':			return mapObject(e, {key: mapExpressionA, value: mapExpressionA, gens: mapArrayA(compClause)});
 			case 'yield':				return mapObject(e, {operand: mapExpression, from: mapExpression});
-			case 'fstring':				return mapObject(e, {parts: mapArrayA(fstringPart)});
+			case 'literal':				return mapObject(e, {
+				value: v => Array.isArray(v) ? v.map(p => 
+					p.field ? {...p, field: mapObject(p.field, {expr: mapExpressionA, spec: mapArrayA(s => typeof s === 'string' ? s : mapExpressionA(s))})} : p
+				) : v
+			});
 			// identifier / literal / imaginary / ellipsis -- no nested AST
 			default:					return e;
 		}
@@ -214,10 +215,10 @@ export function walkB<T extends Walkable>(ast: T,
 	const compClause	= (c: PY.CompClause) => c.type === 'for' ? walkExpression(c.target) || walkExpression(c.iter) : walkExpression(c.test);
 	const withItem 		= (w: PY.WithItem) => walkExpression(w.context) || walkExpression(w.optional_vars);
 	const handler		= (h: PY.ExceptHandler) => walkExpression(h.type) || h.body.some(walkStatement);
-	const fstringPart	= (p: PY.FStringPart) => !!p.field && (walkExpression(p.field.expr) || !!p.field.spec?.some(s => 'expr' in s && walkExpression(s.expr)));
 
 	const expression = (e: Expr): boolean => {
 		switch (e.type) {
+			case 'literal':				return Array.isArray(e.value) && e.value.some(p => !!p.field && (walkExpression(p.field.expr) || !!p.field.spec?.some(s => typeof s !== 'string' && walkExpression(s))));
 			case 'unary':				return walkExpression(e.operand);
 			case 'spread':				return walkExpression(e.operand);
 			case 'await':				return walkExpression(e.operand);
@@ -239,7 +240,6 @@ export function walkB<T extends Walkable>(ast: T,
 			case 'setcomp':				return walkExpression(e.elt) || e.gens.some(compClause);
 			case 'dictcomp':			return walkExpression(e.key) || walkExpression(e.value) || e.gens.some(compClause);
 			case 'yield':				return walkExpression(e.operand) || walkExpression(e.from);
-			case 'fstring':				return e.parts.some(fstringPart);
 			default:					return false;
 		}
 	};

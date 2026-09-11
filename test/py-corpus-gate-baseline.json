@@ -1,0 +1,5 @@
+{
+	"files": 623,
+	"failed": 8,
+	"note": "stdlib files that fail to parse or round-trip unstably, excluding files using syntax deliberately unsupported (match statement, PEP 695); lower is better"
+}

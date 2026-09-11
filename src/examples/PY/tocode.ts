@@ -1,5 +1,5 @@
 import * as PY from './py-parser';
-import { Literal, Module } from '../common';
+import { Module } from '../common';
 import { isModule, isStmt } from './walker';
 
 type Expr = PY.Expr;
@@ -55,7 +55,7 @@ function exprPrecedence(e: Expr): number {
 		case 'call':
 		case 'member':
 		case 'index':			return POSTFIX;
-		default:				return ATOM;	// identifier / literal / imaginary / ellipsis / tuple / list / set / dict / comprehensions / fstring
+		default:				return ATOM;	// identifier / literal / imaginary / ellipsis / tuple / list / set / dict / comprehensions
 	}
 }
 
@@ -186,12 +186,13 @@ export class Output {
 			switch (p.kind) {
 				case 'slash':		return '/';
 				case 'stardelim':	return '*';
-				case 'star':		return '*' + (p.name ?? '');
-				case 'dstar':		return '**' + p.name;
+				case 'star':		return '*' + (p.name ?? '') + maybe(p.annotation, a => ': ' + this.expr(a));
+				case 'dstar':		return '**' + p.name + maybe(p.annotation, a => ': ' + this.expr(a));
 				default: {
-					const ann = !lambda && p.annotation ? ': ' + this.expr(p.annotation) : '';
 					const eq  = !lambda && p.annotation ? ' = ' : '=';
-					return p.name + ann + maybe(p.default, d => eq + this.expr(d));
+					return p.name
+						+ (!lambda && p.annotation ? ': ' + this.expr(p.annotation) : '')
+						+ maybe(p.default, d => eq + this.expr(d));
 				}
 			}
 		}).join(this.comma);
@@ -222,16 +223,16 @@ export class Output {
 	}
 
 	private fstring(parts: PY.FStringPart[]): string {
-		const body = parts.map(p => p.text + (p.field ? this.fstringField(p.field) : '')).join('');
-		const single = !body.includes('\n') && (!body.includes('"') ? '"' : !body.includes("'") ? "'" : '');
+		const fstringField = (f: PY.FStringField) => '{'
+			+ this.expr(f.expr) + (f.selfDoc ? '=' : '') + maybe(f.conv, c => '!' + c)
+			+ (f.spec ? ':' + f.spec.map(s => typeof s === 'string' ? s : '{' + this.expr(s) + '}').join('') : '')
+			+ '}';
+		const body		= parts.map(p => p.text + (p.field ? fstringField(p.field) : '')).join('');
+		const single	= !body.includes('\n') && (!body.includes('"') ? '"' : !body.includes("'") ? "'" : '');
 		return single ? 'f' + single + body + single
 			: !body.includes('"""') ? 'f"""' + body + '"""'
 			: !body.includes("'''") ? "f'''" + body + "'''"
 			: 'f"""' + body.replace(/"/g, '\\"') + '"""';
-	}
-	private fstringField(f: PY.FStringField): string {
-		const spec = f.spec ? ':' + f.spec.map(s => 'expr' in s ? '{' + this.expr(s.expr) + '}' : s.text).join('') : '';
-		return '{' + this.expr(f.expr) + (f.selfDoc ? '=' : '') + maybe(f.conv, c => '!' + c) + spec + '}';
 	}
 
 	// Bare (unparenthesised) tuple where the context allows it -- assignment sides, `return`, `del`,
@@ -255,7 +256,8 @@ export class Output {
 		switch (e.type) {
 			case 'identifier':		return e.name;
 			case 'literal':
-				return e.value === null ? 'None'
+				return Array.isArray(e.value) ? this.fstring(e.value)
+					: e.value === null ? 'None'
 					: typeof e.value === 'boolean' ? (e.value ? 'True' : 'False')
 					: typeof e.value === 'string' ? pyStr(e.value)
 					: String(e.value);
@@ -263,13 +265,13 @@ export class Output {
 			case 'ellipsis':		return '...';
 			case 'unary':			return e.operator === '!' ? 'not ' + this.expr(e.operand, NOT) : e.operator + this.expr(e.operand, UNARY);
 			case 'binary': {
-				const prec = BINARY_PREC[e.operator] ?? ATOM;
-				const rightAssoc = e.operator === '**';
-				const opStr = e.operator === '&&' ? ' and ' : e.operator === '||' ? ' or ' : this.op(e.operator);
-				return this.expr(e.left, rightAssoc ? prec + 1 : prec) + opStr + this.expr(e.right, rightAssoc ? prec : prec + 1);
+				const prec			= BINARY_PREC[e.operator] ?? ATOM;
+				const rightAssoc	= e.operator === '**';
+				return this.expr(e.left, rightAssoc ? prec + 1 : prec)
+					+ (e.operator === '&&' ? ' and ' : e.operator === '||' ? ' or ' : this.op(e.operator))
+					+ this.expr(e.right, rightAssoc ? prec : prec + 1);
 			}
-			case 'compare':			return this.expr(e.left, BOR)
-				+ e.ops.map((o, i) => ' ' + o + ' ' + this.expr(e.comparators[i], BOR)).join('');
+			case 'compare':			return this.expr(e.left, BOR) + e.ops.map((o, i) => ' ' + o + ' ' + this.expr(e.comparators[i], BOR)).join('');
 			case 'conditional':		return this.expr(e.consequent, OR) + ' if ' + this.expr(e.test, OR) + ' else ' + this.expr(e.alternate, TERNARY);
 			case 'lambda':			return 'lambda' + (e.params.length ? ' ' + this.params(e.params, true) : '') + ': ' + this.expr(e.body, LAMBDA);
 			case 'namedexpr':		return e.target + ' := ' + this.expr(e.value, TERNARY);
@@ -278,8 +280,7 @@ export class Output {
 			case 'index':			return this.expr(e.object, POSTFIX) + '[' + this.sliceStr(e.index) + ']';
 			case 'slice':			return this.sliceStr(e);	// only reached if a bare slice is printed on its own
 			case 'call':			return this.expr(e.callee, POSTFIX) + '(' + e.arguments.map(a => this.arg(a)).join(this.comma) + ')';
-			case 'tuple':			return e.elements.length === 0 ? '()'
-				: '(' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + (e.elements.length === 1 ? ',' : '') + ')';
+			case 'tuple':			return e.elements.length === 0 ? '()' : '(' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + (e.elements.length === 1 ? ',' : '') + ')';
 			case 'list':			return '[' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + ']';
 			case 'set':				return e.elements.length === 0 ? 'set()' : '{' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + '}';
 			case 'dict':			return '{' + e.keys.map((k, i) => k === null
@@ -291,7 +292,6 @@ export class Output {
 			case 'dictcomp':		return '{' + this.expr(e.key, TERNARY) + ': ' + this.expr(e.value, TERNARY) + ' ' + this.comprehension(e.gens) + '}';
 			case 'await':			return 'await ' + this.expr(e.operand, AWAIT);
 			case 'yield':			return e.from ? 'yield from ' + this.expr(e.from) : e.operand ? 'yield ' + this.exprList(e.operand) : 'yield';
-			case 'fstring':			return this.fstring(e.parts);
 		}
 	}
 }

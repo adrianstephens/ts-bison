@@ -58,10 +58,11 @@ export interface Ctx {
 	indents:		number[];	// indentation stack, always starts [0]; maintained solely by WS
 	owedIndent:		boolean;	// WS saw a deeper line -- the INDENT terminal still owes one token
 	owedDedents:	number;		// ...or a shallower line -- this many DEDENT tokens still owed
+	inFString:		number;		// depth of open f-strings -- `#` never starts a comment in here (real Python has no such thing)
 }
 
 export function newCtx(): Ctx {
-	return { parenDepth: 0, indents: [0], owedIndent: false, owedDedents: 0 };
+	return { parenDepth: 0, indents: [0], owedIndent: false, owedDedents: 0, inFString: 0 };
 }
 
 // Produced only by `WS`'s callback, never lexed directly (no pattern) -- same trick as
@@ -136,7 +137,7 @@ export const SEP = terminal('SEP', EMPTY, (_lex, ctx: Ctx) =>
 // rejects its own match while DEDENTs are still owed, letting the DEDENT terminal take the slot;
 // once the debt clears (the right nesting level is reached) the keyword lexes normally and
 // attaches to the construct at that level.
-function dedentGuardedKeyword(name: string): Terminal {
+function dedentGuardedKeyword(name: string) {
 	const t = terminal(name, new RegExp(name + '\\b'), (_lex, ctx: Ctx) => ctx.owedDedents > 0 ? undefined : t);
 	return t;
 }
@@ -145,7 +146,7 @@ const ELSE = dedentGuardedKeyword('else');
 const EXCEPT = dedentGuardedKeyword('except');
 const FINALLY = dedentGuardedKeyword('finally');
 
-function bracket(ch: string, delta: number): Terminal {
+function bracket(ch: string, delta: number) {
 	const t = terminal(ch, new RegExp('\\' + ch), (_lex, ctx: Ctx) => {
 		ctx.parenDepth = Math.max(0, ctx.parenDepth + delta);
 		return t;
@@ -167,8 +168,17 @@ export const STRING	= terminal('STRING', /(?:[rRbBuU]|[rR][bB]|[bB][rR])?(?:'''[
 // binds longer so it always wins over the single-quote form at the same position). Nested `{`/`}`
 // reuse the ordinary `obrace`/`cbrace` bracket terminals -- an interpolation is a real expression
 // context, so `f"{ {1: 2}[1] }"` (a dict literal inside a field) tracks paren-depth correctly too.
-function fstringOpen(name: string, q: string) { return terminal(name, new RegExp(`(?:[fF][rR]?|[rR][fF])${q}`)); }
-function fstringClose(name: string, q: string) { return terminal(name, new RegExp(q)); }
+// `inFString` brackets the whole literal (open through close, format specs and all) so the `#`
+// comment skip terminal below can tell it's inside one -- real Python has no such thing as a
+// comment inside an f-string, at any nesting depth, so this isn't a narrowing, just stating that.
+function fstringOpen(name: string, q: string) {
+	const t = terminal(name, new RegExp(`(?:[fF][rR]?|[rR][fF])${q}`), (_lex, ctx: Ctx) => (ctx.inFString++, t));
+	return t;
+}
+function fstringClose(name: string, q: string) {
+	const t = terminal(name, new RegExp(q), (_lex, ctx: Ctx) => (ctx.inFString--, t));
+	return t;
+}
 // Runs to (but not including) an unescaped `{` (interpolation) or the closing quote; `{{`/`}}` are
 // literal-brace escapes. Triple-quoted text may contain raw newlines and lone `'`/`"`.
 function fstringText(name: string, close: string) {
@@ -212,58 +222,61 @@ export type binaryOps	=
 	| '&&' | '||';
 export type compareOps	= '<' | '>' | '<=' | '>=' | '==' | '!=' | '<>' | 'in' | 'not in' | 'is' | 'is not';
 
-export interface Imaginary	{ type: 'imaginary'; value: number }
-export interface Ellipsis	{ type: 'ellipsis' }
+export interface Imaginary		{ type: 'imaginary'; value: number }
+export interface Ellipsis		{ type: 'ellipsis' }
 export interface Compare		{ type: 'compare'; left: Expr; ops: compareOps[]; comparators: Expr[] }
 export type      Conditional	= Common.Conditional<Expr>;
-export interface Lambda		{ type: 'lambda'; params: Param[]; body: Expr }
-export interface NamedExpr	{ type: 'namedexpr'; target: string; value: Expr }
-export type      Spread		= Common.Spread<Expr>;
-export type      Member		= Common.Member<Expr>;
+export interface Lambda			{ type: 'lambda'; params: Param[]; body: Expr }
+export interface NamedExpr		{ type: 'namedexpr'; target: string; value: Expr }
+export type      Spread			= Common.Spread<Expr>;
+export type      Member			= Common.Member<Expr>;
 // `index` holds the whole `[...]` payload: a plain expression, a `SliceExpr`, or a `tuple` of either.
-export type      Index		= Common.Index<Expr>;
-export interface SliceExpr	{ type: 'slice'; lower?: Expr; upper?: Expr; step?: Expr }
-export type      Call		= Common.Call<Expr, Arg>;
-export type      Tuple		= Common.Sequence<Expr, 'tuple'>;
-export type      ListLit	= Common.Sequence<Expr, 'list'>;
-export type      SetLit		= Common.Sequence<Expr, 'set'>;
-export interface DictLit	{ type: 'dict'; keys: (Expr | null)[]; values: Expr[] }
-export interface Comprehension	{ type: 'for'; target: Expr; iter: Expr; is_async: boolean }
-export interface CompIf			{ type: 'if'; test: Expr }
-export type CompClause			= Comprehension | CompIf;
-export interface GeneratorExp	{ type: 'genexp'; elt: Expr; gens: CompClause[] }
-export interface ListComp		{ type: 'listcomp'; elt: Expr; gens: CompClause[] }
-export interface SetComp			{ type: 'setcomp'; elt: Expr; gens: CompClause[] }
-export interface DictComp		{ type: 'dictcomp'; key: Expr; value: Expr; gens: CompClause[] }
+export type      Index			= Common.Index<Expr>;
+export interface SliceExpr		{ type: 'slice'; lower?: Expr; upper?: Expr; step?: Expr }
+export type      Call			= Common.Call<Expr, Arg>;
+export type      Tuple			= Common.Sequence<Expr, 'tuple'>;
+export type      ListLit		= Common.Sequence<Expr, 'list'>;
+export type      SetLit			= Common.Sequence<Expr, 'set'>;
+export interface DictLit		{ type: 'dict'; keys: (Expr | null)[]; values: Expr[] }
 export type      Await			= Common.Await<Expr>;
 // `yield from x` is Python's delegation form; js-parser spells the same idea `yield* x` with a
 // `delegate` flag, so only the extra field differs.
 export interface YieldExpr extends Common.Yield<Expr> { from?: Expr }
 
+export interface Comprehension	{ type: 'for'; target: Expr; iter: Expr; is_async: boolean }
+export interface CompIf			{ type: 'if'; test: Expr }
+export type CompClause			= Comprehension | CompIf;
+export interface GeneratorExp	{ type: 'genexp'; elt: Expr; gens: CompClause[] }
+export interface ListComp		{ type: 'listcomp'; elt: Expr; gens: CompClause[] }
+export interface SetComp		{ type: 'setcomp'; elt: Expr; gens: CompClause[] }
+export interface DictComp		{ type: 'dictcomp'; key: Expr; value: Expr; gens: CompClause[] }
+
+
 // A `{expr[=][!conv][:spec]}` field inside an f-string. `spec`'s own text/nested-field parts
 // mirror `FStringPart` one level down (`f"{x:{width}}"`'s spec is `[{text:''},{expr:width}]`) --
 // real Python allows recursion here too, but a nested field's own `!conv`/`:spec`/`=` are dropped
 // (CPython's own grammar barely exercises that either).
-export interface FStringField	{ expr: Expr; selfDoc?: boolean; conv?: string; spec?: FStringSpecPart[] }
-export type FStringSpecPart	= { text: string } | { expr: Expr };
+export interface FStringField	{ expr: Expr; selfDoc?: boolean; conv?: string; spec?: (string | Expr)[] }
 export interface FStringPart	{ text: string; field?: FStringField }
-export interface FStringLit	{ type: 'fstring'; parts: FStringPart[] }
 
 export type Expr =
 	| Identifier
-	| Literal<number | bigint | string | boolean | null>
+	| Literal<number | bigint | string | boolean | null | FStringPart[]>
 	| Imaginary | Ellipsis
 	| Unary<Expr, unaryOps>
 	| Binary<Expr, binaryOps>
 	| Compare | Conditional | Lambda | NamedExpr
 	| Spread | Member | Index | SliceExpr | Call | Tuple | ListLit | SetLit | DictLit
-	| GeneratorExp | ListComp | SetComp | DictComp | Await | YieldExpr | FStringLit;
+	| Await | YieldExpr
+	| GeneratorExp | ListComp | SetComp | DictComp;
 
-export interface Arg { kind: 'pos' | 'kw' | 'star' | 'dstar'; name?: string; value: Expr }
-
-export interface Param { name?: string; annotation?: Expr; default?: Expr; kind?: 'normal' | 'star' | 'dstar' | 'slash' | 'stardelim' }
-
-export interface Alias { name: string; asname?: string }
+export interface Arg	{ kind: 'pos' | 'kw' | 'star' | 'dstar'; name?: string; value: Expr }
+export interface Param	{ name?: string; annotation?: Expr; default?: Expr; kind?: 'normal' | 'star' | 'dstar' | 'slash' | 'stardelim' }
+export interface Alias	{ name: string; asname?: string }
+export interface WithItem { context: Expr; optional_vars?: Expr }
+export interface ExceptHandler extends Common.Handler<Stmt, string> { star: boolean; type?: Expr }
+// `orelse` is the `else:` clause -- Python-only, so `Try` is extended rather than aliased.
+export interface TryStmt extends Common.Try<Stmt, string> { handlers: ExceptHandler[]; orelse: Stmt[]; finalizer: Stmt[] }
 
 export type Stmt =
 	| Common.ExprStmt<Expr>
@@ -286,10 +299,6 @@ export type Stmt =
 	| { type: 'funcdef'; name: string; params: Param[]; returns?: Expr; body: Stmt[]; decorators: Expr[]; is_async: boolean }
 	| { type: 'classdef'; name: string; bases: Arg[]; body: Stmt[]; decorators: Expr[] };
 
-export interface WithItem { context: Expr; optional_vars?: Expr }
-export interface ExceptHandler extends Common.Handler<Stmt, string> { star: boolean; type?: Expr }
-// `orelse` is the `else:` clause -- Python-only, so `Try` is extended rather than aliased.
-export interface TryStmt extends Common.Try<Stmt, string> { handlers: ExceptHandler[]; orelse: Stmt[]; finalizer: Stmt[] }
 
 interface DictEntry { key: Expr | null; value: Expr }
 interface CommaList { items: Expr[]; trailing: boolean }
@@ -297,9 +306,6 @@ interface AssignRhs { targets: Expr[]; value: Expr }
 interface CompContent { comp: CompClause[] | null; list: CommaList }
 
 // --- AST helpers ---
-
-const PyUnary	= Unary<Expr, unaryOps>;
-const PyBinary	= Binary<Expr, binaryOps>;
 
 // `a < b < c` -> one `Compare` with all the ops; a lone `a < b` is still a `Compare` (single-op),
 // matching CPython -- a C/analysis backend desugars either the same way.
@@ -350,14 +356,21 @@ export const unescapePyString = (s: string): string => s.replace(
 
 // `r`/`R` in the prefix suppresses escape processing entirely (a raw string) -- the prefix is otherwise
 // dropped (string/bytes distinction isn't modeled, see the file header comment).
-function pyString(parts: string[]): Literal<string> {
-	return Literal(parts.map(p => {
-		const m = /^([A-Za-z]*)('''|"""|'|")([\s\S]*)\2$/.exec(p);
-		if (!m)
-			return p;
-		const [, prefix, , inner] = m;
-		return /r/i.test(prefix) ? inner : unescapePyString(inner);
-	}).join(''));
+function pyStringPiece(raw: string): string {
+	const m = /^([A-Za-z]*)('''|"""|'|")([\s\S]*)\2$/.exec(raw)!;
+	const [, prefix, , inner] = m;
+	return /r/i.test(prefix) ? inner : unescapePyString(inner);
+}
+
+// Adjacent string/f-string literals (only whitespace/comments/line-continuation between, enforced
+// by the lexer's `skip`) concatenate into ONE literal -- CPython does this at parse time too, so
+// `'a ' f'{x}'` is indistinguishable from a single f-string once parsed. All-plain pieces join into
+// a `Literal<string>`; if any piece is an f-string, every piece (plain text included) flattens into
+// one `Literal<FStringPart[]>`.
+function concatStrings(pieces: (string | FStringPart[])[]): Literal<string | FStringPart[]> {
+	if (pieces.every((p): p is string => typeof p === 'string'))
+		return Literal(pieces.join(''));
+	return Literal(pieces.flatMap(p => typeof p === 'string' ? [{ text: p }] : p));
 }
 
 const tupleOrSingle = (c: CommaList): Expr => c.items.length === 1 && !c.trailing ? c.items[0] : { type: 'tuple', elements: c.items };
@@ -368,8 +381,8 @@ function commaList(item: Rules<Expr>) {
 	return Rules<CommaList>(self => [
 		Rule([item, ','],			$ => ({ items: [$[0]], trailing: true })),
 		Rule([item, ',', item],		$ => ({ items: [$[0], $[2]], trailing: false })),
-		Rule([self, ',', item],		$ => ({ items: [...($[0] as CommaList).items, $[2]], trailing: false })),
-		Rule([self, ','],			$ => ({ ...($[0] as CommaList), trailing: true })),
+		Rule([self, ',', item],		$ => ({ items: [...$[0].items, $[2]], trailing: false })),
+		Rule([self, ','],			$ => ({ ...$[0], trailing: true })),
 	]);
 }
 
@@ -383,7 +396,9 @@ function commaList(item: Rules<Expr>) {
 // reduce's lookahead delimiter-specific.
 function fstringField() {
 	return Rules<FStringField>(
-		Rule([obrace, fwd_test, fstring_eq_opt, fstring_conv_opt, fstring_spec_opt, cbrace],
+		// `testlist`, not `test`: a bare trailing comma is a valid (if unusual) field, `f"{x,}"` ==
+		// `f"{(x,)}"` -- CPython's own grammar allows a full `star_expressions` here.
+		Rule([obrace, fwd_testlist, fstring_eq_opt, fstring_conv_opt, fstring_spec_opt, cbrace],
 			$ => ({ expr: $[1], selfDoc: $[2] || undefined, conv: $[3], spec: $[4] })),
 	);
 }
@@ -421,10 +436,10 @@ fwd_stmt			= Forward<Stmt[]>(() => stmt),
 
 comp_op = Rules<compareOps>(
 	Rule([OneOf(['<', '>', '==', '>=', '<=', '!=', '<>'])],	$ => $[0]),
-	Rule(['in'],											() => 'in'),
-	Rule(['not', 'in'],										() => 'not in'),
-	Rule(['is'],											() => 'is'),
-	Rule(['is', 'not'],										() => 'is not'),
+	Rule(['in'],											_ => 'in'),
+	Rule(['not', 'in'],										_ => 'not in'),
+	Rule(['is'],											_ => 'is'),
+	Rule(['is', 'not'],										_ => 'is not'),
 ),
 
 // `lambda` parameters: like `param` but never annotated and never parenthesised.
@@ -432,61 +447,65 @@ lambda_param = Rules<Param>(
 	Rule([NAME],						$ => ({ name: $[0] })),
 	Rule([NAME, '=', fwd_test],			$ => ({ name: $[0], default: $[2] })),
 	Rule(['*', NAME],					$ => ({ name: $[1], kind: 'star' })),
-	Rule(['*'],							() => ({ kind: 'stardelim' })),
+	Rule(['*'],							_ => ({ kind: 'stardelim' })),
 	Rule(['**', NAME],					$ => ({ name: $[1], kind: 'dstar' })),
 ),
-lambda_params = List<Param>(lambda_param, ','),
+lambda_params = List(lambda_param, ','),
 
 lambdef = Rules<Expr>(
 	Rule(['lambda', ':', fwd_test],					$ => ({ type: 'lambda', params: [], body: $[2] })),
 	Rule(['lambda', lambda_params, ':', fwd_test],	$ => ({ type: 'lambda', params: $[1], body: $[3] })),
 ),
 
-string_list = List<string>(Rules(Rule([STRING], $ => $[0]))),
-
 // --- f-string interpolation fields: `{expr[=][!conv][:spec]}` ---
-fstring_eq_opt = Rules<boolean>(
-	Rule([],					() => false),
-	Rule(['='],					() => true),
+fstring_eq_opt = Rules(
+	Rule([],					_ => false),
+	Rule(['='],					_ => true),
 ),
-fstring_conv_opt = Rules<string | undefined>(
-	Rule([],					() => undefined),
+fstring_conv_opt = Rules(
+	Rule([],					_ => undefined),
 	Rule([BANG, NAME],			$ => $[1]),
 ),
-fstring_spec_part = Rules<FStringSpecPart>(
-	Rule([FSPEC_TEXT],			$ => ({ text: $[0] })),
-	Rule([obrace, fwd_test, cbrace],	$ => ({ expr: $[1] })),
+fstring_spec_part = Rules<Expr|string>(
+	Rule([FSPEC_TEXT],					$ => $[0]),
+	Rule([obrace, fwd_test, cbrace],	$ => $[1]),
 ),
-fstring_spec_opt = Rules<FStringSpecPart[] | undefined>(
-	Rule([],					() => undefined),
+fstring_spec_opt = Rules(
+	Rule([],									_ => undefined),
 	Rule([':', MaybeList(fstring_spec_part)],	$ => $[1]),
+),
+
+// One plain- or f-string token/sequence -- see `concatStrings` for why a run of these merges into
+// a single literal rather than each becoming its own `atom`.
+string_piece = Rules<string | FStringPart[]>(
+	Rule([STRING],											$ => pyStringPiece($[0])),
+	Rule([FOPEN_SQ, fstringParts(FTEXT_SQ), FCLOSE_SQ],	$ => $[1]),
+	Rule([FOPEN_DQ, fstringParts(FTEXT_DQ), FCLOSE_DQ],	$ => $[1]),
+	Rule([FOPEN_SQ3, fstringParts(FTEXT_SQ3), FCLOSE_SQ3],	$ => $[1]),
+	Rule([FOPEN_DQ3, fstringParts(FTEXT_DQ3), FCLOSE_DQ3],	$ => $[1]),
 ),
 
 atom = Rules<Expr>(
 	// `True`/`False`/`None` are folded in here rather than given their own string terminals: an
 	// upper-case-initial keyword loses tison's longest-match tie-break to the `NAME` regex (its
 	// pattern sorts before the keyword's), so they'd otherwise lex as plain identifiers.
-	Rule([NAME],					$ => $[0] === 'True' ? Literal(true) : $[0] === 'False' ? Literal(false) : $[0] === 'None' ? Literal(null) : Identifier($[0])),
-	Rule([NUMBER],					$ => pyNumber($[0])),
-	Rule([string_list],				$ => pyString($[0])),
-	Rule(['...'],					() => ({ type: 'ellipsis' } as const)),
-	Rule([oparen, cparen],			() => ({ type: 'tuple', elements: [] })),
-	Rule([oparen, fwd_yield, cparen],			$ => $[1]),
-	Rule([oparen, fwd_testlist_comp, cparen],	$ => {
+	Rule([NAME],											$ => $[0] === 'True' ? Literal(true) : $[0] === 'False' ? Literal(false) : $[0] === 'None' ? Literal(null) : Identifier($[0])),
+	Rule([NUMBER],											$ => pyNumber($[0])),
+	Rule([List(string_piece)],								$ => concatStrings($[0])),
+	Rule(['...'],											_ => ({ type: 'ellipsis' })),
+	Rule([oparen, cparen],									_ => ({ type: 'tuple', elements: [] })),
+	Rule([oparen, fwd_yield, cparen],						$ => $[1]),
+	Rule([oparen, fwd_testlist_comp, cparen],				$ => {
 		const { comp, list } = $[1];
 		return comp ? { type: 'genexp', elt: list.items[0], gens: comp } : tupleOrSingle(list);
 	}),
-	Rule([obrack, cbrack],			() => ({ type: 'list', elements: [] })),
-	Rule([obrack, fwd_testlist_comp, cbrack],	$ => {
+	Rule([obrack, cbrack],									_ => ({ type: 'list', elements: [] })),
+	Rule([obrack, fwd_testlist_comp, cbrack],				$ => {
 		const { comp, list } = $[1];
 		return comp ? { type: 'listcomp', elt: list.items[0], gens: comp } : { type: 'list', elements: list.items };
 	}),
-	Rule([obrace, cbrace],			() => ({ type: 'dict', keys: [], values: [] })),
-	Rule([obrace, fwd_dictorset, cbrace],		$ => $[1]),
-	Rule([FOPEN_SQ, fstringParts(FTEXT_SQ), FCLOSE_SQ],		$ => ({ type: 'fstring', parts: $[1] })),
-	Rule([FOPEN_DQ, fstringParts(FTEXT_DQ), FCLOSE_DQ],		$ => ({ type: 'fstring', parts: $[1] })),
-	Rule([FOPEN_SQ3, fstringParts(FTEXT_SQ3), FCLOSE_SQ3],		$ => ({ type: 'fstring', parts: $[1] })),
-	Rule([FOPEN_DQ3, fstringParts(FTEXT_DQ3), FCLOSE_DQ3],		$ => ({ type: 'fstring', parts: $[1] })),
+	Rule([obrace, cbrace],									_ => ({ type: 'dict', keys: [], values: [] })),
+	Rule([obrace, fwd_dictorset, cbrace],					$ => $[1]),
 ),
 
 // The expression grammar is a precedence *cascade* -- one nonterminal per level, each referencing
@@ -506,45 +525,45 @@ atom_expr = Rules<Expr>(self => [
 ]),
 await_expr = Rules<Expr>(
 	atom_expr,
-	Rule(['await', atom_expr],		$ => ({ type: 'await', operand: $[1] })),
+	Rule(['await', atom_expr],				$ => ({ type: 'await', operand: $[1] })),
 ),
 // `factor` (unary +/-/~) and `power` (**) are mutually recursive, exactly as in CPython's grammar:
 // `factor: ('+'|'-'|'~') factor | power` and `power: await_expr ['**' factor]`. This gives
 // `-2 ** 2 == -(2 ** 2)` and `2 ** -3 == 2 ** (-3)`.
 factor = Rules<Expr>(self => [
 	Forward<Expr>(() => power),
-	Rule([OneOf(['+', '-', '~']), self],	$ => PyUnary($[0], $[1])),
+	Rule([OneOf(['+', '-', '~']), self],	$ => Unary($[0], $[1])),
 ]),
 power = Rules<Expr>(
 	await_expr,
-	Rule([await_expr, '**', factor],		$ => PyBinary('**', $[0], $[2])),
+	Rule([await_expr, '**', factor],		$ => Binary('**', $[0], $[2])),
 ),
 term = Rules<Expr>(self => [
 	factor,
-	Rule([self, OneOf(['*', '/', '//', '%', '@']), factor],	$ => PyBinary($[1], $[0], $[2])),
+	Rule([self, OneOf(['*', '/', '//', '%', '@']), factor],	$ => Binary($[1], $[0], $[2])),
 ]),
 arith_expr = Rules<Expr>(self => [
 	term,
-	Rule([self, OneOf(['+', '-']), term],	$ => PyBinary($[1], $[0], $[2])),
+	Rule([self, OneOf(['+', '-']), term],	$ => Binary($[1], $[0], $[2])),
 ]),
 shift_expr = Rules<Expr>(self => [
 	arith_expr,
-	Rule([self, OneOf(['<<', '>>']), arith_expr],	$ => PyBinary($[1], $[0], $[2])),
+	Rule([self, OneOf(['<<', '>>']), arith_expr],	$ => Binary($[1], $[0], $[2])),
 ]),
 band_expr = Rules<Expr>(self => [
 	shift_expr,
-	Rule([self, '&', shift_expr],	$ => PyBinary('&', $[0], $[2])),
+	Rule([self, '&', shift_expr],	$ => Binary('&', $[0], $[2])),
 ]),
 bxor_expr = Rules<Expr>(self => [
 	band_expr,
-	Rule([self, '^', band_expr],	$ => PyBinary('^', $[0], $[2])),
+	Rule([self, '^', band_expr],	$ => Binary('^', $[0], $[2])),
 ]),
 // `expr_bitor` is CPython's `expr` -- the bitwise-or level. `for`/`del`/`with ... as` targets and
 // `*x` use it, deliberately below comparison so the `in` in `for x in xs` is never taken as the
 // `in` comparison operator.
 expr_bitor = Rules<Expr>(self => [
 	bxor_expr,
-	Rule([self, '|', bxor_expr],	$ => PyBinary('|', $[0], $[2])),
+	Rule([self, '|', bxor_expr],	$ => Binary('|', $[0], $[2])),
 ]),
 comparison = Rules<Expr>(self => [
 	expr_bitor,
@@ -552,17 +571,17 @@ comparison = Rules<Expr>(self => [
 ]),
 not_test = Rules<Expr>(self => [
 	comparison,
-	Rule(['not', self],		$ => PyUnary('!', $[1])),
+	Rule(['not', self],		$ => Unary('!', $[1])),
 ]),
 and_test = Rules<Expr>(self => [
 	not_test,
-	Rule([self, 'and', not_test],	$ => PyBinary('&&', $[0], $[2])),
+	Rule([self, 'and', not_test],	$ => Binary('&&', $[0], $[2])),
 ]),
 // `or_test` is the top of the cascade -- it stops short of the ternary and `lambda` (which `test`
 // adds) so `x for x in xs if cond` stays unambiguous.
 or_test = Rules<Expr>(self => [
 	and_test,
-	Rule([self, 'or', and_test],	$ => PyBinary('||', $[0], $[2])),
+	Rule([self, 'or', and_test],	$ => Binary('||', $[0], $[2])),
 ]),
 
 test = Rules<Expr>(self => [
@@ -582,7 +601,7 @@ star_expr = Rules<Expr>(
 
 // yield / yield from -- only valid inside parens or as an expression statement / assignment RHS.
 yield_expr = Rules<YieldExpr>(
-	Rule(['yield'],					() => ({ type: 'yield' })),
+	Rule(['yield'],					_ => ({ type: 'yield' })),
 	Rule(['yield', fwd_testlist],	$ => ({ type: 'yield', operand: $[1] })),
 	Rule(['yield', 'from', test],	$ => ({ type: 'yield', from: $[2] })),
 ),
@@ -596,7 +615,7 @@ testlist = Rules<Expr>(
 
 exprlist_item = Rules<Expr>(Rule([expr_bitor], $ => $[0]), Rule([star_expr], $ => $[0])),
 exprlist = Rules<Expr>(
-	Rule([exprlist_item],			$ => $[0]),
+	Rule([exprlist_item],				$ => $[0]),
 	Rule([commaList(exprlist_item)],	$ => tupleOrSingle($[0])),
 ),
 
@@ -616,11 +635,11 @@ testlist_comp = Rules<CompContent>(
 ),
 
 comp_if_tail = Rules<CompClause[]>(self => [
-	Rule([],								() => []),
-	Rule(['if', or_test, self],				$ => [{ type: 'if', test: $[1] }, ...($[2] as CompClause[])]),
+	Rule([],								_ => []),
+	Rule(['if', or_test, self],				$ => [{ type: 'if', test: $[1] }, ...$[2]]),
 	Rule([fwd_comp_for],					$ => $[0]),
 ]),
-comp_for = Rules<CompClause[]>(
+comp_for = Rules(
 	Rule(['for', exprlist, 'in', or_test, comp_if_tail],			$ => [{ type: 'for', target: $[1], iter: $[3], is_async: false }, ...$[4]]),
 	Rule(['async', 'for', exprlist, 'in', or_test, comp_if_tail],	$ => [{ type: 'for', target: $[2], iter: $[4], is_async: true }, ...$[5]]),
 ),
@@ -632,18 +651,18 @@ dict_item = Rules<DictEntry>(
 	Rule(['**', or_test],			$ => ({ key: null, value: $[1] })),
 ),
 dict_more = Rules<DictEntry[]>(self => [
-	Rule([],						() => []),
-	Rule([','],						() => []),
-	Rule([',', dict_item, self],	$ => [$[1], ...($[2] as DictEntry[])]),
+	Rule([],						_ => []),
+	Rule([','],						_ => []),
+	Rule([',', dict_item, self],	$ => [$[1], ...($[2])]),
 ]),
 set_more = Rules<Expr[]>(self => [
-	Rule([],						() => []),
-	Rule([','],						() => []),
-	Rule([',', tse_item, self],		$ => [$[1], ...($[2] as Expr[])]),
+	Rule([],						_ => []),
+	Rule([','],						_ => []),
+	Rule([',', tse_item, self],		$ => [$[1], ...($[2])]),
 ]),
 dictorsetmaker = Rules<Expr>(
 	Rule([dict_item, fwd_comp_for],	$ => ({ type: 'dictcomp', key: $[0].key!, value: $[0].value, gens: $[1] })),
-	Rule([dict_item, dict_more],		$ => {
+	Rule([dict_item, dict_more],	$ => {
 		const entries = [$[0], ...$[1]];
 		return { type: 'dict', keys: entries.map(e => e.key), values: entries.map(e => e.value) };
 	}),
@@ -660,7 +679,7 @@ argument = Rules<Arg>(
 	Rule(['*', test],				$ => ({ kind: 'star', value: $[1] })),
 	Rule(['**', test],				$ => ({ kind: 'dstar', value: $[1] })),
 ),
-arglist_plain = List<Arg>(argument, ',', true),
+arglist_plain = List(argument, ',', true),
 arglist = Rules<Arg[]>(
 	Rule([test, fwd_comp_for],		$ => [{ kind: 'pos', value: { type: 'genexp', elt: $[0], gens: $[1] } }]),
 	Rule([arglist_plain],			$ => $[0]),
@@ -670,7 +689,7 @@ arglist = Rules<Arg[]>(
 
 subscript = Rules<Expr>(
 	Rule([test],							$ => $[0]),
-	Rule([':'],								() => ({ type: 'slice' })),
+	Rule([':'],								_ => ({ type: 'slice' })),
 	Rule([test, ':'],						$ => ({ type: 'slice', lower: $[0] })),
 	Rule([':', test],						$ => ({ type: 'slice', upper: $[1] })),
 	Rule([test, ':', test],					$ => ({ type: 'slice', lower: $[0], upper: $[2] })),
@@ -681,11 +700,11 @@ subscript = Rules<Expr>(
 	Rule([test, ':', ':'],					$ => ({ type: 'slice', lower: $[0] })),
 	Rule([':', test, ':'],					$ => ({ type: 'slice', upper: $[1] })),
 	Rule([test, ':', test, ':'],			$ => ({ type: 'slice', lower: $[0], upper: $[2] })),
-	Rule([':', ':'],						() => ({ type: 'slice' })),
+	Rule([':', ':'],						_ => ({ type: 'slice' })),
 ),
 subscriptlist = Rules<Expr>(
 	Rule([subscript],						$ => $[0]),
-	Rule([commaList(subscript as Rules<Expr>)],	$ => ({ type: 'tuple', elements: $[0].items })),
+	Rule([commaList(subscript)],			$ => ({ type: 'tuple', elements: $[0].items })),
 ),
 
 // ===================================================================
@@ -699,15 +718,14 @@ param = Rules<Param>(
 	Rule([NAME, ':', test, '=', test],		$ => ({ name: $[0], annotation: $[2], default: $[4] })),
 	Rule(['*', NAME],						$ => ({ name: $[1], kind: 'star' })),
 	Rule(['*', NAME, ':', test],			$ => ({ name: $[1], annotation: $[3], kind: 'star' })),
-	Rule(['*'],								() => ({ kind: 'stardelim' })),
+	Rule(['*'],								_ => ({ kind: 'stardelim' })),
 	Rule(['**', NAME],						$ => ({ name: $[1], kind: 'dstar' })),
 	Rule(['**', NAME, ':', test],			$ => ({ name: $[1], annotation: $[3], kind: 'dstar' })),
-	Rule(['/'],								() => ({ kind: 'slash' })),
+	Rule(['/'],								_ => ({ kind: 'slash' })),
 ),
-paramlist = List<Param>(param, ',', true),
 parameters = Rules<Param[]>(
-	Rule([oparen, cparen],					() => []),
-	Rule([oparen, paramlist, cparen],		$ => $[1]),
+	Rule([oparen, cparen],							_ => []),
+	Rule([oparen, List(param, ',', true), cparen],	$ => $[1]),
 ),
 
 dotted_name = Rules<string>(self => [
@@ -722,57 +740,57 @@ dotted_as_name = Rules<Alias>(
 	Rule([dotted_name],				$ => ({ name: $[0] })),
 	Rule([dotted_name, 'as', NAME],	$ => ({ name: $[0], asname: $[2] })),
 ),
-dotted_as_names	= List<Alias>(dotted_as_name, ','),
-import_as_names	= List<Alias>(import_as_name, ',', true),
+dotted_as_names	= List(dotted_as_name, ','),
+import_as_names	= List(import_as_name, ',', true),
 import_dots = Rules<number>(self => [
-	Rule(['.'],						() => 1),
-	Rule(['...'],					() => 3),
-	Rule([self, '.'],				$ => ($[0] as number) + 1),
-	Rule([self, '...'],				$ => ($[0] as number) + 3),
+	Rule(['.'],						_ => 1),
+	Rule(['...'],					_ => 3),
+	Rule([self, '.'],				$ => $[0] + 1),
+	Rule([self, '...'],				$ => $[0] + 3),
 ]),
 import_from_targets = Rules<Alias[] | '*'>(
-	Rule(['*'],								() => '*' as const),
+	Rule(['*'],								_ => '*'),
 	Rule([import_as_names],					$ => $[0]),
 	Rule([oparen, import_as_names, cparen],	$ => $[1]),
 ),
 
-name_list = List<string>(Rules(Rule([NAME], $ => $[0])), ','),
+name_list = List(Rules(Rule([NAME], $ => $[0])), ','),
 
 // value side of `=` chains: `a = b = c` -> targets [a, b], value c
 assign_rhs = Rules<AssignRhs>(self => [
 	Rule([fwd_yield],								$ => ({ targets: [], value: $[0] })),
 	Rule([testlist_star_expr],						$ => ({ targets: [], value: $[0] })),
-	Rule([testlist_star_expr, '=', self],			$ => ({ targets: [$[0], ...($[2] as AssignRhs).targets], value: ($[2] as AssignRhs).value })),
+	Rule([testlist_star_expr, '=', self],			$ => ({ targets: [$[0], ...$[2].targets], value: $[2].value })),
 ]),
 assign_rhs_v = Rules<Expr>(Rule([fwd_yield], $ => $[0]), Rule([fwd_testlist], $ => $[0])),
 
 small_stmt = Rules<Stmt>(
-	Rule([testlist_star_expr],								$ => ({ type: 'expression', expression: $[0] })),
-	Rule([fwd_yield],										$ => ({ type: 'expression', expression: $[0] })),
-	Rule([testlist_star_expr, AUGASSIGN, assign_rhs_v],		$ => ({ type: 'augassign', target: $[0], op: $[1] as string, value: $[2] })),
-	Rule([testlist_star_expr, ':', test],					$ => ({ type: 'annassign', target: $[0], annotation: $[2] })),
-	Rule([testlist_star_expr, ':', test, '=', test],		$ => ({ type: 'annassign', target: $[0], annotation: $[2], value: $[4] })),
-	Rule([testlist_star_expr, '=', assign_rhs],				$ => ({ type: 'assign', targets: [$[0], ...$[2].targets], value: $[2].value })),
-	Rule(['pass'],											() => ({ type: 'pass' })),
-	Rule(['break'],											() => ({ type: 'break' })),
-	Rule(['continue'],										() => ({ type: 'continue' })),
-	Rule(['return'],										() => ({ type: 'return' })),
-	Rule(['return', testlist_star_expr],					$ => ({ type: 'return', argument: $[1] })),
-	Rule(['raise'],											() => ({ type: 'throw' })),
-	Rule(['raise', test],									$ => ({ type: 'throw', argument: $[1] })),
-	Rule(['raise', test, 'from', test],						$ => ({ type: 'throw', argument: $[1], cause: $[3] })),
-	Rule(['global', name_list],								$ => ({ type: 'global', names: $[1] })),
-	Rule(['nonlocal', name_list],							$ => ({ type: 'nonlocal', names: $[1] })),
-	Rule(['del', exprlist],									$ => ({ type: 'del', targets: $[1] })),
-	Rule(['assert', test],									$ => ({ type: 'assert', test: $[1] })),
-	Rule(['assert', test, ',', test],						$ => ({ type: 'assert', test: $[1], msg: $[3] })),
-	Rule(['import', dotted_as_names],						$ => ({ type: 'import', names: $[1] })),
-	Rule(['from', dotted_name, 'import', import_from_targets],		$ => ({ type: 'importfrom', module: $[1], level: 0, names: $[3] })),
-	Rule(['from', import_dots, 'import', import_from_targets],		$ => ({ type: 'importfrom', level: $[1], names: $[3] })),
+	Rule([testlist_star_expr],												$ => ({ type: 'expression', expression: $[0] })),
+	Rule([fwd_yield],														$ => ({ type: 'expression', expression: $[0] })),
+	Rule([testlist_star_expr, AUGASSIGN, assign_rhs_v],						$ => ({ type: 'augassign', target: $[0], op: $[1], value: $[2] })),
+	Rule([testlist_star_expr, ':', test],									$ => ({ type: 'annassign', target: $[0], annotation: $[2] })),
+	Rule([testlist_star_expr, ':', test, '=', test],						$ => ({ type: 'annassign', target: $[0], annotation: $[2], value: $[4] })),
+	Rule([testlist_star_expr, '=', assign_rhs],								$ => ({ type: 'assign', targets: [$[0], ...$[2].targets], value: $[2].value })),
+	Rule(['pass'],															_ => ({ type: 'pass' })),
+	Rule(['break'],															_ => ({ type: 'break' })),
+	Rule(['continue'],														_ => ({ type: 'continue' })),
+	Rule(['return'],														_ => ({ type: 'return' })),
+	Rule(['return', testlist_star_expr],									$ => ({ type: 'return', argument: $[1] })),
+	Rule(['raise'],															_ => ({ type: 'throw' })),
+	Rule(['raise', test],													$ => ({ type: 'throw', argument: $[1] })),
+	Rule(['raise', test, 'from', test],										$ => ({ type: 'throw', argument: $[1], cause: $[3] })),
+	Rule(['global', name_list],												$ => ({ type: 'global', names: $[1] })),
+	Rule(['nonlocal', name_list],											$ => ({ type: 'nonlocal', names: $[1] })),
+	Rule(['del', exprlist],													$ => ({ type: 'del', targets: $[1] })),
+	Rule(['assert', test],													$ => ({ type: 'assert', test: $[1] })),
+	Rule(['assert', test, ',', test],										$ => ({ type: 'assert', test: $[1], msg: $[3] })),
+	Rule(['import', dotted_as_names],										$ => ({ type: 'import', names: $[1] })),
+	Rule(['from', dotted_name, 'import', import_from_targets],				$ => ({ type: 'importfrom', module: $[1], level: 0, names: $[3] })),
+	Rule(['from', import_dots, 'import', import_from_targets],				$ => ({ type: 'importfrom', level: $[1], names: $[3] })),
 	Rule(['from', import_dots, dotted_name, 'import', import_from_targets],	$ => ({ type: 'importfrom', module: $[2], level: $[1], names: $[4] })),
 ),
 
-small_stmts = List<Stmt>(small_stmt, ';'),
+small_stmts = List(small_stmt, ';'),
 simple_stmt = Rules<Stmt[]>(
 	Rule([small_stmts, NEWLINE],		$ => $[0]),
 	Rule([small_stmts, ';', NEWLINE],	$ => $[0]),
@@ -784,8 +802,8 @@ simple_stmt = Rules<Stmt[]>(
 // complete stmt the only valid tokens are SEP (another stmt at this level) or DEDENT (block ends) --
 // no real token competes for that position, so the empty match always wins.
 stmts = Rules<Stmt[]>(self => [
-	Rule([fwd_stmt],				$ => $[0]),
-	Rule([self, SEP, fwd_stmt],		$ => [...($[0] as Stmt[]), ...$[2]]),
+	Rule([fwd_stmt],					$ => $[0]),
+	Rule([self, SEP, fwd_stmt],			$ => [...$[0], ...$[2]]),
 ]),
 suite = Rules<Stmt[]>(
 	simple_stmt,
@@ -795,46 +813,35 @@ suite = Rules<Stmt[]>(
 // --- compound statements ---
 
 else_opt = Rules<Stmt[]>(
-	Rule([],						() => []),
-	Rule([ELSE, ':', suite],		$ => $[2]),
+	Rule([],							_ => []),
+	Rule([ELSE, ':', suite],			$ => $[2]),
 ),
 if_tail = Rules<Stmt[]>(self => [
-	Rule([],								() => []),
-	Rule([ELIF, namedexpr_test, ':', suite, self],	$ => [{ type: 'if', test: $[1], consequent: $[3], alternate: $[4] as Stmt[] }]),
-	Rule([ELSE, ':', suite],				$ => $[2]),
+	Rule([],										_ => []),
+	Rule([ELIF, namedexpr_test, ':', suite, self],	$ => [{ type: 'if', test: $[1], consequent: $[3], alternate: $[4] }]),
+	Rule([ELSE, ':', suite],						$ => $[2]),
 ]),
-if_stmt = Rules<Stmt>(
-	Rule(['if', namedexpr_test, ':', suite, if_tail],	$ => ({ type: 'if', test: $[1], consequent: $[3], alternate: $[4] })),
-),
-while_stmt = Rules<Stmt>(
-	Rule(['while', namedexpr_test, ':', suite, else_opt],	$ => ({ type: 'while', test: $[1], body: $[3], orelse: $[4] })),
-),
 for_stmt = Rules<Stmt>(
 	Rule(['for', exprlist, 'in', testlist, ':', suite, else_opt],	$ => ({ type: 'for', target: $[1], iter: $[3], body: $[5], orelse: $[6], is_async: false })),
 ),
 
 except_clause = Rules<ExceptHandler>(
-	Rule([EXCEPT, ':', suite],					$ => ({ star: false, body: $[2] })),
-	Rule([EXCEPT, test, ':', suite],				$ => ({ star: false, type: $[1], body: $[3] })),
-	Rule([EXCEPT, test, 'as', NAME, ':', suite],	$ => ({ star: false, type: $[1], param: $[3], body: $[5] })),
-	Rule([EXCEPT, '*', test, ':', suite],			$ => ({ star: true, type: $[2], body: $[4] })),
+	Rule([EXCEPT, ':', suite],							$ => ({ star: false, body: $[2] })),
+	Rule([EXCEPT, test, ':', suite],					$ => ({ star: false, type: $[1], body: $[3] })),
+	Rule([EXCEPT, test, 'as', NAME, ':', suite],		$ => ({ star: false, type: $[1], param: $[3], body: $[5] })),
+	Rule([EXCEPT, '*', test, ':', suite],				$ => ({ star: true, type: $[2], body: $[4] })),
 	Rule([EXCEPT, '*', test, 'as', NAME, ':', suite],	$ => ({ star: true, type: $[2], param: $[4], body: $[6] })),
 ),
-except_clauses = List<ExceptHandler>(except_clause),
 finally_opt = Rules<Stmt[]>(
-	Rule([],							() => []),
-	Rule([FINALLY, ':', suite],		$ => $[2]),
-),
-try_stmt = Rules<Stmt>(
-	Rule(['try', ':', suite, except_clauses, else_opt, finally_opt],	$ => ({ type: 'try', body: $[2], handlers: $[3], orelse: $[4], finalizer: $[5] })),
-	Rule(['try', ':', suite, FINALLY, ':', suite],					$ => ({ type: 'try', body: $[2], handlers: [], orelse: [], finalizer: $[5] })),
+	Rule([],							_ => []),
+	Rule([FINALLY, ':', suite],			$ => $[2]),
 ),
 
 with_item = Rules<WithItem>(
 	Rule([test],						$ => ({ context: $[0] })),
 	Rule([test, 'as', expr_bitor],		$ => ({ context: $[0], optional_vars: $[2] })),
 ),
-with_items = List<WithItem>(with_item, ','),
+with_items = List(with_item, ','),
 // The 3.10 parenthesised form (`with (a as b, c as d):`) is genuinely ambiguous with a
 // parenthesised-expression context manager in one token of lookahead -- CPython resolves it with
 // PEG backtracking. Here tison's on-demand GLR forks at `with (` and the wrong branch dies at the
@@ -850,25 +857,26 @@ funcdef = Rules<Stmt>(
 	Rule(['def', NAME, parameters, '->', test, ':', suite],		$ => ({ type: 'funcdef', name: $[1], params: $[2], returns: $[4], body: $[6], decorators: [], is_async: false })),
 ),
 classdef = Rules<Stmt>(
-	Rule(['class', NAME, ':', suite],					$ => ({ type: 'classdef', name: $[1], bases: [], body: $[3], decorators: [] })),
-	Rule(['class', NAME, oparen, cparen, ':', suite],	$ => ({ type: 'classdef', name: $[1], bases: [], body: $[5], decorators: [] })),
+	Rule(['class', NAME, ':', suite],							$ => ({ type: 'classdef', name: $[1], bases: [], body: $[3], decorators: [] })),
+	Rule(['class', NAME, oparen, cparen, ':', suite],			$ => ({ type: 'classdef', name: $[1], bases: [], body: $[5], decorators: [] })),
 	Rule(['class', NAME, oparen, arglist, cparen, ':', suite],	$ => ({ type: 'classdef', name: $[1], bases: $[3], body: $[6], decorators: [] })),
 ),
 
 decorator = Rules<Expr>(Rule(['@', namedexpr_test, NEWLINE], $ => $[1])),
 decorators = List<Expr>(decorator),
 async_body = Rules<Stmt>(funcdef, for_stmt, with_stmt),
-decorated = Rules<Stmt>(
-	Rule([decorators, funcdef],				$ => ({ ...($[1] as Stmt & { decorators: Expr[] }), decorators: $[0] })),
-	Rule([decorators, classdef],			$ => ({ ...($[1] as Stmt & { decorators: Expr[] }), decorators: $[0] })),
-	Rule([decorators, 'async', funcdef],	$ => ({ ...($[2] as Stmt & { decorators: Expr[]; is_async: boolean }), decorators: $[0], is_async: true })),
-),
-async_stmt = Rules<Stmt>(
-	Rule(['async', async_body],		$ => ({ ...($[1] as Stmt & { is_async: boolean }), is_async: true })),
-),
 
 compound_stmt = Rules<Stmt>(
-	if_stmt, while_stmt, for_stmt, try_stmt, with_stmt, funcdef, classdef, decorated, async_stmt,
+	for_stmt, with_stmt,
+	Rule(['if', namedexpr_test, ':', suite, if_tail],						$ => ({ type: 'if', test: $[1], consequent: $[3], alternate: $[4] })),
+	Rule(['while', namedexpr_test, ':', suite, else_opt],					$ => ({ type: 'while', test: $[1], body: $[3], orelse: $[4] })),
+	Rule(['try', ':', suite, List(except_clause), else_opt, finally_opt],	$ => ({ type: 'try', body: $[2], handlers: $[3], orelse: $[4], finalizer: $[5] })),
+	Rule(['try', ':', suite, FINALLY, ':', suite],							$ => ({ type: 'try', body: $[2], handlers: [], orelse: [], finalizer: $[5] })),
+	Rule(['async', async_body],				$ => ({ ...$[1], is_async: true })),
+	funcdef, classdef,
+	Rule([decorators, funcdef],				$ => ({ ...$[1], decorators: $[0] })),
+	Rule([decorators, classdef],			$ => ({ ...$[1], decorators: $[0] })),
+	Rule([decorators, 'async', funcdef],	$ => ({ ...$[2], decorators: $[0], is_async: true })),
 ),
 
 stmt = Rules<Stmt[]>(
@@ -877,7 +885,7 @@ stmt = Rules<Stmt[]>(
 ),
 
 file_input = Rules<Module<Stmt>>(
-	Rule([],						() => ({ type: 'module', body: [] })),
+	Rule([],						_ => ({ type: 'module', body: [] })),
 	Rule([stmts],					$ => ({ type: 'module', body: $[0] })),
 );
 
@@ -894,20 +902,25 @@ const recover: RecoveryCallback = (lex, row) => {
 	}
 };
 
-export const skip = [/[ \t\f]+/, /#[^\n]*/, /\\\r?\n/, WS];
+// Rejects its own match while inside an f-string (any nesting depth, including format specs) so a
+// shorter but real terminal -- FSPEC_TEXT, most often -- wins instead: `f"{x:#x}"`'s spec text starts
+// right at that `#`, and unlike a genuine comment it's just as much spec content as anything else there.
+const COMMENT = terminal('comment', /#[^\n]*/, (_lex, ctx: Ctx) => ctx.inFString > 0 ? undefined : COMMENT);
+
+export const skip = [/[ \t\f]+/, COMMENT, /\\\r?\n/, WS];
 
 export const rules = {
-	atom, atom_expr, await_expr, factor, power, term, arith_expr, shift_expr,
+	string_piece, atom, atom_expr, await_expr, factor, power, term, arith_expr, shift_expr,
 	band_expr, bxor_expr, expr_bitor, comparison, not_test, and_test, or_test,
 	test, namedexpr_test, testlist, exprlist, testlist_star_expr,
 	comp_op, lambdef, yield_expr, star_expr,
 	testlist_comp, comp_for, comp_if_tail, dictorsetmaker,
 	argument, arglist, subscript, subscriptlist,
-	param, paramlist, parameters,
+	param, parameters,
 	dotted_name, import_as_name, dotted_as_name, import_from_targets,
 	small_stmt, simple_stmt, assign_rhs,
 	stmts, suite, stmt, compound_stmt,
-	if_stmt, while_stmt, for_stmt, try_stmt, with_stmt, funcdef, classdef, decorated, async_stmt,
+	with_stmt, funcdef, classdef,
 	except_clause, with_item,
 	file_input,
 };
