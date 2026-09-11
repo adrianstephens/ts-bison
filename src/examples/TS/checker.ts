@@ -348,7 +348,16 @@ function classBodyScopes(c: TS.Class, scope: Scope, instance: Type, value: Type)
 	// `typeof C` when named, as TS types it: the structural value holds this very member, so a static `return this` would make a cyclic type.
 	const stat = new Scope(scope);
 	stat.addValue('this', c.name && scope.value(c.name) ? { type: 'typeof', name: c.name } : value);
+	inst.flowBoundary = stat.flowBoundary = isClassDecl(c);
 	return { inst, stat };
+}
+
+const isClassDecl = (c: TS.Class) => 'type' in c && c.type === 'class_decl';
+
+function flowContainer(scope: Scope): Scope {
+	const s = new Scope(scope);
+	s.flowBoundary = true;
+	return s;
 }
 
 function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type } {
@@ -449,6 +458,7 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 			// `this.p = o` names the CONSTRUCTOR's own parameter, which the class scope has never heard of --
 			// resolved there it types as `any`, silently defeating the whole inference.
 			const inner = new Scope(scope);
+			inner.flowBoundary = isClassDecl(c);
 			for (const p of T.FixParams(ctor).params)
 				if (typeof p.key === 'string')
 					inner.addValue(p.key, p.typeAnnotation ?? T.ANY);
@@ -489,7 +499,7 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 
 	// Installed only now, *after* the walks above -- a self-memoizing lazy getter
 	for (const { prop, init, inner } of pendingFieldInit) {
-		const initScope = inner ?? scope;
+		const initScope = inner ?? (isClassDecl(c) ? flowContainer(scope) : scope);
 		let resolving = false;
 		Object.defineProperty(prop, 'typeAnnotation', {
 			configurable:	true,
@@ -1168,7 +1178,7 @@ function hoist(stmts: Stmt[], scope: Scope) {
 			const d = chosen[0];
 			const t = TS.FunctionType(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope));
 			if (!d.returnType && d.body)
-				lazyReturnType(t, d, scope, () => checkFunctionBody(t, d.body, scope, hasMod(d, 'async'), hasMod(d, 'generator'), hasMod(d, 'generator')));
+				lazyReturnType(t, d, scope, () => checkFunctionBody(t, d.body, flowContainer(scope), hasMod(d, 'async'), hasMod(d, 'generator'), hasMod(d, 'generator')));
 			scope.addValue(name, t);
 			scope.addDecl(name, d);
 		}
@@ -2829,7 +2839,7 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 
 		case 'function_decl':
 			if (stmt.body)
-				checkFunctionBody(stmt, stmt.body, scope, hasMod(stmt, 'async'), hasMod(stmt, 'generator'), hasMod(stmt, 'generator'), err);
+				checkFunctionBody(stmt, stmt.body, flowContainer(scope), hasMod(stmt, 'async'), hasMod(stmt, 'generator'), hasMod(stmt, 'generator'), err);
 			break;
 
 		case 'class_decl':

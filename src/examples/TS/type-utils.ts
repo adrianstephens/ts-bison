@@ -2971,6 +2971,9 @@ export class Scope {
 	// `false` on a program's scope: `strictNullChecks` off, so `null`/`undefined` belong to every type. Unset inherits; the root is strict.
 	nullChecks?: boolean;
 
+	// Where TS's control-flow container stops (a function declaration, a class declaration's members): the enclosing flow's narrowings don't reach in.
+	flowBoundary = false;
+
 	constructor(public parent?: Scope, private genericTemplate?: boolean) {}
 
 	enclosingFunction(): Scope['functionKind']		{ return this.functionKind ?? this.parent?.enclosingFunction(); }
@@ -2980,7 +2983,7 @@ export class Scope {
 
 	isGenericTemplate(): boolean					{ return !!this.genericTemplate || !!this.parent?.isGenericTemplate(); }
 
-	value(name: string): Type | undefined			{ return this.narrowings?.get(name) ?? this.values.get(name) ?? this.parent?.value(name); }
+	value(name: string): Type | undefined			{ return this.narrowings?.get(name) ?? this.values.get(name) ?? (this.flowBoundary ? this.parent?.declared(name) : this.parent?.value(name)); }
 	type(name: string): TypeEntry | undefined		{ return this.types.get(name) ?? this.parent?.type(name); }
 	declared(name: string): Type | undefined		{ return this.values.get(name) ?? this.parent?.declared(name); }
 	alias(name: string): Expr | undefined			{ return this.aliases?.get(name) ?? (this.values.has(name) ? undefined : this.parent?.alias(name)); }
