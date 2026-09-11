@@ -144,14 +144,28 @@ function resolveFnMember(t: Type, scope: Scope): TS.CallSig | undefined {
 
 // A CONST CONTEXT travels as the expected type (`as const`'s own annotation), which keeps it cache-safe:
 // `recurseCache` keys on (node, expected), so a node seen both inside and outside one cannot poison either.
-const CONST_CONTEXT: Type = TS.RefType('const');
-// `as const` under a context with a mutable array-like member builds MUTABLE tuples, as TS does (`[1] as const satisfies unknown[]`).
-const MUTABLE_CONST_CONTEXT: Type = TS.RefType('const mutable');
-const isConstContext = (t: Type | undefined): t is TS.RefType => t?.type === 'ref' && (t.name === 'const' || t.name === 'const mutable') && !t.typeArgs;
+// TS's const context, standing in for the contextual type `inner` it replaces: a literal keeps its literal type, and an array
+// literal is a tuple -- readonly unless `inner` itself asks for a mutable array (TS's checkArrayLiteral). Each element and
+// property passes on the part of `inner` it stands in: `{ args: [] } as const` against `{ args: Expr[] }` is mutable.
+const constContext = (inner?: Type): TS.RefType => TS.RefType('const', inner ? [inner] : undefined);
+const isConstContext = (t: Type | undefined): t is TS.RefType => t?.type === 'ref' && t.name === 'const' && (t.typeArgs?.length ?? 0) <= 1;
+// The context a const context gives an element or property value: its own part of `inner` where TS's isConstContext reaches the
+// value (a literal, array or object literal), none past anything else -- a conditional's branches, a call's result are ordinary.
+const constContextOf = (e: Expr, inner: Type | undefined): Type | undefined => e.type === 'literal' || e.type === 'array' || e.type === 'object' ? constContext(inner) : undefined;
 const hasMutableArrayLike = (t: Type, scope: Scope) => T.unionMembers(t, scope).some(m => {
 	const r = T.resolveOwn(m, scope);
 	return (r.type === 'array' || r.type === 'tuple') && !r.readonly || T.isRef(r, 'Array');
 });
+// What an array-like contextual type gives position `i`: a tuple's element there, an array's element type.
+const positionContext = (t: Type, i: number, scope: Scope): Type | undefined => {
+	const parts = T.unionMembers(t, scope).flatMap(m => {
+		const r = T.resolveOwn(m, scope);
+		const el = r.type === 'tuple' ? T.tupleElementType(r.elements[i]) : r.type === 'array' ? r.element
+			: r.type === 'ref' && (r.name === 'Array' || r.name === 'ReadonlyArray') ? r.typeArgs?.[0] : undefined;
+		return el ? [el] : [];
+	});
+	return parts.length ? T.combineTypes(parts) : undefined;
+};
 
 
 // Contextual parameter typing: an unannotated arrow/function (`x => x.foo`, whether a call argument, an object-literal
@@ -1502,7 +1516,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// CONST CONTEXT: a READONLY TUPLE whose elements keep their literals and pass the context down. As a plain
 				// array, `Rule<T, const R ...>`'s `ValuesOf<R>` has no positions and every `$[i]` is the union of all of them.
 				if (isConstContext(expected) && e.elements.every(el => el && el.type !== 'spread'))
-					return { type: 'tuple', readonly: expected.name === 'const', elements: e.elements.map(el => T.freeze(recurse(el!, expected))) };
+				{
+					const inner = expected.typeArgs?.[0];
+					return { type: 'tuple', readonly: !(inner && hasMutableArrayLike(inner, scope)), elements: e.elements.map((el, i) => T.freeze(recurse(el!, constContextOf(el!, inner && positionContext(inner, i, scope))))) };
+				}
 				// A union context contributes its one array-like member (Map's `readonly (readonly [K, V])[] | null`).
 				const contextual		= expected && T.resolveOwn(expected, scope);
 				const arrayLike			= contextual?.type === 'union' ? T.unionMembers(contextual, scope).map(m => T.resolveOwn(m, scope)).filter(m => m.type === 'tuple' || m.type === 'array') : [];
@@ -1605,8 +1622,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 								break;
 							case 'field': {
 								// A literal stays literal where its context expects one (TS's isLiteralOfContextualType): `{ kind: "mod" }` as a `Mod`.
-								// Under `as const` every value is itself in the const context, and nothing widens.
-								const _t = isConstContext(expected) ? typeOf(p.value!, scope, false, expected, yieldCollector, err)
+								// A value `as const` reaches is itself in the const context, and does not widen.
+								const valueConst = isConstContext(expected) ? constContextOf(p.value!, expected.typeArgs?.[0] && key !== undefined ? contextualMember(expected.typeArgs[0], key, scope) : undefined) : undefined;
+								const _t = isConstContext(expected) && valueConst ? typeOf(p.value!, scope, false, valueConst, yieldCollector, err)
 									: widenForContext(typeOf(p.value!, scope, false, expectedMember, yieldCollector, err), expectedMember, scope);
 								if (key !== undefined)
 									push(TS.TypeProperty(p.key, _t));
@@ -1882,15 +1900,20 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 							return undefined;
 						const declared = declaredArg(i);
 						// A `const` type parameter (TS 5.0) infers from its argument AS IF it were written `as const`.
-						if (declared?.type === 'ref' && !declared.typeArgs && sig!.typeParams?.some(p => p.name === declared.name && p.const))
-							return arg(a, CONST_CONTEXT);
+						// Its constraint is the contextual type the const context stands in for: `const R extends readonly X[]` is readonly.
+						const constParam = declared?.type === 'ref' && !declared.typeArgs ? sig.typeParams?.find(p => p.name === declared.name && p.const) : undefined;
+						if (constParam)
+							return arg(a, constContext(constParam.constraint));
 						const generic  = declared && !!sig!.typeParams?.some(p => T.mentionsTypeParam(declared, p.name));
 						// A CALL argument gets it too: that is how the shape reaches a callback nested inside
 						// it (`new Map(xs.map(x => [a, b]))`). The inner call reverse-matches its own `U`
 						// from this, contextually types its callback's return, and the literal becomes a
 						// tuple -- see `instantiate`'s `fromExpected`, which keeps that placeholder binding
 						// from escaping as the answer.
-						return arg(a, declared && (!generic || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared))) ? declared : undefined);
+						// An `as const` argument takes the generic shape too: it reads its context only for whether an array is mutable (TS's
+						// checkArrayLiteral) and passes its members' parts on the same way, never inferring from it.
+						const constArg = a.type === 'as' && isConstContext(a.typeAnnotation);
+						return arg(a, declared && (!generic || constArg || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared))) ? declared : undefined);
 					});
 					// TS's two passes: every non-callback argument feeds the inference first, then each callback in order -- its
 					// context FIXES the type parameters its own parameters read, and its return feeds only the ones still open.
@@ -2257,7 +2280,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// never auto-widens either, matching real TS. Survives being embedded in a later-widened container
 				// (`[1, x as const]`) or passed through `satisfies`/a comma/a spread, unlike a shape-based check on
 				// `e` itself would (that only ever sees the *top-level* expression `typeOf` was originally called on).
-				return T.freeze(isConstContext(anno) ? recurse(e.expression, expected && hasMutableArrayLike(expected, scope) ? MUTABLE_CONST_CONTEXT : anno) : anno);
+				return T.freeze(isConstContext(anno) ? recurse(e.expression, constContext(expected)) : anno);
 			}
 			case 'satisfies': {
 				const anno = e.typeAnnotation;
