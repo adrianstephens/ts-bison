@@ -2165,7 +2165,9 @@ function splitDiscriminants(src: TS.ObjectType | Extract<Type, { type: 'tuple' }
 
 // `dstScope` resolves names in `dst`'s own structure (distinct from `scope`, which resolves `src`'s) -- same scope almost
 // always, but differs for a `dst` from another module's signature. Every recursive call passes each value's own origin scope.
-export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope = scope, strict = false, depth = 10): boolean {
+// `precise`: none of the C1 leniency (a widened source accepted into a literal target) -- for inference's common supertype,
+// which TS chooses with its real relation: `string` is not a supertype candidate below `"def"`.
+export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope = scope, strict = false, depth = 10, precise = false): boolean {
 	const recurse = (src: Type, dst: Type, depth: number): boolean => {
 		if (depth < 0) {
 			scope.hitDepthLimit('isAssignable');
@@ -2292,14 +2294,14 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 		if (dst.type === 'literal' && Array.isArray(dst.value)) {
 			if (isLiteral(src, 'string') && !Array.isArray(src.value))
 				return new RegExp(`^${templatePattern(dst.value, dstScope)}$`).test(src.value);
-			return isLiteral(src, 'string') || isRefNamed(src, 'string');	// widened source: lenient (inventory C1)
+			return !precise && (isLiteral(src, 'string') || isRefNamed(src, 'string'));	// widened source: lenient (inventory C1)
 		}
 		if (src.type === 'literal' && Array.isArray(src.value))
 			return recurse(STRING, dst, depth - 1);
 		if (dst.type === 'literal')
 			return src.type === 'literal'
 				? src.value === dst.value
-				: src.type === 'ref' && dst.value !== null && src.name === typeof dst.value;	// widened source: lenient (inventory C1)
+				: !precise && src.type === 'ref' && dst.value !== null && src.name === typeof dst.value;	// widened source: lenient (inventory C1)
 		if (src.type === 'literal')
 			return dst.type === 'ref' && (!ALL_PRIMITIVES.has(dst.name) || dst.name === (src.value === null ? 'null' : typeof src.value));
 
