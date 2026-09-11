@@ -477,18 +477,35 @@ function throughSources(e: Expr, scope: Scope): Expr {
 	return out;
 }
 
+// A string literal's value, or a template literal's with no substitutions (`` `number` ``).
+function staticText(e: Expr): string | undefined {
+	return e.type !== 'literal' ? undefined
+		: typeof e.value === 'string' ? e.value
+		: Array.isArray(e.value) && e.value.every(p => !p.exp) ? e.value.map(p => p.str).join('')
+		: undefined;
+}
+
 // `e` (holding when `sense`) as "`typeof operand` is not `kind`", or undefined.
 function typeofExclusion(e: Expr, sense: boolean): { operand: Expr; kind: string } | undefined {
 	if (e.type !== 'binary' || !['===', '==', '!==', '!='].includes(e.operator))
 		return undefined;
 	const [t, k] = e.left.type === 'unary' && e.left.operator === 'typeof' ? [e.left, e.right] : [e.right, e.left];
-	return (e.operator === '===' || e.operator === '==') !== sense && t.type === 'unary' && t.operator === 'typeof' && T.isLiteral(k, 'string') ? { operand: t.operand, kind: k.value } : undefined;
+	const kind = staticText(k);
+	return (e.operator === '===' || e.operator === '==') !== sense && t.type === 'unary' && t.operator === 'typeof' && kind !== undefined ? { operand: t.operand, kind } : undefined;
 }
 
 // Every result `typeof` can give for a value of `m`: a non-primitive `object` may be a function. Undefined when unknown.
 function typeofNames(m: Type, scope: Scope): string[] | undefined {
 	const name = T.typeofName(m, scope);
 	return name ? [name] : T.isRef(T.resolveOwn(m, scope), 'object') ? ['object', 'function'] : undefined;
+}
+
+// What survives of member `m` once `typeof` is known to be among `kinds` (`inside`) or outside them: kept whole, dropped, or
+// -- an `object` split by 'function' -- refined to its `Function` part. Unknown members are kept.
+function narrowByTypeof(m: Type, kinds: Set<string>, inside: boolean, scope: Scope): boolean | Type {
+	const names = typeofNames(m, scope);
+	const left = names?.filter(n => kinds.has(n) === inside);
+	return !names || left!.length === names.length ? true : !left!.length ? false : left!.includes('function') ? TS.RefType('Function') : true;
 }
 
 export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
@@ -639,7 +656,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 					});
 					let narrowed = scope;
 					for (const { operand, kinds } of excluded.values())
-						narrowed = narrowKey(operand, m => { const names = typeofNames(m, scope); return !names || !names.every(k => kinds.has(k)); }, narrowed) ?? narrowed;
+						narrowed = narrowKey(operand, m => narrowByTypeof(m, kinds, false, scope), narrowed) ?? narrowed;
 					for (const [e, s] of unrelated)
 						narrowed = recurse(e, narrowed, s);
 					return narrowed;
@@ -671,18 +688,18 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 					const loose		= test.operator === '==' || test.operator === '!=';
 					// The compared value when it is one unit type: a literal, or a name typed as one (`Kind.A`, a `const k = 'a'`) -- TS narrows by either.
 					const unitOf = (x: Expr): { value: string | number | bigint | boolean } | undefined => {
+						const text = staticText(x);
 						const t = x.type === 'literal' ? x : T.pathKey(x) !== undefined ? T.resolveOwn(typeOf(x, scope, false), scope) : undefined;
-						return t?.type === 'literal' && t.value !== null && !Array.isArray(t.value) ? { value: t.value as string | number | bigint | boolean } : undefined;
+						return text !== undefined ? { value: text }
+							: t?.type === 'literal' && t.value !== null && !Array.isArray(t.value) ? { value: t.value as string | number | bigint | boolean } : undefined;
 					};
 					for (const [l, r] of [[test.left, test.right], [test.right, test.left]] as const) {
 						const unit = unitOf(r);
 						// typeof x === 'kind' (x may be a dotted path, e.g. `typeof options.layer === 'number'`)
-						if (l.type === 'unary' && l.operator === 'typeof' && T.isLiteral(r, 'string')) {
-							const kind = r.value;
-							const s = narrowKey(l.operand, m => {
-								const n = T.typeofName(m);
-								return n === undefined || (n === kind) === keepMatch;
-							});
+						const text = staticText(r);
+						if (l.type === 'unary' && l.operator === 'typeof' && text !== undefined) {
+							const kinds = new Set([text]);
+							const s = narrowKey(l.operand, m => narrowByTypeof(m, kinds, keepMatch, scope));
 							if (s)
 								return s;
 						}
@@ -2568,15 +2585,18 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 			// test per case, OR-ing fallthrough cases together. `default` runs when NO case matched: the negation of every test, ANDed.
 			const caseTest	= (test: Expr): Expr => ({ type: 'binary', operator: '===', left: stmt.discriminant, right: test });
 			const none		= noCaseMatched(stmt);
+			const earlier: Expr[] = [];		// every earlier clause's test, negated
 			let pending: Expr[] = [];
 			for (const c of stmt.cases) {
 				if (c.test) {
 					typeOf(c.test, scope);
-					pending.push(caseTest(c.test));
+					// A clause is entered when its value matches and no EARLIER clause's did: a repeated `case 'number':` is unreachable.
+					pending.push(earlier.reduce<Expr>((acc, t) => ({ type: 'binary', operator: '&&', left: acc, right: t }), caseTest(c.test)));
+					earlier.push({ type: 'unary', operator: '!', operand: caseTest(c.test) });
 				} else if (none) {
 					pending.push(none);
 				}
-				if (c.consequent.length || !c.test) {
+				if (c.consequent.length) {
 					const test = pending.reduce<Expr | undefined>((acc, t) => acc ? { type: 'binary', operator: '||', left: acc, right: t } : t, undefined);
 					checkBlock(c.consequent, new Scope(test ? narrow(test, scope, true) : scope), typeOf, checkStmt);
 					pending = [];
