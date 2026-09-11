@@ -161,6 +161,31 @@ const MODULE		= terminal('module', /module(?!\w)/, lex => /^\s*([$_\p{ID_Start}]
 // `foo<T>(x)` vs `foo < T > (x)` is genuinely ambiguous to a context-free grammar, and routing it through GLR would fork on every ordinary `<` in the
 // file -- resolved in the lexer instead: a dedicated `<` terminal scans upcoming text for balanced type-argument syntax immediately followed by `(`.
 const GENERIC_CALL_SCAN_LIMIT = 200;
+// The index of the quote closing the string or template literal opened at `text[i]`, or -1; a template's `${...}` may nest literals.
+function skipQuoted(text: string, i: number): number {
+	const quote = text[i];
+	for (let j = i + 1; j < text.length; j++) {
+		const c = text[j];
+		if (c === '\\') {
+			j++;
+		} else if (c === quote) {
+			return j;
+		} else if (quote === '`' && c === '$' && text[j + 1] === '{') {
+			for (let depth = 0, k = j + 1; k < text.length; k++) {
+				if (text[k] === '{') {
+					depth++;
+				} else if (text[k] === '}' && --depth === 0) {
+					j = k;
+					break;
+				} else if (text[k] === '\'' || text[k] === '"' || text[k] === '`') {
+					if ((k = skipQuoted(text, k)) < 0)
+						return -1;
+				}
+			}
+		}
+	}
+	return -1;
+}
 // `followedBy`: what must follow the matching `>` -- `(` for a call, `{`/`implements` for a class heritage superclass.
 function looksLikeBalancedGenericArgs(textAfterLt: string, followedBy: RegExp): boolean {
 	let depth = 1;
@@ -169,7 +194,11 @@ function looksLikeBalancedGenericArgs(textAfterLt: string, followedBy: RegExp): 
 	let braceDepth = 0;
 	for (let i = 0; i < textAfterLt.length && i < GENERIC_CALL_SCAN_LIMIT; i++) {
 		const c = textAfterLt[i];
-		if (c === '<') {
+		if (c === '\'' || c === '"' || c === '`') {
+			// A literal type's text is opaque: a `<` or `>` in it (`Binary<Expr, '<'>(...)`) is no bracket.
+			if ((i = skipQuoted(textAfterLt, i)) < 0)
+				return false;
+		} else if (c === '<') {
 			depth++;
 		} else if (c === '>') {
 			if (--depth === 0)
@@ -182,7 +211,7 @@ function looksLikeBalancedGenericArgs(textAfterLt: string, followedBy: RegExp): 
 		} else if (c === ';') {
 			if (braceDepth === 0)
 				return false;
-		} else if (!/[A-Za-z0-9_$.,\s[\]():|&?'"-]/.test(c)) {
+		} else if (!/[A-Za-z0-9_$.,\s[\]():|&?-]/.test(c)) {
 			return false;
 		}
 	}

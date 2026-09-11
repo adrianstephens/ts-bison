@@ -55,6 +55,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['as const under a mutable context', 'const a = [1, 2] as const satisfies unknown[];',										[]],
 	['readonly tuple into a mutable array', 'declare const r: readonly [number]; const m: number[] = r;',						["is not assignable to type 'number[]'"]],
 
+	['a quoted type argument is opaque', "declare function g<A, B>(a: string): number; declare function h(x: number): void; h(g<number, '<'>('<')); const r: string = g<number, `>${'<'}`>('');", [NOT_ASSIGNABLE('number', 'string')]],
 	['a tagged template is a call',	'declare function tag(s: TemplateStringsArray): number; declare function tag(s: TemplateStringsArray, n: number): string; const r: boolean = tag`x${1}`;', [NOT_ASSIGNABLE('string', 'boolean')]],
 	['object literal candidates union', 'declare function f<T>(a: T, b: T): T; const r = f({ x: 1, z: 2 }, { x: 1, y: "" });',		[]],
 	['primitive candidates do not',	'declare function f<T>(x: { bar: T; baz: T }): T; f({ bar: 1, baz: "" });',						["is not assignable to parameter"]],
