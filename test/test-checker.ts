@@ -100,6 +100,8 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['an instantiated intersection reduces',	'declare function f<T, U>(a: T, b: U): { v: T & U }; const s = f<unknown, string>(1, ""); const q: boolean = s.v; const t = f<any, string>(1, ""); const r: boolean = t.v;', [NOT_ASSIGNABLE('string', 'boolean')]],
 	['a class instance is never falsy',		'class Sc { a = 1 } declare const s: Sc | undefined; const m = s && "x"; const q: boolean = m;', [NOT_ASSIGNABLE('undefined | string', 'boolean')]],
 	['an optional chain equal to a value narrows its roots', 'interface D { type: string } interface N { decl(k: string): D | undefined } declare const h: N | undefined; if (h?.decl("a")?.type === "c") { const n: N = h; } if (h?.decl("a")?.type !== "c") { const m: N = h; }', [NOT_ASSIGNABLE('N | undefined', 'N')]],
+	['a literal index path narrows its reads',	'declare const args: [{ a: 1 }] | [number[]]; if (Array.isArray(args[0])) { const q: number[] = args[0]; }', []],
+	['an assignment target is its declared type', 'let x: { o: boolean } = { o: false }; if (x["o"] === false) { x["o"] = true; } const y: [number, number] = [0, 0]; if (y[0] === 0) { y[0] = -1; }', []],
 	['reduce with and without a seed',		'const r: string = [1, 2].reduce((a, v) => a + v, ""); const s: boolean = [1, 2].reduce((a, v) => a + v);', [NOT_ASSIGNABLE('number', 'boolean')]],
 	['functions have Function members',		'function f(a: number) {} f.call(null, 1); const n: string = f.length;',					[NOT_ASSIGNABLE('number', 'string')]],
 	['an expando assignment declares, not narrows', 'const E = function () {}; E.prop = { x: 2 }; E.prop = { y: "" }; const n = E.prop.x || 0;', []],

@@ -205,6 +205,22 @@ function referenceOf(e: Expr): Expr {
 		:	e;
 }
 
+// The member and index reads that are assignment targets, read as declared rather than narrowed: an assignment is judged
+// against the declaration (`x['o'] = true` after `x['o'] === false`), also through a destructuring target's leaves.
+const assignmentTargets = new WeakSet<Expr>();
+function markAssignmentTargets(e: Expr | undefined) {
+	if (!e)
+		return;
+	if (e.type === 'member' || e.type === 'index')
+		assignmentTargets.add(e);
+	else if (e.type === 'array')
+		e.elements.forEach(el => markAssignmentTargets(el?.type === 'spread' ? el.operand : el));
+	else if (e.type === 'object')
+		e.properties.forEach(p => markAssignmentTargets(p.type === 'spread' ? p.operand : p.type === 'field' ? p.value : undefined));
+	else if (e.type === 'assign')
+		markAssignmentTargets(e.target);
+}
+
 // A callback with an unannotated parameter takes its parameter types from its context (TS's `isContextSensitive`).
 function isContextSensitive(a: Expr): a is Expr & { type: 'function' | 'arrow' } {
 	return (a.type === 'function' || a.type === 'arrow') && a.params.some(p => !p.typeAnnotation);
@@ -1675,7 +1691,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			}
 
 			case 'member': {
-				const key		= T.pathKey(e);
+				const key		= assignmentTargets.has(e) ? undefined : T.pathKey(e);
 				const refined	= key && scope.value(key);	// dotted keys live only in narrowings
 				if (refined)
 					return refined;
@@ -1721,6 +1737,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				return T.optional(t, chained || T.memberOptional(objT, e.property, scope));
 			}
 			case 'index': {
+				// A literal index is a path (`args[0]`) that narrowing refines, exactly as a member's is.
+				const indexKey	= assignmentTargets.has(e) ? undefined : T.pathKey(e);
+				const refined	= indexKey && scope.value(indexKey);
+				if (refined)
+					return refined;
 				const rawObjT = recurse(e.object);
 				// `chained`, not a bare `e.optional` -- see `case 'member'`'s own comment on `isOptionalChainLink`;
 				// same "a chain continuation isn't itself `?.` but still short-circuits" reasoning applies here.
@@ -2149,6 +2170,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			// end in `=`. `operator` absent is a plain `=`; present it is the compound form's BASE operator,
 			// so nothing here slices a string to recover it.
 			case 'assign': {
+				markAssignmentTargets(e.target);
 				let lt = recurse(e.target);
 				// An assignment target's own type contextually types the value being written -- the same
 				// `expected` channel a generic call already solves its type params from, and the only thing a
