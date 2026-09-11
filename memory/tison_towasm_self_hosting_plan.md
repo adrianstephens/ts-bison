@@ -204,6 +204,34 @@ Survey: 22 moved, `negValue` compiles, **59/277**. The next wall is `new Map([[t
 - `toWAT` exists (`mod.toWAT({expandTypes, hexFloats})`, binary-libs wasm.ts) -- `assistant/wrun-wat.ts`
   prints it with `WAT=1`. Read the WAT instead of reasoning about emitted code.
 
+## 2026-09-11 (later): `Parser<any>` CLOSED -- and a survey result I had to retract
+
+**Retraction**: `0eb2ccf` reported the `Parser<any>` row gone. It was my own `backToDeclaredMembers` mapping
+refined parts onto an `any` member (everything is assignable to `any`), hiding the conversion; `f9dfeee`
+excludes `any` and says so. **A row vanishing right after a narrowing/mapping change: probe one of its
+declarations before believing it.**
+
+What actually closed it (all general):
+- `new C(...)` builds the instantiation its destination (`want`) names -- two instantiations are two structs.
+- A generic CALL's type args: where the result is going (else the checker's own type for the call, lazily)
+  REPLACES an `any` the arguments left (`inferTypeArgMap`). ts-parser's `make()` inferred `T = any` from its
+  spread-heavy spec literal.
+- `interface X extends Y`: X's shape is a wasm SUBTYPE of Y's (Y's fields first; `superClass` set), the
+  interface analogue of class `extends`; bases marked non-final by a pre-scan (`markExtendedInterfaces`).
+- A dynamic-object literal's `k: v` -> `map.set` result was never dropped (commented-out `drop`): a stray
+  value shifted every later struct field -> invalid wasm.
+- A lazy module-level global's initializer now gets its declared type as context (`withContext`), like a local.
+
+## IMPORTED MODULES WERE NEVER CHECKED -- only hoisted (`exportScope`)
+
+So their bodies had no per-statement scope stamps (narrowing) and local annotations no `declScope`. The
+survey HID this: it compiles each file as the ENTRY. Real self-hosting (towasm.ts as entry) compiles every
+other module as an import. `TStoWasm` now runs `checkHoisted` (muted, stamping, no re-hoist) once per
+module record. **And a latent checker bug under it**: `checkStmt1` stamps a `function_decl`'s `.scope` as a
+STATEMENT before `checkFunctionBody` runs, and that is the same property as `fn.scope`, so every muted pass
+(the lib's too) skipped every top-level function body as "already walked". "Walked" is now read off the
+body's first statement. Corpus: GAP -3, nothing else moved. Local `var_decl` annotations are stamped too.
+
 ## The `Parser<any> -> Parser<{...}>` row (22 decls) -- one root, partly characterised
 
 21 of the 22 are tiny towasm.ts helpers: towasm.ts imports ts-parser.ts, whose module-level
