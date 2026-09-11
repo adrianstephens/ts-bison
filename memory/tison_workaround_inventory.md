@@ -100,7 +100,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - arrayMethod's `map` model must stay until a type alias union (`Ty | Lit`) is flattened where towasm reads it;
   removing it broke towasm. `reduce` is now TS's real three overloads (6ee71c9).
 - var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked.
-- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2 (16 with the parked intersection work).
+- Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2, 16 after the intersection work (dd1a676).
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested
   generics go exponential (7z.ts hit 4 GB). Diagnostics print types within a budget (0d84298).
@@ -163,6 +163,26 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   (isAssignable's function-vs-object case now looks members up instead of rejecting any required member); and an intersection
   holding `never` IS `never` at instantiation (`reduceInstantiated`), which is what makes a phantom parameter
   (`type ActionType<P> = string & { hack?: P & never }`) infer nothing for `P` instead of `X & never`.
+- ALWAYS re-run the WHOLE `self-errors.sh` after a checker change, never just the file you were fixing: 60d23d4 fixed
+  2 errors in type-utils/towasm and silently added NINE in js-parser/ts-parser, and the corpus A/B was neutral
+  throughout (the corpus runs against lib.esnext.full, so a towasm-lib-scope regression is invisible to it). Reverted
+  in 29fce5d.
+- OPEN, blocked (the optional indexed access, 60d23d4 reverted): `S['kind']` for `kind?: K` must be `K | undefined`
+  (tsc-verified) and fixing it removes type-utils 3145 and towasm 2386. It is blocked by a pre-existing RELATION gap:
+  an unresolved indexed access is OPAQUE and `isAssignable`'s opaque branch passes it leniently, so making it a union
+  exposes that the same resolved destination `string[] | undefined` is accepted written out but rejected through the
+  indexed access -- by then the source is the towasm lib's EXPANDED `Array` class shape, and no rule relates an object
+  shape to an `Array<T>` destination (`dst.name !== 'Array'` excludes it from the structural path). Repro:
+  assistant/tsc-probe/r3.ts, `take2` fails where `take3` passes. Fix that relation gap first.
+- OPEN, blocked (towasm lib `flatMap`): it declares `callback: (...) => U[]` where TS declares `U | readonly U[]`, so
+  `xs.flatMap(x => f(x) ?? [])` (self-hosting type-utils 798) is rejected, and U silently infers `any`. Declaring TS's
+  form needs union-target inference first: `U | readonly U[]` against `string[]` must infer `U = string` (TS's
+  inferToMultipleTypes gives a naked type variable only what the other constituents did not match). A first attempt at
+  that rewrite -- per-source `matched` tracking plus source/target cancellation -- cost +8 self-hosting errors, because
+  the concrete alternatives must still be tried against the WHOLE argument, and "an inference was made" is too coarse a
+  matched signal (it fires for any type parameter, starving the naked one). Also needed: an empty `[]` contextually
+  typed by `U | readonly U[]` currently comes back as `readonly U[]`, leaking the callee's own unbound parameter into
+  the argument type.
 - Real tsc for probes: `node_modules/.bin/tsc --ignoreConfig --noEmit --strict --target es2022 file.ts` (TS 6.0.3 refuses
   files alongside a tsconfig otherwise). Check TS semantics this way before modeling them.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
