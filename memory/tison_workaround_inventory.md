@@ -106,8 +106,10 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   generics go exponential (7z.ts hit 4 GB). Diagnostics print types within a budget (0d84298).
 - Return-type inference outranks a callback's return: `f<D>(m: (x) => D): D` with `const r: boolean = f(u => ...)`
   takes D from `boolean` (inferReturn); TS gives the return type the lowest priority.
-- Pre-existing, found 2026-09-11: msbuild/src/Solution.ts crashes the checker (`t.name.split is not a function`,
-  type-utils `ref` resolution); tison/test/test-tison.ts:96 fails to parse (`(_, ctx) => ({...ctx})` in `Rule(...)`).
+- Pre-existing, found 2026-09-11: tison/test/test-tison.ts:96 fails to parse (`(_, ctx) => ({...ctx})` in `Rule(...)`).
+  (msbuild's Solution.ts crash was a value name used as a type name plus Object.prototype lookups -- fixed 60e35d4/7011a1a.)
+- towasm cannot pass a struct of one interface where a parameter expects an object type with optional fields
+  ("cannot convert ref:ParsedPath to ref:{ root?: ... }", `path.format(path.parse(x))`).
 - towasm lib lacks what tison's sources call: `Object.assign` (TS: `T & U` overloads), `Object.fromEntries`,
   `String.fromCodePoint`, `Uint8Array.set(array, offset)`, `new Map(map)` (Iterable entries).
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
