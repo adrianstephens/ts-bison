@@ -1548,7 +1548,12 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 					: index.type === 'union' && index.types.every(m => isLiteral(m, 'string')) ? index.types.map(m => (m as { value: string }).value)
 					: undefined;
 				if (keys) {
-					const parts = keys.map(key => lookupMember(object, key, scope));
+					// An OPTIONAL property's own `T['k']` includes `undefined`, as TS gives it -- `lookupMember` answers with the
+					// declared type alone, so a `S['kind']` annotation read back a required type its own reads never have.
+					const parts = keys.map(key => {
+						const m = lookupMember(object, key, scope);
+						return m && optional(m, memberOptional(object, key, scope));
+					});
 					if (parts.every(p => !!p))
 						return resolve(scope, combineTypes(parts), depth - 1, stopAtRef);
 				}
