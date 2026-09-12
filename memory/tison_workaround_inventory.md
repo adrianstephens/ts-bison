@@ -195,6 +195,18 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   matched signal (it fires for any type parameter, starving the naked one). Also needed: an empty `[]` contextually
   typed by `U | readonly U[]` currently comes back as `readonly U[]`, leaking the callee's own unbound parameter into
   the argument type.
+- THE UNIT OF PROGRESS is the survey, not checker errors: `assistant/selfhost-survey.sh` (whole set ~2h, or one file,
+  or `--aggregate` to re-render from the per-file JSON in assistant/selfhost-survey/). Its "Causes, ranked by
+  declarations unblocked" table IS the work queue; the script's own header says so. Declarations COMPILED: 25/257
+  (9.7%, 2026-09-05) -> 65/314 (20.7%, 2026-09-11 at dc94612), with `tocode.ts` the first file to compile whole
+  (18/18, 29 functions). Checker errors are only a precondition -- 7 of 14 files have zero and still compile nothing.
+- A missing lib GLOBAL fails at codegen ("'new' is only supported for a known class"), not at checking, and when it is
+  used in a module-level `const` it blocks EVERY declaration in that file. That one shape was the survey's top cause
+  (56 declarations, 3 files) and it was two missing classes: `WeakSet` and `SyntaxError` (e7b936f). Check for this
+  first when a whole file compiles nothing -- `grep -E "^(const|let) .*new [A-Z]"` over the file finds it in seconds.
+  After the fix the top cause blocks 24; next up: `null`/`undefined` where a nullable object type is expected (24),
+  ts-parser's `Rule<any>` conversion (22), towasm's unknown method 'parse' (21), object literal needing a known
+  target type (17).
 - Real tsc for probes: `node_modules/.bin/tsc --ignoreConfig --noEmit --strict --target es2022 file.ts` (TS 6.0.3 refuses
   files alongside a tsconfig otherwise). Check TS semantics this way before modeling them.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
