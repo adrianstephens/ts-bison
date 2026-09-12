@@ -5,7 +5,7 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import * as Common from '../common';
 import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
-import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
+import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, markSynthetic, isSynthetic } from './checker';
 import { Walkable, walk, walkB } from './walker';
 import { Output } from './tocode';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary, patternBindings } from './transform';
@@ -4938,7 +4938,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			pending.unshift(...restBound.flatMap((p, k) => {
 				const read = { type: 'index', object: { type: 'identifier', name: '#rest' }, index: Literal(k) } as Expr;
 				return typeof p.key === 'string'
-					? [JS.VarDecl('let', JS.Var<Type>(p.key, read, p.typeAnnotation ?? wantSig!.restElem!.tsType))]
+					? [markSynthetic(JS.VarDecl('let', JS.Var<Type>(p.key, read, p.typeAnnotation ?? wantSig!.restElem!.tsType)))]
 					: patternBindings('let', p.key, read);
 			}));
 			// The cast-down env local (or, with no captures, just the param itself) is declared after the real params, so it's a genuine local, not mistaken for one more wasm param.
@@ -5732,9 +5732,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							// Same `for (const k of x.keys()) ...` desugaring `case 'for'`'s own `'in'` kind uses --
 							// synthesized directly (not a real `for...in` node) since there's no user-written loop
 							// variable/body here, just this one copy step per spread argument.
-							emitStmt({
+							emitStmt(markSynthetic({
 								type: 'for', kind: 'of',
-								init: JS.VarDecl('const', JS.Var(kName)),
+								init: markSynthetic(JS.VarDecl('const', JS.Var(kName))),
 								right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: spreadName }, property: 'keys' }, arguments: [] },
 								body: JS.Block({
 									type: 'expression', expression: {
@@ -5743,7 +5743,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 										arguments: [{ type: 'identifier', name: kName }, { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: spreadName }, property: 'get' }, arguments: [{ type: 'identifier', name: kName }] }],
 									},
 								}),
-							} as Stmt, ctx);
+							} as Stmt), ctx);
 							continue;
 						}
 						if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
@@ -6910,7 +6910,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// scope as the original `var_decl`, not a nested one.
 						const tmpName = `#destructure$${destructureTempCounter++}`;
 						for (const stmt of [
-							JS.VarDecl('const', JS.Var(tmpName, d.init, d.typeAnnotation)),
+							markSynthetic(JS.VarDecl('const', JS.Var(tmpName, d.init, d.typeAnnotation))),
 							...patternBindings(s.kind, d.name, { type: 'identifier', name: tmpName }),
 						])
 							emitStmt(stmt, ctx);
@@ -6922,8 +6922,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// never reflects flow-sensitive narrowing the way the checker's internal scope tree does).
 					// Without it, a narrowed-non-null receiver (e.g. `if (m === null) return; ...; m.group(0)`)
 					// would still look nullable to `checkerTypeOf` here and member/call resolution could fail
-					// on it. Falls back to `ctx.scope` only if somehow unset (shouldn't happen post-`TStypeCheck`).
-					const stmtScope = (s as any).scope as Scope ?? ctx.scope;
+					// on it. Unset for a real minority of statements, not the "shouldn't happen" this once claimed
+					// -- see the two reasons spelled out at the `narrowedTypeOf` fallback below.
+					const stamped	= (s as any).scope as Scope | undefined;
+					const stmtScope = stamped ?? ctx.scope;
 					const {methodOwner, methodName, calleeOptional} = d.init.type === 'call' && d.init.callee.type === 'member' && !objectIntrinsic(d.init)
 						? {methodOwner: ownerOf(d.init.callee.object, ctx), methodName: d.init.callee.property, calleeOptional: d.init.callee.optional}
 						: {};
@@ -6985,14 +6987,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 
 					tsType ??= checkerTypeOf(d.init, stmtScope);
-					// A SYNTHETIC statement (`for...of` and destructuring both synthesize a `var_decl`) is
-					// never stamped, so `stmtScope` above is just `ctx.scope`, which carries no narrowing:
-					// `for (const i of w.body)` inside `if (w.kind === 'w')` bound `#for0$arr` from an
-					// unnarrowed `w` and got `any`. `narrowedTypeOf` rather than `ctx.typeScope` outright,
-					// so this only fires where `ctx.scope` had NO answer -- a narrowed scope can otherwise
-					// resolve a clean nominal `Map<K,V>` into its full structural shape, which `ownerFor`
-					// then builds an anonymous struct for instead of finding the class.
-					if (T.isAny(tsType) && !(s as any).scope)
+					// Two unrelated reasons `stmtScope` above is `ctx.scope`, which carries no narrowing, and both
+					// want the second look: the statement was SYNTHESIZED after the check pass (`isSynthetic` --
+					// `for (const i of w.body)` inside `if (w.kind === 'w')` bound `#for0$arr` from an unnarrowed
+					// `w` and got `any`), or its stamp was suppressed as a generic method-body template's /
+					// stripped by `substituteTypeParams`. Measured over difftest, only 2 of 58 are the former --
+					// which is why the test names both rather than reading one off the other's absence.
+					// `narrowedTypeOf` rather than `ctx.typeScope` outright, so this only fires where `ctx.scope`
+					// had NO answer -- a narrowed scope can otherwise resolve a clean nominal `Map<K,V>` into its
+					// full structural shape, which `ownerFor` then builds an anonymous struct for.
+					if (T.isAny(tsType) && (isSynthetic(s) || !stamped))
 						tsType = narrowedTypeOf(d.init, ctx);
 
 					const wtype = typeOf(tsType);
@@ -7174,18 +7178,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const arrId: Expr = { type: 'identifier', name: `#for${n}$arr` };
 						const idxId: Expr = { type: 'identifier', name: `#for${n}$i` };
 
-						emitStmt(JS.Block<Stmt>(
-							JS.VarDecl('const', JS.Var(arrId.name, s.right)),
-							JS.For(
-								JS.VarDecl('let', JS.Var(idxId.name, Literal(0))),
+						emitStmt(markSynthetic(JS.Block<Stmt>(
+							markSynthetic(JS.VarDecl('const', JS.Var(arrId.name, s.right))),
+							markSynthetic(JS.For(
+								markSynthetic(JS.VarDecl('let', JS.Var(idxId.name, Literal(0)))),
 								JS.JSBinary('<', idxId, JS.Member(arrId, 'length')),
 								JS.JSUnary('++', idxId),
-								JS.Block<Stmt>(
-									JS.VarDecl(s.init.kind, JS.Var(v.name, JS.Index(arrId, idxId), v.typeAnnotation)),
-									s.body
-								),
-							),
-						), ctx);
+								markSynthetic(JS.Block<Stmt>(
+									markSynthetic(JS.VarDecl(s.init.kind, JS.Var(v.name, JS.Index(arrId, idxId), v.typeAnnotation))),
+									s.body		// the ORIGINAL loop body: checked and stamped, so deliberately not marked
+								)),
+							)),
+						)), ctx);
 						return;
 					}
 					// `for (const k in obj)` -- most efficiently over a dynamic object (structural
@@ -7223,22 +7227,22 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						}
 
 						if (ownerOf(s.right, ctx)?.methodDecls.get('keys')) {
-							emitStmt({
+							emitStmt(markSynthetic({
 								type: 'for', kind: 'of',
 								init: s.init,
 								right: { type: 'call', callee: { type: 'member', object: s.right, property: 'keys' }, arguments: [] },
 								body: s.body,
-							}, ctx);
+							}), ctx);
 							return;
 						}
 
 						const v = s.init.declarations[0];
-						emitStmt({
+						emitStmt(markSynthetic({
 							type: 'for', kind: 'of',
-							init: { type: 'var_decl', kind: s.init.kind, declarations: [{ ...v, name: JS.ArrayPattern([{ target: v.name }]) }] },
+							init: markSynthetic(JS.VarDecl(s.init.kind, { ...v, name: JS.ArrayPattern([{ target: v.name }]) })),
 							right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Object' }, property: 'entries' }, arguments: [s.right] },
 							body: s.body,
-						}, ctx);
+						}), ctx);
 						return;
 					}
 					default:

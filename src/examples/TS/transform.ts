@@ -3,7 +3,7 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import { Module, Location, Identifier, Literal, Binary, Conditional, Assign, Await, Member, ExprStmt, hasMod, dropMod, If, While } from '../common';
 import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
-import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, typeOf1, inferReturn } from './checker';
+import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, typeOf1, inferReturn, markSynthetic } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
 import { Output } from './tocode';
 
@@ -456,7 +456,7 @@ export function StateMachineToAST(machine: StateMachine) {
 // prove, not a reason to reject it.
 export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget, valueExpr: Expr): JS.Stmt<Type>[] {
 	if (typeof target === 'string')
-		return [JS.VarDecl(kind, JS.Var(target, valueExpr))];
+		return [markSynthetic(JS.VarDecl(kind, JS.Var(target, valueExpr)))];
 
 	if (target.type === 'array_pattern') {
 		const stmts = target.elements.flatMap((el, i) => {
@@ -473,7 +473,7 @@ export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget,
 		if (target.rest) {
 			// Real JS semantics: the rest collects the remaining elements into a genuinely new array, not
 			// a view -- `.slice(n)` (already a real `Array<T>` method) gives exactly that.
-			stmts.push(JS.VarDecl(kind, JS.Var(target.rest, JS.Call(JS.Member(valueExpr, 'slice'), [Literal(target.elements.length)]))));
+			stmts.push(markSynthetic(JS.VarDecl(kind, JS.Var(target.rest, JS.Call(JS.Member(valueExpr, 'slice'), [Literal(target.elements.length)])))));
 		}
 		return stmts;
 	}
