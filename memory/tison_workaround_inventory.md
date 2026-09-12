@@ -198,7 +198,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - THE UNIT OF PROGRESS is the survey, not checker errors: `assistant/selfhost-survey.sh` (whole set ~2h, or one file,
   or `--aggregate` to re-render from the per-file JSON in assistant/selfhost-survey/). Its "Causes, ranked by
   declarations unblocked" table IS the work queue; the script's own header says so. Declarations COMPILED: 25/257
-  (9.7%, 2026-09-05) -> 65/314 (20.7%, 2026-09-11 at dc94612), with `tocode.ts` the first file to compile whole
+  (9.7%, 2026-09-05) -> 68/324 (21.0%, 2026-09-12 clean full run at 3aa8692, 6 minutes), with `tocode.ts` the first file to compile whole
   (18/18, 29 functions). Checker errors are only a precondition -- 7 of 14 files have zero and still compile nothing.
 - A missing lib GLOBAL fails at codegen ("'new' is only supported for a known class"), not at checking, and when it is
   used in a module-level `const` it blocks EVERY declaration in that file. That one shape was the survey's top cause
@@ -249,6 +249,21 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   prints a `## NOT MEASURED` section, and it exits non-zero. Always check for `worker for ... exited` in the output.
   Consequence worth remembering: the `undefined`-takes-the-default fix (48ea34b) DID move `oneStepIndexed` past the
   null/undefined cause -- verified with `probe-one-decl` -- even though the stale table said otherwise.
+- THE DOMINANT REMAINING THEME (clean survey 2026-09-12, 68/324 declarations compiled): ONE PHYSICAL REPRESENTATION
+  PER SHAPE. towasm derives struct identity from the checker's `T.typeKey`, which is finer-grained than the physical
+  layout, so two types that share a layout get two structs and every conversion between them fails. Two families,
+  ~72 declarations together -- more than everything else in the queue combined:
+    (a) GENERIC INSTANTIATION (~53): `Rule<any>` vs `Rule<{...}>` (ts-parser 22, js-parser 11), `Rest<{...}>` and
+        `Rest<any>` vs `Rest<union>` (checker/type-utils 18), `Set<lit|lit>` vs `{...}` (2). This is the erasure
+        trap section A already names (Params<number> vs Params<any>): erase to ONE layout per generic shape.
+    (b) NARROWED vs DECLARED (19): `{type:"keyof"; argument:Type}` vs `{type:string; argument:Type}` -- an inferred
+        type predicate narrows a discriminant to its literal, and the narrowed view keys differently even though the
+        value IS an instance of the declared struct. Constraint to respect: towasm.ts:3140 documents that object
+        shapes must NOT simply be widened, because `matchObjectShapeByType`'s discriminant tiebreak needs the literal
+        precision to tell union members apart. TRIED AND INSUFFICIENT: reusing an already-built widened struct in
+        `ensureAnonObjectShape` -- the failing pair is not created through that path, so first find where each struct
+        IS built (log inside `buildObjectShape`, BEFORE its `const info` object literal, not inside it).
+  Attack the identity rule once, generally, rather than the two symptoms separately.
 - `assistant/probe-one-decl.ts <file> <declName>` compiles ONE declaration the way the survey does (its `variantBody`:
   the whole module compiles, only the target is exported) and prints the error WITH its position -- the survey strips
   positions deliberately, to cluster causes, so this is how you turn a cluster back into a source line.
