@@ -6557,6 +6557,18 @@ async function main() {
 	}
 
 	{
+		// JS applies a parameter's default when the argument is `undefined`, so passing it explicitly is the same as
+		// omitting it -- the shape `type-utils.ts` uses throughout (`resolve(scope, t, undefined, stopAtRef)`).
+		const { explicitUndefined, omitted } = await compile(`
+			function g(a: number, b = 10, c = 100): number { return a + b + c; }
+			export function explicitUndefined(): number { return g(1, undefined, 3); }
+			export function omitted(): number { return g(1); }
+		`);
+		check('explicitUndefined()', explicitUndefined(), 14);
+		check('omitted()', omitted(), 111);
+	}
+
+	{
 		// `new X` needs X to be a KNOWN CLASS, so a global the lib never declared fails at codegen, not at checking --
 		// which is how one missing `WeakSet` blocked every declaration in two whole files of the self-hosting survey.
 		const { errClass, weakSet } = await compile(`

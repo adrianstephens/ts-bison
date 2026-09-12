@@ -4182,8 +4182,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 			return params[i];
 		};
+		// JS applies a parameter's DEFAULT when the argument is `undefined`, so passing it explicitly is exactly the same
+		// as omitting it -- `null` is a real value and does NOT trigger the default. Without this, an explicit
+		// `resolve(scope, t, undefined, stopAtRef)` tried to emit `undefined` into the scalar slot `depth = 10` declares.
+		const argOrDefault = (i: number, a: Expr): Expr => nullLiteralKind(a) === 'undefined' && defaults?.[i] ? defaults[i]! : a;
 		// Each argument's parameter type is its context: a literal or generic call there builds what the callee reads.
-		const emitArg = (i: number, a: Expr) => withContext(ctx, resolvedParams?.[i]?.tsType, () => emitAs(a, ctx, wantForArg(i, a)));
+		const emitArg = (i: number, a: Expr) => withContext(ctx, resolvedParams?.[i]?.tsType, () => { const arg = argOrDefault(i, a); return emitAs(arg, ctx, wantForArg(i, arg)); });
 		if (!hasRest) {
 			if (args.some(a => a.type === 'spread'))
 				args = expandTupleSpreads(args, ctx);
