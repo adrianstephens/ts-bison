@@ -1,16 +1,16 @@
 ---
 name: tison-scope-stamping
-description: "How checker scopes reach towasm (statement stamp + branch stamp + synthetic marker), and the measured cost/benefit of the block-node / sparse-stamping idea that was deliberately NOT done"
+description: "How checker scopes reach towasm (statement stamp + branch stamp), and the measured cost/benefit of the block-node / sparse-stamping idea that was deliberately NOT done"
 metadata:
   node_type: memory
   type: project
 ---
 
-How the checker's flow-narrowing reaches `towasm`, after 2026-09-12 (`017239c`, `eee985a`).
+How the checker's flow-narrowing reaches `towasm`, after 2026-09-12 (`017239c`; the synthetic marker from `eee985a` was removed in `ffb7830`).
 
-## Three AST marks, all untyped
+## Two AST marks, both untyped
 
-All are `(node as any).x`, matching `pos` — **never make them formal typed fields**: per
+Both are `(node as any).x`, matching `pos` — **never make them formal typed fields**: per
 [[feedback-no-checker-state]] a declared field on a discriminated union this large already broke
 `keyof`-sensitive generic tooling once. `CallSig.scope?: unknown` is fine only because `CallSig` is a
 single interface.
@@ -20,7 +20,6 @@ single interface.
 - `(expr as any).scope` — per-BRANCH: `&&`/`||`'s right operand, a ternary's consequent/alternate
   (`stampBranch`, checker.ts). towasm's `inNarrowed` prefers it and falls back to re-deriving with
   `narrow()`. Stripped by `substituteTypeParams` AND `substituteEarlierParamRefs`.
-- `(stmt as any).synthetic` — `markSynthetic`/`isSynthetic`, for statements BUILT AFTER the check pass.
 
 **`stampBranch` must stay gated on the `narrowing` depth counter.** `narrow()` calls `typeOf` at ~13
 sites, and its disjunctive case passes the UNnarrowed scope to `recurse(test.right, ...)` — without the
@@ -51,15 +50,22 @@ Surveyed 2026-09-12 over checker/tocode/walker/transform (probe:
 
 So block nodes would cover 1041 of 1166 scopes and leave 135 + 345 needing something else. Net benefit
 is only ~2400 stamps → ~480 (memory/tidiness, **no capability or correctness gain**); cost is three
-towasm reader changes plus a new synthetic marker. Declined by the user on that trade. The
-`markSynthetic` half was done anyway, since it stands on its own.
+towasm reader changes plus a new synthetic marker. Declined by the user on that trade. A standalone
+synthetic marker was then added and REMOVED the same day -- see below.
 
-## What the synthetic marker actually fixed
+## Why there is no synthetic marker (added and removed 2026-09-12; `git log -S markSynthetic`)
 
-`emitStmt`'s `var_decl` case tested `!(s as any).scope` and its comment called that "a SYNTHETIC
-statement". Measured over difftest: **only 2 of 58 firings were synthetic** — the rest are generic
-method-body templates and `substituteTypeParams`-stripped bodies. The condition was right for all 58;
-its stated reason was wrong for 56. It now names both (`isSynthetic(s) || !stamped`).
+`emitStmt`'s `var_decl` case retries a bare `any` through `narrowedTypeOf` when the statement has no
+checker scope. Its comment used to call that "a SYNTHETIC statement"; measured over difftest, **only 2 of
+58 firings are synthetic** -- the rest are generic method-body templates and `substituteTypeParams`-
+stripped bodies. The condition was right for all 58; its stated reason was wrong for 56. It is now just
+`!stamped`, with both reasons in its comment.
+
+An explicit `markSynthetic`/`isSynthetic` pair was tried and removed: synthetic statements are a strict
+SUBSET of unstamped ones (towasm's only check calls run on original ASTs before codegen), so it changed no
+behaviour -- and its own expando write, `(s as any).synthetic = true`, is something towasm cannot compile,
+which broke self-hosting of `patternBindings`. Don't reintroduce it unless a sparse-stamping pass lands,
+which is the only thing that would make "unstamped" stop implying "no checker scope".
 
 ## Instruments
 

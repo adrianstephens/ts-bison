@@ -1839,16 +1839,17 @@ already byte-identical (`Rest<any>` and `Rest<unknown>`), which is what proved t
 was the bug. **Log the layout, not just the key.** `SHAPELOG`-style `process.env` logging inside
 towasm.ts is fine for probing but MUST be removed before surveying (this file's own toggle trap).
 
-**One regression, mine, still open**: `patternBindings` REGRESSED (compiled before). `eee985a` added
-`markSynthetic`, whose `(s as any).synthetic = true` towasm cannot compile -- `unknown field 'synthetic'`,
-an expando write reached through a generic type parameter. Three fixes TRIED AND INSUFFICIENT, each
-reverted (do not retry these blind):
+**The one regression (`patternBindings`) is RESOLVED** by removing the marker that caused it -- it was
+behaviour-identical (see [[tison-scope-stamping]]). The towasm gap it exposed is real and still OPEN,
+just no longer exercised here: `unknown field 'synthetic'` for an expando write reached through a generic
+type parameter (`markSynthetic<S extends Stmt>(s: S)`, a union whose members are all generic refs).
+Three fixes TRIED AND INSUFFICIENT, each reverted (do not retry these blind):
 - resolving each union member as well in the expando-discovery `note` pass, to reach `S`'s constraint;
 - dropping the `part.typeArgs?.length` skip there, since a generic now has one struct keyed by bare name;
 - routing the write through a `Stmt`-typed helper so the receiver is a real union rather than `S`;
 - and the last two TOGETHER.
-So the blocker is upstream of the discovery pass, not in its member filter. Next: log what `note`
-actually receives for that write before changing anything else.
+So the blocker is upstream of the discovery pass, not in its member filter. If it resurfaces: log what
+`note` actually receives for the write before changing anything else.
 
 **Next rows** (after the clear): `only direct calls to named functions...` 23; `'??=' needs a nullable
 object-typed target` 22 (checker); `unknown method 'parse'` 22; the family-(b) anonymous-shape row 19;

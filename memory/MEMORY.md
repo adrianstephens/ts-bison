@@ -40,7 +40,7 @@
 - [closure-param causes](tison_closure_param_causes.md) — the survey's `closure parameter 'X'` rows are THREE unrelated blockers, not one; read before working that row
 - [checker inference](tison_checker_inference.md) — distributive conditionals, contextual callback returns, const contexts, template literal expansion, and probe traps (literal leniency, silent `any` members)
 - [nominal class refs](tison_nominal_class_refs.md) — **`resolve` keeps class refs nominal; `resolveMembers` is the opt-out** (4 sites); replaced 8 per-site guards
-- [scope stamping](tison_scope_stamping.md) — how checker scopes reach towasm (statement/branch/synthetic marks); **don't "fix" `narrowedTypeOf`**; why block-node scopes were measured and declined
+- [scope stamping](tison_scope_stamping.md) — how checker scopes reach towasm (statement/branch stamps); **don't "fix" `narrowedTypeOf`**; why block-node scopes were measured and declined
 - [checker narrowing plan](tison_checker_narrowing_plan.md) — user plans integer/range narrowing in the checker (not started as of 2026-07-31)
 - [ReadType resolution](tison_readtype_resolution.md) — OPEN: opt's spurious `_` key; the reverted fix regressed other fields
 - [vsdg node type](tison_vsdg_node_type.md) — RawNode & INode discriminated union; gate = `assistant/vsdg-check.sh`
