@@ -6557,6 +6557,24 @@ async function main() {
 	}
 
 	{
+		// A getter reached through an optional chain is guarded like any other link: the receiver is evaluated once,
+		// the getter runs only when it is present, and the whole access yields `undefined` when it is not.
+		const { chainGetter } = await compile(`
+			class Box {
+				private n_: number;
+				constructor(n: number) { this.n_ = n; }
+				get len(): number { return this.n_; }
+			}
+			export function chainGetter(flag: number): number {
+				const b: Box | undefined = flag > 100 ? undefined : new Box(7);
+				const gone: Box | undefined = flag > 100 ? new Box(1) : undefined;
+				return (b?.len ?? -1) + (b ? b.len : 0) + (gone?.len ?? -100);
+			}
+		`);
+		check('chainGetter()', chainGetter(0), 7 + 7 - 100);
+	}
+
+	{
 		// JS applies a parameter's default when the argument is `undefined`, so passing it explicitly is the same as
 		// omitting it -- the shape `type-utils.ts` uses throughout (`resolve(scope, t, undefined, stopAtRef)`).
 		const { explicitUndefined, omitted } = await compile(`

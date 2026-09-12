@@ -5416,12 +5416,23 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (cls?.getterNames?.has(e.property)) {
 					// `isOptionalChainLink`, not a bare `e.optional` -- `a?.b.getter` continues `a?.b`'s own
 					// chain even though *this* access has no `?.` of its own written on it (see the checker's
-					// own `isOptionalChainLink` comment, shared verbatim). Same restriction either way: a
-					// getter can't be guarded in this pass, direct `?.` or chain-continued.
-					if (isOptionalChainLink(e))
-						throw `'a?.${e.property}' on a getter is not supported`;
+					// own `isOptionalChainLink` comment, shared verbatim). Guarded exactly like the field read
+					// and the union dispatch below: `methodSig` gives the getter's result type without emitting,
+					// which is what `emitOptionalAccess` needs to type its own result before the call is built.
+					const getter = accessorKey('get', e.property);
+					const sig = isOptionalChainLink(e) ? methodSig(cls, getter, ctx) : undefined;
+					if (sig) {
+						const objWtype = nullableWtype(cls.thisWtype!);
+						emitAs(e.object, ctx, objWtype);
+						const resultWtype = nullableWtype(sig.result);
+						return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
+							ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
+							emitMethodCall(cls, getter, [], ctx);
+							coerceTop(sig.result, ctx, resultWtype);
+						});
+					}
 					emitAs(e.object, ctx, cls.thisWtype!);
-					return emitMethodCall(cls, accessorKey('get', e.property), [], ctx);
+					return emitMethodCall(cls, getter, [], ctx);
 				}
 
 				const fieldIdx	= cls?.fieldIndex.get(e.property);
