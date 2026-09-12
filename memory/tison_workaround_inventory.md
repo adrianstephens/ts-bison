@@ -207,6 +207,14 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   After the fix the top cause blocks 24; next up: `null`/`undefined` where a nullable object type is expected (24),
   ts-parser's `Rule<any>` conversion (22), towasm's unknown method 'parse' (21), object literal needing a known
   target type (17).
+- THE SURVEY CAN LIE, and did: `runWorker` logged a one-line note and resolved when a worker crashed, leaving that
+  file's PREVIOUS JSON on disk -- and the tables render from disk, so a crashed file's rows read as "nothing changed".
+  The type-utils worker crashes (it is the biggest file, 113 probes), so every type-utils row in a survey run after
+  2026-09-11 07:08 was that morning's data. FIXED in `assistant/selfhost-survey.ts` -- gitignored, so re-apply if the
+  file is lost: a failed worker now overwrites the report with `parseError: 'WORKER CRASHED (not measured)'`, the run
+  prints a `## NOT MEASURED` section, and it exits non-zero. Always check for `worker for ... exited` in the output.
+  Consequence worth remembering: the `undefined`-takes-the-default fix (48ea34b) DID move `oneStepIndexed` past the
+  null/undefined cause -- verified with `probe-one-decl` -- even though the stale table said otherwise.
 - `assistant/probe-one-decl.ts <file> <declName>` compiles ONE declaration the way the survey does (its `variantBody`:
   the whole module compiles, only the target is exported) and prints the error WITH its position -- the survey strips
   positions deliberately, to cluster causes, so this is how you turn a cluster back into a source line.
