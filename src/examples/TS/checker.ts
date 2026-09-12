@@ -533,9 +533,29 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 
 // Returns a scope refined by `test` holding (sense=true) or failing (sense=false). Covers truthiness, `!`, `&&`/`||`, typeof, null/undefined
 // comparisons, discriminant-property comparisons, instanceof, `in`, and user-defined type predicates.
-// Exported for towasm: only `ctx.stmtScope` carries narrowing into codegen, and the checker stamps a
-// scope on STATEMENTS only, so a narrowing a ternary's or `&&`'s own test introduces has no stamp to
-// read. Pure, so codegen re-deriving it reaches the same scope the check pass used.
+// Exported for towasm: only `ctx.stmtScope` carries narrowing into codegen, and an unstamped branch
+// (`stampBranch`) still needs re-deriving. Pure, so it reaches the same scope either way.
+
+// Depth of the `narrow()` calls currently on the stack -- transient, restored by its own `finally`, never
+// inspected across operations. `narrow` evaluates `typeOf` on a test's operands (~13 sites), so without
+// this a test containing a nested `&&`/ternary would reach `stampBranch` from inside a SPECULATIVE walk:
+// `narrow`'s own disjunctive case passes the UNnarrowed scope to `recurse(test.right, ...)`, and `??=`'s
+// first win would freeze that wrong answer permanently.
+let narrowing = 0;
+
+// A ternary's or `&&`/`||`'s own branch scope, stamped on the BRANCH node -- the sub-statement narrowing
+// `(stmt as any).scope` cannot reach, since no statement boundary exists inside an expression. Untyped,
+// matching `pos` and the existing statement stamp: a formal field on a member of a discriminated union
+// this large breaks `keyof`-sensitive generic tooling.
+//
+// `isGenericTemplate`, matching `checkFunctionBody`'s `noStamp`: a generic class's method body is ONE
+// template shared by every instantiation, so a stamp taken while its type params are still opaque would
+// block (`??=` first-wins) the per-instantiation scope codegen actually needs.
+function stampBranch(branch: Expr, branchScope: Scope, scope: Scope) {
+	if (!narrowing && branchScope !== scope && !scope.isGenericTemplate())
+		(branch as any).scope ??= branchScope;
+}
+
 // Whether any of `names` is written anywhere in `body`: an assignment, or `++`/`--` on either side.
 function writesAny(body: JS.Stmt<any>[] | Expr, names: Set<string>): boolean {
 	let found = false;
@@ -594,7 +614,12 @@ function narrowByTypeof(m: Type, kinds: Set<string>, inside: boolean, scope: Sco
 
 export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 	const aliasing = new Set<string>();
-	return recurse(scope.hasSources() ? throughSources(test, scope) : test, scope, sense);
+	++narrowing;
+	try {
+		return recurse(scope.hasSources() ? throughSources(test, scope) : test, scope, sense);
+	} finally {
+		--narrowing;
+	}
 
 	// Refines `name`'s binding to the members `keep` accepts (`name` may be a dotted path key). `keep` returns `true` (keep),
 	// `false` (exclude), or a `Type` (replace with a narrower version) -- the last splits a compound member (see `narrowByDiscriminant`).
@@ -2271,7 +2296,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// which is how a closure parameter ended up with no representation at all.
 					// Only `??`: `&&`/`||` yield a value of either side, so the left is no guide to the right.
 					const rightExpected = e.operator === '??' ? T.nonNullable(lt, scope) : undefined;
-					const rt	= typeOf(e.right, e.operator === '&&' ? narrow(e.left, scope, true) : e.operator === '||' ? narrow(e.left, scope, false) : scope, false, rightExpected, yieldCollector, err);
+					const rightScope	= e.operator === '&&' ? narrow(e.left, scope, true) : e.operator === '||' ? narrow(e.left, scope, false) : scope;
+					stampBranch(e.right, rightScope, scope);
+					const rt	= typeOf(e.right, rightScope, false, rightExpected, yieldCollector, err);
 					return T.combineTypes([T.logicalLeftPart(lt, e.operator, scope), rt]);
 				}
 				const rt = recurse(e.right);
@@ -2305,14 +2332,18 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				return T.isBigint(lt, scope) || T.isBigint(rt, scope) ? T.BIGINT : T.NUMBER;
 			}
 
-			case 'conditional':
+			case 'conditional': {
 				recurse(e.test);
+				const thenScope = narrow(e.test, scope, true), elseScope = narrow(e.test, scope, false);
+				stampBranch(e.consequent, thenScope, scope);
+				stampBranch(e.alternate, elseScope, scope);
 				// Precise per branch (`widen: false`) -- `typeOf`'s own final wrap widens the combined result once, if
 				// the caller wants that, same reasoning as the logical-operator case above.
 				return T.combineTypes([
-					typeOf(e.consequent, narrow(e.test, scope, true), false, expected, yieldCollector, err),
-					typeOf(e.alternate, narrow(e.test, scope, false), false, expected, yieldCollector, err)
+					typeOf(e.consequent, thenScope, false, expected, yieldCollector, err),
+					typeOf(e.alternate, elseScope, false, expected, yieldCollector, err)
 				]);
+			}
 
 			case 'sequence':
 				return e.expressions.map(x => recurse(x)).pop() ?? T.ANY;

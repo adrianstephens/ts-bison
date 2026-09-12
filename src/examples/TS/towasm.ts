@@ -1330,7 +1330,10 @@ function substituteTypeParams<N extends Walkable>(node: N, map: ReadonlyMap<stri
 		// accepted: it could only ever have narrowed the type parameter itself, never the concrete
 		// per-instantiation type this compiled body actually needs.
 		(s, process) => { const built = process(s); delete (built as any).scope; return built; },
-		undefined,
+		// `stampBranch`'s branch scopes are the same stamp at sub-statement granularity, and go stale here
+		// for exactly the same reason -- so they are stripped the same way, or a ternary inside a
+		// substituted body would keep resolving its branches through the unsubstituted type parameter.
+		(e, process) => { const built = process(e); delete (built as any).scope; return built; },
 		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
 	)!;
 }
@@ -2710,12 +2713,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// Emit `fn` with `ctx.stmtScope` refined by `test` holding (or failing), for a ternary's or logical
 	// operator's own branch. Narrowing only ever reaches codegen through `stmtScope`, and the checker
-	// stamps a scope on STATEMENTS only -- so a receiver narrowed by the very expression being emitted
+	// stamped a scope on STATEMENTS only -- so a receiver narrowed by the very expression being emitted
 	// (`p ? p.typeArgs![0] : x`) was invisible, and every read through it fell back to `any`. `typeScope`,
 	// not `scope`, so a branch inside an already-narrowed statement composes rather than resets.
-	function inNarrowed<R>(test: Expr, sense: boolean, ctx: FunctionContext, fn: () => R): R {
+	//
+	// `branch`'s own stamp (`stampBranch`, checker.ts) first: re-deriving reaches the same scope only when
+	// `ctx.typeScope` is the one the checker used, which a substituted generic body's is deliberately NOT
+	// (see `substituteTypeParams`) -- and where that body's stamp is correctly absent, this falls back to
+	// exactly the re-derivation it always did.
+	function inNarrowed<R>(branch: Expr, test: Expr, sense: boolean, ctx: FunctionContext, fn: () => R): R {
 		const saved = ctx.stmtScope;
-		ctx.stmtScope = narrow(test, ctx.typeScope, sense);
+		ctx.stmtScope = (branch as any).scope as Scope ?? narrow(test, ctx.typeScope, sense);
 		try {
 			return fn();
 		} finally {
@@ -3875,7 +3883,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (e.type === 'binary' && (e.operator === '&&' || e.operator === '||')) {
 			emitTruthy(e.left, ctx);
 			const _old = ctx.swapOut();
-			inNarrowed(e.left, e.operator === '&&', ctx, () => emitTruthy(e.right, ctx));
+			inNarrowed(e.right, e.left, e.operator === '&&', ctx, () => emitTruthy(e.right, ctx));
 			ctx.emit(e.operator === '&&'
 				? I.if('i32', ctx.swapOut(_old), [I.i32.const(0)])
 				: I.if('i32', [I.i32.const(1)], ctx.swapOut(_old)));
@@ -4131,19 +4139,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// non-optional property-read chain off one) -- nothing here needs to handle anything wider.
 	function substituteEarlierParamRefs(e: Expr, rename: ReadonlyMap<string, string>): Expr {
 		const sub = (x: Expr) => substituteEarlierParamRefs(x, rename);
-		switch (e.type) {
-			case 'identifier': {
-				const to = rename.get(e.name);
-				return to ? { ...e, name: to } : e;
+		// Any node actually REBUILT here loses its branch stamp (`stampBranch`, checker.ts), for the same
+		// reason `substituteTypeParams` strips one: it was taken where the original parameter names were
+		// bound, and cannot resolve the scratch locals they become at the call site. A node returned
+		// untouched below was not rewritten, so its own stamp still means what it said.
+		const out = rebuild();
+		if (out !== e)
+			delete (out as any).scope;
+		return out;
+
+		function rebuild(): Expr {
+			switch (e.type) {
+				case 'identifier': {
+					const to = rename.get(e.name);
+					return to ? { ...e, name: to } : e;
+				}
+				case 'member':		return { ...e, object: sub(e.object) };
+				// The operator shapes `isReemittableDefault` accepts must be descended into as well, or the
+				// `a` in `b = a * 2` stayed pointing at a name the call site has never heard of.
+				case 'binary':		return { ...e, left: sub(e.left), right: sub(e.right) };
+				case 'unary':		return { ...e, operand: sub(e.operand) };
+				case 'conditional':	return { ...e, test: sub(e.test), consequent: sub(e.consequent), alternate: sub(e.alternate) };
+				case 'array':		return { ...e, elements: e.elements.map(el => el && el.type !== 'spread' ? sub(el) : el) };
+				default:			return e;
 			}
-			case 'member':		return { ...e, object: sub(e.object) };
-			// The operator shapes `isReemittableDefault` accepts must be descended into as well, or the
-			// `a` in `b = a * 2` stayed pointing at a name the call site has never heard of.
-			case 'binary':		return { ...e, left: sub(e.left), right: sub(e.right) };
-			case 'unary':		return { ...e, operand: sub(e.operand) };
-			case 'conditional':	return { ...e, test: sub(e.test), consequent: sub(e.consequent), alternate: sub(e.alternate) };
-			case 'array':		return { ...e, elements: e.elements.map(el => el && el.type !== 'spread' ? sub(el) : el) };
-			default:			return e;
 		}
 	}
 
@@ -6101,7 +6120,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							if (!isAnd)
 								ctx.emit(I.i32.eqz);
 							const _old = ctx.swapOut();
-							if (inNarrowed(left, isAnd, ctx, () => emitExpr(right, ctx, 'void')) !== 'void')
+							if (inNarrowed(right, left, isAnd, ctx, () => emitExpr(right, ctx, 'void')) !== 'void')
 								ctx.emit(I.drop);
 							ctx.emit(I.if(undefined, ctx.swapOut(_old)));
 							return 'void';
@@ -6130,7 +6149,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							coerceTop(leftWtype, ctx, wtype);
 						};
 						const _old = ctx.swapOut();
-						const emitRight = () => inNarrowed(left, isAnd, ctx, () => emitAs(right, ctx, wtype));
+						const emitRight = () => inNarrowed(right, left, isAnd, ctx, () => emitAs(right, ctx, wtype));
 						if (isAnd)
 							emitRight();
 						else
@@ -6412,9 +6431,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					throw 'conditional expression has an unsupported type';
 				emitTruthy(e.test, ctx);
 				const _old = ctx.swapOut();
-				inNarrowed(e.test, true, ctx, () => emitAs(e.consequent, ctx, wtype));
+				inNarrowed(e.consequent, e.test, true, ctx, () => emitAs(e.consequent, ctx, wtype));
 				const _then = ctx.swapOut();
-				inNarrowed(e.test, false, ctx, () => emitAs(e.alternate, ctx, wtype));
+				inNarrowed(e.alternate, e.test, false, ctx, () => emitAs(e.alternate, ctx, wtype));
 				const _else = ctx.swapOut(_old);
 				ctx.emit(I.if(toValType(wtype), _then, _else));
 				return wtype;
