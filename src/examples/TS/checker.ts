@@ -2666,18 +2666,6 @@ function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; ri
 	return undefined;
 }
 
-// A statement BUILT AFTER the check pass (towasm's `for...of`/destructuring desugaring, `patternBindings`)
-// -- so the checker never walked it and it has no scope stamp. Consumers must ask this, never infer it from
-// a missing stamp: absence is also what a muted walk, a generic method-body template and an unreachable
-// body leave behind, so reading it as "synthetic" silently ties one fact to three unrelated ones.
-export function markSynthetic<S extends Stmt>(s: S): S {
-	(s as any).synthetic = true;
-	return s;
-}
-export function isSynthetic(s: Stmt): boolean {
-	return !!(s as any).synthetic;
-}
-
 // `check`: the walk to use, defaulting to the plain scope-stamping one. The only caller that wants
 // anything else is `checkFunctionBody`, which composes a return hook and (for the muted first walk of a
 // generic method-body template) drops the stamp -- see `stampScopes`/`afterReturn`.
