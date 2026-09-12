@@ -668,14 +668,20 @@ export function TStypeCheck(ast: Module<Stmt>, global: Scope): Diagnostic[] {
 // `tainted`: this build (or one it awaited) had to skip something to avoid deadlocking on a genuine import cycle -- real and usable, just incomplete.
 interface ModuleShape { scope: Scope; value: Type; tainted: boolean }
 
-// Process-wide, like `libScopeCache`. A genuine cycle (e.g. Node's `fs`<->`fs/promises` `.d.ts` graph) truncates
-// whichever side asks second; `tainted` marks that so it's evicted instead of poisoning later callers.
-const importScopeCache	= new WeakMap<LoadedModule, Promise<ModuleShape>>();
-const waitingFor		= new WeakMap<LoadedModule, Set<LoadedModule>>();
-
-// Own declarations recorded before re-export merging (the part that can cycle) -- lets a plain `import`'s deadlock
-// fallback (`awaitScope`'s `fallbackToOwn`) resolve from here instead, since imports never need re-exports.
-const ownScopeSettled	= new WeakMap<LoadedModule, { scope: Scope; alias?: Type }>();
+// The checker's memos for one module, stamped on the module's own record -- `src.program.scope` below is the same
+// idea. The lifetime that matters is the MODULE's: these are keyed by identity, so a memo is reusable exactly while
+// its module is, and process-wide tables instead kept every past compile's scopes alive (3005d78).
+interface ModuleMemo {
+	// A genuine cycle (e.g. Node's `fs`<->`fs/promises` `.d.ts` graph) truncates whichever side asks second;
+	// `tainted` marks that, so the shape is cleared instead of poisoning later callers.
+	shape?:		Promise<ModuleShape>;
+	// Own declarations, recorded before re-export merging (the part that can cycle) -- lets a plain `import`'s
+	// deadlock fallback (`awaitScope`'s `fallbackToOwn`) resolve from here, since imports never need re-exports.
+	own?:		{ scope: Scope; alias?: Type };
+	// What this module is currently waiting on, for `wouldDeadlock`.
+	waiting?:	Set<LoadedModule>;
+}
+const memoOf = (m: LoadedModule): ModuleMemo => ((m as { memo?: ModuleMemo }).memo ??= {});
 
 function wouldDeadlock(waiter: LoadedModule, target: LoadedModule): boolean {
 	const seen = new Set<LoadedModule>([target]);
@@ -684,7 +690,7 @@ function wouldDeadlock(waiter: LoadedModule, target: LoadedModule): boolean {
 		const cur = stack.pop()!;
 		if (cur === waiter)
 			return true;
-		for (const next of waitingFor.get(cur) ?? []) {
+		for (const next of memoOf(cur).waiting ?? []) {
 			if (!seen.has(next)) {
 				seen.add(next);
 				stack.push(next);
@@ -698,9 +704,7 @@ async function safely<T>(waiter: LoadedModule, target: LoadedModule, func: () =>
 	if (wouldDeadlock(waiter, target))
 		return undefined;
 
-	let waits = waitingFor.get(waiter);
-	if (!waits)
-		waitingFor.set(waiter, waits = new Set());
+	const waits = memoOf(waiter).waiting ??= new Set();
 	waits.add(target);
 	try {
 		return await func();
@@ -736,7 +740,7 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 		}
 		let resolved = await safely(waiter, impSrc, () => makeScope(impSrc));
 		if (!resolved) {
-			const own = ownScopeSettled.get(impSrc);
+			const own = memoOf(impSrc).own;
 			if (!own)
 				return false;	// genuine import cycle -- contribute nothing further rather than deadlock
 			resolved = { scope: own.scope, value: own.alias ?? own.scope.toObject(), tainted: true };
@@ -773,7 +777,7 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 	// Returns `src`'s exported symbols as one `Scope`; also resolves `export ... from` re-exports here, since only
 	// this has the loader that `checker.exportScope` doesn't.
 	async function makeScope(src: LoadedModule): Promise<ModuleShape> {
-		const existing = importScopeCache.get(src);
+		const existing = memoOf(src).shape;
 		if (existing)
 			return existing;
 
@@ -784,8 +788,8 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 			// The module RECORD carries its full internal scope -- towasm resolves names declared in the
 			// module it is compiling through this, and it is the only place that scope survives.
 			src.program.scope ??= inner;
-			// Recorded before the (possibly cyclic) re-export loop awaits anything -- see `ownScopeSettled` for why placement matters.
-			ownScopeSettled.set(src, { scope, alias });
+			// Recorded before the (possibly cyclic) re-export loop awaits anything -- see `ModuleMemo.own` for why placement matters.
+			memoOf(src).own = { scope, alias };
 			for (const stmt of src.program.body) {
 				if (stmt.type !== 'export' || !stmt.source)
 					continue;
@@ -816,12 +820,12 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 			// `export ... from` just merged in, not just what the module's own body declared.
 			return { scope, value: alias ?? scope.toObject(), tainted };
 		});
-		importScopeCache.set(src, cached);
+		memoOf(src).shape = cached;
 		// Caches only clean builds; a tainted one stays valid for concurrent awaiters, then gets evicted (identity-checked,
 		// so a stale rebuild can't clobber a newer entry) so the next caller gets a fresh attempt.
 		cached.then(result => {
-			if (result.tainted && importScopeCache.get(src) === cached)
-				importScopeCache.delete(src);
+			if (result.tainted && memoOf(src).shape === cached)
+				memoOf(src).shape = undefined;
 		});
 		return cached;
 	}
