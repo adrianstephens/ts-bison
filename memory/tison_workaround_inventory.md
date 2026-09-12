@@ -218,9 +218,15 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
 - A REAL MEMORY LEAK, ~140MB per compile -- FOUND AND FIXED 3005d78. `transform.ts`'s process-wide module-scope
   caches (`importScopeCache`, `waitingFor`, `ownScopeSettled`) were strong `Map`s keyed by `LoadedModule`, and only
   one ever deleted. Every compile builds a fresh `ModuleLoader`, so every compile's module `Scope`s -- and through
-  them its whole type and AST graph -- stayed live forever. All three are `WeakMap`s now (every use is get/set/delete
-  by key, none iterates, so semantics are unchanged). Heap with a forced `global.gc()` between probes: FLAT at
+  them its whole type and AST graph -- stayed live forever. Heap with a forced `global.gc()` between probes: FLAT at
   142 -> 218MB where it previously climbed 142 -> 1294MB. This is why the survey's 8GB worker died on type-utils.
+  FINAL SHAPE (2066000, after a first pass made them `WeakMap`s in 3005d78): the three tables are GONE. One
+  `ModuleMemo` (`shape`/`own`/`waiting`) is STAMPED on the module record via a single `memoOf` accessor -- the
+  convention the same function already uses two lines away (`src.program.scope ??= inner`), with the one cast
+  localised there. A memo is keyed by identity, so it lives exactly as long as its module and dies with it; no
+  process-wide state is left. REJECTED alternative: `ModuleLoader` instance fields -- package modules are shared
+  across loaders (`NodeModules.found` is static) while relative ones are per-loader, so instance fields would tie
+  both to the shorter lifetime and make a second loader recompute shapes it already shares.
   REUSE IS PRESERVED, measured both ways (assistant/probe-cache-reuse.ts, three compiles in one process):
     shared loader:  strong 630 -> 0 -> 0ms   weak 678 -> 0 -> 0ms     (full reuse, unchanged)
     fresh loader:   strong 653 -> 400 -> 388ms   weak 647 -> 380 -> 405ms  (partial, unchanged)
