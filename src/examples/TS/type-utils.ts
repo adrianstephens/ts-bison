@@ -4,7 +4,7 @@ import * as JS from './js-parser';
 import { Literal, hasMod } from '../common';
 import { Expr, BindingTarget } from './js-parser';
 import { Type } from './ts-parser';
-import { walk, walkB } from './walker';
+import { walk, walkB, WalkerB } from './walker';
 import { Output } from './tocode';
 
 // ===================================================================
@@ -872,7 +872,7 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 	return uncached();
 
 	function uncached(): Type {
-		return walk(t, undefined, undefined,
+		return walk(undefined, undefined,
 			rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) => {
 				if (x.type === 'ref' && !x.typeArgs && map.has(x.name))
 					return map.get(x.name);
@@ -899,7 +899,7 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 				}
 				return process(m);
 			})
-		) ?? t;
+		).type(t) ?? t;
 	}
 }
 
@@ -918,13 +918,13 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 // first means a type with no 'this' anywhere -- the overwhelming majority -- comes back as the exact
 // same object, no rebuild, and every object-identity-keyed cache downstream keeps working normally.
 function containsThis(t: Type): boolean {
-	return walkB(t, undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'this' || process(x)));
+	return walkB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'this' || process(x))).type(t);
 }
 
 export function substituteThisType(t: Type, thisType: Type): Type {
-	return containsThis(t) ? walk(t, undefined, undefined, rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) =>
+	return containsThis(t) ? walk(undefined, undefined, rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) =>
 		x.type === 'this' ? thisType : process(x)
-	)) ?? t : t;
+	)).type(t) ?? t : t;
 }
 
 // Whether `name` occurs somewhere `inferTypeArgs` would actually descend into -- tells "no argument could ever determine
@@ -940,27 +940,27 @@ export function mentionsTypeParam(t: Type, name: string): boolean {
 	return r;
 }
 function mentions(t: Type, name: string): boolean {
-	return walkB(t, undefined, undefined, searchOnce((t: Type, process: (x: Type) => boolean, recurse: (x: Type | undefined) => boolean) => {
+	return walkB(undefined, undefined, searchOnce((t: Type, process: (x: Type) => boolean, recurse: WalkerB) => {
 		switch (t.type) {
 			case 'ref':				return t.typeArgs ? process(t) : t.name === name;
 			case 'function':
-			case 'constructor':		return t.params.some(p => recurse(p.typeAnnotation)) || recurse(t.returnType);
+			case 'constructor':		return t.params.some(p => recurse.type(p.typeAnnotation)) || recurse.type(t.returnType);
 			case 'object':			return t.members.some(m =>
-				m.type === 'property' ? recurse(m.typeAnnotation)
-				: m.type === 'method' ? recurse(m.returnType)
+				m.type === 'property' ? recurse.type(m.typeAnnotation)
+				: m.type === 'method' ? recurse.type(m.returnType)
 				: false
 			);
-			case 'conditional':		return recurse(t.trueType) || recurse(t.falseType);
+			case 'conditional':		return recurse.type(t.trueType) || recurse.type(t.falseType);
 			case 'array': case 'tuple': case 'intersection': case 'union': case 'predicate':
 				return process(t);
 			// `keyof`/`indexed_access`/`mapped`/`typeof`/`this`/`template_literal`/`infer`: not positions `inferTypeArgs` inverts.
 			default:				return false;
 		}
-	}));
+	})).type(t);
 }
 
 function containsInfer(t: Type): boolean {
-	return walkB(t, undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'infer' || process(x)));
+	return walkB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'infer' || process(x))).type(t);
 }
 
 // An un-annotated parameter's type, inferred from its default. Widened, matching both real TS
@@ -1159,7 +1159,7 @@ function findTypeMember(members: TS.TypeMember[], key: string): TS.TypeMember & 
 // function's own type-parameter names are bound (not free) and must stay resolvable in whatever scope later actually
 // registers them, not permanently baked to the hoisting pass's outer scope.
 export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<string>): T {
-	walkB(t, undefined, undefined,
+	walkB(undefined, undefined,
 		searchOnce((x: Type, process: (x: Type) => boolean) => {
 			// Primitives resolve the same everywhere -- stamping them would only add dead weight and dedup-key noise for no gain.
 			if (x.type === 'ref') {
@@ -1181,7 +1181,7 @@ export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<str
 				m.declScope ??= scope;
 			return process(m);
 		})
-	);
+	).type(t);
 	return t;
 }
 

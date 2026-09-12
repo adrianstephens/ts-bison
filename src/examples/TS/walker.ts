@@ -33,8 +33,7 @@ export const isJsStatement		= guard<TS.Stmt>(stmts);
 type Type	= TS.Type;
 type Expr	= TS.Expr;
 type Stmt	= TS.Stmt;
-export type Walkable0	= Stmt | Expr | Type;
-export type Walkable	= Walkable0 | Module<Stmt> | Stmt[];
+export interface Kinds { statement: Stmt; expression: Expr; type: Type; typeMember: TS.TypeMember; classMember: TS.ClassMember }
 
 //-----------------------------------------------------------------------------
 // Constant folding
@@ -101,16 +100,20 @@ export function calcBinary(op: JS.binaryOps, a: any, b: any) {
 // walk
 //-----------------------------------------------------------------------------
 
-type Recurse		= W.Recurse<Walkable0>;
-type OnAST<U>		= W.OnAST<U, Recurse>;
+export interface Walker extends W.Walker<Kinds> {
+	statements:		<T extends Stmt>(x: readonly T[]) => T[];
+	body:			<T extends Stmt>(x?: T[] | Expr) => T[] | Expr | undefined;	// a function/arrow body
+	module:			<M extends Module<Stmt>>(x: M) => M;
+}
+type OnAST<U>		= W.OnAST<U, Walker>;
 
-export function walk<T extends Walkable>(ast: T,
+export function walk(
 	onStatement?:	OnAST<TS.Stmt>,
 	onExpression?:	OnAST<Expr>,
 	onType?:		OnAST<Type>,
 	onTypeMember?:	OnAST<TS.TypeMember>,
 	onClassMember?:	OnAST<TS.ClassMember>
-): T | undefined {
+): Walker {
 
 	// The bodies still reached through a `CallSig` (a function/method/arrow body) keep js-parser's own
 	// narrow `Statement<T>` -- see the `X` seam comment there. Every NESTED statement slot uses
@@ -438,12 +441,16 @@ export function walk<T extends Walkable>(ast: T,
 		}
 
 	};
-	const recurse: Recurse = x => {
-		if (isType(x))
-			return mapType(x);
-		if (isJsStatement(x) || isTsDeclaration(x))
-			return mapStatement(x);
-		return mapExpression(x) as typeof x;
+	const statements = <T extends Stmt>(x: readonly T[]) => mapArrayA((s: T) => mapStatement(s))(x);
+	const recurse: Walker = {
+		statement:		x => mapStatement(x),
+		expression:		x => mapExpression(x),
+		type:			x => mapType(x),
+		typeMember:		x => mapTypeMember(x),
+		classMember:	x => mapClassMember(x),
+		statements,
+		body:			x => x === undefined ? undefined : Array.isArray(x) ? statements(x) : mapExpressionA(x),
+		module:			x => ({...x, body: statements(x.body)}),
 	};
 
 	const mapStatement		= makeProcess(statement, onStatement, recurse, true);
@@ -457,30 +464,25 @@ export function walk<T extends Walkable>(ast: T,
 	const mapStatementA		= mapDefined(mapStatement);
 	const mapClassMemberU	= (m: JS.ClassMember<any>) => mapClassMember(m as TS.ClassMember) as JS.ClassMember<any>;
 
-	if (isModule(ast))
-		return {...ast, body: mapArray(mapStatement)(ast.body)};
-	if (Array.isArray(ast))
-		return mapArray(mapStatement)(ast) as typeof ast;
-	return recurse(ast) as T;
+	return recurse;
 }
 
 //-----------------------------------------------------------------------------
 // walkB
 //-----------------------------------------------------------------------------
 
-// `kind` lets a caller that already knows what `x` is (e.g. an `if`/`while` test, always an
-// expression) skip the shape-based guess below -- needed because some tags genuinely can't be
-// told apart by shape alone (a 'literal' node is IDENTICAL, field for field, whether it's a
-// type-level literal type or an expression-level literal value; see `recurse`'s own comment).
-export type RecurseB	= (x: TS.Stmt | Expr | Type | undefined, kind?: 'expression' | 'statement' | 'type') => boolean;
-type OnASTB<U>		= W.OnASTB<U, RecurseB>;
+export interface WalkerB extends W.WalkerB<Kinds> {
+	statements:		(x: readonly Stmt[]) => boolean;
+	body:			(x?: Stmt[] | Expr) => boolean;
+}
+type OnASTB<U>		= W.OnASTB<U, WalkerB>;
 
-export function walkB<T extends Walkable>(ast: T,
+export function walkB(
 	onStatement?:	OnASTB<TS.Stmt>,
 	onExpression?:	OnASTB<JS.Expr>,
 	onType?:		OnASTB<Type>,
 	onTypeMember?:	OnASTB<TS.TypeMember|TS.ClassMember>,
-): boolean {
+): WalkerB {
 
 	const walkKey = (key: JS.Key) => typeof key !== 'string' && walkExpression(key.computed);
 
@@ -626,18 +628,14 @@ export function walkB<T extends Walkable>(ast: T,
 		}
 	};
 
-	const recurse: RecurseB = (x, kind) => {
-		if (!x)
-			return false;
-		if (kind === 'expression')
-			return walkExpression(x as JS.Expr);
-		if (kind === 'statement')
-			return walkStatement(x as TS.Stmt);
-		if (kind === 'type' || isType(x))
-			return walkType(x as Type);
-		if (isJsStatement(x) || isTsDeclaration(x))
-			return walkStatement(x);
-		return walkExpression(x);
+	const recurse: WalkerB = {
+		statement:		x => walkStatement(x),
+		expression:		x => walkExpression(x),
+		type:			x => walkType(x),
+		typeMember:		x => walkTypeMember(x),
+		classMember:	x => walkClassMember(x),
+		statements:		x => x.some(walkStatement),
+		body:			x => Array.isArray(x) ? x.some(walkStatement) : walkExpression(x),
 	};
 
 	const walkStatement		= makeProcessB(statement, onStatement, recurse, true);
@@ -646,15 +644,5 @@ export function walkB<T extends Walkable>(ast: T,
 	const walkClassMember 	= makeProcessB(classMember as ((x: TS.TypeMember|TS.ClassMember) => boolean), onTypeMember, recurse, true);
 	const walkType			= makeProcessB(type, onType, recurse);
 
-
-	if (Array.isArray(ast))
-		return ast.some(walkStatement);
-	if (isModule(ast))
-		return ast.body.some(walkStatement);
-	if (isType(ast))
-		return walkType(ast);
-	if (isJsStatement(ast) || isTsDeclaration(ast))
-		return walkStatement(ast);
-	return walkExpression(ast);
-
+	return recurse;
 }

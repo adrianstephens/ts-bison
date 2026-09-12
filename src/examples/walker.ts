@@ -1,5 +1,7 @@
 
-export type Recurse<U>	= <T extends U>(x: T) => T | undefined;
+// A language's walker, one entry per node kind `K`: what `walk` returns and every handler's `recurse`. The caller
+// names the kind, since a tag can't always tell (a TS 'literal' or 'this' is identical as a type and an expression).
+export type Walker<K>	= { [P in keyof K]: <T extends K[P]>(x?: T) => T | undefined };
 export type OnAST<U, R>	= (x: U, process: <T extends U>(x: T) => T, recurse: R) => U | undefined;
 
 export function makeProcess<U, R>(parts: (x: U) => U, on: OnAST<U, R> | undefined, recurse: R, always = false) {
@@ -59,7 +61,7 @@ export function mapObject<N extends Record<string, any>>(node: N, fields: NodeMa
 //  walkB -- boolean short-circuit search
 // ===================================================================
 
-export type RecurseB<U>		= (x: U | undefined) => boolean;
+export type WalkerB<K>		= { [P in keyof K]: (x?: K[P]) => boolean };
 export type OnASTB<U, R>	= (x: U, process: (x: U) => boolean, recurse: R) => boolean;
 
 export function makeProcessB<U, R>(parts: (x: U) => boolean, on: OnASTB<U, R> | undefined, recurse: R, always = false) {

@@ -492,9 +492,9 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// the shape holds that very member, so embedding the shape itself would make the type cyclic.
 	const selfRefs = (t: Type): Type => {
 		const name = c.name;
-		if (!name || !walkB(t, undefined, undefined, (x, process) => x === value || x === instance || process(x)))
+		if (!name || !walkB(undefined, undefined, (x, process) => x === value || x === instance || process(x)).type(t))
 			return t;
-		return walk(t, undefined, undefined, (x, process) => x === value ? { type: 'typeof', name } : x === instance ? ctorReturn : process(x)) ?? t;
+		return walk(undefined, undefined, (x, process) => x === value ? { type: 'typeof', name } : x === instance ? ctorReturn : process(x)).type(t) ?? t;
 	};
 
 	// Installed only now, *after* the walks above -- a self-memoizing lazy getter
@@ -559,12 +559,12 @@ function stampBranch(branch: Expr, branchScope: Scope, scope: Scope) {
 // Whether any of `names` is written anywhere in `body`: an assignment, or `++`/`--` on either side.
 function writesAny(body: JS.Stmt<any>[] | Expr, names: Set<string>): boolean {
 	let found = false;
-	walkB(body, undefined, (x: any, process: (x: any) => boolean) => {
+	walkB(undefined, (x: any, process: (x: any) => boolean) => {
 		if ((x.type === 'assign' && x.target.type === 'identifier' && names.has(x.target.name))
 			|| ((x.type === 'unary' || x.type === 'unary_post') && (x.operator === '++' || x.operator === '--') && x.operand.type === 'identifier' && names.has(x.operand.name)))
 			found = true;
 		return found || process(x);
-	});
+	}).body(body);
 	return found;
 }
 
@@ -1894,13 +1894,13 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						if (resolveParam && typeof resolveParam.key === 'string') {
 							const resolveName = resolveParam.key;
 							const resolvedTypes: Type[] = [];
-							walkB(executor.body as JS.Stmt<any>[] | Expr, undefined, (x, process) => {
+							walkB(undefined, (x, process) => {
 								if (x.type === 'call' && x.callee.type === 'identifier' && x.callee.name === resolveName) {
 									const arg = x.arguments[0];
 									resolvedTypes.push(arg && arg.type !== 'spread' ? recurse(arg) : T.UNDEFINED);
 								}
 								return process(x);
-							});
+							}).body(executor.body as JS.Stmt<any>[] | Expr);
 							typeArgs = [resolvedTypes.length ? T.combineTypes(resolvedTypes) : T.VOID];
 						}
 					}

@@ -2,7 +2,7 @@
 import * as JS from './js-parser';
 import * as TS from './ts-parser';
 import { Identifier, Literal, Unary, Binary, Assign, If, While, DoWhile } from '../common';
-import { Walkable, walkB, calcUnary, calcBinary, RecurseB, isJsStatement, isTsDeclaration } from './walker';
+import { walkB, calcUnary, calcBinary, WalkerB, isJsStatement, isTsDeclaration } from './walker';
 import { patternBindings as buildPatternBindings } from './transform';
 import { tocode } from './type-utils';
 
@@ -311,7 +311,7 @@ class VSDG extends Map<NodeId, Node> {
 
 }
 
-export function BuildVSDG(ast: Walkable): VSDG {
+export function BuildVSDG(ast: Stmt[]): VSDG {
 	interface State { scope: Scope, end: Node, exited: boolean, brokeOut: boolean };
 
 	const graph		= new VSDG;
@@ -455,7 +455,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 	// Shared by 'while' and 'do_while': same mu/theta machinery, differing only in whether the test
 	// is read before the body (while) or after it (do_while -- the body always runs once first).
-	function buildLoop(recurse: RecurseB, test: Expr, body: Stmt, isDoWhile: boolean, forUpdate?: Expr) {
+	function buildLoop(recurse: WalkerB, test: Expr, body: Stmt, isDoWhile: boolean, forUpdate?: Expr) {
 		const preLoop	= getState();
 		const muEnd		= makeNode({ type: 'mu' });
 		if (isDoWhile)
@@ -469,15 +469,15 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		if (isDoWhile) {
 			exited = false;
 			brokeOut = false;
-			recurse(body);
-			recurse(test, 'expression');
+			recurse.statement(body);
+			recurse.expression(test);
 			testNode = getExprNode(test);
 		} else {
-			recurse(test, 'expression');
+			recurse.expression(test);
 			testNode = getExprNode(test);
 			exited = false;
 			brokeOut = false;
-			recurse(body);
+			recurse.statement(body);
 		}
 		loopUpdateStack.pop();
 
@@ -632,7 +632,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// entry/return machinery a top-level function_decl gets. entryNode is connected into the outer
 	// state chain not because the body runs at this point (it doesn't, except a static block) but so
 	// applyGlobalCodeMotion's own region-boundary logic nests it under the right enclosing region.
-	function buildFunctionBody(recurse: RecurseB, params: JS.Params<TS.Type> | undefined, body: Expr | Stmt[]) {
+	function buildFunctionBody(recurse: WalkerB, params: JS.Params<TS.Type> | undefined, body: Expr | Stmt[]) {
 		const outer			= getState();
 		const returnNode	= makeMarker('RETURN_ANCHOR');
 		const entryNode		= makeNode({ type: 'function', returnNodeId: returnNode.id });
@@ -684,14 +684,14 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		currentFunctionEntry = entryNode;
 		for (const [key, tempName] of pendingParamPatterns)
 			for (const stmt of patternBindings('let', key, Identifier(tempName)))
-				recurse(stmt, 'statement');
+				recurse.statement(stmt);
 		if (Array.isArray(body)) {
 			for (const stmt of body)
-				recurse(stmt, 'statement');
+				recurse.statement(stmt);
 			// Left unconnected, matching EARLY_RETURN_MARKER's own "bare `return;`" convention --
 			// reconstructFunctionBody omits the trailing statement whenever this port is unconnected.
 		} else {
-			recurse(body, 'expression');
+			recurse.expression(body);
 			connectValue(getExprNode(body), 0, returnNode, 1);
 		}
 		currentFunctionEntry = outerFunctionEntry;
@@ -711,11 +711,11 @@ export function BuildVSDG(ast: Walkable): VSDG {
 	// inlined/orphaned away. Each resolved value gets a REAL graph edge into `anchor` (ports 1.., 0
 	// being the state predecessor): classInfo's own NodeId references alone are invisible to
 	// ordinary consumer counting, so without an edge the value would look unused.
-	function buildClass(recurse: RecurseB, anchor: Node, s: { superClass?: JS.Expr<any>; body: JS.ClassMember<any>[] }): ClassInfo {
+	function buildClass(recurse: WalkerB, anchor: Node, s: { superClass?: JS.Expr<any>; body: JS.ClassMember<any>[] }): ClassInfo {
 		let port = 1;
 		let superClassNodeId: NodeId | undefined;
 		if (s.superClass) {
-			recurse(s.superClass, 'expression');
+			recurse.expression(s.superClass);
 			const node = getExprNode(s.superClass);
 			connectValue(node, 0, anchor, port++);
 			superClassNodeId = node.id;
@@ -732,7 +732,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 				let keyNodeId;
 				if ('key' in m && typeof m.key !== 'string') {
 					const expr = m.key.computed;
-					recurse(expr, 'expression');
+					recurse.expression(expr);
 					const node = getExprNode(expr);
 					connectValue(node, 0, anchor, port++);
 					keyNodeId = node.id;
@@ -752,7 +752,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							// A static field's initializer runs once, at class-definition time, same as
 							// heritage/keys -- resolved and wired into `anchor` at its own port for the same
 							// reason (without a real edge, it's a phantom reference that looks unused).
-							recurse(m.value, 'expression');
+							recurse.expression(m.value);
 							const valueNode = getExprNode(m.value);
 							connectValue(valueNode, 0, anchor, port++);
 							return { keyNodeId, valueNodeId: valueNode.id };
@@ -773,7 +773,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		};
 	}
 
-	walkB(ast,
+	walkB(
 		(s, process, recurse) => {
 			switch (s.type) {
 				case 'function_decl':
@@ -790,7 +790,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// going". `exited = true` makes 'if' build a real gamma around this path instead, so
 					// each return prints itself, in place, with no value-merge needed here at all.
 					if (s.argument)
-						recurse(s.argument, 'expression');
+						recurse.expression(s.argument);
 					const marker = makeMarker('EARLY_RETURN_MARKER');
 					connectEnd(marker);
 					if (s.argument)
@@ -802,7 +802,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// Only an EXPLICIT throw is modeled -- a call inside `try` that might itself throw
 					// isn't a control-flow edge to `catch`; real JS's own exception routing handles
 					// that at runtime regardless, since nothing here reorders the try body's statements.
-					recurse(s.argument, 'expression');
+					recurse.expression(s.argument);
 					const marker = makeMarker('THROW_MARKER');
 					connectEnd(marker);
 					connectValue(getExprNode(s.argument), 0, marker, 1);
@@ -832,7 +832,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// loopUpdateStack, so it's correctly transparent to a `continue` inside a case).
 					const forUpdate = loopUpdateStack[loopUpdateStack.length - 1];
 					if (forUpdate)
-						recurse(structuredClone(forUpdate), 'expression');
+						recurse.expression(structuredClone(forUpdate));
 					connectEnd(makeMarker('CONTINUE_MARKER'));
 					exited = true;
 					return false;
@@ -844,7 +844,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					for (const v of s.declarations) {
 						if (typeof v.name === 'string') {
 							if (v.init)
-								recurse(v.init, 'expression');
+								recurse.expression(v.init);
 							// A dedicated wrapper node per declared variable, not an alias to the
 							// initializer's own node -- otherwise `let x = 5; let y = 5;` would bind both
 							// names to the same node, with no way to tell which name to print.
@@ -863,9 +863,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 							// directly), then desugar the pattern off that temp -- a nested pattern is
 							// handled for free by re-entering this same case for each flattened result.
 							const tempName = `__destructure${nextId++}`;
-							recurse(JS.VarDecl<TS.Type>(s.kind, JS.Var<TS.Type>(tempName, v.init)) as Stmt, 'statement');
+							recurse.statement(JS.VarDecl<TS.Type>(s.kind, JS.Var<TS.Type>(tempName, v.init)) as Stmt);
 							for (const stmt of patternBindings(s.kind, v.name, Identifier(tempName)))
-								recurse(stmt, 'statement');
+								recurse.statement(stmt);
 						} else {
 							console.log(`not handling destructured declarator with no initializer`);
 						}
@@ -880,13 +880,13 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					return false;
 				}
 				case 'if': {
-					recurse(s.test, 'expression');
+					recurse.expression(s.test);
 					const test		= getExprNode(s.test);
 					const parent	= getState();
 					// `recurse`, not `process`: a bare, non-block consequent (`if (x) let y = 1;`) still
 					// needs its own var_decl/if/while dispatch, which `process` alone wouldn't give it.
-					const trueState		= walkBranch(parent, () => recurse(s.consequent));
-					const falseState	= walkBranch(parent, () => { if (s.alternate) recurse(s.alternate!); });
+					const trueState		= walkBranch(parent, () => recurse.statement(s.consequent));
+					const falseState	= walkBranch(parent, () => { if (s.alternate) recurse.statement(s.alternate!); });
 					mergeState(parent, test, trueState, falseState);
 					reconcileVariables(parent, test, trueState, falseState);
 					return false;
@@ -920,9 +920,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						const iterName		= `__iter${suffix}`;
 						const resultName	= `__r${suffix}`;
 						const iterable		= s.kind === 'in' ? JS.Call<TS.Type>(JS.Member<TS.Type>(Identifier('Object'), 'keys'), [s.right]) : s.right;
-						recurse(JS.VarDecl<TS.Type>('const', JS.Var<TS.Type>(iterName,
+						recurse.statement(JS.VarDecl<TS.Type>('const', JS.Var<TS.Type>(iterName,
 							JS.Call<TS.Type>(JS.Index<TS.Type>(iterable, JS.Member<TS.Type>(Identifier('Symbol'), 'iterator')), [])
-						)), 'statement');
+						)));
 
 						const value = JS.Member<TS.Type>(Identifier(resultName), 'value');
 						buildLoop(recurse, Literal(true), JS.Block<Stmt>(
@@ -939,9 +939,9 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// folding `update` into the body's own normal (non-continue) tail.
 					if (s.init) {
 						if (s.init.type === 'var_decl')
-							recurse(s.init, 'statement');
+							recurse.statement(s.init);
 						else
-							recurse(s.init, 'expression');
+							recurse.expression(s.init);
 					}
 					const test = s.test ?? Literal(true);
 					const body = s.update ? JS.Block(s.body, JS.Expression(s.update)) : s.body;
@@ -956,7 +956,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 					// Evaluate the discriminant exactly once, into a dedicated wrapper node so every
 					// case test reads the same value.
-					recurse(s.discriminant, 'expression');
+					recurse.expression(s.discriminant);
 					const discNode	= makeNode({ type: 'var', declKind: 'let' });
 					connectValue(getExprNode(s.discriminant), 0, discNode, 0);
 					const suffix	= discNode.id;
@@ -974,7 +974,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						if (!c.test)
 							return { matchName: undefined, testNodeId: undefined };
 						const matchName = `__match${i}_${suffix}`;
-						recurse(JS.VarDecl('let', JS.Var(matchName,
+						recurse.statement(JS.VarDecl('let', JS.Var(matchName,
 							{ type: 'binary', operator: '===', left: Identifier(discName), right: c.test } as Expr
 						)));
 						return { matchName, testNodeId: getExprNode(c.test).id };
@@ -985,7 +985,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// variable -- fallthrough across case boundaries just works via the same
 					// gamma/mu/theta reassignment-merging any real local uses.
 					const hitName = `__hit_${suffix}`;
-					recurse(JS.VarDecl('let', JS.Var(hitName, Literal(false))));
+					recurse.statement(JS.VarDecl('let', JS.Var(hitName, Literal(false))));
 
 					// `default` matches iff none of the OTHER cases' tests matched, independent of its
 					// own position, so this is built once from every real case's match flag.
@@ -1030,7 +1030,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 								left: Identifier(hitName),
 								right: matchNames[i] ? Identifier(matchNames[i]!) : negateOr(realMatches),
 							} as Expr;
-							recurse(testExpr, 'expression');
+							recurse.expression(testExpr);
 							const testNode	= getExprNode(testExpr);
 							const parent	= getState();
 							let bodyBoundary: Node | undefined;
@@ -1039,11 +1039,11 @@ export function BuildVSDG(ast: Walkable): VSDG {
 								// user-written `hit = true;` would use -- switchInternal keeps it always
 								// resolving by name regardless of forcedPrint/needsTemp, since its own
 								// mutation is structurally never printed (see boundaryId above).
-								recurse(Assign<Expr, JS.assignableOps>(Identifier(hitName), Literal(true)), 'expression');
+								recurse.expression(Assign<Expr, JS.assignableOps>(Identifier(hitName), Literal(true)));
 								scope.get(hitName)!.switchInternal = true;
 								bodyBoundary = end;
 								for (const stmt of c.consequent)
-									recurse(stmt, 'statement');
+									recurse.statement(stmt);
 							});
 							const falseState = walkBranch(parent, () => {});
 							// Any state gamma mergeState builds here belongs entirely to switch's own
@@ -1094,7 +1094,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 
 					scope = new Scope(scope);
 					for (const stmt of s.body)
-						recurse(stmt, 'statement');
+						recurse.statement(stmt);
 					scope = scope.closeAndFlush()!;
 					const tryState		= getState();
 
@@ -1110,10 +1110,10 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						catchParamName = `__destructure${nextId++}`;
 						scope.create(catchParamName, makeNamedNode('var', catchParamName));
 						for (const stmt of patternBindings('let', handler.param, Identifier(catchParamName)))
-							recurse(stmt, 'statement');
+							recurse.statement(stmt);
 					}
 					for (const stmt of handler.body)
-						recurse(stmt, 'statement');
+						recurse.statement(stmt);
 					scope = scope.closeAndFlush()!;
 					const catchState	= getState();
 
@@ -1166,7 +1166,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 						// shouldn't leak out, but an ordinary reassignment should still propagate.
 						scope		= new Scope(scope);
 						for (const stmt of s.finalizer)
-							recurse(stmt, 'statement');
+							recurse.statement(stmt);
 						scope			= scope.closeAndFlush()!;
 						finallyExited	= exited;
 						finallyBrokeOut	= brokeOut;
@@ -1191,7 +1191,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// walks s.declaration independently) runs the declaration's own handler exactly
 					// once, avoiding a literal duplicate; `exported` is read back at that node's own
 					// print site to wrap it in `export `.
-					recurse(s.declaration, 'statement');
+					recurse.statement(s.declaration);
 					if (s.declaration.type === 'var_decl') {
 						// `end` here is a MUTATION_MARKER wrapping only the LAST declarator's rebind --
 						// wrong for `export const a = 1, b = 2;` (every declarator needs the flag), so
@@ -1237,7 +1237,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					// with no `default` (referencing only already-declared bindings by name), needs no
 					// VSDG resolution, so it stays on the generic passthru fallback below.
 					if (s.default !== undefined && (isJsStatement(s.default) || isTsDeclaration(s.default))) {
-						recurse(s.default, 'statement');
+						recurse.statement(s.default);
 						end.exported = 'default';
 						return false;
 					}
@@ -1507,7 +1507,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 					s.properties.forEach((prop, index) => {
 						switch (prop.type) {
 							case 'spread':
-								recurse(prop.operand);
+								recurse.expression(prop.operand);
 								connectValue(getExprNode(prop.operand), 0, node, index);
 								break;
 							case 'method': case 'get': case 'set':
@@ -1522,7 +1522,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 								if (typeof prop.key !== 'string') {
 									console.log(`not handling computed object key`);
 								} else {
-									recurse(prop.value, 'expression');
+									recurse.expression(prop.value);
 									connectValue(getExprNode(prop.value!), 0, node, index);
 								}
 								break;
@@ -1574,7 +1574,7 @@ export function BuildVSDG(ast: Walkable): VSDG {
 		// process(s)'s generic per-member descent (which used to land here). Kept as a documented
 		// no-op, not deleted outright, in case that ever changes.
 		//() => false
-	);
+	).statements(ast);
 //	programStart.programEndId = end.id;
 	graph.root = end.id;
 	return graph;

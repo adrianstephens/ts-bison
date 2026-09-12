@@ -17,8 +17,8 @@ function test(name: string, code: string) {
 		// walk() identity transform + walkB() full traversal: rebuilding every visited node must
 		// leave a tree that prints the same, and walkB must reach every node it structurally can.
 		let visited = 0;
-		const rebuilt = walk(ast, (s, p) => p(s) as Stmt, (e, p) => p(e) as Expr)!;
-		walkB(ast, s => (visited++, false), e => (visited++, false));
+		const rebuilt = walk((s, p) => p(s) as Stmt, (e, p) => p(e) as Expr).module(ast);
+		walkB(s => (visited++, false), e => (visited++, false)).statements(ast.body);
 
 		if (dump) {
 			console.log(`\u2713 ${name}`);

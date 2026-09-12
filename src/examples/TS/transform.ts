@@ -2,7 +2,7 @@ import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
 import { Module, Location, Identifier, Literal, Binary, Conditional, Assign, Await, Member, ExprStmt, hasMod, dropMod, If, While } from '../common';
-import { Walkable, walk, walkB, calcUnary, calcBinary } from './walker';
+import { walk, walkB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, typeOf1, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
 import { Output } from './tocode';
@@ -30,8 +30,8 @@ const typeMasks = {
 	function:	0,
 } as const;
 
-export function foldConstants<T extends Walkable>(ast: T) {
-	return walk(ast,
+export function foldConstants<T extends Expr>(e: T) {
+	return walk(
 		undefined,
 		(expr, process) => {
 			expr = process(expr);
@@ -136,7 +136,7 @@ export function foldConstants<T extends Walkable>(ast: T) {
 			return expr;
 		},
 		undefined
-	);
+	).expression(e);
 }
 
 //-----------------------------------------------------------------------------
@@ -153,7 +153,7 @@ export function foldConstants<T extends Walkable>(ast: T) {
 // here -- real, but narrower and deferred; only a plain 'let x = ...'/'const x = ...' is hoisted.
 export function collectHoistedLocals(body: Stmt[]): Map<string, { stmt: Stmt; decl: JS.Var<Type> }> {
 	const decls = new Map<string, { stmt: Stmt; decl: JS.Var<Type> }>();
-	walkB(body,
+	walkB(
 		(s, process) => {
 			if (s.type === 'var_decl') {
 				for (const d of s.declarations) {
@@ -164,7 +164,7 @@ export function collectHoistedLocals(body: Stmt[]): Map<string, { stmt: Stmt; de
 			return process(s);
 		},
 		(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
-	);
+	).statements(body);
 	return decls;
 }
 
@@ -251,17 +251,17 @@ export function BuildStateMachine(stmts: Stmt[]) {
 
 	// Stops at a nested closure boundary (a yield/await inside it belongs to *that* function, not this one)
 	function containsSuspend(stmt: Stmt): boolean {
-		return walkB(stmt,
+		return walkB(
 			undefined,
 			(e, process) => suspendExpr(e as Expr) ? true : (e.type === 'arrow' || e.type === 'function') ? false : process(e)
-		);
+		).statement(stmt);
 	}
 
 	// A bare (unlabeled -- labeled break/continue is unsupported everywhere else in towasm.ts too) break
-	// or continue that would target the loop/switch containing `stmts` directly, not a nested one (which
+	// or continue that would target the loop/switch containing `body` directly, not a nested one (which
 	// establishes its own break/continue scope, same reasoning `case 'switch'`'s own scoping needs).
-	function containsOwnBreakOrContinue(stmts: Stmt|Stmt[]): boolean {
-		return walkB(stmts,
+	function containsOwnBreakOrContinue(body: Stmt): boolean {
+		return walkB(
 			(s, process) => {
 				if (s.type === 'break' || s.type === 'continue')
 					return true;
@@ -270,7 +270,7 @@ export function BuildStateMachine(stmts: Stmt[]) {
 				return process(s);
 			},
 			(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
-		);
+		).statement(body);
 	}
 
 	function bodyStmtsOf(stmt: Stmt): Stmt[] {
@@ -496,7 +496,7 @@ export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget,
 const dropOptional = (p: JS.Param<any>) => dropMod(p, 'optional');
 
 export function TStoJS(ast: Module<Stmt>) {
-	return walk(ast, 
+	return walk(
 		//onStatement
 		(stmt, process) => {
 			switch (stmt.type) {
@@ -598,10 +598,10 @@ export function TStoJS(ast: Module<Stmt>) {
 				case 'as':
 				case 'satisfies':
 				case 'instantiation':
-					return recurse(expr.expression);
+					return recurse.expression(expr.expression);
 
 				case 'unary_post':
-					return expr.operator === '!' ? recurse(expr.operand) : process(expr);
+					return expr.operator === '!' ? recurse.expression(expr.operand) : process(expr);
 
 				default:
 					return process(expr);
@@ -609,7 +609,7 @@ export function TStoJS(ast: Module<Stmt>) {
 		},
 		//onType
 		(_type, _process) => undefined
-	);
+	).module(ast);
 }
 
 // ===================================================================
@@ -1210,7 +1210,7 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 
 	// ---- Strip bodies/initializers down to their essentials in one pass, registering owners as we go --
 
-	const stripped = walk(program, (stmt, process) => {
+	const stripped = walk((stmt, process) => {
 		switch (stmt.type) {
 			case 'import':
 				return stmt;
@@ -1261,9 +1261,9 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 			default:
 				return undefined;
 		}
-	})!;
+	}).module(program);
 
-	const collectDeclRefs = (owner: TS.Stmt|Expr|Type, refs: Set<string>) => walk(owner,
+	const declRefs = (refs: Set<string>) => walk(
 		undefined,
 		(e, process) => {
 			if (e.type === 'identifier')
@@ -1279,15 +1279,14 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 
 	const worklist	= [...reachable];
 	while (worklist.length) {
-		const refs = new Set<string>();
+		const refs		= new Set<string>();
+		const collect	= declRefs(refs);
 		for (const owner of owners.get(worklist.pop()!) ?? []) {
 			if ('type' in owner) {
-				collectDeclRefs(owner, refs);
+				collect.statement(owner);
 			} else {
-				if (owner.init)
-					collectDeclRefs(owner.init, refs);
-				if (owner.typeAnnotation)
-					collectDeclRefs(owner.typeAnnotation as Type, refs);
+				collect.expression(owner.init);
+				collect.type(owner.typeAnnotation as Type);
 			}
 		}
 		for (const ref of refs) {
@@ -1302,7 +1301,7 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 
 	stripped.body.splice(stripped.body.findLastIndex(i => i.type === 'import') + 1, 0, ...syntheticBases);
 
-	return walk(stripped,
+	return walk(
 		(stmt, process) => {
 			switch (stmt.type) {
 				case 'import':
@@ -1371,6 +1370,6 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 		},
 		undefined,
 		resolveTypes(global, importScope)
-	)!;
+	).module(stripped);
 }
 

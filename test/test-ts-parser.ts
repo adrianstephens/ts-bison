@@ -44,7 +44,7 @@ function test(name: string, code: string, format = 20) {
 			case 3: console.log(output.toCode(TStoDecl(program))); break;
 			case 20: {
 				console.log(output.toCode(program));
-				const graph		= vsdg.BuildVSDG(program);
+				const graph		= vsdg.BuildVSDG(program.body);
 				vsdg.Optimize(graph);
 				const { blocks, blockIds } = vsdg.applyGlobalCodeMotion(graph);
 				const stmts = vsdg.BuildProgram(graph, blocks, blockIds);
@@ -88,7 +88,7 @@ async function testAsync(parser: Parser, name: string, filename: string, format 
 			}
 			case 20: {
 				console.log(output.toCode(program));
-				const graph		= vsdg.BuildVSDG(program);
+				const graph		= vsdg.BuildVSDG(program.body);
 				vsdg.Optimize(graph);
 				const { blocks, blockIds } = vsdg.applyGlobalCodeMotion(graph);
 				const stmts = vsdg.BuildProgram(graph, blocks, blockIds);

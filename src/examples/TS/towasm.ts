@@ -6,7 +6,7 @@ import * as T from './type-utils';
 import * as Common from '../common';
 import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
 import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
-import { Walkable, walk, walkB } from './walker';
+import { Walker, walk, walkB } from './walker';
 import { Output } from './tocode';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary, patternBindings } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
@@ -836,16 +836,16 @@ function unwrapAs(e: Expr): Expr {
 // arrow/function's own body (closure boundary) -- same idiom as the named-function self-reference
 // check a few hundred lines down (`e.type === 'identifier' && e.name === selfName`).
 function exprMentionsName(name: string, e: Expr): boolean {
-	return walkB(e, undefined, (ex, process) =>
+	return walkB(undefined, (ex, process) =>
 		ex.type === 'identifier' && ex.name === name ? true
 		: (ex.type === 'arrow' || ex.type === 'function') ? false
-		: process(ex));
+		: process(ex)).expression(e);
 }
 
 // Whether `body` assigns to `this` anywhere -- real TS never allows this, so it has exactly one meaning
 // here: "this method replaces its own receiver's physical value" (a wasm-GC array/struct can't resize in place). Detected structurally -- any method on any class doing this gets the same treatment, not a hardcoded list.
 function assignsToThis(body: Stmt[]): boolean {
-	return walkB(body, undefined, (e, process) => e.type === 'assign' && !e.operator && e.target.type === 'this' ? true : process(e));
+	return walkB(undefined, (e, process) => e.type === 'assign' && !e.operator && e.target.type === 'this' ? true : process(e)).statements(body);
 }
 
 
@@ -871,7 +871,7 @@ function ownBoundNames(names: string[], body: Stmt[] | Expr, selfName?: string):
 	// A `for`'s own `init` (e.g. `for (let i = ...)`) reaches this same `var_decl` case too -- walker.ts
 	// routes it through the real statement walk, not just a bare declarator walk, so no separate case is
 	// needed here to keep a closure's own loop variable from being mistaken for a free (captured) one.
-	walkB(body,
+	walkB(
 		(s, process) => {
 			// A nested `function_decl` binds its own name in the enclosing scope (like a `var_decl`
 			// would), but its body is a separate closure boundary -- its own params/locals/further-nested
@@ -887,14 +887,14 @@ function ownBoundNames(names: string[], body: Stmt[] | Expr, selfName?: string):
 			return process(s);
 		},
 		(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
-	);
+	).body(body);
 	return bound;
 }
 
 // Recursively collects free variables into `free`. A nested closure's bound names merge into `bound`
 // before recursing, so a level-2 capture of a level-0 variable transitively appears in level-1's set.
 function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<string>) {
-	walkB(body,
+	walkB(
 		(s, process) => {
 			// Mirrors the `arrow`/`function` expression handling below, but for a nested function
 			// *declaration* statement -- its own name is already bound (see `ownBoundNames`), so this only
@@ -924,7 +924,7 @@ function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<stri
 			}
 			return process(e);
 		}
-	);
+	).body(body);
 }
 
 // Names this body declares that a nested closure captures AND something assigns -- the locals that must
@@ -954,7 +954,7 @@ function collectCapturedMutables(body: Stmt[]): Set<string> {
 	// shares ONE binding and every closure sees its final value -- the shared holder is the correct answer
 	// there, and copying by value gave `for (var i...) fs.push(() => i)` a 0 where JS says 3.
 	const perIteration = new Set<string>();
-	walkB(body,
+	walkB(
 		(st, process) => {
 			// A nested function is a closure boundary: everything free in it is captured from here (or
 			// from further out, which is harmless -- an outer name simply isn't one of our locals).
@@ -966,7 +966,7 @@ function collectCapturedMutables(body: Stmt[]): Set<string> {
 			if (st.type === 'function_decl') {
 				const nested = st.body ?? [];
 				collectFreeVars(ownBoundNames(paramNames(st.params, st.rest), nested, st.name), nested, captured);
-				walkB(nested, undefined, (e, p) => { noteAssignExpr(e, assigned); return p(e); });
+				walkB(undefined, (e, p) => { noteAssignExpr(e, assigned); return p(e); }).statements(nested);
 				return false;
 			}
 			return process(st);
@@ -976,13 +976,13 @@ function collectCapturedMutables(body: Stmt[]): Set<string> {
 				const nested = e.body ?? [];
 				collectFreeVars(ownBoundNames(paramNames(e.params, e.rest), nested, e.type === 'function' ? e.name : undefined), nested, captured);
 				// ...and assignments INSIDE the closure count too: `() => { n = n + 1; }` is the whole point.
-				walkB(nested, undefined, (x, p) => { noteAssignExpr(x, assigned); return p(x); });
+				walkB(undefined, (x, p) => { noteAssignExpr(x, assigned); return p(x); }).body(nested);
 				return false;
 			}
 			noteAssignExpr(e, assigned);
 			return process(e);
 		}
-	);
+	).statements(body);
 	return new Set([...captured].filter(n => assigned.has(n) && !perIteration.has(n)));
 }
 
@@ -1296,9 +1296,9 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 // Substitutes a generic class's own single type parameter (`PARAM`) for `subs` throughout its decl -- shared
 // by `builtinOwner` and `ensureClass`. `thisTsType`, when given, also substitutes a `T[]`-shaped member type for the whole instantiation itself -- specific to `Array<T>`'s own shape, ordinary callers omit it.
 function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<string, Type>): JS.ClassDecl<Type> {
-	const out = walk(decl, undefined, undefined, (t, process) =>
+	const out = walk(undefined, undefined, (t, process) =>
 		t.type === 'ref' && map.has(t.name) ? map.get(t.name) : process(t)
-	)!;
+	).statement(decl)!;
 	// A STATIC member is restored verbatim: real TS forbids one from referencing its class's type
 	// parameters at all ("Static members cannot reference class type parameters"), so substituting into
 	// one can only ever corrupt something -- and what it corrupted was a static's OWN type parameter of
@@ -1315,8 +1315,8 @@ function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<str
 // class reference (`Box<number>`, always an explicit type argument at the use site), unifies both the
 // explicit-type-args and inferred-from-arguments cases: the caller resolves `map` either way (see
 // `ensureGenericFunc`), this just applies it structurally through params/return type/body alike.
-function substituteTypeParams<N extends Walkable>(node: N, map: ReadonlyMap<string, Type>): N {
-	return walk(node,
+function substituteTypeParams(map: ReadonlyMap<string, Type>): Walker {
+	return walk(
 		// `checkStmt`'s own `(stmt as any).scope ??= scope` stamp (checker.ts) is a plain, enumerable
 		// property set once, during the *original*, unsubstituted (generic-level, `T` still opaque)
 		// check of this function's body -- `walk`'s own `mapObject` primitive copies it along verbatim,
@@ -1337,7 +1337,7 @@ function substituteTypeParams<N extends Walkable>(node: N, map: ReadonlyMap<stri
 		// substituted body would keep resolving its branches through the unsubstituted type parameter.
 		(e, process) => { const built = process(e); delete (built as any).scope; return built; },
 		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
-	)!;
+	);
 }
 
 // `Uint8Array`/`Int32Array`/`Uint32Array` are real generic instantiations of `TypedArray<T>`
@@ -1520,7 +1520,7 @@ function collectRangeWidenings(body: Stmt[], scope: Scope): Map<JS.Var<Type>, Ty
 	// widening too, silently overflowing `i`'s wasm local once reassigned.
 	const isSmallIntLit = (x: Expr) => x.type === 'literal' && typeof x.value === 'number' && Number.isInteger(x.value) && x.value >= -0x80000000 && x.value <= 0x7fffffff;
 
-	return scoped(() => { walkB(body,
+	return scoped(() => { walkB(
 		(s, process) => {
 			switch (s.type) {
 				case 'block': case 'switch': case 'try':
@@ -1563,7 +1563,7 @@ function collectRangeWidenings(body: Stmt[], scope: Scope): Map<JS.Var<Type>, Ty
 			}
 			return process(e);
 		}
-	); return result; });
+	).statements(body); return result; });
 }
 
 // `Object.defineProperty(target, key, {value, ...})` -- the one real, general escape hatch for
@@ -1587,7 +1587,7 @@ function isDefinePropertyCall(e: Expr): e is JS.Call<Type> & { callee: JS.Member
 // which specific one) whether `everExtended` needs poking *now*, before any of them could possibly
 // get `ensureClass`'d and their own struct type finalized first (`ensureGenericFunc`'s own comment).
 function containsDefineProperty(body: Stmt[]): boolean {
-	return walkB(body, undefined, (e, process) => isDefinePropertyCall(e) || process(e));
+	return walkB(undefined, (e, process) => isDefinePropertyCall(e) || process(e)).statements(body);
 }
 
 // The plain local names (see `FunctionContext.definePropertyTargets`'s own comment on why this is
@@ -4808,12 +4808,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				typeParams: undefined,
 				params: e.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p),
 				returnType: e.returnType && T.substituteType(e.returnType, map),
-				body: substituteTypeParams(e.body ?? [], map),
+				body: substituteTypeParams(map).body(e.body),
 			};
 		}
 
 		const body	= e.body ?? [];
-		if (e.name && !allowSelfCall && walkB(body, undefined, (e, process) => e.type === 'identifier' ? true : process(e)))
+		if (e.name && !allowSelfCall && walkB(undefined, (e, process) => e.type === 'identifier' ? true : process(e)).body(body))
 			throw `a named function expression referencing its own name ('${e.name}') is not supported`;
 
 		// The call site's own expected closure signature (`want`, when this literal is being compiled
@@ -5014,7 +5014,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			? new Map(decl.typeParams.map(p => [p.name, (p.constraint ?? T.ANY) as Type]))
 			: undefined;
 		const target	= funcs.get(key) ?? (erased
-			? compileFunc(genericKey(name, decl.typeParams!, erased, global), { ...substituteTypeParams(decl, erased), typeParams: undefined }, homeModule, name)
+			? compileFunc(genericKey(name, decl.typeParams!, erased, global), { ...substituteTypeParams(erased).statement(decl)!, typeParams: undefined }, homeModule, name)
 			: compileFunc(name, decl, homeModule));
 		if (!target)
 			throw `'${name}' can't be used as a value`;
@@ -7633,11 +7633,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (typeof p.key === 'string')
 				bound.add(p.key);
 		let ok = true;
-		walk(e.body as Walkable, undefined, (x, process) => {
+		walk(undefined, (x, process) => {
 			if (x.type === 'identifier' && !bound.has(x.name))
 				ok = false;
 			return process(x);
-		});
+		}).body(e.body);
 		return ok;
 	}
 
@@ -7821,7 +7821,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (t.type === 'ref' && !t.typeArgs)
 					everExtended.add(t.name);
 		}
-		return compileFunc(key, { ...substituteTypeParams(decl, map), typeParams: undefined }, homeModule, name)!;
+		return compileFunc(key, { ...substituteTypeParams(map).statement(decl)!, typeParams: undefined }, homeModule, name)!;
 	}
 
 	// `realName`: the function's own real, DECLARED name -- for a generic instantiation, `name` itself is
@@ -9308,7 +9308,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				params:		decl.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p),
 				rest:		decl.rest?.typeAnnotation ? { ...decl.rest, typeAnnotation: T.substituteType(decl.rest.typeAnnotation, map) } : decl.rest,
 				returnType: decl.returnType ? T.substituteType(decl.returnType, map) : decl.returnType,
-				body:		decl.body ? substituteTypeParams(decl.body, map) : decl.body,
+				body:		decl.body ? substituteTypeParams(map).statements(decl.body) : decl.body,
 			};
 		}
 
@@ -9996,7 +9996,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// receiver -- a parameter or a local is resolvable there and nowhere else. Tracked down the
 			// statement walk; the module scope is only the outermost fallback.
 			let scope = modScope;
-			walkB(m.body,
+			walkB(
 				(st, process) => {
 					const saved = scope;
 					scope = (st as unknown as { scope?: Scope }).scope ?? scope;
@@ -10014,7 +10014,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					else if (isDefinePropertyCall(e) && e.arguments[0])
 						note(e.arguments[0], e.arguments[1]?.type === 'literal' && typeof e.arguments[1].value === 'string' ? e.arguments[1].value : undefined, scope);
 					return process(e);
-				});
+				}).statements(m.body);
 		}
 	}
 	collectExpandoFields();
@@ -10115,7 +10115,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	const reached	= new Set<string>();
 	const pending: string[] = [];
 
-	const collectNames = (node: TS.Stmt | TS.Stmt[]) => walk(node, undefined, (e, process) => {
+	const collectNames = walk(undefined, (e, process) => {
 		if (e.type === 'identifier')
 			pending.push(e.name);
 		return process(e);
@@ -10128,7 +10128,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// under-approximate" comment above; walking a module that turns out unreached just adds a few
 	// harmless extra names to `reached`.
 	for (const body of moduleBodies.values())
-		collectNames(body.body);
+		collectNames.statements(body.body);
 
 	while (pending.length) {
 		const name = pending.shift()!;
@@ -10136,7 +10136,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			reached.add(name);
 			const decl = functionDeclByName.get(name) ?? LIB_DECL_MAP.get(name);
 			if (decl && (decl.type === 'function_decl' || decl.type === 'class_decl'))
-				collectNames(decl);
+				collectNames.statement(decl);
 		}
 	}
 

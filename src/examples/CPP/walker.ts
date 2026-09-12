@@ -50,18 +50,22 @@ export const isPackParameter	= (p: ParamDecl): p is CPP.PackParameter => !!packP
 // walk
 //-----------------------------------------------------------------------------
 
-export type Walkable0 = Definition | Stmt | Expr | ClassMember;
-export type Walkable = Walkable0 | Walkable0[] | Module<Definition>;
+export interface Kinds { definition: Definition; statement: Stmt; expression: Expr; classMember: ClassMember }
 
-type Recurse		= W.Recurse<Walkable0>;
-type OnAST<U>		= W.OnAST<U, Recurse>;
+export interface Walker extends W.Walker<Kinds> {
+	definitions:	(x: readonly Definition[]) => Definition[];
+	statements:		(x: readonly Stmt[]) => Stmt[];
+	module:			<M extends Module<Definition>>(x: M) => M;
+}
 
-export function walk<T extends Walkable>(ast: T,
+type OnAST<U>		= W.OnAST<U, Walker>;
+
+export function walk(
 	onDefinition?:	OnAST<Definition>,
 	onStatement?:	OnAST<Stmt>,
 	onExpression?:	OnAST<Expr>,
 	onClassMember?:	OnAST<ClassMember>,
-): T | undefined {
+): Walker {
 
 	// ---- shared leaves (declarators, type-names, specifiers) ----
 	// C's declarator/type-name system has no TS analogue -- there's no separate "Type" AST, so these are
@@ -291,16 +295,16 @@ export function walk<T extends Walkable>(ast: T,
 	};
 	const classMemberU = (m: ClassMember) => classMember(m);
 
-	const recurse: Recurse = x => {
-		if (isClassMember(x))
-			return mapClassMember(x) as typeof x;
-		if (isDefinition(x) && !isStatementOnly(x))
-			return mapDefinition(x) as typeof x;
-		if (isStatementOnly(x))
-			return mapStatement(x) as typeof x;
-		return mapExpression(x) as typeof x;
+	const definitions = mapArrayA((d: Definition) => mapDefinition(d));
+	const recurse: Walker = {
+		definition:		x => mapDefinition(x),
+		statement:		x => mapStatement(x),
+		expression:		x => mapExpression(x),
+		classMember:	x => mapClassMember(x),
+		definitions,
+		statements:		mapArrayA((s: Stmt) => mapStatement(s)),
+		module:			x => ({...x, body: definitions(x.body)}),
 	};
-
 
 	const mapStatement		= makeProcess(statementExtra, onStatement, recurse, true);
 	const mapDefinition		= makeProcess(definitionExtra, onDefinition, recurse, true);
@@ -312,34 +316,25 @@ export function walk<T extends Walkable>(ast: T,
 	const mapDefinitionA	= mapDefined(mapDefinition);
 	const mapClassMemberA	= mapDefined(mapClassMember);
 
-	if (isTranslationUnit(ast))
-		return {...ast, body: mapArray(mapDefinition)(ast.body) ?? []} as T;
-	if (Array.isArray(ast)) {
-		if (ast.length === 0)
-			return ast as T;
-		const first = ast[0];
-		if (isClassMember(first))
-			return mapArray(mapClassMember)(ast as ClassMember[]) as T;
-		if (isDefinition(first) && !isStatementOnly(first))
-			return mapArray(mapDefinition)(ast as Definition[]) as T;
-		return mapArray(mapStatement)(ast as Stmt[]) as T;
-	}
-	recurse(ast);
+	return recurse;
 }
 
 //-----------------------------------------------------------------------------
 // walkB
 //-----------------------------------------------------------------------------
 
-type RecurseB		= W.RecurseB<Walkable>
-type OnASTB<U>		= W.OnASTB<U, RecurseB>;
+export interface WalkerB extends W.WalkerB<Kinds> {
+	definitions:	(x: readonly Definition[]) => boolean;
+	statements:		(x: readonly Stmt[]) => boolean;
+}
+type OnASTB<U>		= W.OnASTB<U, WalkerB>;
 
-export function walkB<T extends Walkable>(ast: T,
+export function walkB(
 	onDefinition?:	OnASTB<Definition>,
 	onStatement?:	OnASTB<Stmt>,
 	onExpression?:	OnASTB<Expr>,
 	onClassMember?:	OnASTB<ClassMember>,
-): boolean {
+): WalkerB {
 
 	const walkDeclarator = (d?: Declarator | AbstractDeclarator): boolean => {
 		if (!d)
@@ -477,14 +472,13 @@ export function walkB<T extends Walkable>(ast: T,
 				: false;
 		}
 	};
-	const recurse: RecurseB = x => {
-		if (isClassMember(x))
-			return walkClassMember(x);
-		if (isDefinition(x) && !isStatementOnly(x))
-			return walkDefinition(x);
-		if (isStatementOnly(x))
-			return walkStatement(x);
-		return walkExpression(x as Expr);
+	const recurse: WalkerB = {
+		definition:		x => walkDefinition(x),
+		statement:		x => walkStatement(x),
+		expression:		x => walkExpression(x),
+		classMember:	x => walkClassMember(x),
+		definitions:	x => x.some(walkDefinition),
+		statements:		x => x.some(walkStatement),
 	};
 
 	const walkStatement		= makeProcessB(statement, onStatement, recurse, true);
@@ -492,17 +486,5 @@ export function walkB<T extends Walkable>(ast: T,
 	const walkExpression	= makeProcessB(expression, onExpression, recurse);
 	const walkClassMember	= makeProcessB(classMember, onClassMember, recurse, true);
 
-	if (Array.isArray(ast)) {
-		if (ast.length === 0)
-			return false;
-		const first = ast[0];
-		if (isClassMember(first))
-			return (ast as ClassMember[]).some(walkClassMember);
-		if (isDefinition(first) && !isStatementOnly(first))
-			return (ast as Definition[]).some(walkDefinition);
-		return (ast as Stmt[]).some(walkStatement);
-	}
-	if (isTranslationUnit(ast))
-		return ast.body.some(walkDefinition);
-	return recurse(ast);
+	return recurse;
 }

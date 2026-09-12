@@ -229,9 +229,9 @@ export function lower(program: Module<any>, options: typeof OptionsDefault) {
 
 	const used: Record<string, boolean> = {};
 
-	const lowered = walk(program, undefined, (expr, process) =>
+	const lowered = walk(undefined, (expr, process) =>
 		expr.type === 'jsx' ? lower(process(expr)) : process(expr)
-	)!;
+	).module(program);
 
 	const usedkeys = Object.keys(used);
 	if (usedkeys.length) {

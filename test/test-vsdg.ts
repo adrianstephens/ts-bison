@@ -577,7 +577,7 @@ export async function main() {
 	// (1) `walker.ts`'s `isType` guard mis-routed ANY bare expression-level `literal` node (e.g. a
 	// `while (true)` test) to the no-op type-walker, since a type-level literal type and an
 	// expression-level literal value are IDENTICAL shapes with no structural way to tell them
-	// apart -- fixed by letting `recurse` take an explicit `'expression'` hint (a real, general
+	// apart -- fixed by the caller naming the kind, `recurse.expression(test)` (a real, general
 	// bug: even a hand-parsed `if (true) {...}` hit it, nothing to do with switch specifically);
 	// (2) the discriminant's own wrapper node was built by hand but never threaded into the state
 	// chain via `rebindVar`, so `let __disc = ...;` never printed even though every case read it;

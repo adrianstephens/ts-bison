@@ -34,8 +34,7 @@ export const isStmt		= guard<PY.Stmt>(stmtTags);
 
 type Expr = PY.Expr;
 type Stmt = PY.Stmt;
-export type Walkable0 = Stmt | Expr;
-export type Walkable = Walkable0 | Module<PY.Stmt> | Stmt[];
+export interface Kinds { statement: Stmt; expression: Expr }
 
 // ===================================================================
 //  Constant folding
@@ -103,13 +102,16 @@ export function calcBinary(op: PY.binaryOps, a: unknown, b: unknown): unknown {
 //  walk -- immutable transform
 // ===================================================================
 
-type Recurse	= W.Recurse<Walkable0>;
-type OnAST<U>	= W.OnAST<U, Recurse>;
+export interface Walker extends W.Walker<Kinds> {
+	statements:	(x: readonly Stmt[]) => Stmt[];
+	module:		<M extends Module<Stmt>>(x: M) => M;
+}
+type OnAST<U>	= W.OnAST<U, Walker>;
 
-export function walk<T extends Walkable>(ast: T,
+export function walk(
 	onStatement?:	OnAST<Stmt>,
 	onExpression?:	OnAST<Expr>,
-): T | undefined {
+): Walker {
 
 	const param			= (p: PY.Param): PY.Param => mapObject(p, {annotation: mapExpression, default: mapExpression});
 	const arg   		= (a: PY.Arg): PY.Arg => mapObject(a, {value: mapExpressionA});
@@ -184,31 +186,34 @@ export function walk<T extends Walkable>(ast: T,
 		}
 	};
 
-	const recurse: Recurse = x => (isStmt(x) ? mapStatement(x) : mapExpression(x)) as typeof x;
+	const recurse: Walker = {
+		statement:	x => mapStatement(x),
+		expression:	x => mapExpression(x),
+		statements:	x => mapStmts(x),
+		module:		x => ({...x, body: mapStmts(x.body)}),
+	};
 
 	const mapStatement		= makeProcess(statement, onStatement, recurse, true);
 	const mapExpression		= makeProcess(expression, onExpression, recurse);
 	const mapExpressionA	= mapDefined(mapExpression);
 	const mapStmts			= mapArrayA(mapStatement);
 
-	if (isModule(ast))
-		return {...ast, body: mapStmts(ast.body)} as T;
-	if (Array.isArray(ast))
-		return mapStmts(ast) as T;
-	return recurse(ast as Stmt | Expr) as T;
+	return recurse;
 }
 
 // ===================================================================
 //  walkB -- boolean short-circuit search
 // ===================================================================
 
-type RecurseB	= W.RecurseB<Walkable0>;
-type OnASTB<U>	= W.OnASTB<U, RecurseB>;
+export interface WalkerB extends W.WalkerB<Kinds> {
+	statements:	(x: readonly Stmt[]) => boolean;
+}
+type OnASTB<U>	= W.OnASTB<U, WalkerB>;
 
-export function walkB<T extends Walkable>(ast: T,
+export function walkB(
 	onStatement?:	OnASTB<Stmt>,
 	onExpression?:	OnASTB<Expr>,
-): boolean {
+): WalkerB {
 
 	const param 		= (p: PY.Param) => walkExpression(p.annotation) || walkExpression(p.default);
 	const arg   		= (a: PY.Arg) => walkExpression(a.value);
@@ -265,14 +270,14 @@ export function walkB<T extends Walkable>(ast: T,
 		}
 	};
 
-	const recurse: RecurseB = x => !x ? false : isStmt(x) ? walkStatement(x) : walkExpression(x);
+	const recurse: WalkerB = {
+		statement:	x => walkStatement(x),
+		expression:	x => walkExpression(x),
+		statements:	x => x.some(walkStatement),
+	};
 
 	const walkStatement		= makeProcessB(statement, onStatement, recurse, true);
 	const walkExpression	= makeProcessB(expression, onExpression, recurse);
 
-	if (isModule(ast))
-		return ast.body.some(walkStatement);
-	if (Array.isArray(ast))
-		return ast.some(walkStatement);
-	return recurse(ast);
+	return recurse;
 }
