@@ -43,7 +43,7 @@ Probe results: silent unless noted.
    `decl.returnType` with N forced to any. towasm dodges it twice (7904-7911 reads the hoisted snapshot;
    7951-7957 passes N separately). Fix: `yield` types as the declared TNext; never overwrite an annotated
    return type; delete both towasm dodges.
-6. **`constructor`** -> any by name (type-utils 1803-1804). Fix: delete; lib's `Object.constructor: Function` answers.
+6. **DONE** (verified 2026-09-11, probe assistant/tsc-probe/s1.ts): `o.constructor` gives `Function`, as tsc does.
 7. **Uninferrable type param** -> `default ?? constraint ?? any`, sometimes without even a GAP
    (`declare function g<T>(): T; g().foo` silent). TS >= 3.5 infers `unknown` (checker 1180). Do after B1.
 8. `typeOf`'s `default: return T.ANY` (2006) -> exhaustive `never` switch; instantiation expression on a
@@ -57,7 +57,17 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
    (`typeOf1` -> widen=true), so even a variable declared `{ kind: "b" }` reads as `{ kind: string }` and
    the leniency is what keeps that passing. Fix both together: checks use the precise init type, then
    return false here.
-2. Construct-only value called (checker 1597-1599): `C()` accepted. TS 2348.
+2. **TRIED, NOT LANDED** -- patch kept at `assistant/c2-call-construct.patch` (54 lines). Removing the cross-kind
+   leniency (a plain call falling back to construct signatures and `new` falling back to a call signature) makes the
+   checker match tsc exactly on probe assistant/tsc-probe/s2.ts: TS2348 for a plain call on a construct-only value,
+   TS7009 for `new` on a call-only one (which still evaluates to `any`). Tests, gate 838/838 and libdecls all pass
+   with it. It is NOT committed because it raises self-hosting 13 -> 17: `Array(n)` and `RegExp(...)` called WITHOUT
+   `new` (core.ts 81, js-parser 372, towasm 1274, wasm 1187) are legal only because TS's lib gives `ArrayConstructor`/
+   `RegExpConstructor` BOTH a call and a construct signature, while the towasm lib has `declare class Array<T>` --
+   a class value has no call signature. So the leniency was masking missing lib declarations. Land this TOGETHER with
+   the lib fix, which needs the class+var merge rule already listed below (`declare var Array: ArrayConstructor`
+   alongside the class); `interface TypedArrayConstructor<A>` + `declare var Uint8Array` in lib.d.ts is the precedent
+   that already works.
 3. Overload no-fit -> WARNING, args unchecked (1628). TS 2769; needs exact overload resolution first.
    (Overloaded class members no longer expose their implementation, 3f23a8a, so this now fires where TS errs.)
 4. isAssignable skips methods/call/index members (2087), function params (2070), missing returns (2069):
