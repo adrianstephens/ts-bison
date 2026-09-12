@@ -670,12 +670,12 @@ interface ModuleShape { scope: Scope; value: Type; tainted: boolean }
 
 // Process-wide, like `libScopeCache`. A genuine cycle (e.g. Node's `fs`<->`fs/promises` `.d.ts` graph) truncates
 // whichever side asks second; `tainted` marks that so it's evicted instead of poisoning later callers.
-const importScopeCache	= new Map<LoadedModule, Promise<ModuleShape>>();
-const waitingFor		= new Map<LoadedModule, Set<LoadedModule>>();
+const importScopeCache	= new WeakMap<LoadedModule, Promise<ModuleShape>>();
+const waitingFor		= new WeakMap<LoadedModule, Set<LoadedModule>>();
 
 // Own declarations recorded before re-export merging (the part that can cycle) -- lets a plain `import`'s deadlock
 // fallback (`awaitScope`'s `fallbackToOwn`) resolve from here instead, since imports never need re-exports.
-const ownScopeSettled	= new Map<LoadedModule, { scope: Scope; alias?: Type }>();
+const ownScopeSettled	= new WeakMap<LoadedModule, { scope: Scope; alias?: Type }>();
 
 function wouldDeadlock(waiter: LoadedModule, target: LoadedModule): boolean {
 	const seen = new Set<LoadedModule>([target]);
