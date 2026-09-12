@@ -207,6 +207,14 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   After the fix the top cause blocks 24; next up: `null`/`undefined` where a nullable object type is expected (24),
   ts-parser's `Rule<any>` conversion (22), towasm's unknown method 'parse' (21), object literal needing a known
   target type (17).
+- The survey's AGGREGATE mixes per-file JSONs of different vintages: `--aggregate` (and every run) re-renders from
+  whatever is on disk, so a table can blend this morning's rows with tonight's. Before quoting ANY survey number,
+  check `stat -f '%Sm %N' assistant/selfhost-survey/*.json` -- on 2026-09-11 the rows spanned 07:08 to 21:52 while
+  the newest fix was 22:34. Only a full clean run licenses a headline figure like "65/314 compiled".
+- Slicing (added to the gitignored `assistant/selfhost-survey.ts`, re-apply if lost): `--slice start:count` bounds a
+  worker to that many declarations and writes a `.partN.json`; the parent retries a crashed file in slices of 24 and
+  merges. That is what makes type-utils measurable at all -- each probe re-checks the whole file, and 113 of them in
+  one process exhausts the 8GB heap (the machine has 16GB, so raising it is not an option).
 - THE SURVEY CAN LIE, and did: `runWorker` logged a one-line note and resolved when a worker crashed, leaving that
   file's PREVIOUS JSON on disk -- and the tables render from disk, so a crashed file's rows read as "nothing changed".
   The type-utils worker crashes (it is the biggest file, 113 probes), so every type-utils row in a survey run after
