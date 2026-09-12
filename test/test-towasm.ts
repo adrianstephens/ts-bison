@@ -6557,6 +6557,21 @@ async function main() {
 	}
 
 	{
+		// A checker guard that only the LIB scope can catch: here `Array` is a real class, so an `Array<T>` source is
+		// expanded to its members before a union destination is decomposed, and `F['modifiers']` (an optional property's
+		// indexed access, hence `string[] | undefined`) could never be reached by an array again. `compile` throws on any
+		// checker error, so this fails loudly if that ordering regresses.
+		const { arrayThroughUnion } = await compile(`
+			interface F { modifiers?: string[] }
+			export function arrayThroughUnion(): number {
+				const m: { modifiers?: F["modifiers"] } = { modifiers: ["x", "y"] };
+				return m.modifiers ? m.modifiers.length : 0;
+			}
+		`);
+		check('arrayThroughUnion()', arrayThroughUnion(), 2);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

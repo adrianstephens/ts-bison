@@ -2390,7 +2390,10 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			return true;
 		// A class ref `resolve` keeps nominal is compared by its members, on either side (`number[]` is not a `number` just because
 		// `Array` is a class in codegen's lib). Only a name with no declaration at all stays unverifiable.
-		if (src.type === 'ref' && !ALL_PRIM.has(src.name)) {
+		// ... but NOT while `dst` is still a union or intersection: those decompose below and re-enter this rule per member,
+		// and expanding first would drop the ref identity that the by-name `Array`/same-name fast paths above need -- the only
+		// way an `Array<X>` source ever matches an `Array<Y>` destination, since `Array` is excluded from the structural path.
+		if (src.type === 'ref' && !ALL_PRIM.has(src.name) && dst.type !== 'union' && dst.type !== 'intersection') {
 			const members = resolveMembers(src, scope);
 			return members.type === 'ref' || recurse(members, dst, depth - 1);
 		}
