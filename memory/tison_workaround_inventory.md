@@ -207,6 +207,20 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   After the fix the top cause blocks 24; next up: `null`/`undefined` where a nullable object type is expected (24),
   ts-parser's `Rule<any>` conversion (22), towasm's unknown method 'parse' (21), object literal needing a known
   target type (17).
+- `assistant/probe-one-decl.ts <file> <declName>` compiles ONE declaration the way the survey does (its `variantBody`:
+  the whole module compiles, only the target is exported) and prints the error WITH its position -- the survey strips
+  positions deliberately, to cluster causes, so this is how you turn a cluster back into a source line.
+- OPEN, the next real codegen bug (found this way): type-utils.ts:1460:97
+  `constraintParts.find(m => m.type === 'keyof')?.argument` fails with
+  "internal: cannot convert ref:{ type:"keyof"; argument:Type }:true to ref:{ type:string; argument:Type }:true".
+  A NARROWED object shape (literal discriminant, from an inferred type predicate) and the declared shape it was
+  narrowed from become TWO structs, because struct identity is `T.typeKey` and that keeps the literal. At runtime the
+  value IS an instance of the declared struct, so the conversion can never succeed. The tension to respect:
+  towasm.ts:3140 documents that an object shape must NOT simply be widened, because `matchObjectShapeByType`'s
+  discriminant tiebreak needs the literal precision to tell union members apart. TRIED AND INSUFFICIENT: having
+  `ensureAnonObjectShape` reuse an already-built widened struct on a hit -- the failing pair is not created through
+  that path, so find where each struct IS built first (log inside `buildObjectShape`, BEFORE its `const info`
+  literal, not inside it).
 - Real tsc for probes: `node_modules/.bin/tsc --ignoreConfig --noEmit --strict --target es2022 file.ts` (TS 6.0.3 refuses
   files alongside a tsconfig otherwise). Check TS semantics this way before modeling them.
 - Instruments: the local TypeScript checkout lacks 1339 `.errors.txt` that git tracks, so ~1300 tsc-rejected
