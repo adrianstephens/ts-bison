@@ -1889,31 +1889,34 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				}
 				let overloads: TS.CallSig[] | undefined;
 				const parts = calleeT.type === 'intersection' ? calleeT.types.map(p => T.resolveOwn(p, scope)) : [calleeT];
-				// A bare `constructor` part is NOT taken for a plain call here any more -- it used to be, which
-				// pre-empted the call-vs-construct preference the member scan below already implements. A
-				// primitive wrapper is exactly that shape: `class BigInt`'s constructor alongside a
-				// `declare var BigInt` whose call signature returns `bigint`, so `BigInt(5)` typed as
-				// `BigInt`. It stays available as the LENIENT fallback below, so calling a construct-only
-				// value still works as it always has.
+				// A bare `constructor` part is NOT taken for a plain call: that would pre-empt the call-vs-construct
+				// preference the member scan below implements. A primitive wrapper is exactly that shape -- `class
+				// BigInt`'s constructor alongside a `declare var BigInt` whose call signature returns `bigint`, so
+				// `BigInt(5)` must type as `bigint`, and its own call signature is found by that scan.
 				let sig: TS.CallSig|undefined = e.type === 'new'
 					? parts.find(p => p.type === 'constructor') ?? parts.find(p => p.type === 'function')
 					: parts.find(p => p.type === 'function');
 				sig ??= T.unionSignature(calleeT, e.type === 'new' ? 'construct' : 'call', scope);
 				if (!sig) {
-					// `new` prefers a construct signature, a plain call a bare call signature -- each falls back to the other when its preferred
-					// kind is absent (real TS wouldn't allow that cross-fallback), matching this checker's existing leniency.
+					// Each kind takes only its OWN signatures: TS rejects both cross directions -- a plain call on a
+					// construct-only value is TS2348, and `new` on a call-only one TS7009 (which still evaluates to `any`).
 					const members 		= T.collectMembers(calleeT, scope);
 					const constructs	= members.filter(m => m.type === 'construct');
 					const callSigs		= members.filter(m => m.type === 'call');
 					const own			= e.type === 'new' ? constructs : callSigs;
-					const calls			= own.length ? own : (e.type === 'new' ? callSigs : constructs);
+					// `new` still falls back to a call signature: TS reports that as TS7009, an IMPLICIT-ANY diagnostic that
+					// fires only under `noImplicitAny` (which this checker does not track yet) and still evaluates to `any` --
+					// erroring unconditionally cost 56 corpus false positives. A plain call on a construct-only value is
+					// different: TS2348 is unconditional, so that direction is rejected here.
+					const calls			= own.length || e.type !== 'new' ? own : callSigs;
 					if (calls.length === 1) {
 						sig = calls[0];
 					} else if (calls.length > 1) {
 						overloads = calls;		// resolved below, once argument types are known
-					} else if ((sig = parts.find(p => p.type === 'constructor'))) {
-						// The leniency noted above: a plain call on a value that only has a construct
-						// signature. Real TS rejects it; this checker has always allowed it.
+					} else if (e.type !== 'new' && (constructs.length > 0 || parts.some(p => p.type === 'constructor'))) {
+						if (err)
+							err(SEVERITY.ERROR, pos)`Type '${calleeT}' is not callable without 'new' in '${e}'`;
+						return T.ANY;
 					} else if (T.sealed(calleeT, scope)) {
 						if (err)
 							err(SEVERITY.ERROR, pos)`Type '${calleeT}' is not callable in '${e}'`;

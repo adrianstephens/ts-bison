@@ -256,6 +256,13 @@ interface RegExp {
 	// Non-standard extensions
 }
 
+// As TS's `RegExpConstructor`: callable without `new` (`RegExp(src, flags)`), same as `ArrayConstructor` above.
+interface RegExpConstructor {
+	new (source: string, flags?: string): RegExp;
+	(source: string, flags?: string): RegExp;
+}
+declare var RegExp: RegExpConstructor;
+
 //-----------------------------------------------------------------------------
 //	Array
 //-----------------------------------------------------------------------------
@@ -303,6 +310,15 @@ declare class Array<T> {
 	reduceRight(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T, initialValue: T): T;
 	reduceRight<U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number, array: T[]) => U, initialValue: U): U;
 }
+
+// As TS's `ArrayConstructor`: `Array` is callable WITHOUT `new` as well (`Array(n).fill(x)`, the standard
+// fixed-size idiom), which a `declare class` alone cannot say -- its value has only a construct signature.
+// Same shape `TypedArrayConstructor` above already uses; the statics stay on the class in `lib/array.ts`.
+interface ArrayConstructor {
+	new <T>(n?: number): T[];
+	<T>(n?: number): T[];
+}
+declare var Array: ArrayConstructor;
 
 interface ArrayLike<T> {
 	readonly length: number;
