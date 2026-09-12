@@ -6642,6 +6642,33 @@ async function main() {
 	}
 
 	{
+		// A block-scoped name is bound for its whole block, so a closure in its OWN initializer reaches it -- also
+		// inside a NESTED block (type-utils.ts's `objectKeyNames`, in a switch case), and from a nested callback.
+		const { selfRecursiveLocal, selfRecursiveNested } = await compile(`
+			export function selfRecursiveLocal(): number {
+				const base = 10;
+				if (base > 0) {
+					const sum = (n: number): number => n <= 0 ? base : n + sum(n - 1);
+					return sum(4);
+				}
+				return -1;
+			}
+			type Tree = { v: number; kids: Tree[] };
+			export function selfRecursiveNested(kind: number): number {
+				switch (kind) {
+					case 1: {
+						const total = (t: Tree): number => { let s = t.v; for (const x of t.kids.map(k => total(k))) s += x; return s; };
+						return total({ v: 1, kids: [{ v: 2, kids: [] }, { v: 3, kids: [{ v: 4, kids: [] }] }] });
+					}
+				}
+				return -1;
+			}
+		`);
+		check('selfRecursiveLocal()', selfRecursiveLocal(), 20);
+		check('selfRecursiveNested(1)', selfRecursiveNested(1), 10);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

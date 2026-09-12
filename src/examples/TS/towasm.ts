@@ -560,6 +560,8 @@ class FunctionContext {
 	// alongside `widenedTypes`. Consulted only by `ensureForwardHolder`, to find a sibling `const`/`let`
 	// declared LATER in this same body that an EARLIER closure literal needs to forward-reference.
 	ownBody?:			Stmt[];
+	// Declarators whose initializers are compiling right now, innermost last -- see `ensureForwardHolder`.
+	initializing?:		JS.Var<Type>[];
 
 	// `collectCapturedMutables(ownBody)`, computed on first use -- see `needsHolder`.
 	holderNames?:			Set<string>;
@@ -1921,7 +1923,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// Returns `undefined` (leaving the existing "unresolved identifier" throw to fire) for a name that
 	// isn't a sibling declaration at all -- a genuinely unresolvable name, not a forward reference.
 	function ensureForwardHolder(ctx: FunctionContext, name: string): Local | undefined {
-		const d = ctx.ownBody?.flatMap(s => s.type === 'var_decl' ? s.declarations : []).find(d => d.name === name);
+		// Its own initializer's declarator first: a self-reference may sit in any nested block (a switch case,
+		// `objectKeyNames`), which the shallow top-level scan misses -- and its holder then lands in the right scope.
+		const d = ctx.initializing?.slice().reverse().find(d => d.name === name)
+			?? ctx.ownBody?.flatMap(s => s.type === 'var_decl' ? s.declarations : []).find(d => d.name === name);
 		if (!d)
 			return undefined;
 		const tsType = d.typeAnnotation ?? (d.init && checkerTypeOf(d.init, ctx.scope));
@@ -7009,35 +7014,41 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// element is itself a generic call (`const rules: Expr[] = [makeRule(() => ({...}))]`).
 					const savedContextualReturn = ctx.contextualReturn;
 					ctx.contextualReturn = tsType;
-					if (hoisted) {
-						ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index));
-						emitAs(d.init, ctx, wtype);
-						ctx.emit(I.struct.set(ctx.closureEnv!.envTypeIndex, hoisted.index));
-					} else {
-						// An EARLIER sibling closure may already have forward-referenced this exact name
-						// (`ensureForwardHolder`, from `emitClosureLiteral`'s own free-var check) -- but so may
-						// `d.init` ITSELF, compiled next (a self-recursive arrow, e.g. walker.ts's own
-						// `mapBindingTarget`, calling its own not-yet-declared name from inside its own body).
-						// Either way a plain `declareValue` after the fact would silently shadow the holder with
-						// a second, independent local, leaving whatever captured it forever empty -- so the
-						// check for an existing holder has to happen AFTER `d.init` compiles, not before, and
-						// the value goes through a scratch local first (`struct.set` needs the holder's own ref
-						// pushed before the value, but the value is what's already on the stack at this point).
-						// A local a nested closure captures and something assigns has to BE a holder from the
-						// start, not a value copied into the env (`needsHolder`). Declared before `d.init`
-						// compiles so a closure inside the initializer captures the holder too, and so the
-						// store below goes through the same path a forward reference already took.
-						if (!ctx.lookup(d.name)?.holderInner && needsHolder(ctx, d.name))
-							declareHolder(ctx, d.name, wtype, tsType);
-						emitAs(d.init, ctx, wtype);
-						const forwardHolder = ctx.lookup(d.name);
-						if (forwardHolder?.holderInner) {
-							const scratch = ctx.temp(`$fwd$${d.name}`, wtype);
-							ctx.emit(I.local.set(scratch), I.local.get(forwardHolder.index), I.local.get(scratch));
-							ctx.emit(I.struct.set((forwardHolder.wtype as { typeIndex: number }).typeIndex, 0));
+					const initializing = (ctx.initializing ??= []);
+					initializing.push(d);
+					try {
+						if (hoisted) {
+							ctx.emit(I.local.get(ctx.closureEnv!.envLocal.index));
+							emitAs(d.init, ctx, wtype);
+							ctx.emit(I.struct.set(ctx.closureEnv!.envTypeIndex, hoisted.index));
 						} else {
-							ctx.emit(I.local.set(ctx.declareValue(d.name, wtype, tsType).index));
+							// An EARLIER sibling closure may already have forward-referenced this exact name
+							// (`ensureForwardHolder`, from `emitClosureLiteral`'s own free-var check) -- but so may
+							// `d.init` ITSELF, compiled next (a self-recursive arrow, e.g. walker.ts's own
+							// `mapBindingTarget`, calling its own not-yet-declared name from inside its own body).
+							// Either way a plain `declareValue` after the fact would silently shadow the holder with
+							// a second, independent local, leaving whatever captured it forever empty -- so the
+							// check for an existing holder has to happen AFTER `d.init` compiles, not before, and
+							// the value goes through a scratch local first (`struct.set` needs the holder's own ref
+							// pushed before the value, but the value is what's already on the stack at this point).
+							// A local a nested closure captures and something assigns has to BE a holder from the
+							// start, not a value copied into the env (`needsHolder`). Declared before `d.init`
+							// compiles so a closure inside the initializer captures the holder too, and so the
+							// store below goes through the same path a forward reference already took.
+							if (!ctx.lookup(d.name)?.holderInner && needsHolder(ctx, d.name))
+								declareHolder(ctx, d.name, wtype, tsType);
+							emitAs(d.init, ctx, wtype);
+							const forwardHolder = ctx.lookup(d.name);
+							if (forwardHolder?.holderInner) {
+								const scratch = ctx.temp(`$fwd$${d.name}`, wtype);
+								ctx.emit(I.local.set(scratch), I.local.get(forwardHolder.index), I.local.get(scratch));
+								ctx.emit(I.struct.set((forwardHolder.wtype as { typeIndex: number }).typeIndex, 0));
+							} else {
+								ctx.emit(I.local.set(ctx.declareValue(d.name, wtype, tsType).index));
+							}
 						}
+					} finally {
+						initializing.pop();
 					}
 					ctx.contextualReturn = savedContextualReturn;
 				}
