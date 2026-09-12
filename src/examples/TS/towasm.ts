@@ -8524,15 +8524,26 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// same-module caller unaffected by this.
 	function ensureObjectShape(name: string, typeArgs?: Type[], declScope?: Scope): ClassInfo | undefined {
 		const scope = declScope ?? global;
-		// Same composite-key convention as `ensureClass` itself -- two different type arguments are two
-		// different physical shapes (e.g. `TypeParam<Type>` vs. a bare, implicitly-`any` `TypeParam`).
-		const key		= typeArgs?.length ? `${name}<${typeArgs.map(t => T.typeKey(T.resolve(scope, t))).join(',')}>` : name;
+		const entry = scope.type(name);
+		if (!entry)
+			return undefined;
+
+		// ERASURE: ONE physical layout per generic shape. A generic INTERFACE/ALIAS is a pure field layout
+		// with no compiled code of its own, and wasm struct fields are mutable, hence invariant -- so
+		// `Rest<ArrayType>` could never be a subtype of `Rest<Type>` no matter how the two were built, and
+		// keying per type argument only produced structs nothing could convert between (measured: four
+		// separate `Rest<...>`, two of them -- `<any>` and `<unknown>` -- already byte-identical).
+		// Every type-parameter position therefore takes the parameter's own constraint (`?? any`), the same
+		// erasure convention towasm already applies to generic FUNCTION bodies, so every instantiation
+		// shares one struct and a conversion between them is identity.
+		//
+		// `ensureClass` applies the same rule where it is sound (see its own comment): a generic CLASS owns
+		// method bodies monomorphized per instantiation, so only a method-free one can merge outright.
+		const erased	= entry.typeParams?.length ? entry.typeParams.map(p => p.constraint ?? T.ANY) : undefined;
+		const key		= name;
 		const existing	= classes.get(key);
 		if (existing)
 			return existing;
-
-		if (!scope.type(name))
-			return undefined;
 
 		// Via a `RefType` (not the entry's own raw, still-generic `.type` directly) so a reference to a
 		// generic interface/alias -- bare (`TypeParam`) or explicit (`TypeParam<X>`) -- goes through
@@ -8541,7 +8552,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// itself (a plain `TS.RefType` carries no scope of its own) -- this exact ref becomes `thisTsType`
 		// below, and `fieldDeclaredType`'s own later re-resolution of it needs to find `name` again from
 		// wherever it was actually declared, not wherever `global` (the entry module) happens to be.
-		const ref = TS.RefType(name, typeArgs);
+		const ref = TS.RefType(name, erased ?? typeArgs);
 		ref.declScope = scope;
 		// `resolveObjectType` (not a hand-rolled intersection-flatten here) -- an interface `extends`ing
 		// another (`Method<T> extends CallSig<T>`) needs its own parts (`CallSig<T>` itself still an
@@ -8661,17 +8672,43 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// Resolves fields and the struct type eagerly, but only collects method/ctor decls -- building each is
 	// deferred to `ensureMethod`/`ensureCtor`, the same lazy treatment `ensureFunc` gives top-level functions.
 	function ensureClass(name: string, typeArgs?: Type[], declScope?: Scope): ClassInfo | undefined {
-		// A real generic instantiation (`Box<number>`) is cached under a composite key, not the bare class
-		// name -- two different type arguments are two different physical classes. Keying off the *unresolved* class name (not `T.resolve`'s expanded form) keeps two classes with identical field shapes from colliding.
+		// A generic instantiation whose type argument survives the collapse below (`Box<number>`) is cached
+		// under a composite key, not the bare class name. Keying off the *unresolved* class name (not
+		// `T.resolve`'s expanded form) keeps two classes with identical field shapes from colliding.
 		// A wasm pseudo-type argument (`TypedArray<u8>`/`<i32>`/etc, see `TYPED_ARRAY_TAGS`) is kept
 		// unresolved too, by its own name -- `T.resolve` collapses every one of them alike down to plain
 		// `number` (they're all just `= number` aliases), which would otherwise key `TypedArray<u8>` and
 		// `TypedArray<i32>` identically and wrongly collide the two into one shared (and wrongly $elem-tagged
 		// by whichever instantiated first) physical class.
-		if (name === 'Array') {
-			if (typeArgs?.[0].type !== 'ref' || (!TYPED_ARRAY_TAGS.has(typeArgs[0].name) && typeArgs[0].name !== 'number' && typeArgs[0].name !== 'boolean' && typeArgs[0].name !== 'any'))
-				typeArgs = [T.ANY];
-		}
+		// A type argument earns its own physical instantiation only when it changes the LAYOUT -- when the
+		// value is stored UNBOXED. Every reference type occupies one ref slot, so swapping one for another
+		// can never reshape a struct; only a scalar (`number` -> f64, `boolean` -> i32) or a typed-array
+		// tag can. Everything else collapses to `any`, so all such instantiations share one struct and a
+		// conversion between them is identity rather than the `cannot convert ref:X<a> to ref:X<b>` that
+		// nothing could satisfy -- wasm struct fields are mutable, hence invariant, so no arrangement of
+		// separate structs could ever have been convertible.
+		//
+		// This is the `name === 'Array'` collapse that used to live here, with the name test removed: the
+		// rule was always structural, and hardcoding one class's name left every other generic
+		// (`Terminal<T>`, `Rule<T>`, `Rest<T>`, ...) keyed per type argument. `Array`'s own behaviour is
+		// unchanged -- it is a one-parameter generic whose kept arguments are exactly these.
+		// The tag test reads the UNRESOLVED name on purpose: `T.resolve` collapses every `TypedArray` tag
+		// alike to plain `number`, which would wrongly merge `TypedArray<u8>` with `TypedArray<i32>`.
+		const ownsLayout = (t: Type) => {
+			if (t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name))
+				return true;
+			const r = T.resolve(global, t);
+			return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean' || r.name === 'any');
+		};
+		// Restricted to a class with no METHODS of its own. A method body is compiled against the
+		// instantiation it was reached through (`substElemMethods`), so merging two instantiations whose
+		// methods differ produces code built for one layout running against the other -- measured, as a
+		// wasm `invalid struct index` and one difftest disagreement. `Array` keeps its collapse because
+		// its methods are then compiled for the boxed `any` form, which is the whole point of collapsing
+		// to it; a DATA-shaped generic (`Terminal<T>`, `Rule<T>`) has no such code to disagree about.
+		const classDecl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name) ?? declScope?.decl(name);
+		if (name === 'Array' || (classDecl?.type === 'class_decl' && !classDecl.body.some(m => m.type === 'method')))
+			typeArgs = typeArgs?.map(t => ownsLayout(t) ? t : T.ANY);
 		const key = typeArgs?.length
 			? `${name}<${typeArgs.map(t => t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name) ? t.name : T.typeKey(T.resolve(global, t))).join(',')}>`
 			: name;
