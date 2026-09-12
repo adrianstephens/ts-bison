@@ -215,18 +215,18 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   worker to that many declarations and writes a `.partN.json`; the parent retries a crashed file in slices of 24 and
   merges. That is what makes type-utils measurable at all -- each probe re-checks the whole file, and 113 of them in
   one process exhausts the 8GB heap (the machine has 16GB, so raising it is not an option).
-- A REAL MEMORY LEAK, per type-check+codegen run (found 2026-09-12 while diagnosing the survey's OOM). It is NOT one
-  pathological declaration: heap grows ~140MB for EVERY probe, monotonically, so the 8GB worker dies around probe
-  55-60 whichever file it is on. Bisected with env flags now in `assistant/selfhost-survey.ts` (DBG_MEM per-probe heap,
-  DBG_NOCODEGEN, DBG_NOCHECK, DBG_FRESHLIB, DBG_GC):
-    parse only ......... ~4MB/run   (flat -- the parser is fine)
-    + type-check ....... ~60MB/run  (so the CHECKER retains ~56MB per run)
-    + codegen .......... ~140MB/run (so TOWASM retains another ~80MB per run)
-  It survives a forced `global.gc()` before each probe, so it is live retained data, not lazy collection. It is NOT the
-  shared lib scope: a fresh `makeLibScope()` per probe grows identically. No strong module-level Map/Set accumulator
-  exists in the TS sources, and type-utils' own caches (widenCache/substituteTypeCache/mentionsCache) are all WeakMaps.
-  NEXT STEP: two heap snapshots (`v8.writeHeapSnapshot()` after probe 2 and probe 10) and diff object counts by
-  constructor to find what accumulates -- reading code has not found it.
+- A REAL MEMORY LEAK, ~140MB per compile -- FOUND AND FIXED 3005d78. `transform.ts`'s process-wide module-scope
+  caches (`importScopeCache`, `waitingFor`, `ownScopeSettled`) were strong `Map`s keyed by `LoadedModule`, and only
+  one ever deleted. Every compile builds a fresh `ModuleLoader`, so every compile's module `Scope`s -- and through
+  them its whole type and AST graph -- stayed live forever. All three are `WeakMap`s now (every use is get/set/delete
+  by key, none iterates, so semantics are unchanged). Heap with a forced `global.gc()` between probes: FLAT at
+  142 -> 218MB where it previously climbed 142 -> 1294MB. This is why the survey's 8GB worker died on type-utils.
+  How it was found, worth repeating for the next leak: bisect with env flags in `assistant/selfhost-survey.ts` --
+  DBG_MEM (per-probe heap), DBG_NOCODEGEN, DBG_NOCHECK, DBG_FRESHLIB, DBG_REUSE, DBG_GC. Parse alone was flat,
+  parse+check grew, and re-checking ONE cached AST was flat -- which said "checking pins each parsed AST" and pointed
+  straight at the module caches. Ruled out on the way: type-utils' own globals are all fine (widenCache is a Map of
+  at most 8 flag combinations holding WeakMaps; substituteTypeCache/mentionsCache are WeakMaps; `tocode`'s `printing`
+  Set is balanced by try/finally and its typeBudget defaults to Infinity).
 - THE SURVEY CAN LIE, and did: `runWorker` logged a one-line note and resolved when a worker crashed, leaving that
   file's PREVIOUS JSON on disk -- and the tables render from disk, so a crashed file's rows read as "nothing changed".
   The type-utils worker crashes (it is the biggest file, 113 probes), so every type-utils row in a survey run after
