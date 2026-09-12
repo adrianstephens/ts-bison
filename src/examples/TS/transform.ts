@@ -831,11 +831,10 @@ export async function TStypeCheckAsync(program: Module<Stmt>, loader: ModuleLoad
 	}
 
 	// The entry program never goes through `makeScope` (nothing imports it) -- just its own stable identity for `wouldDeadlock`'s bookkeeping.
-	const entrySrc: LoadedModule = { program, canonical: '.' };
 	const entryScope = new Scope(global);
 	// A SCRIPT (no top-level import/export) declares into the global space -- see `Scope.globalSpace`.
 	entryScope.globalSpace = !program.body.some(s => s.type === 'import' || s.type === 'export' || s.type === 'export_decl' || s.type === 'export_assignment');
-	await resolveImports(entrySrc, entryScope, program.body, '.');
+	await resolveImports({ program, canonical: '.' }, entryScope, program.body, '.');
 
 	const depthExhaustion = new Map<string, number>();
 	global.hitDepthLimit = fn => depthExhaustion.set(fn, (depthExhaustion.get(fn) ?? 0) + 1);
