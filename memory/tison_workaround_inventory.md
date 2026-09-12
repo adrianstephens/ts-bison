@@ -57,17 +57,18 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
    (`typeOf1` -> widen=true), so even a variable declared `{ kind: "b" }` reads as `{ kind: string }` and
    the leniency is what keeps that passing. Fix both together: checks use the precise init type, then
    return false here.
-2. **TRIED, NOT LANDED** -- patch kept at `assistant/c2-call-construct.patch` (54 lines). Removing the cross-kind
-   leniency (a plain call falling back to construct signatures and `new` falling back to a call signature) makes the
-   checker match tsc exactly on probe assistant/tsc-probe/s2.ts: TS2348 for a plain call on a construct-only value,
-   TS7009 for `new` on a call-only one (which still evaluates to `any`). Tests, gate 838/838 and libdecls all pass
-   with it. It is NOT committed because it raises self-hosting 13 -> 17: `Array(n)` and `RegExp(...)` called WITHOUT
-   `new` (core.ts 81, js-parser 372, towasm 1274, wasm 1187) are legal only because TS's lib gives `ArrayConstructor`/
-   `RegExpConstructor` BOTH a call and a construct signature, while the towasm lib has `declare class Array<T>` --
-   a class value has no call signature. So the leniency was masking missing lib declarations. Land this TOGETHER with
-   the lib fix, which needs the class+var merge rule already listed below (`declare var Array: ArrayConstructor`
-   alongside the class); `interface TypedArrayConstructor<A>` + `declare var Uint8Array` in lib.d.ts is the precedent
-   that already works.
+2. **DONE 830dc66** (the unconditional half). A plain call on a construct-only value is now TS2348. Its leniency was
+   masking a LIB gap -- `Array(n)`/`RegExp(src, flags)` without `new` -- fixed in the same commit with
+   `interface ArrayConstructor`/`RegExpConstructor` + ambient vars (the `TypedArrayConstructor` shape). STILL OPEN: the
+   `new`-on-a-call-signature direction, which TS reports as TS7009, an implicit-any diagnostic gated on `noImplicitAny`
+   (untracked here) that still evaluates to `any`. Enforcing it unconditionally cost 56 corpus false positives
+   (measured), so it needs `noImplicitAny` tracking first, not a stricter rule.
+   FOUND WHILE DOING IT -- towasm codegen gap: `new Array<number>(3)` compiles, `Array<number>(3)` does NOT
+   ("internal: cannot convert arr:ref:false to arr:f64:false"), because the CALL path does not specialise a generic
+   class constructor the way the construct path does. Pre-existing in kind (generic erasure, section A) but newly
+   REACHABLE now that a call signature exists; JS specifies `Array(n)` and `new Array(n)` as identical, so the fix is
+   to route a plain call on a constructor-backed lib value through the construct path. Affects only files that do not
+   compile yet (js-parser 372, towasm 1274, wasm 1187, core 81); probes assistant/tsc-probe/s4.ts and s5.ts.
 3. Overload no-fit -> WARNING, args unchecked (1628). TS 2769; needs exact overload resolution first.
    (Overloaded class members no longer expose their implementation, 3f23a8a, so this now fires where TS errs.)
 4. isAssignable skips methods/call/index members (2087), function params (2070), missing returns (2069):
