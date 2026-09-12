@@ -221,6 +221,14 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   them its whole type and AST graph -- stayed live forever. All three are `WeakMap`s now (every use is get/set/delete
   by key, none iterates, so semantics are unchanged). Heap with a forced `global.gc()` between probes: FLAT at
   142 -> 218MB where it previously climbed 142 -> 1294MB. This is why the survey's 8GB worker died on type-utils.
+  REUSE IS PRESERVED, measured both ways (assistant/probe-cache-reuse.ts, three compiles in one process):
+    shared loader:  strong 630 -> 0 -> 0ms   weak 678 -> 0 -> 0ms     (full reuse, unchanged)
+    fresh loader:   strong 653 -> 400 -> 388ms   weak 647 -> 380 -> 405ms  (partial, unchanged)
+  The reason is structural, not incidental: these caches are keyed by OBJECT IDENTITY, so reuse depends on the
+  `LoadedModule` surviving -- which means the loader surviving (`ModuleLoader.imported` is per-instance; only
+  `NodeModules.found` is static/process-wide). A `WeakMap` drops an entry only once its key is unreachable, and an
+  unreachable module can never be handed to `get()` again, so nothing hittable is ever lost. With a fresh loader the
+  strong entries were unhittable by construction -- pure retention.
   How it was found, worth repeating for the next leak: bisect with env flags in `assistant/selfhost-survey.ts` --
   DBG_MEM (per-probe heap), DBG_NOCODEGEN, DBG_NOCHECK, DBG_FRESHLIB, DBG_REUSE, DBG_GC. Parse alone was flat,
   parse+check grew, and re-checking ONE cached AST was flat -- which said "checking pins each parsed AST" and pointed
