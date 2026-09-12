@@ -8602,20 +8602,48 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			info.superClass = base;
 			(types[info.typeIndex] as { supertypes: number[] }).supertypes = [base.typeIndex];
 		}
-		if (!typeArgs?.length)
+		return layoutTwin(info, key, structural);
+	}
+
+	// A STRUCTURAL shape's identity is its physical layout -- fields sorted, each by its stored wasm type -- since
+	// wasm struct fields are invariant and two structs with one layout could never convert. Final, supertype-free only.
+	function layoutTwin(info: ClassInfo, ...aliases: string[]): ClassInfo {
+		const sub = types[info.typeIndex];
+		if (info.superClass || !('final' in sub) || !sub.final)
 			return info;
-		// Two instantiations of one generic shape with the same physical layout (`Lit<any>`, `Lit<string | null>`)
-		// are one struct: a JS value has no type arguments, so TS lets either stand for the other.
-		const layout	= `${name}#${info.fields.map(f => `${f.name}${f.optional ? '?' : ''}:${wasmTypeKey(f.wtype)}`).join(',')}`;
+		const fieldKey	= (w: WasmType) => typeof w === 'object' && 'ref' in w && classes.get(w.ref) ? `ref:${classes.get(w.ref)!.name}:${!!w.nullable}` : wasmTypeKey(w);
+		const layout	= `#layout#${info.fields.map(f => `${f.name}${f.optional ? '?' : ''}:${fieldKey(f.wtype)}`).sort().join(',')}`;
 		const twin		= classes.get(layout);
 		if (!twin) {
 			classes.set(layout, info);
-		} else if (!types.slice(info.typeIndex + 1).some(t => mentionsTypeIndex(t, info.typeIndex))) {
-			classes.set(key, twin);
-			classes.set(structural, twin);
-			return twin;
+			return info;
 		}
-		return info;
+		// Refused once a later type already names `info`'s own index: repointing the key would strand it.
+		if (twin === info || types.slice(info.typeIndex + 1).some(t => mentionsTypeIndex(t, info.typeIndex)))
+			return info;
+		// The twin will hold values of both, so its TS type becomes their field-wise union: sound for either, and it
+		// keeps every tag `matchObjectShape`'s discriminant tiebreak reads. No representable union, no merge.
+		const merged = T.typeKey(twin.thisTsType) === T.typeKey(info.thisTsType) ? twin.thisTsType : unionShapes(twin.thisTsType, info.thisTsType);
+		if (!merged)
+			return info;
+		for (const k of aliases)
+			classes.set(k, twin);
+		if (merged !== twin.thisTsType) {
+			twin.thisTsType = merged;
+			classes.set(T.typeKey(merged), twin);
+		}
+		return twin;
+	}
+
+	// Field-wise union of two structural shapes, resolved the way `fieldDeclaredType` resolves them.
+	function unionShapes(a: Type, b: Type): TS.ObjectType | undefined {
+		const ra = resolveObjectType(a, global), rb = resolveObjectType(b, global);
+		if (!ra || !rb)
+			return undefined;
+		const other = new Map(rb.members.flatMap(m => m.type === 'property' && typeof m.key === 'string' ? [[m.key, m.typeAnnotation] as const] : []));
+		return TS.ObjectType(ra.members.map(m => m.type === 'property' && typeof m.key === 'string' && other.has(m.key)
+			? { ...m, typeAnnotation: T.combineTypes([m.typeAnnotation, other.get(m.key)!]) }
+			: m));
 	}
 
 	function mentionsTypeIndex(t: wasm.SubType, index: number): boolean {
@@ -8627,13 +8655,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			: comp.kind === 'func' && (comp.params.some(p => is(p.type)) || comp.results.some(is)));
 	}
 
-	// An anonymous inline object-type annotation (`{value: T; consumed: number}` as a return/field/param
-	// type, never named via `interface`/`type X = ...`) has no name to key `ensureObjectShape` by -- real TS
-	// treats these structurally, but this compiler's struct system is nominal, so it needs *some* identity.
-	// Uses the already-resolved type's own rendered source text (`T.typeKey`) as that identity: two
-	// syntactically-identical anonymous shapes (including after generic substitution, e.g. two different
-	// instantiations that happen to produce the same concrete member types) collapse to one physical struct,
-	// which is correct -- there's no name to keep them apart by even if desired.
+	// An anonymous inline object type has no name to key by, so `T.typeKey` is its cache key; its identity is its
+	// physical layout (`layoutTwin`), so shapes that print differently but store alike share one struct.
 	// Shapes currently being vetted below -- a member whose own type leads back here would otherwise
 	// recurse forever, and a cyclic anonymous shape is exactly one this can't build anyway.
 	const anonShapeVetting = new Set<string>();
@@ -8659,7 +8682,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		} finally {
 			anonShapeVetting.delete(key);
 		}
-		return buildObjectShape(key, obj.members, obj, key, true);
+		return layoutTwin(buildObjectShape(key, obj.members, obj, key, true), key);
 	}
 
 	// Resolves fields and the struct type eagerly, but only collects method/ctor decls -- building each is

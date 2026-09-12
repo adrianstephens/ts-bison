@@ -6622,6 +6622,26 @@ async function main() {
 	}
 
 	{
+		// A structural shape's identity is its physical layout, not its printed type: field order and a literal
+		// vs its widened type change neither. `fieldOrder` crosses `{a;b}` into `{b;a}`; `sameLayoutUnion`'s two
+		// members share one struct, so narrowing and spread must read the tag from the value itself.
+		const { fieldOrder, sameLayoutUnion } = await compile(`
+			type P = { a: number; b: string };
+			function h(q: { b: string; a: number }): number { return q.a + q.b.length; }
+			export function fieldOrder(): number { const p: P = { a: 1, b: "xy" }; return h(p); }
+
+			type K = { type: "a"; v: number } | { type: "b"; v: number };
+			function f(k: K): number { return k.type === "a" ? k.v : -k.v; }
+			function g(k: K): number { const c = { ...k }; return c.type === "b" ? c.v * 10 : c.v; }
+			export function sameLayoutUnion(): number {
+				return f({ type: "a", v: 2 }) + f({ type: "b", v: 3 }) + g({ type: "b", v: 4 }) + g({ type: "a", v: 5 });
+			}
+		`);
+		check('fieldOrder()', fieldOrder(), 3);
+		check('sameLayoutUnion()', sameLayoutUnion(), 44);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
