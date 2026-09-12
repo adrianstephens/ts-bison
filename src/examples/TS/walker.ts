@@ -22,7 +22,9 @@ const typeTags = guard<Type>(['ref', 'literal', 'range', 'template_literal', 'th
 // the tag alone can't tell an object-type literal from an object-literal expression -- a field-level tiebreak can.
 // The `elements` exclusion screens out an array-literal EXPRESSION, which shares the 'array' tag with an array
 // TYPE -- but no expression is tagged 'tuple', so a tuple type (which has `elements`) must not be screened out.
-export const isType = (node: any): node is Type => typeTags(node) && !('properties' in node || ('elements' in node && node.type !== 'tuple') || 'body' in node);
+// A ternary EXPRESSION shares 'conditional' with a conditional TYPE; only the expression has a `test`. Walked as a
+// type, a closure whose body is a bare ternary yielded no identifiers, so nothing in it was ever captured.
+export const isType = (node: any): node is Type => typeTags(node) && !('properties' in node || ('elements' in node && node.type !== 'tuple') || 'body' in node || 'test' in node);
 export const isTsDeclaration	= guard<TS.Declaration>(['type_alias_decl', 'interface_decl', 'enum_decl', 'namespace_decl']);
 // Tests JS statement tags but asserts the wide `TS.Statement`: since js-parser's `X` seam every JS
 // statement IS one, and asserting the narrow type is what used to force casts at the call sites.
