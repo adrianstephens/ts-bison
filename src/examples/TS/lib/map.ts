@@ -163,3 +163,16 @@ class WeakMap<K, V> {
 	set(key: K, value: V): this		{ this.map_.set(key, value); return this; }
 	delete(key: K): boolean			{ return this.map_.delete(key); }
 }
+
+// Backed by `Set`, and not weak either -- same reasoning as `WeakMap` above.
+class WeakSet<T> {
+	private set_: Set<T>;
+
+	constructor(values: readonly T[] = []) {
+		this.set_ = new Set<T>(values);
+	}
+
+	has(value: T): boolean			{ return this.set_.has(value); }
+	add(value: T): this				{ this.set_.add(value); return this; }
+	delete(value: T): boolean		{ return this.set_.delete(value); }
+}

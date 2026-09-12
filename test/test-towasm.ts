@@ -6557,6 +6557,26 @@ async function main() {
 	}
 
 	{
+		// `new X` needs X to be a KNOWN CLASS, so a global the lib never declared fails at codegen, not at checking --
+		// which is how one missing `WeakSet` blocked every declaration in two whole files of the self-hosting survey.
+		const { errClass, weakSet } = await compile(`
+			export function errClass(): number {
+				const e = new SyntaxError("bad token");
+				return e.name.length + e.message.length;
+			}
+			class Node { constructor(public id: number) {} }
+			export function weakSet(): number {
+				const seen = new WeakSet<Node>();
+				const a = new Node(1), b = new Node(2);
+				seen.add(a);
+				return (seen.has(a) ? 1 : 0) + (seen.has(b) ? 10 : 0);
+			}
+		`);
+		check('errClass()', errClass(), 'SyntaxError'.length + 'bad token'.length);
+		check('weakSet()', weakSet(), 1);
+	}
+
+	{
 		// A checker guard that only the LIB scope can catch: here `Array` is a real class, so an `Array<T>` source is
 		// expanded to its members before a union destination is decomposed, and `F['modifiers']` (an optional property's
 		// indexed access, hence `string[] | undefined`) could never be reached by an array again. `compile` throws on any

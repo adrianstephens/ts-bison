@@ -30,3 +30,10 @@ class RangeError extends Error {
 		this.name = 'RangeError';
 	}
 }
+
+class SyntaxError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'SyntaxError';
+	}
+}
