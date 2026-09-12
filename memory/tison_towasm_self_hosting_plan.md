@@ -1851,9 +1851,13 @@ Three fixes TRIED AND INSUFFICIENT, each reverted (do not retry these blind):
 So the blocker is upstream of the discovery pass, not in its member filter. If it resurfaces: log what
 `note` actually receives for the write before changing anything else.
 
-**Next rows** (after the clear): `only direct calls to named functions...` 23; `'??=' needs a nullable
-object-typed target` 22 (checker); `unknown method 'parse'` 22; the family-(b) anonymous-shape row 19;
-`indexing is only supported on number[]/...` 17.
+**Family (b) closed later the same day by `layoutTwin`** -- see [[tison-workaround-inventory]]; 20 moved.
+
+**Next rows**: `only direct calls to named functions...` 23; `'??=' needs a nullable object-typed target`
+21 (checker); `unknown method 'parse'` 22; **`unresolved identifier 'objectKeyNames'` 20** -- where family (b)
+landed: type-utils.ts:1590, a local arrow `const objectKeyNames = (...) => ... objectKeyNames(...)` that
+calls ITSELF, and towasm does not bind a name inside its own initializer (the `recurse` row is likely the
+same gap); `indexing is only supported on number[]/...` 17.
 
 ## Scope
 

@@ -275,11 +275,25 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
       typed-array tag); every reference type is one ref slot and cannot reshape a struct.
   Rows cleared: `Rule<any>`->`Rule<{...}>` 22->0 and 11->0, `Rest<...>` 16->0 and 2->0, "object literal
   needs a known target type" 19->0, plus five singles.
-- **FAMILY (b) IS NOT THE SAME MISTAKE** -- measured. `internal: cannot convert ref:{...}:true to
-  ref:{...}:true` sat at 19 before and after (towasm/type-utils). It is ANONYMOUS object shapes keyed by
-  their narrowed member types, with no generic involved, so the erasure above cannot reach it. Treat it
-  as its own root; the towasm.ts:3140 constraint (shapes must not simply be widened, because
-  `matchObjectShapeByType`'s discriminant tiebreak needs the literal precision) still stands.
+- **FAMILY (b) CLOSED too (`layoutTwin`) -- it WAS the same mistake, one level over.** The erasure could not
+  reach it because no generic is involved: all 19 were ONE pair of ANONYMOUS shapes, `{type:"keyof";
+  argument:Type}` vs `{type:string; argument:Type}`, byte-identical in layout (`type:arr:i16 argument:ref:any`),
+  both built by `ensureAnonObjectShape` (so the older "not created through that path" note was wrong).
+  `ensureObjectShape` already had a layout-twin block, but keyed `name#fields-in-order` and applied only to
+  generics. Now one helper, `layoutTwin`, used by BOTH shape builders: key = fields SORTED, each by stored wasm
+  type, refs canonicalized to their struct; only FINAL, supertype-free shapes (merging into a struct with
+  subtypes would make `ref.test` on it accept them); refused if a later type already names the new index
+  (`mentionsTypeIndex`). Survey: 19 + 1 moved, all onto `unresolved identifier 'objectKeyNames'`.
+- **A merged struct's `thisTsType` is the FIELD-WISE UNION of the merged shapes, not a widening.** Widening
+  literals was tried first and broke `matchObjectShape`'s discriminant tiebreak: every single-field
+  `{type: <tag>}` shape in the compiler shares one layout, so they all merge, and a struct left carrying ONE
+  member's tag (a named-interface twin never got widened) excluded every other tag -- measured on transform.ts
+  `BuildStateMachine`, `define(id, [], { type: 'complete' })` -> "object literal needs a known target type".
+  The union (`{type: 'this' | 'complete' | ...}`) is sound for every value AND keeps every tag. No
+  representable union (`resolveObjectType` fails) -> the merge is refused rather than keeping one member's type.
+- **Field ORDER had zero measured cases**: `matchObjectShape`/`matchObjectShapeByType` already match candidates
+  by field-name SET, so `{a;b}` into `{b;a}` compiled before `layoutTwin` too (test-towasm `fieldOrder`). The
+  sorted key is still right -- it just is not what closed anything.
 - **The `ensureClass` merge is restricted to a METHOD-FREE class, and that restriction is measured, not
   cautious.** A method body is compiled against the instantiation it was reached through
   (`substElemMethods`), so merging two instantiations whose methods differ runs code built for one layout
