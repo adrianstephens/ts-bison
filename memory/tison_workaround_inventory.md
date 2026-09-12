@@ -167,13 +167,14 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   2 errors in type-utils/towasm and silently added NINE in js-parser/ts-parser, and the corpus A/B was neutral
   throughout (the corpus runs against lib.esnext.full, so a towasm-lib-scope regression is invisible to it). Reverted
   in 29fce5d.
-- OPEN, blocked (the optional indexed access, 60d23d4 reverted): `S['kind']` for `kind?: K` must be `K | undefined`
-  (tsc-verified) and fixing it removes type-utils 3145 and towasm 2386. It is blocked by a pre-existing RELATION gap:
-  an unresolved indexed access is OPAQUE and `isAssignable`'s opaque branch passes it leniently, so making it a union
-  exposes that the same resolved destination `string[] | undefined` is accepted written out but rejected through the
-  indexed access -- by then the source is the towasm lib's EXPANDED `Array` class shape, and no rule relates an object
-  shape to an `Array<T>` destination (`dst.name !== 'Array'` excludes it from the structural path). Repro:
-  assistant/tsc-probe/r3.ts, `take2` fails where `take3` passes. Fix that relation gap first.
+- An `Array<X>` source could not reach an `Array<Y>` destination through ANY extra level of recursion: `isAssignable`
+  expanded a non-primitive ref source to its members (`resolveMembers`) BEFORE decomposing a union/intersection
+  destination, while `Array`/`ReadonlyArray` destinations are excluded from the structural path -- so once the by-name
+  Array comparison (which runs before `resolve`) was passed, array-ness was gone for good. Fixed by deferring that
+  expansion while `dst` is still a union or intersection, so each member re-enters with the ref intact. This is what
+  blocked the optional indexed access (`S['kind']` as `K | undefined` adds exactly one union level): both are in now.
+  Only the TOWASM lib scope reproduces it (there `Array` is a real class); test-towasm's `arrayThroughUnion` guards it,
+  and test-checker (lib.esnext.full) CANNOT -- a checker-suite case for this passes either way.
 - OPEN, blocked (towasm lib `flatMap`): it declares `callback: (...) => U[]` where TS declares `U | readonly U[]`, so
   `xs.flatMap(x => f(x) ?? [])` (self-hosting type-utils 798) is rejected, and U silently infers `any`. Declaring TS's
   form needs union-target inference first: `U | readonly U[]` against `string[]` must infer `U = string` (TS's
