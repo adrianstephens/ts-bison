@@ -264,6 +264,31 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
         `ensureAnonObjectShape` -- the failing pair is not created through that path, so first find where each struct
         IS built (log inside `buildObjectShape`, BEFORE its `const info` object literal, not inside it).
   Attack the identity rule once, generally, rather than the two symptoms separately.
+- **FAMILY (a) CLOSED `80ac3c4` -- 77 declarations moved, the largest survey delta this plan has recorded.**
+  The rule was: struct identity came from `T.typeKey` (the type's printed TEXT), finer-grained than the
+  physical layout, and wasm struct fields are mutable hence INVARIANT -- so separate structs could never
+  have been convertible no matter how they were built. Two halves, one rule:
+  (i) `ensureObjectShape` (generic interface/alias -- a pure layout, no compiled code of its own) erases
+      every type-parameter position to the parameter's constraint (`?? any`) and keys by bare NAME.
+  (ii) `ensureClass` already had the rule as `if (name === 'Array')` -- a name special-case of the general
+      truth: a type argument earns its own instantiation only when stored UNBOXED (a scalar, or a
+      typed-array tag); every reference type is one ref slot and cannot reshape a struct.
+  Rows cleared: `Rule<any>`->`Rule<{...}>` 22->0 and 11->0, `Rest<...>` 16->0 and 2->0, "object literal
+  needs a known target type" 19->0, plus five singles.
+- **FAMILY (b) IS NOT THE SAME MISTAKE** -- measured. `internal: cannot convert ref:{...}:true to
+  ref:{...}:true` sat at 19 before and after (towasm/type-utils). It is ANONYMOUS object shapes keyed by
+  their narrowed member types, with no generic involved, so the erasure above cannot reach it. Treat it
+  as its own root; the towasm.ts:3140 constraint (shapes must not simply be widened, because
+  `matchObjectShapeByType`'s discriminant tiebreak needs the literal precision) still stands.
+- **The `ensureClass` merge is restricted to a METHOD-FREE class, and that restriction is measured, not
+  cautious.** A method body is compiled against the instantiation it was reached through
+  (`substElemMethods`), so merging two instantiations whose methods differ runs code built for one layout
+  against the other: a wasm `invalid struct index` in test-towasm plus one difftest disagreement
+  (`conform/async/generatorValueUndefinedAfterDone`, wasm 0 vs TS 1). Excluding only the CONSTRUCTOR from
+  that test (tried: a constructor just writes the shared layout) reproduces the same disagreement, so a
+  constructor is NOT safe to ignore. `name === 'Array'` therefore survives as the one method-bearing class
+  whose collapse is known sound; removing it needs the collapse to become authoritative for method
+  instantiation too.
 - `assistant/probe-one-decl.ts <file> <declName>` compiles ONE declaration the way the survey does (its `variantBody`:
   the whole module compiles, only the target is exported) and prints the error WITH its position -- the survey strips
   positions deliberately, to cluster causes, so this is how you turn a cluster back into a source line.

@@ -1823,6 +1823,37 @@ Three lessons worth keeping:
 `Type '{k,v}' is not callable` — naming the *element* type, because member lookup falls through to
 the numeric index signature. That message actively disguises clusters; fixing it re-clusters rows.
 
+## 2026-09-12: the identity rule, once (`80ac3c4`) -- 77 moved, the largest delta recorded
+
+Struct identity came from `T.typeKey`, the type's printed TEXT, which is finer than the physical layout.
+Since wasm struct fields are mutable and therefore INVARIANT, two instantiations sharing a layout got two
+structs that nothing could ever convert between -- every `internal: cannot convert ref:X<a> to ref:X<b>`
+in the table was this one mistake. Fixed in both places at once (see [[tison-workaround-inventory]] for
+the full rule and the rows it cleared). `compiled` went 68/324 -> 67/326 while 77 declarations moved:
+**read the moved/regressed lines, never the flat total** -- exactly the trap this file already warns about.
+
+**Method that worked, and is worth repeating.** The inventory said "log inside `buildObjectShape` BEFORE
+its `const info` literal". That was right, and one step short: logging the KEY showed four `Rest<...>`
+being built, but only logging each built struct's FIELD WASM TYPES showed why -- two of the four were
+already byte-identical (`Rest<any>` and `Rest<unknown>`), which is what proved the key, not the layout,
+was the bug. **Log the layout, not just the key.** `SHAPELOG`-style `process.env` logging inside
+towasm.ts is fine for probing but MUST be removed before surveying (this file's own toggle trap).
+
+**One regression, mine, still open**: `patternBindings` REGRESSED (compiled before). `eee985a` added
+`markSynthetic`, whose `(s as any).synthetic = true` towasm cannot compile -- `unknown field 'synthetic'`,
+an expando write reached through a generic type parameter. Three fixes TRIED AND INSUFFICIENT, each
+reverted (do not retry these blind):
+- resolving each union member as well in the expando-discovery `note` pass, to reach `S`'s constraint;
+- dropping the `part.typeArgs?.length` skip there, since a generic now has one struct keyed by bare name;
+- routing the write through a `Stmt`-typed helper so the receiver is a real union rather than `S`;
+- and the last two TOGETHER.
+So the blocker is upstream of the discovery pass, not in its member filter. Next: log what `note`
+actually receives for that write before changing anything else.
+
+**Next rows** (after the clear): `only direct calls to named functions...` 23; `'??=' needs a nullable
+object-typed target` 22 (checker); `unknown method 'parse'` 22; the family-(b) anonymous-shape row 19;
+`indexing is only supported on number[]/...` 17.
+
 ## Scope
 
 In: towasm.ts, checker.ts, type-utils.ts, walker.ts, transform.ts, tison.ts, ts-parser.ts,
