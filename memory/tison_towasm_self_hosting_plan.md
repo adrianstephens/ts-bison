@@ -1853,11 +1853,33 @@ So the blocker is upstream of the discovery pass, not in its member filter. If i
 
 **Family (b) closed later the same day by `layoutTwin`** -- see [[tison-workaround-inventory]]; 20 moved.
 
-**Next rows**: `only direct calls to named functions...` 23; `'??=' needs a nullable object-typed target`
-21 (checker); `unknown method 'parse'` 22; **`unresolved identifier 'objectKeyNames'` 20** -- where family (b)
-landed: type-utils.ts:1590, a local arrow `const objectKeyNames = (...) => ... objectKeyNames(...)` that
-calls ITSELF, and towasm does not bind a name inside its own initializer (the `recurse` row is likely the
-same gap); `indexing is only supported on number[]/...` 17.
+## `objectKeyNames` closed -- and a walker bug under it (2026-09-12, evening)
+
+Two separate general fixes, both found by writing the regression test FIRST:
+- **Nested self-reference** (towasm): `ensureForwardHolder` only scanned the function's TOP-LEVEL
+  `var_decl`s, and `objectKeyNames` sits in a switch case. `FunctionContext.initializing` now holds the
+  declarators whose initializers are compiling; the forward-holder lookup checks it first, so a closure in
+  its own initializer finds itself at any depth and its holder lands in that block's scope. Do NOT widen
+  the shallow scan to outer blocks instead: the holder would be declared in the INNER scope and the outer
+  declaration could never fill it. (That latent hazard already exists for a nested closure forward-
+  referencing a later TOP-LEVEL sibling -- OPEN, untested.)
+- **Walker root misclassification** (walker.ts `isType`): a bare ternary EXPRESSION root shares the tag
+  'conditional' with a conditional TYPE and the field tiebreak did not cover it, so `walkB`/`walk` walked it
+  as a type -- a closure whose body is a bare ternary had NO free variables and captured nothing. Fixed by
+  shape (`test` exists only on the expression). OPEN: `this` and `literal` are IDENTICAL in shape as type
+  and expression, so `() => this` is still walked as a type; flipping the default breaks type walkers on a
+  bare `this` return type -- needs caller-stated intent, not a guess.
+Survey: 3 newly compile, 39 moved, 68 -> 71/325. The `parseInt` rows only RELABELED (call to unknown
+function -> unresolved identifier) -- those closures now see `parseInt` as a free name; same blocker.
+
+**Next rows**: `'??=' needs a nullable object-typed target` 44 (where objectKeyNames' 20 landed);
+`unknown method 'parse'` 22; `only direct calls to named functions...` 21; `indexing is only supported on
+number[]/...` 17; `unresolved identifier 'parseInt'` 12; `param 'value' needs an explicit type` 12.
+
+**Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
+relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
+my own grep filter (`grep -v 'free=\[\]'`) hid the decisive log line for three rounds: when a probe prints
+nothing, rerun it UNFILTERED before concluding a code path was never reached.
 
 ## Scope
 
