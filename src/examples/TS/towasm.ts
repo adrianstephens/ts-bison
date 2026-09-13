@@ -2727,6 +2727,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return JS.Call(JS.Member(iterator, 'next'), T.isNullish(it.next, ctx.typeScope) ? [] : [{ type: 'identifier', name: 'undefined' }]);
 	}
 
+	// Every remaining value of an iterator, into a new array: what JS's `...` does with an iterable, and a rest pattern.
+	function drainIterator(iterator: Expr, it: T.IterationTypes, ctx: FunctionContext): Expr {
+		const arrName = `#iter$${destructureTempCounter++}`, rName = `#iter$${destructureTempCounter++}`;
+		const arr: Expr = { type: 'identifier', name: arrName }, r: Expr = { type: 'identifier', name: rName };
+		emitStmt(JS.VarDecl('const', JS.Var(arrName, { type: 'array', elements: [] } as Expr, TS.ArrayType(it.yield))), ctx);
+		emitStmt(JS.For(
+			JS.VarDecl('let', JS.Var(rName, nextCall(iterator, it, ctx))),
+			JS.JSUnary('!', JS.Member(r, 'done')),
+			{ type: 'assign', target: r, value: nextCall(iterator, it, ctx) } as Expr,
+			{ type: 'expression' as const, expression: JS.Call(JS.Member(arr, 'push'), [JS.Member(r, 'value')]) },
+		), ctx);
+		return arr;
+	}
+
+	// A spread operand as an array: a non-array iterable's iterator drained into one, anything else as it is.
+	function spreadSource(operand: Expr, ctx: FunctionContext): Expr {
+		const it = iteratesByProtocol(operand, ctx);
+		if (!it)
+			return operand;
+		const itName = `#iter$${destructureTempCounter++}`;
+		emitStmt(JS.VarDecl('const', JS.Var(itName, JS.Call(JS.Member(operand, '[Symbol.iterator]'), []))), ctx);
+		return drainIterator({ type: 'identifier', name: itName }, it, ctx);
+	}
+
 	// A destructuring pattern bound from `value` one level at a time: each level is materialized into a typed temp first, so
 	// an array pattern indexes an array/tuple and iterates anything else, decided from that level's own type.
 	function emitPatternBinding(kind: JS.DeclarationKind, target: BindingTarget, value: Expr, typeAnnotation: Type | undefined, ctx: FunctionContext): void {
@@ -2767,17 +2791,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					? { type: 'conditional', test: JS.Member(r, 'done'), consequent: el.default, alternate: Binary('??', got, el.default) } as Expr
 					: got, el.default ? undefined : it.yield, ctx);
 			}
-			if (target.rest) {
-				const rest = temp(), r = temp();
-				declare(rest, { type: 'array', elements: [] } as Expr, TS.ArrayType(it.yield));
-				emitStmt(JS.For(
-					JS.VarDecl('let', JS.Var((r as { name: string }).name, nextCall(iterator, it, ctx))),
-					JS.JSUnary('!', JS.Member(r, 'done')),
-					{ type: 'assign', target: r, value: nextCall(iterator, it, ctx) } as Expr,
-					{ type: 'expression' as const, expression: JS.Call(JS.Member(rest, 'push'), [JS.Member(r, 'value')]) },
-				), ctx);
-				emitPatternBinding(kind, target.rest, rest, undefined, ctx);
-			}
+			if (target.rest)
+				emitPatternBinding(kind, target.rest, drainIterator(iterator, it, ctx), undefined, ctx);
 			return;
 		}
 
@@ -4171,10 +4186,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					ctx.emit(I.local.set(value));
 					parts.push({ spread: false, value });
 				} else if (el.type === 'spread') {
-					const srcKind = objectArrayKind(el.operand, ctx);
+					const operand = spreadSource(el.operand, ctx);
+					const srcKind = objectArrayKind(operand, ctx);
 					if (srcKind !== kind)
 						throw 'a spread element in an array literal must be an array of the same element type';
-					emitAs(el.operand, ctx, ARR_WTYPE[srcKind]);
+					emitAs(operand, ctx, ARR_WTYPE[srcKind]);
 					const src = ctx.temp(`$spread$src$${i}`, ARR_WTYPE[srcKind]);
 					const len = ctx.temp(`$spread$len$${i}`, 'i32');
 					ctx.emit(I.local.set(src), I.local.get(src), I.array.len, I.local.set(len));

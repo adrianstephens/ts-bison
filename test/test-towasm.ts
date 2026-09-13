@@ -6908,6 +6908,19 @@ async function main() {
 	}
 
 	{
+		// A spread of a non-array iterable drains its iterator into the new array, as JS does (type-utils.ts's `[...new Set(...)]`).
+		const { spreadSet, spreadGen, spreadMap } = await compile(`
+			export function spreadSet(): number { const xs = [...new Set<number>([3, 1, 3, 2])]; return xs.length * 100 + xs[0] * 10 + xs[2]; }
+			function* gen(): Generator<number, void, unknown> { yield 7; yield 8; }
+			export function spreadGen(): number { const xs = [1, ...gen(), 9]; return xs.length * 1000 + xs[1] * 100 + xs[2] * 10 + xs[3]; }
+			export function spreadMap(): number { const m = new Map<string, number>([['a', 5]]); const es = [...m]; return es.length * 10 + es[0][1]; }
+		`);
+		check('spreadSet()', spreadSet(), 332);
+		check('spreadGen()', spreadGen(), 4789);
+		check('spreadMap()', spreadMap(), 15);
+	}
+
+	{
 		// An array pattern over a non-array iterates, as JS does (`const [[name, arg]] = map`, type-utils.ts's `substituteType`).
 		const { destrMap, destrGen, destrDefaults, destrParam } = await compile(`
 			export function destrMap(): number { const m = new Map<string, number>([['ab', 7], ['c', 1]]); const [[k, v]] = m; return k.length * 10 + v; }
