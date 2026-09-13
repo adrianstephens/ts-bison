@@ -6,7 +6,7 @@ import v8 from 'v8';
 import * as TS from '../src/examples/TS/ts-parser';
 import * as T from '../src/examples/TS/type-utils';
 import { TStoWasm, makeLibScope } from '../src/examples/TS/towasm';
-import { quoteString } from '../src/examples/TS/tocode';
+import { quoteString } from '../src/examples/TS/printer';
 import { TStypeCheck, TStypeCheckAsync } from '../src/examples/TS/transform';
 import { ModuleLoader, collectModules } from '../src/examples/TS/module-loader';
 import { SEVERITY } from '../src/examples/TS/checker';

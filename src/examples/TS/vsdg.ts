@@ -2,7 +2,7 @@
 import * as JS from './js-parser';
 import * as TS from './ts-parser';
 import { Identifier, Literal, Unary, Binary, Assign, If, While, DoWhile } from '../common';
-import { walkB, calcUnary, calcBinary, WalkerB, isJsStatement, isTsDeclaration } from './walker';
+import { walkerB, calcUnary, calcBinary, WalkerB, isJsStatement, isTsDeclaration } from './walker';
 import { patternBindings as buildPatternBindings } from './transform';
 import { tocode } from './type-utils';
 
@@ -773,7 +773,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 		};
 	}
 
-	walkB(
+	walkerB(
 		(s, process, recurse) => {
 			switch (s.type) {
 				case 'function_decl':

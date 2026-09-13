@@ -1,7 +1,7 @@
 import assert from 'assert';
 import * as TS from '../src/examples/TS/ts-parser';
 import { BuildVSDG, Optimize, applyGlobalCodeMotion, BuildProgram } from '../src/examples/TS/vsdg';
-import { Output as CodeOutput } from '../src/examples/TS/tocode';
+import { printer as codePrinter } from '../src/examples/TS/printer';
 
 // Regression suite for vsdg.ts's BuildVSDG -> applyGlobalCodeMotion -> Output pipeline: builds
 // the VSDG for a program, schedules it, and reconstructs source from the result, then checks the
@@ -13,7 +13,7 @@ import { Output as CodeOutput } from '../src/examples/TS/tocode';
 // naming-convention placeholder for real purity analysis (not implemented yet) -- see the `pure`
 // check in BuildVSDG's 'call' case. Every other call name is treated as effectful.
 
-const printer = new CodeOutput();
+const printer = codePrinter();
 
 // Every (name, src, expected) triple `check` is given, in call order -- populated as a side effect
 // of running `main` below, purely so a SEPARATE harness (e.g. one verifying Output's no-blocks path

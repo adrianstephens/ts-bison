@@ -2,7 +2,7 @@ import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
 import { Module, Location, Identifier, Literal, Binary, Conditional, Assign, Await, Member, ExprStmt, hasMod, dropMod, If, While } from '../common';
-import { walk, walkB, calcUnary, calcBinary } from './walker';
+import { walker, walkerB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, typeOf1, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
 
@@ -30,7 +30,7 @@ const typeMasks = {
 } as const;
 
 export function foldConstants<T extends Expr>(e: T) {
-	return walk(
+	return walker(
 		undefined,
 		(expr, process) => {
 			expr = process(expr);
@@ -152,7 +152,7 @@ export function foldConstants<T extends Expr>(e: T) {
 // here -- real, but narrower and deferred; only a plain 'let x = ...'/'const x = ...' is hoisted.
 export function collectHoistedLocals(body: Stmt[]): Map<string, { stmt: Stmt; decl: JS.Var<Type> }> {
 	const decls = new Map<string, { stmt: Stmt; decl: JS.Var<Type> }>();
-	walkB(
+	walkerB(
 		(s, process) => {
 			if (s.type === 'var_decl') {
 				for (const d of s.declarations) {
@@ -250,7 +250,7 @@ export function BuildStateMachine(stmts: Stmt[]) {
 
 	// Stops at a nested closure boundary (a yield/await inside it belongs to *that* function, not this one)
 	function containsSuspend(stmt: Stmt): boolean {
-		return walkB(
+		return walkerB(
 			undefined,
 			(e, process) => suspendExpr(e as Expr) ? true : (e.type === 'arrow' || e.type === 'function') ? false : process(e)
 		).statement(stmt);
@@ -260,7 +260,7 @@ export function BuildStateMachine(stmts: Stmt[]) {
 	// or continue that would target the loop/switch containing `body` directly, not a nested one (which
 	// establishes its own break/continue scope, same reasoning `case 'switch'`'s own scoping needs).
 	function containsOwnBreakOrContinue(body: Stmt): boolean {
-		return walkB(
+		return walkerB(
 			(s, process) => {
 				if (s.type === 'break' || s.type === 'continue')
 					return true;
@@ -495,7 +495,7 @@ export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget,
 const dropOptional = (p: JS.Param<any>) => dropMod(p, 'optional');
 
 export function TStoJS(ast: Module<Stmt>) {
-	return walk(
+	return walker(
 		//onStatement
 		(stmt, process) => {
 			switch (stmt.type) {
@@ -1209,7 +1209,7 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 
 	// ---- Strip bodies/initializers down to their essentials in one pass, registering owners as we go --
 
-	const stripped = walk((stmt, process) => {
+	const stripped = walker((stmt, process) => {
 		switch (stmt.type) {
 			case 'import':
 				return stmt;
@@ -1262,7 +1262,7 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 		}
 	}).module(program);
 
-	const declRefs = (refs: Set<string>) => walk(
+	const declRefs = (refs: Set<string>) => walker(
 		undefined,
 		(e, process) => {
 			if (e.type === 'identifier')
@@ -1300,7 +1300,7 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 
 	stripped.body.splice(stripped.body.findLastIndex(i => i.type === 'import') + 1, 0, ...syntheticBases);
 
-	return walk(
+	return walker(
 		(stmt, process) => {
 			switch (stmt.type) {
 				case 'import':

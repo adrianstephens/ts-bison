@@ -3,7 +3,7 @@ import * as TS from '../src/examples/TS/ts-parser';
 import * as T from '../src/examples/TS/type-utils';
 import * as vsdg from '../src/examples/TS/vsdg';
 
-import { Output} from '../src/examples/TS/tocode';
+import { printer } from '../src/examples/TS/printer';
 import { TStoDecl, TStoJS, TStypeCheck, TStypeCheckAsync, loadLib } from '../src/examples/TS/transform';
 import { ModuleLoader } from '../src/examples/TS/module-loader';
 
@@ -11,7 +11,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { SEVERITY } from '../src/examples/TS/checker';
 
-const output = new Output();
+const output = printer();
 const total_sev = [] as number[];
 
 const parser = TS.make();

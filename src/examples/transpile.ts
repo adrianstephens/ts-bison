@@ -6,9 +6,9 @@ import * as JS from './TS/js-parser';
 import * as PY from './PY/py-parser';
 import * as C from './CPP/c-parser';
 import * as CPP from './CPP/cpp-parser';
-import { Output as PYOutput, Options as PYOptions } from './PY/tocode';
-import { Output as TSOutput, Options as TSOptions } from './TS/tocode';
-import { Output as CPPOutput, Options as CPPOptions } from './CPP/tocode';
+import { printer as PYprinter, Options as PYOptions } from './PY/printer';
+import { printer as TSprinter, Options as TSOptions } from './TS/printer';
+import { printer as CPPprinter, Options as CPPOptions } from './CPP/printer';
 import { isExpr as isCppExprNode, isPackParameter as isCppPackParameter } from './CPP/walker';
 import { Module, bodyOf, Identifier, Literal, Unary, UnaryPost, Binary, Call, Member, Index, Conditional, Spread, Sequence, Assign, Await, Yield, ExprStmt, Return, Throw, If, While, DoWhile } from './common';
 
@@ -292,7 +292,7 @@ function TS2PY(ts: Module<TS.Stmt>) {
 }
 
 export function ts2py(source: string, opts?: PYOptions): string {
-	return new PYOutput(opts).statements(TS2PY(TS.parse(source)));
+	return PYprinter(opts).statements(TS2PY(TS.parse(source)));
 }
 
 // ===================================================================
@@ -629,7 +629,7 @@ function PY2TS(py: Module<PY.Stmt>) {
 }
 
 export function py2ts(source: string, opts?: TSOptions): string {
-	return new TSOutput(opts).statements(PY2TS(PY.parse(source)));
+	return TSprinter(opts).statements(PY2TS(PY.parse(source)));
 }
 
 // ===================================================================
@@ -1038,7 +1038,7 @@ function CPP2TS(cpp: Module<CPP.Definition>) {
 
 export async function cpp2ts(source: string, opts?: TSOptions, cppOpts?: CPP.Options): Promise<string> {
 	const unit = await CPP.parse(source, cppOpts);
-	return new TSOutput(opts).statements(CPP2TS(unit));
+	return TSprinter(opts).statements(CPP2TS(unit));
 }
 
 // cpp -> py composes onto the TS AST rather than duplicating another bespoke cpp <-> py mapping:
@@ -1047,7 +1047,7 @@ export async function cpp2ts(source: string, opts?: TSOptions, cppOpts?: CPP.Opt
 // coverage is the INTERSECTION of both stages' `unsupported()` sets, not a new union of its own.
 export async function cpp2py(source: string, opts?: PYOptions, cppOpts?: CPP.Options): Promise<string> {
 	const unit = await CPP.parse(source, cppOpts);
-	return new PYOutput(opts).statements(TS2PY({type: 'module', body: CPP2TS(unit)}));
+	return PYprinter(opts).statements(TS2PY({type: 'module', body: CPP2TS(unit)}));
 }
 
 // ===================================================================
@@ -1357,7 +1357,7 @@ function TS2CPP(ts: Module<TS.Stmt>) {
 	return ts.body.flatMap(topLevel);
 }
 export function ts2cpp(source: string, opts?: CPPOptions): string {
-	return new CPPOutput(opts).module({ type: 'module', body: TS2CPP(TS.parse(source)) });
+	return CPPprinter(opts).module({ type: 'module', body: TS2CPP(TS.parse(source)) });
 }
 
 // ===================================================================
@@ -1725,5 +1725,5 @@ function PY2CPP(py: Module<PY.Stmt>) {
 }
 
 export function py2cpp(source: string, opts?: CPPOptions): string {
-	return new CPPOutput(opts).module({ type: 'module', body: PY2CPP(PY.parse(source)) });
+	return CPPprinter(opts).module({ type: 'module', body: PY2CPP(PY.parse(source)) });
 }

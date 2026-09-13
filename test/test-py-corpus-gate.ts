@@ -16,7 +16,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { parse } from '../src/examples/PY/py-parser';
-import { Output } from '../src/examples/PY/tocode';
+import { printer } from '../src/examples/PY/printer';
 import { corpusPresent, corpusFiles, unsupportedMap } from './py-corpus';
 
 const BASELINE = path.join(__dirname, 'py-corpus-gate-baseline.json');
@@ -37,8 +37,8 @@ interface Baseline { files: number; failed: number; note: string }
 		const source = await fs.readFile(file, 'utf8');
 		try {
 			const ast1 = parse(source);
-			const printed1 = new Output().module(ast1);
-			const printed2 = new Output().module(parse(printed1));
+			const printed1 = printer().module(ast1);
+			const printed2 = printer().module(parse(printed1));
 			if (printed1 !== printed2)
 				failures.push(`${file} [unstable round-trip]`);
 		} catch (e) {

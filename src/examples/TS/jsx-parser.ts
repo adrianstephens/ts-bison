@@ -1,7 +1,7 @@
 import { Rules, Forward, MaybeList, terminal, ForceFork } from '../../tison';
 import * as JS from './js-parser';
 import { Module, Literal, Identifier } from '../common';
-import { walk } from './walker';
+import { walker } from './walker';
 
 const Rule = JS.Rule;
 const IDENT = JS.IDENT;
@@ -229,7 +229,7 @@ export function lower(program: Module<any>, options: typeof OptionsDefault) {
 
 	const used: Record<string, boolean> = {};
 
-	const lowered = walk(undefined, (expr, process) =>
+	const lowered = walker(undefined, (expr, process) =>
 		expr.type === 'jsx' ? lower(process(expr)) : process(expr)
 	).module(program);
 

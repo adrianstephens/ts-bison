@@ -1,10 +1,10 @@
 import { parse, Expr, Stmt } from '../src/examples/PY/py-parser';
-import { Output } from '../src/examples/PY/tocode';
+import { printer } from '../src/examples/PY/printer';
 import { walk, walkB } from '../src/examples/PY/walker';
 
 let pass = 0, fail = 0;
 const dump = process.argv.includes('-v');
-const out = new Output();
+const out = printer();
 
 function test(name: string, code: string) {
 	try {

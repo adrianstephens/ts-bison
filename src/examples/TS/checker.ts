@@ -2,9 +2,9 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import { Literal, hasMod, Location, getPos } from '../common';
-import { isTsDeclaration, walk, walkB } from './walker';
+import { isTsDeclaration, walker, walkerB } from './walker';
 import * as T from './type-utils';
-import { Output } from './tocode';
+import { printer } from './printer';
 
 export const SEVERITY = {
 	GAP:		0,	// known missing functionality (see the header's own gap list) -- not a judgment call, just a reminder
@@ -14,7 +14,7 @@ export const SEVERITY = {
 export type SEVERITY = (typeof SEVERITY)[keyof typeof SEVERITY];
 export type Err = (sev: SEVERITY, pos: Location) => (strings: TemplateStringsArray, ...values: (string | number | undefined)[]) => void;
 // A fresh printer per interpolated value: `typeBudget` is spent per `Output` instance, never reset.
-const show = () => new Output({ typeBudget: 4096 });
+const show = () => printer({ typeBudget: 4096 });
 
 type Type		= TS.Type;
 type Expr		= TS.Expr;
@@ -495,9 +495,9 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	// the shape holds that very member, so embedding the shape itself would make the type cyclic.
 	const selfRefs = (t: Type): Type => {
 		const name = c.name;
-		if (!name || !walkB(undefined, undefined, (x, process) => x === value || x === instance || process(x)).type(t))
+		if (!name || !walkerB(undefined, undefined, (x, process) => x === value || x === instance || process(x)).type(t))
 			return t;
-		return walk(undefined, undefined, (x, process) => x === value ? { type: 'typeof', name } : x === instance ? ctorReturn : process(x)).type(t) ?? t;
+		return walker(undefined, undefined, (x, process) => x === value ? { type: 'typeof', name } : x === instance ? ctorReturn : process(x)).type(t) ?? t;
 	};
 
 	// Installed only now, *after* the walks above -- a self-memoizing lazy getter
@@ -562,7 +562,7 @@ function stampBranch(branch: Expr, branchScope: Scope, scope: Scope) {
 // Whether any of `names` is written anywhere in `body`: an assignment, or `++`/`--` on either side.
 function writesAny(body: JS.Stmt<any>[] | Expr, names: Set<string>): boolean {
 	let found = false;
-	walkB(undefined, (x: any, process: (x: any) => boolean) => {
+	walkerB(undefined, (x: any, process: (x: any) => boolean) => {
 		if ((x.type === 'assign' && x.target.type === 'identifier' && names.has(x.target.name))
 			|| ((x.type === 'unary' || x.type === 'unary_post') && (x.operator === '++' || x.operator === '--') && x.operand.type === 'identifier' && names.has(x.operand.name)))
 			found = true;
@@ -1915,7 +1915,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						if (resolveParam && typeof resolveParam.key === 'string') {
 							const resolveName = resolveParam.key;
 							const resolvedTypes: Type[] = [];
-							walkB(undefined, (x, process) => {
+							walkerB(undefined, (x, process) => {
 								if (x.type === 'call' && x.callee.type === 'identifier' && x.callee.name === resolveName) {
 									const arg = x.arguments[0];
 									resolvedTypes.push(arg && arg.type !== 'spread' ? recurse(arg) : T.UNDEFINED);

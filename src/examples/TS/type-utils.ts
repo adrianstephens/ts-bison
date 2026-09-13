@@ -4,8 +4,8 @@ import * as JS from './js-parser';
 import { Literal, hasMod } from '../common';
 import { Expr, BindingTarget } from './js-parser';
 import { Type } from './ts-parser';
-import { walk, walkB, WalkerB } from './walker';
-import { Output } from './tocode';
+import { walker, walkerB, WalkerB } from './walker';
+import { printer } from './printer';
 
 // ===================================================================
 //  Type utilities
@@ -50,7 +50,7 @@ const OPAQUE_GAP	= new Set(['keyof', 'indexed_access', 'conditional', 'infer', '
 // A Map, not an object: it is indexed by names from source, and `constructor`/`toString` must not find `Object.prototype`'s.
 const BOXED_PRIMITIVE = new Map([['string', 'String'], ['number', 'Number'], ['boolean', 'Boolean'], ['bigint', 'BigInt'], ['symbol', 'Symbol']]);
 
-export const tocode = new Output({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
+export const tocode = printer({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
 export function typeKey(t: Type) { return tocode.type(t); }
 export function exprKey(e: Expr) { return tocode.expression(e); }
 
@@ -896,7 +896,7 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 	return uncached();
 
 	function uncached(): Type {
-		return walk(undefined, undefined,
+		return walker(undefined, undefined,
 			rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) => {
 				if (x.type === 'ref' && !x.typeArgs && map.has(x.name))
 					return map.get(x.name);
@@ -942,11 +942,11 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 // first means a type with no 'this' anywhere -- the overwhelming majority -- comes back as the exact
 // same object, no rebuild, and every object-identity-keyed cache downstream keeps working normally.
 function containsThis(t: Type): boolean {
-	return walkB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'this' || process(x))).type(t);
+	return walkerB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'this' || process(x))).type(t);
 }
 
 export function substituteThisType(t: Type, thisType: Type): Type {
-	return containsThis(t) ? walk(undefined, undefined, rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) =>
+	return containsThis(t) ? walker(undefined, undefined, rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) =>
 		x.type === 'this' ? thisType : process(x)
 	)).type(t) ?? t : t;
 }
@@ -964,7 +964,7 @@ export function mentionsTypeParam(t: Type, name: string): boolean {
 	return r;
 }
 function mentions(t: Type, name: string): boolean {
-	return walkB(undefined, undefined, searchOnce((t: Type, process: (x: Type) => boolean, recurse: WalkerB) => {
+	return walkerB(undefined, undefined, searchOnce((t: Type, process: (x: Type) => boolean, recurse: WalkerB) => {
 		switch (t.type) {
 			case 'ref':				return t.typeArgs ? process(t) : t.name === name;
 			case 'function':
@@ -984,7 +984,7 @@ function mentions(t: Type, name: string): boolean {
 }
 
 function containsInfer(t: Type): boolean {
-	return walkB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'infer' || process(x))).type(t);
+	return walkerB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'infer' || process(x))).type(t);
 }
 
 // An un-annotated parameter's type, inferred from its default. Widened, matching both real TS
@@ -1192,7 +1192,7 @@ function findTypeMember(members: TS.TypeMember[], key: string): TS.TypeMember & 
 // function's own type-parameter names are bound (not free) and must stay resolvable in whatever scope later actually
 // registers them, not permanently baked to the hoisting pass's outer scope.
 export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<string>): T {
-	walkB(undefined, undefined,
+	walkerB(undefined, undefined,
 		searchOnce((x: Type, process: (x: Type) => boolean) => {
 			// Primitives resolve the same everywhere -- stamping them would only add dead weight and dedup-key noise for no gain.
 			if (x.type === 'ref') {

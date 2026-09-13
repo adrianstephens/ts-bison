@@ -97,7 +97,7 @@ export interface Walker extends W.Walker<Kinds> {
 }
 type OnAST<U>		= W.OnAST<U, Walker>;
 
-export function walk(
+export function walker(
 	onStatement?:	OnAST<TS.Stmt>,
 	onExpression?:	OnAST<Expr>,
 	onType?:		OnAST<Type>,
@@ -467,7 +467,7 @@ export interface WalkerB extends W.WalkerB<Kinds> {
 }
 type OnASTB<U>		= W.OnASTB<U, WalkerB>;
 
-export function walkB(
+export function walkerB(
 	onStatement?:	OnASTB<TS.Stmt>,
 	onExpression?:	OnASTB<JS.Expr>,
 	onType?:		OnASTB<Type>,
