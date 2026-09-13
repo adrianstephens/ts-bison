@@ -3712,8 +3712,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const paramFits = (p: WasmType, i: number) => wasmTypeEq(p, wantSig.params[i])
 				|| (typeof p !== 'string' && typeof wantSig.params[i] !== 'string')
 				|| (typeof p === 'string' && isAnyRef(wantSig.params[i])) || (typeof wantSig.params[i] === 'string' && isAnyRef(p));
-			if (gotSig.params.length <= wantSig.params.length && !!gotSig.hasRest === !!wantSig.hasRest
-				&& gotSig.params.every(paramFits)) {
+			// MORE params than the slot offers still fits when the wrapper can supply every extra one: checker.ts passes
+			// `narrowByDiscriminant(m: Type, depth = 6)` as a `(m: Type) => ...`, ordinary TS since a default makes its JS arity 1.
+			if ((gotSig.params.length <= wantSig.params.length || gotSig.params.slice(wantSig.params.length).every((p, i) => {
+				const d = gotSig.defaults?.[wantSig.params.length + i];
+				return (!!d && isReemittableDefault(d)) || (typeof p !== 'string' && !!p.nullable);
+			})) && !!gotSig.hasRest === !!wantSig.hasRest
+				&& gotSig.params.slice(0, wantSig.params.length).every(paramFits)) {
 				const orig = ctx.temp(`$origClosure$${closureCallTempCounter++}`, got);
 				ctx.emit(I.local.set(orig));
 				const { info, wantStructTypeIndex, envTypeIndex } = ensureClosureCoercionWrapper(gotSig, wantSig);
@@ -5412,7 +5417,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!target)
 			throw `'${name}' can't be used as a value`;
 
-		const sig: FuncSig = { params: target.params, result: target.result, hasRest: target.hasRest };
+		// `defaults` travel with it: a slot with fewer params converts by supplying them (`ensureClosureCoercionWrapper`).
+		const sig: FuncSig = { params: target.params, result: target.result, hasRest: target.hasRest, defaults: target.defaults };
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 		const { funcIndex, typeIndex } = registerFuncAtType(funcTypeIndex);
 		// Erasure answers only where the WANTED signature is itself erased (`CommonAction<C> =
@@ -5491,7 +5497,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	function emitFunctionValue(fn: { name: string; decl: FunctionDecl; module: string }, want: WasmType | undefined, ctx: FunctionContext, typeArgs?: Type[]): WasmType {
 		const { info, structTypeIndex } = ensureFunctionValueWrapper(fn.name, fn.decl, fn.module, want, typeArgs);
 		ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.i32.const(jsLength(fn.decl.params)), I.struct.new(structTypeIndex));
-		return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
+		return { closure: { params: info.params, result: info.result, hasRest: info.hasRest, defaults: info.defaults } };
 	}
 
 	// A closure *value* whose own concrete signature doesn't match some slot it's being coerced into, but
@@ -5548,6 +5554,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			argLocals.slice(0, gotSig.params.length).forEach((l, i) => {
 				wctx.emit(I.local.get(l.index));
 				coerceTop(wantSig.params[i], wctx, gotSig.params[i]);
+			});
+			// Params the caller never passes get the callback's own defaults, exactly as a call site omitting them would.
+			gotSig.params.slice(argLocals.length).forEach((p, i) => {
+				const d = gotSig.defaults?.[argLocals.length + i];
+				if (d)
+					emitAs(d, wctx, p);
+				else
+					emitDefaultValue(p, wctx);
 			});
 			wctx.emit(I.local.get(env.index), I.struct.get(envTypeIndex, 0), I.struct.get(gotStructTypeIndex, 0), I.call_ref(gotFuncTypeIndex));
 			coerceTop(gotSig.result, wctx, wantSig.result);

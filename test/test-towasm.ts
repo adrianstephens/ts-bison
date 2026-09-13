@@ -7481,6 +7481,21 @@ async function main() {
 	}
 
 	{
+		// A function with a DEFAULTED trailing parameter passed where a shorter callback is expected (checker.ts's
+		// `narrowByDiscriminant(m, depth = 6)` as a `(m) => ...`): the wrapper supplies the default the caller never passes.
+		const { defaultedCallback } = await compile(`
+			function scale(n: number, by = 10): number { return n * by; }
+			function twice(f: (n: number) => number, n: number): number { return f(f(n)); }
+			export function defaultedCallback(): number {
+				const direct = twice(scale, 1);
+				const named: (n: number) => number = scale;
+				return direct + named(2) * 1000;
+			}
+		`);
+		check('defaultedCallback()', defaultedCallback(), 100 + 20000);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
