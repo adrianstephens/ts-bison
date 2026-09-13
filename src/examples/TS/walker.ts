@@ -316,7 +316,7 @@ export function walk(
 				body:		mapArrayA(mapClassMemberU),
 				typeParams:	mapArray(mapTypeParamU),
 				implements: mapArray(mapTypeU)
-			}) as JS.Expr;
+			});
 			case 'instantiation':	return mapObject(expr, {
 				expression: mapExpressionA,
 				typeArgs:	mapArray(mapTypeU)
@@ -397,10 +397,10 @@ export function walk(
 				body:			mapArrayA(mapStatementC),
 			});
 			case 'export':		return mapObject(stmt, {
-				default: 		d => !d ? undefined : isJsStatement(d) ? mapStatement(d) as JS.Declaration<any> : mapExpressionA(d)
+				default: 		d => !d ? undefined : isJsStatement(d) ? mapStatement(d) : mapExpressionA(d)
 			});
 			case 'export_decl':	return mapObject(stmt, {
-				declaration:	d => mapStatement(d) as JS.Declaration<any>
+				declaration:	d => mapStatement(d)
 			});
 			case 'class_decl':	return mapObject(stmt, {
 				superClass:		mapExpression,
@@ -605,9 +605,9 @@ export function walkB(
 			case 'export':				return !!stmt.default && (isJsStatement(stmt.default) ? walkStatement(stmt.default) : walkExpression(stmt.default as JS.Expr));
 			case 'export_decl':			return walkStatement(stmt.declaration);
 			case 'class_decl':			return walkExpression(stmt.superClass)
-				|| (stmt.body as TS.ClassMember[]).some(walkClassMember)
-				|| !!stmt.typeParams?.some(t => walkTypeParam(t as TS.TypeParam))
-				|| !!stmt.implements?.some(t => walkType(t as Type));
+				|| (stmt.body).some(walkClassMember)
+				|| !!stmt.typeParams?.some(t => walkTypeParam(t))
+				|| !!stmt.implements?.some(t => walkType(t));
 			case 'type_alias_decl':		return !!stmt.typeParams?.some(walkTypeParam) || walkType(stmt.value);
 			case 'interface_decl':		return !!stmt.typeParams?.some(walkTypeParam)
 				|| !!stmt.extendsClause?.some(t => walkType(t))
