@@ -8448,10 +8448,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// so `wt` alone never reflects that the field can physically be absent. Force it nullable here
 		// regardless: a field that can be omitted must always have a real "no value" to construct with
 		// (`emitDefaultValue`, when an object literal omits it), independent of what its own annotation says.
-		// Scalar kinds (`f64`/`i32`/...) and a boxed-`any` ref already have their own zero-default in
-		// `emitDefaultValue` with no `.nullable` needed -- only a real, non-`any` object/array/closure kind
-		// needs the wrap.
-		if (optional && typeof wt === 'object' && !wt.nullable && !('ref' in wt && wt.ref === 'any'))
+		// A boxed `any` too (a multi-shape union collapses to one): its non-null default is a boxed `0`, so an
+		// absent field read back as `0`, not `undefined`, and `??=` could never fill it.
+		if (optional && typeof wt === 'object' && !wt.nullable)
 			wt = nullableWtype(wt);
 		// A scalar-typed one needs the same null-boxing an optional *parameter* already gets: without it
 		// there's no "absent" distinct from `0`/`false`, so `??=` and `=== undefined` can't work at all

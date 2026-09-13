@@ -6669,6 +6669,23 @@ async function main() {
 	}
 
 	{
+		// An optional field whose type collapses to boxed `any` (a multi-shape union) is still OPTIONAL: absent reads
+		// back `undefined`, and `??=` fills it (type-utils.ts's `entry.defaultSubstitution ??= ...`).
+		const { optionalUnionMemo } = await compile(`
+			type Sh = { kind: "a"; n: number } | { kind: "b"; s: string };
+			interface Entry { base: Sh; memo?: Sh }
+			function memoOf(e: Entry): Sh { e.memo ??= e.base; return e.memo; }
+			export function optionalUnionMemo(): number {
+				const e: Entry = { base: { kind: "a", n: 7 } };
+				const absent = e.memo === undefined ? 100 : 0;
+				const m = memoOf(e);
+				return absent + (m.kind === "a" ? m.n : -1) + (e.memo !== undefined ? 1000 : 0);
+			}
+		`);
+		check('optionalUnionMemo()', optionalUnionMemo(), 1107);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
