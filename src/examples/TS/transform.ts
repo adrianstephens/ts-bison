@@ -462,11 +462,11 @@ export function patternBindings(kind: JS.DeclarationKind, target: BindingTarget,
 			if (!el)
 				return [];
 			const elemExpr: Expr = JS.Index(valueExpr, Literal(i));
-			// A default is LENGTH-guarded, not `?? default`: the pattern can be longer than the value
-			// (`const [a, b = 7] = [1]`, entirely ordinary JS), and reading past the end traps in wasm
-			// rather than giving `undefined`, so `??` never got the chance to supply the default.
+			// A default applies where the element is `undefined` -- past the end OR present as `undefined` -- and never
+			// for `null`, so neither a length test nor `??` alone is JS. The length guard stays: reading past the end traps in wasm.
 			return patternBindings(kind, el.target, el.default
-				? Conditional<Expr>(Binary<Expr, '<'>('<', Literal(i), JS.Member(valueExpr, 'length')), elemExpr, el.default)
+				? Conditional<Expr>(Binary<Expr, '<'>('<', Literal(i), JS.Member(valueExpr, 'length')),
+					Conditional<Expr>(Binary<Expr, '==='>('===', elemExpr, Identifier('undefined')), el.default, elemExpr), el.default)
 				: elemExpr);
 		});
 		if (target.rest) {

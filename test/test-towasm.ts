@@ -7392,6 +7392,19 @@ async function main() {
 	}
 
 	{
+		// An array pattern's default applies exactly where the element is `undefined`: past the end, or present as `undefined`.
+		// `null` is a value and keeps it, as JS does.
+		const { patternDefaults } = await compile(`
+			export function patternDefaults(): number {
+				const [a = 1, b = 2, c = 3] = [10, undefined] as (number | undefined)[];
+				const [d = 4] = [null] as (number | null)[];
+				return a + b * 10 + c * 100 + (d === null ? 1000 : 0);
+			}
+		`);
+		check('patternDefaults()', patternDefaults(), 10 + 20 + 300 + 1000);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

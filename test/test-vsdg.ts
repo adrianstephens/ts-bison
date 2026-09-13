@@ -1238,7 +1238,7 @@ export async function main() {
 	`, `
 		function f(arr) {
 			const __destructure5 = arr;
-			return [__destructure5[0], __destructure5[2] ?? 99, __destructure5.slice(3)];
+			return [__destructure5[0], (2 < __destructure5.length) ? (__destructure5[2] === undefined) ? 99 : __destructure5[2] : 99, __destructure5.slice(3)];
 		}
 	`);
 

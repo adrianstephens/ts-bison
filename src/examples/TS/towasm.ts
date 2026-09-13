@@ -2847,13 +2847,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (target.type === 'array_pattern') {
 			const it = iteratesByProtocol(tmp, ctx);
 			if (!it) {
-				// A default is LENGTH-guarded, not `?? default`: reading past an array's end traps in wasm rather than giving `undefined`.
+				// A default applies where the element is `undefined`: past the end (the length guard -- reading past an array's end traps in
+				// wasm), or present as `undefined` where the element type admits it. Never for `null`, which is a value JS keeps.
 				target.elements.forEach((el, i) => {
 					if (!el)
 						return;
 					const elem = JS.Index(tmp, Literal(i));
 					emitPatternBinding(kind, el.target, el.default
-						? { type: 'conditional', test: Binary<Expr, '<'>('<', Literal(i), JS.Member(tmp, 'length')), consequent: elem, alternate: el.default } as Expr
+						? { type: 'conditional', test: Binary<Expr, '<'>('<', Literal(i), JS.Member(tmp, 'length')), alternate: el.default,
+							consequent: readsPastEnd(elem, ctx)
+								? { type: 'conditional', test: Binary<Expr, '==='>('===', elem, { type: 'identifier', name: 'undefined' } as Expr), consequent: el.default, alternate: elem } as Expr
+								: elem } as Expr
 						: elem, undefined, ctx);
 				});
 				if (target.rest)
