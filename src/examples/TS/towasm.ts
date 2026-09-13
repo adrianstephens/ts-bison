@@ -5489,6 +5489,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return resultWtype;
 	}
 
+	// A bare name bound to a module-level VALUE, not a function (walker.ts's `export const isJsStatement = guard<TS.Stmt>(...)`,
+	// called by name in printer.ts): the call calls the value it holds, as a namespace member's does.
+	function isModuleValue(name: string, ctx: FunctionContext): boolean {
+		if (ctx.resolvesName(name) || resolveDecl(ctx.homeModule, name) || funcs.has(homeKey(ctx.homeModule, name)))
+			return false;
+		const imported	= namedImportsByModule.get(ctx.homeModule)?.get(name);
+		const decl		= imported ? moduleScopeOf(imported.module)?.decl(imported.name) : moduleScopeOf(ctx.homeModule)?.decl(name);
+		// Not an inline-asm intrinsic (`const loadI32 = __asm<[i32], i32>('i32.load')`): that IS the instruction, not a value.
+		const init		= decl?.type === 'var_decl' ? decl.declarations.find(d => d.name === (imported?.name ?? name))?.init : undefined;
+		return !!init && !(init.type === 'call' && isAsm(init));
+	}
+
 	// `NS.x` through `import * as NS` naming a module-level variable, not a function: a call to it calls the value it holds.
 	function isNamespaceValue(e: Expr & { type: 'member' }, ctx: FunctionContext): boolean {
 		return e.object.type === 'identifier' && !ctx.lookup(e.object.name) && ctx.scope.namespace(e.object.name)?.decl(e.property)?.type === 'var_decl';
@@ -7136,9 +7148,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// One-shot: consumed here (for this call's own generic type-param inference, if it applies)
 					// and cleared immediately, so it can't leak into this same call's own arguments below (see
 					// `contextualReturn`'s own comment on why that would be wrong).
-					const contextualReturn = ctx.contextualReturn;
-					ctx.contextualReturn = undefined;
-					return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn ?? (() => checkerTypeOf(e, ctx.scope)));
+					if (!isModuleValue(e.callee.name, ctx)) {
+						const contextualReturn = ctx.contextualReturn;
+						ctx.contextualReturn = undefined;
+						return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn ?? (() => checkerTypeOf(e, ctx.scope)));
+					}
 				}
 
 				// `obj?.method(...)` -- the `?.` sits on the `member` callee (or a chain further out

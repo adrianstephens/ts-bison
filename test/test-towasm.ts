@@ -7519,6 +7519,26 @@ async function main() {
 	}
 
 	{
+		// A call to a name bound to a module-level VALUE, imported or local (walker.ts's `export const isJsStatement = guard<...>(...)`,
+		// called by name in printer.ts): the value is the function.
+		const { moduleValueCall } = await compileMulti({
+			helpers: `
+				export function over(k: number) { return (n: number) => n > k; }
+				export const isEven = (n: number) => n % 2 === 0;
+				export const isBig = over(10);
+			`,
+			main: `
+				import { isEven, isBig } from './helpers';
+				const isSmall = (n: number) => n < 5;
+				export function moduleValueCall(): number {
+					return (isEven(4) ? 1 : 0) + (isBig(20) ? 10 : 0) + (isBig(3) ? 100 : 0) + (isSmall(1) ? 1000 : 0);
+				}
+			`,
+		}, 'main');
+		check('moduleValueCall()', moduleValueCall(), 1011);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
