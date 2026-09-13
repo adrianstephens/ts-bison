@@ -132,6 +132,10 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// TS 5.5 infers a type predicate only when the function is true exactly when the parameter has that type. `isTop` is false for
 	// most `R`s, so its false branch must not exclude `R` (type-utils.ts `isAny`, which left `src.type === 'ref'` as `never`).
 	['an inferred predicate needs its false branch to be exact', 'interface R { type: "ref"; name: string } interface L { type: "lit" } type Ty = R | L; function isTop(t: Ty) { return t.type === "ref" && t.name === "any"; } function f(src: Ty) { if (isTop(src)) return; const l: L = src; }', ['is not assignable']],
+	// TS's arity rule: a source needing more arguments than the target passes is not assignable (towasm's `staticGuard` folded
+	// `has0args(f2)` to true on it). Optional, defaulted and trailing `void` parameters, and a rest target, are not needed.
+	['a function needing more arguments than the target passes is not assignable', 'const f2 = (a: number, b: number) => a + b; const g: () => number = f2;', ['is not assignable']],
+	['optional, defaulted, void and rest parameters are not needed arguments', 'const f = (a: number, b?: number, c = 1) => a; const g: (a: number) => number = f; const h: (...xs: number[]) => number = (a: number, b: number) => a; declare const r: (v: void) => void; const p: () => void = r;', []],
 ];
 
 (async () => {

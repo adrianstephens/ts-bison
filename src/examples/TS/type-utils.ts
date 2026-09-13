@@ -988,6 +988,15 @@ function widenedDefaultType(d: JS.Expr<any> | undefined): Type | undefined {
 	return w.type === 'ref' && !w.typeArgs && WASM_PSEUDO_TYPES.has(w.name) ? NUMBER : w;
 }
 
+// TS's getMinArgumentCount: through the last parameter a call must pass -- not optional (or defaulted), and not accepting `void`.
+export function minArgumentCount(sig: TS.Params, scope: Scope): number {
+	const own = sig.params.filter(p => p.key !== 'this');
+	let n = own.length;
+	while (n > 0 && (hasMod(own[n - 1], 'optional') || (own[n - 1].typeAnnotation && unionMembers(resolveOwn(own[n - 1].typeAnnotation!, scope), scope).some(m => m.type === 'ref' && m.name === 'void'))))
+		n--;
+	return n;
+}
+
 // JS.ParamList to TS.ParamList; a defaulted parameter counts as optional
 export function FixParams(params: JS.Params<any>): TS.Params {
 	return {
@@ -2498,6 +2507,9 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 		if (dst.type === 'function' || dst.type === 'constructor') {
 			if (src.type !== dst.type)
 				return src.type === 'object' && src.members.some(m => m.type === (dst.type === 'constructor' ? 'construct' : 'call'));
+			// TS's arity rule (compareSignaturesRelated): a source needing more arguments than the target ever passes is not one.
+			if (!dst.rest && minArgumentCount(src, scope) > dst.params.filter(p => p.key !== 'this').length)
+				return false;
 			if (!dst.returnType || !src.returnType)
 				return true;	// missing return type (e.g. an unmodeled class method): lenient
 			// parameters deliberately unchecked (bivariance noise); returns covariant, void-dst absorbs anything
