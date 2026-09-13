@@ -7119,6 +7119,24 @@ async function main() {
 	}
 
 	{
+		// An optional call on an `any` receiver (walker.ts `stmt.finalizer?.some(walkStatement)`): the dynamic dispatch runs inside
+		// the null guard, and a nullish receiver short-circuits to undefined without evaluating its arguments.
+		const { optionalAnyCall } = await compile(`
+			class Box { constructor(public v: number) {} add(n: number, m: number): number { return this.v + n + m; } }
+			let calls = 0;
+			function arg(): number { calls++; return 1; }
+			export function optionalAnyCall(): number {
+				const box: any = new Box(3);
+				const none: any = undefined;
+				const a = box?.add(1, 2) as number;
+				const b = none?.add(arg(), 0);
+				return a * 10 + (b === undefined ? 1 : 0) + calls * 100;
+			}
+		`);
+		check('optionalAnyCall()', optionalAnyCall(), 61);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

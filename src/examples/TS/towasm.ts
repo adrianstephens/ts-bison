@@ -6892,8 +6892,20 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (!physWtype || typeof physWtype === 'string')
 							throw `'a?.${methodName}(...)' needs an object-typed value on its left`;
 						const owner = ownerOf(objExpr, ctx);
-						if (!owner)
+						if (!owner) {
+							// A receiver typed `any` still has its method at run time: the dispatch a plain call takes (`ensureAnyDispatch`),
+							// inside the null guard, so a nullish receiver skips the arguments too (walker.ts `stmt.finalizer?.some(...)`).
+							if (T.isAny(narrowedTypeOf(objExpr, ctx)) && !e.arguments.some(a => a.type === 'spread')) {
+								const w = wtypeOf(e, ctx);
+								const resultWtype = w && w !== 'void' ? nullableWtype(w) : REF_ANY_NULLABLE;
+								emitAs(objExpr, ctx, REF_ANY_NULLABLE);
+								return emitOptionalAccess(ctx, REF_ANY_NULLABLE, resultWtype, objLocal => {
+									ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
+									ctx.emit(I.call(ensureAnyDispatch(methodName, e.arguments.map(a => emitExpr(a, ctx)), e.arguments.map(a => narrowedTypeOf(a, ctx)), resultWtype, ctx).funcIndex));
+								});
+							}
 							throw `unknown method '${methodName}'`;
+						}
 						const objWtype = owner.thisWtype && typeof owner.thisWtype !== 'string' ? nullableWtype(owner.thisWtype) : physWtype;
 						const typeArgs = e.typeArgs;
 						const method = ensureMethod(owner, methodName, e.arguments, ctx, typeArgs);
