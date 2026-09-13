@@ -2082,6 +2082,20 @@ name, so the extra local collided -- 46 survey blocks. Fixed by skipping the bin
 UNboxing, so a numeric LITERAL type -- which has compact integer storage -- stored an f64 box and read an i32 box back:
 "illegal cast". Both directions now use the same test.
 
+**Batch 10 (2026-09-13, after the rename)**: the `bindPattern`/printer chain, each its own commit -- a nested assignment
+narrowing after its branch (6cc55ec, a false positive on towasm's own `bindingIn`); truthiness of a concrete class ref
+whatever the checker's type says (2233e8e, 47 blocks -- printer.ts's `!!expr.operator.match(...)`); a method whose return
+names its CLASS's type parameter keeping the receiver's arguments (1b5e004 -- the `var_decl` method-return bypass reads the
+ERASED `Array<any>`, so `filter(): T[]` was `any[]`; the checker wins there, but the erased answer is still needed where the
+checker has none, e.g. a `Map`-routed dynamic object's `keys()`); a callback with DEFAULTED trailing parameters converting
+to a shorter signature (0d2e7e5 -- the wrapper supplies the defaults, and a function VALUE's signature now carries them);
+and a type parameter's DEFAULT being instantiated with the arguments already chosen (e629898 -- common.ts's
+`Call<E, A = E>` left `arguments: E[]`, so every narrowed `Expr` call had elements typed by a bare parameter).
+**Trap**: preferring the checker's type for EVERY method-call initializer regressed `big` (a precise literal type stores
+narrower than the declared `number`) and difftest to 2153/2 disagree. Keep such a change keyed to the shape that is wrong.
+**Next**: printer.ts calls `isJsStatement`, a name bound to a module-level CONST holding a function -- the bare-identifier
+sibling of 7aea4bc's namespace-member fix (script ready: `assistant/module-value-call.py`).
+
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
 my own grep filter (`grep -v 'free=\[\]'`) hid the decisive log line for three rounds: when a probe prints
