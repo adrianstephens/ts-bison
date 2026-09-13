@@ -1361,24 +1361,9 @@ function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<str
 // `ensureGenericFunc`), this just applies it structurally through params/return type/body alike.
 function substituteTypeParams(map: ReadonlyMap<string, Type>): Walker {
 	return walk(
-		// `checkStmt`'s own `(stmt as any).scope ??= scope` stamp (checker.ts) is a plain, enumerable
-		// property set once, during the *original*, unsubstituted (generic-level, `T` still opaque)
-		// check of this function's body -- `walk`'s own `mapObject` primitive copies it along verbatim,
-		// same reference, onto every rebuilt statement here, still pointing at the stale generic-level
-		// scope (where a type parameter like `N` never resolved to the real per-call-site argument
-		// type). Stripped here so `stmtScope = (s as any).scope ?? ctx.scope` (towasm.ts's own read of
-		// it) correctly falls back to `ctx.scope` -- the *real*, per-instantiation scope this exact
-		// monomorphization builds via `declareParams` -- instead of silently re-deriving a type through
-		// the substituted body's own values via a scope that never learned about the substitution at
-		// all (found via `walker.ts`'s own self-hosting attempt: `{...node}` inside a generic function
-		// resolved `node`'s type as the bare, unsubstituted type parameter itself). Trades away
-		// whatever flow-narrowing the generic-level check had already computed for this statement --
-		// accepted: it could only ever have narrowed the type parameter itself, never the concrete
-		// per-instantiation type this compiled body actually needs.
+		// The checker's stamps are the TEMPLATE's scopes, where `T` is opaque: stale for an instance, which `instantiateDecl`
+		// re-checks so its own narrowing (on the concrete types) is stamped afresh.
 		(s, process) => { const built = process(s); delete (built as any).scope; return built; },
-		// `stampBranch`'s branch scopes are the same stamp at sub-statement granularity, and go stale here
-		// for exactly the same reason -- so they are stripped the same way, or a ternary inside a
-		// substituted body would keep resolving its branches through the unsubstituted type parameter.
 		(e, process) => { const built = process(e); delete (built as any).scope; return built; },
 		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
 	);
@@ -5311,7 +5296,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			: undefined;
 		const instance	= erased && genericKey(name, decl.typeParams!, erased, global);
 		const target	= funcs.get(instance || key) ?? (instance
-			? compileFunc(instance, { ...substituteTypeParams(erased!).statement(decl)!, typeParams: undefined }, homeModule, name)
+			? compileFunc(instance, instantiateDecl(decl, erased!, homeModule), homeModule, name)
 			: compileFunc(name, decl, homeModule));
 		if (!target)
 			throw `'${name}' can't be used as a value`;
@@ -8284,6 +8269,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// difference from a class reference: a function's type arguments are usually left implicit at the call
 	// site, inferred from the arguments (`inferTypeArgMap`, above). Explicit call-site type args
 	// (`identity<number>(5)`) are honored too, same as a class's are.
+	// A generic function's instance, checked as a declaration of its own: its narrowing depends on the type arguments
+	// (`typeof x === 'string'` on `T | string`, js-parser.ts `CallSig<T>`'s `args[0]` after `Array.isArray`), which the template can't see.
+	function instantiateDecl(decl: FunctionDecl, map: Map<string, Type>, homeModule: string): FunctionDecl {
+		const inst = { ...substituteTypeParams(map).statement(decl)!, typeParams: undefined } as FunctionDecl;
+		checkHoisted([inst], new Scope(moduleScopeOf(homeModule) ?? libGlobal));
+		return inst;
+	}
+
 	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, homeModule = '.'): FuncInfo {
 		const typeParams	= decl.typeParams!;
 		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, scope, expected, decl.returnType as Type | undefined, decl.rest);
@@ -8304,7 +8297,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (t.type === 'ref' && !t.typeArgs)
 					everExtended.add(t.name);
 		}
-		return compileFunc(key, { ...substituteTypeParams(map).statement(decl)!, typeParams: undefined }, homeModule, name)!;
+		return compileFunc(key, instantiateDecl(decl, map, homeModule), homeModule, name)!;
 	}
 
 	// `realName`: the function's own real, DECLARED name -- for a generic instantiation, `name` itself is

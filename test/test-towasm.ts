@@ -7313,6 +7313,27 @@ async function main() {
 	}
 
 	{
+		// A generic function's instance keeps its template's narrowing, in its own types (js-parser.ts `CallSig<T>`: `args[0]` after
+		// `Array.isArray` is `CallSig<T> | Params<T>`, and a `T | string` narrowed by `typeof`).
+		const { genericNarrowing } = await compile(`
+			interface Params<T> { params: T[]; rest?: T }
+			interface Sig<T> extends Params<T> { ret?: T; extra?: number }
+			type Args<T> = [Sig<T>] | [Params<T>] | [Params<T>, T | undefined] | [T[]];
+			function make<T>(...args: Args<T>): Sig<T> {
+				if (Array.isArray(args[0]))
+					return { params: args[0] };
+				return args.length > 1 ? { ...args[0], ret: args[1] } : args[0];
+			}
+			function pick<T>(x: T | string): number { if (typeof x === 'string') return x.length; return 0; }
+			export function genericNarrowing(): number {
+				const a = make<number>({ params: [1, 2], rest: 3 }, 4);
+				return (a.ret ?? 0) + (a.rest ?? 0) * 10 + pick<number>('abcd') * 1000;
+			}
+		`);
+		check('genericNarrowing()', genericNarrowing(), 4034);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
