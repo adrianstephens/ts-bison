@@ -7106,6 +7106,19 @@ async function main() {
 	}
 
 	{
+		// Calling a function stored in an `any` (core.ts `params[0](() => rules)`): dispatched over the program's closure types,
+		// with one, two and zero arguments; the same value also still casts to a typed callback.
+		const { anyCallee } = await compile(`
+			function twice(f: (n: number) => number, n: number): number { return f(f(n)); }
+			export function anyCallee(): number {
+				const fs: any[] = [(n: number) => n + 1, (s: string, k: number) => s.length * k, () => 7];
+				return (fs[0](10) as number) + (fs[1]('abc', 100) as number) + (fs[2]() as number) * 1000 + twice(fs[0], 1);
+			}
+		`);
+		check('anyCallee()', anyCallee(), 7314);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

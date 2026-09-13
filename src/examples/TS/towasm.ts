@@ -415,7 +415,7 @@ type FullSig = Required<Omit<FuncSig, 'resolvedParams' | 'restElem'>> & Pick<Fun
 interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; reassignsThis?: boolean }
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
-interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number }
+interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number; sig: FuncSig }
 
 // Per-operand info for builtin dispatch -- wtype for kind-polymorphic dispatch, owner for identity dispatch.
 interface OperandInfo { wtype: WasmType | undefined; owner?: ClassInfo }
@@ -7049,6 +7049,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 				}
 
+				// A callee typed `any` (core.ts `params[0](() => rules)`): dispatched over the program's closure types.
+				if (T.isAny(checkerTypeOf(unwrapAs(e.callee), ctx.scope)) && !e.arguments.some(a => a.type === 'spread')) {
+					emitAs(e.callee, ctx, REF_ANY);
+					const info = ensureAnyCallDispatch(e.arguments.map(a => emitExpr(a, ctx)), want ?? REF_ANY);
+					ctx.emit(I.call(info.funcIndex));
+					return info.result;
+				}
+
 				throw 'only direct calls to named functions, methods, or Math intrinsics are supported';
 
 			}
@@ -7907,7 +7915,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			info = { funcTypeIndex, structTypeIndex: addType({final: true, supertypes: [ensureClosureBase()], type: { kind: 'struct', fields: [
 				{ type: { ref: funcTypeIndex, nullable: false }, mut: false },
 				{ type: { ref: envBase, nullable: false }, mut: false },
-			] } } ) };
+			] } } ), sig };
 			closureTypes.set(key, info);
 		}
 		return info;
@@ -9965,6 +9973,67 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A real dynamic-dispatch cascade for `recv.name()` where `recv`'s static type is genuinely `any`.
 	// One shared function per `(name, want)` pair, reserved immediately so call sites can `call` it right away -- but its body can only be built
 	// once the full, final candidate set is known, needing every class ever discovered. `lateWorklist`, drained only once `worklist` has fully emptied, is what guarantees that.
+	// A call through a callee whose type is `any` (core.ts `params[0](...)`): the function it holds is known only at run time, so
+	// a dispatch per call shape tests it against every closure type the program has, converts each argument to that type's
+	// parameter (one the call leaves out must take `undefined`), and the result to what the call wants. None traps.
+	function ensureAnyCallDispatch(argWtypes: WasmType[], want: WasmType): FuncInfo {
+		const key = `#call(${argWtypes.map(wasmTypeKey).join(',')})=>${wasmTypeKey(want)}`;
+		const existing = anyDispatchFuncs.get(key);
+		if (existing)
+			return existing;
+
+		const { funcIndex, typeIndex } = registerFunc(toParams2([{ key: 'callee', wtype: REF_ANY, tsType: T.ANY },
+			...argWtypes.map((wtype, i) => ({ key: `arg${i}`, wtype, tsType: T.ANY }))]), toResults(want));
+		const info: FuncInfo = { params: [REF_ANY, ...argWtypes], result: want, funcIndex, typeIndex };
+		anyDispatchFuncs.set(key, info);
+		funcs.set(`<any dispatch>.${key}`, info);
+		lateWorklist.push(() => {
+			// Only candidates every argument converts to physically: a branch that cannot compile is never the callee of a
+			// correct program. `any` on either side boxes or casts; two structs only upcast; closures by the wrapper's own rule.
+			const isAnyRef = (w: WasmType) => typeof w !== 'string' && 'ref' in w && w.ref === 'any';
+			const kind = (w: WasmType) => typeof w === 'string' ? 'scalar' : 'closure' in w ? 'closure' : 'arr' in w ? `arr:${w.arr}` : 'ref';
+			const closureFits = (got: FuncSig, param: FuncSig): boolean => got.params.length <= param.params.length && !!got.hasRest === !!param.hasRest
+				&& got.params.every((g, i) => fits(param.params[i], g));
+			const fits = (got: WasmType, param: WasmType): boolean => got !== 'void' && param !== 'void' && (wasmTypeEq(got, param) || isAnyRef(got) || isAnyRef(param)
+				|| (kind(got) === kind(param) && (kind(got) === 'scalar' || kind(got).startsWith('arr')
+					|| (typeof got !== 'string' && typeof param !== 'string' && 'closure' in got && 'closure' in param && closureFits(got.closure, param.closure))
+					|| (typeof got !== 'string' && typeof param !== 'string' && 'ref' in got && 'ref' in param && isSubclassOf(got.ref, param.ref)))));
+			const candidates = [...closureTypes.values()].filter(c => !c.sig.hasRest && c.sig.params.length >= argWtypes.length
+				&& argWtypes.every((w, i) => fits(w, c.sig.params[i]))
+				&& c.sig.params.slice(argWtypes.length).every(p => typeof p !== 'string' && (!!p.nullable || isAnyRef(p))));
+			if (!candidates.length)
+				throw `no closure type in the program takes ${argWtypes.length} such argument(s) -- a call through 'any' needs at least one real candidate`;
+			const dctx = new FunctionContext(key, new Scope(libGlobal), plainReturn(want), undefined);
+			const callee = dctx.declareLocal('$callee', REF_ANY);
+			const argLocals = argWtypes.map((w, i) => dctx.declareLocal(`$arg$${i}`, w));
+
+			function buildArm(i: number): wasm.Instr[] {
+				if (i >= candidates.length)
+					return [I.unreachable];
+				const c = candidates[i];
+				dctx.emit(I.local.get(callee.index), I.ref.test(c.structTypeIndex));
+				const _cond = dctx.swapOut();
+				const held = dctx.temp(`$closure$${closureCallTempCounter++}`, { typeIndex: c.structTypeIndex, nullable: false });
+				dctx.emit(I.local.get(callee.index), I.ref.cast(c.structTypeIndex), I.local.tee(held), I.struct.get(c.structTypeIndex, 1));
+				c.sig.params.forEach((p, j) => {
+					if (j < argLocals.length) {
+						dctx.emit(I.local.get(argLocals[j].index));
+						coerceTop(argWtypes[j], dctx, p);
+					} else {
+						emitAs({ type: 'identifier', name: 'undefined' }, dctx, p);
+					}
+				});
+				dctx.emit(I.local.get(held), I.struct.get(c.structTypeIndex, 0), I.call_ref(c.funcTypeIndex));
+				coerceTop(c.sig.result, dctx, want);
+				return [..._cond, I.if(want === 'void' ? undefined : toValType(want), dctx.swapOut(), buildArm(i + 1))];
+			}
+
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(1 + argLocals.length, toValType);
+		});
+		return info;
+	}
+
 	// A method call on an `any`/`unknown` receiver: which class's method runs is known only at run time, so a dispatch per
 	// call shape tests the receiver against every reachable owner of `name` (strings and arrays too), converts each argument
 	// from its own static representation to that candidate's parameter, and the result to what the call wants. None traps.
