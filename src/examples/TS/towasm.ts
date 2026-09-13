@@ -5165,8 +5165,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// zero-capture trampoline per function name instead: same shape `emitClosureLiteral`'s own
 	// zero-capture case builds (`env` ignored, `envBase` reused directly, no distinct env type), just
 	// forwarding straight through to the real, already-compiled (or newly compiled here) function.
-	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl, homeModule = '.', want?: WasmType): { info: FuncInfo; structTypeIndex: number } {
-		const key = homeKey(homeModule, name);
+	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl, homeModule = '.', want?: WasmType, typeArgs?: Type[]): { info: FuncInfo; structTypeIndex: number } {
+		const key = typeArgs ? `${homeKey(homeModule, name)}<${typeArgs.map(T.typeKey).join(',')}>` : homeKey(homeModule, name);
 		const existing = functionValueWrappers.get(key);
 		if (existing) {
 			const { structTypeIndex } = ensureClosureType({ params: existing.params, result: existing.result, hasRest: existing.hasRest });
@@ -5176,11 +5176,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// erase to their bounds -- exactly what `closureSigParts` already does for a generic function
 		// TYPE, and what the value's own declared type (`CommonAction<C> = <T>(value: T, ...) => any`)
 		// erases to on the other side of the assignment. One instantiation, since the erasure is fixed.
+		// Explicit type arguments (an instantiation expression, `f<A>`) pick the instantiation instead.
 		const erased	= decl.typeParams?.length
-			? new Map(decl.typeParams.map(p => [p.name, (p.constraint ?? T.ANY) as Type]))
+			? new Map(decl.typeParams.map((p, i) => [p.name, (typeArgs?.[i] ?? (typeArgs && p.default) ?? p.constraint ?? T.ANY) as Type]))
 			: undefined;
-		const target	= funcs.get(key) ?? (erased
-			? compileFunc(genericKey(name, decl.typeParams!, erased, global), { ...substituteTypeParams(erased).statement(decl)!, typeParams: undefined }, homeModule, name)
+		const instance	= erased && genericKey(name, decl.typeParams!, erased, global);
+		const target	= funcs.get(instance || key) ?? (instance
+			? compileFunc(instance, { ...substituteTypeParams(erased!).statement(decl)!, typeParams: undefined }, homeModule, name)
 			: compileFunc(name, decl, homeModule));
 		if (!target)
 			throw `'${name}' can't be used as a value`;
@@ -5192,7 +5194,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// <T>(value: T, ...) => any`). A concrete one needs the real instantiation, which nothing here
 		// can infer -- `want` is physical and carries no type arguments -- so say that rather than let
 		// it surface as an `internal: cannot convert (ref:any)=>ref:any to (f64)=>f64` further out.
-		if (erased && want && typeof want !== 'string' && 'closure' in want
+		if (erased && !typeArgs && want && typeof want !== 'string' && 'closure' in want
 			&& want.closure.params.length === sig.params.length
 			&& !want.closure.params.every((p, i) => wasmTypeEq(p, sig.params[i])))
 			throw `generic function '${name}' as a value only erases to its bounds -- a concrete instantiation is not supported`;
@@ -5210,6 +5212,32 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			info.body = wctx.toFuncBody(1 + argLocals.length, toValType);
 		});
 		return { info, structTypeIndex };
+	}
+
+	// The top-level function a bare `f` or a namespace-qualified `NS.f` names when read as a VALUE, resolved as a call to
+	// it would be: a module's own declaration, a named import, or the namespace's target module.
+	function functionValueDecl(e: Expr, ctx: FunctionContext): { name: string; decl: FunctionDecl; module: string } | undefined {
+		if (e.type === 'identifier') {
+			const own = resolveDecl(ctx.homeModule, e.name);
+			if (own)
+				return own.type === 'function_decl' && own.body ? { name: e.name, decl: own, module: ctx.homeModule } : undefined;
+			const imported = namedImportsByModule.get(ctx.homeModule)?.get(e.name);
+			const decl = imported && functionDeclByName.get(homeKey(imported.module, imported.name));
+			return decl?.type === 'function_decl' && decl.body ? { name: imported!.name, decl, module: imported!.module } : undefined;
+		}
+		if (e.type === 'member' && e.object.type === 'identifier' && !ctx.lookup(e.object.name)) {
+			const nsDecl	= ctx.scope.namespace(e.object.name)?.decl(e.property);
+			const module	= nsDecl && stmtHomeModule.get(nsDecl);
+			const decl		= module !== undefined ? functionDeclByName.get(homeKey(module, e.property)) : undefined;
+			return decl?.type === 'function_decl' && decl.body ? { name: e.property, decl, module: module! } : undefined;
+		}
+		return undefined;
+	}
+
+	function emitFunctionValue(fn: { name: string; decl: FunctionDecl; module: string }, want: WasmType | undefined, ctx: FunctionContext, typeArgs?: Type[]): WasmType {
+		const { info, structTypeIndex } = ensureFunctionValueWrapper(fn.name, fn.decl, fn.module, want, typeArgs);
+		ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
+		return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
 	}
 
 	// A closure *value* whose own concrete signature doesn't match some slot it's being coerced into, but
@@ -5521,21 +5549,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// `imported`: same idea as `emitCall`'s own named-import redirect -- `name` may be a plain
 				// `import { foo } from '...'` binding local to `ctx.homeModule` rather than a real
 				// declaration of its own.
-				let fnDecl = resolveDecl(ctx.homeModule, name);
-				let fnName = name, fnModule = ctx.homeModule;
-				if (!fnDecl) {
-					const imported = namedImportsByModule.get(ctx.homeModule)?.get(name);
-					if (imported) {
-						fnDecl = functionDeclByName.get(homeKey(imported.module, imported.name));
-						fnName = imported.name;
-						fnModule = imported.module;
-					}
-				}
-				if (fnDecl && fnDecl.type === 'function_decl' && fnDecl.body) {
-					const { info, structTypeIndex } = ensureFunctionValueWrapper(fnName, fnDecl, fnModule, want);
-					ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
-					return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
-				}
+				const fnValue = functionValueDecl(e, ctx);
+				if (fnValue)
+					return emitFunctionValue(fnValue, want, ctx);
 				// CommonJS's own per-module wrapper names -- see `checker.bindModuleNames` for why these are
 				// module-scoped and not global. A compile-time constant, the substitution a bundler makes:
 				// the compiled module has no file of its own to ask at runtime.
@@ -5577,14 +5593,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// wrapper a bare reference gets, resolved in the target module exactly as a namespace-
 						// qualified CALL resolves it. Without this the read fell through to treating the namespace
 						// itself as an object, and tried to represent every function it exports.
-						const nsDecl	= ns.decl(e.property);
-						const nsTarget	= nsDecl && stmtHomeModule.get(nsDecl);
-						const fnDecl	= nsTarget !== undefined ? functionDeclByName.get(homeKey(nsTarget, e.property)) : undefined;
-						if (fnDecl?.type === 'function_decl' && fnDecl.body) {
-							const { info, structTypeIndex } = ensureFunctionValueWrapper(e.property, fnDecl, nsTarget, want);
-							ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
-							return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
-						}
+						const fnValue = functionValueDecl(e, ctx);
+						if (fnValue)
+							return emitFunctionValue(fnValue, want, ctx);
 					}
 				}
 
@@ -5804,6 +5815,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// expression and pass its actual `WasmType` straight through, ignoring the asserted one entirely.
 			case 'as':
 				return emitExpr(e.expression, ctx, want);
+
+			// `f<A>` / `NS.f<A>` read as a VALUE (ts-parser.ts `export const CallSig = JS.CallSig<Type>`): the generic function
+			// instantiated at those type arguments, as a closure. A call through one goes the same way.
+			case 'instantiation': {
+				const fnValue = functionValueDecl(e.expression, ctx);
+				if (!fnValue)
+					throw `'${T.exprKey(e.expression)}' with type arguments names no generic function`;
+				return emitFunctionValue(fnValue, want, ctx, e.typeArgs);
+			}
 
 			// `(a, b, c)` -- every expression but the last runs purely for its side effects, same as a bare
 			// expression-statement (`emitStmt`'s own `'void'`-then-`I.drop` idiom, reused verbatim); only the

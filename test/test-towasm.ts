@@ -6978,6 +6978,22 @@ async function main() {
 	}
 
 	{
+		// An instantiation expression read as a value is the generic function instantiated at its type arguments (ts-parser.ts
+		// `export const CallSig = JS.CallSig<Type>`), named directly or through a namespace.
+		const { instValue } = await compileMulti({
+			lib: `export function pick<T>(xs: T[], i: number): T { return xs[i]; }`,
+			main: `
+				import * as L from './lib';
+				import { pick } from './lib';
+				const pickNum = pick<number>;
+				const pickStr = L.pick<string>;
+				export function instValue(): number { return pickNum([4, 5], 1) * 10 + pickStr(['ab', 'c'], 0).length; }
+			`,
+		}, 'main');
+		check('instValue()', instValue(), 52);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {
