@@ -1881,9 +1881,10 @@ One defect in two places: a value that may be ABSENT had a NON-nullable slot, so
 - The dynamic-field protocol (`ensureAnyField`/`ensureAnyFieldWrite`: a property read or written through
   `as any`, e.g. checker.ts's own statement stamp) used the non-null `any` for its value. Now nullable; the
   receiver stays non-null.
-Compiled stayed 75/328 -- all 45 moved to later blockers, nothing regressed. **Lead**: `inferReturn` now stops
-at `local '$new$ref:any:true' redeclared with different type`, a scratch local keyed by wtype colliding; check
-whether the nullable `any` introduced it before anything else.
+Compiled stayed 75/328 -- all 45 moved to later blockers, nothing regressed. The two fixes also EXPOSED a
+latent bug: `FunctionContext.temp` compared scratch-local types by object IDENTITY while naming them by
+`wasmTypeKey`, so a fresh `nullableWtype(REF_ANY)` and the `REF_ANY_NULLABLE` constant collided under one
+name. Now compared by key; `inferReturn`/`checkFunctionBody` moved on.
 
 **Next rows** (75/328): `unknown method 'RefType'` 24 (checker.ts, via type-utils.ts:62's module-level
 `TS.RefType('any')` -- a function called through a NAMESPACE import); `unknown method 'parse'` 22; `only
