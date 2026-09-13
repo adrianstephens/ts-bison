@@ -1,7 +1,8 @@
 import * as C from './c-parser';
 import * as CPP from './cpp-parser';
 import { Module } from '../common';
-import { isTranslationUnit, isDefinition, isStatementOnly, isExpr, isClassMember, isDeclarator, isPackParameter } from './walker';
+import { isExpr, isDeclarator, isPackParameter, Kinds } from './walker';
+import { Printer } from '../walker';
 
 type Definition			= CPP.Definition;
 type Stmt				= CPP.Stmt;
@@ -89,7 +90,7 @@ function withParens(x: string, parens = true)			{ return parens ? '(' + x + ')' 
 function poss(enable: boolean | undefined, s: string)	{ return enable ? s : ''; }
 function maybe<T>(value: T, fn: (value: NonNullable<T>) => string)	{ return value ? fn(value as NonNullable<T>) : ''; }
 
-export class Output {
+export class Output implements Printer<Kinds> {
 	opts;
 	newline = '\n';
 	comma	= ', ';
@@ -100,16 +101,12 @@ export class Output {
 		this.comma		= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: Module<Definition> | Definition | Stmt | Expr | ClassMember): string {
-		if (isTranslationUnit(ast))
-			return ast.body.map(d => this.definition(d)).join(this.opts.newline);
-		if (isClassMember(ast))
-			return this.classMember(ast);
-		if (isDefinition(ast) && !isStatementOnly(ast))
-			return this.definition(ast as Definition);
-		if (isStatementOnly(ast) || isDefinition(ast))
-			return this.statement(ast as Stmt);
-		return this.expr(ast as Expr);
+	definitions(defs: readonly Definition[]): string {
+		return defs.map(d => this.definition(d)).join(this.opts.newline);
+	}
+
+	module(m: Module<Definition>): string {
+		return this.definitions(m.body);
 	}
 
 	// ===================================================================
@@ -160,7 +157,7 @@ export class Output {
 	arraySize(size?: C.TypeSpecifier | Expr): string {
 		if (size === undefined)
 			return '';
-		return isExpr(size) ? this.expr(size as Expr) : this.typeSpecifier(size as C.TypeSpecifier);
+		return isExpr(size) ? this.expression(size as Expr) : this.typeSpecifier(size as C.TypeSpecifier);
 	}
 
 	// `groupIfPointer`: set when recursing into a FunctionDecl's `name` or ArrayDecl's `element` -- a
@@ -194,10 +191,10 @@ export class Output {
 				+ (t.body ? ' ' + this.curlyIndented(() => t.body!.map(m => this.classMember(m)).join(this.newline)) : '');
 			case 'enum':				return 'enum' + poss((t as CPP.CppEnumSpecifier).scoped, ' class') + maybe(t.name, n => ' ' + n)
 				+ maybe((t as CPP.CppEnumSpecifier).base, b => ' : ' + this.typeSpecifier(b))
-				+ (t.members ? ' ' + this.curlyIndented(() => t.members!.map(m => m.name + maybe(m.init, e => ' = ' + this.expr(e, ASSIGN_PREC))).join(',' + this.newline)) : '');
+				+ (t.members ? ' ' + this.curlyIndented(() => t.members!.map(m => m.name + maybe(m.init, e => ' = ' + this.expression(e, ASSIGN_PREC))).join(',' + this.newline)) : '');
 			case 'generic':				return t.name + '<' + t.args.map(a => this.templateArg(a)).join(this.comma) + '>';
 			case 'qualified_type':		return t.parts.join('::');
-			case 'decltype':				return 'decltype(' + (t.auto ? 'auto' : this.expr(t.expression!)) + ')';
+			case 'decltype':				return 'decltype(' + (t.auto ? 'auto' : this.expression(t.expression!)) + ')';
 			default:					throw new Error(`Unknown type specifier: ${(t as any).type}`);
 		}
 	}
@@ -221,10 +218,10 @@ export class Output {
 		return poss(b.virtual, 'virtual ') + maybe(b.access, a => a + ' ') + b.name + maybe(b.args, a => '<' + a.map(t => this.templateArg(t)).join(this.comma) + '>');
 	}
 	templateArg(a: CPP.TemplateArg): string {
-		return (isExpr(a.value) ? this.expr(a.value, ASSIGN_PREC) : this.typeName(a.value)) + poss(a.pack, '...');
+		return (isExpr(a.value) ? this.expression(a.value, ASSIGN_PREC) : this.typeName(a.value)) + poss(a.pack, '...');
 	}
 	templateParam(p: CPP.TemplateParam): string {
-		const val = maybe(p.default, d => ' = ' + (isExpr(d) ? this.expr(d, ASSIGN_PREC) : this.typeName(d)));
+		const val = maybe(p.default, d => ' = ' + (isExpr(d) ? this.expression(d, ASSIGN_PREC) : this.typeName(d)));
 		return p.nonType
 			? this.declSpec(p.nonType) + poss(p.pack, '...') + ' ' + p.name + val
 			: 'typename ' + poss(p.pack, '...') + p.name + val;
@@ -249,7 +246,7 @@ export class Output {
 			return this.declSpec(p.specifiers) + ' ' + declared;
 		}
 		const declared = p.declarator ? this.declStr(p.declarator) : '';
-		return this.declSpec(p.specifiers) + (declared ? ' ' + declared : '') + maybe(p.default, d => ' = ' + this.expr(d, ASSIGN_PREC));
+		return this.declSpec(p.specifiers) + (declared ? ' ' + declared : '') + maybe(p.default, d => ' = ' + this.expression(d, ASSIGN_PREC));
 	}
 
 	initDeclaratorStr(d: C.InitDeclarator<Declarator, Expr>): string {
@@ -257,7 +254,7 @@ export class Output {
 			: this.declStr(d.declarator) + ' = ' + this.initializerStr(d.initializer);
 	}
 	initializerStr(i: C.Initializer<Expr>): string {
-		return isExpr(i) ? this.expr(i, ASSIGN_PREC)
+		return isExpr(i) ? this.expression(i, ASSIGN_PREC)
 			: '{' + i.elements.map(e => this.initializerStr(e)).join(this.comma) + '}';
 	}
 
@@ -285,7 +282,7 @@ export class Output {
 	}
 	ctorTail(t: CPP.CtorTail): string {
 		const init = t.initializerList?.length
-			? ' : ' + t.initializerList.map(m => m.name + '(' + m.arguments.map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + ')').join(this.comma)
+			? ' : ' + t.initializerList.map(m => m.name + '(' + m.arguments.map(a => this.expression(a, ASSIGN_PREC)).join(this.comma) + ')').join(this.comma)
 			: '';
 		return init + (
 			t.defaulted		? ' = default;'
@@ -307,14 +304,14 @@ export class Output {
 			case 'using_decl':			return 'using ' + [...d.scope, d.name].join('::') + ';';
 			case 'using_alias':			return 'using ' + d.name + ' = ' + this.typeName(d.target) + ';';
 			case 'template':			return 'template<' + d.params.map(p => this.templateParam(p)).join(this.comma) + '> ' + this.templateBody(d.declaration);
-			case 'static_assert':		return 'static_assert(' + this.expr(d.condition) + maybe(d.message, m => this.comma + JSON.stringify(m)) + ');';
+			case 'static_assert':		return 'static_assert(' + this.expression(d.condition) + maybe(d.message, m => this.comma + JSON.stringify(m)) + ');';
 			case 'method_def':			return maybe(d.specifiers, s => this.declSpec(s) + ' ') + maybe(d.pointer, this.levelsStr.bind(this)) + d.scope.join('::') + '::' + d.name + this.paramList(d.params, d.variadic) + this.methodTail(d.tail);
 			case 'constructor_def':		return d.scope.join('::') + '::' + d.name + this.paramList(d.params, d.variadic) + this.ctorTail(d.tail);
 			case 'destructor_def':		return d.scope.join('::') + '::~' + d.name + '()' + this.methodTail(d.tail);
 			case 'operator_def':		return this.declSpec(d.specifiers) + ' ' + maybe(d.scope, s => s.join('::') + '::') + 'operator' + d.operator + this.paramList(d.params, d.variadic) + this.methodTail(d.tail);
 			case 'static_member_def':	return this.declSpec(d.specifiers) + ' ' + maybe(d.pointer, this.levelsStr.bind(this)) + d.scope.join('::') + '::' + d.name
-				+ maybe(d.initializer, e => ' = ' + this.expr(e, ASSIGN_PREC))
-				+ maybe(d.ctorArgs, a => '(' + a.map(x => this.expr(x, ASSIGN_PREC)).join(this.comma) + ')')
+				+ maybe(d.initializer, e => ' = ' + this.expression(e, ASSIGN_PREC))
+				+ maybe(d.ctorArgs, a => '(' + a.map(x => this.expression(x, ASSIGN_PREC)).join(this.comma) + ')')
 				+ ';';
 			default:					throw new Error(`Unknown definition: ${(d as any).type}`);
 		}
@@ -323,7 +320,7 @@ export class Output {
 	forInitStr(i?: Expr | Declaration | TypedefDecl): string {
 		if (!i)
 			return '';
-		return isExpr(i) ? this.expr(i as Expr) : this.declarationLike(i, false);
+		return isExpr(i) ? this.expression(i as Expr) : this.declarationLike(i, false);
 	}
 
 	statement(s: Stmt): string {
@@ -331,30 +328,30 @@ export class Output {
 			case 'declaration':
 			case 'typedef':				return this.declarationLike(s);
 			case 'block':				return this.block(s);
-			case 'if':					return 'if (' + this.expr(s.test) + ') ' + this.dependentCode(s.consequent) + maybe(s.alternate, alt => ' else ' + this.dependentCode(alt));
-			case 'while':				return 'while (' + this.expr(s.test) + ') ' + this.dependentCode(s.body);
-			case 'do_while':			return 'do ' + this.dependentCode(s.body) + ' while (' + this.expr(s.test) + ');';
-			case 'for':					return 'for (' + this.forInitStr(s.init) + '; ' + maybe(s.test, c => this.expr(c)) + '; ' + maybe(s.update, u => this.expr(u)) + ') ' + this.dependentCode(s.body);
-			case 'switch':				return 'switch (' + this.expr(s.discriminant) + ') ' + this.dependentCode(s.body);
-			case 'case':				return 'case ' + this.expr(s.test) + ': ' + this.statement(s.body);
+			case 'if':					return 'if (' + this.expression(s.test) + ') ' + this.dependentCode(s.consequent) + maybe(s.alternate, alt => ' else ' + this.dependentCode(alt));
+			case 'while':				return 'while (' + this.expression(s.test) + ') ' + this.dependentCode(s.body);
+			case 'do_while':			return 'do ' + this.dependentCode(s.body) + ' while (' + this.expression(s.test) + ');';
+			case 'for':					return 'for (' + this.forInitStr(s.init) + '; ' + maybe(s.test, c => this.expression(c)) + '; ' + maybe(s.update, u => this.expression(u)) + ') ' + this.dependentCode(s.body);
+			case 'switch':				return 'switch (' + this.expression(s.discriminant) + ') ' + this.dependentCode(s.body);
+			case 'case':				return 'case ' + this.expression(s.test) + ': ' + this.statement(s.body);
 			case 'default':				return 'default: ' + this.statement(s.body);
 			case 'break':				return 'break;';
 			case 'continue':			return 'continue;';
-			case 'return':				return 'return' + maybe(s.argument, e => ' ' + this.expr(e)) + ';';
+			case 'return':				return 'return' + maybe(s.argument, e => ' ' + this.expression(e)) + ';';
 			case 'goto':				return 'goto ' + s.label + ';';
 			case 'labeled':				return s.label + ': ' + this.statement(s.body);
 			case 'empty':				return ';';
 			// cpp
-			case 'throw':				return 'throw' + maybe(s.argument, a => ' ' + this.expr(a)) + ';';
+			case 'throw':				return 'throw' + maybe(s.argument, a => ' ' + this.expression(a)) + ';';
 			case 'try':					return 'try ' + this.block(s.body) + s.handlers.map(h =>
 				' catch (' + maybe(h.type, t => this.typeName(t)) + poss(h.byRef, '&') + maybe(h.param, n => (h.type ? ' ' : '') + n) + ') ' + this.block(h.body)
 			).join('');
-			case 'range_for':			return 'for (' + this.declSpec(s.specifiers) + ' ' + this.declStr(s.declarator) + ' : ' + this.expr(s.range) + ') ' + this.dependentCode(s.body);
+			case 'range_for':			return 'for (' + this.declSpec(s.specifiers) + ' ' + this.declStr(s.declarator) + ' : ' + this.expression(s.range) + ') ' + this.dependentCode(s.body);
 			case 'static_assert':
 			case 'using_namespace':
 			case 'using_decl':
 			case 'using_alias':			return this.definition(s as unknown as Definition);
-			case 'expression':			return this.expr(s.expression) + ';';
+			case 'expression':			return this.expression(s.expression) + ';';
 			default:					throw new Error(`Unknown statement: ${(s as any).type}`);
 		}
 	}
@@ -365,8 +362,8 @@ export class Output {
 
 	structDeclaratorStr(d: CPP.StructDeclarator): string {
 		if ('declarator' in d)
-			return this.declStr(d.declarator) + maybe(d.initializer, e => ' = ' + this.expr(e, ASSIGN_PREC));
-		return (d.name ?? '') + (d.type === 'bitfield' ? ' : ' + this.expr(d.width!, ASSIGN_PREC) : '');
+			return this.declStr(d.declarator) + maybe(d.initializer, e => ' = ' + this.expression(e, ASSIGN_PREC));
+		return (d.name ?? '') + (d.type === 'bitfield' ? ' : ' + this.expression(d.width!, ASSIGN_PREC) : '');
 	}
 
 	classMember(m: ClassMember): string {
@@ -415,11 +412,11 @@ export class Output {
 			return 'this';
 		if (c.defaultCapture)
 			return c.defaultCapture;
-		return poss(c.byRef, '&') + (c.name ?? '') + maybe(c.init, i => '=' + this.expr(i, ASSIGN_PREC));
+		return poss(c.byRef, '&') + (c.name ?? '') + maybe(c.init, i => '=' + this.expression(i, ASSIGN_PREC));
 	}
 
 	// `minPrec`: the precedence tier required of `e` here -- if lower, it gets parens. Defaults to 0 (never wraps).
-	expr(e: Expr, minPrec = 0): string {
+	expression(e: Expr, minPrec = 0): string {
 		return withParens(this.exprBody(e), exprPrecedence(e) < minPrec);
 	}
 
@@ -428,37 +425,37 @@ export class Output {
 			case 'identifier':			return e.name;
 			case 'literal':				return this.literal(e);
 			case 'char_literal':		return this.charLiteral(e.value);
-			case 'unary':				return e.operator + poss(/[a-z]/i.test(e.operator), ' ') + this.expr(e.operand, UNARY_PREC);
-			case 'unary_post':			return this.expr(e.operand, POSTFIX_PREC) + e.operator;
+			case 'unary':				return e.operator + poss(/[a-z]/i.test(e.operator), ' ') + this.expression(e.operand, UNARY_PREC);
+			case 'unary_post':			return this.expression(e.operand, POSTFIX_PREC) + e.operator;
 			case 'binary': {
 				const op = e.operator, prec = BINARY_PREC[op] ?? 0;
-				return this.expr(e.left, prec) + this.operator(op) + this.expr(e.right, prec + 1);
+				return this.expression(e.left, prec) + this.operator(op) + this.expression(e.right, prec + 1);
 			}
 			// Right-associative and the loosest thing there is: the target re-emits at the postfix tier
 			// the grammar demands, the value at assignment's own tier -- same shape as TS/tocode.ts's own `assign`.
-			case 'assign':				return this.expr(e.target, POSTFIX_PREC) + this.operator((e.operator ?? '') + '=') + this.expr(e.value, ASSIGN_PREC);
-			case 'conditional':			return this.expr(e.test, LOGICAL_OR_PREC) + this.operator('?') + this.expr(e.consequent, 0) + this.operator(':') + this.expr(e.alternate, CONDITIONAL_PREC);
-			case 'index':				return this.expr(e.object, POSTFIX_PREC) + '[' + this.expr(e.index) + ']';
-			case 'member':				return this.expr(e.object, POSTFIX_PREC) + '.' + e.property;
-			case 'pointer_member':		return this.expr(e.object, POSTFIX_PREC) + '->' + e.property;
-			case 'call':				return this.expr(e.callee, POSTFIX_PREC) + '(' + e.arguments.map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + ')';
-			case 'cast':				return '(' + this.typeName(e.typeAnnotation) + ')' + this.expr(e.expression, UNARY_PREC);
+			case 'assign':				return this.expression(e.target, POSTFIX_PREC) + this.operator((e.operator ?? '') + '=') + this.expression(e.value, ASSIGN_PREC);
+			case 'conditional':			return this.expression(e.test, LOGICAL_OR_PREC) + this.operator('?') + this.expression(e.consequent, 0) + this.operator(':') + this.expression(e.alternate, CONDITIONAL_PREC);
+			case 'index':				return this.expression(e.object, POSTFIX_PREC) + '[' + this.expression(e.index) + ']';
+			case 'member':				return this.expression(e.object, POSTFIX_PREC) + '.' + e.property;
+			case 'pointer_member':		return this.expression(e.object, POSTFIX_PREC) + '->' + e.property;
+			case 'call':				return this.expression(e.callee, POSTFIX_PREC) + '(' + e.arguments.map(a => this.expression(a, ASSIGN_PREC)).join(this.comma) + ')';
+			case 'cast':				return '(' + this.typeName(e.typeAnnotation) + ')' + this.expression(e.expression, UNARY_PREC);
 			case 'sizeof_type':			return 'sizeof(' + this.typeName(e.operand) + ')';
 			// cpp
 			case 'this':				return 'this';
 			case 'null_literal':		return 'nullptr';
 			case 'qualified':			return e.parts.join('::');
 			case 'new':					return 'new ' + this.typeSpecifier(e.typeName)
-				+ maybe(e.size, s => '[' + this.expr(s) + ']')
-				+ (e.braced ? '{' + (e.arguments ?? []).map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + '}'
-					: e.arguments ? '(' + e.arguments.map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + ')' : '');
-			case 'delete':				return 'delete' + poss(e.array, '[]') + ' ' + this.expr(e.operand, UNARY_PREC);
-			case 'spread':				return this.expr(e.operand) + '...';
+				+ maybe(e.size, s => '[' + this.expression(s) + ']')
+				+ (e.braced ? '{' + (e.arguments ?? []).map(a => this.expression(a, ASSIGN_PREC)).join(this.comma) + '}'
+					: e.arguments ? '(' + e.arguments.map(a => this.expression(a, ASSIGN_PREC)).join(this.comma) + ')' : '');
+			case 'delete':				return 'delete' + poss(e.array, '[]') + ' ' + this.expression(e.operand, UNARY_PREC);
+			case 'spread':				return this.expression(e.operand) + '...';
 			case 'sizeof_pack':			return 'sizeof...(' + e.name + ')';
-			case 'cpp_cast':			return e.kind + '<' + this.typeName(e.target) + '>(' + this.expr(e.expression) + ')';
-			case 'typeid':				return 'typeid(' + (e.expression ? this.expr(e.expression) : this.typeName(e.target!)) + ')';
+			case 'cpp_cast':			return e.kind + '<' + this.typeName(e.target) + '>(' + this.expression(e.expression) + ')';
+			case 'typeid':				return 'typeid(' + (e.expression ? this.expression(e.expression) : this.typeName(e.target!)) + ')';
 			case 'alignof':				return 'alignof(' + this.typeName(e.target) + ')';
-			case 'functional_cast':		return e.target + '(' + e.arguments.map(a => this.expr(a, ASSIGN_PREC)).join(this.comma) + ')';
+			case 'functional_cast':		return e.target + '(' + e.arguments.map(a => this.expression(a, ASSIGN_PREC)).join(this.comma) + ')';
 			case 'lambda':				return '[' + e.captures.map(c => this.captureStr(c)).join(this.comma) + ']'
 				+ this.paramList(e.params, e.variadic)
 				+ poss(e.mutable, ' mutable')

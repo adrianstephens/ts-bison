@@ -1,17 +1,12 @@
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import { Module, Literal, hasMod } from '../common';
-import { isModule, isType, isJsStatement, guard, isTsDeclaration } from './walker';
+import { isJsStatement, isTsDeclaration, Kinds } from './walker';
+import { Printer } from '../walker';
 
 type Type	= TS.Type;
 type Expr	= JS.Expr;
 const VOID	= TS.RefType('void');
-
-// ===================================================================
-//  Type Guards
-// ===================================================================
-
-const isBindingTarget	= guard<JS.BindingTarget>(['object_pattern', 'array_pattern']);
 
 const DefaultOptions = {
 	newline: 			'\n',
@@ -148,7 +143,7 @@ function typeMemberName(key: JS.Key<Type>): string {
 		: '[' + JS.ExprToDottedName(key.computed) + ']';
 }
 
-export class Output {
+export class Output implements Printer<Kinds> {
 	opts;
 	newline = '\n';
 	colon	= ': ';
@@ -166,18 +161,12 @@ export class Output {
 		this.comma		= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: Module<any> | TS.Stmt | Type | Expr | TS.Stmt[]) {
-		if (Array.isArray(ast))
-			return ast.map(s => this.statement(s)).join(this.opts.newline);
-		if (isModule(ast))
-			return ast.body.map(s => this.statement(s as TS.Stmt)).join(this.opts.newline);
-		if (isType(ast))
-			return this.type(ast);
-		if (isJsStatement(ast) || isTsDeclaration(ast))
-			return this.statement(ast);
-		if (isBindingTarget(ast))
-			return this.bindingTarget(ast);
-		return this.expr(ast);
+	statements(stmts: readonly TS.Stmt[]): string {
+		return stmts.map(s => this.statement(s)).join(this.opts.newline);
+	}
+
+	module(m: Module<TS.Stmt>): string {
+		return this.statements(m.body);
 	}
 
 	// ===================================================================
@@ -207,7 +196,7 @@ export class Output {
 	}
 	
 	private decorators(list?: Expr[]): string {
-		return list ? list.map(d => '@' + this.expr(d) + this.newline).join('') : '';
+		return list ? list.map(d => '@' + this.expression(d) + this.newline).join('') : '';
 	}
 
 	typeAnnotation(type?: Type) {
@@ -219,7 +208,7 @@ export class Output {
 			return target;
 		if (target.type === 'object_pattern') {
 			const parts = target.properties.map(p =>
-				this.memberKey(p.key) + ':' + this.bindingTarget(p.value) + maybe(p.default, def => ' = ' + this.expr(def, 2))
+				this.memberKey(p.key) + ':' + this.bindingTarget(p.value) + maybe(p.default, def => ' = ' + this.expression(def, 2))
 			);
 			if (target.rest)
 				parts.push('...' + target.rest);
@@ -227,7 +216,7 @@ export class Output {
 		}
 		if (target.type === 'array_pattern') {
 			const parts = target.elements.map(e => maybe(e,
-				e => this.bindingTarget(e.target) + maybe(e.default, def => ' = ' + this.expr(def, 2))
+				e => this.bindingTarget(e.target) + maybe(e.default, def => ' = ' + this.expression(def, 2))
 			));
 			if (target.rest)
 				parts.push('...' + target.rest);
@@ -245,7 +234,7 @@ export class Output {
 				+	this.bindingTarget(param.key)
 				+	optional(hasMod(param, 'optional'))
 				+	this.typeAnnotation(param.typeAnnotation as Type)
-				+	maybe(param.default, def => ' = ' + this.expr(def, 2));
+				+	maybe(param.default, def => ' = ' + this.expression(def, 2));
 		});
 		if (rest)
 			parts.push('...' + this.bindingTarget(rest.key) + this.typeAnnotation(rest.typeAnnotation as Type));
@@ -278,38 +267,40 @@ export class Output {
 	typeMemberBody(members: TS.TypeMember[]): string {
 		if (members.length === 0)
 			return '{}';
-		return this.curlyIndented(() => members.map(m => {
-			switch (m.type) {
-				case 'property':
-					return readonly(hasMod(m, 'readonly'))
-						+ typeMemberName(m.key)
-						+ optional(hasMod(m, 'optional'))
-						+ this.typeAnnotation(m.typeAnnotation);
+		return this.curlyIndented(() => members.map(m => this.typeMember(m)).join(';' + this.newline));
+	}
 
-				case 'method':
-					return typeMemberName(m.key)
-						+ optional(hasMod(m, 'optional'))
-						+ this.typeParams(m.typeParams)
-						+ this.params(m)
-						+ this.typeAnnotation(m.returnType);
+	typeMember(m: TS.TypeMember): string {
+		switch (m.type) {
+			case 'property':
+				return readonly(hasMod(m, 'readonly'))
+					+ typeMemberName(m.key)
+					+ optional(hasMod(m, 'optional'))
+					+ this.typeAnnotation(m.typeAnnotation);
 
-				case 'index':
-					return '[' + m.paramName + this.typeAnnotation(m.paramType) + ']' + this.typeAnnotation(m.typeAnnotation);
+			case 'method':
+				return typeMemberName(m.key)
+					+ optional(hasMod(m, 'optional'))
+					+ this.typeParams(m.typeParams)
+					+ this.params(m)
+					+ this.typeAnnotation(m.returnType);
 
-				case 'call':
-					return this.typeParams(m.typeParams)
-						+ this.params(m)
-						+ this.typeAnnotation(m.returnType ?? VOID);
+			case 'index':
+				return '[' + m.paramName + this.typeAnnotation(m.paramType) + ']' + this.typeAnnotation(m.typeAnnotation);
 
-				case 'construct':
-					return 'new ' + this.typeParams(m.typeParams)
-						+ this.params(m)
-						+ this.typeAnnotation(m.returnType ?? VOID);
+			case 'call':
+				return this.typeParams(m.typeParams)
+					+ this.params(m)
+					+ this.typeAnnotation(m.returnType ?? VOID);
 
-				default:
-					throw new Error(`Unknown member kind: ${(m as any).kind}`);
-			}
-		}).join(';' + this.newline));
+			case 'construct':
+				return 'new ' + this.typeParams(m.typeParams)
+					+ this.params(m)
+					+ this.typeAnnotation(m.returnType ?? VOID);
+
+			default:
+				throw new Error(`Unknown member kind: ${(m as any).kind}`);
+		}
 	}
 
 	// `minPrec`: the precedence tier required of `type` here -- if lower, it gets parens. Defaults to 0 (never wraps),
@@ -410,7 +401,7 @@ export class Output {
 				return poss(type.asserts, 'asserts ') + type.paramName + maybe(type.assertedType, type => ' is ' + this.type(type));
 
 			case 'import':
-				return 'import(' + maybe(type.source, source => quoteString(source)) + maybe(type.name, name => this.comma + name) + ')';
+				return 'import(' + quoteString(type.source) + ')' + maybe(type.name, name => '.' + name) + this.typeArgs(type.typeArgs);
 
 			default:
 				throw new Error(`Unknown type: ${(type as any).type}`);
@@ -434,7 +425,7 @@ export class Output {
 			this.bindingTarget(decl.name)
 			+ poss(decl.definite, '!')
 			+ this.typeAnnotation(decl.typeAnnotation as Type)
-			+ maybe(decl.init, init => ' = ' + this.expr(init, 2))
+			+ maybe(decl.init, init => ' = ' + this.expression(init, 2))
 		).join(this.comma);
 	}
 
@@ -455,7 +446,7 @@ export class Output {
 				return declare(stmt.ambient)
 					+ poss(stmt.const, 'const ')
 					+ 'enum ' + stmt.name + ' ' + this.curlyIndented(()=>stmt.members.map(m =>
-					 	m.name + maybe(m.init, init => ' = ' + this.expr(init, 2))
+					 	m.name + maybe(m.init, init => ' = ' + this.expression(init, 2))
 					).join(this.newline));
 
 			case 'namespace_decl':
@@ -471,7 +462,7 @@ export class Output {
 
 			case 'expression': {
 				// Real JS forbids an ExpressionStatement from starting with `{` -- a destructuring reassignment (`{a, b} = f()`) is exactly this.
-				const code = this.expr(stmt.expression);
+				const code = this.expression(stmt.expression);
 				return withParens(code, code.startsWith('{')) + ';';
 			}
 
@@ -479,25 +470,25 @@ export class Output {
 				return ';';
 
 			case 'if':
-				return 'if (' + this.expr(stmt.test) + ') '
+				return 'if (' + this.expression(stmt.test) + ') '
 					+ this.dependentCode(stmt.consequent)
 					+ maybe(stmt.alternate, alt => ' else ' + this.dependentCode(alt));
 
 			case 'do_while':
-				return 'do ' + this.dependentCode(stmt.body) + ' while (' + this.expr(stmt.test) + ');';
+				return 'do ' + this.dependentCode(stmt.body) + ' while (' + this.expression(stmt.test) + ');';
 
 			case 'while':
-				return 'while (' + this.expr(stmt.test) + ') ' + this.dependentCode(stmt.body);
+				return 'while (' + this.expression(stmt.test) + ') ' + this.dependentCode(stmt.body);
 
 			case 'for':
 				return 'for ' + poss(stmt.kind === 'of await', 'await ') + withParens(
 					maybe(stmt.init, init => (init.type === 'var_decl'
 						? this.varDecls(init)
-						: this.expr(init)
+						: this.expression(init)
 					))
 					+ (stmt.kind === 'normal'
-						? '; ' + maybe(stmt.test, test => this.expr(test)) + '; ' + maybe(stmt.update, update => this.expr(update))
-						: ' ' + (stmt.kind === 'of await' ? 'of' : stmt.kind) + ' ' + this.expr(stmt.right)
+						? '; ' + maybe(stmt.test, test => this.expression(test)) + '; ' + maybe(stmt.update, update => this.expression(update))
+						: ' ' + (stmt.kind === 'of await' ? 'of' : stmt.kind) + ' ' + this.expression(stmt.right)
 					)
 				 ) + ' ' + this.dependentCode(stmt.body);
 
@@ -508,21 +499,21 @@ export class Output {
 				return 'break' + maybe(stmt.label, label => ' ' + label) + ';';
 
 			case 'return':
-				return 'return' + maybe(stmt.argument, arg => ' ' + this.expr(arg)) + ';';
+				return 'return' + maybe(stmt.argument, arg => ' ' + this.expression(arg)) + ';';
 
 			case 'with':
-				return 'with (' + this.expr(stmt.argument) + ') ' + this.dependentCode(stmt.body);
+				return 'with (' + this.expression(stmt.argument) + ') ' + this.dependentCode(stmt.body);
 
 			case 'labeled':
 				return stmt.label + this.colon + this.statement(stmt.body);
 
 			case 'switch':
-				return 'switch (' + this.expr(stmt.discriminant) + ') ' + this.curlyIndented(() => stmt.cases.map(c =>
-					(c.test ? 'case ' + this.expr(c.test) : 'default') + ':' + this.indented(()=> this.newline + c.consequent.map(s => this.statement(s)).join(this.newline))
+				return 'switch (' + this.expression(stmt.discriminant) + ') ' + this.curlyIndented(() => stmt.cases.map(c =>
+					(c.test ? 'case ' + this.expression(c.test) : 'default') + ':' + this.indented(()=> this.newline + c.consequent.map(s => this.statement(s)).join(this.newline))
 				).join(this.newline));
 
 			case 'throw':
-				return 'throw ' + this.expr(stmt.argument) + ';';
+				return 'throw ' + this.expression(stmt.argument) + ';';
 
 			case 'try':
 				return 'try ' + this.indentBlock(stmt.body)
@@ -556,7 +547,7 @@ export class Output {
 
 			case 'export':
 				if (stmt.default)
-					return 'export default ' + this.toCode(stmt.default);
+					return 'export default ' + (isJsStatement(stmt.default) || isTsDeclaration(stmt.default) ? this.statement(stmt.default) : this.expression(stmt.default));
 
 				return 'export ' + typeOnly(stmt.typeOnly)
 					+ (stmt.specifiers
@@ -573,7 +564,7 @@ export class Output {
 					+ poss(stmt.abstract, 'abstract ')
 					+ 'class ' + stmt.name
 					+ this.typeParams(stmt.typeParams as TS.TypeParam[])
-					+ maybe(stmt.superClass, sup => ' extends ' + this.expr(sup, 18))
+					+ maybe(stmt.superClass, sup => ' extends ' + this.expression(sup, 18))
 					+ maybe(stmt.implements, imp => ' implements ' + imp.map(t => this.type(t)).join(this.comma))
 					+ ' ' + this.curlyIndented(() => stmt.body.map(m => this.classMember(m as TS.ClassMember)).join(this.newline));
 
@@ -612,7 +603,7 @@ export class Output {
 					+	this.memberKey(member.key)
 					+	(hasMod(member, 'optional') ? '?' : hasMod(member, 'definite') ? '!' : '')
 					+	this.typeAnnotation(member.typeAnnotation)
-					+	maybe(member.value, val => ' = ' + this.expr(val, 2))
+					+	maybe(member.value, val => ' = ' + this.expression(val, 2))
 					+	';';
 
 			case 'method':	return result + generator(hasMod(member, 'generator')) + this.classMethod(member);
@@ -628,14 +619,14 @@ export class Output {
 	memberKey(key: JS.Key<any>): string {
 		return typeof key === 'string'
 			? isValidIdentifier(key) ? key : quoteString(key)
-			: '[' + this.expr(key.computed, 2) + ']';
+			: '[' + this.expression(key.computed, 2) + ']';
 	}
 	// ===================================================================
 	//  Expressions
 	// ===================================================================
 
 	// `print`: how a substitution prints -- an expression's, or (a template literal TYPE) a type's; the node kinds overlap (`conditional`).
-	templateParts(parts: JS.TemplatePart<any>[], print: (x: any) => string = x => this.expr(x)): string {
+	templateParts(parts: JS.TemplatePart<any>[], print: (x: any) => string = x => this.expression(x)): string {
 		return '`' + parts.map(p => p.str + maybe(p.exp, exp => '${' + print(exp) + '}')).join('') + '`';
 	}
 
@@ -658,7 +649,7 @@ export class Output {
 	}
 
 	// `minPrec`: the precedence tier required of `expr` here -- if lower, it gets parens. Defaults to 0 (never wraps), right for statement-level callers.
-	expr(expr: Expr, minPrec = 0): string {
+	expression(expr: Expr, minPrec = 0): string {
 		return withParens(this.exprBody(expr), exprPrecedence(expr) < minPrec);
 	}
 
@@ -679,16 +670,16 @@ export class Output {
 			case 'array':
 				// Elements use `assignment_expression` in the grammar (array_literal's `element_list`),
 				// so minPrec=2 keeps a literal comma/sequence element from being misread as two elements.
-				return '[' + expr.elements.map((e: Expr | undefined) => maybe(e, e => this.expr(e, 2))).join(this.comma) + ']';
+				return '[' + expr.elements.map((e: Expr | undefined) => maybe(e, e => this.expression(e, 2))).join(this.comma) + ']';
 
 			case 'object':
 				return this.curlyIndented(() => expr.properties.map(p => {
 					switch (p.type) {
-						case 'spread':		return '...' + this.expr(p.operand, 2);
+						case 'spread':		return '...' + this.expression(p.operand, 2);
 						case 'get':			return 'get ' + this.memberKey(p.key) + '() ' + this.indentBlock(p.body!);
 						case 'set':			return 'set ' + this.memberKey(p.key) + this.paramList(p.params, p.rest) + ' ' + this.indentBlock(p.body!);
 						case 'method':		return aSync(hasMod(p, 'async')) + generator(hasMod(p, 'generator')) + this.memberKey(p.key) + this.paramList(p.params, p.rest) + ' ' + this.indentBlock(p.body!);
-						case 'field':		return this.memberKey(p.key) + this.colon + this.expr(p.value!, 2);
+						case 'field':		return this.memberKey(p.key) + this.colon + this.expression(p.value!, 2);
 					}
 				}).join(',' + this.newline));
 
@@ -701,61 +692,61 @@ export class Output {
 					+ ' ' + this.indentBlock(expr.body!);
 
 			case 'member':
-				return this.expr(expr.object, 18) + (expr.optional ? '?.' : '.') + expr.property;
+				return this.expression(expr.object, 18) + (expr.optional ? '?.' : '.') + expr.property;
 
 			case 'index':
 				// `property` uses the full `expression` production (allows comma) per the grammar's `'[' expression ']'` -- no wrapping needed.
-				return this.expr(expr.object, 18) + poss(expr.optional, '?.') + '[' + this.expr(expr.index) + ']';
+				return this.expression(expr.object, 18) + poss(expr.optional, '?.') + '[' + this.expression(expr.index) + ']';
 
 			case 'call':
-				return this.expr(expr.callee, 18)
+				return this.expression(expr.callee, 18)
 					+ this.typeArgs(expr.typeArgs as Type[])
 					+ poss(expr.optional, '?.')
-					+ withParens(expr.arguments.map((a: Expr) => this.expr(a, 2)).join(this.comma));
+					+ withParens(expr.arguments.map((a: Expr) => this.expression(a, 2)).join(this.comma));
 
 			case 'new':
-				return 'new ' + this.expr(expr.callee, 18)
+				return 'new ' + this.expression(expr.callee, 18)
 					+ this.typeArgs(expr.typeArgs as Type[])
-					+ withParens(expr.arguments.map((a: Expr) => this.expr(a, 2)).join(this.comma) );
+					+ withParens(expr.arguments.map((a: Expr) => this.expression(a, 2)).join(this.comma) );
 
 			// Binds like a prefix unary, so it shares their operand tier.
 			case 'await':
-				return 'await ' + this.expr(expr.operand, 16);
+				return 'await ' + this.expression(expr.operand, 16);
 
 			case 'unary':
 				// Operand is `unary_expression` (self) in the grammar -- same tier, so chained unaries
 				// (`!!x`, `typeof typeof x`) don't need parens, but anything looser (e.g. `-(a + b)`) does.
-				return expr.operator + poss(!!expr.operator.match(/\w+/), ' ') + this.expr(expr.operand, 16);
+				return expr.operator + poss(!!expr.operator.match(/\w+/), ' ') + this.expression(expr.operand, 16);
 
 			case 'unary_post':
-				return this.expr(expr.operand, 18) + expr.operator;
+				return this.expression(expr.operand, 18) + expr.operator;
 
 			// Right-associative and the loosest thing there is: the target re-emits at the
 			// left-hand-side tier the grammar demands, the value at assignment's own tier.
 			case 'assign':
-				return this.expr(expr.target, 18) + this.operator((expr.operator ?? '') + '=') + this.expr(expr.value, 2);
+				return this.expression(expr.target, 18) + this.operator((expr.operator ?? '') + '=') + this.expression(expr.value, 2);
 
 			case 'binary': {
 				const op	= expr.operator;
 				const prec	= BINARY_PREC[op] ?? 0;
-				return withParens(this.expr(expr.left, op === '**' ? 16 : prec), needsNullishParens(op, expr.left) || needsAsIntersectionParens(op, expr.left))
+				return withParens(this.expression(expr.left, op === '**' ? 16 : prec), needsNullishParens(op, expr.left) || needsAsIntersectionParens(op, expr.left))
 					+ this.operator(op)
-					+ withParens(this.expr(expr.right, op === '**' ? 15 : prec + 1), needsNullishParens(op, expr.right));
+					+ withParens(this.expression(expr.right, op === '**' ? 15 : prec + 1), needsNullishParens(op, expr.right));
 			}
 
 			case 'conditional':
 				// `test` is parsed as `nullish_expression` (tier 4); `consequent`/`alternate` are full
 				// `assignment_expression` (tier 2, i.e. anything but a bare sequence) -- see conditional_expression.
-				return this.expr(expr.test, 4) + this.operator('?') + this.expr(expr.consequent, 2) + this.operator(':') + this.expr(expr.alternate, 2);
+				return this.expression(expr.test, 4) + this.operator('?') + this.expression(expr.consequent, 2) + this.operator(':') + this.expression(expr.alternate, 2);
 
 			case 'sequence':
-				return expr.expressions.map((e: Expr) => this.expr(e, 2)).join(this.comma);
+				return expr.expressions.map((e: Expr) => this.expression(e, 2)).join(this.comma);
 
 			case 'spread':
-				return '...' + this.expr(expr.operand, 2);
+				return '...' + this.expression(expr.operand, 2);
 
 			case 'tagged_template':
-				return this.expr(expr.tag, 18) + this.templateParts(expr.quasi);
+				return this.expression(expr.tag, 18) + this.templateParts(expr.quasi);
 
 			case 'arrow': {
 				return aSync(hasMod(expr, 'async'))
@@ -768,28 +759,28 @@ export class Output {
 					+ ' => '
 					+ (Array.isArray(expr.body)
 						? this.indentBlock(expr.body)
-						: arrowParens(this.expr(expr.body, 2))	// Body is `assignment_expression` (tier 2) -- but an object literal body additionally needs parens regardless of precedence, or `{` would be read as the arrow's block body instead (the same ambiguity real TS. requires `() => ({})` for).
+						: arrowParens(this.expression(expr.body, 2))	// Body is `assignment_expression` (tier 2) -- but an object literal body additionally needs parens regardless of precedence, or `{` would be read as the arrow's block body instead (the same ambiguity real TS. requires `() => ({})` for).
 					);
 			}
 
 			case 'yield':
-				return 'yield' + generator(expr.delegate) + maybe(expr.operand, op => ' ' + this.expr(op, 2));
+				return 'yield' + generator(expr.delegate) + maybe(expr.operand, op => ' ' + this.expression(op, 2));
 
 			case 'class':
 				return 'class' + maybe(expr.name, name => ' ' + name)
 					+ this.typeParams(expr.typeParams as TS.TypeParam[])
-					+ maybe(expr.superClass, sup => ' extends ' + this.expr(sup, 18))
+					+ maybe(expr.superClass, sup => ' extends ' + this.expression(sup, 18))
 					+ maybe(expr.implements, imp => ' implements ' + imp.map(t => this.type(t as Type)).join(this.comma))
 					+ ' ' + this.curlyIndented(() => (expr.body as TS.ClassMember[]).map(m => this.classMember(m)).join(this.newline));
 
 			case 'as':
-				return this.expr(expr.expression, 11) + ' as ' + this.type(expr.typeAnnotation as Type);
+				return this.expression(expr.expression, 11) + ' as ' + this.type(expr.typeAnnotation as Type);
 
 			case 'satisfies':
-				return this.expr(expr.expression, 11) + ' satisfies ' + this.type(expr.typeAnnotation as Type);
+				return this.expression(expr.expression, 11) + ' satisfies ' + this.type(expr.typeAnnotation as Type);
 
 			case 'instantiation':
-				return this.expr(expr.expression, 18) + this.typeArgs(expr.typeArgs as Type[]);
+				return this.expression(expr.expression, 18) + this.typeArgs(expr.typeArgs as Type[]);
 
 			default:
 				return String(expr);

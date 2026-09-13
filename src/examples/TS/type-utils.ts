@@ -46,7 +46,7 @@ const BOXED_PRIMITIVE = new Map([['string', 'String'], ['number', 'Number'], ['b
 
 export const tocode = new Output({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
 export function typeKey(t: Type) { return tocode.type(t); }
-export function exprKey(e: Expr) { return tocode.expr(e); }
+export function exprKey(e: Expr) { return tocode.expression(e); }
 
 export const NUMBER		= TS.RefType('number');
 export const STRING		= TS.RefType('string');

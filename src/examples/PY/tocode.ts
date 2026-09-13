@@ -1,6 +1,7 @@
 import * as PY from './py-parser';
 import { Module } from '../common';
-import { isModule, isStmt } from './walker';
+import { Kinds } from './walker';
+import { Printer } from '../walker';
 
 type Expr = PY.Expr;
 type Stmt = PY.Stmt;
@@ -77,7 +78,7 @@ function pyStr(v: string): string {
 		:	'"""' + esc.replace(/"/g, '\\"') + '"""';
 }
 
-export class Output {
+export class Output implements Printer<Kinds> {
 	opts;
 	newline = '\n';
 	comma	= ', ';
@@ -88,14 +89,12 @@ export class Output {
 		this.comma	= this.opts.spaceAfterComma ? ', ' : ',';
 	}
 
-	toCode(ast: Module<Stmt> | Stmt | Stmt[] | Expr): string {
-		if (isModule(ast))
-			return ast.body.map(s => this.statement(s)).join(this.newline);
-		if (Array.isArray(ast))
-			return ast.map(s => this.statement(s)).join(this.newline);
-		if (isStmt(ast))
-			return this.statement(ast);
-		return this.expr(ast);
+	statements(stmts: readonly Stmt[]): string {
+		return stmts.map(s => this.statement(s)).join(this.newline);
+	}
+
+	module(m: Module<Stmt>): string {
+		return this.statements(m.body);
 	}
 
 	// ===================================================================
@@ -124,7 +123,7 @@ export class Output {
 			return '';
 		if (alternate.length === 1 && alternate[0].type === 'if') {
 			const e = alternate[0];
-			return this.newline + 'elif ' + this.expr(e.test) + this.suite(e.consequent) + this.elseChain(e.alternate);
+			return this.newline + 'elif ' + this.expression(e.test) + this.suite(e.consequent) + this.elseChain(e.alternate);
 		}
 		return this.newline + 'else' + this.suite(alternate);
 	}
@@ -137,7 +136,7 @@ export class Output {
 	// ===================================================================
 
 	private decorators(list: Expr[]): string {
-		return list.map(d => '@' + this.expr(d) + this.newline).join('');
+		return list.map(d => '@' + this.expression(d) + this.newline).join('');
 	}
 
 	statement(s: Stmt): string {
@@ -145,33 +144,33 @@ export class Output {
 			case 'expression':		return this.exprList(s.expression);
 			case 'assign':			return s.targets.map(t => this.exprList(t) + ' = ').join('') + this.exprList(s.value);
 			case 'augassign':		return this.exprList(s.target) + ' ' + s.op + ' ' + this.exprList(s.value);
-			case 'annassign':		return this.expr(s.target) + ': ' + this.expr(s.annotation) + maybe(s.value, v => ' = ' + this.exprList(v));
+			case 'annassign':		return this.expression(s.target) + ': ' + this.expression(s.annotation) + maybe(s.value, v => ' = ' + this.exprList(v));
 			case 'return':			return 'return' + maybe(s.argument, v => ' ' + this.exprList(v));
 			case 'pass':			return 'pass';
 			case 'break':			return 'break';
 			case 'continue':		return 'continue';
-			case 'throw':			return 'raise' + maybe(s.argument, e => ' ' + this.expr(e) + maybe(s.cause, c => ' from ' + this.expr(c)));
+			case 'throw':			return 'raise' + maybe(s.argument, e => ' ' + this.expression(e) + maybe(s.cause, c => ' from ' + this.expression(c)));
 			case 'global':			return 'global ' + s.names.join(this.comma);
 			case 'nonlocal':		return 'nonlocal ' + s.names.join(this.comma);
 			case 'del':				return 'del ' + this.exprList(s.targets);
-			case 'assert':			return 'assert ' + this.expr(s.test) + maybe(s.msg, m => this.comma + this.expr(m));
+			case 'assert':			return 'assert ' + this.expression(s.test) + maybe(s.msg, m => this.comma + this.expression(m));
 			case 'import':			return 'import ' + s.names.map(a => a.name + maybe(a.asname, n => ' as ' + n)).join(this.comma);
 			case 'importfrom':		return 'from ' + '.'.repeat(s.level) + (s.module ?? '') + ' import '
 				+ (s.names === '*' ? '*' : s.names.map(a => a.name + maybe(a.asname, n => ' as ' + n)).join(this.comma));
-			case 'if':				return 'if ' + this.expr(s.test) + this.suite(s.consequent) + this.elseChain(s.alternate);
-			case 'while':			return 'while ' + this.expr(s.test) + this.suite(s.body) + this.elseClause(s.orelse);
+			case 'if':				return 'if ' + this.expression(s.test) + this.suite(s.consequent) + this.elseChain(s.alternate);
+			case 'while':			return 'while ' + this.expression(s.test) + this.suite(s.body) + this.elseClause(s.orelse);
 			case 'for':				return (s.is_async ? 'async ' : '') + 'for ' + this.exprList(s.target) + ' in ' + this.exprList(s.iter)
 				+ this.suite(s.body) + this.elseClause(s.orelse);
 			case 'with':			return (s.is_async ? 'async ' : '') + 'with '
-				+ s.items.map(w => this.expr(w.context) + maybe(w.optional_vars, v => ' as ' + this.expr(v))).join(this.comma)
+				+ s.items.map(w => this.expression(w.context) + maybe(w.optional_vars, v => ' as ' + this.expression(v))).join(this.comma)
 				+ this.suite(s.body);
 			case 'try':				return 'try' + this.suite(s.body)
 				+ s.handlers.map(h => this.newline + 'except' + (h.star ? '*' : '')
-					+ maybe(h.type, t => ' ' + this.expr(t)) + maybe(h.param, n => ' as ' + n) + this.suite(h.body)).join('')
+					+ maybe(h.type, t => ' ' + this.expression(t)) + maybe(h.param, n => ' as ' + n) + this.suite(h.body)).join('')
 				+ this.elseClause(s.orelse)
 				+ (s.finalizer.length ? this.newline + 'finally' + this.suite(s.finalizer) : '');
 			case 'funcdef':			return this.decorators(s.decorators) + (s.is_async ? 'async ' : '') + 'def ' + s.name
-				+ '(' + this.params(s.params) + ')' + maybe(s.returns, r => ' -> ' + this.expr(r)) + this.suite(s.body);
+				+ '(' + this.params(s.params) + ')' + maybe(s.returns, r => ' -> ' + this.expression(r)) + this.suite(s.body);
 			case 'classdef':		return this.decorators(s.decorators) + 'class ' + s.name
 				+ (s.bases.length ? '(' + s.bases.map(a => this.arg(a)).join(this.comma) + ')' : '') + this.suite(s.body);
 		}
@@ -186,13 +185,13 @@ export class Output {
 			switch (p.kind) {
 				case 'slash':		return '/';
 				case 'stardelim':	return '*';
-				case 'star':		return '*' + (p.name ?? '') + maybe(p.annotation, a => ': ' + this.expr(a));
-				case 'dstar':		return '**' + p.name + maybe(p.annotation, a => ': ' + this.expr(a));
+				case 'star':		return '*' + (p.name ?? '') + maybe(p.annotation, a => ': ' + this.expression(a));
+				case 'dstar':		return '**' + p.name + maybe(p.annotation, a => ': ' + this.expression(a));
 				default: {
 					const eq  = !lambda && p.annotation ? ' = ' : '=';
 					return p.name
-						+ (!lambda && p.annotation ? ': ' + this.expr(p.annotation) : '')
-						+ maybe(p.default, d => eq + this.expr(d));
+						+ (!lambda && p.annotation ? ': ' + this.expression(p.annotation) : '')
+						+ maybe(p.default, d => eq + this.expression(d));
 				}
 			}
 		}).join(this.comma);
@@ -200,32 +199,32 @@ export class Output {
 
 	private arg(a: PY.Arg): string {
 		switch (a.kind) {
-			case 'kw':		return a.name + '=' + this.expr(a.value, TERNARY);
-			case 'star':	return '*' + this.expr(a.value, UNARY);
-			case 'dstar':	return '**' + this.expr(a.value, UNARY);
-			default:		return this.expr(a.value, TERNARY);
+			case 'kw':		return a.name + '=' + this.expression(a.value, TERNARY);
+			case 'star':	return '*' + this.expression(a.value, UNARY);
+			case 'dstar':	return '**' + this.expression(a.value, UNARY);
+			default:		return this.expression(a.value, TERNARY);
 		}
 	}
 
 	private comprehension(gens: PY.CompClause[]): string {
 		return gens.map(c => c.type === 'for'
-			? (c.is_async ? 'async ' : '') + 'for ' + this.exprList(c.target) + ' in ' + this.expr(c.iter, OR)
-			: 'if ' + this.expr(c.test, OR)
+			? (c.is_async ? 'async ' : '') + 'for ' + this.exprList(c.target) + ' in ' + this.expression(c.iter, OR)
+			: 'if ' + this.expression(c.test, OR)
 		).join(' ');
 	}
 
 	private sliceStr(e: Expr): string {
 		if (e.type === 'slice')
-			return maybe(e.lower, l => this.expr(l)) + ':' + maybe(e.upper, u => this.expr(u)) + maybe(e.step, s => ':' + this.expr(s));
+			return maybe(e.lower, l => this.expression(l)) + ':' + maybe(e.upper, u => this.expression(u)) + maybe(e.step, s => ':' + this.expression(s));
 		if (e.type === 'tuple')
 			return e.elements.map(x => this.sliceStr(x)).join(this.comma);
-		return this.expr(e);
+		return this.expression(e);
 	}
 
 	private fstring(parts: PY.FStringPart[]): string {
 		const fstringField = (f: PY.FStringField) => '{'
-			+ this.expr(f.expr) + (f.selfDoc ? '=' : '') + maybe(f.conv, c => '!' + c)
-			+ (f.spec ? ':' + f.spec.map(s => typeof s === 'string' ? s : '{' + this.expr(s) + '}').join('') : '')
+			+ this.expression(f.expr) + (f.selfDoc ? '=' : '') + maybe(f.conv, c => '!' + c)
+			+ (f.spec ? ':' + f.spec.map(s => typeof s === 'string' ? s : '{' + this.expression(s) + '}').join('') : '')
 			+ '}';
 		const body		= parts.map(p => p.text + (p.field ? fstringField(p.field) : '')).join('');
 		const single	= !body.includes('\n') && (!body.includes('"') ? '"' : !body.includes("'") ? "'" : '');
@@ -240,15 +239,15 @@ export class Output {
 	private exprList(e: Expr): string {
 		if (e.type === 'tuple')
 			return e.elements.length === 0 ? '()'
-				: e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + (e.elements.length === 1 ? ',' : '');
-		return this.expr(e);
+				: e.elements.map(x => this.expression(x, TERNARY)).join(this.comma) + (e.elements.length === 1 ? ',' : '');
+		return this.expression(e);
 	}
 
 	// ===================================================================
 	//  Expressions
 	// ===================================================================
 
-	expr(e: Expr, minPrec = 0): string {
+	expression(e: Expr, minPrec = 0): string {
 		return withParens(this.exprBody(e), exprPrecedence(e) < minPrec);
 	}
 
@@ -263,35 +262,35 @@ export class Output {
 					: String(e.value);
 			case 'imaginary':		return String(e.value) + 'j';
 			case 'ellipsis':		return '...';
-			case 'unary':			return e.operator === '!' ? 'not ' + this.expr(e.operand, NOT) : e.operator + this.expr(e.operand, UNARY);
+			case 'unary':			return e.operator === '!' ? 'not ' + this.expression(e.operand, NOT) : e.operator + this.expression(e.operand, UNARY);
 			case 'binary': {
 				const prec			= BINARY_PREC[e.operator] ?? ATOM;
 				const rightAssoc	= e.operator === '**';
-				return this.expr(e.left, rightAssoc ? prec + 1 : prec)
+				return this.expression(e.left, rightAssoc ? prec + 1 : prec)
 					+ (e.operator === '&&' ? ' and ' : e.operator === '||' ? ' or ' : this.op(e.operator))
-					+ this.expr(e.right, rightAssoc ? prec : prec + 1);
+					+ this.expression(e.right, rightAssoc ? prec : prec + 1);
 			}
-			case 'compare':			return this.expr(e.left, BOR) + e.ops.map((o, i) => ' ' + o + ' ' + this.expr(e.comparators[i], BOR)).join('');
-			case 'conditional':		return this.expr(e.consequent, OR) + ' if ' + this.expr(e.test, OR) + ' else ' + this.expr(e.alternate, TERNARY);
-			case 'lambda':			return 'lambda' + (e.params.length ? ' ' + this.params(e.params, true) : '') + ': ' + this.expr(e.body, LAMBDA);
-			case 'namedexpr':		return e.target + ' := ' + this.expr(e.value, TERNARY);
-			case 'spread':			return '*' + this.expr(e.operand, UNARY);
-			case 'member':			return this.expr(e.object, POSTFIX) + '.' + e.property;
-			case 'index':			return this.expr(e.object, POSTFIX) + '[' + this.sliceStr(e.index) + ']';
+			case 'compare':			return this.expression(e.left, BOR) + e.ops.map((o, i) => ' ' + o + ' ' + this.expression(e.comparators[i], BOR)).join('');
+			case 'conditional':		return this.expression(e.consequent, OR) + ' if ' + this.expression(e.test, OR) + ' else ' + this.expression(e.alternate, TERNARY);
+			case 'lambda':			return 'lambda' + (e.params.length ? ' ' + this.params(e.params, true) : '') + ': ' + this.expression(e.body, LAMBDA);
+			case 'namedexpr':		return e.target + ' := ' + this.expression(e.value, TERNARY);
+			case 'spread':			return '*' + this.expression(e.operand, UNARY);
+			case 'member':			return this.expression(e.object, POSTFIX) + '.' + e.property;
+			case 'index':			return this.expression(e.object, POSTFIX) + '[' + this.sliceStr(e.index) + ']';
 			case 'slice':			return this.sliceStr(e);	// only reached if a bare slice is printed on its own
-			case 'call':			return this.expr(e.callee, POSTFIX) + '(' + e.arguments.map(a => this.arg(a)).join(this.comma) + ')';
-			case 'tuple':			return e.elements.length === 0 ? '()' : '(' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + (e.elements.length === 1 ? ',' : '') + ')';
-			case 'list':			return '[' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + ']';
-			case 'set':				return e.elements.length === 0 ? 'set()' : '{' + e.elements.map(x => this.expr(x, TERNARY)).join(this.comma) + '}';
+			case 'call':			return this.expression(e.callee, POSTFIX) + '(' + e.arguments.map(a => this.arg(a)).join(this.comma) + ')';
+			case 'tuple':			return e.elements.length === 0 ? '()' : '(' + e.elements.map(x => this.expression(x, TERNARY)).join(this.comma) + (e.elements.length === 1 ? ',' : '') + ')';
+			case 'list':			return '[' + e.elements.map(x => this.expression(x, TERNARY)).join(this.comma) + ']';
+			case 'set':				return e.elements.length === 0 ? 'set()' : '{' + e.elements.map(x => this.expression(x, TERNARY)).join(this.comma) + '}';
 			case 'dict':			return '{' + e.keys.map((k, i) => k === null
-				? '**' + this.expr(e.values[i], OR)
-				: this.expr(k, TERNARY) + ': ' + this.expr(e.values[i], TERNARY)).join(this.comma) + '}';
-			case 'genexp':			return '(' + this.expr(e.elt, TERNARY) + ' ' + this.comprehension(e.gens) + ')';
-			case 'listcomp':		return '[' + this.expr(e.elt, TERNARY) + ' ' + this.comprehension(e.gens) + ']';
-			case 'setcomp':			return '{' + this.expr(e.elt, TERNARY) + ' ' + this.comprehension(e.gens) + '}';
-			case 'dictcomp':		return '{' + this.expr(e.key, TERNARY) + ': ' + this.expr(e.value, TERNARY) + ' ' + this.comprehension(e.gens) + '}';
-			case 'await':			return 'await ' + this.expr(e.operand, AWAIT);
-			case 'yield':			return e.from ? 'yield from ' + this.expr(e.from) : e.operand ? 'yield ' + this.exprList(e.operand) : 'yield';
+				? '**' + this.expression(e.values[i], OR)
+				: this.expression(k, TERNARY) + ': ' + this.expression(e.values[i], TERNARY)).join(this.comma) + '}';
+			case 'genexp':			return '(' + this.expression(e.elt, TERNARY) + ' ' + this.comprehension(e.gens) + ')';
+			case 'listcomp':		return '[' + this.expression(e.elt, TERNARY) + ' ' + this.comprehension(e.gens) + ']';
+			case 'setcomp':			return '{' + this.expression(e.elt, TERNARY) + ' ' + this.comprehension(e.gens) + '}';
+			case 'dictcomp':		return '{' + this.expression(e.key, TERNARY) + ': ' + this.expression(e.value, TERNARY) + ' ' + this.comprehension(e.gens) + '}';
+			case 'await':			return 'await ' + this.expression(e.operand, AWAIT);
+			case 'yield':			return e.from ? 'yield from ' + this.expression(e.from) : e.operand ? 'yield ' + this.exprList(e.operand) : 'yield';
 		}
 	}
 }

@@ -2,6 +2,8 @@
 // A language's walker, one entry per node kind `K`: what `walk` returns and every handler's `recurse`. The caller
 // names the kind, since a tag can't always tell (a TS 'literal' or 'this' is identical as a type and an expression).
 export type Walker<K>	= { [P in keyof K]: <T extends K[P]>(x?: T) => T | undefined };
+// The printing counterpart: a language's code printer, one entry per node kind.
+export type Printer<K>	= { [P in keyof K]: (x: K[P]) => string };
 export type OnAST<U, R>	= (x: U, process: <T extends U>(x: T) => T, recurse: R) => U | undefined;
 
 export function makeProcess<U, R>(parts: (x: U) => U, on: OnAST<U, R> | undefined, recurse: R, always = false) {

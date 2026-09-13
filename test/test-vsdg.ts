@@ -26,7 +26,7 @@ function compile(src: string): string {
 	Optimize(graph);
 	const { blocks, blockIds } = applyGlobalCodeMotion(graph);
 	const stmts		= BuildProgram(graph, blocks, blockIds);
-	return printer.toCode(stmts as any).trim();
+	return printer.statements(stmts).trim();
 }
 
 function indent(s: string) {

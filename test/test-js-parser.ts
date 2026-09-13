@@ -6,7 +6,7 @@ function test(name: string, code: string) {
 	try {
 		console.log('====' + name + '====');
 		const ast = parse(code);
-		console.log(output.toCode(ast));
+		console.log(output.module(ast));
 	} catch (e) {
 		console.error(`${name} failed:`, e);
 	}

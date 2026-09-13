@@ -3,34 +3,8 @@ import { Module } from '../common';
 import * as W from '../walker';
 import {mapObject, mapArrayA, mapDefined, makeProcess, makeProcessB} from '../walker';
 
-// ===================================================================
-//  Type guards
-// ===================================================================
 // Python's AST has only two node domains -- statements and expressions -- so this walker is a
-// trimmed-down version of TS/walker.ts (no separate Type / declarator domains). The `guard` helper
-// and the `walk` / `walkB` machinery are otherwise the same shape.
-
-export function guard<R>(types: string[]) {
-	const set = new Set(types);
-	return (node: any): node is R => node && typeof node === 'object' && 'type' in node && set.has(node.type);
-}
-
-const exprTags = [
-	'identifier', 'literal', 'imaginary', 'ellipsis', 'unary', 'binary', 'compare', 'conditional', 'lambda',
-	'namedexpr', 'spread', 'member', 'index', 'slice', 'call', 'tuple', 'list', 'set', 'dict',
-	'genexp', 'listcomp', 'setcomp', 'dictcomp', 'await', 'yield', 'fstring',
-];
-const stmtTags = [
-	'expression', 'assign', 'augassign', 'annassign', 'return', 'pass', 'break', 'continue', 'throw',
-	'global', 'nonlocal', 'del', 'assert', 'import', 'importfrom', 'if', 'while', 'for', 'with',
-	'try', 'funcdef', 'classdef',
-];
-
-export const isModule	= guard<Module<PY.Stmt>>(['module']);
-export const isExpr		= guard<PY.Expr>(exprTags);
-// `for` / `if` are also comprehension-clause tags -- those never appear as standalone nodes (only
-// inside a comprehension's `gens`), so they're walked inline and left out of `stmtTags`.
-export const isStmt		= guard<PY.Stmt>(stmtTags);
+// trimmed-down version of TS/walker.ts (no separate Type / declarator domains).
 
 type Expr = PY.Expr;
 type Stmt = PY.Stmt;

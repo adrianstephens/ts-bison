@@ -39,17 +39,17 @@ function test(name: string, code: string, format = 20) {
 				console.error(`  ${d.pos.line}:${d.pos.col} - ${d.message}`);
 		}
 		switch (format) {
-			case 1: console.log(output.toCode(program)); break;
-			case 2: console.log(output.toCode(TStoJS(program)!)); break;
-			case 3: console.log(output.toCode(TStoDecl(program))); break;
+			case 1: console.log(output.module(program)); break;
+			case 2: console.log(output.module(TStoJS(program))); break;
+			case 3: console.log(output.module(TStoDecl(program))); break;
 			case 20: {
-				console.log(output.toCode(program));
+				console.log(output.module(program));
 				const graph		= vsdg.BuildVSDG(program.body);
 				vsdg.Optimize(graph);
 				const { blocks, blockIds } = vsdg.applyGlobalCodeMotion(graph);
 				const stmts = vsdg.BuildProgram(graph, blocks, blockIds);
 				console.log('==== VSDG');
-				console.log(output.toCode(stmts));
+				console.log(output.statements(stmts));
 				break;
 			}
 		}
@@ -78,22 +78,22 @@ async function testAsync(parser: Parser, name: string, filename: string, format 
 				console.error(`  ${d.pos.line}:${d.pos.col} - ${d.message}`);
 		}
 		switch (format) {
-			case 1: console.log(output.toCode(program)); break;
-			case 2: console.log(output.toCode(TStoJS(program)!)); break;
-			case 3: console.log(output.toCode(TStoDecl(program))); break;
+			case 1: console.log(output.module(program)); break;
+			case 2: console.log(output.module(TStoJS(program))); break;
+			case 3: console.log(output.module(TStoDecl(program))); break;
 			case 13: {
 				const dest = path.join(path.dirname(filename), '../dist', path.basename(filename, '.ts') + '.debug.d.ts');
-				await fs.writeFile(dest, output.toCode(TStoDecl(program)));
+				await fs.writeFile(dest, output.module(TStoDecl(program)));
 				break;
 			}
 			case 20: {
-				console.log(output.toCode(program));
+				console.log(output.module(program));
 				const graph		= vsdg.BuildVSDG(program.body);
 				vsdg.Optimize(graph);
 				const { blocks, blockIds } = vsdg.applyGlobalCodeMotion(graph);
 				const stmts = vsdg.BuildProgram(graph, blocks, blockIds);
 				//console.log('==== VSDG');
-				console.log(output.toCode(stmts));
+				console.log(output.statements(stmts));
 				break;
 			}
 		}

@@ -31,18 +31,11 @@ export function guard<R>(types: string[]) {
 	return (node: any): node is R => node && typeof node === 'object' && 'type' in node && set.has(node.type);
 }
 
-const definitionTags	= ['declaration', 'typedef', 'function_def', 'namespace', 'linkage', 'using_namespace', 'using_decl', 'using_alias', 'template', 'static_assert', 'method_def', 'constructor_def', 'destructor_def', 'operator_def', 'static_member_def'];
-const statementOnlyTags = ['block', 'expression', 'if', 'while', 'do_while', 'for', 'switch', 'case', 'default', 'break', 'continue', 'return', 'goto', 'labeled', 'empty', 'throw', 'try', 'range_for'];
 const exprTags			= ['identifier', 'literal', 'char_literal', 'unary', 'unary_post', 'binary', 'assign', 'conditional', 'index', 'member', 'pointer_member', 'call', 'cast', 'sizeof_type', 'this', 'null_literal', 'qualified', 'new', 'delete', 'spread', 'sizeof_pack', 'cpp_cast', 'typeid', 'alignof', 'functional_cast', 'lambda'];
-const classMemberTags	= ['struct_member', 'member_typedef', 'access_label', 'constructor', 'destructor', 'method', 'conversion', 'using_decl', 'using_alias', 'member_template'];
 const declaratorTags	= ['identifier', 'pointer', 'array', 'function', 'reference', 'rvalue_reference'];
 const packParamTags	= ['parameter']; // both ParameterDecl and PackParameter use this tag; distinguished by `pack`
 
-export const isTranslationUnit	= guard<Module<Definition>>(['module']);
-export const isDefinition		= guard<Definition>(definitionTags);
-export const isStatementOnly	= guard<Stmt>(statementOnlyTags);
 export const isExpr				= guard<Expr>(exprTags);
-export const isClassMember		= guard<ClassMember>(classMemberTags);
 export const isDeclarator		= guard<Declarator | AbstractDeclarator>(declaratorTags);
 export const isPackParameter	= (p: ParamDecl): p is CPP.PackParameter => !!packParamTags.includes(p.type) && 'pack' in p && !!p.pack;
 

@@ -4,6 +4,7 @@ import * as JS from './js-parser';
 import { Literal, hasMod, Location, getPos } from '../common';
 import { isTsDeclaration, walk, walkB } from './walker';
 import * as T from './type-utils';
+import { Output } from './tocode';
 
 export const SEVERITY = {
 	GAP:		0,	// known missing functionality (see the header's own gap list) -- not a judgment call, just a reminder
@@ -11,7 +12,9 @@ export const SEVERITY = {
 	ERROR:		2,
 } as const;
 export type SEVERITY = (typeof SEVERITY)[keyof typeof SEVERITY];
-export type Err = (sev: SEVERITY, pos: Location) => (strings: TemplateStringsArray, ...values: any[]) => void;
+export type Err = (sev: SEVERITY, pos: Location) => (strings: TemplateStringsArray, ...values: (string | number | undefined)[]) => void;
+// A fresh printer per interpolated value: `typeBudget` is spent per `Output` instance, never reset.
+const show = () => new Output({ typeBudget: 4096 });
 
 type Type		= TS.Type;
 type Expr		= TS.Expr;
@@ -1075,7 +1078,7 @@ function checkAssignable(src: Type, dst: Type, scope: Scope, pos: Location, dstS
 	if (lax && (src === dst || T.typeKey(src) === T.typeKey(dst)))
 		return true;
 	if (lax)
-		err(SEVERITY.GAP, pos)`Assignability of '${src}' to '${dst}' could not be fully verified ('keyof'/conditional/'infer'/mapped types aren't evaluated)`;
+		err(SEVERITY.GAP, pos)`Assignability of '${show().type(src)}' to '${show().type(dst)}' could not be fully verified ('keyof'/conditional/'infer'/mapped types aren't evaluated)`;
 	return lax;
 };
 
@@ -1094,7 +1097,7 @@ function checkExcessProps(lit: Expr, target: Type, pos: Location, targetScope: S
 
 	for (const p of lit.properties)
 		if (p.type !== 'spread' && typeof p.key === 'string' && !targets.some(t => t.members.some(m => (m.type === 'property' || m.type === 'method') && m.key === p.key)))
-			err(SEVERITY.ERROR, pos)` Object literal may only specify known properties, and '${p.key}' does not exist in type '${target}'`;
+			err(SEVERITY.ERROR, pos)` Object literal may only specify known properties, and '${show().memberKey(p.key)}' does not exist in type '${show().type(target)}'`;
 }
 
 // ---- declaration hoisting / namespace resolution ------------------------------------------
@@ -1252,7 +1255,7 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 function iterationOrReport(t: Type, scope: Scope, pos: Location, err?: Err, async = false): T.IterationTypes {
 	const it = T.iterationTypes(t, scope, async);
 	if (!it && err)
-		err(T.sealed(t, scope) ? SEVERITY.ERROR : SEVERITY.GAP, pos)`Type '${t}' must have a '[Symbol.iterator]()' method that returns an iterator`;
+		err(T.sealed(t, scope) ? SEVERITY.ERROR : SEVERITY.GAP, pos)`Type '${show().type(t)}' must have a '[Symbol.iterator]()' method that returns an iterator`;
 	return it ?? { yield: T.ANY, return: T.ANY, next: T.ANY };
 }
 
@@ -1493,11 +1496,12 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 					map.set(p.name, t);
 					return;
 				}
-				map.set(p.name, t ?? p.default ?? p.constraint ?? T.ANY);
+				const assumed = t ?? p.default ?? p.constraint ?? T.ANY;
+				map.set(p.name, assumed);
 				// A declared default is a correct, unremarkable fallback (real TS does it silently too) -- only worth flagging when
 				// some supplied argument's type actually mentions `p.name` and still couldn't pin it down.
 				if (err && !p.default && params.some((prm, i) => argTs[i] && prm.typeAnnotation && T.mentionsTypeParam(prm.typeAnnotation, p.name)))
-					err(SEVERITY.GAP, pos)`Type parameter '${p.name}' could not be inferred from the arguments; assumed '${map.get(p.name)}'`;
+					err(SEVERITY.GAP, pos)`Type parameter '${p.name}' could not be inferred from the arguments; assumed '${show().type(assumed)}'`;
 			});
 		}
 		params		= params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p);
@@ -1764,7 +1768,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				const t		= T.lookupMember(T.nonNullable(objT, scope, chained), e.property, scope);
 				if (!t) {
 					if (err && !e.optional && T.sealed(objT, scope))
-						err(SEVERITY.ERROR, pos)`Property '${e.property}' does not exist on type '${objT}'`;
+						err(SEVERITY.ERROR, pos)`Property '${e.property}' does not exist on type '${show().type(objT)}'`;
 					return T.ANY;
 				}
 				// `lookupMember` returns an optional property's type unwidened (callers needing "is this optional" use `memberOptional`);
@@ -1809,7 +1813,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				if (objT.type === 'tuple' && T.isLiteral(e.index, 'number')) {
 					const el = objT.elements[e.index.value];
 					if (err && !el)
-						err(SEVERITY.ERROR, pos)`Tuple type '${objT}' has no element at index ${e.index.value}`;
+						err(SEVERITY.ERROR, pos)`Tuple type '${show().type(objT)}' has no element at index ${e.index.value}`;
 					const t = el && T.tupleElementType(el);
 					return t ? T.optional(t, chained) : T.ANY;
 				}
@@ -1828,7 +1832,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				if (T.isLiteral(e.index, 'string')) {
 					const t = T.lookupMember(objT, e.index.value, scope);
 					if (err && !t && T.sealed(objT, scope))
-						err(SEVERITY.ERROR, pos)`Property '${e.index.value}' does not exist on type '${objT}'`;
+						err(SEVERITY.ERROR, pos)`Property '${e.index.value}' does not exist on type '${show().type(objT)}'`;
 					if (!t)
 						return T.ANY;
 					return T.optional(t, chained || T.memberOptional(objT, e.index.value, scope));
@@ -1940,11 +1944,11 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						overloads = calls;		// resolved below, once argument types are known
 					} else if (e.type !== 'new' && (constructs.length > 0 || parts.some(p => p.type === 'constructor'))) {
 						if (err)
-							err(SEVERITY.ERROR, pos)`Type '${calleeT}' is not callable without 'new' in '${e}'`;
+							err(SEVERITY.ERROR, pos)`Type '${show().type(calleeT)}' is not callable without 'new' in '${show().expression(e)}'`;
 						return T.ANY;
 					} else if (T.sealed(calleeT, scope)) {
 						if (err)
-							err(SEVERITY.ERROR, pos)`Type '${calleeT}' is not callable in '${e}'`;
+							err(SEVERITY.ERROR, pos)`Type '${show().type(calleeT)}' is not callable in '${show().expression(e)}'`;
 						return T.ANY;
 					}
 				}
@@ -2104,7 +2108,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					});
 				}
 				if (overloads && !sig && err)
-					err(SEVERITY.WARNING, pos)`No overload of '${e.callee}' matches this call; arguments left unchecked`;
+					err(SEVERITY.WARNING, pos)`No overload of '${show().expression(e.callee)}' matches this call; arguments left unchecked`;
 
 				if (sig) {
 					const { declScope, argTs, params, returnType } = settle(sig, false);
@@ -2118,13 +2122,13 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						const required	= params.reduce((n, p, i) => hasMod(p, 'optional') || (iife && i >= argTs.length && !iife.params[i]?.typeAnnotation) ? n : i + 1, 0);
 						const max		= sig.rest ? Infinity : params.length;
 						if (argTs.length < required || argTs.length > max)
-							err(SEVERITY.ERROR, pos)`Expected ${required === max ? required : required + '-' + (max === Infinity ? 'more' : max)} arguments, but got ${argTs.length} in '${e}'`;
+							err(SEVERITY.ERROR, pos)`Expected ${required === max ? required : required + '-' + (max === Infinity ? 'more' : max)} arguments, but got ${argTs.length} in '${show().expression(e)}'`;
 						argTs.forEach((t, i) => {
 							const p = params[i];
 							if (t && p && p.typeAnnotation) {
 								// an optional parameter also accepts undefined
 								if (!checkAssignable(t, hasMod(p, 'optional') ? TS.UnionType([p.typeAnnotation, T.UNDEFINED]) : p.typeAnnotation, scope, pos, declScope, err))
-									err(SEVERITY.ERROR, pos)`Argument of type '${t}' is not assignable to parameter '${p.key}: ${p.typeAnnotation}' in '${e}'`;
+									err(SEVERITY.ERROR, pos)`Argument of type '${show().type(t)}' is not assignable to parameter '${show().bindingTarget(p.key)}: ${show().type(p.typeAnnotation)}' in '${show().expression(e)}'`;
 								else
 									checkExcessProps(e.arguments[i], p.typeAnnotation, pos, declScope, err);
 							}
@@ -2183,7 +2187,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					case '++':
 					case '--':
 						if (err && !T.isNumberLike(r, scope))
-							err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${argT}' in '${e}'`;
+							err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${show().type(argT)}' in '${show().expression(e)}'`;
 						return T.isBigint(r, scope) ? T.BIGINT : T.NUMBER;
 					default:
 						return T.isBigint(r, scope) ? T.BIGINT : T.NUMBER;
@@ -2200,7 +2204,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					return T.isNullish(t, scope) ? T.NEVER : t;
 				}
 				if (err && !T.isNumberLike(argT, scope))
-					err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${argT}' in '${e}'`;
+					err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${show().type(argT)}' in '${show().expression(e)}'`;
 				return T.isAny(T.resolveOwn(argT, scope)) ? T.ANY : T.isBigint(argT, scope) ? T.BIGINT : T.NUMBER;
 			}
 
@@ -2252,7 +2256,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 
 					if (!e.operator) {
 						if (!checkAssignable(rt, lt, scope, pos, scope, err)) {
-							err(SEVERITY.ERROR, pos)`Type '${rt}' is not assignable to type '${lt}' in '${e.target} = ...'`;
+							err(SEVERITY.ERROR, pos)`Type '${show().type(rt)}' is not assignable to type '${show().type(lt)}' in '${show().expression(e.target)} = ...'`;
 						} else {
 							checkExcessProps(e.value, lt, pos, scope, err);
 							// Later statements see the assigned type, not the wider declared one. `pathKey`, not just an identifier: a
@@ -2313,9 +2317,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				}
 				if (err) {
 					if (!T.isNumberLike(lt, scope))
-						err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${lt}' in '${e.left}'`;
+						err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${show().type(lt)}' in '${show().expression(e.left)}'`;
 					if (!T.isNumberLike(rt, scope))
-						err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${rt}' in '${e.right}'`;
+						err(SEVERITY.ERROR, pos)`Operand of '${e.operator}' must be numeric, got '${show().type(rt)}' in '${show().expression(e.right)}'`;
 				}
 				if (T.isAny(T.resolveOwn(lt, scope)) || T.isAny(T.resolveOwn(rt, scope)))
 					return T.ANY;
@@ -2366,7 +2370,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				const delegated	= e.delegate ? iterationOrReport(argT, scope, pos, err, async) : undefined;
 				const yielded	= delegated ? delegated.yield : T.unwrapIfAsync(argT, scope, async);
 				if (err && fnKind?.yield && !checkAssignable(yielded, fnKind.yield, scope, pos, scope, err))
-					err(SEVERITY.ERROR, pos)`Type '${yielded}' is not assignable to the yielded type '${fnKind.yield}'`;
+					err(SEVERITY.ERROR, pos)`Type '${show().type(yielded)}' is not assignable to the yielded type '${show().type(fnKind.yield)}'`;
 				yieldCollector?.push(delegated ? yielded : T.widenLiterals(yielded));
 				// `yield x` evaluates to what `next(v)` is given: the declared N, else `any` (as TS, which flags it under noImplicitAny).
 				return delegated ? delegated.return : fnKind?.next ?? T.ANY;
@@ -2389,7 +2393,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				const t = recurse(e.expression, anno);
 				if (err) {
 					if (!checkAssignable(t, anno, scope, pos, scope, err))
-						err(SEVERITY.ERROR, pos)`Type '${t}' does not satisfy the expected type '${anno}'`;
+						err(SEVERITY.ERROR, pos)`Type '${show().type(t)}' does not satisfy the expected type '${show().type(anno)}'`;
 					else
 						checkExcessProps(e.expression, anno, pos, scope, err);
 				}
@@ -2494,7 +2498,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		const precise	= p.default && typeOf(p.default, inner, false, anno, undefined, err);
 		const dt		= precise && T.widenLiterals(precise);
 		if (err && precise && anno && !checkAssignable(precise, anno, inner, (p as any).pos, inner, err))
-			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${precise}' is not assignable to parameter type '${anno}'`;
+			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${show().type(precise)}' is not assignable to parameter type '${show().type(anno)}'`;
 		if (typeof p.key === 'string') {
 			inner.addValue(p.key, anno ? T.optional(anno, hasMod(p, 'optional') && !p.default) : dt ? T.widenNullish(dt, inner) : T.ANY);
 		} else {
@@ -2539,7 +2543,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 					const t = typeOf(argument, scope, false, expected, undefined, err);
 					if (err) {
 						if (!checkAssignable(T.unwrapIfAsync(t, scope, async), expected, scope, (argument as any).pos, scope, err))
-							err(SEVERITY.ERROR, (argument as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
+							err(SEVERITY.ERROR, (argument as any).pos)`Type '${show().type(t)}' is not assignable to declared return type '${show().type(expected)}'`;
 						else
 							checkExcessProps(argument, expected, (argument as any).pos, scope, err);
 					}
@@ -2593,7 +2597,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		const t = typeOf(body, inner, false, expected ?? inferHint, undefined, err);
 		if (expected) {
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
-				err(SEVERITY.ERROR, (body as any).pos)`Type '${t}' is not assignable to declared return type '${expected}'`;
+				err(SEVERITY.ERROR, (body as any).pos)`Type '${show().type(t)}' is not assignable to declared return type '${show().type(expected)}'`;
 		} else if (!isPredicate && !declaredReturn) {
 			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(widenForContext(t, inferHint, inner), inner)), inner, async);
 		}
@@ -2611,7 +2615,7 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 					const t		= typeOf(m.value, inner, false, m.typeAnnotation, undefined, err);
 					if (m.typeAnnotation && err) {
 						if (!checkAssignable(t, m.typeAnnotation, inner, (m as any).pos, inner, err))
-							err(SEVERITY.ERROR, (m as any).pos)`Type '${t}' is not assignable to type '${m.typeAnnotation}'`;
+							err(SEVERITY.ERROR, (m as any).pos)`Type '${show().type(t)}' is not assignable to type '${show().type(m.typeAnnotation)}'`;
 						else
 							checkExcessProps(m.value, m.typeAnnotation, (m as any).pos, inner, err);
 					}
@@ -2764,7 +2768,7 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 					if (!init)
 						checkExcessProps(d.init, anno, pos, scope, err);
 					else if (!checkAssignable(init, anno, scope, pos, scope, err))
-						err(SEVERITY.ERROR, pos)`Type '${init}' is not assignable to type '${anno}' in declaration of '${d.name}'`;
+						err(SEVERITY.ERROR, pos)`Type '${show().type(init)}' is not assignable to type '${show().type(anno)}' in declaration of '${show().bindingTarget(d.name)}'`;
 				}
 				if (!stmt.ambient)
 					hoistVar(scope, d, stmt.kind !== 'const', undefined, err);

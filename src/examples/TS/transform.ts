@@ -5,7 +5,6 @@ import { Module, Location, Identifier, Literal, Binary, Conditional, Assign, Awa
 import { walk, walkB, calcUnary, calcBinary } from './walker';
 import { SEVERITY, Err, checkBlock, checkStmt1, exportScope, typeOf, typeOf1, inferReturn } from './checker';
 import { LoadedModule, ModuleLoader } from './module-loader';
-import { Output } from './tocode';
 
 type Expr			= JS.Expr;
 type Stmt			= TS.Stmt;
@@ -624,9 +623,9 @@ export interface Diagnostic {
 
 function makeDiagnostic(func: (d: Diagnostic) => void): Err {
 	const clip		= (s: string, max = 60)	=> s.length > max ? s.slice(0, max - 3) + '...' : s;
-	const toString	= (v: any) => v === undefined ? '' : typeof v === 'string' ? v : new Output({ typeBudget: 4096 }).toCode(v);
+	const toString	= (v: string | number | undefined) => v === undefined ? '' : String(v);
 
-	return (severity: SEVERITY, pos: Location) => (strings: TemplateStringsArray, ...values: any[]) => func({
+	return (severity: SEVERITY, pos: Location) => (strings: TemplateStringsArray, ...values: (string | number | undefined)[]) => func({
 		severity,
 		message: ['GAP', 'WRN', 'ERR'][severity] + ': ' + strings.map((s, i) => s + clip(toString(values[i]))).join(''),
 		pos

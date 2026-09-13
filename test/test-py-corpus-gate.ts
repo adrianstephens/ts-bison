@@ -37,8 +37,8 @@ interface Baseline { files: number; failed: number; note: string }
 		const source = await fs.readFile(file, 'utf8');
 		try {
 			const ast1 = parse(source);
-			const printed1 = new Output().toCode(ast1);
-			const printed2 = new Output().toCode(parse(printed1));
+			const printed1 = new Output().module(ast1);
+			const printed2 = new Output().module(parse(printed1));
 			if (printed1 !== printed2)
 				failures.push(`${file} [unstable round-trip]`);
 		} catch (e) {

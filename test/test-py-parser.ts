@@ -9,10 +9,10 @@ const out = new Output();
 function test(name: string, code: string) {
 	try {
 		const ast = parse(code);
-		const printed = out.toCode(ast);
+		const printed = out.module(ast);
 
 		// tocode round-trip: print -> parse -> print, the second printing must be identical.
-		const printed2 = out.toCode(parse(printed));
+		const printed2 = out.module(parse(printed));
 
 		// walk() identity transform + walkB() full traversal: rebuilding every visited node must
 		// leave a tree that prints the same, and walkB must reach every node it structurally can.
@@ -26,8 +26,8 @@ function test(name: string, code: string) {
 		}
 		if (printed !== printed2)
 			throw new Error(`tocode not stable\n--- 1 ---\n${printed}\n--- 2 ---\n${printed2}`);
-		if (out.toCode(rebuilt) !== printed)
-			throw new Error(`walk() identity changed the tree\n${out.toCode(rebuilt)}`);
+		if (out.module(rebuilt) !== printed)
+			throw new Error(`walk() identity changed the tree\n${out.module(rebuilt)}`);
 		if (visited === 0)
 			throw new Error('walkB visited nothing');
 		console.log(`\u2713 ${name}`);

@@ -395,7 +395,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 		}
 		const node = expnodes.get(expr);
 		if (!node)
-			throw new Error(`missing node for ${tocode.expr(expr)}`);
+			throw new Error(`missing node for ${tocode.expression(expr)}`);
 		return node;
 	}
 	function getState(): State {
@@ -2672,7 +2672,7 @@ function getStructuralKey(node: Node): string {
 			// the wrapper OBJECT, always defined once assigned regardless of what it wraps. The
 			// replacer handles a bigint anywhere inside it -- JSON.stringify otherwise throws
 			// outright on a raw bigint.
-			default: key += tocode.expr(node.expr);
+			default: key += tocode.expression(node.expr);
 		}
 	} else if ('name' in node) {
 		key += node.name;
