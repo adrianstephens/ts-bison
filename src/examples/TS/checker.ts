@@ -813,11 +813,19 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 						return text !== undefined ? { value: text }
 							: t?.type === 'literal' && t.value !== null && !Array.isArray(t.value) ? { value: t.value as string | number | bigint | boolean } : undefined;
 					};
+					// A comparand typed as a union of unit literals (`kind: 'call' | 'construct'`) matches any of them. TS narrows by it on the
+					// matching branch only: the other holds for every member but the one value the comparand turned out to be.
+					const literalUnionOf = (x: Expr): Set<unknown> | undefined => {
+						const t = T.pathKey(x) !== undefined ? T.resolveOwn(typeOf(x, scope, false), scope) : undefined;
+						const parts = t?.type === 'union' ? t.types.map(u => T.resolveOwn(u, scope)) : undefined;
+						return parts?.every(u => u.type === 'literal' && u.value !== null && !Array.isArray(u.value)) ? new Set(parts.map(u => (u as { value: unknown }).value)) : undefined;
+					};
 					for (const [l, r] of [[test.left, test.right], [test.right, test.left]] as const) {
 						const unit = unitOf(r);
+						const units = unit ? new Set<unknown>([unit.value]) : keepMatch ? literalUnionOf(r) : undefined;
 						// An optional chain equal to a non-nullish value (`ns?.decl(k)?.type === 'class_decl'`) did not short-circuit, so every
 						// object before a `?.` in it is non-nullish -- only on the matching branch, as with a truthy chain.
-						if (unit && keepMatch && (l.type === 'member' || l.type === 'index' || l.type === 'call'))
+						if (units && keepMatch && (l.type === 'member' || l.type === 'index' || l.type === 'call'))
 							scope = nonNullChainRoots(l, scope);
 						// typeof x === 'kind' (x may be a dotted path, e.g. `typeof options.layer === 'number'`)
 						const text = staticText(r);
@@ -877,14 +885,14 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 						const discKey = l.type === 'member' ? l.property
 							: l.type === 'index' && (T.isLiteral(l.index, 'number') || T.isLiteral(l.index, 'string')) ? String(l.index.value)
 							: undefined;
-						if ((l.type === 'member' || l.type === 'index') && discKey !== undefined && unit) {
+						if ((l.type === 'member' || l.type === 'index') && discKey !== undefined && units) {
 							// `x?.prop === literal` truly holding also implies `x` itself is non-nullish -- a nullish `x` would
 							// short-circuit the whole expression to `undefined`, which a non-nullish literal can never equal.
 							// Only sound when this branch asserts the equality actually held (`keepMatch`): the excluding branch
 							// (`x?.prop !== literal`) is satisfied by a nullish `x` just as well, so no such inference there.
 
 							const prop = discKey;
-							const target = unit.value;
+							const targets = units;
 
 							// Narrows `m` by a discriminant-property equality test, recursing into `m`'s structure to split a compound member down
 							// to its matching sub-variant(s) rather than keep/discard it whole.
@@ -911,11 +919,11 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 								if (!rp)
 									return true;	// unresolvable discriminant: lenient, matching `lookupMember`'s/`resolve`'s own established leniency
 								if (rp.type === 'literal')
-									return (rp.value === target) === keepMatch;
+									return targets.has(rp.value) === keepMatch;
 								// The discriminant property is itself a union of literals declared directly on one interface (not a nested alias) --
 								// `r` isn't a union to split, so only whether the whole of it can be excluded/kept without ambiguity.
 								return rp.type !== 'union' || !rp.types.every(x => x.type === 'literal')
-									|| (keepMatch ? rp.types.some(x => x.value === target) : rp.types.some(x => x.value !== target));
+									|| (keepMatch ? rp.types.some(x => targets.has(x.value)) : rp.types.some(x => !targets.has(x.value)));
 							}
 
 							const s = narrowKey(l.object, narrowByDiscriminant, keepMatch && l.optional ? narrowKey(l.object, m => !T.isNullish(m, scope)) : scope);
