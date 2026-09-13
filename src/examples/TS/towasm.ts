@@ -8497,7 +8497,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// reasoning as `ensureClass`'s own placeholder-first ordering: a union type reachable again through one
 	// of its own members' fields (confirmed real: `Type`'s own recursive AST-node union in ts-parser.ts)
 	// finds `info` already in `classes` and returns immediately, well before this loop runs twice.
-	function buildObjectShape(key: string, members: TS.TypeMember[], thisTsType: Type, declName: string, everFinal: boolean): ClassInfo {
+	function buildObjectShape(key: string, members: TS.TypeMember[], thisTsType: Type, declName: string, everFinal: boolean, shape = shapeKey(members)): ClassInfo {
 		const info: ClassInfo = {
 			name:		key, thisTsType,
 			decl:		{ name: declName, body: [] },
@@ -8529,7 +8529,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 
 		addExpandoFields(info, declName);
-		addExpandoFields(info, shapeKey(members));
+		addExpandoFields(info, shape);
 		types[info.typeIndex] = {
 			final: everFinal,
 			supertypes: [], type: {
@@ -8625,7 +8625,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return reached;
 		const basePos	= new Map(base?.fields.map((f, i) => [f.name, i]));
 		const at		= (m: TS.TypeMember) => ('key' in m && typeof m.key === 'string' ? basePos.get(m.key) : undefined) ?? Infinity;
-		const info		= buildObjectShape(key, base ? [...resolved.members].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name));
+		// The base's expando fields (and `#ext`) are part of its layout, so they are repeated in place: a base that
+		// gains one would otherwise silently stop being this shape's wasm supertype.
+		const declared	= new Set(resolved.members.flatMap(m => 'key' in m && typeof m.key === 'string' ? [m.key] : []));
+		const inherited	= (base?.fields ?? []).filter(f => !declared.has(f.name))
+			.map(f => TS.TypeProperty(f.name, f.name === '#ext' ? TS.RefType('Map', [T.STRING, T.ANY]) : T.ANY, ['optional']));
+		const info		= buildObjectShape(key, base ? [...resolved.members, ...inherited].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name), shapeKey(resolved.members));
 		classes.set(structural, info);
 		const baseType = base && types[base.typeIndex];
 		if (base && baseType && 'final' in baseType && !baseType.final && base.fields.every((f, i) =>

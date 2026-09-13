@@ -1907,15 +1907,17 @@ that stamps its own parameter makes that parameter "receive" the key, inductivel
   `unreachable`. The survey cannot see this -- it only compiles.
 - **Found, separate, OPEN**: the intrinsic `object` type has no wasm representation (`<T extends object>`
   erased to its bound throws "'object' has no representation"); it should be a non-null `anyref`.
-- **Trap**: fixing a blocker can make a shared MODULE-LEVEL blocker absorb many declarations -- the
-  object-literal row went 0 -> 34 with declarations moving from unrelated causes. That looked like a
-  regression; an A/B (propagation switched off) showed it was only blocker ORDER. A/B before calling it one.
+- **Trap -- a WRONG conclusion was committed here**: the object-literal row went 0 -> 34 and `ff36157` called
+  it blocker order. It was a real regression: a base interface gaining expando fields stopped being its derived
+  interface's wasm supertype (`CallSig` lost `super=Params`), so `{params, rest}` matched both. Fixed by
+  repeating the base's full layout, expandos and `#ext` included, as the derived prefix (`derivedUpcast` test).
+  The A/B was too coarse: it toggled the whole feature. Compare the struct layouts (`super=`) before calling a jump "order".
 
-**Next rows** (75/329): `an object literal needs a known target type` 34 -- almost all checker.ts's
-module-level `ANY_FUNCTION = TS.FunctionType({ params: [], rest: ... }, T.ANY)` (:232): `{params, rest}` matches
-both `Params` and `CallSig` and nothing distinguishes them, so the literal should take `FunctionType`'s declared
-parameter type as its target; `unknown method 'parse'` 23; `only direct calls to named functions...` 21;
-`indexing is only supported on number[]/...` 18; `internal: cannot convert arr:ref:true to i32` 18.
+**Next rows** (75/329; object-literal row 34 -> 0, all 34 moved to later causes): `unknown method 'parse'` 23;
+`only direct calls to named functions...` 21; `param 'typeOf''s default value must be a literal...` 19 --
+checker.ts's `checkBlock(..., typeOf = typeOf1(), ...)`: towasm re-emits defaults at CALL sites so it rejects
+a call default, but JS evaluates defaults in the CALLEE -- that is the general fix; `indexing is only
+supported on number[]/...` 19; `cannot convert arr:ref:true to i32` 18; `param 'value' needs an explicit type` 17.
 
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And

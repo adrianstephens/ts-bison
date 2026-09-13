@@ -6761,6 +6761,25 @@ async function main() {
 	}
 
 	{
+		// A base interface that gains an expando slot must stay its derived interface's wasm supertype: the derived
+		// layout repeats the base's WHOLE layout, expandos included, or upcasting a `Derived` to `Base` cannot compile.
+		const { derivedUpcast } = await compile(`
+			interface Base { a: number }
+			interface Derived extends Base { b: number }
+			function tagIt<T>(t: T): T { Object.defineProperty(t, "tag", { value: 1 }); return t; }
+			function tagOf(x: unknown): number { return (x as any).tag as number; }
+			function takeBase(x: Base): number { return x.a; }
+			export function derivedUpcast(): number {
+				const b: Base = { a: 5 };
+				tagIt(b);
+				const d: Derived = { a: 1, b: 2 };
+				return takeBase(d) + tagOf(b);
+			}
+		`);
+		check('derivedUpcast()', derivedUpcast(), 2);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
