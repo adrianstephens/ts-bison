@@ -7434,6 +7434,24 @@ async function main() {
 	}
 
 	{
+		// A numeric LITERAL type has compact integer storage but boxes as `f64` like any other number, so reading one back out of an
+		// `any` slot must unbox from that box; a real `boolean` still boxes and unboxes as `i32`.
+		const { constTupleLiteral } = await compile(`
+			export function constTupleLiteral(): number {
+				const t = [3, 5] as const;
+				const [l, r] = t;
+				const flags = [true, false] as const;
+				const [f0, f1] = flags;
+				let s = 0;
+				for (const [a, b] of [[3, 5], [5, 3]] as const)
+					s += a * 10 + b;
+				return l * 10 + r + s * 100 + (f0 && !f1 ? 100000 : 0);
+			}
+		`);
+		check('constTupleLiteral()', constTupleLiteral(), 108835);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

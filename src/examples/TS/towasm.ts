@@ -3959,6 +3959,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		} else {
 			let got = emitExpr(e, ctx, want);
+			// UNboxing from `any`, the mirror of the boxing rule just below: a number was boxed as `f64` whatever its compact
+			// integer storage, a real `boolean` as `i32`, so the checker's own type picks which box this value is in.
+			if ((want === 'i32' || want === 'u32') && typeof got !== 'string' && 'ref' in got && got.ref === 'any'
+				&& ownerFor(checkerTypeOf(unwrapAs(e), ctx.scope))?.name !== 'Boolean') {
+				coerceTop(got, ctx, 'f64');
+				got = 'f64';
+			}
 			// Boxing into `any`: `i32` is this compiler's physical representation for *both* a real `boolean` and
 			// a compact-integer `number` -- by the time a bare `'i32'` reaches `coerceTop` that distinction is gone, so it always picked the boolean box. Disambiguated here via the checker's own real type for `e`.
 			if (got === 'i32' && typeof want !== 'string' && 'ref' in want && want.ref === 'any' && ownerFor(checkerTypeOf(unwrapAs(e), ctx.scope))?.name !== 'Boolean') {
