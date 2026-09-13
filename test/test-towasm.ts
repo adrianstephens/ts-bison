@@ -7554,6 +7554,51 @@ async function main() {
 	}
 
 	{
+		// A computed STRING key on a struct, read and written (walker.ts's `mapObject`: `node[k]`, `r[k] = ret`): the property is
+		// found by name at run time, and a key naming no field reads `undefined`.
+		const { computedKeyAccess } = await compile(`
+			interface Obj { values: number[]; name?: string }
+			export function computedKeyAccess(): number {
+				const o: Obj = { values: [1, 2], name: 'a' };
+				let found = 0;
+				for (const k of ['values', 'name', 'missing'] as const)
+					if ((o as any)[k] !== undefined)
+						found++;
+				for (const k of ['name'] as const)
+					(o as any)[k] = 'z';
+				return found * 10 + (o.name === 'z' ? 1 : 0);
+			}
+		`);
+		check('computedKeyAccess()', computedKeyAccess(), 21);
+	}
+
+	{
+		// walker.ts's own `mapObject(node, fields)` shape: every field of the node mapped by name through a `NodeMap<N>`.
+		const { mapObjectShape } = await compile(`
+			type NodeMap<N> = {[K in keyof N]?: (x: N[K]) => N[K]};
+			function mapObject<N extends Record<string, any>>(node: N, fields: NodeMap<N>): N {
+				const r = {...node};
+				for (const f in fields) {
+					const k = f as keyof N;
+					if (node[k] !== undefined) {
+						const ret = fields[k]?.(node[k]);
+						if (ret !== undefined)
+							r[k] = ret;
+					}
+				}
+				return r;
+			}
+			interface Obj { values: number[]; name?: string }
+			export function mapObjectShape(): number {
+				const o: Obj = { values: [1, 2] };
+				const r = mapObject(o, { values: (vs: number[]) => vs.concat([3]) });
+				return r.values.length * 10 + o.values.length;
+			}
+		`);
+		check('mapObjectShape()', mapObjectShape(), 32);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

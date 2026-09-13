@@ -5065,6 +5065,39 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				};
 			}
 
+			// A computed STRING key on a struct, the write side of `case 'index'`'s own by-name read (walker.ts's `mapObject`'s
+			// `r[k] = ret`): the assignment goes to whichever field the key names, and a key naming none writes nothing, since
+			// a struct has no slot to grow.
+			const byNameOwner = ownerOf(target.object, ctx);
+			if (byNameOwner && byNameOwner.typeIndex !== -1 && byNameOwner.fields.length && T.isAssignable(narrowedTypeOf(target.index, ctx), T.STRING, ctx.typeScope)) {
+				const n			= optionalTempCounter++;
+				const objId		= { type: 'identifier', name: `#keyobj$${n}` } as Expr;
+				const keyId		= { type: 'identifier', name: `#key$${n}` } as Expr;
+				const valId		= { type: 'identifier', name: `#keyval$${n}` } as Expr;
+				const keyWtype	= typeOf(T.STRING)!;
+				emitAs(target.object, ctx, byNameOwner.thisWtype!);
+				ctx.emit(I.local.set(ctx.declareValue(`#keyobj$${n}`, byNameOwner.thisWtype!, byNameOwner.thisTsType!).index));
+				emitAs(target.index, ctx, keyWtype);
+				ctx.emit(I.local.set(ctx.declareValue(`#key$${n}`, keyWtype, T.STRING).index));
+				const valLocal	= ctx.declareValue(`#keyval$${n}`, REF_ANY_NULLABLE, T.ANY);
+				const readChain	= byNameOwner.fields.reduce<Expr>((alternate, f) => ({ type: 'conditional',
+					test:		{ type: 'binary', operator: '===', left: keyId, right: Literal(f.name) } as Expr,
+					consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
+					alternate,
+				}) as Expr, { type: 'identifier', name: 'undefined' } as Expr);
+				return {
+					wtype:	REF_ANY_NULLABLE,
+					old:	captureOld(REF_ANY_NULLABLE, () => emitAs(readChain, ctx, REF_ANY_NULLABLE)),
+					write:	makeWrite(REF_ANY_NULLABLE, val => {
+						ctx.emit(I.local.get(val), I.local.set(valLocal.index));
+						byNameOwner.fields.forEach(f => emitStmt({ type: 'if',
+							test:		{ type: 'binary', operator: '===', left: keyId, right: Literal(f.name) } as Expr,
+							consequent:	{ type: 'expression', expression: { type: 'assign', target: { type: 'member', object: objId, property: f.name }, value: valId } as Expr } as Stmt,
+						} as Stmt, ctx));
+					}),
+				};
+			}
+
 			const kind = objectArrayKind(target.object, ctx);
 			// `i16`/`i8` (`string`/packed-byte storage) rejected same as `case 'index'`'s own read side.
 			if (!kind || kind === 'i16' || kind === 'i8')
@@ -6117,6 +6150,25 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							ctx.emit(I.call(info.funcIndex));
 							return info.result;
 						}
+					}
+					// A computed STRING key on a struct (walker.ts's `mapObject`'s `node[k]`, `k: keyof N`): JS looks the property up by
+					// name at run time, which is that comparison over the class's own field names -- synthesized, so the ordinary
+					// member reads and conditional lowering compile it. A key naming no field reads `undefined`, as JS does.
+					const byName = ownerOf(e.object, ctx);
+					if (byName && byName.typeIndex !== -1 && byName.fields.length && T.isAssignable(narrowedTypeOf(e.index, ctx), T.STRING, ctx.typeScope)) {
+						const n			= optionalTempCounter++;
+						const objId		= { type: 'identifier', name: `#keyobj$${n}` } as Expr;
+						const keyId		= { type: 'identifier', name: `#key$${n}` } as Expr;
+						const keyWtype	= typeOf(T.STRING)!;
+						emitAs(e.object, ctx, byName.thisWtype!);
+						ctx.emit(I.local.set(ctx.declareValue(`#keyobj$${n}`, byName.thisWtype!, byName.thisTsType!).index));
+						emitAs(e.index, ctx, keyWtype);
+						ctx.emit(I.local.set(ctx.declareValue(`#key$${n}`, keyWtype, T.STRING).index));
+						return emitExpr(byName.fields.reduce<Expr>((alternate, f) => ({ type: 'conditional',
+							test:		{ type: 'binary', operator: '===', left: keyId, right: Literal(f.name) } as Expr,
+							consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
+							alternate,
+						}) as Expr, { type: 'identifier', name: 'undefined' } as Expr), ctx, want ?? REF_ANY_NULLABLE);
 					}
 					throw `'${T.exprKey(e.object)}' is indexed but is not an array, a typed array, or a class with 'get' (its type: '${T.typeKey(narrowedTypeOf(e.object, ctx))}')`;
 				}
