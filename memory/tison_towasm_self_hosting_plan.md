@@ -2109,6 +2109,15 @@ AND write on an `any` (also wasm.ts's `(OP as any)[v.op]`). Needs a real design:
 time, so either a generated "property by name" dispatch (per class, comparing the key against each field name) or a
 dynamic representation for `any`-typed objects. Nothing in towasm does computed-key access on a struct today.
 
+**INVARIANT (learnt the hard way twice, 2026-09-13)**: anything that runs WHILE a shape is being resolved -- shape matching
+above all -- must ask the CHECKER (`isAssignable`, `lookupMember`), never `typeOf`. `typeOf` builds structs, and
+`buildObjectShape` only survives recursive types by registering a placeholder struct BEFORE resolving members; a `typeOf`
+call from inside that resolution re-enters below the placeholder and does not terminate. ts-parser.ts's `CallSig` reaches
+its own `Param[]` and the recursive `Type` union this way. It cost a 100-minute survey hang (31d1125, fixed 1747a12 with a
+re-entrancy flag, then properly by using the checker's relation). The user notes the same recursion has bitten before.
+**A hang is invisible to the usual gates**: towasm tests, difftest, corpus gate and lint all passed. Treat "the survey
+stops making progress on one file" as a failure, not slowness.
+
 **Lib fidelity needs overload resolution first (tried and reverted, 2026-09-13)**: three checker false positives on our own
 tsc-clean code are lib gaps -- `new Map(otherMap)`, a typed array's `set(array, offset)` copy form, `Object.fromEntries`.
 Adding a second `set` BODY breaks the index-write lowering (`a[i] = v` lowers to `set(i, v)`: towasm's index convention
