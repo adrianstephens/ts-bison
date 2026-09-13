@@ -2224,6 +2224,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			? { stmt: varStmt as TS.Stmt, d: varStmt.declarations.find(d => d.name === name) }
 			: scope === ctx.scope ? topLevelVars.get(homeKey(ctx.homeModule, name)) : undefined;
 		if (!own?.d) {
+			// A named import of another module's const (`import { isJsStatement } from './walker'` in printer.ts): the same lazy
+			// global under its DECLARING module's identity, since the reading module's own scope never declares it.
+			const imported	= scope === ctx.scope ? namedImportsByModule.get(ctx.homeModule)?.get(name) : undefined;
+			const target	= imported && topLevelVars.get(homeKey(imported.module, imported.name));
+			if (imported && target?.d) {
+				const wrapper	= ensureLazyGlobal(imported.name, imported.module, target.d, moduleScopeOf(imported.module) ?? scope);
+				const slot		= lazyGlobalSlots.get(homeKey(imported.module, imported.name));
+				return wrapper && slot ? { wrapper, slot } : undefined;
+			}
 			// A module-level binding in a STATIC lib file (`LIB_AST`). Those files are never in
 			// `moduleBodies`, so they have no `stmtHomeModule` entry and are absent from `topLevelVars` --
 			// but they are a single flat scope sharing one `libGlobal`, so one identity for the whole lib
