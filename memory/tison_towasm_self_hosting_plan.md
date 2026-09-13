@@ -2096,6 +2096,14 @@ narrower than the declared `number`) and difftest to 2153/2 disagree. Keep such 
 **Next**: printer.ts calls `isJsStatement`, a name bound to a module-level CONST holding a function -- the bare-identifier
 sibling of 7aea4bc's namespace-member fix (script ready: `assistant/module-value-call.py`).
 
+**Lib fidelity needs overload resolution first (tried and reverted, 2026-09-13)**: three checker false positives on our own
+tsc-clean code are lib gaps -- `new Map(otherMap)`, a typed array's `set(array, offset)` copy form, `Object.fromEntries`.
+Adding a second `set` BODY breaks the index-write lowering (`a[i] = v` lowers to `set(i, v)`: towasm's index convention
+collides with TS's own `set`), and a second `Map` constructor breaks existing `new Map([...])` calls -- towasm resolves
+multiple constructors by argument type, but not when one form has a defaulted parameter. Doing these properly needs either
+a rename of the index-write convention (`set`/`get` on Array/Map/TypedArray, plus the lowering) or real overload
+resolution for lib methods. `Object.fromEntries` additionally needs an intrinsic, as `Object.entries` has.
+
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
 my own grep filter (`grep -v 'free=\[\]'`) hid the decisive log line for three rounds: when a probe prints
