@@ -7226,6 +7226,27 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 						const v			= s.init.declarations[0];
 						const n			= forTempCounter++;
+						// A non-array with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable: `next()` until
+						// `done`. `for...of` sends `undefined` to a `next` that takes a value (a generator's). Arrays stay indexed below.
+						const srcT = narrowedTypeOf(s.right, ctx);
+						if (!objectArrayKind(s.right, ctx) && T.lookupMember(srcT, '[Symbol.iterator]', ctx.typeScope)) {
+							const it = T.iterationTypes(srcT, ctx.typeScope);
+							if (!it)
+								throw `'for...of': '${T.typeKey(srcT)}' has '[Symbol.iterator]()' but its iterator has no 'next()'`;
+							const itId: Expr	= { type: 'identifier', name: `#for${n}$it` };
+							const rId: Expr		= { type: 'identifier', name: `#for${n}$r` };
+							const next = (): Expr => JS.Call(JS.Member(itId, 'next'), T.isNullish(it.next, ctx.typeScope) ? [] : [{ type: 'identifier', name: 'undefined' }]);
+							emitStmt(JS.Block<Stmt>(
+								JS.VarDecl('const', JS.Var(`#for${n}$it`, JS.Call(JS.Member(s.right, '[Symbol.iterator]'), []))),
+								JS.For(
+									JS.VarDecl('let', JS.Var(`#for${n}$r`, next())),
+									JS.JSUnary('!', JS.Member(rId, 'done')),
+									{ type: 'assign', target: rId, value: next() } as Expr,
+									JS.Block<Stmt>(JS.VarDecl(s.init.kind, JS.Var(v.name, JS.Member(rId, 'value'), v.typeAnnotation ?? it.yield)), s.body),
+								),
+							), ctx);
+							return;
+						}
 						const arrId: Expr = { type: 'identifier', name: `#for${n}$arr` };
 						const idxId: Expr = { type: 'identifier', name: `#for${n}$i` };
 
@@ -8969,13 +8990,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						addField(info, m.key, m.typeAnnotation ?? (m.value ? checkerTypeOf(m.value, homeScope) : T.lookupMember(info.thisTsType, m.key, homeScope)), !m.value && hasMod(m, 'optional'));
 
 				} else if (m.type === 'method') {
-					// A computed name can't be stored as a decl key -- and can never be called via `.name()` syntax either, so it's simply never reachable, no need to throw.
-					if (typeof m.key === 'string') {
+					// A computed name with a static spelling (`[Symbol.iterator]`, via `T.memberKey`) is registered under it:
+					// the iteration protocol calls it by that name. A truly dynamic one has no name to call it by.
+					const key = T.memberKey(m.key);
+					if (key !== undefined) {
 						const value = isAsmMethod(m);
 						if (value) {
-							inlineDecls.push({ key: m.key, value, typeParams: m.typeParams?.map(tp => tp.name) });
+							inlineDecls.push({ key, value, typeParams: m.typeParams?.map(tp => tp.name) });
 						} else {
-							addMethod(m.key, m);
+							addMethod(key, m);
 						}
 					}
 

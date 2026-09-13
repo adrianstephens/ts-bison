@@ -67,13 +67,13 @@ class Map<K, V> {
 		this.values_ = [];
 	}
 
-	// Real snapshots (plain arrays), not live `MapIterator`s -- full iterator-protocol/`for...of`
-	// support is the separate, already-tracked "for...of over a general iterable" gap; these are
-	// still genuinely useful without it.
+	// Snapshots (plain arrays), not live iterators; iterating the Map itself (`[Symbol.iterator]`) is the live path.
 	keys(): K[]			{ return this.keys_.slice(); }
 	values(): V[]		{ return this.values_.slice(); }
 	entries(): [K, V][]	{ return this.keys_.map((k, i) => [k, this.values_[i]]); }
-//	[Symbol.iterator](): MapIterator<[K, V]>;
+	[Symbol.iterator](): Generator<[K, V], void, unknown> {
+		return __towasm_indexed<[K, V]>(() => this.keys_.length, i => [this.keys_[i], this.values_[i]]);
+	}
 
 	// `thisArg` is ignored (not needed for the few real call sites this project has, and not supported by the `for...of` loop either).
 	forEach(callbackfn: (value: V, key: K, map: Map<K, V>) => void, thisArg?: any): void {
@@ -130,11 +130,13 @@ class Set<T> {
 		this.items_ = [];
 	}
 
-	// A real snapshot (plain array), not a live `SetIterator` -- see Map.keys's own comment.
+	// A snapshot (plain array), not a live iterator -- see Map.keys's own comment.
 	values(): T[]		{ return this.items_.slice(); }
 	keys()				{ return this.values(); }
 	entries(): [T, T][] { return this.items_.map(k => [k, k]); }
-	//[Symbol.iterator](): SetIterator<T>;
+	[Symbol.iterator](): Generator<T, void, unknown> {
+		return __towasm_indexed<T>(() => this.items_.length, i => this.items_[i]);
+	}
 
 	forEach(callbackfn: (value: T, value2: T, set: Set<T>) => void, thisArg?: any): void {
 		const n = this.items_.length;

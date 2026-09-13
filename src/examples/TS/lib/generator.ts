@@ -31,4 +31,14 @@ export class Generator<Y, R, N> {
 	next(v: N): IteratorResult<Y, R> {
 		return this.step(v);
 	}
+	// A generator is its own iterator.
+	[Symbol.iterator](): Generator<Y, R, N> {
+		return this;
+	}
+}
+
+// `at(i)` while `i < size()`, both read on every step: how `Map`/`Set` iterate their own backing arrays live.
+export function* __towasm_indexed<T>(size: () => number, at: (i: number) => T): Generator<T, void, unknown> {
+	for (let i = 0; i < size(); i++)
+		yield at(i);
 }

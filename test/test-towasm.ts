@@ -6842,6 +6842,40 @@ async function main() {
 	}
 
 	{
+		// `for...of` over a non-array iterates by the protocol: `[Symbol.iterator]()`, then `next()` until `done`.
+		const { iterGen, iterMap, iterSet, iterUserClass, iterBreakContinue } = await compile(`
+			function* gen(): Generator<number, void, unknown> { yield 1; yield 2; yield 3; }
+			export function iterGen(): number { let s = 0; for (const x of gen()) s = s * 10 + x; return s; }
+			export function iterMap(): number {
+				const m = new Map<string, number>([['a', 1], ['bb', 2]]);
+				let s = 0;
+				for (const [k, v] of m)
+					s += k.length * 10 + v;
+				return s;
+			}
+			export function iterSet(): number { const st = new Set<number>([4, 5]); let s = 0; for (const x of st) s += x; return s; }
+			function* upTo(n: number): Generator<number, void, unknown> { for (let i = 0; i < n; i++) yield i; }
+			class Range { constructor(public n: number) {} [Symbol.iterator](): Generator<number, void, unknown> { return upTo(this.n); } }
+			export function iterUserClass(): number { let s = 0; for (const x of new Range(4)) s += x; return s; }
+			function* five(): Generator<number, void, unknown> { for (let i = 1; i <= 5; i++) yield i; }
+			export function iterBreakContinue(): number {
+				let s = 0;
+				for (const x of five()) {
+					if (x === 2) continue;
+					if (x === 4) break;
+					s += x;
+				}
+				return s;
+			}
+		`);
+		check('iterGen()', iterGen(), 123);
+		check('iterMap()', iterMap(), 33);
+		check('iterSet()', iterSet(), 9);
+		check('iterUserClass()', iterUserClass(), 6);
+		check('iterBreakContinue()', iterBreakContinue(), 4);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
