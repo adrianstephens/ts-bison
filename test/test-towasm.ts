@@ -6935,6 +6935,36 @@ async function main() {
 	}
 
 	{
+		// `flat()` flattens one level (type-utils.ts's `parts.flat()`), typed as TS's FlatArray reduces at depth 1.
+		const { flatNested } = await compile(`
+			export function flatNested(): number {
+				const parts: string[][] = [['a', 'b'], [], ['c']];
+				const f: string[] = parts.flat();
+				return f.length * 10 + (f[2] === 'c' ? 1 : 0);
+			}
+		`);
+		check('flatNested()', flatNested(), 31);
+	}
+
+	{
+		// A type guard its argument's type settles is decided statically and the dead branch never compiled -- lib `flat` on a
+		// `number[]` has an array branch that cannot compile for a number, and on `string[][]` the reverse.
+		const { guardFold } = await compile(`
+			function sum(xs: number[]): number { return xs.reduce((a, b) => a + b, 0); }
+			export function guardFold(): number {
+				const n: number = 5;
+				let r = 0;
+				if (Array.isArray(n)) r += n.length; else r += n;
+				const s: string[] = ['ab'];
+				if (!Array.isArray(s)) r += 100; else r += s.length * 10;
+				const nums = [1, 2].flat();
+				return r + nums.length * 100 + sum(nums);
+			}
+		`);
+		check('guardFold()', guardFold(), 218);
+	}
+
+	{
 		// An array pattern over a non-array iterates, as JS does (`const [[name, arg]] = map`, type-utils.ts's `substituteType`).
 		const { destrMap, destrGen, destrDefaults, destrParam } = await compile(`
 			export function destrMap(): number { const m = new Map<string, number>([['ab', 7], ['c', 1]]); const [[k, v]] = m; return k.length * 10 + v; }

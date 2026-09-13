@@ -223,6 +223,22 @@ export class Array<T> {
 		}
 		return -1;
 	}
+	// One level, TS's default depth: an element that is itself an array contributes its elements. The element type is
+	// what TS's `FlatArray<T[], 1>` reduces to. `flat(depth)` beyond 1 is not declared, so the checker rejects it.
+	flat(): (T extends readonly (infer U)[] ? U : T)[] {
+		const out: (T extends readonly (infer U)[] ? U : T)[] = [];
+		for (let i = 0; i < this.length; i++) {
+			const el: T = this[i];
+			if (Array.isArray(el)) {
+				// Typed, so its elements are read as an array's: a ref-element Array<T> is compiled as Array<any>, where `el` is `any`.
+				const inner: any[] = el;
+				for (let j = 0; j < inner.length; j++)
+					out.push(inner[j]);
+			} else
+				out.push(el as T extends readonly (infer U)[] ? U : T);	// compiled only when `T` is no array (towasm `staticGuard`), where this is `T`
+		}
+		return out;
+	}
 	// Real TS lets the callback return `U | readonly U[]`; here it must return an array. Telling the two
 	// apart needs a runtime array test on a union, which this compiler has no representation for -- and
 	// the array form is what every real caller uses.

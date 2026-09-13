@@ -2711,6 +2711,33 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// per-instantiation substitution `ctx.scope` has; the checker's own internal tracking can otherwise
 	// fully structurally resolve a value where `ctx.scope` keeps its clean nominal `ref`) -- none of which
 	// this needs to enumerate, since they only ever matter once a union is actually in play.
+	// A type guard call (`x is P`, not `asserts`) its argument's type settles: `true` when every value of that type is a `P`,
+	// `false` when none can be, `undefined` when only the value can tell. Decided by the checker's own comparability.
+	function staticGuard(test: Expr, ctx: FunctionContext): boolean | undefined {
+		if (test.type === 'unary' && test.operator === '!') {
+			const inner = staticGuard(test.operand, ctx);
+			return inner === undefined ? undefined : !inner;
+		}
+		if (test.type !== 'call')
+			return undefined;
+		const scope	= ctx.typeScope;
+		const fn	= T.resolveOwn(checkerTypeOf(test.callee, scope), scope);
+		if (fn.type !== 'function' || fn.typeParams?.length)
+			return undefined;
+		const pred = fn.returnType;
+		if (pred?.type !== 'predicate' || pred.asserts || !pred.assertedType)
+			return undefined;
+		const arg = test.arguments[fn.params.findIndex(p => p.key === pred.paramName)];
+		if (!arg || arg.type === 'spread')
+			return undefined;
+		const a = narrowedTypeOf(arg, ctx), p = pred.assertedType;
+		if (T.isAny(a))
+			return undefined;
+		if (T.isAssignable(a, p, scope, scope, true))
+			return true;
+		return T.unionMembers(a, scope).some(m => T.isAssignable(m, p, scope, scope, true) || T.isAssignable(p, m, scope, scope, true)) ? undefined : false;
+	}
+
 	// A non-array with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable; an array stays indexed.
 	function iteratesByProtocol(e: Expr, ctx: FunctionContext): T.IterationTypes | undefined {
 		const t = narrowedTypeOf(e, ctx);
@@ -7194,6 +7221,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				return;
 
 			case 'if': {
+				// A type guard its argument's type settles is decided here, and the dead branch is never compiled: it may not
+				// even compile for this instantiation (lib `flat`'s array branch for a `number` element). The test still runs.
+				const known = staticGuard(s.test, ctx);
+				if (known !== undefined) {
+					emitTruthy(s.test, ctx);
+					ctx.emit(I.drop);
+					const live = known ? s.consequent : s.alternate;
+					if (live)
+						emitStmt(live, ctx);
+					return;
+				}
 				emitTruthy(s.test, ctx);
 				const old = ctx.swapOut();
 				ctx.enterLabel();
