@@ -7041,6 +7041,17 @@ async function main() {
 	}
 
 	{
+		// Unary `+` on a string is ToNumber, i.e. `Number(s)` (type-utils.ts `lookupMember`'s `t.elements[+prop]`).
+		const { unaryPlusString } = await compile(`
+			export function unaryPlusString(): number {
+				const s = '42', t = ' 7 ', e = '';
+				return +s + +t + (+e === 0 ? 100 : 0);
+			}
+		`);
+		check('unaryPlusString()', unaryPlusString(), 149);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

@@ -6170,6 +6170,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					return 'i32';
 				}
 
+				// `+s` is ToNumber, which for a string is exactly `Number(s)`: the lib wrapper's string constructor parses it (trimmed,
+				// '' is 0, trailing junk is NaN). Another non-number operand still falls through to the error below.
+				if (e.operator === '+' && T.typeofName(narrowedTypeOf(e.operand, ctx), ctx.scope) === 'string')
+					return emitExpr({ type: 'call', callee: { type: 'identifier', name: 'Number' }, arguments: [e.operand] } as Expr, ctx, want);
 				const t = notUnsigned(scalarKind(info.wtype));
 				if (t) {
 					switch (e.operator) {
