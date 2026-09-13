@@ -1886,11 +1886,15 @@ latent bug: `FunctionContext.temp` compared scratch-local types by object IDENTI
 `wasmTypeKey`, so a fresh `nullableWtype(REF_ANY)` and the `REF_ANY_NULLABLE` constant collided under one
 name. Now compared by key; `inferReturn`/`checkFunctionBody` moved on.
 
-**Next rows** (75/328): `unknown method 'RefType'` 24 (checker.ts, via type-utils.ts:62's module-level
-`TS.RefType('any')` -- a function called through a NAMESPACE import); `unknown method 'parse'` 22; `only
-direct calls to named functions...` 21; `indexing is only supported on number[]/...` 19; `internal: cannot
-convert arr:ref:true to i32` 18 (type-utils; the probe prints NO position -- needs a trace); `param 'value'
-needs an explicit type` 14.
+**`unknown method 'RefType'` closed (24 -> 0)**: a lazy global's initializer was compiled in the scope its
+name was FOUND in -- for an `NS.name` read, the declaring module's EXPORT scope, which lacks that module's own
+imports -- so type-utils.ts's `ANY = TS.RefType('any')` could not see `TS`. `lazyGlobalFor` now compiles it in
+`moduleScopeOf(homeModule)`, the scope the module's functions already compile in.
+
+**Next rows** (75/328): `unknown method 'parse'` 22; `only direct calls to named functions...` 21; `unknown
+field 'pos'` 19 (checker.ts, e.g. :2753 `(stmt as any).pos` -- the parser's position stamp read through
+`as any`); `indexing is only supported on number[]/...` 19; `internal: cannot convert arr:ref:true to i32`
+18 (type-utils; the probe prints NO position -- needs a trace); `param 'value' needs an explicit type` 17.
 
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
