@@ -7496,6 +7496,29 @@ async function main() {
 	}
 
 	{
+		// A type parameter whose default names an earlier one (common.ts's `Call<E, A = E>`, the shape every `Expr` union member
+		// has): the default is instantiated with the argument given, so the members' own types resolve.
+		const { defaultTypeArg } = await compile(`
+			interface C<E, A = E> { type: 'call'; callee: E; args: A[] }
+			interface Lit { type: 'lit'; v: number }
+			type Ex = C<Ex> | Lit;
+			function total(e: Ex): number {
+				if (e.type === 'call') {
+					let n = 0;
+					for (const a of e.args)
+						n += a.type === 'lit' ? a.v : 1;
+					return n;
+				}
+				return 0;
+			}
+			export function defaultTypeArg(): number {
+				return total({ type: 'call', callee: { type: 'lit', v: 1 }, args: [{ type: 'lit', v: 5 }, { type: 'lit', v: 2 }] });
+			}
+		`);
+		check('defaultTypeArg()', defaultTypeArg(), 7);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

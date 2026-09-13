@@ -146,6 +146,8 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a tuple indexed by a computed number includes an optional position', 'declare function f(t: [number, string?], i: number): void; const g = (t: [number, string?], i: number) => { const q: number = t[i]; };', ['is not assignable']],
 	// TS narrows at an assignment wherever it sits, so a branch that assigns inside a call argument still settles the type after it.
 	['an assignment nested in a call argument narrows after the branch', 'interface B { v: number } declare const m: Map<string, B>; function f(k: string): B { let b = m.get(k); if (!b) { m.set(k, b = { v: 1 }); } return b; }', []],
+	// TS instantiates a type parameter's default with the arguments already chosen, so one naming an earlier parameter resolves.
+	['a type parameter default naming an earlier one is instantiated with it', 'interface C<E, A = E> { c: E; args: A[] } declare const x: C<number>; const q: boolean = x.args;', ['number[]']],
 ];
 
 (async () => {

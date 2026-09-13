@@ -877,6 +877,14 @@ function substituteShadowed<S extends TS.CallSig>(sig: S, map: Map<string, Type>
 	};
 }
 
+// TS's rule for a missing type argument: a parameter's DEFAULT may name the parameters before it (`Call<E, A = E>` in common.ts),
+// so each default is instantiated with the arguments already chosen -- otherwise the bare parameter escapes into the member types.
+export function typeArgMap(typeParams: readonly TS.TypeParam[], typeArgs: readonly Type[] | undefined, fallback: Type = ANY): Map<string, Type> {
+	const map = new Map<string, Type>();
+	typeParams.forEach((p, i) => map.set(p.name, typeArgs?.[i] ?? (p.default ? substituteType(p.default, map) : fallback)));
+	return map;
+}
+
 export function substituteType(t: Type, map: Map<string, Type>): Type {
 	if (map.size === 1) {
 		const [[name, arg]] = map;
@@ -1350,7 +1358,7 @@ export function resolveMembers(t: Type, scope: Scope, depth = 10): Type {
 	if (!ns || !entry)
 		return r;
 	return resolve(ns, entry.typeParams?.length
-		? substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, r.typeArgs?.[i] ?? p.default ?? ANY])))
+		? substituteType(entry.type, typeArgMap(entry.typeParams, r.typeArgs))
 		: entry.type, depth - 1);
 }
 
@@ -1712,11 +1720,11 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 						if (!entry.typeParams?.length)
 							return resolve(ns, entry.type, depth - 1, stopAtRef);
 						if (!t.typeArgs) {
-							entry.defaultSubstitution ??= substituteType(entry.type, new Map(entry.typeParams.map(p => [p.name, p.default ?? ANY])));
+							entry.defaultSubstitution ??= substituteType(entry.type, typeArgMap(entry.typeParams, undefined));
 							return resolve(ns, entry.defaultSubstitution, depth - 1, stopAtRef);
 						}
 						const tparams	= entry.typeParams;
-						const args		= tparams.map((p, i) => t.typeArgs?.[i] ?? p.default ?? ANY);
+						const args		= [...typeArgMap(tparams, t.typeArgs).values()];
 						const subst		= (as: Type[]) => resolve(ns, substituteType(entry.type, new Map(tparams.map((p, i) => [p.name, as[i]]))), depth - 1, stopAtRef);
 						// A conditional alias whose CHECK TYPE is a naked type parameter DISTRIBUTES over a
 						// union argument: `Extract<A | B, U>` is `(A extends U ? A : never) | (B extends U ?
@@ -2805,7 +2813,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 		} else if (paramT.type === 'ref' && paramT.typeArgs) {
 			// A generic alias unfolded one level (`paramT.name` is declared in `declScope`, not `scope`).
 			const entry		= declScope.type(paramT.name);
-			const unfold	= () => substituteType(entry!.type, new Map(entry!.typeParams!.map((p, i) => [p.name, paramT.typeArgs![i] ?? p.default ?? ANY])));
+			const unfold	= () => substituteType(entry!.type, typeArgMap(entry!.typeParams!, paramT.typeArgs));
 			const sameName	= argT.type === 'ref' && argT.name === paramT.name;
 			if (paramT.name === 'Array' && paramT.typeArgs.length === 1 && a.type === 'array') {
 				recurse(paramT.typeArgs[0], a.element, depth - 1);
@@ -2982,7 +2990,7 @@ export function asPromiseRef(t: Type, scope: Scope, depth = 6): TS.RefType | und
 		return t.typeArgs?.length ? t : undefined;
 	const entry = ownScope(t, scope).type(t.name);
 	return entry && asPromiseRef(entry.typeParams?.length
-		? substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, t.typeArgs?.[i] ?? p.default ?? ANY])))
+		? substituteType(entry.type, typeArgMap(entry.typeParams, t.typeArgs))
 		: entry.type, scope, depth - 1
 	);
 }
@@ -3029,7 +3037,7 @@ function globalIterationTypes(t: Type, scope: Scope, async: boolean, generatorRe
 	const entry = ownScope(t, scope).lookupType(t.name);
 	if (!entry?.typeParams || entry !== root.type(t.name))
 		return undefined;
-	const [y, r, n] = entry.typeParams.map((p, i) => t.typeArgs?.[i] ?? p.default ?? UNKNOWN);
+	const [y, r, n] = [...typeArgMap(entry.typeParams, t.typeArgs, UNKNOWN).values()];
 	return { yield: y ?? UNKNOWN, return: r ?? ANY, next: n ?? ANY };
 }
 
@@ -3130,7 +3138,7 @@ export function expandRefOnce(scope: Scope, t: Type): Type {
 	if (!entry)
 		return t;
 	return entry.typeParams?.length
-		? substituteType(entry.type, new Map(entry.typeParams.map((p, i) => [p.name, t.typeArgs?.[i] ?? p.default ?? ANY])))
+		? substituteType(entry.type, typeArgMap(entry.typeParams, t.typeArgs))
 		: entry.type;
 }
 
