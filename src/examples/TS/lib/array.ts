@@ -130,6 +130,11 @@ export class Array<T> {
 	}
 	// SameValueZero, NOT `indexOf(x) !== -1`: the two genuinely differ on NaN -- `indexOf` uses strict
 	// equality and can never find one (correctly), while `[NaN].includes(NaN)` is true.
+	// A negative index counts back from the end; out of range is `undefined`.
+	at(index: number): T | undefined {
+		const i = index < 0 ? this.length + index : index;
+		return i >= 0 && i < this.length ? this[i] : undefined;
+	}
 	includes(x: T): boolean {
 		for (let i = 0; i < this.length; i++) {
 			const v = this[i];

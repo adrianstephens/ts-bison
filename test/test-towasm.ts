@@ -6978,6 +6978,18 @@ async function main() {
 	}
 
 	{
+		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
+		const { arrayAt } = await compile(`
+			export function arrayAt(): number {
+				const xs = [3, 5, 7];
+				const names = ['ab', 'cde'];
+				return (xs.at(-1) ?? 0) * 100 + (xs.at(0) ?? 0) * 10 + (xs.at(5) === undefined ? 1 : 0) + (names.at(-1) ?? '').length * 1000;
+			}
+		`);
+		check('arrayAt()', arrayAt(), 3731);
+	}
+
+	{
 		// An array pattern over a non-array iterates, as JS does (`const [[name, arg]] = map`, type-utils.ts's `substituteType`).
 		const { destrMap, destrGen, destrDefaults, destrParam } = await compile(`
 			export function destrMap(): number { const m = new Map<string, number>([['ab', 7], ['c', 1]]); const [[k, v]] = m; return k.length * 10 + v; }
