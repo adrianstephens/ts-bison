@@ -1866,15 +1866,15 @@ Two separate general fixes, both found by writing the regression test FIRST:
 - **Walker root misclassification** (walker.ts `isType`): a bare ternary EXPRESSION root shares the tag
   'conditional' with a conditional TYPE and the field tiebreak did not cover it, so `walkB`/`walk` walked it
   as a type -- a closure whose body is a bare ternary had NO free variables and captured nothing. Fixed by
-  shape (`test` exists only on the expression). OPEN: `this` and `literal` are IDENTICAL in shape as type
-  and expression, so `() => this` is still walked as a type; flipping the default breaks type walkers on a
-  bare `this` return type -- needs caller-stated intent, not a guess.
+  shape (`test` exists only on the expression). Superseded by `abb7fd8` (the user's rework): `walk`/`walkB`
+  now take each node's kind from the CALLER (`walkB(...).body(body)`), so nothing guesses a root's kind any
+  more -- `isType`, the `test` tiebreak and the `this`/`literal` ambiguity are all gone.
 Survey: 3 newly compile, 39 moved, 68 -> 71/325. The `parseInt` rows only RELABELED (call to unknown
 function -> unresolved identifier) -- those closures now see `parseInt` as a free name; same blocker.
 
-**Next rows**: `'??=' needs a nullable object-typed target` 44 (where objectKeyNames' 20 landed);
+**Next rows** (75/328 after the walker/printer rework): `'??=' needs a nullable object-typed target` 45;
 `unknown method 'parse'` 22; `only direct calls to named functions...` 21; `indexing is only supported on
-number[]/...` 17; `unresolved identifier 'parseInt'` 12; `param 'value' needs an explicit type` 12.
+number[]/...` 17; `param 'value' needs an explicit type` 13; `unresolved identifier 'parseInt'` 12.
 
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
