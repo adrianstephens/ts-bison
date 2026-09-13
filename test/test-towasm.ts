@@ -7275,6 +7275,20 @@ async function main() {
 	}
 
 	{
+		// A read TS types as possibly `undefined` is bounds-checked, since JS reads past the end as `undefined` (js-parser.ts
+		// `CallSig`'s `args[1]` with one argument): a union-of-tuples rest, an optional tuple element, a `(T | undefined)[]`.
+		const { tupleIndexPastEnd } = await compile(`
+			function second(...args: [number] | [number, number]): number { const b = args[1]; return b === undefined ? -1 : b; }
+			export function tupleIndexPastEnd(): number {
+				const xs: (string | undefined)[] = ['a'];
+				const t: [number, string?] = [1];
+				return second(5) + second(5, 7) * 10 + (xs[3] === undefined ? 100 : 0) + (t[1] === undefined ? 1000 : 0);
+			}
+		`);
+		check('tupleIndexPastEnd()', tupleIndexPastEnd(), 1169);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

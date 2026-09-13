@@ -5363,6 +5363,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return undefined;
 	}
 
+	// An index read TS types as possibly `undefined` (`args[1]` on `[A] | [A, B]`, an optional tuple element, `(T | undefined)[]`):
+	// JS reads past the end as `undefined`, where `array.get` traps, so such a read is bounds-checked.
+	function readsPastEnd(e: Expr, ctx: FunctionContext): boolean {
+		return T.unionMembers(T.resolve(ctx.typeScope, narrowedTypeOf(e, ctx)), ctx.typeScope).some(m => T.isNullish(m, ctx.typeScope));
+	}
+
+	// `e.object[e.index]` held in locals, `read` run only when the index is below the length (unsigned: a negative one is
+	// past the end too), `null` otherwise.
+	function emitBoundedRead(e: Expr & { type: 'index' }, objWtype: WasmType, resultWtype: WasmType, ctx: FunctionContext, read: (obj: Local, idx: Local & { name: string }) => void): WasmType {
+		const n		= optionalTempCounter++;
+		const obj	= ctx.declareLocal(`$bobj$${n}`, objWtype);
+		const idx	= Object.assign(ctx.declareValue(`$bidx$${n}`, 'i32', T.NUMBER), { name: `$bidx$${n}` });
+		emitAs(e.object, ctx, objWtype);
+		ctx.emit(I.local.set(obj.index));
+		emitAs(e.index, ctx, 'i32');
+		ctx.emit(I.local.set(idx.index), I.local.get(idx.index), I.local.get(obj.index), I.array.len, I.i32.lt_u);
+		const _old = ctx.swapOut();
+		read(obj, idx);
+		const _then = ctx.swapOut();
+		emitDefaultValue(resultWtype, ctx);
+		ctx.emit(I.if(toValType(resultWtype), _then, ctx.swapOut(_old)));
+		return resultWtype;
+	}
+
 	// `NS.x` through `import * as NS` naming a module-level variable, not a function: a call to it calls the value it holds.
 	function isNamespaceValue(e: Expr & { type: 'member' }, ctx: FunctionContext): boolean {
 		return e.object.type === 'identifier' && !ctx.lookup(e.object.name) && ctx.scope.namespace(e.object.name)?.decl(e.property)?.type === 'var_decl';
@@ -5920,8 +5944,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							coerceTop(emitMethodCall(cls, 'get', [e.index], ctx), ctx, resultWtype);
 						});
 					}
+					const thisW = cls.thisWtype!;
+					if (typeof thisW !== 'string' && 'arr' in thisW && readsPastEnd(e, ctx)) {
+						const resultWtype = nullableWtype(sig.result);
+						return emitBoundedRead(e, thisW, resultWtype, ctx, (obj, idx) => {
+							ctx.emit(I.local.get(obj.index));
+							coerceTop(emitMethodCall(cls, 'get', [{ type: 'identifier', name: idx.name }], ctx), ctx, resultWtype);
+						});
+					}
 					// `emitAs`, not a raw `emitExpr` -- `e.object` may itself be boxed `anyref` (`a[i][j]`), same reasoning as the field-read cast above.
-					emitAs(e.object, ctx, cls.thisWtype!);
+					emitAs(e.object, ctx, thisW);
 					return emitMethodCall(cls, 'get', [e.index], ctx);
 				}
 				const kind = objectArrayKind(e.object, ctx);
@@ -5961,6 +5993,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emit(I.local.get(objLocal));
 						emitAs(e.index, ctx, 'i32');
 						ctx.emit(I.array.get(ensureArrayType(kind)));
+						coerceTop(elemWtype, ctx, resultWtype);
+					});
+				}
+				if (readsPastEnd(e, ctx)) {
+					const resultWtype = nullableWtype(elemWtype);
+					return emitBoundedRead(e, ARR_WTYPE[kind], resultWtype, ctx, (obj, idx) => {
+						ctx.emit(I.local.get(obj.index), I.local.get(idx.index), I.array.get(ensureArrayType(kind)));
 						coerceTop(elemWtype, ctx, resultWtype);
 					});
 				}
