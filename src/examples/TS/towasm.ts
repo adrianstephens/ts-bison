@@ -1996,6 +1996,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// `objectKeyNames`), which the shallow top-level scan misses -- and its holder then lands in the right scope.
 		const d = ctx.initializing?.slice().reverse().find(d => d.name === name)
 			?? ctx.ownBody?.flatMap(s => s.type === 'var_decl' ? s.declarations : []).find(d => d.name === name);
+		// A sibling function declaration not yet created: mutual recursion (checker.ts `typeOf`'s `recurse` and `recurseUncached`).
+		const fd = d ? undefined : ctx.ownBody?.find((s): s is Extract<Stmt, { type: 'function_decl' }> => s.type === 'function_decl' && s.name === name && !!s.body);
+		if (fd) {
+			const fnType = (fd as { scope?: Scope }).scope?.value(name) ?? checkerTypeOf({ ...fd, type: 'function' } as Expr, ctx.scope);
+			const fnWtype = typeOf(fnType);
+			return fnWtype ? declareHolder(ctx, name, fnWtype, fnType) : undefined;
+		}
 		if (!d)
 			return undefined;
 		const tsType = d.typeAnnotation ?? (d.init && checkerTypeOf(d.init, ctx.scope));
@@ -7924,6 +7931,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// local, hitting the genuine "redeclared" guard below meant for real, user-visible shadowing.
 				if (!s.body)
 					return;
+				// A sibling created earlier already captured this name's forward holder (`ensureForwardHolder`): fill that.
+				if (ctx.lookup(s.name)?.holderInner) {
+					const target = emitAssignTarget({ type: 'identifier', name: s.name }, ctx, 'none');
+					coerceTop(emitClosureLiteral(s, ctx, true), ctx, target.wtype);
+					target.write(false);
+					return;
+				}
 				ctx.emit(I.local.set(ctx.declareLocal(s.name, emitClosureLiteral(s, ctx, true)).index));
 				return;
 

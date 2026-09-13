@@ -7379,6 +7379,19 @@ async function main() {
 	}
 
 	{
+		// Sibling nested functions calling each other (checker.ts `typeOf`'s `recurse` and `recurseUncached`): the one created first
+		// captures the other's forward holder, which the other fills when it is created.
+		const { mutualNested } = await compile(`
+			export function mutualNested(): number {
+				function even(n: number): boolean { return n === 0 ? true : odd(n - 1); }
+				function odd(n: number): boolean { return n === 0 ? false : even(n - 1); }
+				return (even(4) ? 1 : 0) + (odd(7) ? 10 : 0) + (even(3) ? 100 : 0);
+			}
+		`);
+		check('mutualNested()', mutualNested(), 11);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
