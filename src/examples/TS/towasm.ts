@@ -4813,7 +4813,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 
 		const body	= e.body ?? [];
-		if (e.name && !allowSelfCall && walkB(undefined, (e, process) => e.type === 'identifier' ? true : process(e)).body(body))
+		if (e.name && !allowSelfCall && walkB(undefined, (e1, process) => e1.type === 'identifier' ? e1.name === e.name : process(e1)).body(body))
 			throw `a named function expression referencing its own name ('${e.name}') is not supported`;
 
 		// The call site's own expected closure signature (`want`, when this literal is being compiled
