@@ -11,21 +11,27 @@ import { Output } from './tocode';
 //  Type utilities
 // ===================================================================
 
-const _NORMAL_PRIM	= ['never', 'void', 'number', 'string', 'boolean', 'bigint', 'symbol', 'object', 'undefined', 'null'] as const;
-const _LOOSE		= ['any', 'unknown'] as const;
-const _KEYABLE_PRIM	= ['number', 'string', 'symbol'] as const;
+const _PRIMITIVES		= ['number', 'string', 'symbol', 'boolean', 'bigint', 'undefined', 'object', 'never', 'void', 'null'] as const;
+type PRIMITIVES			= (typeof _PRIMITIVES)[number];
 
-type NORMAL_PRIM	= (typeof _NORMAL_PRIM)[number];
-type LOOSE			= (typeof _LOOSE)[number];
-type KEYABLE_PRIM	= (typeof _KEYABLE_PRIM)[number];
-type ALL_PRIM		= NORMAL_PRIM | LOOSE;
+class TypeSet<T extends string> {
+	set;
+	constructor(public values: ReadonlyArray<T>) {
+		this.set = new Set<string>(values);
+	}
+	has(name: string): name is T {
+		return this.set.has(name);
+	}
+	or<U extends string>(other: TypeSet<U>): TypeSet<T | U> {
+		return new TypeSet([...this.values, ...other.values]);
+	}
+}
 
-const ALL_PRIM		= new Set<string>([..._NORMAL_PRIM, ..._LOOSE]);
-const NORMAL_PRIM	= new Set(_NORMAL_PRIM);
-const LOOSE			= new Set(_LOOSE);
-const KEYABLE_PRIM	= new Set(_KEYABLE_PRIM);
-
-function has<T extends string>(set: { has: (n: T)=> boolean }, name: string): name is T	{ return set.has(name as T); }
+const KEY_TYPES			= new TypeSet(['number', 'string', 'symbol']);
+const SIMPLE_TYPES		= new TypeSet(['number', 'string', 'symbol', 'boolean', 'bigint', 'undefined']);
+const PRIMITIVES		= new TypeSet(_PRIMITIVES);
+const TOP_TYPES			= new TypeSet(['any', 'unknown']);
+const INTRINSIC_TYPES	= PRIMITIVES.or(TOP_TYPES);
 
 // `declare type i32 = number` etc (lib.d.ts) -- wasm-level pseudo-types, deliberately never resolved past
 // their own `ref` form (see that file's own comment: "not used for arithmetic, never resolved by the
@@ -61,14 +67,11 @@ export const UNKNOWN	= TS.RefType('unknown');
 export const NUMERIC	= TS.UnionType([NUMBER, BIGINT]);
 
 export function isRef<T extends string>(t: Type, name: T): t is TS.RefType<T>							{ return t.type === 'ref' && t.name === name; }
-export function isRefOf<T extends string>(t: Type, set: { has: (n: T)=> boolean }): t is TS.RefType<T>	{ return t.type === 'ref' && has(set, t.name); }
+export function isRefOf<T extends string>(t: Type, set: { has: (n: T)=> boolean }): t is TS.RefType<T>	{ return t.type === 'ref' && set.has(t.name as any); }
 
-//const NORMAL_PRIM	= new Set(['never', 'void', 'number', 'string', 'boolean', 'bigint', 'symbol', 'object', 'undefined', 'null'] as const);
-//const ANY_PRIM		= new Set(['any', 'unknown'] as const);
-//const KEYABLE_PRIM	= new Set(['number', 'string', 'symbol'] as const);
-export function isPrimitive(t: Type){ return isRefOf(t, NORMAL_PRIM); }
-export function isKeyable(t: Type)	{ return isRefOf(t, KEYABLE_PRIM); }
-export function isAny(t: Type)		{ return isRefOf(t, LOOSE); }
+export function isPrimitive(t: Type){ return t.type === 'ref' && PRIMITIVES.has(t.name); }
+export function isKeyable(t: Type)	{ return t.type === 'ref' && KEY_TYPES.has(t.name); }
+export function isAny(t: Type)		{ return t.type === 'ref' && TOP_TYPES.has(t.name); }
 export function isBoolean(t: Type)	{ return isRef(t, 'boolean'); }
 export function isString(t: Type)	{ return isRef(t, 'string'); }
 
@@ -106,8 +109,6 @@ export function isLiteral<K extends keyof TypeOfMap>(t: Type|Expr, type: K): t i
 	return t.type === 'literal' && literalType(t) === type;
 }
 
-const TYPEOF_PRIMITIVES = ['number', 'string', 'boolean', 'bigint', 'symbol', 'undefined'];
-
 // What `typeof` would report for a value of this type, or undefined when it can't be known statically --
 // which is also the only way to answer `'object'`/`'function'`, neither of which has a single physical
 // form for codegen to test for at runtime.
@@ -127,18 +128,18 @@ export function typeofName(t: Type, scope?: Scope): string | undefined {
 			// A part that makes the value a PRIMITIVE wins over the object-ish ones -- a branded
 			// `string & {brand}` is a string, and `typeof` reports it as one.
 			const parts = r.types.map(p => typeofName(p, scope));
-			return parts.find(n => n && TYPEOF_PRIMITIVES.includes(n))
+			return parts.find(n => n && SIMPLE_TYPES.has(n))
 				?? (parts.includes('function') ? 'function' : 'object');
 		}
 		case 'union': {
 			// Every inhabitant must agree. `unionMembers` resolves and flattens, and drops `never` -- see
 			// its own comment. Only with a `scope`; without one this stays a shallow, as-given answer.
-			const members = scope ? unionMembers(r, scope) : r.types.filter(m => !isRef(m, 'never'));
-			const names = new Set(members.map(m => typeofName(m, scope)));
+			const members	= scope ? unionMembers(r, scope) : r.types.filter(m => !isRef(m, 'never'));
+			const names		= new Set(members.map(m => typeofName(m, scope)));
 			return names.size === 1 && !names.has(undefined) ? [...names][0] : undefined;
 		}
 		case 'ref': {
-			if (TYPEOF_PRIMITIVES.includes(r.name))
+			if (SIMPLE_TYPES.has(r.name))
 				return r.name;
 			if (r.name === 'void' || r.name === 'null')
 				return r.name === 'void' ? 'undefined' : 'object';
@@ -461,14 +462,14 @@ export function joinTypes(types: Type[]): Type {
 
 // The disjoint domain of a resolved intersection member (TS's DisjointDomains, `void` counted as `undefined`), 'structural'
 // for an object type, undefined when unknown (a type parameter, an unresolved name).
-type Domain = NORMAL_PRIM | 'structural' | undefined;
+type Domain = PRIMITIVES | 'structural' | undefined;
 function domainOf(r: Type, scope: Scope): Domain {
 	switch (r.type) {
 		case 'literal':	return literalType(r) as Domain;
 		case 'range':	return r.base;
 		case 'object': case 'array': case 'tuple': case 'function': case 'constructor':
 			return 'structural';
-		case 'ref':		return r.name === 'void' ? 'undefined' : has(NORMAL_PRIM, r.name) ? r.name : isClassRef(r, scope) ? 'structural' : undefined;
+		case 'ref':		return r.name === 'void' ? 'undefined' : PRIMITIVES.has(r.name) ? r.name : isClassRef(r, scope) ? 'structural' : undefined;
 		default:		return undefined;
 	}
 }
@@ -1163,7 +1164,7 @@ export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<str
 		searchOnce((x: Type, process: (x: Type) => boolean) => {
 			// Primitives resolve the same everywhere -- stamping them would only add dead weight and dedup-key noise for no gain.
 			if (x.type === 'ref') {
-				if (!x.declScope && !ALL_PRIM.has(x.name) && !exclude?.has(x.name))
+				if (!x.declScope && !INTRINSIC_TYPES.has(x.name) && !exclude?.has(x.name))
 					x.declScope = scope;
 			} else if (x.type === 'typeof') {
 				// A `typeof X` query names a VALUE, so it needs its declaring scope for exactly the reason a
@@ -1223,7 +1224,7 @@ export function stampSig<T extends TS.CallSig>(sig: T, scope: Scope): T {
 // Does this ref name a real `class`? `resolve` keeps such a ref nominal (see its own `case 'ref'`), so
 // every consumer that used to be handed a class's expanded structural shape now meets the ref instead.
 export function isClassRef(t: Type, scope: Scope): boolean {
-	if (t.type !== 'ref' || ALL_PRIM.has(t.name))
+	if (t.type !== 'ref' || INTRINSIC_TYPES.has(t.name))
 		return false;
 	const parts	= t.name.split('.');
 	const name	= parts.pop()!;
@@ -1272,7 +1273,7 @@ function isAbstract(t: Type, scope: Scope): boolean {
 		// '.', so a namespace-qualified type (`TS.Stmt`) looked unbound and every conditional over one
 		// stayed deferred: `Extract<TS.Stmt, {type:'module_decl'}>` resolved to `never` despite `TS.Stmt`
 		// resolving perfectly well to its 33 members.
-		case 'ref':				return !t.typeArgs && !t.name.includes('.') && !ALL_PRIM.has(t.name) && !isClassRef(t, scope) && (!scope.type(t.name) || !!scope.type(t.name)?.isTypeParam);
+		case 'ref':				return !t.typeArgs && !t.name.includes('.') && !INTRINSIC_TYPES.has(t.name) && !isClassRef(t, scope) && (!scope.type(t.name) || !!scope.type(t.name)?.isTypeParam);
 		case 'indexed_access':	return isAbstract(t.object, scope) || isAbstract(t.index, scope);
 		default:				return false;
 	}
@@ -1302,7 +1303,7 @@ export function resolveOwn(t: Type, scope: Scope): Type {
 // Expands exactly one level: the members it yields keep their own nominal refs.
 export function resolveMembers(t: Type, scope: Scope, depth = 10): Type {
 	const r = resolveOwn(t, scope);
-	if (r.type !== 'ref' || ALL_PRIM.has(r.name))
+	if (r.type !== 'ref' || INTRINSIC_TYPES.has(r.name))
 		return r;
 	const refScope	= r.declScope as Scope ?? scope;
 	const parts		= r.name.split('.');
@@ -1537,7 +1538,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				// already have collapsed it before this check ever saw `'mapped'`, permanently missing this
 				// composition for exactly the common case (`Partial<Record<string,T>>` and the like).
 				let peeled = t.object;
-				for (let i = 0; i < depth && peeled.type === 'ref' && !ALL_PRIM.has(peeled.name); i++)
+				for (let i = 0; i < depth && peeled.type === 'ref' && !INTRINSIC_TYPES.has(peeled.name); i++)
 					peeled = expandRefOnce(scope, peeled);
 
 				if (peeled.type === 'mapped')
@@ -1653,7 +1654,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 			case 'ref':
 				if (stopAtRef)
 					return t;
-				if (!ALL_PRIM.has(t.name)) {
+				if (!INTRINSIC_TYPES.has(t.name)) {
 					// A ref's own `declScope` wins over the ambient `scope` for lookup -- kept local, not
 					// reassigned onto `scope` (which `uncached`'s closure shares with `resolve`'s own resolving-set bookkeeping below; reassigning it here used to leak that set onto the wrong scope).
 					const refScope = t.declScope as Scope ?? scope;
@@ -1880,7 +1881,7 @@ export function isTruthy(t: Type, scope: Scope): boolean {
 // A class or interface instance is an object, never falsy -- TS's object type facts. Not an empty shape (`{}`, `Object`),
 // which a primitive satisfies, nor anything unresolved.
 function isObjectRef(r: TS.RefType, scope: Scope): boolean {
-	if (ALL_PRIM.has(r.name))
+	if (INTRINSIC_TYPES.has(r.name))
 		return false;
 	const m = resolveMembers(r, scope);
 	return m.type === 'object' ? m.members.length > 0 : m.type === 'intersection' && m.types.some(p => p.type === 'object' && p.members.length > 0);
@@ -1916,7 +1917,7 @@ function isLiteralOnly(t: Type, scope: Scope, depth = 6): boolean | undefined {
 		// A CLASS is definitively not a literal union -- `undefined` here means "could not look the name
 		// up", which stopped being true for classes once `resolve` began keeping them nominal, and left
 		// `string extends RegExp` undecidable in `case 'conditional'`.
-		case 'ref':		return ALL_PRIM.has(t.name) || isClassRef(t, scope) ? false : undefined;
+		case 'ref':		return INTRINSIC_TYPES.has(t.name) || isClassRef(t, scope) ? false : undefined;
 		case 'union':
 			if (depth >= 0) {
 				const parts = t.types.map(m => isLiteralOnly(resolveOwn(m, scope), scope, depth - 1));
@@ -2393,14 +2394,14 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 		// ... but NOT while `dst` is still a union or intersection: those decompose below and re-enter this rule per member,
 		// and expanding first would drop the ref identity that the by-name `Array`/same-name fast paths above need -- the only
 		// way an `Array<X>` source ever matches an `Array<Y>` destination, since `Array` is excluded from the structural path.
-		if (src.type === 'ref' && !ALL_PRIM.has(src.name) && dst.type !== 'union' && dst.type !== 'intersection') {
+		if (src.type === 'ref' && !INTRINSIC_TYPES.has(src.name) && dst.type !== 'union' && dst.type !== 'intersection') {
 			const members = resolveMembers(src, scope);
 			return members.type === 'ref' || recurse(members, dst, depth - 1);
 		}
 		// (A primitive source keeps to the primitive rules below: no primitive but its own wrapper satisfies a class. A type
 		// parameter destination is opaque -- its constraint is an upper bound for what IT is, not for what fits it.)
-		if (dst.type === 'ref' && !ALL_PRIM.has(dst.name) && dst.name !== 'Array' && dst.name !== 'ReadonlyArray'
-			&& !(src.type === 'ref' && ALL_PRIM.has(src.name)) && !dstScope.type(dst.name)?.isTypeParam) {
+		if (dst.type === 'ref' && !INTRINSIC_TYPES.has(dst.name) && dst.name !== 'Array' && dst.name !== 'ReadonlyArray'
+			&& !(src.type === 'ref' && INTRINSIC_TYPES.has(src.name)) && !dstScope.type(dst.name)?.isTypeParam) {
 			const members = resolveMembers(dst, dstScope);
 			if (members.type !== 'ref')
 				return recurse(src, members, depth - 1);
@@ -2469,7 +2470,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				? src.value === dst.value
 				: !precise && src.type === 'ref' && dst.value !== null && src.name === typeof dst.value;	// widened source: lenient (inventory C1)
 		if (src.type === 'literal')
-			return dst.type === 'ref' && (!ALL_PRIM.has(dst.name) || dst.name === (src.value === null ? 'null' : typeof src.value));
+			return dst.type === 'ref' && (!INTRINSIC_TYPES.has(dst.name) || dst.name === (src.value === null ? 'null' : typeof src.value));
 
 		// `dst`/`src` can no longer be `'array'` here -- `normalizeArray` plus `resolve()` above already expanded that into the real
 		// lib.es5 structural body. Only tuple-vs-tuple is left to handle structurally.
@@ -2497,7 +2498,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				// A primitive auto-boxes for structural checks too, not just member access -- otherwise `string` could never
 				// structurally satisfy `Iterable<T>`/`ArrayLike<T>` (e.g. `Array.from(str)`).
 				const boxed = BOXED_PRIMITIVE.get(src.name);
-				return boxed ? recurse(TS.RefType(boxed), dst, depth - 1) : !ALL_PRIM.has(src.name);	// unresolved nominal: lenient
+				return boxed ? recurse(TS.RefType(boxed), dst, depth - 1) : !INTRINSIC_TYPES.has(src.name);	// unresolved nominal: lenient
 			}
 			if (src.type === 'function' || src.type === 'constructor')
 				// A function's apparent type is the global `Function` interface, then `Object`'s -- which `lookupMember` already
@@ -2525,7 +2526,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 
 		if (dst.type === 'ref') {
 			if (dst.name === 'object')
-				return !(src.type === 'ref' && ALL_PRIM.has(src.name)) || src.name === 'object' || src.name === 'null';
+				return !(src.type === 'ref' && INTRINSIC_TYPES.has(src.name)) || src.name === 'object' || src.name === 'null';
 			if (dst.name === 'void')
 				return src.type === 'ref' && (src.name === 'void' || src.name === 'undefined');
 			if (src.type === 'ref') {
@@ -2547,7 +2548,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				const boxedSrc = BOXED_PRIMITIVE.get(src.name);
 				if (boxedSrc && (isClassRef(dst, dstScope) || dst.name === 'Array' || dst.name === 'ReadonlyArray'))
 					return boxedSrc === dst.name;
-				return !(ALL_PRIM.has(src.name) && ALL_PRIM.has(dst.name));	// distinct primitives: no; unresolved names: lenient
+				return !(INTRINSIC_TYPES.has(src.name) && INTRINSIC_TYPES.has(dst.name));	// distinct primitives: no; unresolved names: lenient
 			}
 			// `Array`/`ReadonlyArray` are well-known structural shapes, not "some unresolved generic" -- a plain
 			// object/function (anything reaching here didn't match the tuple/array-ref cases above, which already
@@ -2556,11 +2557,11 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			// unknown[]`, misrouting it into `TupleReadType` and leaking its unbound `infer` names into the output.
 			if (dst.name === 'Array' || dst.name === 'ReadonlyArray')
 				return false;
-			return !ALL_PRIM.has(dst.name);	// structural value into unresolved named type: lenient
+			return !INTRINSIC_TYPES.has(dst.name);	// structural value into unresolved named type: lenient
 		}
 
 		if (src.type === 'ref')
-			return !ALL_PRIM.has(src.name);
+			return !INTRINSIC_TYPES.has(src.name);
 
 		return src.type === dst.type;
 	};
