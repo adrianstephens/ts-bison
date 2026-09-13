@@ -7169,6 +7169,31 @@ async function main() {
 	}
 
 	{
+		// A call through a namespace import to a module-level VALUE (type-utils.ts `TS.CallSig(...)`, where ts-parser.ts has
+		// `export const CallSig = JS.CallSig<Type>`): an instantiation alias, a plain alias (default omitted), a closure literal.
+		const { nsConstCall } = await compileMulti({
+			base: `
+				export function pair<T>(a: T, b: T): T[] { return [a, b]; }
+				export function scale(x: number, k = 2): number { return x * k; }
+			`,
+			mid: `
+				import * as B from './base';
+				export const numPair = B.pair<number>;
+				export const twice = B.scale;
+				export const add = (a: number, b: number) => a + b;
+			`,
+			main: `
+				import * as M from './mid';
+				export function nsConstCall(): number {
+					const p = M.numPair(3, 4);
+					return p[0] * 1000 + p[1] * 100 + M.twice(5) + M.add(1, 2) * 10000;
+				}
+			`,
+		}, 'main');
+		check('nsConstCall()', nsConstCall(), 33410);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

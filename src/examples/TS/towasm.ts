@@ -5340,6 +5340,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return undefined;
 	}
 
+	// `NS.x` through `import * as NS` naming a module-level variable, not a function: a call to it calls the value it holds.
+	function isNamespaceValue(e: Expr & { type: 'member' }, ctx: FunctionContext): boolean {
+		return e.object.type === 'identifier' && !ctx.lookup(e.object.name) && ctx.scope.namespace(e.object.name)?.decl(e.property)?.type === 'var_decl';
+	}
+
 	function emitFunctionValue(fn: { name: string; decl: FunctionDecl; module: string }, want: WasmType | undefined, ctx: FunctionContext, typeArgs?: Type[]): WasmType {
 		const { info, structTypeIndex } = ensureFunctionValueWrapper(fn.name, fn.decl, fn.module, want, typeArgs);
 		ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.i32.const(jsLength(fn.decl.params)), I.struct.new(structTypeIndex));
@@ -6922,7 +6927,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// continues one, e.g. `obj?.a.method(...)` -- `isOptionalChainLink`, not a bare
 				// `e.callee.optional`, see `case 'member'`'s own comment). Treated as one guarded operation:
 				// `obj` evaluated once, checked for null, call only in the non-null arm -- restricted to a real user method (`ensureMethod`), not a `Math`/prelude intrinsic whose result type depends on the call site.
-				if (e.callee.type === 'member') {
+				if (e.callee.type === 'member' && !isNamespaceValue(e.callee, ctx)) {
 					if (isOptionalChainLink(e.callee)) {
 						const objExpr		= e.callee.object;
 						const methodName	= e.callee.property;
