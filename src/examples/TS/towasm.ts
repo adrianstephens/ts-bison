@@ -7532,10 +7532,24 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// specific receiver type the checker's own call-site inference might know about; this
 						// bypass path doesn't have that available, matching its existing generic-lib-method tradeoff).
 						const method		= methodOwner.decl.body.find(m => m.type === 'method' && m.key === methodName) as MethodMember | undefined;
-						// A return naming the method's OWN type parameter (`map<U>(...): U[]`) is only known from call-site inference.
+							// A return naming the method's OWN type parameter (`map<U>(...): U[]`) is only known from call-site inference. One naming
+						// its CLASS's (`Array<T>.filter(): T[]`) is only known from the receiver: this owner is the ERASED instantiation
+						// (`Array<any>` backs every array of a non-scalar element), whose decl already reads `any[]`. The original generic
+						// declaration says which, and the checker knows the real instantiation.
+						const ownerName		= methodOwner.decl.name;
+						const generic		= ownerName ? LIB_DECL_MAP.get(ownerName) ?? userGenericClassDecls.get(ownerName) : undefined;
+						const genericReturn	= generic?.type === 'class_decl' ? (generic.body.find(m => m.type === 'method' && m.key === methodName) as MethodMember | undefined)?.returnType : undefined;
 						const methodReturn	= method?.returnType && !method.typeParams?.some(p => T.mentionsTypeParam(method.returnType!, p.name)) ? method.returnType : undefined;
 						const substituted = methodReturn && T.substituteThisType(methodReturn, methodOwner.thisTsType);
 						tsType = substituted && calleeOptional ? T.combineTypes([substituted, T.UNDEFINED]) : substituted;
+						// A return naming the CLASS's parameter read off the erased owner is `any`-shaped (`filter(): T[]` is `any[]`
+						// there), so the checker -- which knows the real instantiation -- wins, unless it has no answer either: a
+						// structural dynamic object routed to `Map` has no `keys()` for the checker to see at all.
+						if (tsType && genericReturn && (generic?.type === 'class_decl' ? generic.typeParams ?? [] : []).some(p => T.mentionsTypeParam(genericReturn, p.name))) {
+							const checked = checkerTypeOf(d.init, stmtScope);
+							if (!T.isAny(checked))
+								tsType = checked;
+						}
 					}
 
 					tsType ??= checkerTypeOf(d.init, stmtScope);

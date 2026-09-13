@@ -7465,6 +7465,22 @@ async function main() {
 	}
 
 	{
+		// A method whose return names its CLASS's type parameter (`Array<T>.filter(): T[]`) keeps the receiver's element type
+		// (checker.ts `narrow`'s `parts.filter(...)` over `[Expr, boolean][]`), so the result is still a tuple array.
+		const { filterTupleArray } = await compile(`
+			export function filterTupleArray(): number {
+				const parts: [number, boolean][] = [[1, true], [2, false], [3, true]];
+				const kept = parts.filter(p => p[1]);
+				let s = 0;
+				for (const [n, b] of kept)
+					s += n * (b ? 1 : 0);
+				return s * 10 + kept.length;
+			}
+		`);
+		check('filterTupleArray()', filterTupleArray(), 42);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
