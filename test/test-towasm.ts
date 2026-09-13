@@ -3613,6 +3613,21 @@ async function main() {
 		}, 'main');
 		check('a namespace-qualified const reads a NON-EXPORTED sibling of its own module', privateSibling(), 1122);
 
+		// ...and one whose initializer calls through its OWN module's namespace import (type-utils.ts's
+		// `ANY = TS.RefType('any')`): the wrapper must compile in that module's scope, not the export scope it was found in.
+		const { nsInitViaOwnImport } = await compileMulti({
+			helper:	`export function make(x: number): number { return x + 1; }`,
+			lib: `
+				import * as H from './helper';
+				export const k: number = H.make(20);
+			`,
+			main: `
+				import * as L from './lib';
+				export function nsInitViaOwnImport(): number { return L.k * 2; }
+			`,
+		}, 'main');
+		check('a namespace-qualified const whose initializer calls through its own namespace import', nsInitViaOwnImport(), 42);
+
 		// A namespace-qualified FUNCTION read as a VALUE (`makeRule(Common.stampPos)`): calls through the namespace
 		// always compiled, but a bare read produced no closure to pass.
 		const { nsFnValue } = await compileMulti({

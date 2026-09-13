@@ -2162,7 +2162,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return undefined;
 		}
 		const homeModule	= stmtHomeModule.get(own.stmt) ?? ctx.homeModule;
-		const wrapper		= ensureLazyGlobal(name, homeModule, own.d, scope);
+		// `scope` is only where `name` was FOUND: an `NS.name` read finds it in the module's export scope, which lacks
+		// that module's own imports. The initializer compiles in its home module's own scope, as its functions do.
+		const wrapper		= ensureLazyGlobal(name, homeModule, own.d, moduleScopeOf(homeModule) ?? scope);
 		const slot			= lazyGlobalSlots.get(homeKey(homeModule, name));
 		return wrapper && slot ? { wrapper, slot } : undefined;
 	}
