@@ -7194,6 +7194,18 @@ async function main() {
 	}
 
 	{
+		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
+		// and trailing junk, radix 36 letters, and NaN when no digit is read.
+		const { parseIntGlobal } = await compile(`
+			export function parseIntGlobal(): number {
+				return parseInt('0x1F', 16) + parseInt('ff', 16) * 100 + parseInt('  -12px') * 100000 + parseInt('z', 36) * 1e7
+					+ (Number.isNaN(parseInt('q')) ? 1e9 : 0) + parseFloat('2.5e1') * 1e10 + parseInt('0x10') * 1e12;
+			}
+		`);
+		check('parseIntGlobal()', parseIntGlobal(), 16251348825531);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

@@ -117,9 +117,8 @@ function getUnsigned(p: StringParser, radix = 10, value = 0): number {
 	// into the loop condition itself instead of exiting from the middle of the body.
 	let stop = false;
 	while (!stop && p.pos < p.n) {
-		let d = p.code() - 48;
-		if (d > 9)
-			d = (d + 48 - 65 + 10) & 0x1f;
+		const c = p.code(), lower = c | 32;
+		const d = c >= 48 && c <= 57 ? c - 48 : lower >= 97 && lower <= 122 ? lower - 87 : -1;
 		// `>=`, not `>`: a digit equal to the radix is out of range, and `> radix` let 'a' (10) through
 		// for radix 10, so `Number('abc')` parsed as 10 instead of NaN.
 		if (d < 0 || d >= radix) {
@@ -258,10 +257,23 @@ export class Number {
 
 	// Leading whitespace is skipped by both, per JS. Only here, not inside `getInt`/`getFloat`
 	// themselves -- `getInt` also reads a float's exponent, where `1e 5` is not `1e5`.
-	static parseInt(s: string, radix = 10): number {
+	// An omitted or 0 radix is 10, or 16 after a `0x` prefix (which radix 16 also accepts); one outside 2..36 is NaN.
+	static parseInt(s: string, radix?: number): number {
 		const p = new StringParser(s);
 		p.skipWhitespace();
-		return getInt(p, radix);
+		const sign = getSign(p);
+		let r = radix ? Math.trunc(radix) : 0;
+		if ((r === 0 || r === 16) && p.code() === 48 && p.pos + 1 < p.n && (p.str.charCodeAt(p.pos + 1) | 32) === 120) {
+			p.pos += 2;
+			r = 16;
+		}
+		if (r === 0)
+			r = 10;
+		if (r < 2 || r > 36)
+			return NaN;
+		const pos = p.pos;
+		const value = getUnsigned(p, r);
+		return p.pos === pos ? NaN : sign * value;
 	}
 
 	static parseFloat(str: string): number {
@@ -582,3 +594,7 @@ export class Math {
 	}
 
 }
+
+// The global functions JS defines as the same functions as `Number`'s.
+export function parseInt(s: string, radix?: number): number	{ return Number.parseInt(s, radix); }
+export function parseFloat(s: string): number				{ return Number.parseFloat(s); }
