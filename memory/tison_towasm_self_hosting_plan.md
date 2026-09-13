@@ -2062,6 +2062,26 @@ two physical forms of one value, with no aliasing-preserving conversion between 
 per argument (the comment says that left structs nothing could convert between), or represent every array reached
 through an erased type parameter as ref-kind at the use site too.
 
+**Batch 8-9 (2026-09-13, after the user's printer/walker rename)**. The `bindPattern` chain continued: a conditional
+receiver for a `this`-reassigning method (`(done ? returns : yields).push(v)`, 4a311ff); `never` read through `as any`
+(tocode/printer's `(type as any).type` in an exhausted `default:`, f358e24); a nested function naming ITSELF as a value
+(checker.ts `typeOf`'s `recurse`, captured by arrows inside it, f6f8c23) and SIBLING nested functions calling each other
+(`recurse`/`recurseUncached`, through the forward holder a `var_decl` already gets, 08ce7be); a tuple indexed by a
+COMPUTED number reading `T[number]` (1af30b9, the checker: towasm's desugared `for...of` indexes its source, so every
+element of a tuple source was `any`).
+**Two regressions I introduced and caught late**:
+1. `a82ad89` had replaced `?? default` with a LENGTH test in BOTH array-pattern lowerings. Neither is JS -- a default
+applies where the element is `undefined` (past the end or present as `undefined`), never for `null` -- and test-vsdg had
+been failing since, because I never ran it. Fixed in e789767. **Run test-vsdg (and the parser tests) too, not just
+towasm/checker/gate/difftest.**
+2. The self-name binding broke `function typeArgs(typeArgs?: Type[])` (printer.ts): the parameter SHADOWS the function
+name, so the extra local collided -- 46 survey blocks. Fixed by skipping the binding where the body re-binds the name
+(18a81b4). **A name-based mention test must respect shadowing.**
+**Representation rule learnt (9655eca)**: `i32` is the storage for both `boolean` and a compact integer `number`, so
+`emitAs` asks the checker which it is when BOXING (a number converts to `f64` first). Nothing mirrored that when
+UNboxing, so a numeric LITERAL type -- which has compact integer storage -- stored an f64 box and read an i32 box back:
+"illegal cast". Both directions now use the same test.
+
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
 my own grep filter (`grep -v 'free=\[\]'`) hid the decisive log line for three rounds: when a probe prints
