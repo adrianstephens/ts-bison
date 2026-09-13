@@ -9494,7 +9494,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						return;
 					}
 					const wtype = cls.fields[cls.fieldIndex.get(field)!].wtype;
-					const local = ctx.declareLocal(`$field$${field}`, wtype);
+					// An optional field already holds its seeded default, and a field may be assigned twice before `this` exists: one local.
+					const local = values.get(field) ?? ctx.declareLocal(`$field$${field}`, wtype);
 					emitAs(value, ctx, wtype);
 					ctx.emit(I.local.set(local.index));
 					values.set(field, local);

@@ -7006,6 +7006,20 @@ async function main() {
 	}
 
 	{
+		// An optional parameter property in a constructor that collects its fields first (an object-typed field forces that):
+		// its seeded default and its assignment are one local (type-utils.ts's `Scope`).
+		const { paramPropOptional } = await compile(`
+			class S {
+				private values = new Map<string, number>();
+				constructor(public parent?: S, private tag?: string) {}
+				depth(): number { return this.parent ? this.parent.depth() + 1 : 0; }
+			}
+			export function paramPropOptional(): number { const a = new S(); const b = new S(a, 'x'); return b.depth() * 10 + a.depth(); }
+		`);
+		check('paramPropOptional()', paramPropOptional(), 10);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {
