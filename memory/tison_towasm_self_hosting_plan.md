@@ -2026,6 +2026,15 @@ Survey after these: 87/334, no new ERR rows; `only direct calls` 22 and `closure
 declarations moved on to `unknown field 'type'` 20 and the object-literal row, 2 -> 23). The skipped `JSON.parse` row now
 reads `unresolved identifier 'JSON'` 26. Next found: `TS.CallSig(...)` (ts-parser `export const CallSig = JS.CallSig<Type>`)
 is a namespace member that is a VALUE, and the call path only took function declarations; global `parseInt` is missing.
+Both fixed (7aea4bc, bb2e816); their blocks moved on to the object-literal row (23 -> 33) and `Terminal<any>` (1 -> 12).
+**Lib-fidelity gap, OPEN (a design question)**: type-utils.ts 3260 `(this.aliases ??= new Map()).set(d.name, d.init)` is 2
+checker ERRs, false positives: TS's lib types a no-argument `new Map()` as `Map<any, any>` (MapConstructor's non-generic
+`new ()` overload, lib.es2015.collection.d.ts:50), so tsc accepts it; towasm's lib `Map` is a generic CLASS, which cannot
+express that overload, so the checker infers `Map<string, Expr>` from the context. Wherever the towasm lib's declared
+shape diverges from TS's lib, tsc-clean code gets checker errors.
+Closure signatures kept the rest out of `resolvedParams` (it lived only as `restElem`), while `emitCallArgs` reads the
+rest's type at `resolvedParams[fixedCount]`, as compiled functions store it: a literal argument against a union-of-tuples
+rest (js-parser.ts `CallSigParams<T>`, via `TS.CallSig({params, rest})`) had no target type through a closure call.
 
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
