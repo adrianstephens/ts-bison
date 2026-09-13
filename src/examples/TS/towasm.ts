@@ -3210,6 +3210,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// candidate's own declared field *types* instead of an expression's actual property *values* --
 	// ambiguous or partial (a computed/non-string key, or a non-property member) cases return
 	// `undefined`, never a guess.
+	let matchingShape = false;
 	function matchObjectShapeByType(t: TS.ObjectType): ClassInfo | undefined {
 		const props = new Map<string, Type>();
 		for (const m of t.members) {
@@ -3222,13 +3223,24 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// The field TYPES must agree too, not just their names: `NodeMap<Obj>`'s `values` is a mapper `(x: number[]) => number[]`
 		// where `Obj`'s own is `number[]` -- the same names, an unrelated shape, and the literal then built against the wrong one.
 		// Compared physically and tolerantly (nullability aside, a boxed `any` fits anything), since that is what a value of this
-		// shape must actually be stored as.
+		// shape must actually be stored as. Each property's own type is asked for ONCE, not once per candidate, and not at all
+		// while this is already running for an outer shape: `typeOf` builds shapes, which lands back here.
 		const sameKind = (a: WasmType, b: WasmType) => wasmTypeEq(a, b)
 			|| (typeof a !== 'string' && typeof b !== 'string' && wasmTypeEq({ ...a, nullable: false } as WasmType, { ...b, nullable: false } as WasmType))
 			|| [a, b].some(w => typeof w !== 'string' && 'ref' in w && w.ref === 'any');
+		const propWtypes = matchingShape ? undefined : new Map<string, WasmType | undefined>();
+		if (propWtypes) {
+			matchingShape = true;
+			try {
+				for (const [k, pt] of props)
+					propWtypes.set(k, typeOf(pt));
+			} finally {
+				matchingShape = false;
+			}
+		}
 		const candidates = [...new Set(classes.values())].filter(cls =>
 			cls.typeIndex !== -1 && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
-			&& [...props].every(([k, pt]) => { const w = typeOf(pt); return !w || sameKind(w, cls.fields[cls.fieldIndex.get(k)!].wtype); })
+			&& [...props.keys()].every(k => { const w = propWtypes?.get(k); return !w || sameKind(w, cls.fields[cls.fieldIndex.get(k)!].wtype); })
 		);
 		if (candidates.length === 1)
 			return candidates[0];
