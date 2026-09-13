@@ -1840,8 +1840,8 @@ was the bug. **Log the layout, not just the key.** `SHAPELOG`-style `process.env
 towasm.ts is fine for probing but MUST be removed before surveying (this file's own toggle trap).
 
 **The one regression (`patternBindings`) is RESOLVED** by removing the marker that caused it -- it was
-behaviour-identical (see [[tison-scope-stamping]]). The towasm gap it exposed is real and still OPEN,
-just no longer exercised here: `unknown field 'synthetic'` for an expando write reached through a generic
+behaviour-identical (see [[tison-scope-stamping]]). The towasm gap it exposed -- now COVERED by the receiver analysis below --
+was: `unknown field 'synthetic'` for an expando write reached through a generic
 type parameter (`markSynthetic<S extends Stmt>(s: S)`, a union whose members are all generic refs).
 Three fixes TRIED AND INSUFFICIENT, each reverted (do not retry these blind):
 - resolving each union member as well in the expando-discovery `note` pass, to reach `S`'s constraint;
@@ -1891,10 +1891,31 @@ name was FOUND in -- for an `NS.name` read, the declaring module's EXPORT scope,
 imports -- so type-utils.ts's `ANY = TS.RefType('any')` could not see `TS`. `lazyGlobalFor` now compiles it in
 `moduleScopeOf(homeModule)`, the scope the module's functions already compile in.
 
-**Next rows** (75/328): `unknown method 'parse'` 22; `only direct calls to named functions...` 21; `unknown
-field 'pos'` 19 (checker.ts, e.g. :2753 `(stmt as any).pos` -- the parser's position stamp read through
-`as any`); `indexing is only supported on number[]/...` 19; `internal: cannot convert arr:ref:true to i32`
-18 (type-utils; the probe prints NO position -- needs a trace); `param 'value' needs an explicit type` 17.
+## Expandos through untyped receivers -- `collectReceivedExpandos` (2026-09-13)
+
+`unknown field 'pos'` 19 -> 0. Position stamping writes `pos` onto a receiver typed `T`/`any`
+(`stampPos<T>`, installed as every parser's rule action; `mapObject`'s `r`; checker.ts's `at<N>`), which names
+no struct, so discovery gave no struct the slot. The pre-pass now follows such a receiver BACKWARDS to its
+sources: parameter -> callers' args, local -> assigned values, call -> callees' returns, ternary/logical ->
+both sides, object spread -> source, with FUNCTION VALUES tracked to a fixpoint (the stamper is passed as a
+value and called through a parameter). Structural shapes' expandos are keyed by member names (`shapeKey`),
+not name, so a named interface and its anonymous twin keep one layout; classes stay by name. `defineProperty`
+on an erased receiver lowers to the dynamic field write. The user's framing that made it tractable: a function
+that stamps its own parameter makes that parameter "receive" the key, inductively through callers.
+- **Known holes (runtime, not compile-time)**: trails ending at a value typed `any` (~70 for `pos`) and function
+  values stored into object/array fields are not followed; a stamp reaching one hits the dynamic write's
+  `unreachable`. The survey cannot see this -- it only compiles.
+- **Found, separate, OPEN**: the intrinsic `object` type has no wasm representation (`<T extends object>`
+  erased to its bound throws "'object' has no representation"); it should be a non-null `anyref`.
+- **Trap**: fixing a blocker can make a shared MODULE-LEVEL blocker absorb many declarations -- the
+  object-literal row went 0 -> 34 with declarations moving from unrelated causes. That looked like a
+  regression; an A/B (propagation switched off) showed it was only blocker ORDER. A/B before calling it one.
+
+**Next rows** (75/329): `an object literal needs a known target type` 34 -- almost all checker.ts's
+module-level `ANY_FUNCTION = TS.FunctionType({ params: [], rest: ... }, T.ANY)` (:232): `{params, rest}` matches
+both `Params` and `CallSig` and nothing distinguishes them, so the literal should take `FunctionType`'s declared
+parameter type as its target; `unknown method 'parse'` 23; `only direct calls to named functions...` 21;
+`indexing is only supported on number[]/...` 18; `internal: cannot convert arr:ref:true to i32` 18.
 
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
