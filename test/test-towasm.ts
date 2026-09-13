@@ -7052,6 +7052,29 @@ async function main() {
 	}
 
 	{
+		// A struct passed where the parameter is a DIFFERENT, structural type it does not subtype: the callee is monomorphized per
+		// argument type (common.ts `hasMod(e: {modifiers?: string[]}, m)` called with a `Param`), and gets the same object.
+		const { structuralParam } = await compileMulti({
+			common: `
+				export function hasMod(e: { modifiers?: string[] }, m: string): boolean { return !!e.modifiers?.includes(m); }
+				export function addMod(e: { modifiers?: string[] }, m: string): void { (e.modifiers ??= []).push(m); }
+			`,
+			main: `
+				import { hasMod, addMod } from './common';
+				interface Param { key: string; modifiers?: string[] }
+				interface Field { name: string; size: number; modifiers?: string[] }
+				export function structuralParam(): number {
+					const p: Param = { key: 'a', modifiers: ['optional'] };
+					const f: Field = { name: 'b', size: 2 };
+					addMod(f, 'readonly');
+					return (hasMod(p, 'optional') ? 1 : 0) + (hasMod(f, 'readonly') ? 10 : 0) + (hasMod(p, 'x') ? 100 : 0) + (f.modifiers!.length * 1000);
+				}
+			`,
+		}, 'main');
+		check('structuralParam()', structuralParam(), 1011);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

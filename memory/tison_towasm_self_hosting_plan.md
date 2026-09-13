@@ -1992,6 +1992,12 @@ Unary `+` on a string lowers to `Number(s)` (e40b3f4, 40 blocks). TRIED AND REMO
 number[]` traps (illegal cast). The any-METHOD dispatch (`findAnyDispatchCandidates`) only takes ZERO-arg methods and
 skips array-backed owners; the general fix is a dynamic call convention with arguments -- the same design as item 4.
 
+**User decisions, 2026-09-13**: (1) calls on `any`/`unknown` values (item 4 and the args-taking method case) get a
+DYNAMIC CALL CONVENTION: boxed args to a per-(name, arity) dispatch that type-tests the value's physical type against
+every reachable class (arrays by element kind too) and closure type, adapting args per candidate and boxing the result.
+(2) a named struct passed where a STRUCTURAL type is expected: MONOMORPHIZE the callee per concrete argument struct type,
+as generics already are (direct field reads, same object, mutations visible).
+
 **Next rows** (86/331): `cannot convert ref:Param to
 ref:{...}` 23 -- a NAMED struct passed where a STRUCTURAL type is expected (`hasMod(p, 'optional')`, param `{modifiers?:
 string[]}`): towasm has no struct -> structural-supertype conversion, a representation design question for the user;

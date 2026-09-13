@@ -852,6 +852,11 @@ function unwrapAs(e: Expr): Expr {
 	return e;
 }
 
+// An identifier, `this`, or a non-optional member chain of one: reading it again has no side effect.
+function isPurePath(e: Expr): boolean {
+	return e.type === 'identifier' || e.type === 'this' || (e.type === 'member' && !e.optional && isPurePath(e.object));
+}
+
 // Whether expression tree `e` references identifier `name` anywhere, not descending into a nested
 // arrow/function's own body (closure boundary) -- same idiom as the named-function self-reference
 // check a few hundred lines down (`e.type === 'identifier' && e.name === selfName`).
@@ -4458,6 +4463,33 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 	}
 
+	// A struct argument where the parameter is a DIFFERENT struct it does not subtype (`hasMod(e: {modifiers?: string[]})` given
+	// a `Param`): TS accepts it structurally and no conversion exists between two unrelated structs, so the callee is compiled
+	// once per concrete argument type, as a generic is. The same object goes in, not a copy.
+	function ensureStructuralInstance(name: string, decl: FunctionDecl, args: Expr[], ctx: FunctionContext, homeModule: string): FuncInfo | undefined {
+		if (!decl.body)
+			return undefined;
+		let changed = false;
+		const params = decl.params.map((p, i) => {
+			const arg = args[i];
+			// A literal is built AS the parameter's type (its context), and an index-signature parameter is a dynamic object read
+			// by key: neither is a struct to specialize for.
+			if (!arg || arg.type === 'spread' || arg.type === 'object' || arg.type === 'array' || !p.typeAnnotation
+				|| indexSignatureValueType(T.resolve(global, p.typeAnnotation)))
+				return p;
+			const want = typeOf(p.typeAnnotation), got = wtypeOf(arg, ctx);
+			if (!want || !got || typeof want === 'string' || typeof got === 'string' || !('ref' in want) || !('ref' in got)
+				|| want.ref === got.ref || want.ref === 'any' || got.ref === 'any' || isSubclassOf(got.ref, want.ref))
+				return p;
+			changed = true;
+			return { ...p, typeAnnotation: narrowedTypeOf(arg, ctx) };
+		});
+		if (!changed)
+			return undefined;
+		const key = `${name}#struct<${params.map(p => p.typeAnnotation ? T.typeKey(p.typeAnnotation) : '_').join(',')}>`;
+		return funcs.get(homeKey(homeModule, key)) ?? compileFunc(key, { ...decl, params }, homeModule, name);
+	}
+
 	// Dispatches every `builtins` entry, coercing args via `emitAs`; falls back to `ensureFunc` for a plain user-declared function not in `builtins` at all.
 	// `typeArgs`: only ever meaningful for a plain user-declared generic function (`builtins` entries and
 	// host imports are never generic) -- an explicit `identity<number>(5)` call-site type argument list, or
@@ -4514,7 +4546,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const info = decl
 			? (decl.typeParams?.length
 				? ensureGenericFunc(name, decl, args, typeArgs, ctx.scope, expected, homeModule)
-				: ensureFunc(name, decl, homeModule))
+				: ensureStructuralInstance(name, decl, args, ctx, homeModule) ?? ensureFunc(name, decl, homeModule))
 			: funcs.get(name);
 		if (!info)
 			throw `call to unknown function '${name}'`;
@@ -4935,6 +4967,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// `wtype` -- the value on the stack was already coerced to it by the caller (`emitAssign`'s `emitAs(right, ctx, target.wtype)` or its compound-op equivalent), so no extra conversion belongs here.
 				write: makeWrite(wtype, val => ctx.emit(I.local.get(obj), I.local.get(idx), I.local.get(val), I.array.set(typeIndex))),
 			};
+		} else if (target.type === 'assign' && isPurePath(target.target)) {
+			// `(a.b ??= []).push(x)`: the assignment runs first, and its own target is where a write-back goes (a wasm array's
+			// `push` builds a new one). Only for a target without side effects, which is read again rather than held.
+			emitStmt({ type: 'expression', expression: target }, ctx);
+			const inner = emitAssignTarget(target.target, ctx, old);
+			// The kept value is the assignment's result, non-null when that is (`??=`), though its slot may be nullable.
+			const result = wtypeOf(target, ctx);
+			if (old === 'keep' && typeof inner.wtype !== 'string' && inner.wtype.nullable && result && typeof result !== 'string' && !result.nullable)
+				ctx.emit(I.ref.as_non_null);
+			return inner;
 		} else {
 			throw `cannot assign to ${target.type}`;
 		}
