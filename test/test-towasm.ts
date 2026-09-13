@@ -6686,6 +6686,25 @@ async function main() {
 	}
 
 	{
+		// A field written through `as any` on a union receiver (checker.ts's `(s as any).scope ??= scope`) is an
+		// expando that may never have been set: it reads back `undefined` until written, and `??=` keeps the first.
+		const { expandoNullishAssign } = await compile(`
+			interface A { kind: "a" }
+			interface B { kind: "b" }
+			function stamp(x: A | B, v: string): string { (x as any).tag ??= v; return (x as any).tag as string; }
+			export function expandoNullishAssign(): number {
+				const a: A = { kind: "a" };
+				const b: B = { kind: "b" };
+				const absent = (b as any).tag === undefined ? 100 : 0;
+				const first = stamp(a, "xy");
+				const second = stamp(a, "zzz");
+				return absent + first.length * 10 + second.length;
+			}
+		`);
+		check('expandoNullishAssign()', expandoNullishAssign(), 122);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

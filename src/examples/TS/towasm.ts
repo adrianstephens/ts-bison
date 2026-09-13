@@ -4660,9 +4660,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if ([...classes.values()].some(c => c.fieldIndex.has(prop) && c.typeIndex !== -1)) {
 					const dispatch = ensureAnyFieldWrite(prop, ctx);
 					return {
-						wtype: REF_ANY,
-						old: captureOld(REF_ANY, () => { emitAs(target.object, ctx, REF_ANY); ctx.emit(I.call(ensureAnyField(prop, ctx).funcIndex)); }),
-						write: makeWrite(REF_ANY, val => {
+						wtype: REF_ANY_NULLABLE,
+						old: captureOld(REF_ANY_NULLABLE, () => { emitAs(target.object, ctx, REF_ANY); ctx.emit(I.call(ensureAnyField(prop, ctx).funcIndex)); }),
+						write: makeWrite(REF_ANY_NULLABLE, val => {
 							emitAs(target.object, ctx, REF_ANY);
 							ctx.emit(I.local.get(val), I.call(dispatch.funcIndex));
 						}),
@@ -5522,7 +5522,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (T.isAny(T.resolveOwn(narrowedTypeOf(e.object, ctx), ctx.typeScope))) {
 						emitAs(e.object, ctx, REF_ANY);
 						ctx.emit(I.call(ensureAnyField(e.property, ctx).funcIndex));
-						return REF_ANY;
+						return REF_ANY_NULLABLE;
 					}
 					throw `unknown field '${e.property}'`;
 				}
@@ -9413,13 +9413,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (existing)
 			return existing;
 
-		const { funcIndex, typeIndex } = registerFunc(toParams2([{key: 'recv', wtype: REF_ANY, tsType: T.ANY}]), toResults(REF_ANY));
-		const info: FuncInfo = { params: [REF_ANY], result: REF_ANY, funcIndex, typeIndex };
+		// A field that was never written reads `undefined`, so the result is nullable -- as `any` itself is.
+		const { funcIndex, typeIndex } = registerFunc(toParams2([{key: 'recv', wtype: REF_ANY, tsType: T.ANY}]), toResults(REF_ANY_NULLABLE));
+		const info: FuncInfo = { params: [REF_ANY], result: REF_ANY_NULLABLE, funcIndex, typeIndex };
 		anyFieldFuncs.set(name, info);
 		funcs.set(`<any field>.${name}`, info);
 
 		lateWorklist.push(() => {
-			const dctx = new FunctionContext(`field_${name}`, new Scope(libGlobal), plainReturn(REF_ANY), undefined);
+			const dctx = new FunctionContext(`field_${name}`, new Scope(libGlobal), plainReturn(REF_ANY_NULLABLE), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY);
 
 			// Deduped by physical HEAP type, not by `ClassInfo` -- several owners can share one, and a
@@ -9434,7 +9435,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					seen.add(heap);
 					candidates.push({ cls, heap, read: () => {
 						dctx.emit(I.struct.get(cls.typeIndex, idx));
-						coerceTop(cls.fields[idx].wtype, dctx, REF_ANY);
+						coerceTop(cls.fields[idx].wtype, dctx, REF_ANY_NULLABLE);
 					} });
 				} else if (cls.getterNames?.has(name)) {
 					const sig = methodSig(cls, accessorKey('get', name), dctx);
@@ -9453,7 +9454,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						candidates.push({ cls, heap, read: () => {
 							emitMethodCall(cls, accessorKey('get', name), [], dctx);
 							coerceTop(sig.result, dctx, want);
-							coerceTop(want, dctx, REF_ANY);
+							coerceTop(want, dctx, REF_ANY_NULLABLE);
 						} });
 					}
 				}
@@ -9500,7 +9501,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const _cond = dctx.swapOut();
 				dctx.emit(I.local.get(recv.index), I.ref.cast(c.heap));
 				c.read();
-				return [..._cond, I.if(toValType(REF_ANY), dctx.swapOut(), buildArm(i + 1))];
+				return [..._cond, I.if(toValType(REF_ANY_NULLABLE), dctx.swapOut(), buildArm(i + 1))];
 			}
 			dctx.emit(...buildArm(0));
 			info.body = dctx.toFuncBody(1, toValType);
@@ -9520,16 +9521,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		const { funcIndex, typeIndex } = registerFunc(toParams2([
 			{ key: 'recv', wtype: REF_ANY, tsType: T.ANY },
-			{ key: 'value', wtype: REF_ANY, tsType: T.ANY },
+			{ key: 'value', wtype: REF_ANY_NULLABLE, tsType: T.ANY },
 		]), toResults('void'));
-		const info: FuncInfo = { params: [REF_ANY, REF_ANY], result: 'void', funcIndex, typeIndex };
+		const info: FuncInfo = { params: [REF_ANY, REF_ANY_NULLABLE], result: 'void', funcIndex, typeIndex };
 		anyFieldWriteFuncs.set(name, info);
 		funcs.set(`<any field write>.${name}`, info);
 
 		lateWorklist.push(() => {
 			const dctx	= new FunctionContext(`field_set_${name}`, new Scope(libGlobal), plainReturn('void'), undefined);
 			const recv	= dctx.declareLocal('$recv', REF_ANY);
-			const value	= dctx.declareLocal('$value', REF_ANY);
+			const value	= dctx.declareLocal('$value', REF_ANY_NULLABLE);
 
 			const seen = new Set<wasm.HeapType>();
 			const candidates: { heap: wasm.HeapType; typeIndex: number; index: number; wtype: WasmType }[] = [];
@@ -9552,7 +9553,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				dctx.emit(I.local.get(recv.index), I.ref.test(c.heap));
 				const _cond = dctx.swapOut();
 				dctx.emit(I.local.get(recv.index), I.ref.cast(c.heap), I.local.get(value.index));
-				coerceTop(REF_ANY, dctx, c.wtype);
+				coerceTop(REF_ANY_NULLABLE, dctx, c.wtype);
 				dctx.emit(I.struct.set(c.typeIndex, c.index));
 				return [..._cond, I.if(undefined, dctx.swapOut(), buildArm(i + 1))];
 			}
