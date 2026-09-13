@@ -7234,6 +7234,21 @@ async function main() {
 	}
 
 	{
+		// A tuple's members are `Array`'s, since it is physically one (`args.length` in js-parser.ts `JS.CallSig`): a tuple local,
+		// a string tuple, a tuple rest, and a rest typed by a union of tuples.
+		const { tupleLength } = await compile(`
+			function lenRest(...args: [number, string]): number { return args.length; }
+			function lenUnion(...args: [number] | [number, number]): number { return args.length; }
+			export function tupleLength(): number {
+				const t: [number, string] = [1, 'a'];
+				const s: [string, string] = ['x', 'y'];
+				return t.length + lenRest(1, 'a') * 10 + lenUnion(1, 2) * 100 + lenUnion(3) * 1000 + s.length * 10000;
+			}
+		`);
+		check('tupleLength()', tupleLength(), 21222);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

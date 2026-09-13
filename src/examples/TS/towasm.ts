@@ -416,6 +416,7 @@ interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
 interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number; sig: FuncSig }
+type TupleT = Extract<Type, { type: 'tuple' }>;
 // A function value's own properties that its closure struct stores, by field index (after `code` and `env`).
 const CLOSURE_FIELDS = new Map([['length', 2]]);
 
@@ -3296,6 +3297,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return t.types.find(p => PRIMITIVE_TAGS.has(T.typeofName(p, global) ?? ''));
 	}
 
+	// A tuple is physically `arr:ref` whatever its elements (`wasmTypeOf`), so its owner is `Array` over a ref-kind element:
+	// the union of every position when that is one, else `any` (`[number, number]` would otherwise name `arr:f64`).
+	function tupleArrayOwner(tuples: TupleT[]): ClassInfo | undefined {
+		const el = T.combineTypes(tuples.flatMap(tu => tu.elements.map(x => T.tupleElementType(x) ?? T.ANY)));
+		const wt = typeOf(TS.ArrayType(el));
+		return ensureClass('Array', [wt && typeof wt !== 'string' && 'arr' in wt && wt.arr === 'ref' ? el : T.ANY]);
+	}
+
 	function ownerFor(t: Type): ClassInfo | undefined {
 		// Same fast path `wasmTypeOf` needs, for the same reason -- a hoisted `builtinTypes` name would
 		// otherwise fully expand via its own `declScope` before reaching the `w.type === 'ref'` check below.
@@ -3339,12 +3348,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		switch (w.type) {
 			case 'union': {
 				const nonNullish = T.nonNullable(w, global);
-				return nonNullish !== w ? ownerFor(nonNullish) : undefined;
+				if (nonNullish !== w)
+					return ownerFor(nonNullish);
+				// A union of tuples (js-parser.ts `CallSigParams<T>`, a rest's type) is one `arr:ref` whichever member it is.
+				const members = T.unionMembers(w, global).map(m => T.resolve(global, m));
+				return members.every(m => m.type === 'tuple') ? tupleArrayOwner(members as TupleT[]) : undefined;
 			}
 			case 'array':
 				// `T[]`/`Array<T>`/`ReadonlyArray<T>` all resolve to `Array`'s own methods -- `ReadonlyArray` has no
 				// separate lib declaration, it's a checker-only "readonly view" of the same structural shape.
 				return ensureClass('Array', [w.element]);
+			case 'tuple':
+				return tupleArrayOwner([w]);
 
 			case 'ref': {
 				const mutable = READONLY_ALIAS.get(w.name);
