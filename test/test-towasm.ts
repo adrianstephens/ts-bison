@@ -6994,6 +6994,18 @@ async function main() {
 	}
 
 	{
+		// `typeof x` as a VALUE when the type allows several tags: tested at run time, one tag after another (type-utils.ts
+		// `typeofName`'s `typeof r.value`). A null slot is 'object' when the type admits null and not undefined.
+		const { typeofValue } = await compile(`
+			function tag(v: string | number | boolean | null): string { return typeof v; }
+			export function typeofValue(): number {
+				return (tag('a') === 'string' ? 1 : 0) + (tag(1) === 'number' ? 10 : 0) + (tag(true) === 'boolean' ? 100 : 0) + (tag(null) === 'object' ? 1000 : 0);
+			}
+		`);
+		check('typeofValue()', typeofValue(), 1111);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

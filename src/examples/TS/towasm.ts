@@ -3952,6 +3952,41 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return false;
 	}
 
+	// `typeof x` as a VALUE when its type allows several tags: the operand is held once, then each tag that type allows is
+	// tested (`emitTypeofTest`), 'object' last and untested, being the complement. A null slot is `null` or `undefined` by the
+	// type alone -- the two share one representation -- so a type admitting both cannot be answered.
+	function emitTypeofValue(operand: Expr, ctx: FunctionContext): WasmType {
+		const t			= checkerTypeOf(unwrapAs(operand), ctx.scope);
+		const members	= T.unionMembers(t, ctx.scope);
+		const hasNull	= members.some(m => T.isLiteral(m, 'null') || T.isRef(m, 'null'));
+		if (hasNull && members.some(m => T.isRef(m, 'undefined') || T.isRef(m, 'void')))
+			throw `'typeof' of '${T.typeKey(t)}': null and undefined share one representation here, so a null slot cannot be told apart`;
+		const ALL		= ['undefined', 'number', 'boolean', 'string', 'bigint', 'function', 'object'];
+		const named		= members.map(m => T.isNullish(m, ctx.scope) ? (hasNull ? 'object' : 'undefined') : T.typeofName(m, ctx.scope));
+		const tags		= named.some(n => n === undefined) ? ALL : ALL.filter(tag => named.includes(tag));
+		const held		= `#typeof$${optionalTempCounter++}`;
+		emitStmt(JS.VarDecl('const', JS.Var(held, operand, t)), ctx);
+		const id: Expr	= { type: 'identifier', name: held };
+		const str		= typeOf(T.STRING)!;
+		const cascade = (i: number): void => {
+			const tag = tags[i];
+			if (i === tags.length - 1) {
+				emitAs(Literal(tag), ctx, str);
+				return;
+			}
+			// A null slot is tested by `emitTypeofTest('undefined')`; its tag is the type's own null tag.
+			if (!emitTypeofTest(id, tag === 'object' && hasNull ? 'undefined' : tag, ctx))
+				throw `'typeof' of '${T.typeKey(t)}' cannot be told apart at run time (tag '${tag}')`;
+			const _old = ctx.swapOut();
+			emitAs(Literal(tag), ctx, str);
+			const _then = ctx.swapOut();
+			cascade(i + 1);
+			ctx.emit(I.if(toValType(str), _then, ctx.swapOut(_old)));
+		};
+		cascade(0);
+		return str;
+	}
+
 	// True when a value of this type is truthy whenever it is non-null -- an object, an array, a tuple, a
 	// function. Never a `string` (`''` is falsy), a `number` (`0`, `NaN`), a `boolean`, a literal, or a
 	// genuinely dynamic `any`/type parameter, for all of which truthiness is a property of the VALUE.
@@ -6113,9 +6148,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 				}
 
-				// A bare `typeof x` as a VALUE -- answerable only when the checker's type gives every
-				// inhabitant the same tag; a genuinely dynamic one would need a real runtime cascade
-				// producing a string, which nothing in the target set actually asks for.
+				// A bare `typeof x` as a VALUE: the tag itself when the checker's type gives every inhabitant the same one, else a
+				// run-time cascade over the tags its type allows (`emitTypeofValue`).
 				if (e.operator === 'typeof') {
 					const known = T.typeofName(checkerTypeOf(unwrapAs(e.operand), ctx.scope), ctx.scope);
 					if (known !== undefined) {
@@ -6123,6 +6157,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							ctx.emit(I.drop);
 						return emitExpr(Literal(known), ctx, want);
 					}
+					return emitTypeofValue(e.operand, ctx);
 				}
 
 				// `!x` is exactly "is x falsy", so it answers for every operand shape `emitTruthy` understands
