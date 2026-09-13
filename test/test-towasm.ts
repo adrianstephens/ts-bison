@@ -7260,6 +7260,21 @@ async function main() {
 	}
 
 	{
+		// A closure literal's default is applied in the callee (checker.ts's `(e, scope, expected?, widen = true) => ...` as a
+		// `typeOf` whose `widen?: boolean` callers omit): its slot is the function type's optional one, called either way.
+		const { closureDefaultOptional } = await compile(`
+			type TO = (e: number, scope: string, expected?: number, widen?: boolean) => number;
+			function use(f: TO): number { return f(1, 'a') + f(2, 'b', 3, false) * 10; }
+			export function closureDefaultOptional(): number {
+				const local = (a: number, b = 5) => a + b;
+				return use((e: number, scope: string, expected?: number, widen = true) => (widen ? 100 : 0) + e + (expected ?? 0))
+					+ local(1) * 1000 + local(1, 2) * 10000;
+			}
+		`);
+		check('closureDefaultOptional()', closureDefaultOptional(), 36151);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

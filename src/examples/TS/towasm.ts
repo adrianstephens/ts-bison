@@ -5136,7 +5136,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const params = ownParams.map((p, i): ResolvedParam => {
 			if (p.default) {
 				const fromWant = p.typeAnnotation ? undefined : wantParam(i);
-				return noteEarlier(p, resolveParam(fromWant ? { ...p, typeAnnotation: fromWant.tsType } : p, earlier, defaultScope));
+				// Called through the wanted type: where its slot is optional, an omitted argument arrives as `undefined` (checker.ts's
+				// `widen = true` as a `typeOf`'s `widen?: boolean`), so the literal applies its own default.
+				const slot = i < fixedCount ? wantSig?.params[i] : undefined;
+				return noteEarlier(p, resolveParam(fromWant ? { ...p, typeAnnotation: fromWant.tsType } : p, earlier, defaultScope, !!slot && typeof slot !== 'string' && !!slot.nullable));
 			}
 			// An UNANNOTATED parameter takes the callee's declared one, for the same reason `result` does
 			// above -- `Rules<T>(self => [...])` and every `Rule([...], $ => ...)` can name it no other way.
@@ -5216,7 +5219,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}) } });
 		}
 
-		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length, defaults: defaultsWithImplicitUndefined(ownParams), resolvedParams: params };
+		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length, defaults: ownParams.map((p, i) => params[i].calleeDefault || (!p.default && hasMod(p, 'optional')) ? { type: 'identifier', name: 'undefined' } as Expr : p.default), resolvedParams: params };
 		// Captured now: the body compiles later, once this literal's own context (`Rule<CallSig>`'s action) is gone.
 		// The checker's own contextual type wins: it saw the chosen OVERLOAD, where `ctx` only has the implementation's.
 		const contextFn		= (e as { contextualType?: Type }).contextualType ?? ctx.contextualReturn;
@@ -8076,9 +8079,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// referencing default (`isReemittableDefault`) and, when the default itself has no explicit type
 	// annotation, to infer its type against a scope that actually has those earlier parameters declared
 	// (plain `libGlobal` can't see them at all -- they're this function's own locals, not global names).
-	function resolveParam(p: JS.Param<Type>, earlierNames?: ReadonlySet<string>, scope: Scope = libGlobal): ResolvedParam {
+	function resolveParam(p: JS.Param<Type>, earlierNames?: ReadonlySet<string>, scope: Scope = libGlobal, calleeOnly = false): ResolvedParam {
 		let tsType = p.typeAnnotation;
-		const calleeSide = !!p.default && !isReemittableDefault(p.default, earlierNames);
+		const calleeSide = !!p.default && (calleeOnly || !isReemittableDefault(p.default, earlierNames));
 		if (p.default)
 			tsType ??= checkerTypeOf(p.default, scope);
 		if (!tsType)
