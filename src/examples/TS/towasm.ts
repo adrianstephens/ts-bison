@@ -5242,10 +5242,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 			// An UNANNOTATED parameter takes the callee's declared one, for the same reason `result` does
 			// above -- `Rules<T>(self => [...])` and every `Rule([...], $ => ...)` can name it no other way.
-			const ctx = p.typeAnnotation ? undefined : wantParam(i);
+			// An annotation the checker wrote back names types from the SIGNATURE's own module (printer.ts's `m` over `stmt.body` is
+			// annotated `ClassMember<Type>`, js-parser's), which need not resolve here -- the wanted signature is the physical truth.
+			const annotated = p.typeAnnotation && typeOf(p.typeAnnotation);
+			const ctx = annotated ? undefined : wantParam(i);
 			// See `closureFuncSigType`'s own identical comment -- box a real but wasm-unrepresentable
 			// `void` as `any` rather than reject otherwise-valid source.
-			const wt = p.typeAnnotation ? typeOf(p.typeAnnotation) : ctx?.wtype;
+			const wt = annotated || ctx?.wtype;
 			const boxed = wt === 'void' ? REF_ANY : wt;
 			if (!boxed)
 				throw `closure parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
@@ -5255,7 +5258,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// this literal), since nothing ever calls this literal's own compiled function directly while
 			// skipping an argument; `call_ref` always supplies a real value for every physical param.
 			// The type widens with the slot, as `resolveParam`'s does: left bare, `x ?? d` read `x` as never nullish and dropped `?? d`.
-			const tsType = (p.typeAnnotation ?? ctx?.tsType)!;
+			const tsType = (annotated ? p.typeAnnotation : ctx?.tsType ?? p.typeAnnotation)!;
 			return hasMod(p, 'optional') ? noteEarlier(p, { key: p.key, wtype: nullableWtype(boxed), tsType: T.combineTypes([tsType, T.UNDEFINED]) })
 				: noteEarlier(p, { key: p.key, wtype: boxed, tsType });
 		});
