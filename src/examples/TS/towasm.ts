@@ -3219,8 +3219,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 		// See `matchObjectShape`'s own comment -- same optional-field-omission tolerance, not an exact match,
 		// and the same `new Set` for the same reason: one `ClassInfo` is reachable under several keys.
+		// The field TYPES must agree too, not just their names: `NodeMap<Obj>`'s `values` is a mapper `(x: number[]) => number[]`
+		// where `Obj`'s own is `number[]` -- the same names, an unrelated shape, and the literal then built against the wrong one.
+		// Compared physically and tolerantly (nullability aside, a boxed `any` fits anything), since that is what a value of this
+		// shape must actually be stored as.
+		const sameKind = (a: WasmType, b: WasmType) => wasmTypeEq(a, b)
+			|| (typeof a !== 'string' && typeof b !== 'string' && wasmTypeEq({ ...a, nullable: false } as WasmType, { ...b, nullable: false } as WasmType))
+			|| [a, b].some(w => typeof w !== 'string' && 'ref' in w && w.ref === 'any');
 		const candidates = [...new Set(classes.values())].filter(cls =>
 			cls.typeIndex !== -1 && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
+			&& [...props].every(([k, pt]) => { const w = typeOf(pt); return !w || sameKind(w, cls.fields[cls.fieldIndex.get(k)!].wtype); })
 		);
 		if (candidates.length === 1)
 			return candidates[0];

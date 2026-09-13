@@ -7539,6 +7539,21 @@ async function main() {
 	}
 
 	{
+		// A shape is matched to a declared class only when the field TYPES agree too: walker.ts's `NodeMap<N>` has the same field
+		// NAMES as the node it maps, but each is a mapper over that field, not the field itself.
+		const { mapperShapeTarget } = await compile(`
+			interface Obj { values: number[]; name?: string }
+			type NodeMap<N> = {[K in keyof N]?: (x: N[K]) => N[K]};
+			function apply(node: Obj, nm: NodeMap<Obj>): number { return nm.values ? nm.values(node.values).length : 0; }
+			export function mapperShapeTarget(): number {
+				const o: Obj = { values: [1, 2] };
+				return apply(o, { values: (vs: number[]) => vs.concat([3]) });
+			}
+		`);
+		check('mapperShapeTarget()', mapperShapeTarget(), 3);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
