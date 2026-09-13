@@ -1983,8 +1983,20 @@ reasons, both fixed: (1) inference widened `'never'` to `string` for `T extends 
 the literal (`primitiveConstraint`); (2) `narrowTo`'s false branch used lax `isAssignable`, whose inventory-C1 rule lets a
 widened `string` satisfy `"never"`, so `RefType` was excluded -- exclusion now uses `precise` (inference already did).
 
-**Next rows** (86/330): `unknown field 'name'` 32; `unknown method 'reduce'` 18 (the Stmt intersection above);
-`unknown method 'some'` 15; `closure parameter 'name' needs an explicit ... type` 13; `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts. **User, 2026-09-13:
+An inferred type predicate (`isAny(t)` = `t.type === 'ref' && ...`) is only valid when its false branch is exact (TS
+5.5's rule) -- the checker inferred `t is RefType` and every caller's else branch lost all RefTypes (`unknown field 'name'`,
+32 -> 0). Survey 86/331 after d8a5abc/817bff7/b3bafc9: no new ERR rows; `name`, `reduce`, `stmt.cases` rows gone.
+
+Unary `+` on a string lowers to `Number(s)` (e40b3f4, 40 blocks). TRIED AND REMOVED: taking a method's owner from
+`(x as T)` when `x` is `any`/`unknown` -- UNSOUND, since an `unknown` array literal is built as a boxed `arr:ref`, so `as
+number[]` traps (illegal cast). The any-METHOD dispatch (`findAnyDispatchCandidates`) only takes ZERO-arg methods and
+skips array-backed owners; the general fix is a dynamic call convention with arguments -- the same design as item 4.
+
+**Next rows** (86/331): `cannot convert ref:Param to
+ref:{...}` 23 -- a NAMED struct passed where a STRUCTURAL type is expected (`hasMod(p, 'optional')`, param `{modifiers?:
+string[]}`): towasm has no struct -> structural-supertype conversion, a representation design question for the user;
+direct calls through `any` 22 (item 4, user decision pending); `unknown method 'some'` 17 (`(x as T[]).some` over an
+`unknown`); `closure parameter 'name' needs an explicit ... type` 14; `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts. **User, 2026-09-13:
 skip tableCache.ts entirely for now** -- do not work this row, and do not touch tableCache.ts; `indexing is only supported
 on number[]/...` 19 (not strings, see above); `only direct calls...` 21 -- core.ts:185 `params[0](...)`, calling an
 `any`-typed value, which needs a calling convention for closures boxed as `any`; `param 'value' needs an
