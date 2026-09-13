@@ -228,6 +228,7 @@ type WasmType		= WasmScalar
 	| { typeIndex:	number; nullable?: boolean; primKind: WasmScalarI };
 
 const TYPED_ARRAY_TAGS = new Set(['i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'f32', 'f64']);
+const PRIMITIVE_TAGS = new Set(['string', 'number', 'boolean', 'bigint']);
 
 // Shared singletons -- ctx.local compares WasmType by object identity
 const ARR_WTYPE: Record<WasmElementI, WasmType> = {
@@ -2584,6 +2585,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const arr = arrayPartOf(resolved);
 				if (arr)
 					return wasmTypeOf(TS.ArrayType(arr.element), global);
+				const prim = primitivePart(resolved);
+				if (prim)
+					return typeOf(prim);
 				break;
 			}
 			case 'union': {
@@ -3274,6 +3278,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// The `MethodOwner` a static `Type` dispatches method calls against -- derived directly from the `Type` itself, never by reverse-decoding an already-collapsed `WasmType`
+	// The primitive part of an intersection, which is what its value is at run time, as `typeofName` rules: a brand or `{}` beside
+	// it (`string & {}`, which `NonNullable<string | undefined>` is, or a branded `string & {__brand: 'Id'}`) carries no data.
+	function primitivePart(t: TS.IntersectionType): Type | undefined {
+		return t.types.find(p => PRIMITIVE_TAGS.has(T.typeofName(p, global) ?? ''));
+	}
+
 	function ownerFor(t: Type): ClassInfo | undefined {
 		// Same fast path `wasmTypeOf` needs, for the same reason -- a hoisted `builtinTypes` name would
 		// otherwise fully expand via its own `declScope` before reaching the `w.type === 'ref'` check below.
@@ -3363,6 +3373,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const arr = arrayPartOf(w);
 				if (arr)
 					return ensureClass('Array', [arr.element]);
+				const prim = primitivePart(w);
+				if (prim)
+					return ownerFor(prim);
 				const merged = resolveObjectType(w, global);
 				// Same last resort the 'object' case above uses -- synthesize the flattened shape when
 				// nothing declared matches it, or a value of such a type has no owner to read fields off.

@@ -7075,6 +7075,21 @@ async function main() {
 	}
 
 	{
+		// A primitive intersected with an object type is that primitive at run time: `NonNullable<T>` is `T & {}` (tocode.ts
+		// `maybe(type.name, name => '.' + name)`), and a branded `string & {__brand}` reads `.length` off the string.
+		const { brandedPrimitive } = await compile(`
+			function maybe<T>(value: T, fn: (value: NonNullable<T>) => string) { return value ? fn(value as NonNullable<T>) : ''; }
+			type Id = string & { readonly __brand: 'Id' };
+			function idLength(id: Id): number { return id.length; }
+			export function brandedPrimitive(): number {
+				const n: string | undefined = 'ab';
+				return maybe(n, s => s + '!').length * 10 + idLength('xyz' as Id);
+			}
+		`);
+		check('brandedPrimitive()', brandedPrimitive(), 33);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {
