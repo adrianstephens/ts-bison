@@ -141,6 +141,9 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a union of tuples read past a shorter member is possibly undefined', 'function f(...args: [number] | [number, number]) { const q: number = args[1]; }', ['is not assignable']],
 	['an optional tuple element reads as possibly undefined', 'function g(t: [number, string?]) { const r: string = t[1]; }', ['is not assignable']],
 	['a rest tuple position reads its element type', 'function h(t: [number, ...string[]]) { const s: string = t[3]; const n: number = t[0]; }', []],
+	// TS's `T[number]`: a computed index reads any position, an optional one contributing `undefined` too.
+	['a tuple indexed by a computed number reads any position', 'declare const i: number; const t = [1, "a"] as const; const q: boolean = t[i];', ['is not assignable']],
+	['a tuple indexed by a computed number includes an optional position', 'declare function f(t: [number, string?], i: number): void; const g = (t: [number, string?], i: number) => { const q: number = t[i]; };', ['is not assignable']],
 ];
 
 (async () => {

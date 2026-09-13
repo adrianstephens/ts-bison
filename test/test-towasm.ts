@@ -7419,6 +7419,21 @@ async function main() {
 	}
 
 	{
+		// `for...of` over a tuple (checker.ts `narrow`'s `[[l, r], [r, l]] as const`): the desugared indexed read types each element
+		// as the union of the tuple's positions, so the pattern can destructure it.
+		const { constTupleIterate } = await compile(`
+			export function constTupleIterate(): number {
+				const a: number = 3, b: number = 5;
+				let total = 0;
+				for (const [l, r] of [[a, b], [b, a]] as const)
+					total += l * 10 + r;
+				return total;
+			}
+		`);
+		check('constTupleIterate()', constTupleIterate(), 88);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

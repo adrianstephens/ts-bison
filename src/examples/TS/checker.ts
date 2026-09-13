@@ -1828,6 +1828,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				const arrayUnion = !T.isLiteral(e.index, 'string') && T.arrayUnionAsArray(objT, scope);
 				if (arrayUnion)
 					return T.optional(arrayUnion.element, chained);
+				// A tuple indexed by a COMPUTED number reads any of its positions, as TS's `T[number]` does -- towasm's own desugared
+				// `for...of` indexes its source by a loop variable, and got `any` for every element of a tuple.
+				if (objT.type === 'tuple' && !T.isLiteral(e.index, 'number') && T.isNumberLike(recurse(e.index), scope))
+					return T.optional(T.combineTypes(objT.elements.map((_, i) => T.tupleReadType(objT, i, scope) ?? T.UNDEFINED)), chained);
 				if (objT.type === 'tuple' && T.isLiteral(e.index, 'number')) {
 					const t = T.tupleReadType(objT, e.index.value, scope);
 					if (err && !t)
