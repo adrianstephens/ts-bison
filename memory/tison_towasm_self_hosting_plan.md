@@ -1933,6 +1933,16 @@ Batch-probed 2026-09-13, it holds several causes: (a) an expression-bodied arrow
 (type-utils.ts:2984) turned out to be (a) too: an arrow capturing a narrowed `t`. (e) about 12 declarations threw with no position at all.
 **Trap**: a probe's `at L:C` names no file, and the position can be in ANY module the probe reaches
 (`parse`'s 33:131 was tableCache.ts). Two repros "failed to reproduce" because I had the wrong file.
+FIXED in `f9863c0`: `TSWError.module` is recorded where `pos` is, and the probe prints `module:line:col`.
+`withCatchAt` wraps worklist BODIES (closures, top-level functions), which run outside their declaration's
+named catch, so an error on a synthesized node now names its body ("recurse in narrow") and falls back to
+the body's position. The indexing error also prints the indexed expression and its type now.
+(e) was mostly array DESTRUCTURING of a non-array: `patternBindings` (transform.ts) lowers every array
+pattern to indexing (`#destructure$0[0]`), right only for arrays/tuples. `const [[name, arg]] = map`
+(type-utils.ts `substituteType`) indexes a Map, and `for (const [l, r] of [[..], [..]] as const)` in
+checker.ts `narrow` iterates a tuple whose element type comes out `any`. JS uses the iteration protocol
+here. OPEN, needs a design choice: materialize (`[...src]`, simple, but eagerly drains a generator) or lower
+to the iterator protocol towasm's `for_of` uses (exact).
 
 **Next rows** (77/330): `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts, which also needs
 zlib/crypto host modules and turning parsed dynamic objects into typed structs; `indexing is only supported

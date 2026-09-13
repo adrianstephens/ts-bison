@@ -5655,7 +5655,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							return info.result;
 						}
 					}
-					throw "indexing is only supported on number[]/boolean[]/Uint8Array/Int32Array/Uint32Array ('string' is immutable and not indexable in this pass)";
+					throw `'${T.exprKey(e.object)}' is indexed but is not an array, a typed array, or a class with 'get' (its type: '${T.typeKey(narrowedTypeOf(e.object, ctx))}')`;
 				}
 				// `nullable: true` on the 'ref' case -- `ensureArrayType`'s `'ref'`-kind field is declared
 				// nullable (shared physical storage for every non-scalar kind), so `array.get` always really
