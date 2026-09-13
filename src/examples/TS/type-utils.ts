@@ -474,6 +474,13 @@ function domainOf(r: Type, scope: Scope): Domain {
 	}
 }
 
+// TS's hasPrimitiveConstraint: a type parameter bounded by a primitive (`T extends string`, a literal union) infers the
+// literal itself, unwidened -- `f<T extends string>(x: T): T` called with 'a' is 'a'.
+const PRIMITIVE_DOMAINS = new Set(['string', 'number', 'bigint', 'boolean', 'symbol', 'undefined', 'null']);
+function primitiveConstraint(c: Type | undefined, scope: Scope): boolean {
+	return !!c && unionMembers(c, scope).some(m => PRIMITIVE_DOMAINS.has(domainOf(resolveOwn(m, scope), scope) ?? ''));
+}
+
 type Unit = string | number | bigint | boolean;
 const unitOf = (r: Type): Unit | undefined => r.type === 'literal' && !Array.isArray(r.value) && r.value !== null ? r.value
 	: r.type === 'range' && r.min !== undefined && r.min === r.max ? r.min : undefined;
@@ -2742,7 +2749,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				const tp = tparams.get(paramT.name)!;
 				// Widening a literal argument (`'string'` -> `string`) is the usual default, but not when the type param's constraint is
 				// itself a union of literals (`K extends 'string' | 'number'`) -- the widened form would fall outside the constraint.
-				found(paramT.name, tp.const || tp.constraint?.type === 'keyof' || (!!tp.constraint && isLiteralOnly(resolveOwn(tp.constraint, scope), scope) === true) ? src : widenLiterals(src));
+				found(paramT.name, tp.const || tp.constraint?.type === 'keyof' || primitiveConstraint(tp.constraint, scope) ? src : widenLiterals(src));
 			}
 			return;
 		}

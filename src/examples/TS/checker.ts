@@ -685,9 +685,11 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 		// node's own wide `value` union). A plain boolean `keep` would silently discard that.
 		// A member WIDER than the target (`Lit<string | number>` guarded to `Lit<string>`) narrows to it too, as in TS.
 		if (r.type === 'union' && !T.isAny(target))
+			// Excluding a member (the false branch) takes the EXACT relation: a widened `string` counting as a `"never"` (isAssignable's
+			// lenient widened-source rule) dropped `RefType` from `isRef(src, 'never')`'s else branch and left `src` as `never`.
 			return narrowValue(scope, name, sense
 				? m => T.isAssignable(m, target, scope) || T.isAssignable(target, m, scope) ? target : false
-				: m => !T.isAssignable(m, target, scope), t);
+				: m => !T.isAssignable(m, target, scope, scope, false, 10, true), t);
 		if (!sense)
 			return scope;
 		const s = new Scope(scope);

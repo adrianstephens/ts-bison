@@ -1978,6 +1978,10 @@ cause table's ERR rows after every checker/lib change. `typeof` on a fully dynam
 type-utils `isAbstract` treated a stamped member of an imported union (`EnumDecl`) as an unbound type parameter
 because the AMBIENT scope did not know it, while `resolve` looks it up in the ref's own `declScope`. So the
 distributed intersection kept every conflicting member. It now looks up in `declScope ?? scope`, as `resolve` does.
+Guard narrowing (`if (isRef(src, 'never')) return;` then `src.type === 'ref'`) left `src` as `never` for TWO checker
+reasons, both fixed: (1) inference widened `'never'` to `string` for `T extends string` -- TS's hasPrimitiveConstraint keeps
+the literal (`primitiveConstraint`); (2) `narrowTo`'s false branch used lax `isAssignable`, whose inventory-C1 rule lets a
+widened `string` satisfy `"never"`, so `RefType` was excluded -- exclusion now uses `precise` (inference already did).
 
 **Next rows** (86/330): `unknown field 'name'` 32; `unknown method 'reduce'` 18 (the Stmt intersection above);
 `unknown method 'some'` 15; `closure parameter 'name' needs an explicit ... type` 13; `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts. **User, 2026-09-13:

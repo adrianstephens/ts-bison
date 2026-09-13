@@ -125,6 +125,10 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// TS narrows a discriminant compared with a value typed as a union of literals, on the matching branch only.
 	['a discriminant compared with a literal-union value narrows', 'type A = { type: "a"; x: 1 } | { type: "b"; y: 2 } | { type: "c"; z: 3 }; function f(m: A, k: "a" | "b") { if (m.type === k) { const n: { type: "a"; x: 1 } | { type: "b"; y: 2 } = m; } }', []],
 	['a literal-union comparand does not narrow the other branch', 'type A = { type: "a"; x: 1 } | { type: "b"; y: 2 } | { type: "c"; z: 3 }; function f(m: A, k: "a" | "b") { if (m.type !== k) { const o: { type: "c"; z: 3 } = m; } }', ['is not assignable']],
+	// A guard's false branch drops only members ASSIGNABLE to the guarded type: `R` (its `T` defaulted to `string`) is not an
+	// `R<'never'>`, so it stays. Dropping it narrowed `src.type === 'ref'` to `never` (type-utils.ts `isAssignable`'s `recurse`).
+	['a guard with a narrower type argument keeps a defaulted member', 'interface R<T extends string = string> { type: "ref"; name: T } interface L { type: "lit" } type Ty = R | L; declare function isRef<T extends string>(t: Ty, name: T): t is R<T>; function f(src: Ty) { if (isRef(src, "never")) return; const l: L = src; }', ['is not assignable']],
+	['a primitive-constrained type parameter infers the literal', 'declare function lit<T extends string>(x: T): T; const a: "a" = lit("a");', []],
 ];
 
 (async () => {
