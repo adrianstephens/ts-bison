@@ -6705,6 +6705,26 @@ async function main() {
 	}
 
 	{
+		// Two writes whose slots are the same wasm type built as two different objects -- an optional union field's
+		// fresh `nullableWtype(REF_ANY)` and a dynamic field's `REF_ANY_NULLABLE` -- share one `$new` scratch local.
+		const { sameKeyTemps } = await compile(`
+			type Sh = { kind: "a"; n: number } | { kind: "b"; s: string };
+			interface Holder { memo?: Sh }
+			interface A { kind: "a" }
+			interface B { kind: "b" }
+			export function sameKeyTemps(): number {
+				const h: Holder = {};
+				const x: A | B = { kind: "a" };
+				const s: Sh = { kind: "a", n: 3 };
+				h.memo = s;
+				(x as any).tag = s;
+				return (h.memo !== undefined ? 10 : 0) + ((x as any).tag !== undefined ? 1 : 0);
+			}
+		`);
+		check('sameKeyTemps()', sameKeyTemps(), 11);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

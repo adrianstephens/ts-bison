@@ -666,7 +666,9 @@ class FunctionContext {
 	temp(name: string, wtype: WasmType): number {
 		const prev = this.lookup(name);
 		if (prev) {
-			if (prev.wtype !== wtype)
+			// Structurally, as the name itself was built (`scratchName` keys by `wasmTypeKey`): two equal types
+			// need not be one object -- a fresh `nullableWtype(REF_ANY)` and the `REF_ANY_NULLABLE` constant.
+			if (wasmTypeKey(prev.wtype) !== wasmTypeKey(wtype))
 				throw `local '${name}' redeclared with different type`;
 			return prev.index;
 		}
