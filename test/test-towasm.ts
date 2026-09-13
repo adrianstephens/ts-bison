@@ -7554,6 +7554,23 @@ async function main() {
 	}
 
 	{
+		// Shape matching runs while a shape is being resolved, so it must not ask for a physical type: ts-parser.ts's `CallSig`
+		// reaches its own `Param[]` and the recursive `Type` union that way, and asking did not terminate.
+		const { recursiveShapeMatch } = await compile(`
+			interface Lit { kind: 'lit'; v: number }
+			interface Call { kind: 'call'; args: Node[]; sig: Sig }
+			interface Sig { params: Node[]; ret?: Node }
+			type Node = Lit | Call;
+			export function recursiveShapeMatch(): number {
+				const s: Sig = { params: [{ kind: 'lit', v: 1 }] };
+				const c: Node = { kind: 'call', args: [{ kind: 'lit', v: 2 }], sig: s };
+				return c.kind === 'call' ? c.args.length + c.sig.params.length : 0;
+			}
+		`);
+		check('recursiveShapeMatch()', recursiveShapeMatch(), 2);
+	}
+
+	{
 		// A computed STRING key on a struct, read and written (walker.ts's `mapObject`: `node[k]`, `r[k] = ret`): the property is
 		// found by name at run time, and a key naming no field reads `undefined`.
 		const { computedKeyAccess } = await compile(`
