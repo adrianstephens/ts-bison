@@ -7289,6 +7289,30 @@ async function main() {
 	}
 
 	{
+		// A spread of a union-typed operand (js-parser.ts `CallSig`'s `{ ...args[0], returnType }`, `args[0]: CallSig | Params`): each
+		// field comes off whichever member the value is, and a member without it leaves it absent. Both members are spread here.
+		const { unionSpread } = await compile(`
+			interface Params { params: number[]; rest?: number }
+			interface Sig extends Params { ret?: number; extra?: number }
+			type Args = [Sig] | [Params] | [Params, number | undefined] | [number[]];
+			function make(...args: Args): Sig {
+				if (Array.isArray(args[0]))
+					return { params: args[0] };
+				return { ...args[0], ret: args[1] };
+			}
+			export function unionSpread(): number {
+				const a = make({ params: [1, 2], rest: 3 }, 4);
+				const b = make({ params: [5], ret: 6, extra: 7 });
+				const p: Params = { params: [9] };
+				const c = make(p, 1);
+				return (a.ret ?? 0) + (a.rest ?? 0) * 10 + (b.extra ?? 0) * 100 + b.params.length * 1000
+					+ (c.ret ?? 0) * 10000 + (c.extra === undefined ? 100000 : 0);
+			}
+		`);
+		check('unionSpread()', unionSpread(), 111734);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

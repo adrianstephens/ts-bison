@@ -6155,7 +6155,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// is ever read back off a spread operand -- any of *its* own extra fields are simply not
 				// part of this shape, the same way a real JS spread's own excess properties would just
 				// never be looked at by a nominally-typed consumer.
-				interface FieldSource { expr?: Expr; spreadLocal?: Local; spreadCls?: ClassInfo }
+				interface FieldSource { expr?: Expr; spreadLocal?: Local; spreadCls?: ClassInfo; unionCls?: ClassInfo[]; nullable?: boolean }
 				// Every source for a field, in written order -- not just the last one. `{...D, ...opts}` is the
 				// reason: an OPTIONAL property of a later operand is only "last wins" when it's actually
 				// present at runtime, so an absent one has to fall back to whatever came before it.
@@ -6168,8 +6168,22 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// literal targeting that shape would already get.
 						const spreadT	= T.resolve(ctx.scope, narrowedTypeOf(p.operand, ctx));
 						const spreadCls	= ownerOf(p.operand, ctx) ?? (spreadT.type === 'object' ? ensureAnonObjectShape(spreadT) : undefined);
-						if (!spreadCls)
-							throw `object literal for '${owner.name}': a spread operand needs a known object type, got '${T.typeKey(spreadT)}'`;
+						if (!spreadCls) {
+							// A union of object types (js-parser.ts `{ ...args[0] }`, `args[0]: CallSig | Params`): each field is read off
+							// whichever member the value is, and is absent where that member has none, as it is for a nullish operand.
+							const parts		= spreadT.type === 'union' ? T.unionMembers(spreadT, ctx.scope) : [];
+							const solid		= parts.filter(m => !T.isNullish(m, ctx.scope));
+							const unionCls	= solid.flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
+							if (!unionCls.length || !unionCls.every(o => o && o.typeIndex !== -1))
+								throw `object literal for '${owner.name}': a spread operand needs a known object type, got '${T.typeKey(spreadT)}'`;
+							const spreadLocal = ctx.declareLocal(`$spread$${closureCallTempCounter++}`, REF_ANY_NULLABLE);
+							emitAs(p.operand, ctx, REF_ANY_NULLABLE);
+							ctx.emit(I.local.set(spreadLocal.index));
+							const src: FieldSource = { spreadLocal, unionCls: unionCls as ClassInfo[], nullable: solid.length < parts.length };
+							for (const name of new Set(src.unionCls!.flatMap(m => m.fields.map(f => f.name))))
+								addSource(name, src);
+							continue;
+						}
 						const spreadLocal = ctx.declareValue(`$spread$${closureCallTempCounter++}`, spreadCls.thisWtype!, spreadCls.thisTsType!);
 						emitAs(p.operand, ctx, spreadCls.thisWtype!);
 						ctx.emit(I.local.set(spreadLocal.index));
@@ -6185,16 +6199,49 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				}
 				// A source is "certain" when it always yields a value: an explicit `k: v`, or a spread of a
 				// field that isn't optional. Everything written before the last certain source is dead.
-				const certain	= (src: FieldSource, name: string) => !!src.expr || !src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].optional;
+				// A union spread's field is certain only when every member has it, none optional, and the operand is never nullish.
+				const certain	= (src: FieldSource, name: string) => !!src.expr || (src.unionCls
+					? !src.nullable && src.unionCls.every(m => { const i = m.fieldIndex.get(name); return i !== undefined && !m.fields[i].optional; })
+					: !src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].optional);
 				const rawWtype	= (src: FieldSource, name: string) => src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].wtype;
+				// A spread source's field, as `want`: a union's off whichever member the value is, the absent default where it has none.
+				const readSpread = (src: FieldSource, name: string, want: WasmType): void => {
+					if (!src.unionCls) {
+						const idx = src.spreadCls!.fieldIndex.get(name)!;
+						ctx.emit(I.local.get(src.spreadLocal!.index), I.struct.get(src.spreadCls!.typeIndex, idx));
+						coerceTop(src.spreadCls!.fields[idx].wtype, ctx, want);
+						return;
+					}
+					const members = src.unionCls;
+					const arm = (i: number): wasm.Instr[] => {
+						if (i >= members.length)
+							return [I.unreachable];
+						const m = members[i], idx = m.fieldIndex.get(name);
+						ctx.emit(I.local.get(src.spreadLocal!.index), I.ref.test(m.typeIndex));
+						const _cond = ctx.swapOut();
+						if (idx === undefined) {
+							emitDefaultValue(want, ctx);
+						} else {
+							ctx.emit(I.local.get(src.spreadLocal!.index), I.ref.cast(m.typeIndex), I.struct.get(m.typeIndex, idx));
+							coerceTop(m.fields[idx].wtype, ctx, want);
+						}
+						return [..._cond, I.if(toValType(want), ctx.swapOut(), arm(i + 1))];
+					};
+					if (!src.nullable)
+						return void ctx.emit(...arm(0));
+					ctx.emit(I.local.get(src.spreadLocal!.index), I.ref.is_null);
+					const _old = ctx.swapOut();
+					emitDefaultValue(want, ctx);
+					const _then = ctx.swapOut();
+					ctx.emit(...arm(0));
+					ctx.emit(I.if(toValType(want), _then, ctx.swapOut(_old)));
+				};
 				const emitOne	= (src: FieldSource, f: { name: string; wtype: WasmType }) => {
 					if (src.expr) {
 						// The field's declared type is the value's context: a nested literal picks its union member from it.
 						withContext(ctx, fieldDeclaredType(owner, f.name), () => emitAs(src.expr!, ctx, f.wtype));
 					} else {
-						const idx = src.spreadCls!.fieldIndex.get(f.name)!;
-						ctx.emit(I.local.get(src.spreadLocal!.index), I.struct.get(src.spreadCls!.typeIndex, idx));
-						coerceTop(src.spreadCls!.fields[idx].wtype, ctx, f.wtype);
+						readSpread(src, f.name, f.wtype);
 					}
 				};
 				// `last ?? (the one before it ?? ...)`, lowered exactly like the `??` operator itself.
@@ -6202,10 +6249,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					const last = chain[chain.length - 1];
 					if (chain.length === 1 || certain(last, f.name))
 						return emitOne(last, f);
-					const srcWtype	= rawWtype(last, f.name);
-					const idx		= last.spreadCls!.fieldIndex.get(f.name)!;
+					const srcWtype	= last.unionCls ? nullableWtype(f.wtype) : rawWtype(last, f.name);
 					const tmp		= ctx.declareLocal(`$spread$${f.name}$${optionalTempCounter++}`, srcWtype);
-					ctx.emit(I.local.get(last.spreadLocal!.index), I.struct.get(last.spreadCls!.typeIndex, idx));
+					readSpread(last, f.name, srcWtype);
 					ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
 					const old = ctx.swapOut();
 					emitChain(chain.slice(0, -1), f);
