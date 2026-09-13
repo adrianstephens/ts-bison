@@ -1813,6 +1813,14 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				recurse(e.index);
 				if (objT.type === 'array')
 					return T.optional(objT.element, chained);
+				// A union of tuples and arrays reads each member's position (TS's getIndexedAccessType): a member too short there, or
+				// optional there, reads `undefined` (js-parser.ts `CallSig`'s `args[1]` over `CallSigParams<T>`).
+				if (objT.type === 'union' && T.isLiteral(e.index, 'number')) {
+					const i			= e.index.value;
+					const members	= T.unionMembers(objT, scope).map(m => T.resolveOwn(m, scope));
+					if (members.every(m => m.type === 'tuple' || m.type === 'array'))
+						return T.optional(T.combineTypes(members.map(m => m.type === 'array' ? m.element : T.tupleReadType(m, i, scope) ?? T.UNDEFINED)), chained);
+				}
 				// A literal index reads that property of each member: a tuple's position, an interface's `0:` key.
 				const atKey = objT.type !== 'tuple' && T.isLiteral(e.index, 'number') && T.lookupMember(objT, String(e.index.value), scope);
 				if (atKey)
@@ -1821,10 +1829,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				if (arrayUnion)
 					return T.optional(arrayUnion.element, chained);
 				if (objT.type === 'tuple' && T.isLiteral(e.index, 'number')) {
-					const el = objT.elements[e.index.value];
-					if (err && !el)
+					const t = T.tupleReadType(objT, e.index.value, scope);
+					if (err && !t)
 						err(SEVERITY.ERROR, pos)`Tuple type '${show().type(objT)}' has no element at index ${e.index.value}`;
-					const t = el && T.tupleElementType(el);
 					return t ? T.optional(t, chained) : T.ANY;
 				}
 				// A declared `[i: number]: T` index signature (real lib.d.ts typed arrays once `TStypeCheckAsync`

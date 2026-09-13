@@ -136,6 +136,11 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// `has0args(f2)` to true on it). Optional, defaulted and trailing `void` parameters, and a rest target, are not needed.
 	['a function needing more arguments than the target passes is not assignable', 'const f2 = (a: number, b: number) => a + b; const g: () => number = f2;', ['is not assignable']],
 	['optional, defaulted, void and rest parameters are not needed arguments', 'const f = (a: number, b?: number, c = 1) => a; const g: (a: number) => number = f; const h: (...xs: number[]) => number = (a: number, b: number) => a; declare const r: (v: void) => void; const p: () => void = r;', []],
+	// TS's read of a tuple position: an optional element, or a union member too short for it, reads `undefined` too (towasm's
+	// bounds-checked read relies on it); a position a rest spread covers reads the spread's element, with no error.
+	['a union of tuples read past a shorter member is possibly undefined', 'function f(...args: [number] | [number, number]) { const q: number = args[1]; }', ['is not assignable']],
+	['an optional tuple element reads as possibly undefined', 'function g(t: [number, string?]) { const r: string = t[1]; }', ['is not assignable']],
+	['a rest tuple position reads its element type', 'function h(t: [number, ...string[]]) { const s: string = t[3]; const n: number = t[0]; }', []],
 ];
 
 (async () => {

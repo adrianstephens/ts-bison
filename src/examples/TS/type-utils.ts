@@ -354,6 +354,22 @@ export function tupleElementType(te: TS.TupleElement | undefined): Type | undefi
 	return !te || te.type === 'spread' ? undefined : te.type === 'optional' || te.type === 'labeled' ? te.element : te;
 }
 
+// A READ of position `i` (TS's getIndexedAccessType): an optional element may be absent, so it reads `T | undefined`; a position a
+// rest spread covers reads the spread's element or any fixed one after it; no type at all past a fixed-length tuple's end.
+export function tupleReadType(t: Extract<Type, { type: 'tuple' }>, i: number, scope: Scope): Type | undefined {
+	const spreadAt = t.elements.findIndex(e => e.type === 'spread');
+	if (spreadAt >= 0 && i >= spreadAt) {
+		const rest = resolveOwn((t.elements[spreadAt] as { argument: Type }).argument, scope);
+		return combineTypes([rest.type === 'array' ? rest.element : rest.type === 'ref' && rest.name === 'Array' && rest.typeArgs?.length === 1 ? rest.typeArgs[0] : ANY,
+			...t.elements.slice(spreadAt + 1).map(e => tupleElementType(e) ?? ANY)]);
+	}
+	const el = t.elements[i];
+	if (!el)
+		return undefined;
+	const v = tupleElementType(el)!;
+	return el.type === 'optional' || (el.type === 'labeled' && el.optional) ? combineTypes([v, UNDEFINED]) : v;
+}
+
 export function bindingNames(t: BindingTarget): string[] {
 	return typeof t === 'string' ? [t]
 		: t.type === 'object_pattern' ? [...t.properties.flatMap(p => bindingNames(p.value)), ...(t.rest ? [t.rest] : [])]
