@@ -1913,11 +1913,21 @@ that stamps its own parameter makes that parameter "receive" the key, inductivel
   repeating the base's full layout, expandos and `#ext` included, as the derived prefix (`derivedUpcast` test).
   The A/B was too coarse: it toggled the whole feature. Compare the struct layouts (`super=`) before calling a jump "order".
 
-**Next rows** (75/329; object-literal row 34 -> 0, all 34 moved to later causes): `unknown method 'parse'` 23;
-`only direct calls to named functions...` 21; `param 'typeOf''s default value must be a literal...` 19 --
-checker.ts's `checkBlock(..., typeOf = typeOf1(), ...)`: towasm re-emits defaults at CALL sites so it rejects
-a call default, but JS evaluates defaults in the CALLEE -- that is the general fix; `indexing is only
-supported on number[]/...` 19; `cannot convert arr:ref:true to i32` 18; `param 'value' needs an explicit type` 17.
+`default value must be a literal...` 19 -> 0 (76/330). towasm re-emitted every default at the CALL site, so a
+default naming anything the caller can't see (`checkBlock(..., typeOf = typeOf1())`, a capture, `this`) was
+rejected, and closure literals rejected ALL defaults. Now a default that can't be re-emitted is applied in the
+CALLEE, as JS does: its slot is exactly an optional `p?: T` slot, callers pass `undefined`, and `declareParams`
+emits `let p: T = #param$i ?? <default>`. One rule, decided by `defaultsWithImplicitUndefined`, shared by
+declarations, function types and closure literals. The checker now writes an unannotated defaulted param's
+inferred type back onto the node, like `applyContextualParams` does. Open: a type admitting `null` is rejected
+(an omitted argument arrives as null), and async/generator functions still reject defaults.
+
+**Next rows** (76/330): `unknown method 'parse'` 23 -- `JSON.parse` in tableCache.ts, which also needs
+zlib/crypto host modules and turning parsed dynamic objects into typed structs; `indexing is only supported
+on number[]/...` 21 (string indexing); `only direct calls...` 21 -- core.ts:185 `params[0](...)`, calling an
+`any`-typed value, which needs a calling convention for closures boxed as `any`; `param 'value' needs an
+explicit type` 18; `cannot convert arr:ref:true to i32` 18; `unsupported expression 'instantiation'` 16 --
+`export const CallSig = JS.CallSig<Type>` (ts-parser.ts:29).
 
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And

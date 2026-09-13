@@ -6780,6 +6780,45 @@ async function main() {
 	}
 
 	{
+		// A default no call site can re-emit (a call, a capture, `this`, `new`) is applied in the callee, where JS evaluates it.
+		const { calleeDefaultCall, calleeDefaultUndefined, calleeDefaultClosure, calleeDefaultMethod, calleeDefaultScalar } = await compile(`
+			function seed(): number[] { return [1, 2]; }
+			function sum(n: number, xs = seed()): number { let t = n; for (const x of xs) t += x; return t; }
+			export function calleeDefaultCall(): number { return sum(10) * 100 + sum(0, [5]); }
+			export function calleeDefaultUndefined(): number { return sum(1, undefined); }
+			export function calleeDefaultClosure(): number {
+				const base = 7;
+				function add(x: number, y = base * 2): number { return x + y; }
+				const count = (s: string, seen = new Set<string>()): number => { seen.add(s); return seen.size; };
+				return add(1) * 100 + add(1, 2) * 10 + count('a');
+			}
+			class Box { n = 4; get(k: number = this.twice()): number { return k + 1; } twice(): number { return this.n * 2; } }
+			export function calleeDefaultMethod(): number { return new Box().get() * 10 + new Box().get(0); }
+			function next(): number { return 41; }
+			function inc(k = next()): number { return k + 1; }
+			export function calleeDefaultScalar(): number { return inc() * 1000 + inc(0); }
+		`);
+		check('calleeDefaultCall()', calleeDefaultCall(), 1305);
+		check('calleeDefaultUndefined()', calleeDefaultUndefined(), 4);
+		check('calleeDefaultClosure()', calleeDefaultClosure(), 1531);
+		check('calleeDefaultMethod()', calleeDefaultMethod(), 91);
+		check('calleeDefaultScalar()', calleeDefaultScalar(), 42001);
+
+		// The default names something the CALLER cannot see (checker.ts's `checkBlock(..., typeOf = typeOf1())`).
+		const { calleeDefaultCrossModule } = await compileMulti({
+			lib: `
+				function hidden(): number { return 40; }
+				export function f(x: number, y = hidden()): number { return x + y; }
+			`,
+			main: `
+				import { f } from './lib';
+				export function calleeDefaultCrossModule(): number { return f(2); }
+			`,
+		}, 'main');
+		check('calleeDefaultCrossModule()', calleeDefaultCrossModule(), 42);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

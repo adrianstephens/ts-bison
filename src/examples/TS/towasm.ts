@@ -467,7 +467,9 @@ interface ClassInfo extends MethodOwner {
 interface Local			{ wtype: WasmType, index: number; holderInner?: WasmType; }
 interface Global extends Local {init: Expr, mut: boolean}
 
-interface ResolvedParam { key: BindingTarget; wtype: WasmType; tsType: Type }
+// `calleeDefault`: a default no call site can re-emit (a call, a capture, `this`). Its slot is an optional one and
+// `declareParams` applies the default in the callee, which is where JS evaluates it anyway.
+interface ResolvedParam { key: BindingTarget; wtype: WasmType; tsType: Type; calleeDefault?: { value: Expr; tsType: Type } }
 
 interface ClosureEnv {
 	envLocal:		Local;
@@ -727,12 +729,14 @@ class FunctionContext {
 	declareParams(params: ResolvedParam[]): JS.Stmt<Type>[] {
 		const pending: JS.Stmt<Type>[] = [];
 		params.forEach((p, i) => {
-			if (typeof p.key === 'string') {
+			if (typeof p.key === 'string' && !p.calleeDefault) {
 				this.declareValue(p.key, p.wtype, p.tsType);
 			} else {
 				const tmpName = `#param$${i}`;
 				this.declareValue(tmpName, p.wtype, p.tsType);
-				pending.push(...patternBindings('let', p.key, { type: 'identifier', name: tmpName }));
+				const incoming: Expr = { type: 'identifier', name: tmpName };
+				const value = p.calleeDefault ? { type: 'binary', operator: '??', left: incoming, right: p.calleeDefault.value } as Expr : incoming;
+				pending.push(...(typeof p.key === 'string' ? [JS.VarDecl('let', JS.Var<Type>(p.key, value, p.calleeDefault!.tsType))] : patternBindings('let', p.key, value)));
 			}
 		});
 		return pending;
@@ -908,8 +912,7 @@ function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<stri
 			// *declaration* statement -- its own name is already bound (see `ownBoundNames`), so this only
 			// needs to stop descent and collect its body's free vars under its own (merged) bound set.
 			if (s.type === 'function_decl') {
-				const nestedBody = s.body ?? [];
-				collectFreeVars(new Set([...bound, ...ownBoundNames(paramNames(s.params, s.rest), nestedBody, s.name)]), nestedBody, free);
+				collectClosureFreeVars(bound, s, s.name, free);
 				return false;
 			}
 			return process(s);
@@ -926,13 +929,22 @@ function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<stri
 				return false;
 			}
 			if (e.type === 'arrow' || e.type === 'function') {
-				const nestedBody = e.body ?? [];
-				collectFreeVars(new Set([...bound, ...ownBoundNames(paramNames(e.params, e.rest), nestedBody, e.type === 'function' ? e.name : undefined)]), nestedBody, free);
+				collectClosureFreeVars(bound, e, e.type === 'function' ? e.name : undefined, free);
 				return false;
 			}
 			return process(e);
 		}
 	).body(body);
+}
+
+// A closure's free variables: its body's and its parameter defaults', since a default runs inside the callee.
+function collectClosureFreeVars(outer: Set<string>, fn: { params: JS.Param<Type>[]; rest?: JS.Rest<Type>; body?: Stmt[] | Expr }, selfName: string | undefined, free: Set<string>) {
+	const body = fn.body ?? [];
+	const bound = new Set([...outer, ...ownBoundNames(paramNames(fn.params, fn.rest), body, selfName)]);
+	collectFreeVars(bound, body, free);
+	for (const p of fn.params)
+		if (p.default)
+			collectFreeVars(bound, p.default, free);
 }
 
 // Names this body declares that a nested closure captures AND something assigns -- the locals that must
@@ -2334,18 +2346,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// Naming the whole signature, not just the parameter: one of these reaches a caller from some
 		// enclosing declaration's own type, and the parameter name alone rarely says which.
 		const sigText = () => T.typeKey({ type: 'function', ...sig } as Type);
-		// Names to this parameter's own LEFT, so a default that reads an earlier one (`dstScope = scope`)
-		// validates exactly as it does on the declaration side (`resolveParams`).
-		const earlier = new Set<string>();
-		const params = func.params.map(p => {
-			// A default is NOT a reason to reject a function type. `defaultsWithImplicitUndefined` below
-			// hands the very same expression to every call site, exactly as a direct call to the real
-			// declaration already gets it -- so the only requirement is the one the declaration path
-			// (`resolveParam`) already imposes: that the expression can be re-emitted there.
-			if (p.default && !isReemittableDefault(p.default, earlier))
-				throw `function type parameter '${describeBinding(p.key)}''s default value must be a literal, an array literal of them, or a read of an earlier parameter, in '${sigText()}'`;
-			if (typeof p.key === 'string')
-				earlier.add(p.key);
+		const defaults = defaultsWithImplicitUndefined(func.params);
+		const params = func.params.map((p, i) => {
 			// `void` is real, valid TS here (real TS lets a param/field declare `void`, if uselessly) --
 			// there's just no wasm value it can itself represent, so box it as `any` like any other
 			// "no meaningful value" position instead of rejecting otherwise-valid source.
@@ -2353,16 +2355,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const boxed = wt === 'void' ? REF_ANY : wt;
 			if (!boxed)
 				throw `function type parameter '${describeBinding(p.key)}': '${p.typeAnnotation ? T.typeKey(p.typeAnnotation) : '<no annotation>'}' has no representation, in '${sigText()}'`;
-			// A bare `p?: T` (optional, no `=`) widens to `T | undefined` for real TS -- give it a
-			// nullable physical slot so an omitted trailing arg's synthesized implicit-`undefined`
-			// default (`defaultsWithImplicitUndefined`, below) is a valid value through `call_ref`.
-			// A defaulted one is the opposite and keeps its plain type: the call site fills the declared
-			// default in, so the slot always holds a real value. Same rule `resolveParam` uses for a real
-			// function declaration -- and it has to be the same, or the two physical signatures disagree.
-			// (The checker marks a defaulted param `optional` too, hence testing `p.default` first.)
-			return !p.default && hasMod(p, 'optional') ? nullableWtype(boxed) : boxed;
+			// A slot a caller may fill with `undefined` (a bare `p?: T`, or a default only the callee can apply) is nullable;
+			// a re-emitted default always arrives. Same rule as `resolveParam`, or the two physical signatures disagree.
+			return defaults[i] && nullLiteralKind(defaults[i]!) === 'undefined' ? nullableWtype(boxed) : boxed;
 		});
-		const defaults = defaultsWithImplicitUndefined(func.params);
 		// Always built: an UNANNOTATED closure parameter takes its type from the callee's declared
 		// signature (`emitClosureLiteral`), which needs the TS type and not just the physical one.
 		const resolvedParams = func.params.map((p, i) => ({ key: p.key, wtype: params[i], tsType: p.typeAnnotation! }));
@@ -4861,9 +4857,21 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const restBound		= wantSig?.hasRest && !e.rest ? e.params.slice(fixedCount) : [];
 		const ownParams		= restBound.length ? e.params.slice(0, fixedCount) : e.params;
 
+		// A defaulted parameter resolves as a declaration's does (`resolveParam`), typed by the contextual signature
+		// when unannotated, with the earlier parameters in scope for its default.
+		const earlier = new Set<string>(), defaultScope = new Scope(ctx.typeScope);
+		const noteEarlier = (p: JS.Param<Type>, r: ResolvedParam) => {
+			if (typeof p.key === 'string') {
+				earlier.add(p.key);
+				defaultScope.addValue(p.key, r.tsType);
+			}
+			return r;
+		};
 		const params = ownParams.map((p, i): ResolvedParam => {
-			if (p.default)
-				throw `closure parameter '${describeBinding(p.key)}' cannot have a default value`;
+			if (p.default) {
+				const fromWant = p.typeAnnotation ? undefined : wantSig?.resolvedParams?.[i];
+				return noteEarlier(p, resolveParam(fromWant ? { ...p, typeAnnotation: fromWant.tsType } : p, earlier, defaultScope));
+			}
 			// An UNANNOTATED parameter takes the callee's declared one, for the same reason `result` does
 			// above -- `Rules<T>(self => [...])` and every `Rule([...], $ => ...)` can name it no other way.
 			const ctx = p.typeAnnotation ? undefined : wantSig?.resolvedParams?.[i];
@@ -4878,7 +4886,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// (`closureFuncSigType`'s `defaults`, built from the field/variable's own declared TYPE, not
 			// this literal), since nothing ever calls this literal's own compiled function directly while
 			// skipping an argument; `call_ref` always supplies a real value for every physical param.
-			return {key: p.key, wtype: hasMod(p, 'optional') ? nullableWtype(boxed) : boxed, tsType: (p.typeAnnotation ?? ctx?.tsType)! };
+			return noteEarlier(p, {key: p.key, wtype: hasMod(p, 'optional') ? nullableWtype(boxed) : boxed, tsType: (p.typeAnnotation ?? ctx?.tsType)! });
 		});
 		// The callee's own rest array becomes this literal's last physical parameter, whether or not the
 		// literal spelled a rest -- the two must agree on the physical signature.
@@ -4896,7 +4904,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 
 		const free = new Set<string>();
-		collectFreeVars(ownBoundNames(paramNames(e.params, e.rest), body, e.name), body, free);
+		collectClosureFreeVars(new Set(), e, e.name, free);
 
 		if (e.type !== 'arrow' && free.has('this'))
 			throw "'this' inside a function expression is not supported -- only an arrow function's lexical 'this' is";
@@ -4939,7 +4947,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}) } });
 		}
 
-		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length };
+		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length, defaults: defaultsWithImplicitUndefined(ownParams), resolvedParams: params };
 		// Captured now: the body compiles later, once this literal's own context (`Rule<CallSig>`'s action) is gone.
 		// The checker's own contextual type wins: it saw the chosen OVERLOAD, where `ctx` only has the implementation's.
 		const contextFn		= (e as { contextualType?: Type }).contextualType ?? ctx.contextualReturn;
@@ -7632,7 +7640,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// call" semantics) as long as the expression never references anything outside its own literal
 	// value, or an *earlier* parameter (`earlierNames`, e.g. real code like `updateBuffer(b: Uint8Array,
 	// off = 0, len = b.length)`) -- any other identifier/call would resolve against the *call site's*
-	// scope, not the declaring function's, so is still rejected. A literal has no such reference by
+	// scope, not the declaring function's, so it is applied in the callee instead. A literal has no such reference by
 	// construction; an array literal is exactly as safe whenever every element recursively is too; a
 	// (possibly chained) plain, non-optional property read off an earlier parameter is safe the same way
 	// a literal is -- no call, no side effect, nothing but a value already known by the time it's needed.
@@ -7691,8 +7699,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// `undefined` identifier expression as the default whenever one is otherwise missing -- `emitAs`'s
 	// own `isNullLiteral` handling already treats a bare `undefined` as a real, valid value wherever a
 	// nullable (or plain `any`) target is expected, so this needs no further codegen support at all.
-	function defaultsWithImplicitUndefined(params: readonly { default?: Expr; modifiers?: string[] }[]): (Expr | undefined)[] {
-		return params.map(p => p.default ?? (hasMod(p, 'optional') ? { type: 'identifier', name: 'undefined' } : undefined));
+	// A default only the callee can evaluate (`calleeDefault`) is applied there, so callers pass `undefined` for it too.
+	function defaultsWithImplicitUndefined(params: readonly { key: BindingTarget; default?: Expr; modifiers?: string[] }[]): (Expr | undefined)[] {
+		return params.map((p, i) => p.default && isReemittableDefault(p.default, new Set(params.slice(0, i).flatMap(q => typeof q.key === 'string' ? [q.key] : []))) ? p.default
+			: p.default || hasMod(p, 'optional') ? { type: 'identifier', name: 'undefined' } : undefined);
 	}
 
 	// `earlierNames`/`scope`: only ever passed by `resolveParams` below, threading in the sibling
@@ -7702,11 +7712,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// (plain `libGlobal` can't see them at all -- they're this function's own locals, not global names).
 	function resolveParam(p: JS.Param<Type>, earlierNames?: ReadonlySet<string>, scope: Scope = libGlobal): ResolvedParam {
 		let tsType = p.typeAnnotation;
-		if (p.default) {
-			if (!isReemittableDefault(p.default, earlierNames))
-				throw `'param '${describeBinding(p.key)}''s default value must be a literal (an array literal of them), or a read of an earlier parameter (e.g. 'b.length')`;
+		const calleeSide = !!p.default && !isReemittableDefault(p.default, earlierNames);
+		if (p.default)
 			tsType ??= checkerTypeOf(p.default, scope);
-		}
 		if (!tsType)
 			throw `'param '${describeBinding(p.key)}' needs an explicit type`;
 		const rawWtype = typeOf(tsType);
@@ -7724,7 +7732,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// it as the bare annotation made `wtypeOf` derive a plain scalar for a slot that is physically a
 		// nullable box -- so `b === undefined` on `b?: number` was rejected as "needs a nullable
 		// object-typed value" even though the box it is held in answers exactly that.
-		return !p.default && hasMod(p, 'optional')
+		if (calleeSide && T.unionMembers(tsType, scope).some(m => { const r = T.resolveOwn(m, scope); return r.type === 'literal' ? r.value === null : r.type === 'ref' && r.name === 'null'; }))
+			throw `param '${describeBinding(p.key)}': a default applied in the callee needs a type without 'null' -- an omitted argument arrives as null, so an explicit null would take the default too`;
+		return calleeSide ? { key: p.key, wtype: nullableWtype(boxed), tsType: T.combineTypes([tsType, T.UNDEFINED]), calleeDefault: { value: p.default!, tsType } }
+			: !p.default && hasMod(p, 'optional')
 			? { key: p.key, wtype: nullableWtype(boxed), tsType: T.combineTypes([tsType, T.UNDEFINED]) }
 			: { key: p.key, wtype: boxed, tsType };
 	}
@@ -7732,9 +7743,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// Resolves a whole param list left to right, growing the earlier-names/scope `resolveParam` needs to
 	// validate and type a default that reads an earlier parameter -- each param sees every param resolved
 	// before it (real JS default-evaluation order), never one declared after it.
-	function resolveParams(params: readonly JS.Param<Type>[]): ResolvedParam[] {
+	function resolveParams(params: readonly JS.Param<Type>[], home: Scope = libGlobal): ResolvedParam[] {
 		const earlierNames = new Set<string>();
-		const scope = new Scope(libGlobal);
+		const scope = new Scope(home);
 		return params.map(p => {
 			const r = resolveParam(p, earlierNames, scope);
 			if (typeof p.key === 'string') {
@@ -7897,7 +7908,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// `libGlobal` exactly as before.
 			const homeScope = (checkedType?.type === 'function' ? checkedType.declScope as Scope | undefined : undefined) ?? moduleScope;
 
-			const params	= resolveParams(decl.params);
+			const params	= resolveParams(decl.params, homeScope ?? libGlobal);
 			if (decl.rest?.typeAnnotation)
 				params.push({key: decl.rest.key, wtype: restParamWtype(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
 
@@ -9167,7 +9178,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (existing)
 			return existing;
 
-		const params		= resolveParams(ctor.params);
+		const params		= resolveParams(ctor.params, cls.declScope ?? libGlobal);
 		if (ctor.rest?.typeAnnotation)
 			params.push({key: ctor.rest.key, wtype: restParamWtype(ctor.rest.typeAnnotation)!, tsType: ctor.rest.typeAnnotation});
 
@@ -9358,7 +9369,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!result)
 			throw `'${fullName}' has an unsupported return type`;
 
-		const params		= resolveParams(decl.params);
+		const params		= resolveParams(decl.params, owner.declScope ?? libGlobal);
 		if (decl.rest?.typeAnnotation)
 			params.push({key: decl.rest.key, wtype: restParamWtype(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
 

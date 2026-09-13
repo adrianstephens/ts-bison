@@ -2499,6 +2499,10 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		const dt		= precise && T.widenLiterals(precise);
 		if (err && precise && anno && !checkAssignable(precise, anno, inner, (p as any).pos, inner, err))
 			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${show().type(precise)}' is not assignable to parameter type '${show().type(anno)}'`;
+		// Written back, as `applyContextualParams` writes a contextual one: the function's own type (`FixParams`) has no
+		// scope to type a non-literal default in, so `(s, seen = new Set<string>()) => ...` lost `seen`'s type.
+		if (!anno && dt)
+			p.typeAnnotation = typeof p.key === 'string' ? T.widenNullish(dt, inner) : dt;
 		if (typeof p.key === 'string') {
 			inner.addValue(p.key, anno ? T.optional(anno, hasMod(p, 'optional') && !p.default) : dt ? T.widenNullish(dt, inner) : T.ANY);
 		} else {
