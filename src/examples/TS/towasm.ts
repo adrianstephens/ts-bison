@@ -4252,9 +4252,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// thing it can hold is an object/array/function (`alwaysTruthy`). `Stmt | undefined` is the common
 		// case: the physical type collapsed to `any` because the union's members differ physically, not
 		// because the value could be a primitive.
-		if (typeof got === 'object' && (!('ref' in got && (got.ref === 'any' || got.ref === 'exn'))
+		// A concrete class ref holds that class or null whatever the checker's type says (printer.ts's `!!expr.operator.match(...)`,
+		// typed `any` there) -- so the null test stands, unless the class is a boxed primitive, where `0`/`''` are falsy too.
+		const refCls = typeof got === 'object' && 'ref' in got && got.ref !== 'any' && got.ref !== 'exn' ? ensureClass(got.ref) : undefined;
+		if (typeof got === 'object' && ((!('ref' in got && (got.ref === 'any' || got.ref === 'exn'))
 				? !T.isAny(T.resolveOwn(t, ctx.scope))
-				: alwaysTruthy(t, ctx.scope))) {
+				: alwaysTruthy(t, ctx.scope))
+				|| (!!refCls && !['number', 'boolean', 'string', 'bigint'].some(k => builtinTypeOwner(k) === refCls)))) {
 			if (got.nullable)
 				ctx.emit(I.ref.is_null, I.i32.eqz);
 			else

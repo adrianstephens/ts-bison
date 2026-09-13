@@ -7452,6 +7452,19 @@ async function main() {
 	}
 
 	{
+		// A value physically held as a class reference is that class or null, so `if (x)` is the null test even where the checker
+		// types it `any` (printer.ts's `!!expr.operator.match(/\\w+/)`).
+		const { refTruthyAsAny } = await compile(`
+			export function refTruthyAsAny(): number {
+				const m = 'ab12'.match(/[0-9]+/);
+				const none = 'abc'.match(/[0-9]+/);
+				return ((m as any) ? 1 : 0) + ((none as any) ? 10 : 0);
+			}
+		`);
+		check('refTruthyAsAny()', refTruthyAsAny(), 1);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
