@@ -1872,9 +1872,24 @@ Two separate general fixes, both found by writing the regression test FIRST:
 Survey: 3 newly compile, 39 moved, 68 -> 71/325. The `parseInt` rows only RELABELED (call to unknown
 function -> unresolved identifier) -- those closures now see `parseInt` as a free name; same blocker.
 
-**Next rows** (75/328 after the walker/printer rework): `'??=' needs a nullable object-typed target` 45;
-`unknown method 'parse'` 22; `only direct calls to named functions...` 21; `indexing is only supported on
-number[]/...` 17; `param 'value' needs an explicit type` 13; `unresolved identifier 'parseInt'` 12.
+## The `??=` row closed, 45 -> 22 -> 0 (2026-09-13)
+
+One defect in two places: a value that may be ABSENT had a NON-nullable slot, so it could neither read back
+`undefined` nor be tested by `??=`.
+- `addField` made every optional field nullable EXCEPT a boxed `any` (a carve-out from `6eedae0`, when `any`
+  was still non-null), whose default is a boxed `0` -- an absent `defaultSubstitution?: Type` read as `0`.
+- The dynamic-field protocol (`ensureAnyField`/`ensureAnyFieldWrite`: a property read or written through
+  `as any`, e.g. checker.ts's own statement stamp) used the non-null `any` for its value. Now nullable; the
+  receiver stays non-null.
+Compiled stayed 75/328 -- all 45 moved to later blockers, nothing regressed. **Lead**: `inferReturn` now stops
+at `local '$new$ref:any:true' redeclared with different type`, a scratch local keyed by wtype colliding; check
+whether the nullable `any` introduced it before anything else.
+
+**Next rows** (75/328): `unknown method 'RefType'` 24 (checker.ts, via type-utils.ts:62's module-level
+`TS.RefType('any')` -- a function called through a NAMESPACE import); `unknown method 'parse'` 22; `only
+direct calls to named functions...` 21; `indexing is only supported on number[]/...` 19; `internal: cannot
+convert arr:ref:true to i32` 18 (type-utils; the probe prints NO position -- needs a trace); `param 'value'
+needs an explicit type` 14.
 
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
