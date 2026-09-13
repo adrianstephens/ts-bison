@@ -6965,6 +6965,19 @@ async function main() {
 	}
 
 	{
+		// `x || undefined`: the right has no representation of its own, so it takes the whole expression's type, as a
+		// conditional's branch does (type-utils.ts `matchInfer`'s `a.elements.every(...) || undefined`).
+		const { orUndefined } = await compile(`
+			function kept(xs: number[]): boolean | undefined { return xs.every(x => x > 0) || undefined; }
+			export function orUndefined(): number {
+				const a = kept([1, 2]), b = kept([1, -1]);
+				return (a === true ? 10 : 0) + (b === undefined ? 1 : 0);
+			}
+		`);
+		check('orUndefined()', orUndefined(), 11);
+	}
+
+	{
 		// An array pattern over a non-array iterates, as JS does (`const [[name, arg]] = map`, type-utils.ts's `substituteType`).
 		const { destrMap, destrGen, destrDefaults, destrParam } = await compile(`
 			export function destrMap(): number { const m = new Map<string, number>([['ab', 7], ['c', 1]]); const [[k, v]] = m; return k.length * 10 + v; }

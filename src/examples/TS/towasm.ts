@@ -6298,13 +6298,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						}
 						const leftWtype		= wtypeOf(left, ctx);
 						const rightWtype	= wtypeOf(right, ctx);
-						if (!leftWtype || !rightWtype || leftWtype === 'void' || rightWtype === 'void')
+						if (!leftWtype || leftWtype === 'void' || rightWtype === 'void')
 							throw `'${operator}' needs both operands to have a representable value type`;
 						// Same rule `typeOf`'s own union case uses -- one shared physical form when both
 						// sides already agree, else the checker's own type for the whole expression (a real
 						// union, so boxed). Not taken from the checker outright: this stays correct even
 						// where its type for `&&` is narrower than the two operands together.
-						const wtype = wasmTypeEq(leftWtype, rightWtype) ? leftWtype : (wtypeOf(e, ctx) ?? REF_ANY);
+						// A right operand with no representation of its own (a bare `undefined`/`null`) is emitted into the whole
+						// expression's type, as a conditional's branch is: `every(...) || undefined` is a nullable boolean.
+						const wtype = rightWtype && wasmTypeEq(leftWtype, rightWtype) ? leftWtype : (wtypeOf(e, ctx) ?? REF_ANY);
 						const leftLocal = ctx.declareLocal(`$logic$left$${optionalTempCounter++}`, leftWtype);
 						emitAs(left, ctx, leftWtype);
 						ctx.emit(I.local.tee(leftLocal.index));
