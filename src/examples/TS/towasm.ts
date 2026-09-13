@@ -142,16 +142,24 @@ class TSWError {
 	msg:	string;
 	pos?:	Location;
 	scope:	string[] = [];
+	// The module `pos` is in, set where `pos` is (`inModule`): a position alone can't say which reached file it's in.
+	module?: string;
 	constructor(err: string|TSWError, node?: any, ...scope: string[]) {
 		if (err instanceof TSWError) {
 			this.msg	= err.msg;
 			this.pos		= err.pos ?? node?.pos;
+			this.module		= err.module;
 			this.scope		= [...err.scope, ...scope];
 		} else {
 			this.msg	= err;
 			this.pos		= node?.pos;
 			this.scope		= scope;
 		}
+	}
+	inModule(module: string): TSWError {
+		if (this.pos && !this.module)
+			this.module = module;
+		return this;
 	}
 	get message() {
 		return `tsw:${this.pos ? ` (${this.pos.line}:${this.pos.col})` : ''}${this.scope.map(i => ` in ${i}`).join('')} ${this.msg}`;
@@ -2234,6 +2242,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const offset = addData(bytes, 2);
 		strings.set(value, offset);
 		return offset;
+	}
+
+	// A body compiled later from the worklist, outside its declaration's own catch: names it, and falls back to its
+	// position and module for an error raised on a synthesized node that has none.
+	function withCatchAt(item: ()=>void, node: unknown, module: string, ...scopes: string[]) {
+		return () => {
+			try {
+				item();
+			} catch (e) {
+				throw new TSWError(e as any, node, ...scopes).inModule(module);
+			}
+		};
 	}
 
 	function withCatch(item: ()=>void, ...scopes: string[]) {
@@ -4958,7 +4978,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex };
 		closureLiterals.push(info);
 
-		worklist.push(withCatch(() => {
+		worklist.push(withCatchAt(() => {
 			const fnCtx		= new FunctionContext(e.name ?? '<anonymous>', new Scope(libGlobal), plainReturn(result, returnContext), undefined, ctx.homeModule);
 			// Env param first (real wasm param index 0), then this literal's own params -- `toFuncBody`'s `numParams` assumes the first `1 + params.length` declared locals are the real wasm params, in order.
 			const envParam	= fnCtx.declareLocal('#envParam', { typeIndex: envBase, nullable: false });
@@ -4999,7 +5019,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				emitStmt(Object.assign({ type: 'return', argument: body } as Stmt, { scope: (body as any).scope }), fnCtx);
 			}
 			info.body = fnCtx.toFuncBody(1 + params.length, toValType);
-		}));
+		}, e, ctx.homeModule, `${e.name ?? '<closure>'} in ${ctx.name}`));
 
 		// Creation site: `struct.new` pops fields in declaration order (`ensureClosureType`'s `[code,
 		// env]`), so the code pointer goes on the stack before the env struct. Each captured value is
@@ -6804,7 +6824,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			default:
 				throw `unsupported expression '${e.type}'`;
 		} } catch (err) {
-			throw new TSWError(err as any, e);
+			throw new TSWError(err as any, e).inModule(ctx.homeModule);
 		}
 	}
 
@@ -7916,7 +7936,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const {funcIndex, typeIndex} = registerFunc(toParams2(params), toResults(result));
 			const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation};
 			funcs.set(homeKey(homeModule, name), info);
-			worklist.push(withCatch(() => {
+			worklist.push(withCatchAt(() => {
 				const ctx	= new FunctionContext(name, new Scope(homeScope ?? libGlobal), plainReturn(result, decl.returnType as Type | undefined), undefined, homeModule);
 				ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
 				ctx.ownBody = decl.body!;
@@ -7924,7 +7944,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				emitStmts(decl.body!, ctx);
 				emitTrailingUnreachable(ctx, result);
 				info.body		= ctx.toFuncBody(params.length, toValType);
-			}));
+			}, decl, homeModule, name));
 			return info;
 
 		} catch (e) {
@@ -8987,7 +9007,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				}
 			} catch (e) {
 				//console.log(e);
-				throw new TSWError(e as any, m);
+				throw new TSWError(e as any, m).inModule(info.homeModule ?? '.');
 			}
 		}
 
@@ -9047,7 +9067,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			try {
 				inlineMethods.set(i.key, makeAsm(i.value, defines, i.typeParams, w => typeof w === 'object' && 'arr' in w ? ensureArrayType(w.arr) : undefined));
 			} catch (err) {
-				throw new TSWError(err as any, i.value);
+				throw new TSWError(err as any, i.value).inModule(info.homeModule ?? '.');
 			}
 		}
 
@@ -10525,7 +10545,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				ctx.emit(...ctx.swapOut(before));
 			} catch (e) {
 				ctx.swapOut(before);
-				onTopLevelError(new TSWError(e as any, st, '<module init>'));
+				onTopLevelError(new TSWError(e as any, st, '<module init>').inModule(ctx.homeModule));
 			}
 		};
 		const emitOneTopLevel = (st: Stmt) => {
