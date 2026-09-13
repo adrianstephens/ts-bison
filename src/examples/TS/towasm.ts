@@ -5152,7 +5152,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// (`closureFuncSigType`'s `defaults`, built from the field/variable's own declared TYPE, not
 			// this literal), since nothing ever calls this literal's own compiled function directly while
 			// skipping an argument; `call_ref` always supplies a real value for every physical param.
-			return noteEarlier(p, {key: p.key, wtype: hasMod(p, 'optional') ? nullableWtype(boxed) : boxed, tsType: (p.typeAnnotation ?? ctx?.tsType)! });
+			// The type widens with the slot, as `resolveParam`'s does: left bare, `x ?? d` read `x` as never nullish and dropped `?? d`.
+			const tsType = (p.typeAnnotation ?? ctx?.tsType)!;
+			return hasMod(p, 'optional') ? noteEarlier(p, { key: p.key, wtype: nullableWtype(boxed), tsType: T.combineTypes([tsType, T.UNDEFINED]) })
+				: noteEarlier(p, { key: p.key, wtype: boxed, tsType });
 		});
 		// The callee's own rest array becomes this literal's last physical parameter, whether or not the
 		// literal spelled a rest -- the two must agree on the physical signature.

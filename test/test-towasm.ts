@@ -7249,6 +7249,17 @@ async function main() {
 	}
 
 	{
+		// A closure literal's optional parameter is `T | undefined` in its body, as its slot is: `b ?? 10` must test it.
+		const { closureOptionalParam } = await compile(`
+			export function closureOptionalParam(): number {
+				const f = (a: number, b?: number) => a + (b ?? 10);
+				return f(1) + f(1, 2) * 100;
+			}
+		`);
+		check('closureOptionalParam()', closureOptionalParam(), 311);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
