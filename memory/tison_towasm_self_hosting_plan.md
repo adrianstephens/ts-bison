@@ -2009,6 +2009,24 @@ on number[]/...` 19 (not strings, see above); `only direct calls...` 21 -- core.
 explicit type` 18; `cannot convert arr:ref:true to i32` 18; `unsupported expression 'instantiation'` 16 --
 `export const CallSig = JS.CallSig<Type>` (ts-parser.ts:29).
 
+**Dynamic calls, `fn.length`, and the arity rule (2026-09-13, late)**. Item 4 done per the user's decision: a callee
+typed `any` dispatches over every registered closure type (`ensureAnyCallDispatch`; `ClosureTypeInfo` keeps its `sig`;
+candidates filtered to those each argument physically converts to), and `obj?.m(args)` on an `any` receiver takes
+`ensureAnyDispatch` inside the null guard (318f402, 8ca74d3). Limit: a closure type first registered in the late
+worklist is not a candidate. Then core.ts `has0args` needed `fn.length`: a closure is now `{code, env, length}`
+(`CLOSURE_FIELDS`, field 2 of the closure base, so `code`/`env` reads did not move). A literal or function value stores
+`jsLength` (params before the first default), and a coercion wrapper copies the original's, since it is the same function.
+**Miscompile found by the test**: `isAssignable`'s function case never looked at parameters, so `(a, b) => number` was
+assignable to `() => number` even in precise mode, and `staticGuard` folded `has0args(f2)` to `true`, deleting the live
+branch. Fixed with TS's arity rule (`minArgumentCount` = getMinArgumentCount). **Lesson**: `staticGuard` DELETES code on
+precise assignability, so any leniency left in precise mode is a miscompile, not a missed error. Still lenient there:
+parameter TYPES, an object with a call member as any function, a missing return type. Open: a function with a defaulted
+trailing parameter cannot be coerced to a shorter signature (the wrapper knows wasm signatures, not defaults).
+Survey after these: 87/334, no new ERR rows; `only direct calls` 22 and `closure parameter 'name'` 20 gone (their
+declarations moved on to `unknown field 'type'` 20 and the object-literal row, 2 -> 23). The skipped `JSON.parse` row now
+reads `unresolved identifier 'JSON'` 26. Next found: `TS.CallSig(...)` (ts-parser `export const CallSig = JS.CallSig<Type>`)
+is a namespace member that is a VALUE, and the call path only took function declarations; global `parseInt` is missing.
+
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
 my own grep filter (`grep -v 'free=\[\]'`) hid the decisive log line for three rounds: when a probe prints
