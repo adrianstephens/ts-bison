@@ -5305,7 +5305,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		closureLiterals.push(info);
 		// A body naming itself as a VALUE (checker.ts `typeOf`'s `recurse`, captured by arrows inside it) binds its name to the
 		// closure it runs as: its own code over the env it was given. A direct self-call stays direct (`selfCall` is tried first).
-		const selfType = allowSelfCall && e.name && namesSelfAsValue(body, e.name)
+		// Not where the function's own parameters or body re-bind the name (printer.ts `function typeArgs(typeArgs?: Type[])`): those
+		// references are to that binding, and a local for the function itself would collide with it.
+		const selfType = allowSelfCall && e.name && !ownBoundNames(paramNames(e.params, e.rest), body).has(e.name) && namesSelfAsValue(body, e.name)
 			? (e as { scope?: Scope }).scope?.value(e.name) ?? checkerTypeOf({ ...e, type: 'function' } as Expr, ctx.typeScope)
 			: undefined;
 

@@ -7392,6 +7392,20 @@ async function main() {
 	}
 
 	{
+		// A nested function whose own parameter shadows its name (printer.ts `function typeArgs(typeArgs?: Type[])`): the mentions
+		// inside it are that parameter's, so the function does not also bind its own name.
+		const { shadowedSelfName } = await compile(`
+			export function shadowedSelfName(): number {
+				function typeArgs(typeArgs?: number[]): number {
+					return typeArgs ? [typeArgs].map(typeArgs => typeArgs.length)[0] : 0;
+				}
+				return typeArgs([1, 2, 3]) * 10 + typeArgs();
+			}
+		`);
+		check('shadowedSelfName()', shadowedSelfName(), 30);
+	}
+
+	{
 		// An array pattern's default applies exactly where the element is `undefined`: past the end, or present as `undefined`.
 		// `null` is a value and keeps it, as JS does.
 		const { patternDefaults } = await compile(`
