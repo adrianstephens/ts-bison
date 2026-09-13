@@ -8,7 +8,7 @@ import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
 import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
 import { Walker, walk, walkB } from './walker';
 import { Output } from './tocode';
-import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary, patternBindings } from './transform';
+import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
 import * as WAT from '../wat-parser';
 
@@ -743,8 +743,8 @@ class FunctionContext {
 				const tmpName = `#param$${i}`;
 				this.declareValue(tmpName, p.wtype, p.tsType);
 				const incoming: Expr = { type: 'identifier', name: tmpName };
-				const value = p.calleeDefault ? { type: 'binary', operator: '??', left: incoming, right: p.calleeDefault.value } as Expr : incoming;
-				pending.push(...(typeof p.key === 'string' ? [JS.VarDecl('let', JS.Var<Type>(p.key, value, p.calleeDefault!.tsType))] : patternBindings('let', p.key, value)));
+				pending.push(JS.VarDecl('let', JS.Var<Type>(p.key,
+					p.calleeDefault ? { type: 'binary', operator: '??', left: incoming, right: p.calleeDefault.value } as Expr : incoming, p.calleeDefault?.tsType)));
 			}
 		});
 		return pending;
@@ -2711,6 +2711,86 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// per-instantiation substitution `ctx.scope` has; the checker's own internal tracking can otherwise
 	// fully structurally resolve a value where `ctx.scope` keeps its clean nominal `ref`) -- none of which
 	// this needs to enumerate, since they only ever matter once a union is actually in play.
+	// A non-array with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable; an array stays indexed.
+	function iteratesByProtocol(e: Expr, ctx: FunctionContext): T.IterationTypes | undefined {
+		const t = narrowedTypeOf(e, ctx);
+		if (objectArrayKind(e, ctx) || !T.lookupMember(t, '[Symbol.iterator]', ctx.typeScope))
+			return undefined;
+		const it = T.iterationTypes(t, ctx.typeScope);
+		if (!it)
+			throw `'${T.typeKey(t)}' has '[Symbol.iterator]()' but its iterator has no 'next()'`;
+		return it;
+	}
+
+	// `iterator.next()`: JS sends `undefined` to a `next` that takes a value (a generator's).
+	function nextCall(iterator: Expr, it: T.IterationTypes, ctx: FunctionContext): Expr {
+		return JS.Call(JS.Member(iterator, 'next'), T.isNullish(it.next, ctx.typeScope) ? [] : [{ type: 'identifier', name: 'undefined' }]);
+	}
+
+	// A destructuring pattern bound from `value` one level at a time: each level is materialized into a typed temp first, so
+	// an array pattern indexes an array/tuple and iterates anything else, decided from that level's own type.
+	function emitPatternBinding(kind: JS.DeclarationKind, target: BindingTarget, value: Expr, typeAnnotation: Type | undefined, ctx: FunctionContext): void {
+		if (typeof target === 'string') {
+			emitStmt(JS.VarDecl(kind, JS.Var(target, value, typeAnnotation)), ctx);
+			return;
+		}
+		const temp = (): Expr => ({ type: 'identifier', name: `#destructure$${destructureTempCounter++}` });
+		const declare = (id: Expr, init: Expr, type?: Type) => emitStmt(JS.VarDecl('const', JS.Var((id as { name: string }).name, init, type)), ctx);
+		const tmp = temp();
+		declare(tmp, value, typeAnnotation);
+
+		if (target.type === 'array_pattern') {
+			const it = iteratesByProtocol(tmp, ctx);
+			if (!it) {
+				// A default is LENGTH-guarded, not `?? default`: reading past an array's end traps in wasm rather than giving `undefined`.
+				target.elements.forEach((el, i) => {
+					if (!el)
+						return;
+					const elem = JS.Index(tmp, Literal(i));
+					emitPatternBinding(kind, el.target, el.default
+						? { type: 'conditional', test: Binary<Expr, '<'>('<', Literal(i), JS.Member(tmp, 'length')), consequent: elem, alternate: el.default } as Expr
+						: elem, undefined, ctx);
+				});
+				if (target.rest)
+					emitPatternBinding(kind, target.rest, JS.Call(JS.Member(tmp, 'slice'), [Literal(target.elements.length)]), undefined, ctx);
+				return;
+			}
+			const iterator = temp();
+			declare(iterator, JS.Call(JS.Member(tmp, '[Symbol.iterator]'), []));
+			for (const el of target.elements) {
+				const r = temp();
+				declare(r, nextCall(iterator, it, ctx));	// a hole still advances
+				if (!el)
+					continue;
+				const got = JS.Member(r, 'value');
+				emitPatternBinding(kind, el.target, el.default
+					? { type: 'conditional', test: JS.Member(r, 'done'), consequent: el.default, alternate: Binary('??', got, el.default) } as Expr
+					: got, el.default ? undefined : it.yield, ctx);
+			}
+			if (target.rest) {
+				const rest = temp(), r = temp();
+				declare(rest, { type: 'array', elements: [] } as Expr, TS.ArrayType(it.yield));
+				emitStmt(JS.For(
+					JS.VarDecl('let', JS.Var((r as { name: string }).name, nextCall(iterator, it, ctx))),
+					JS.JSUnary('!', JS.Member(r, 'done')),
+					{ type: 'assign', target: r, value: nextCall(iterator, it, ctx) } as Expr,
+					{ type: 'expression' as const, expression: JS.Call(JS.Member(rest, 'push'), [JS.Member(r, 'value')]) },
+				), ctx);
+				emitPatternBinding(kind, target.rest, rest, undefined, ctx);
+			}
+			return;
+		}
+
+		if (target.rest)
+			throw "a rest property ('...') in an object destructuring pattern is not supported";
+		for (const prop of target.properties) {
+			if (typeof prop.key !== 'string')
+				throw "a computed key ('[expr]') in an object destructuring pattern is not supported";
+			const propExpr = JS.Member(tmp, prop.key);
+			emitPatternBinding(kind, prop.value, prop.default ? Binary('??', propExpr, prop.default) : propExpr, undefined, ctx);
+		}
+	}
+
 	function narrowedTypeOf(e: Expr, ctx: FunctionContext): Type {
 		const unwrapped = unwrapAs(e);
 		const base = checkerTypeOf(unwrapped, ctx.scope);
@@ -4986,12 +5066,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// Each parameter the callee's rest covers, read back out of that one array -- synthesized as
 			// real `let x = #rest[k]` statements so the ordinary indexing path types and emits them. The
 			// declared type has to ride along, or the binding reads back as the rest's own element type.
-			pending.unshift(...restBound.flatMap((p, k) => {
-				const read = { type: 'index', object: { type: 'identifier', name: '#rest' }, index: Literal(k) } as Expr;
-				return typeof p.key === 'string'
-					? [JS.VarDecl('let', JS.Var<Type>(p.key, read, p.typeAnnotation ?? wantSig!.restElem!.tsType))]
-					: patternBindings('let', p.key, read);
-			}));
+			pending.unshift(...restBound.map((p, k) => JS.VarDecl('let', JS.Var<Type>(p.key,
+				{ type: 'index', object: { type: 'identifier', name: '#rest' }, index: Literal(k) } as Expr, p.typeAnnotation ?? wantSig!.restElem!.tsType))));
 			// The cast-down env local (or, with no captures, just the param itself) is declared after the real params, so it's a genuine local, not mistaken for one more wasm param.
 			let envLocal	= envParam;
 			if (fields) {
@@ -6217,7 +6293,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// `a ?? b` -- `a`'s combined-with-`b` type drives the `if`'s result. A left that can never
 					// actually be null/undefined makes `b` provably dead code -- same conclusion real TS's
 					// own type checker would reach -- so it's evaluated and returned directly, no runtime
-					// check at all; `patternBindings` relies on exactly this for a destructuring default on
+					// check at all; `emitPatternBinding` relies on exactly this for a destructuring default on
 					// an already-non-nullable value (an ordinary array element, a non-optional object field).
 					case '??': {
 						const wtype = wtypeOf(e, ctx);
@@ -6960,12 +7036,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// desugars into plain `var_decl`s reading their own piece back off it -- emitted
 						// directly (not wrapped in a `block`) since these bindings belong to the *same*
 						// scope as the original `var_decl`, not a nested one.
-						const tmpName = `#destructure$${destructureTempCounter++}`;
-						for (const stmt of [
-							JS.VarDecl('const', JS.Var(tmpName, d.init, d.typeAnnotation)),
-							...patternBindings(s.kind, d.name, { type: 'identifier', name: tmpName }),
-						])
-							emitStmt(stmt, ctx);
+						emitPatternBinding(s.kind, d.name, d.init, d.typeAnnotation, ctx);
 						continue;
 					}
 					// Type computed before emitting the init, so the init can be emitted via `emitAs` straight into the local's declared representation.
@@ -7219,7 +7290,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// destructuring pattern (`for (const [k, v] of pairs)`) -- `JS.Var`'s own `name: BindingTarget`
 						// already carries either through unchanged, and the synthesized `var_decl` this desugars into
 						// (`JS.VarDecl(s.init.kind, JS.Var(v.name, ...))` below) is handled the same generic way any
-						// other pattern-typed `var_decl` already is (`hoistVar`/`patternBindings`) -- nothing here
+						// other pattern-typed `var_decl` already is (`hoistVar`/`emitPatternBinding`) -- nothing here
 						// needs to know or care which shape `v.name` is.
 						if (s.init.type !== 'var_decl' || s.init.declarations.length !== 1)
 							throw "'for...of' loop variable must be a single declaration";
@@ -7228,20 +7299,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const n			= forTempCounter++;
 						// A non-array with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable: `next()` until
 						// `done`. `for...of` sends `undefined` to a `next` that takes a value (a generator's). Arrays stay indexed below.
-						const srcT = narrowedTypeOf(s.right, ctx);
-						if (!objectArrayKind(s.right, ctx) && T.lookupMember(srcT, '[Symbol.iterator]', ctx.typeScope)) {
-							const it = T.iterationTypes(srcT, ctx.typeScope);
-							if (!it)
-								throw `'for...of': '${T.typeKey(srcT)}' has '[Symbol.iterator]()' but its iterator has no 'next()'`;
+						const it = iteratesByProtocol(s.right, ctx);
+						if (it) {
 							const itId: Expr	= { type: 'identifier', name: `#for${n}$it` };
 							const rId: Expr		= { type: 'identifier', name: `#for${n}$r` };
-							const next = (): Expr => JS.Call(JS.Member(itId, 'next'), T.isNullish(it.next, ctx.typeScope) ? [] : [{ type: 'identifier', name: 'undefined' }]);
 							emitStmt(JS.Block<Stmt>(
 								JS.VarDecl('const', JS.Var(`#for${n}$it`, JS.Call(JS.Member(s.right, '[Symbol.iterator]'), []))),
 								JS.For(
-									JS.VarDecl('let', JS.Var(`#for${n}$r`, next())),
+									JS.VarDecl('let', JS.Var(`#for${n}$r`, nextCall(itId, it, ctx))),
 									JS.JSUnary('!', JS.Member(rId, 'done')),
-									{ type: 'assign', target: rId, value: next() } as Expr,
+									{ type: 'assign', target: rId, value: nextCall(itId, it, ctx) } as Expr,
 									JS.Block<Stmt>(JS.VarDecl(s.init.kind, JS.Var(v.name, JS.Member(rId, 'value'), v.typeAnnotation ?? it.yield)), s.body),
 								),
 							), ctx);

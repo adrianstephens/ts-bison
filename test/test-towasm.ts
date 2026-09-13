@@ -6876,6 +6876,22 @@ async function main() {
 	}
 
 	{
+		// An array pattern over a non-array iterates, as JS does (`const [[name, arg]] = map`, type-utils.ts's `substituteType`).
+		const { destrMap, destrGen, destrDefaults, destrParam } = await compile(`
+			export function destrMap(): number { const m = new Map<string, number>([['ab', 7], ['c', 1]]); const [[k, v]] = m; return k.length * 10 + v; }
+			function* gen(): Generator<number, void, unknown> { yield 1; yield 2; yield 3; yield 4; }
+			export function destrGen(): number { const [a, , b, ...rest] = gen(); return a * 1000 + b * 100 + rest.length * 10 + rest[0]; }
+			export function destrDefaults(): number { const [x, y = 9, z = 5] = new Set<number>([2]); return x * 100 + y * 10 + z; }
+			function takesPair([a, b]: Set<number>): number { return a * 10 + b; }
+			export function destrParam(): number { return takesPair(new Set<number>([3, 4])); }
+		`);
+		check('destrMap()', destrMap(), 27);
+		check('destrGen()', destrGen(), 1314);
+		check('destrDefaults()', destrDefaults(), 295);
+		check('destrParam()', destrParam(), 34);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {
