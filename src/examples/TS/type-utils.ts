@@ -1273,7 +1273,12 @@ function isAbstract(t: Type, scope: Scope): boolean {
 		// '.', so a namespace-qualified type (`TS.Stmt`) looked unbound and every conditional over one
 		// stayed deferred: `Extract<TS.Stmt, {type:'module_decl'}>` resolved to `never` despite `TS.Stmt`
 		// resolving perfectly well to its 33 members.
-		case 'ref':				return !t.typeArgs && !t.name.includes('.') && !INTRINSIC_TYPES.has(t.name) && !isClassRef(t, scope) && (!scope.type(t.name) || !!scope.type(t.name)?.isTypeParam);
+		// Looked up where `resolve` looks it up, in the ref's own `declScope`: a stamped member of an imported union
+		// (`EnumDecl` in `Stmt & {type:'switch'}`) is unknown to the ambient scope, and treating it as unbound kept it unreduced.
+		case 'ref': {
+			const home = t.declScope as Scope ?? scope;
+			return !t.typeArgs && !t.name.includes('.') && !INTRINSIC_TYPES.has(t.name) && !isClassRef(t, home) && (!home.type(t.name) || !!home.type(t.name)?.isTypeParam);
+		}
 		case 'indexed_access':	return isAbstract(t.object, scope) || isAbstract(t.index, scope);
 		default:				return false;
 	}

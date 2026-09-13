@@ -1965,7 +1965,22 @@ return type" (towasm.ts `compileGeneratorFunc`); `void` works. (3) `for...of` ov
 (`[[a, b], [b, a]] as const`, checker.ts `narrow`) fails "unknown field 'length'" -- a tuple is neither
 array-kind nor iterable to towasm.
 
-**Next rows** (77/330): `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts. **User, 2026-09-13:
+**Progress 2026-09-13, "biggest rows first" (user's choice)**: 78 -> 80 -> 86/330. Fixed: lib find/findIndex
+predicates `=> unknown` (arr:ref->i32 24 -> 0); spread of any iterable; a type parameter never infers from a leaked
+copy of itself (flatMap's `[]` typed `U[]`; param 'value' 18 -> 0); lib `flat()` + `staticGuard` (a type guard its
+argument's type settles is folded, the dead branch not compiled); `x || undefined`; lib `at`; discriminant vs a
+literal-UNION comparand narrows; instantiation expressions as values; `typeof` as a value (run-time cascade);
+collecting-constructor field locals. **Lesson (again)**: removing the leaked-`U` leniency exposed a real
+checker gap (literal-union narrowing) as a NEW checker ERR -- fixed the gap, did not restore the leniency. Diff the
+cause table's ERR rows after every checker/lib change. `typeof` on a fully dynamic `any` inherits
+`emitTypeofTest`'s limit: an i32 array (`boolean[]`) tests as 'bigint'.
+`Stmt & { type: 'switch' }` (checker.ts `clausesNeverFallOut`/`noCaseMatched`) lost `cases` in towasm: FIXED.
+type-utils `isAbstract` treated a stamped member of an imported union (`EnumDecl`) as an unbound type parameter
+because the AMBIENT scope did not know it, while `resolve` looks it up in the ref's own `declScope`. So the
+distributed intersection kept every conflicting member. It now looks up in `declScope ?? scope`, as `resolve` does.
+
+**Next rows** (86/330): `unknown field 'name'` 32; `unknown method 'reduce'` 18 (the Stmt intersection above);
+`unknown method 'some'` 15; `closure parameter 'name' needs an explicit ... type` 13; `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts. **User, 2026-09-13:
 skip tableCache.ts entirely for now** -- do not work this row, and do not touch tableCache.ts; `indexing is only supported
 on number[]/...` 19 (not strings, see above); `only direct calls...` 21 -- core.ts:185 `params[0](...)`, calling an
 `any`-typed value, which needs a calling convention for closures boxed as `any`; `param 'value' needs an

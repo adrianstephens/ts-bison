@@ -7020,6 +7020,27 @@ async function main() {
 	}
 
 	{
+		// An intersection of an IMPORTED union with a discriminant reduces to the matching member, even though the union's
+		// members are known only where it is declared (checker.ts's `stmt: Stmt & { type: 'switch' }`).
+		const { importedUnionIntersection } = await compileMulti({
+			lib: `
+				export interface A { type: 'a'; x: number }
+				export interface B { type: 'b'; items: number[] }
+				export type U = A | B;
+			`,
+			main: `
+				import type { U } from './lib';
+				function count(b: U & { type: 'b' }): number { return b.items.length; }
+				export function importedUnionIntersection(): number {
+					const u: U = { type: 'b', items: [1, 2, 3] };
+					return u.type === 'b' ? count(u) : 0;
+				}
+			`,
+		}, 'main');
+		check('importedUnionIntersection()', importedUnionIntersection(), 3);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {
