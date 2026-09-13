@@ -2677,8 +2677,20 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 // gets re-evaluated with that branch's narrowing in effect, not the pre-`if` scope) so the
 // post-if type can merge the branches.
 function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; rights: { expr: Expr; scope: Scope }[] } | undefined {
-	if (st.type === 'expression' && st.expression.type === 'assign' && !st.expression.operator && st.expression.target.type === 'identifier' && (!name || st.expression.target.name === name))
-		return { name: st.expression.target.name, rights: [{ expr: st.expression.value, scope }] };
+	if (st.type === 'expression') {
+		// The assignment may sit anywhere in the expression (towasm.ts `bindingIn`'s `c.names.set(name, b = {...})`), which TS's own
+		// flow analysis narrows at just the same. Never inside a closure there: that runs later, if at all.
+		let found: { name: string; value: Expr } | undefined;
+		walkerB(undefined, (e, process) => {
+			if (e.type === 'arrow' || e.type === 'function')
+				return false;
+			if (e.type === 'assign' && !e.operator && e.target.type === 'identifier' && (!name || e.target.name === name))
+				found = { name: e.target.name, value: e.value };
+			return process(e);
+		}).body(st.expression);
+		if (found)
+			return { name: found.name, rights: [{ expr: found.value, scope }] };
+	}
 
 	if (st.type === 'block' && st.body.length) {
 		// Not just the last statement: `if (!x) { x = e; bookkeeping(); }` assigns `x` before unrelated further work --

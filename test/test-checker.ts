@@ -144,6 +144,8 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// TS's `T[number]`: a computed index reads any position, an optional one contributing `undefined` too.
 	['a tuple indexed by a computed number reads any position', 'declare const i: number; const t = [1, "a"] as const; const q: boolean = t[i];', ['is not assignable']],
 	['a tuple indexed by a computed number includes an optional position', 'declare function f(t: [number, string?], i: number): void; const g = (t: [number, string?], i: number) => { const q: number = t[i]; };', ['is not assignable']],
+	// TS narrows at an assignment wherever it sits, so a branch that assigns inside a call argument still settles the type after it.
+	['an assignment nested in a call argument narrows after the branch', 'interface B { v: number } declare const m: Map<string, B>; function f(k: string): B { let b = m.get(k); if (!b) { m.set(k, b = { v: 1 }); } return b; }', []],
 ];
 
 (async () => {
