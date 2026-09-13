@@ -7334,6 +7334,20 @@ async function main() {
 	}
 
 	{
+		// A `this`-reassigning method on a conditional receiver (type-utils.ts `(done ? returns : yields).push(v)`): the grown array
+		// is written back to whichever branch it came from.
+		const { conditionalPush } = await compile(`
+			export function conditionalPush(): number {
+				const evens: number[] = [], odds: number[] = [];
+				for (let i = 0; i < 7; i++)
+					(i % 2 === 0 ? evens : odds).push(i);
+				return evens.length * 10 + odds.length + evens[3] * 100;
+			}
+		`);
+		check('conditionalPush()', conditionalPush(), 643);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

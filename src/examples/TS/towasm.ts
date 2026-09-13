@@ -5008,6 +5008,38 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				ctx.emit(I.ref.as_non_null);
 			return inner;
 		} else {
+			// `(c ? a : b).push(x)` (type-utils.ts `iterationTypes`): a `this`-reassigning method's write-back goes to whichever
+			// branch the receiver came from, so the test is held and both the read and the write branch on it.
+			if (target.type === 'conditional') {
+				const test = ctx.temp(`$ctarget$${optionalTempCounter++}`, 'i32');
+				emitTruthy(target.test, ctx);
+				ctx.emit(I.local.set(test));
+				const _outer	= ctx.swapOut();
+				const a			= emitAssignTarget(target.consequent, ctx, old);
+				const _readA	= ctx.swapOut();
+				const b			= emitAssignTarget(target.alternate, ctx, old);
+				const _readB	= ctx.swapOut(_outer);
+				if (!wasmTypeEq(a.wtype, b.wtype))
+					throw `cannot assign to a conditional whose branches differ ('${wasmTypeKey(a.wtype)}' and '${wasmTypeKey(b.wtype)}')`;
+				ctx.emit(I.local.get(test), I.if(old === 'none' ? undefined : toValType(a.wtype), _readA, _readB));
+				const savedOld = old === 'keep' ? ctx.temp(scratchName('$old', a.wtype), a.wtype) : undefined;
+				if (savedOld !== undefined)
+					ctx.emit(I.local.tee(savedOld));
+				return { wtype: a.wtype, old: savedOld, write: tee => {
+					const val = ctx.temp(scratchName('$new', a.wtype), a.wtype);
+					ctx.emit(I.local.set(val));
+					const _o = ctx.swapOut();
+					ctx.emit(I.local.get(val));
+					a.write(false);
+					const _writeA = ctx.swapOut();
+					ctx.emit(I.local.get(val));
+					b.write(false);
+					ctx.emit(I.local.get(test), I.if(undefined, _writeA, ctx.swapOut(_o)));
+					if (tee)
+						ctx.emit(I.local.get(val));
+					return val;
+				} };
+			}
 			throw `cannot assign to ${target.type}`;
 		}
 	}
