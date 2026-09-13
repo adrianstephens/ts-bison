@@ -2725,11 +2725,19 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 		if (depth < 0)
 			return;
 		if (paramT.type === 'ref' && !paramT.typeArgs && tparams.has(paramT.name)) {
+			// A member naming one of the callee's own type parameters that is no type parameter at the call site can only have
+			// leaked in through context (an empty `[]` typed against the unsolved `U[]`): as in TS, a parameter never infers from itself.
+			const leaked	= (m: Type) => m.type === 'ref' && !m.typeArgs && tparams.has(m.name) && !scope.type(m.name)?.isTypeParam;
+			const members	= argT.type === 'union' ? argT.types : [argT];
+			const own		= members.filter(m => !leaked(m));
+			if (!own.length)
+				return;
+			const src		= own.length === members.length ? argT : combineTypes(own);
 			if (!out.has(paramT.name)) {
 				const tp = tparams.get(paramT.name)!;
 				// Widening a literal argument (`'string'` -> `string`) is the usual default, but not when the type param's constraint is
 				// itself a union of literals (`K extends 'string' | 'number'`) -- the widened form would fall outside the constraint.
-				found(paramT.name, tp.const || tp.constraint?.type === 'keyof' || (!!tp.constraint && isLiteralOnly(resolveOwn(tp.constraint, scope), scope) === true) ? argT : widenLiterals(argT));
+				found(paramT.name, tp.const || tp.constraint?.type === 'keyof' || (!!tp.constraint && isLiteralOnly(resolveOwn(tp.constraint, scope), scope) === true) ? src : widenLiterals(src));
 			}
 			return;
 		}

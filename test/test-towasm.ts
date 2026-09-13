@@ -6921,6 +6921,20 @@ async function main() {
 	}
 
 	{
+		// A type parameter never infers from itself: `flatMap(t => c ? [t.name] : [])`'s `[]` is typed against the unsolved `U[]`,
+		// and taking `U` from it left `Set<U>` with nothing to represent (type-utils.ts's `combineTypes`).
+		const { flatMapInfer } = await compile(`
+			interface N { name: string }
+			export function flatMapInfer(): number {
+				const xs: N[] = [{ name: 'a' }, { name: 'bcd' }, { name: 'ef' }];
+				const s = new Set(xs.flatMap(t => t.name.length > 1 ? [t.name] : []));
+				return s.size * 10 + (s.has('bcd') ? 1 : 0);
+			}
+		`);
+		check('flatMapInfer()', flatMapInfer(), 21);
+	}
+
+	{
 		// An array pattern over a non-array iterates, as JS does (`const [[name, arg]] = map`, type-utils.ts's `substituteType`).
 		const { destrMap, destrGen, destrDefaults, destrParam } = await compile(`
 			export function destrMap(): number { const m = new Map<string, number>([['ab', 7], ['c', 1]]); const [[k, v]] = m; return k.length * 10 + v; }
