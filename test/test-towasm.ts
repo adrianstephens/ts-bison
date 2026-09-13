@@ -7194,6 +7194,46 @@ async function main() {
 	}
 
 	{
+		// A literal argument, called through a closure value, against a rest typed by a UNION of tuples (js-parser.ts
+		// `CallSigParams<T>`): the closure's signature carries the rest's type to the call, as a function's does.
+		const { closureTupleRest } = await compile(`
+			interface Params<T> { params: T[]; rest?: T }
+			interface Sig<T> extends Params<T> { ret?: T; extra?: number }
+			type SigArgs<T> = [Sig<T>] | [Params<T>] | [Params<T>, T | undefined] | [T[]];
+			function count<T>(...args: SigArgs<T>): number {
+				return Array.isArray(args[0]) ? 0 : (args[0] as Params<T>).rest as number;
+			}
+			export function closureTupleRest(): number {
+				const f = count<number>;
+				return f({ params: [1, 2], rest: 3 }, 4);
+			}
+		`);
+		check('closureTupleRest()', closureTupleRest(), 3);
+	}
+
+	{
+		// The same through a namespace alias, with the rest's union declared only in the callee's module (type-utils.ts
+		// `TS.CallSig({params, rest})`, ts-parser.ts `CallSig = JS.CallSig<Type>`).
+		const { nsTupleRestLiteral } = await compileMulti({
+			base: `
+				export interface Params<T> { params: T[]; rest?: T }
+				export interface Sig<T> extends Params<T> { ret?: T; extra?: number }
+				export type SigArgs<T> = [Sig<T>] | [Params<T>] | [Params<T>, T | undefined] | [T[]];
+				export function count<T>(...args: SigArgs<T>): number { return Array.isArray(args[0]) ? 0 : (args[0] as Params<T>).rest as number; }
+			`,
+			mid: `
+				import * as B from './base';
+				export const countN = B.count<number>;
+			`,
+			main: `
+				import * as M from './mid';
+				export function nsTupleRestLiteral(): number { return M.countN({ params: [1, 2], rest: 3 }, 4); }
+			`,
+		}, 'main');
+		check('nsTupleRestLiteral()', nsTupleRestLiteral(), 3);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

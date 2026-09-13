@@ -2408,6 +2408,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (!wt || wt === 'void')
 				throw "a function type's rest parameter needs an explicit array type";
 			params.push(wt);
+			resolvedParams.push({ key: func.rest.key, wtype: wt, tsType: func.rest.typeAnnotation });
 			hasRest = true;
 			const element = arrayPartOf(func.rest.typeAnnotation)?.element;
 			const ewt = element && typeOf(element);
@@ -5116,14 +5117,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 			return r;
 		};
+		const wantParam = (i: number) => i < fixedCount ? wantSig?.resolvedParams?.[i] : undefined;
 		const params = ownParams.map((p, i): ResolvedParam => {
 			if (p.default) {
-				const fromWant = p.typeAnnotation ? undefined : wantSig?.resolvedParams?.[i];
+				const fromWant = p.typeAnnotation ? undefined : wantParam(i);
 				return noteEarlier(p, resolveParam(fromWant ? { ...p, typeAnnotation: fromWant.tsType } : p, earlier, defaultScope));
 			}
 			// An UNANNOTATED parameter takes the callee's declared one, for the same reason `result` does
 			// above -- `Rules<T>(self => [...])` and every `Rule([...], $ => ...)` can name it no other way.
-			const ctx = p.typeAnnotation ? undefined : wantSig?.resolvedParams?.[i];
+			const ctx = p.typeAnnotation ? undefined : wantParam(i);
 			// See `closureFuncSigType`'s own identical comment -- box a real but wasm-unrepresentable
 			// `void` as `any` rather than reject otherwise-valid source.
 			const wt = p.typeAnnotation ? typeOf(p.typeAnnotation) : ctx?.wtype;
