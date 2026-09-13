@@ -3001,6 +3001,11 @@ export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6, 
 	}
 	const protocol = (key: string): IterationTypes | undefined => {
 		const iterator	= findFunctionType(lookupMember(t, key, scope) ?? NEVER, scope)?.returnType;
+		// An iterator that is itself a global Iterator/Generator reference is read off its type arguments, as TS's
+		// getIterationTypesOfIteratorFast does: `next()`'s bundled IteratorResult can't split `value` by `done`.
+		const fastIterator	= iterator && globalIterationTypes(substituteThisType(iterator, t), scope, key === '[Symbol.asyncIterator]', true);
+		if (fastIterator)
+			return fastIterator;
 		const nextSig	= iterator && findFunctionType(lookupMember(substituteThisType(iterator, t), 'next', scope) ?? NEVER, scope);
 		const next		= nextSig?.returnType;
 		if (!next)

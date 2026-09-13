@@ -6876,6 +6876,25 @@ async function main() {
 	}
 
 	{
+		// A Map/Set's iterator is a Generator: its yield comes off the type arguments, not `next()`'s bundled
+		// IteratorResult, whose `value: Y | R` made `x` below `string | void` and this a type error.
+		const { iterTyped } = await compile(`
+			function len(s: string): number { return s.length; }
+			export function iterTyped(): number {
+				const st = new Set<string>(['ab', 'c']);
+				const m = new Map<string, number>([['xyz', 4]]);
+				let n = 0;
+				for (const x of st)
+					n += len(x);
+				for (const [k, v] of m)
+					n += len(k) * 10 + v;
+				return n;
+			}
+		`);
+		check('iterTyped()', iterTyped(), 37);
+	}
+
+	{
 		// An array pattern over a non-array iterates, as JS does (`const [[name, arg]] = map`, type-utils.ts's `substituteType`).
 		const { destrMap, destrGen, destrDefaults, destrParam } = await compile(`
 			export function destrMap(): number { const m = new Map<string, number>([['ab', 7], ['c', 1]]); const [[k, v]] = m; return k.length * 10 + v; }

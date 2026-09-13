@@ -1941,11 +1941,32 @@ the body's position. The indexing error also prints the indexed expression and i
 pattern to indexing (`#destructure$0[0]`), right only for arrays/tuples. `const [[name, arg]] = map`
 (type-utils.ts `substituteType`) indexes a Map, and `for (const [l, r] of [[..], [..]] as const)` in
 checker.ts `narrow` iterates a tuple whose element type comes out `any`. JS uses the iteration protocol
-here. OPEN, needs a design choice: materialize (`[...src]`, simple, but eagerly drains a generator) or lower
-to the iterator protocol towasm's `for_of` uses (exact).
+here. **Correction**: towasm has NO iterator protocol -- its `for...of` lowers EVERY source to
+`arr.length` + `arr[i]`, so `for (const [k, v] of map)` and `for (const x of gen())` fail too ("unknown
+field 'length'"). **User, 2026-09-13: implement the iteration protocol** (`[Symbol.iterator]()`/`next()`),
+keeping the indexed path for arrays, over materializing. The checker already has it (`T.iterationTypes`,
+`T.memberKey` gives `'[Symbol.iterator]'`); towasm and the lib do not.
+Implementation: a computed-key method registers under `T.memberKey`'s name; `iteratesByProtocol` (a non-array
+with `[Symbol.iterator]`) drives both `for...of` and array patterns (`emitPatternBinding`, towasm-owned, one
+typed temp per level -- transform.ts's `patternBindings` is type-blind and always indexes). Map/Set iterate
+live through the lib generator `__towasm_indexed`.
+**Regression I committed in `6ec2275`, fixed next**: iterating a Map/Set takes the checker's PROTOCOL path
+(`[Symbol.iterator]()` returns a Generator, then `next()`'s bundled IteratorResult types `value` as `Y | R`),
+not the Generator fast path I claimed. So `for (const n of someSet)` made `n: string | void`, and 14 survey
+blocks became checker ERRs. The survey's "moved to a new cause" line hid it. Fix: `iterationTypes` reads an
+iterator that is a global Iterator/Generator ref off its type args, as TS's getIterationTypesOfIteratorFast
+does. **Lesson**: after any lib or checker change, diff the cause TABLE for new rows (especially `ERR:`),
+not just the survey's "Since" summary.
+**Open, found doing it**: (1) the lib's `IteratorResult` is ONE class (`value: Y | R; done: boolean`), not
+TS's discriminated union, so `T.iterationTypes` can't split `value` by `done` for a user iterator class that
+returns it -- its yield comes out `Y | R`. Faithful fix: make it TS's union and have `compileGeneratorFunc`
+build the shape. (2) a generator returning `undefined` (`Generator<T, undefined, N>`) throws "unsupported
+return type" (towasm.ts `compileGeneratorFunc`); `void` works. (3) `for...of` over a TUPLE value
+(`[[a, b], [b, a]] as const`, checker.ts `narrow`) fails "unknown field 'length'" -- a tuple is neither
+array-kind nor iterable to towasm.
 
-**Next rows** (77/330): `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts, which also needs
-zlib/crypto host modules and turning parsed dynamic objects into typed structs; `indexing is only supported
+**Next rows** (77/330): `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts. **User, 2026-09-13:
+skip tableCache.ts entirely for now** -- do not work this row, and do not touch tableCache.ts; `indexing is only supported
 on number[]/...` 19 (not strings, see above); `only direct calls...` 21 -- core.ts:185 `params[0](...)`, calling an
 `any`-typed value, which needs a calling convention for closures boxed as `any`; `param 'value' needs an
 explicit type` 18; `cannot convert arr:ref:true to i32` 18; `unsupported expression 'instantiation'` 16 --
