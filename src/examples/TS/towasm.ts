@@ -961,6 +961,46 @@ function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<stri
 	).body(body);
 }
 
+// Whether a nested function's body names it other than as the callee of a direct self-call: a value use, or any mention
+// inside a closure within it (a capture). Such a body needs its own name bound (`emitClosureLiteral`).
+function namesSelfAsValue(body: Stmt[] | Expr, name: string): boolean {
+	let found = false;
+	const inClosure = (fn: Parameters<typeof collectClosureFreeVars>[1], self: string | undefined) => {
+		const free = new Set<string>();
+		collectClosureFreeVars(new Set(), fn, self, free);
+		return free.has(name);
+	};
+	walkB(
+		(st, process) => {
+			if (found)
+				return false;
+			if (st.type === 'function_decl') {
+				found = inClosure(st, st.name);
+				return false;
+			}
+			return process(st);
+		},
+		(e, process) => {
+			if (found)
+				return false;
+			if (e.type === 'identifier') {
+				found = e.name === name;
+				return false;
+			}
+			if (e.type === 'arrow' || e.type === 'function') {
+				found = inClosure(e, e.type === 'function' ? e.name : undefined);
+				return false;
+			}
+			if (e.type === 'call' && e.callee.type === 'identifier' && e.callee.name === name) {
+				found = e.arguments.some(a => namesSelfAsValue(a as Expr, name));
+				return false;
+			}
+			return process(e);
+		}
+	).body(body);
+	return found;
+}
+
 // A closure's free variables: its body's and its parameter defaults', since a default runs inside the callee.
 function collectClosureFreeVars(outer: Set<string>, fn: { params: JS.Param<Type>[]; rest?: JS.Rest<Type>; body?: Stmt[] | Expr }, selfName: string | undefined, free: Set<string>) {
 	const body = fn.body ?? [];
@@ -5252,6 +5292,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const { funcIndex, typeIndex }	= registerFuncAtType(funcTypeIndex);
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex };
 		closureLiterals.push(info);
+		// A body naming itself as a VALUE (checker.ts `typeOf`'s `recurse`, captured by arrows inside it) binds its name to the
+		// closure it runs as: its own code over the env it was given. A direct self-call stays direct (`selfCall` is tried first).
+		const selfType = allowSelfCall && e.name && namesSelfAsValue(body, e.name)
+			? (e as { scope?: Scope }).scope?.value(e.name) ?? checkerTypeOf({ ...e, type: 'function' } as Expr, ctx.typeScope)
+			: undefined;
 
 		worklist.push(withCatchAt(() => {
 			const fnCtx		= new FunctionContext(e.name ?? '<anonymous>', new Scope(libGlobal), plainReturn(result, returnContext), undefined, ctx.homeModule);
@@ -5272,6 +5317,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			fnCtx.closureEnv = { envLocal, envTypeIndex, fields: fields ?? new Map() };
 			if (allowSelfCall && e.name)
 				fnCtx.selfCall = info;
+			if (selfType) {
+				fnCtx.emit(I.ref.func(funcIndex), I.local.get(envParam.index), I.i32.const(jsLength(e.params)), I.struct.new(structTypeIndex));
+				fnCtx.emit(I.local.set(fnCtx.declareValue(e.name!, { closure: sig }, selfType).index));
+			}
 			for (const name of capturedNames) {
 				const tsType = ctx.scope.value(name);
 				if (tsType)

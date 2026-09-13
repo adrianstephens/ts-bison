@@ -7364,6 +7364,21 @@ async function main() {
 	}
 
 	{
+		// A nested function naming itself as a value (checker.ts `typeOf`'s `recurse`, called from arrows inside itself): captured by an
+		// inner closure, and passed on as a callback.
+		const { selfRefClosure } = await compile(`
+			export function selfRefClosure(): number {
+				const r = rec(3);
+				function rec(n: number): number { return n <= 0 ? 0 : [n - 1].map(m => rec(m))[0] + 1; }
+				const apply = (f: (x: number) => number, x: number) => f(x);
+				function count(n: number): number { return n <= 0 ? 0 : apply(count, n - 1) + 1; }
+				return r * 100 + count(4);
+			}
+		`);
+		check('selfRefClosure()', selfRefClosure(), 304);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
