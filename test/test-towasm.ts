@@ -6740,6 +6740,27 @@ async function main() {
 	}
 
 	{
+		// A key written onto a receiver typed only as a type parameter lands on whatever reaches it: a direct call's
+		// argument, one forwarded through another generic, and -- the stamper passed as a VALUE and applied to a
+		// callback's result -- that callback's returned object (the parsers' `makeRule(stampPos)` shape).
+		const { stampDirect, stampForwarded, stampViaValue } = await compile(`
+			interface Leaf { kind: "leaf"; v: number }
+			interface Pair { kind: "pair"; a: number; b: number }
+			function tagIt<T>(t: T): T { Object.defineProperty(t, "tag", { value: 42 }); return t; }
+			function viaForward<T>(t: T): T { return tagIt(t); }
+			function withCommon(common: <T>(t: T) => T, action: () => Leaf): () => Leaf { return () => common(action()); }
+			function makeLeaf(): Leaf { return { kind: "leaf", v: 1 }; }
+			function tagOf(x: unknown): number { return (x as any).tag as number; }
+			export function stampDirect(): number { const p: Pair = { kind: "pair", a: 1, b: 2 }; tagIt(p); return tagOf(p); }
+			export function stampForwarded(): number { const p: Pair = { kind: "pair", a: 3, b: 4 }; viaForward(p); return tagOf(p) + p.a; }
+			export function stampViaValue(): number { const f = withCommon(tagIt, makeLeaf); const l = f(); return tagOf(l) + l.v; }
+		`);
+		check('stampDirect()', stampDirect(), 42);
+		check('stampForwarded()', stampForwarded(), 45);
+		check('stampViaValue()', stampViaValue(), 43);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

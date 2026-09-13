@@ -828,6 +828,12 @@ function scratchName(prefix: string, wtype: WasmType): string {
 
 // `as` is a pure pass-through in codegen (`case 'as'` just compiles `e.expression`), but `checkerTypeOf`
 // still honors the asserted type -- any codegen-facing type/owner lookup must unwrap it first or it sees a fictional type, wrongly losing method/owner dispatch on the real underlying value.
+// A structural shape's expando identity: its member names. A named shape and its anonymous twin share it, so they get
+// the same expando fields and `layoutTwin` can still merge them.
+function shapeKey(members: readonly TS.TypeMember[]): string {
+	return `#shape#${members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string' ? [m.key] : []).sort().join(',')}`;
+}
+
 function unwrapAs(e: Expr): Expr {
 	while (e.type === 'as')
 		e = e.expression;
@@ -4474,6 +4480,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// which has no way to express that at all.
 		const local  = ctx.lookup(targetExpr.name);
 		const owner  = local && typeof local.wtype !== 'string' && 'ref' in local.wtype ? ensureClass(local.wtype.ref) : undefined;
+		// An erased receiver (a generic's `T`, `any`): the key's slot is on whichever structs reach it
+		// (`collectReceivedExpandos`), so the write dispatches on the runtime struct, as `(x as any).k = v` does.
+		if (!owner && local && typeof local.wtype !== 'string' && 'ref' in local.wtype && local.wtype.ref === 'any') {
+			emitAs(targetExpr, ctx, REF_ANY);
+			emitAs(valueProp.value, ctx, REF_ANY_NULLABLE);
+			ctx.emit(I.call(ensureAnyFieldWrite(key, ctx).funcIndex));
+			return emitExpr(targetExpr, ctx);
+		}
 		if (!owner)
 			throw `'Object.defineProperty': '${targetExpr.name}' needs a known class type`;
 
@@ -8425,6 +8439,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!spec)
 			return;
 		if (spec === 'dynamic') {
+			if (info.fieldIndex.has('#ext'))
+				return;
 			const map = ensureClass('Map', [TS.RefType('string'), T.ANY]);
 			if (!map)
 				throw `internal: 'Map' isn't available for '${name}''s own dynamic expando`;
@@ -8513,6 +8529,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 
 		addExpandoFields(info, declName);
+		addExpandoFields(info, shapeKey(members));
 		types[info.typeIndex] = {
 			final: everFinal,
 			supertypes: [], type: {
@@ -9972,25 +9989,34 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// annotation for exactly this reason. Not scope-precise: over-approximating adds an unused
 		// optional field to a shape, which costs a slot and breaks nothing.
 		const annots = new Map<string, Type>();
-		const note = (recv: Expr, key: string | undefined, scope: Scope) => {
-			// The RAW type, never `T.resolve`'s: resolving a ref expands it to its object shape and loses
-			// the NAME. Resolved only to discover a union hiding behind an alias.
-			const bare	= unwrapAs(recv);
-			const raw	= (bare.type === 'identifier' ? annots.get(bare.name) : undefined) ?? checkerTypeOf(bare, scope);
-			// Every member of a union gets the slot: the write lands on whichever one it turns out to be
-			// at runtime. A shape with no name (an inline object type), a generic instantiation, or a
-			// non-`ref` (an array, a primitive) has nowhere to put one.
-			for (const part of T.unionMembers(raw, scope)) {
-				if (part.type !== 'ref' || part.typeArgs?.length)
+		// Every member of a union gets the slot: the write lands on whichever one it turns out to be at runtime. A
+		// generic instantiation shares its shape's one struct, keyed by the bare name (`ensureObjectShape`), and an
+		// array is `Array`'s. A shape with no name (an inline object type) or a type parameter has nowhere to put one.
+		// A structural shape (an interface, an alias, an inline object type) by its member names -- `shapeKey`, the
+		// identity `layoutTwin` merges by, so a named shape and its anonymous twin keep one layout. A class by name.
+		const noteType = (raw: Type, key: string | undefined, scope: Scope) => {
+			for (const member of T.unionMembers(raw, scope)) {
+				const part = member.type === 'array' || member.type === 'tuple' ? TS.RefType('Array') : member;
+				if (part.type === 'ref' && (T.isAny(part) || scope.type(part.name)?.isTypeParam))
 					continue;
-				const prior = pendingExtensions.get(part.name);
+				const isClass	= part.type === 'ref' && (T.isClassRef(part, scope) || LIB_DECL_MAP.get(part.name)?.type === 'class_decl');
+				const shape		= part.type === 'object' ? part : part.type === 'ref' && !isClass ? resolveObjectType(part, scope) : undefined;
+				const name		= shape ? shapeKey(shape.members) : part.type === 'ref' ? part.name : undefined;
+				if (!name)
+					continue;
+				const prior = pendingExtensions.get(name);
 				if (prior === 'dynamic')
 					continue;
 				if (key === undefined)
-					pendingExtensions.set(part.name, 'dynamic');
-				else if (!T.lookupMember(part, key, scope))
-					pendingExtensions.set(part.name, [...new Set([...(prior ?? []), key])]);
+					pendingExtensions.set(name, 'dynamic');
+				else if (!(shape ? shape.members.some(m => 'key' in m && m.key === key) : T.lookupMember(part, key, scope)))
+					pendingExtensions.set(name, [...new Set([...(prior ?? []), key])]);
 			}
+		};
+		// The RAW type, never `T.resolve`'s: resolving a ref expands it to its object shape and loses the NAME.
+		const note = (recv: Expr, key: string | undefined, scope: Scope) => {
+			const bare = unwrapAs(recv);
+			noteType((bare.type === 'identifier' ? annots.get(bare.name) : undefined) ?? checkerTypeOf(bare, scope), key, scope);
 		};
 		for (const [moduleId, m] of moduleBodies) {
 			const modScope = moduleScopeOf(moduleId);
@@ -10019,6 +10045,278 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						note(e.arguments[0], e.arguments[1]?.type === 'literal' && typeof e.arguments[1].value === 'string' ? e.arguments[1].value : undefined, scope);
 					return process(e);
 				}).statements(m.body);
+		}
+		collectReceivedExpandos(noteType);
+	}
+
+	// A key written onto a receiver whose static type names no struct -- a type parameter, `any`, `object` -- lands on
+	// whatever that receiver holds at runtime, and only its SOURCES say what that is. So the receiver is followed
+	// backwards -- a parameter to its callers' arguments, a local to what is assigned to it, a call to what its callees
+	// return, with function values tracked, since a stamper passed as a value (`makeRule(stampPos)`) is called through
+	// a parameter -- down to types that name a struct. Flow- and context-insensitive: over-approximating only adds an
+	// unused optional slot. Not followed: a function value stored into an object or array field and called from there.
+	function collectReceivedExpandos(noteType: (t: Type, key: string, scope: Scope) => void) {
+		interface Fn		{ params: (Binding | undefined)[]; returns: Site[]; declaredReturn?: Type; callers: Set<Call> }
+		interface Binding	{ param?: { fn: Fn; index: number }; fn?: Fn; values: Site[]; declared?: Type; declScope?: Scope }
+		interface Container	{ parent?: Container; names: Map<string, Binding>; moduleId: string; fn?: Fn }
+		interface Site		{ e: Expr; c: Container; scope: Scope; from?: Fn }
+		interface Call		{ callee: Site; args: (Site | undefined)[] }
+
+		const fnOf			= new Map<object, Fn>();
+		const moduleOf		= new Map<object, string>();
+		const containerOf	= new Map<string, Container>();
+		const bindings: Binding[]	= [];
+		const calls: Call[]			= [];
+		const assigns: { target: Site; value: Site }[]	= [];
+		const seeds: { s: Site; key: string }[]			= [];
+
+		const bindingIn = (c: Container, name: string): Binding => {
+			let b = c.names.get(name);
+			if (!b) {
+				c.names.set(name, b = { values: [] });
+				bindings.push(b);
+			}
+			return b;
+		};
+		const enter = (node: object, sig: TS.CallSig, c: Container, scope: Scope): Container => {
+			const contextual	= (node as { contextualType?: Type }).contextualType;
+			const fn: Fn		= { params: [], returns: [], callers: new Set(), declaredReturn: sig.returnType ?? (contextual?.type === 'function' ? contextual.returnType : undefined) };
+			fnOf.set(node, fn);
+			const inner: Container = { parent: c, names: new Map(), moduleId: c.moduleId, fn };
+			sig.params.forEach((p, index) => {
+				if (typeof p.key === 'string') {
+					const b: Binding = { param: { fn, index }, values: [], declared: p.typeAnnotation, declScope: scope };
+					inner.names.set(p.key, fn.params[index] = b);
+					bindings.push(b);
+				}
+			});
+			return inner;
+		};
+		// Some part of the receiver's own type names no struct, so its own type cannot say where the key lands.
+		const untyped = (recv: Expr, scope: Scope) => T.unionMembers(checkerTypeOf(unwrapAs(recv), scope), scope).some(m =>
+			m.type !== 'ref' || T.isAny(m) || m.name === 'object' || !!scope.type(m.name)?.isTypeParam);
+
+		for (const [moduleId, m] of moduleBodies) {
+			const modScope = moduleScopeOf(moduleId);
+			if (!modScope)
+				continue;
+			let c: Container = { names: new Map(), moduleId };
+			containerOf.set(moduleId, c);
+			for (const st of m.body)
+				moduleOf.set(st.type === 'export_decl' ? st.declaration : st, moduleId);
+			let scope = modScope;
+			const site = (e: Expr): Site => ({ e, c, scope });
+			const within = (inner: Container, process: () => boolean) => {
+				const saved = c;
+				c = inner;
+				const r = process();
+				c = saved;
+				return r;
+			};
+			walkB(
+				(st, process) => {
+					const savedScope = scope;
+					scope = (st as unknown as { scope?: Scope }).scope ?? scope;
+					let r: boolean;
+					if (st.type === 'function_decl' && st.body) {
+						const inner = enter(st, st, c, scope);
+						bindingIn(c, st.name).fn ??= fnOf.get(st);
+						r = within(inner, () => process(st));
+					} else {
+						if (st.type === 'var_decl') {
+							for (const d of st.declarations) {
+								if (typeof d.name !== 'string')
+									continue;
+								const b = bindingIn(c, d.name);
+								b.declared ??= d.typeAnnotation;
+								b.declScope ??= scope;
+								if (d.init)
+									b.values.push(site(d.init));
+							}
+						} else if (st.type === 'return' && st.argument && c.fn) {
+							c.fn.returns.push(site(st.argument));
+						}
+						r = process(st);
+					}
+					scope = savedScope;
+					return r;
+				},
+				(e, process) => {
+					if (e.type === 'arrow' || e.type === 'function') {
+						const inner = enter(e, e, c, scope);
+						const fn = fnOf.get(e)!;
+						if (e.type === 'function' && e.name)
+							inner.names.set(e.name, { fn, values: [] });
+						return within(inner, () => {
+							if (e.type === 'arrow' && !Array.isArray(e.body))
+								fn.returns.push(site(e.body));
+							return process(e);
+						});
+					}
+					if (e.type === 'call') {
+						calls.push({ callee: site(e.callee), args: e.arguments.map(a => a.type === 'spread' ? undefined : site(a)) });
+						const key = e.arguments[1];
+						if (isDefinePropertyCall(e) && e.arguments[0] && key?.type === 'literal' && typeof key.value === 'string' && untyped(e.arguments[0], scope))
+							seeds.push({ s: site(e.arguments[0]), key: key.value });
+					} else if (e.type === 'assign') {
+						if (e.target.type === 'identifier')
+							assigns.push({ target: site(e.target), value: site(e.value) });
+						else if (e.target.type === 'member' && untyped(e.target.object, scope))
+							seeds.push({ s: site(e.target.object), key: e.target.property });
+					}
+					return process(e);
+				},
+				undefined,
+				(member, process) => (member.type === 'method' || member.type === 'get' || member.type === 'set') && 'body' in member && member.body
+					? within(enter(member, member as TS.CallSig, c, scope), () => process(member))
+					: process(member)
+			).statements(m.body);
+		}
+
+		const lookup = (name: string, c: Container): Binding | undefined => {
+			for (let k: Container | undefined = c; k; k = k.parent) {
+				const b = k.names.get(name);
+				if (b)
+					return b;
+			}
+			const imported = namedImportsByModule.get(c.moduleId)?.get(name);
+			return imported && containerOf.get(imported.module)?.names.get(imported.name);
+		};
+		// An identifier, or `NS.name` through an `import * as NS`.
+		const bindingOf = (s: Site, e: Expr): Binding | undefined => {
+			if (e.type === 'identifier')
+				return lookup(e.name, s.c);
+			if (e.type === 'member' && e.object.type === 'identifier' && !lookup(e.object.name, s.c)) {
+				const decl = s.scope.namespace(e.object.name)?.decl(e.property);
+				const home = decl && moduleOf.get(decl);
+				return home !== undefined ? containerOf.get(home)?.names.get(e.property) : undefined;
+			}
+			return undefined;
+		};
+		for (const { target, value } of assigns)
+			bindingOf(target, target.e)?.values.push(value);
+
+		// The functions each parameter or local may hold -- to a fixpoint, since a parameter holds what its callers
+		// pass, and who its callers are depends on which functions each callee expression may hold.
+		const held = new Map<Binding, Set<Fn>>();
+		const fnsOf = (s: Site, seen = new Set<Expr>()): Set<Fn> => {
+			const e	= unwrapAs(s.e);
+			const out	= new Set<Fn>();
+			if (seen.has(e))
+				return out;
+			seen.add(e);
+			const add = (x: Expr) => fnsOf({ ...s, e: x }, seen).forEach(f => out.add(f));
+			if (e.type === 'arrow' || e.type === 'function') {
+				out.add(fnOf.get(e)!);
+			} else if (e.type === 'identifier' || e.type === 'member') {
+				const b = bindingOf(s, e);
+				if (b?.fn)
+					out.add(b.fn);
+				else if (b)
+					held.get(b)?.forEach(f => out.add(f));
+			} else if (e.type === 'call') {
+				for (const g of fnsOf({ ...s, e: e.callee }, seen))
+					for (const r of g.returns)
+						fnsOf(r, seen).forEach(f => out.add(f));
+			} else if (e.type === 'conditional') {
+				add(e.consequent);
+				add(e.alternate);
+			} else if (e.type === 'binary' && (e.operator === '&&' || e.operator === '||' || e.operator === '??')) {
+				add(e.left);
+				add(e.right);
+			}
+			return out;
+		};
+		for (let changed = true; changed;) {
+			changed = false;
+			const hold = (b: Binding | undefined, fs: Set<Fn>) => {
+				if (!b || b.fn || !fs.size)
+					return;
+				let set = held.get(b);
+				if (!set)
+					held.set(b, set = new Set());
+				for (const f of fs)
+					if (!set.has(f)) {
+						set.add(f);
+						changed = true;
+					}
+			};
+			for (const call of calls)
+				for (const g of fnsOf(call.callee)) {
+					if (!g.callers.has(call)) {
+						g.callers.add(call);
+						changed = true;
+					}
+					g.params.forEach((p, i) => {
+						const a = call.args[i];
+						if (a)
+							hold(p, fnsOf(a));
+					});
+				}
+			for (const b of bindings)
+				for (const v of b.values)
+					hold(b, fnsOf(v));
+		}
+
+		// Each receiver, followed back to its sources.
+		const reached	= new Map<string, Set<Expr>>();
+		const work		= [...seeds];
+		while (work.length) {
+			const { s, key } = work.pop()!;
+			// A cast states the type the value is used as -- which names its struct where the value's own type may not.
+			let e = s.e;
+			for (; e.type === 'as'; e = e.expression)
+				noteType(e.typeAnnotation, key, s.scope);
+			let seen = reached.get(key);
+			if (!seen)
+				reached.set(key, seen = new Set());
+			if (seen.has(e))
+				continue;
+			seen.add(e);
+			const follow = (x: Expr, from = s.from) => work.push({ s: { ...s, e: x, from }, key });
+			let followed = false;
+			const b = e.type === 'identifier' || e.type === 'member' ? bindingOf(s, e) : undefined;
+			if (b && !b.fn) {
+				if (b.declared)
+					noteType(b.declared, key, b.declScope ?? s.scope);
+				if (b.param)
+					for (const call of b.param.fn.callers) {
+						const a = call.args[b.param.index];
+						if (a) {
+							work.push({ s: a, key });
+							followed = true;
+						}
+					}
+				for (const v of b.values) {
+					work.push({ s: v, key });
+					followed = true;
+				}
+			} else if (e.type === 'call') {
+				for (const g of fnsOf({ ...s, e: e.callee }))
+					for (const r of g.returns) {
+						work.push({ s: { ...r, from: g }, key });
+						followed = true;
+					}
+			} else if (e.type === 'conditional') {
+				follow(e.consequent);
+				follow(e.alternate);
+				followed = true;
+			} else if (e.type === 'binary' && (e.operator === '&&' || e.operator === '||' || e.operator === '??')) {
+				follow(e.left);
+				follow(e.right);
+				followed = true;
+			} else if (e.type === 'object') {
+				// A spread copies its source's shape into this one.
+				for (const p of e.properties)
+					if (p.type === 'spread')
+						follow(p.operand, undefined);
+			}
+			if (followed)
+				continue;
+			// Nothing further to follow: the value is made here, or comes from where this analysis does not look.
+			if (s.from?.declaredReturn)
+				noteType(s.from.declaredReturn, key, s.scope);
+			noteType(checkerTypeOf(e, s.scope), key, s.scope);
 		}
 	}
 	collectExpandoFields();
