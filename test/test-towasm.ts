@@ -7348,6 +7348,22 @@ async function main() {
 	}
 
 	{
+		// A value typed `never` (an exhausted switch's `default:`) read through `as any` is `any` (tocode.ts `(type as any).type`).
+		const { neverAsAny } = await compile(`
+			type Shape = { kind: 'a'; n: number } | { kind: 'b'; m: number };
+			function describe(s: Shape): number {
+				switch (s.kind) {
+					case 'a': return s.n;
+					case 'b': return s.m;
+					default: return (s as any).kind === 'x' ? 1 : 2;
+				}
+			}
+			export function neverAsAny(): number { return describe({ kind: 'a', n: 5 }) + describe({ kind: 'b', m: 7 }) * 10; }
+		`);
+		check('neverAsAny()', neverAsAny(), 75);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`

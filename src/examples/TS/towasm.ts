@@ -2842,6 +2842,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	function narrowedTypeOf(e: Expr, ctx: FunctionContext): Type {
 		const unwrapped = unwrapAs(e);
+		const t = narrowedValueTypeOf(unwrapped, ctx);
+		// A value typed `never` (an exhausted switch's `default:`, tocode.ts `(type as any).type`) has no type but the asserted one.
+		return unwrapped !== e && !T.unionMembers(t, ctx.scope).length ? checkerTypeOf(e, ctx.typeScope) : t;
+	}
+
+	function narrowedValueTypeOf(unwrapped: Expr, ctx: FunctionContext): Type {
 		const base = checkerTypeOf(unwrapped, ctx.scope);
 		// `any` counts as well as a real union: a field read off a NARROWED union receiver (`w.body`
 		// inside `if (w.kind === 'w')`) has no baseline type at all, because `ctx.scope` still sees `w` as
@@ -7157,7 +7163,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// No single static owner -- if the receiver is genuinely `any`, a real runtime dispatch can still resolve it, same as real JS would.
 						// Checked via the checker's own type, not `wtypeOf` (gives `undefined`, not `REF_ANY`,
 						// for a genuinely `any`-typed expression). `want ?? REF_ANY`: a bare expression-statement calls `emitExpr` with no `want` at all, and `REF_ANY` is always a safe target (`coerceTop` widens to it).
-						if (T.isAny(checkerTypeOf(unwrapAs(obj), ctx.scope)) && !e.arguments.some(a => a.type === 'spread')) {
+						if (T.isAny(narrowedTypeOf(obj, ctx)) && !e.arguments.some(a => a.type === 'spread')) {
 							emitAs(obj, ctx, REF_ANY);
 							const info = ensureAnyDispatch(e.callee.property, e.arguments.map(a => emitExpr(a, ctx)), e.arguments.map(a => narrowedTypeOf(a, ctx)), want ?? REF_ANY, ctx);
 							ctx.emit(I.call(info.funcIndex));
@@ -7230,7 +7236,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				}
 
 				// A callee typed `any` (core.ts `params[0](() => rules)`): dispatched over the program's closure types.
-				if (T.isAny(checkerTypeOf(unwrapAs(e.callee), ctx.scope)) && !e.arguments.some(a => a.type === 'spread')) {
+				if (T.isAny(narrowedTypeOf(e.callee, ctx)) && !e.arguments.some(a => a.type === 'spread')) {
 					emitAs(e.callee, ctx, REF_ANY);
 					const info = ensureAnyCallDispatch(e.arguments.map(a => emitExpr(a, ctx)), want ?? REF_ANY);
 					ctx.emit(I.call(info.funcIndex));
