@@ -207,7 +207,7 @@ export class Array<T> {
 		Array._copy(result, 0, scratch, 0, n);
 		return result;
 	}
-	find(callback: (value: T, index: number, array: this) => boolean, thisArg?: any): T | undefined {
+	find(callback: (value: T, index: number, array: this) => unknown, thisArg?: any): T | undefined {
 		for (let i = 0; i < this.length; i++) {
 			if (callback(this[i], i, this))
 				return this[i];
@@ -216,7 +216,7 @@ export class Array<T> {
 		// specifies for no match.
 		return undefined;
 	}
-	findIndex(callback: (value: T, index: number, array: this) => boolean, thisArg?: any): number {
+	findIndex(callback: (value: T, index: number, array: this) => unknown, thisArg?: any): number {
 		for (let i = 0; i < this.length; i++) {
 			if (callback(this[i], i, this))
 				return i;

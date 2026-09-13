@@ -6895,6 +6895,19 @@ async function main() {
 	}
 
 	{
+		// A `find`/`findIndex` predicate returns `unknown`, as TS's lib declares, and is tested for truthiness:
+		// type-utils.ts's `find(m => literalKeys(m))` returns an array or undefined, not a boolean.
+		const { findTruthy } = await compile(`
+			function keysOf(n: number): string[] | undefined { return n > 2 ? ['k'] : undefined; }
+			export function findTruthy(): number {
+				const xs = [1, 3, 5];
+				return (xs.find(x => keysOf(x)) ?? 0) * 10 + xs.findIndex(x => keysOf(x));
+			}
+		`);
+		check('findTruthy()', findTruthy(), 31);
+	}
+
+	{
 		// An array pattern over a non-array iterates, as JS does (`const [[name, arg]] = map`, type-utils.ts's `substituteType`).
 		const { destrMap, destrGen, destrDefaults, destrParam } = await compile(`
 			export function destrMap(): number { const m = new Map<string, number>([['ab', 7], ['c', 1]]); const [[k, v]] = m; return k.length * 10 + v; }
