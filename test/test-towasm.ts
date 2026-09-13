@@ -7137,6 +7137,38 @@ async function main() {
 	}
 
 	{
+		// JS `fn.length` (core.ts `has0args`): the parameters before the first default, for a literal, a function value, a
+		// coerced closure (still the same function), a union of function types, an optional chain and an `any` receiver.
+		const { fnLength } = await compile(`
+			function has0args(fn: (() => number) | ((a: number, b: number) => number)): fn is () => number { return fn.length === 0; }
+			function two(a: number, b = 1): number { return a + b; }
+			function one(a: number): number { return a; }
+			function pickFn(b: boolean): ((a: number) => number) | undefined { return b ? one : undefined; }
+			export function fnLength(): number {
+				const f0 = () => 7;
+				const f2 = (a: number, b: number) => a + b;
+				const d = (a: number, b = 2, c = 3) => a + b + c;
+				let r = 0;
+				if (has0args(f0))
+					r += f0();
+				if (!has0args(f2))
+					r += f2(10, 20);
+				r += d.length * 100;
+				const g = two;
+				r += g.length * 1000;
+				const x: any = f2;
+				r += (x.length as number) * 10000;
+				const k: (a: number) => number = f0;
+				r += k.length * 100000;
+				r += (pickFn(false)?.length ?? 5) * 1000000;
+				r += (pickFn(true)?.length ?? 5) * 10000000;
+				return r;
+			}
+		`);
+		check('fnLength()', fnLength(), 15021137);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

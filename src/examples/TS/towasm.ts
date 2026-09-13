@@ -416,6 +416,15 @@ interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?
 interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
 interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number; sig: FuncSig }
+// A function value's own properties that its closure struct stores, by field index (after `code` and `env`).
+const CLOSURE_FIELDS = new Map([['length', 2]]);
+
+// JS `fn.length`: the parameters before the first defaulted one; a rest parameter and a TS `this` parameter never count.
+function jsLength(params: { key: unknown; default?: unknown }[]): number {
+	const own = params.filter(p => p.key !== 'this');
+	const i = own.findIndex(p => p.default !== undefined);
+	return i < 0 ? own.length : i;
+}
 
 // Per-operand info for builtin dispatch -- wtype for kind-polymorphic dispatch, owner for identity dispatch.
 interface OperandInfo { wtype: WasmType | undefined; owner?: ClassInfo }
@@ -2029,10 +2038,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// subtyping: a closure's own first field is `(ref $itsFuncType)`, and every func type is a subtype of
 	// the abstract `func`. That makes `ref.test (ref $closureBase)` exactly "is this value a function" --
 	// nominal, so no unrelated struct can match it however its fields happen to line up.
+	// It also holds `CLOSURE_FIELDS` (JS `length`), so they read off any function value whatever its signature.
 	function ensureClosureBase(): number {
 		return registerType({ final: false, supertypes: [], type: { kind: 'struct', fields: [
 			{ type: { ref: 'func', nullable: false }, mut: false },
 			{ type: { ref: ensureEnvBase(), nullable: false }, mut: false },
+			{ type: toValType('i32'), mut: false },
 		] } });
 	}
 
@@ -3648,7 +3659,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const orig = ctx.temp(`$origClosure$${closureCallTempCounter++}`, got);
 				ctx.emit(I.local.set(orig));
 				const { info, wantStructTypeIndex, envTypeIndex } = ensureClosureCoercionWrapper(gotSig, wantSig);
-				ctx.emit(I.ref.func(info.funcIndex), I.local.get(orig), I.struct.new(envTypeIndex), I.struct.new(wantStructTypeIndex));
+				// The wrapper is the same JS function, so it keeps the original's `length`.
+					ctx.emit(I.ref.func(info.funcIndex), I.local.get(orig), I.struct.new(envTypeIndex),
+						I.local.get(orig), I.struct.get(ensureClosureBase(), CLOSURE_FIELDS.get('length')!), I.struct.new(wantStructTypeIndex));
 				return;
 			}
 		}
@@ -5246,7 +5259,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				emitRawSlot(ctx, name);
 		}
 		ctx.emit(fields ? I.struct.new(envTypeIndex) : I.struct.new_default(envBase));
-		ctx.emit(I.struct.new(structTypeIndex));
+		ctx.emit(I.i32.const(jsLength(e.params)), I.struct.new(structTypeIndex));
 		return { closure: sig };
 	}
 
@@ -5329,7 +5342,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	function emitFunctionValue(fn: { name: string; decl: FunctionDecl; module: string }, want: WasmType | undefined, ctx: FunctionContext, typeArgs?: Type[]): WasmType {
 		const { info, structTypeIndex } = ensureFunctionValueWrapper(fn.name, fn.decl, fn.module, want, typeArgs);
-		ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.struct.new(structTypeIndex));
+		ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.i32.const(jsLength(fn.decl.params)), I.struct.new(structTypeIndex));
 		return { closure: { params: info.params, result: info.result, hasRest: info.hasRest } };
 	}
 
@@ -5787,6 +5800,31 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								return REF_ANY;
 							}
 						}
+					}
+					// Every non-nullish member a closure: the value is a closure struct, which stores `CLOSURE_FIELDS` itself.
+					const closureField = CLOSURE_FIELDS.get(e.property);
+					const recvMembers = closureField !== undefined ? T.unionMembers(T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx)), ctx.typeScope).filter(m => !T.isNullish(m, ctx.typeScope)) : [];
+					if (recvMembers.length && recvMembers.every(m => { const w = typeOf(m); return !!w && typeof w !== 'string' && 'closure' in w; })) {
+						const base = ensureClosureBase();
+						if (isOptionalChainLink(e)) {
+							const resultWtype = nullableWtype('f64');
+							emitAs(e.object, ctx, REF_ANY_NULLABLE);
+							return emitOptionalAccess(ctx, REF_ANY_NULLABLE, resultWtype, objLocal => {
+								ctx.emit(I.local.get(objLocal), I.ref.cast(base), I.struct.get(base, closureField!));
+								coerceTop('u32', ctx, 'f64');
+								coerceTop('f64', ctx, resultWtype);
+							});
+						}
+						const w = emitExpr(e.object, ctx);
+						if (typeof w !== 'string' && 'closure' in w) {
+							if (w.nullable)
+								ctx.emit(I.ref.as_non_null);
+						} else {
+							coerceTop(w, ctx, REF_ANY_NULLABLE);
+							ctx.emit(I.ref.cast(base));
+						}
+						ctx.emit(I.struct.get(base, closureField!));
+						return 'u32';
 					}
 					// A genuinely dynamic receiver still has a real answer -- see `ensureAnyField`.
 					if (T.isAny(T.resolveOwn(narrowedTypeOf(e.object, ctx), ctx.typeScope))) {
@@ -7927,6 +7965,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			info = { funcTypeIndex, structTypeIndex: addType({final: true, supertypes: [ensureClosureBase()], type: { kind: 'struct', fields: [
 				{ type: { ref: funcTypeIndex, nullable: false }, mut: false },
 				{ type: { ref: envBase, nullable: false }, mut: false },
+				{ type: toValType('i32'), mut: false },
 			] } } ), sig };
 			closureTypes.set(key, info);
 		}
@@ -8446,7 +8485,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				else
 					emitDefaultValue(field.wtype, ctx);
 			}
-			ctx.emit(I.struct.new(frameTypeIndex), I.struct.new(structTypeIndex), I.call(genCtor.funcIndex), I.return);
+			ctx.emit(I.struct.new(frameTypeIndex), I.i32.const(sig.params.length), I.struct.new(structTypeIndex), I.call(genCtor.funcIndex), I.return);
 			info.body = ctx.toFuncBody(params.length, toValType);
 		}, name, homeModule));
 		return info;
@@ -8653,7 +8692,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const thenMethod = ensureMethod(awaitedClass, 'then', [], fnCtx)!;
 						fnCtx.emit(
 							I.local.get(promiseLocal.index),
-							I.ref.func(trampolineFuncIndex), I.local.get(frameLocal.index), I.struct.new(trampolineStructTypeIndex),
+							I.ref.func(trampolineFuncIndex), I.local.get(frameLocal.index), I.i32.const(1), I.struct.new(trampolineStructTypeIndex),
 							I.call(thenMethod.funcIndex), I.return
 						);
 					}
@@ -9772,14 +9811,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// Deduped by physical HEAP type, not by `ClassInfo` -- several owners can share one, and a
 			// repeated arm is dead code.
 			const seen = new Set<wasm.HeapType>();
-			const candidates: { cls: ClassInfo; heap: wasm.HeapType; read: () => void }[] = [];
+			const candidates: { heap: wasm.HeapType; read: () => void }[] = [];
 			const probe = (cls: ClassInfo | undefined, heap: wasm.HeapType | undefined) => {
 				if (!cls || heap === undefined || seen.has(heap))
 					return;
 				const idx = cls.fieldIndex.get(name);
 				if (idx !== undefined && cls.typeIndex !== -1) {
 					seen.add(heap);
-					candidates.push({ cls, heap, read: () => {
+					candidates.push({ heap, read: () => {
 						dctx.emit(I.struct.get(cls.typeIndex, idx));
 						coerceTop(cls.fields[idx].wtype, dctx, REF_ANY_NULLABLE);
 					} });
@@ -9797,7 +9836,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const canonical	= (declared && typeOf(declared)) || sig.result;
 						const want		= canonical === 'void' ? sig.result : canonical;
 						seen.add(heap);
-						candidates.push({ cls, heap, read: () => {
+						candidates.push({ heap, read: () => {
 							emitMethodCall(cls, accessorKey('get', name), [], dctx);
 							coerceTop(sig.result, dctx, want);
 							coerceTop(want, dctx, REF_ANY_NULLABLE);
@@ -9833,6 +9872,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				probe(cls, cls.typeIndex !== -1 ? cls.typeIndex
 					: w && typeof w !== 'string' && ('arr' in w || 'typeIndex' in w) ? heapTypeIndexOf(w)
 					: undefined);
+			}
+			// Gated like the arrays: with no closure type, no function value can be in an `any` slot.
+			const closureField = CLOSURE_FIELDS.get(name);
+			if (closureField !== undefined && closureTypes.size) {
+				const base = ensureClosureBase();
+				candidates.push({ heap: base, read: () => {
+					dctx.emit(I.struct.get(base, closureField));
+					coerceTop('u32', dctx, 'f64');
+					coerceTop('f64', dctx, REF_ANY_NULLABLE);
+				} });
 			}
 			if (!candidates.length)
 				throw `no reachable class declares a field '${name}' -- a dynamic read on 'any' needs at least one real candidate`;
