@@ -7090,6 +7090,22 @@ async function main() {
 	}
 
 	{
+		// A method call with arguments on an `any`/`unknown` receiver dispatches on the value's real representation, and each
+		// argument is converted to the candidate's parameter (walker.ts `(e.typeArgs as Type[]).some(walkType)`). `nums` is built
+		// as an array of boxed values, so the `number` callback is adapted to `Array<any>.some`'s.
+		const { anyMethodArgs } = await compile(`
+			class Box { constructor(public v: number) {} add(n: number, m: number): number { return this.v + n + m; } }
+			export function anyMethodArgs(): number {
+				const nums: unknown = [1, 5];
+				const box: any = new Box(10);
+				const words: unknown = ['ab', 'c'];
+				return ((nums as number[]).some(x => x > 1) ? 1 : 0) + box.add(2, 3) * 10 + (words as string[]).indexOf('c') * 1000;
+			}
+		`);
+		check('anyMethodArgs()', anyMethodArgs(), 1151);
+	}
+
+	{
 		// Array.prototype.at: a negative index counts from the end, out of range is undefined (type-utils.ts `matchInfer`).
 		const { arrayAt } = await compile(`
 			export function arrayAt(): number {

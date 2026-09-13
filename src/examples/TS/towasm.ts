@@ -3638,8 +3638,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// a `(x: any)` slot and has to be adapted, not rejected. Both sides must be REFERENCE types --
 			// a scalar mismatch (`f64` caller, `i32` callback) would be a lossy narrowing, and silently
 			// truncating an argument is worse than the error it replaces.
+			// A scalar on one side and a boxed `any` on the other converts too, by (un)boxing in the wrapper.
+			const isAnyRef = (w: WasmType) => typeof w !== 'string' && 'ref' in w && w.ref === 'any';
 			const paramFits = (p: WasmType, i: number) => wasmTypeEq(p, wantSig.params[i])
-				|| (typeof p !== 'string' && typeof wantSig.params[i] !== 'string');
+				|| (typeof p !== 'string' && typeof wantSig.params[i] !== 'string')
+				|| (typeof p === 'string' && isAnyRef(wantSig.params[i])) || (typeof wantSig.params[i] === 'string' && isAnyRef(p));
 			if (gotSig.params.length <= wantSig.params.length && !!gotSig.hasRest === !!wantSig.hasRest
 				&& gotSig.params.every(paramFits)) {
 				const orig = ctx.temp(`$origClosure$${closureCallTempCounter++}`, got);
@@ -6974,9 +6977,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// No single static owner -- if the receiver is genuinely `any`, a real runtime dispatch can still resolve it, same as real JS would.
 						// Checked via the checker's own type, not `wtypeOf` (gives `undefined`, not `REF_ANY`,
 						// for a genuinely `any`-typed expression). `want ?? REF_ANY`: a bare expression-statement calls `emitExpr` with no `want` at all, and `REF_ANY` is always a safe target (`coerceTop` widens to it).
-						if (T.isAny(checkerTypeOf(unwrapAs(obj), ctx.scope)) && e.arguments.length === 0) {
-							const info = ensureAnyDispatch(e.callee.property, want ?? REF_ANY, ctx);
+						if (T.isAny(checkerTypeOf(unwrapAs(obj), ctx.scope)) && !e.arguments.some(a => a.type === 'spread')) {
 							emitAs(obj, ctx, REF_ANY);
+							const info = ensureAnyDispatch(e.callee.property, e.arguments.map(a => emitExpr(a, ctx)), e.arguments.map(a => narrowedTypeOf(a, ctx)), want ?? REF_ANY, ctx);
 							ctx.emit(I.call(info.funcIndex));
 							return info.result;
 						}
@@ -9702,10 +9705,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// reassigning, zero-argument `name` -- the candidate set a dynamic (`any`-typed) dispatch of `name()`
 	// cascades over. Deduped by physical `heapType` (several owners sharing one physical type need only one
 	// `ref.test` arm). `!assignsToThis` excludes a method with no sensible write-back target through a boxed `any` value (`Array<T>.push`/etc).
-	function findAnyDispatchCandidates(name: string, ctx: FunctionContext): { heapType: number; isBoxedScalar: boolean; funcInfo: FuncInfo }[] {
+	function findAnyDispatchCandidates(name: string, argTs: Type[], ctx: FunctionContext): { heapType: number; isBoxedScalar: boolean; funcInfo: FuncInfo }[] {
 		const found = new Map<number, { heapType: number; isBoxedScalar: boolean; funcInfo: FuncInfo }>();
 		const probe = (owner: ClassInfo | undefined, heapType: number, isBoxedScalar: boolean) => {
-			if (owner && !found.has(heapType) && owner.methodDecls.get(name)?.find(d => d.body && !assignsToThis(d.body) && T.argsFit(T.FixSig(d, T.ANY), [], ctx.scope))) {
+			if (owner && !found.has(heapType) && owner.methodDecls.get(name)?.find(d => d.body && !d.rest && !assignsToThis(d.body) && T.argsFit(T.FixSig(d, T.ANY), argTs, ctx.scope))) {
 				const funcInfo = ensureMethod(owner, name, [], ctx);
 				if (funcInfo)
 					found.set(heapType, { heapType, isBoxedScalar, funcInfo });
@@ -9713,9 +9716,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		};
 		probe(builtinTypeOwner('number'), ensureBoxType('f64'), true);
 		probe(builtinTypeOwner('boolean'), ensureBoxType('i32'), true);
+		// A string and a plain array are array values with no struct of their own, probed as `ensureAnyField` probes them.
+		probe(builtinTypeOwner('string'), ensureArrayType('i16'), false);
+		for (const [kind, elem] of [['f64', T.NUMBER], ['ref', T.ANY]] as const) {
+			if (hasArrayType(kind))
+				probe(ensureClass('Array', [elem]), ensureArrayType(kind), false);
+		}
 		for (const cls of classes.values()) {
-			// `-1` is `ensureClass`'s sentinel for "scalar-backed, no physical heap type" -- meaningless as a
-			// `ref.test` target (every scalar-backed class would collide on it); already covered above via `ensureBoxType` for the two real cases (`number`/`boolean`) that can reach an `any` slot.
 			if (cls.typeIndex !== -1)
 				probe(cls, cls.typeIndex, false);
 		}
@@ -9958,23 +9965,28 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A real dynamic-dispatch cascade for `recv.name()` where `recv`'s static type is genuinely `any`.
 	// One shared function per `(name, want)` pair, reserved immediately so call sites can `call` it right away -- but its body can only be built
 	// once the full, final candidate set is known, needing every class ever discovered. `lateWorklist`, drained only once `worklist` has fully emptied, is what guarantees that.
-	function ensureAnyDispatch(name: string, want: WasmType, ctx: FunctionContext): FuncInfo {
-		const key = `${name}=>${wasmTypeKey(want)}`;
+	// A method call on an `any`/`unknown` receiver: which class's method runs is known only at run time, so a dispatch per
+	// call shape tests the receiver against every reachable owner of `name` (strings and arrays too), converts each argument
+	// from its own static representation to that candidate's parameter, and the result to what the call wants. None traps.
+	function ensureAnyDispatch(name: string, argWtypes: WasmType[], argTs: Type[], want: WasmType, ctx: FunctionContext): FuncInfo {
+		const key = `${name}(${argWtypes.map(wasmTypeKey).join(',')})=>${wasmTypeKey(want)}`;
 		const existing = anyDispatchFuncs.get(key);
 		if (existing)
 			return existing;
 
-		const { funcIndex, typeIndex } = registerFunc(toParams2([{key: 'recv', wtype: REF_ANY, tsType: T.ANY}]), toResults(want));
-		const info: FuncInfo = { params: [REF_ANY], result: want, funcIndex, typeIndex };
+		const { funcIndex, typeIndex } = registerFunc(toParams2([{key: 'recv', wtype: REF_ANY, tsType: T.ANY},
+			...argWtypes.map((wtype, i) => ({ key: `arg${i}`, wtype, tsType: argTs[i] }))]), toResults(want));
+		const info: FuncInfo = { params: [REF_ANY, ...argWtypes], result: want, funcIndex, typeIndex };
 
 		anyDispatchFuncs.set(key, info);
 		funcs.set(`<any dispatch>.${key}`, info);
 		lateWorklist.push(() => {
-			const candidates = findAnyDispatchCandidates(name, ctx);
+			const candidates = findAnyDispatchCandidates(name, argTs, ctx);
 			if (!candidates.length)
-				throw `no reachable class (or 'number'/'boolean') declares a matching zero-argument '${name}' -- a dynamic dispatch on 'any' needs at least one real candidate`;
+				throw `no reachable class (or 'number'/'boolean'/'string'/array) declares a '${name}' callable with ${argTs.length} such argument(s) -- a dynamic dispatch on 'any' needs at least one real candidate`;
 			const dctx = new FunctionContext(key, new Scope(libGlobal), plainReturn(want), undefined);
 			const recv = dctx.declareLocal('$recv', REF_ANY);
+			const argLocals = argWtypes.map((w, i) => dctx.declareLocal(`$arg$${i}`, w));
 
 			function buildArm(i: number): wasm.Instr[] {
 				if (i >= candidates.length)
@@ -9985,16 +9997,25 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				dctx.emit(I.local.get(recv.index), I.ref.cast(c.heapType));
 				if (c.isBoxedScalar)
 					dctx.emit(I.struct.get(c.heapType, 0));
-				// The call site is zero-`args`, but the candidate may still declare optional/defaulted trailing
-				// params beyond `this` -- wasm has no "optional", so their defaults must still be pushed (`emitCallArgs`, shared with `emitMethodCall`).
-				emitCallArgs(name, c.funcInfo.params, c.funcInfo.defaults, !!c.funcInfo.hasRest, [], dctx, c.funcInfo.resolvedParams);
+				c.funcInfo.params.forEach((p, j) => {
+					if (j < argLocals.length) {
+						dctx.emit(I.local.get(argLocals[j].index));
+						coerceTop(argWtypes[j], dctx, p);
+						return;
+					}
+					// A trailing parameter the call leaves out takes its default (an optional one's implicit `undefined`).
+					const d = c.funcInfo.defaults?.[j];
+					if (!d)
+						throw `'${name}' needs more than ${argLocals.length} argument(s)`;
+					emitAs(d, dctx, p);
+				});
 				dctx.emit(I.call(c.funcInfo.funcIndex));
 				coerceTop(c.funcInfo.result, dctx, want);
 				return [..._cond, I.if(want === 'void' ? undefined : toValType(want), dctx.swapOut(), buildArm(i + 1))];
 			}
 
 			dctx.emit(...buildArm(0));
-			info.body = dctx.toFuncBody(1, toValType);
+			info.body = dctx.toFuncBody(1 + argLocals.length, toValType);
 		});
 		return info;
 	}
