@@ -2035,6 +2035,32 @@ shape diverges from TS's lib, tsc-clean code gets checker errors.
 Closure signatures kept the rest out of `resolvedParams` (it lived only as `restElem`), while `emitCallArgs` reads the
 rest's type at `resolvedParams[fixedCount]`, as compiled functions store it: a literal argument against a union-of-tuples
 rest (js-parser.ts `CallSigParams<T>`, via `TS.CallSig({params, rest})`) had no target type through a closure call.
+Fixed (e203f49). The `bindPattern` chain then peeled, one commit each: a tuple's members are `Array`'s (d368333: a tuple
+is physically `arr:ref`, so its owner is `Array` over a ref-kind element, else `Array<any>`); a closure literal's optional
+parameter is `T | undefined` in its body (`x ?? d` had dropped the `?? d` and trapped); and a closure literal's default is
+applied in the callee where the WANTED slot is nullable -- the "closure-conversion" row (`(...,i32)` vs `(...,box?)`) was
+checker.ts's `(e, scope, expected?, widen = true) => ...` passed as a `typeOf` whose `widen?: boolean` callers omit.
+**Trap**: forcing EVERY closure default into the callee broke `fnLength` -- an unannotated local's own function type
+keeps caller-side defaults. The literal must follow its wanted slot, not a blanket rule.
+Next on that chain: js-parser.ts `CallSig`'s `{ ...args[0], ... }`, a spread of `args[0]` that TS has narrowed by
+`Array.isArray` but towasm sees as `CallSig | Params | Param[]`.
+That spread needed four fixes (2026-09-13, batch 7): union-typed spread operands (`readSpread`, a `ref.test` cascade per
+field, absent where a member lacks it); bounds-checked index reads where the checker type admits `undefined`
+(`emitBoundedRead`; `array.get` traps past the end, JS reads `undefined`); the CHECKER typing a tuple read past a short
+union member or at an optional element as `| undefined` (`tupleReadType`, TS's getIndexedAccessType); and generic
+INSTANCES losing all narrowing, because `substituteTypeParams` deletes the template's stamps (towasm's `if` narrows only
+through stamps) -- fixed by re-checking each instance as a declaration of its own (`instantiateDecl`, 8ffb1e4).
+**Tried and replaced**: reading the TEMPLATE's narrowing through the instance's type arguments. It cannot work: the template
+often has no narrowing to give -- `typeof x === 'string'` on `T | string` leaves `T | string` there, since `T` is opaque --
+and layering it also masked the instance's own branch narrowing. Only a check at the concrete types gives what TS gives.
+Still stale the same way: a generic METHOD instance (`ensureMethod`'s body substitution; a re-check needs the class
+context) and a generic closure literal erased to its bounds (needs its enclosing scope).
+**Design question, OPEN (for the user)**: generic INTERFACES are ERASED (`ensureObjectShape`: one struct per shape, each
+type parameter at its constraint), so `Params<number>`'s `params: T[]` is physically `arr:ref`, while towasm derives
+`number[]` as `arr:f64` everywhere else. `mk<number>([1,2,3]).params.length` fails "cannot convert arr:ref to arr:f64" --
+two physical forms of one value, with no aliasing-preserving conversion between them. Choices: monomorphize interfaces
+per argument (the comment says that left structs nothing could convert between), or represent every array reached
+through an erased type parameter as ref-kind at the use site too.
 
 **Traps hit this session**: parallel Bash calls share ONE working directory -- a `cd` in one races another's
 relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd X && ... )` subshell. And
