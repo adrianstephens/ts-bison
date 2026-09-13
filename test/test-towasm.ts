@@ -6819,6 +6819,29 @@ async function main() {
 	}
 
 	{
+		// An expression-bodied arrow sees a captured name narrowed where the arrow is created (towasm.ts's own `wasmTypeEq`).
+		const { arrowNarrowed } = await compile(`
+			type W = 'i32' | 'f64' | { ref: string } | { closure: { params: W[] } };
+			function eq(a: W, b: W): boolean {
+				if (typeof a === 'string' || typeof b === 'string')
+					return a === b;
+				if ('ref' in a && 'ref' in b)
+					return a.ref === b.ref;
+				if ('closure' in a && 'closure' in b)
+					return a.closure.params.every((p, i) => eq(p, b.closure.params[i]));
+				return false;
+			}
+			export function arrowNarrowed(): number {
+				const x: W = { closure: { params: ['i32', { ref: 'A' }] } };
+				const y: W = { closure: { params: ['i32', { ref: 'A' }] } };
+				const z: W = { closure: { params: ['i32', { ref: 'B' }] } };
+				return (eq(x, y) ? 10 : 0) + (eq(x, z) ? 1 : 0);
+			}
+		`);
+		check('arrowNarrowed()', arrowNarrowed(), 10);
+	}
+
+	{
 		// TStoWasm assumes `ast` already went through TStypeCheck (which stamps `ast.scope`) -- calling it
 		// on a freshly parsed, never-checked program should fail loudly instead of silently doing the wrong thing.
 		try {

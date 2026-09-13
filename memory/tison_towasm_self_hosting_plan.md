@@ -1922,9 +1922,21 @@ declarations, function types and closure literals. The checker now writes an una
 inferred type back onto the node, like `applyContextualParams` does. Open: a type admitting `null` is rejected
 (an omitted argument arrives as null), and async/generator functions still reject defaults.
 
-**Next rows** (76/330): `unknown method 'parse'` 23 -- `JSON.parse` in tableCache.ts, which also needs
+The `indexing is only supported on number[]/...` row is NOT about strings: that message fires whenever the
+indexed value resolves to no array and no class with `get` (a plain `s[i]` works via lib `String.get`).
+Batch-probed 2026-09-13, it holds several causes: (a) an expression-bodied arrow lost a capture's narrowing
+(`wasmTypeEq`'s `b.closure.params[i]`): towasm compiles the body as a synthesized, UNSTAMPED `return`, so
+`ctx.stmtScope` stayed unset. FIXED: the checker stamps an expression body with its `inner` scope, gated on
+`narrowing` like branch stamps, and the synthesized return carries it. (b) a computed key on `any`
+(checker.ts:580 `out[k]`, wasm.ts:418 `(OP as any)[v.op]`) needs a runtime-keyed dynamic read. (c) a
+`Record` indexed by a literal-union key (`ARR_WTYPE[we]`, towasm.ts:324). (d) `t.typeArgs?.[i]`
+(type-utils.ts:2984) turned out to be (a) too: an arrow capturing a narrowed `t`. (e) about 12 declarations threw with no position at all.
+**Trap**: a probe's `at L:C` names no file, and the position can be in ANY module the probe reaches
+(`parse`'s 33:131 was tableCache.ts). Two repros "failed to reproduce" because I had the wrong file.
+
+**Next rows** (77/330): `unknown method 'parse'` 24 -- `JSON.parse` in tableCache.ts, which also needs
 zlib/crypto host modules and turning parsed dynamic objects into typed structs; `indexing is only supported
-on number[]/...` 21 (string indexing); `only direct calls...` 21 -- core.ts:185 `params[0](...)`, calling an
+on number[]/...` 19 (not strings, see above); `only direct calls...` 21 -- core.ts:185 `params[0](...)`, calling an
 `any`-typed value, which needs a calling convention for closures boxed as `any`; `param 'value' needs an
 explicit type` 18; `cannot convert arr:ref:true to i32` 18; `unsupported expression 'instantiation'` 16 --
 `export const CallSig = JS.CallSig<Type>` (ts-parser.ts:29).

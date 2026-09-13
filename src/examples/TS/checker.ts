@@ -2598,6 +2598,9 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		// Precise (unwidened): `expected` may itself be a narrow/literal declared return type (rare, but real), so the
 		// assignability check below must see `body`'s exact inferred type, not a pre-widened one -- only the *inference*
 		// branch (no declared type to check against) widens, and only there.
+		// Stamped like a block body's statements, so towasm's closure sees what this saw (a capture narrowed outside it).
+		if (!noStamp && !narrowing)
+			(body as any).scope ??= inner;
 		const t = typeOf(body, inner, false, expected ?? inferHint, undefined, err);
 		if (expected) {
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))

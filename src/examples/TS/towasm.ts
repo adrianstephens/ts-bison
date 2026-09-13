@@ -4995,7 +4995,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				emitStmts(body, fnCtx);
 				emitTrailingUnreachable(fnCtx, result);
 			} else {
-				emitStmt({ type: 'return', argument: body }, fnCtx);
+				// The checker stamps an expression body with the scope it checked it in, as it stamps a block body's statements.
+				emitStmt(Object.assign({ type: 'return', argument: body } as Stmt, { scope: (body as any).scope }), fnCtx);
 			}
 			info.body = fnCtx.toFuncBody(1 + params.length, toValType);
 		}));
