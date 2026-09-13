@@ -2540,7 +2540,12 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			const inner		= new Scope(scope);
 			inner.addValue(key, paramT);
 			const narrowed	= narrow(test, inner, true).value(key);
-			if (narrowed && narrowed !== paramT)
+			// TS infers `x is T` only when the function is false exactly when `x` is no `T`: the false branch must narrow the parameter
+			// to its declared type less `T`, or a caller's else branch loses members it never ruled out (`t.type === 'ref' && ...`).
+			const keys		= (t: Type) => new Set(T.unionMembers(t, inner).map(m => T.typeKey(m)));
+			const falseT	= keys(narrow(test, inner, false).value(key) ?? paramT);
+			const restT		= narrowed && keys(TS.UnionType(T.unionMembers(paramT, inner).filter(m => !T.isAssignable(m, narrowed, inner, inner, false, 10, true))));
+			if (narrowed && narrowed !== paramT && restT && falseT.size === restT.size && [...restT].every(k => falseT.has(k)))
 				return TS.Predicate(key, narrowed);
 		}
 		return result;

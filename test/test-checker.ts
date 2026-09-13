@@ -129,6 +129,9 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// `R<'never'>`, so it stays. Dropping it narrowed `src.type === 'ref'` to `never` (type-utils.ts `isAssignable`'s `recurse`).
 	['a guard with a narrower type argument keeps a defaulted member', 'interface R<T extends string = string> { type: "ref"; name: T } interface L { type: "lit" } type Ty = R | L; declare function isRef<T extends string>(t: Ty, name: T): t is R<T>; function f(src: Ty) { if (isRef(src, "never")) return; const l: L = src; }', ['is not assignable']],
 	['a primitive-constrained type parameter infers the literal', 'declare function lit<T extends string>(x: T): T; const a: "a" = lit("a");', []],
+	// TS 5.5 infers a type predicate only when the function is true exactly when the parameter has that type. `isTop` is false for
+	// most `R`s, so its false branch must not exclude `R` (type-utils.ts `isAny`, which left `src.type === 'ref'` as `never`).
+	['an inferred predicate needs its false branch to be exact', 'interface R { type: "ref"; name: string } interface L { type: "lit" } type Ty = R | L; function isTop(t: Ty) { return t.type === "ref" && t.name === "any"; } function f(src: Ty) { if (isTop(src)) return; const l: L = src; }', ['is not assignable']],
 ];
 
 (async () => {
