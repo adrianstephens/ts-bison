@@ -2096,6 +2096,19 @@ narrower than the declared `number`) and difftest to 2153/2 disagree. Keep such 
 **Next**: printer.ts calls `isJsStatement`, a name bound to a module-level CONST holding a function -- the bare-identifier
 sibling of 7aea4bc's namespace-member fix (script ready: `assistant/module-value-call.py`).
 
+**Batch 11 (2026-09-13)**: the printer path, each its own commit -- a call to a name bound to a module-level CONST holding a
+function (676a65f, 46 blocks; walker.ts's `export const isJsStatement = guard<TS.Stmt>(...)`, the bare-identifier sibling of
+7aea4bc; an inline-asm const like `loadI32 = __asm<...>(...)` must STAY on the direct path, which cost 25 difftest cases
+before it was excluded); a NAMED IMPORT of another module's const reading that module's lazy global (8d1b5af); and a
+closure parameter whose written-back annotation does not resolve where the closure is written falling back to the wanted
+signature's slot (e3aad3c -- printer.ts's `m` over `stmt.body` is annotated `ClassMember<Type>`, js-parser's name; the
+deeper fix is for the checker to stamp what it writes back with its own declaring scope).
+**towasm.ts `scalarKind` now compiles through printer.ts** and stops only in tableCache.ts (`JSON`), which is out of scope.
+**Next on the checker path**: checker.ts `throughSources`'s `const out: any = {...e}` then `out[k]` -- a computed-key read
+AND write on an `any` (also wasm.ts's `(OP as any)[v.op]`). Needs a real design: the receiver's class is only known at run
+time, so either a generated "property by name" dispatch (per class, comparing the key against each field name) or a
+dynamic representation for `any`-typed objects. Nothing in towasm does computed-key access on a struct today.
+
 **Lib fidelity needs overload resolution first (tried and reverted, 2026-09-13)**: three checker false positives on our own
 tsc-clean code are lib gaps -- `new Map(otherMap)`, a typed array's `set(array, offset)` copy form, `Object.fromEntries`.
 Adding a second `set` BODY breaks the index-write lowering (`a[i] = v` lowers to `set(i, v)`: towasm's index convention
