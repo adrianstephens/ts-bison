@@ -2165,6 +2165,9 @@ export function indexSignatureOf(t: Type, scope: Scope, depth = 6): Type | undef
 // specific, as TS requires), a string one every key. A numeric signature must not answer `'push'` for `String`'s `[i: number]`.
 function indexSignatureFor(members: TS.TypeMember[], prop: string, scope: Scope): Type | undefined {
 	const indexes = members.filter((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index');
+	// A well-known symbol key (`memberKey`'s `[Symbol.iterator]`) is covered only by a `symbol` index signature, never a string one.
+	if (prop.startsWith('[Symbol.'))
+		return indexes.find(m => unionMembers(m.paramType, scope).some(p => isRef(resolveOwn(p, scope), 'symbol')))?.typeAnnotation;
 	return ((/^(0|[1-9]\d*)$/.test(prop) && indexes.find(m => isNumberLike(m.paramType, scope))) || indexes.find(m => !isNumberLike(m.paramType, scope)))?.typeAnnotation;
 }
 
@@ -3062,14 +3065,26 @@ export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6, 
 		const parts = r.types.map(m => iterationTypes(m, scope, async, depth - 1));
 		return parts.every(p => !!p) ? { yield: combineTypes(parts.map(p => p!.yield)), return: combineTypes(parts.map(p => p!.return)), next: combineTypes(parts.map(p => p!.next)) } : undefined;
 	}
+	// TS's getIterationTypesOfIterable: a method, iterator or `next` typed `any` iterates as `any`. The member is read through the
+	// receiver's own `this`, so `declare [Symbol.iterator]: this["entries"]` reaches the receiver's `entries`.
+	const anyIteration	= { yield: ANY, return: ANY, next: ANY };
+	const isAnyType		= (x: Type | undefined) => !!x && isAny(resolveOwn(x, scope));
 	const protocol = (key: string): IterationTypes | undefined => {
-		const iterator	= findFunctionType(lookupMember(t, key, scope) ?? NEVER, scope)?.returnType;
+		const method	= lookupMember(t, key, scope);
+		if (isAnyType(method))
+			return anyIteration;
+		const iterator	= findFunctionType(substituteThisType(method ?? NEVER, t), scope)?.returnType;
+		if (isAnyType(iterator))
+			return anyIteration;
 		// An iterator that is itself a global Iterator/Generator reference is read off its type arguments, as TS's
 		// getIterationTypesOfIteratorFast does: `next()`'s bundled IteratorResult can't split `value` by `done`.
 		const fastIterator	= iterator && globalIterationTypes(substituteThisType(iterator, t), scope, key === '[Symbol.asyncIterator]', true);
 		if (fastIterator)
 			return fastIterator;
-		const nextSig	= iterator && findFunctionType(lookupMember(substituteThisType(iterator, t), 'next', scope) ?? NEVER, scope);
+		const nextMember	= iterator && lookupMember(substituteThisType(iterator, t), 'next', scope);
+		if (isAnyType(nextMember))
+			return anyIteration;
+		const nextSig	= nextMember && findFunctionType(nextMember, scope);
 		const next		= nextSig?.returnType;
 		if (!next)
 			return undefined;
