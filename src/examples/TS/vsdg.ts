@@ -262,7 +262,7 @@ class VSDG extends Map<NodeId, Node> {
 	removeInputs(node: Node) {
 		for (const e of node.inputs) {
 			const down = this.getNode(e.nodeId);
-			down.outputs[e.port] = down.outputs[e.port].filter(e => e.nodeId !== node.id);
+			down.outputs[e.port] = down.outputs[e.port].filter(c => c.nodeId !== node.id);
 		}
 		// Clears node's OWN inputs too, not just the producers' outputs -- harmless for printing, but
 		// a later pass that walks every node's inputs unconditionally (scheduleEarly) would otherwise
@@ -546,8 +546,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 				// wrong (confirmed empirically: corrupts GCM scheduling). break: unlike those, its
 				// target (an enclosing loop/switch) DOES read `name` back through the graph, so it
 				// falls through to the ordinary gamma-building below.
-				const exitedState = trueState.exited ? trueState : falseState;
-				if (trueState.exited !== falseState.exited && !exitedState.brokeOut) {
+				if (trueState.exited !== falseState.exited && !(trueState.exited ? trueState : falseState).brokeOut) {
 					const exitedVal = trueState.exited ? trueVal : falseVal;
 					if (exitedVal.boundName === name)
 						exitedVal.forcedPrint = true;
@@ -572,14 +571,18 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 				// itself be an operand here (e.g. a later switch case merging against an earlier
 				// case's own __hit merge), and it must keep resolving by name for any FURTHER merge
 				// chained off it, unlike a plain reassignment genuinely superseded by this one.
-				if (trueExitedViaBreak && trueVal.boundName === name && (trueVal.switchInternal || isLoopCarried(name)))
+
+				const forcedPrint	= (n: Node) => n.boundName === name && (n.switchInternal || isLoopCarried(name));
+				const clearable		= (n: Node) => n.boundName === name && !(n.type === 'var' && n.declKind) && n.type !== 'gammaValue' && n.type !== 'exceptValue';
+
+				if (trueExitedViaBreak && forcedPrint(trueVal))
 					trueVal.forcedPrint = true;
-				else if (trueVal.boundName === name && !(trueVal.type === 'var' && trueVal.declKind) && trueVal.type !== 'gammaValue' && trueVal.type !== 'exceptValue')
+				else if (clearable(trueVal))
 					trueVal.boundName = undefined;
 
-				if (falseExitedViaBreak && falseVal.boundName === name && (falseVal.switchInternal || isLoopCarried(name)))
+				if (falseExitedViaBreak && forcedPrint(falseVal))
 					falseVal.forcedPrint = true;
-				else if (falseVal.boundName === name && !(falseVal.type === 'var' && falseVal.declKind) && falseVal.type !== 'gammaValue' && falseVal.type !== 'exceptValue')
+				else if (clearable(falseVal))
 					falseVal.boundName = undefined;
 
 				// When one side broke out, its operand still carries boundName === name -- printing the merge itself under that same name would be circular; neverMaterialize gets the same "never print by this name" outcome directly.
@@ -957,10 +960,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 					const realMatches = matchNames.filter((n): n is string => n !== undefined);
 					const negateOr = (names: string[]): Expr => names.length === 0
 						? Literal(true)
-						: {
-							type: 'unary', operator: '!',
-							operand: names.map((n): Expr => Identifier(n)).reduce((a, b) => ({ type: 'binary', operator: '||', left: a, right: b } as Expr)),
-						} as Expr;
+						: Unary('!', names.map((n): Expr => Identifier(n)).reduce((a, b) => Binary('||', a, b)));
 
 					// Each case becomes `if (hit || <own condition>) { hit = true; ...body... }`: once
 					// true, `hit` makes every later test irrelevant, giving fallthrough for free.
@@ -990,11 +990,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 						const switchCases: { testNodeId?: NodeId; boundaryId: NodeId; tailId: NodeId }[] = [];
 
 						for (const [i, c] of s.cases.entries()) {
-							const testExpr = {
-								type: 'binary', operator: '||',
-								left: Identifier(hitName),
-								right: matchNames[i] ? Identifier(matchNames[i]!) : negateOr(realMatches),
-							} as Expr;
+							const testExpr	= Binary('||', Identifier(hitName), matchNames[i] ? Identifier(matchNames[i]!) : negateOr(realMatches));
 							recurse.expression(testExpr);
 							const testNode	= getExprNode(testExpr);
 							const parent	= getState();
@@ -1491,8 +1487,6 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 									connectValue(getExprNode(prop.value!), 0, node, index);
 								}
 								break;
-	//						default:
-	//							 console.log(`not handling object property ${prop.type}`);
 						}
 					});
 					if (hasMethod)
@@ -2233,9 +2227,12 @@ export function BuildProgram(
 	// statement must print under its own name regardless of block placement: a rebind or a genuine
 	// local declaration -- unlike a gammaValue/named-except merge (a pure value with no state anchor).
 	function needsDirectPlacement(node: Node): boolean {
-		if (node.type === 'unary_post' || node.type === 'mutation' || (node.type === 'var' && node.declKind !== undefined))
-			return !(node.type === 'mutation' && node.expr.type === 'assign') || !isInlinableSlot(node);
-		return false;
+		switch (node.type) {
+			case 'unary_post':	return true;
+			case 'var':			return node.declKind !== undefined;
+			case 'mutation':	return node.expr.type !== 'assign' || !isInlinableSlot(node);
+			default:			return false;
+		}
 	}
 
 	// The inverse of blockIds: which nodes GCM scheduled into a given block, grouped once on first
@@ -2471,14 +2468,8 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 	switch (expr.type) {
 		case 'binary': {
 			// Find the incoming value edges for this node
-			const leftEdge	= node.inputs[0];
-			const rightEdge	= node.inputs[1];
-			if (!leftEdge || !rightEdge)
-				return false;
-
-			// Get the actual source nodes
-			const left	= graph.getNode(leftEdge.nodeId);
-			const right = graph.getNode(rightEdge.nodeId);
+			const left	= graph.getNode(node.inputs[0].nodeId);
+			const right = graph.getNode(node.inputs[1].nodeId);
 
 			// If both inputs are constants, we can fold them!
 			if (left.isLiteralNode() && right.isLiteralNode()) {
@@ -2494,11 +2485,7 @@ function foldConstants(graph: VSDG, node: Node): boolean {
 			return false;
 		}
 		case 'unary': {
-			const edge = node.inputs[0];
-			if (!edge)
-				return false;
-
-			const operand	= graph.getNode(edge.nodeId);
+			const operand	= graph.getNode(node.inputs[0].nodeId);
 			if (operand.isLiteralNode()) {
 				const r = calcUnary(expr.operator, operand.expr.value);
 				if (r !== undefined) {
@@ -2933,69 +2920,51 @@ export function applyGlobalCodeMotion(graph: VSDG) {
 
 		// Recursively process all downstream consumers first
 		for (const portChannels of node.outputs) {
-			if (!portChannels)
-				continue;
-			for (const consumerEdge of portChannels)
-				scheduleLate(consumerEdge.nodeId);
+			if (portChannels)
+				for (const consumerEdge of portChannels)
+					scheduleLate(consumerEdge.nodeId);
 		}
+
+		const isSchedulingIrrelevant = (consumerNode: Node, port: number): boolean => {
+			switch (consumerNode.type) {
+				case 'mu':
+				case 'muValue':		return port === 1;
+				case 'gammaValue':	return port !== 0;
+				case 'exceptValue': return true;
+				case 'theta':		return port === 1;
+				default:			return consumerNode.isVestigialEdge(port);
+			}
+		};
 
 		// Find the Least Common Ancestor (LCA) block of all consumers
 		let latestBlock: BlockId | null = null;
 
 		for (const portChannels of node.outputs) {
-			if (!portChannels)
-				continue;
-			for (const consumerEdge of portChannels) {
-				const consumerNode = graph.get(consumerEdge.nodeId)!;
+			if (portChannels) {
+				for (const consumerEdge of portChannels) {
+					const consumerNode = graph.get(consumerEdge.nodeId)!;
+					if (isSchedulingIrrelevant(consumerNode, consumerEdge.port))
+						continue;
 
-				// A mu's port 1 is its FEEDBACK edge, a genuine back-edge -- it doesn't constrain
-				// "must be ready by" the mu's own block, or latestBlock could come out shallower
-				// than earliestBlock, a contradiction the walk below can't reconcile.
-				if ((consumerNode.type === 'mu' || consumerNode.type === 'muValue') && consumerEdge.port === 1)
-					continue;
+					let consumerBlock = blockIds.get(consumerEdge.nodeId)!;
 
-				// Same structural issue for if/else: feeding a gammaValue's trueVal/falseVal only
-				// means "I'm one of the two alternatives", not "ready by the gammaValue's own block"
-				// -- that block sits AFTER both branches, not inside either one.
-				if (consumerNode.type === 'gammaValue' && consumerEdge.port !== 0)
-					continue;
+					// A mu's port 0 (its INITIAL, pre-loop value) belongs to the block BEFORE the loop --
+					// the pre-header, the immediate dominator sitting right outside the loop structure.
+					if ((consumerNode.type === 'mu' || consumerNode.type === 'muValue') && consumerEdge.port === 0)
+						consumerBlock = blocks.getParent(consumerBlock) || "block_entry";
 
-				// Same issue for exceptValue's own tryVal/catchVal -- unlike gammaValue, both ports here
-				// are value ports (no condition port), so both are excluded.
-				if (consumerNode.type === 'exceptValue')
-					continue;
+					// A consumer in a DIFFERENT function's own region (e.g. a captured variable's
+					// reassignment, read by name after the function returns) might run zero, one, or many
+					// times, at a point this static schedule can't place -- treating it as an ordinary
+					// constraint would (and did) drag the node out of the function it belongs in.
+					// forcedPrint keeps such a node from being dropped once its only consumer is excluded.
+					if (regionRootOf(consumerBlock) !== regionRootOf(blockIds.get(nodeId)!))
+						continue;
 
-				// Same issue for the state theta's own port-1 (condition): the theta's block is
-				// "after the loop exited", logically outside it, but the condition it reads is
-				// computed INSIDE the loop every iteration -- treating this as an ordinary constraint
-				// would schedule it one loop-nesting level shallower than everything else it feeds.
-				if (consumerNode.type === 'theta' && consumerEdge.port === 1)
-					continue;
-
-				// Likewise never actually read by codegen -- left as an ordinary constraint, this
-				// dragged the OLD value's own declaration/scheduling into wherever the assignment
-				// itself happened to live (e.g. into an if-branch it has no real reason to be inside).
-				if (consumerNode.isVestigialEdge(consumerEdge.port))
-					continue;
-
-				let consumerBlock = blockIds.get(consumerEdge.nodeId)!;
-
-				// A mu's port 0 (its INITIAL, pre-loop value) belongs to the block BEFORE the loop --
-				// the pre-header, the immediate dominator sitting right outside the loop structure.
-				if ((consumerNode.type === 'mu' || consumerNode.type === 'muValue') && consumerEdge.port === 0)
-					consumerBlock = blocks.getParent(consumerBlock) || "block_entry";
-
-				// A consumer in a DIFFERENT function's own region (e.g. a captured variable's
-				// reassignment, read by name after the function returns) might run zero, one, or many
-				// times, at a point this static schedule can't place -- treating it as an ordinary
-				// constraint would (and did) drag the node out of the function it belongs in.
-				// forcedPrint keeps such a node from being dropped once its only consumer is excluded.
-				if (regionRootOf(consumerBlock) !== regionRootOf(blockIds.get(nodeId)!))
-					continue;
-
-				latestBlock = latestBlock === null
-					? consumerBlock
-					: blocks.findLeastCommonAncestor(latestBlock, consumerBlock);
+					latestBlock = latestBlock === null
+						? consumerBlock
+						: blocks.findLeastCommonAncestor(latestBlock, consumerBlock);
+				}
 			}
 		}
 
@@ -3012,8 +2981,7 @@ export function applyGlobalCodeMotion(graph: VSDG) {
 		// -- the two cases are indistinguishable from information available at this point in scheduling.
 		const earliestBlock	= blockIds.get(nodeId)!;
 		const floor			= blocks.getLoopDepth(earliestBlock);
-		let bestBlock: BlockId | undefined;
-		let bestDepth		= Infinity;
+		let bestDepth		= Infinity, bestBlock;
 
 		// The `currentBlock` guard is a defensive backstop against a blockTree dead end that doesn't pass through earliestBlock on the way to the root.
 		let currentBlock: BlockId | undefined = latestBlock || earliestBlock;

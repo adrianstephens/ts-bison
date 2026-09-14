@@ -7448,12 +7448,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			wtype: () => result,
 			emit(ctx, argument) {
 				if (result === undefined) {
-					// `() => sideEffect()` -- a concise arrow body is compiled as `return <expr>`, and for a
-					// `void`-returning callee that expression genuinely has no value. Real TS allows it (a
-					// `void` expression is a valid `void` return), so the expression is emitted for its
-					// EFFECTS and only a returned value that really exists is rejected.
+					// A concise arrow body is compiled as `return <expr>`, and a `void` slot accepts a body that
+					// really does produce a value -- TS's return-type bivariance (`forEach(x => out.push(x))`),
+					// where JS simply discards it, exactly as an expression statement does. A genuinely
+					// `: void`-annotated function returning a value is the CHECKER's error, raised before codegen.
 					if (argument && emitExpr(argument, ctx, 'void') !== 'void')
-						throw "a 'void' function cannot return a value";
+						ctx.emit(I.drop);
 				} else if (argument) {
 					// A `void` expression returned where the signature declares a value: real JS gives
 					// `undefined`, so the expression runs for its effects and the declared result's own

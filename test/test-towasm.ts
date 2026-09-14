@@ -2536,6 +2536,30 @@ async function main() {
 		check("a 'void' field compiles, assignable from 'undefined', rest of the class still works", fieldTest(), 42);
 	}
 
+	{
+		// TS's return-type bivariance: a callback whose slot is `(v) => void` may have a body that really
+		// does produce a value, and JS discards it. Codegen used to throw "a 'void' function cannot return a
+		// value" -- rejecting legal TS. The genuine error (a `: void`-annotated function returning a value)
+		// is the CHECKER's, raised before codegen, so the value is simply dropped here as a statement's is.
+		const { valueReturningCallback, voidCallReturned } = await compile(`
+			export function valueReturningCallback(): number {
+				let n = 0;
+				const inc = (): number => { n += 2; return n; };
+				[1, 2, 3].forEach(() => inc());
+				return n;
+			}
+			export function voidCallReturned(): number {
+				let n = 0;
+				const bump = (): void => { n++; };
+				const wrap = (): void => bump();
+				wrap(); wrap();
+				return n;
+			}
+		`);
+		check("a value-returning body in a '(v) => void' callback slot drops the value", valueReturningCallback(), 6);
+		check("returning a 'void' call from a 'void' arrow", voidCallReturned(), 2);
+	}
+
 	await checkThrows('void local is rejected', () => compile(`
 		export function noop(): void {}
 		export function f(): number {
