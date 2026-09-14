@@ -16,14 +16,9 @@ get a representation derived from them. Anything asking "how is this stored" mus
 there is one and only fall back to resolving the type — `typeOf(u8)` widens to `u32`, so resolving a
 tag AS a type silently loses the packing (this produced an i32-element `ArrayBuffer`, 2026-09-14).
 
-**Where this is load-bearing:** `ensureClass('Array', [Node])` and `('Array', [Foo])` are two distinct
-`ClassInfo`s (separate method instantiations) that resolve to ONE physical type index. What collapses
-them is the constructor-returnType mechanism: `typeOf(Array<T>)` answers with a representation, and
-`info.typeIndex` follows from that rather than from the instantiation key (`genericKey`/`typeKey`,
-which keeps tag arguments verbatim but is otherwise keyed by type).
-
-So **retiring that mechanism for `Array` would give one struct per element TYPE** — `Node[]` and
-`Foo[]` becoming distinct wasm types with identical layout, and a `Node[]` no longer flowing into an
-`any[]` slot. If it is retired (see [[tison-array-identity]]'s next step), `Array`'s physical
-instantiation must first be keyed on the element REPRESENTATION, which the tag machinery already
-allows — then one struct per kind falls out and the declared `data` field can build it.
+**History, and a prediction that did not hold:** before 014ac83, `ensureClass('Array', [Node])` and
+`('Array', [Foo])` shared one physical type, because the constructor-returnType mechanism answered with a
+representation. 014ac83 made `Array` an ordinary class, so they are now distinct structs. This note used to
+predict that would stop a `Node[]` flowing into an `any[]` slot. It did not: an `any` receiver dispatches
+dynamically and never meets a `ref.cast`. Struct merging stays a tool to reach for on evidence only -- see
+[[tison-array-identity]].

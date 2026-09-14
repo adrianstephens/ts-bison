@@ -1,36 +1,42 @@
 ---
 name: tison-array-identity
-description: "BLOCKER for self-hosting: `Array<T>` IS the bare wasm array, so `push` reassigns the binding and every ALIAS of the array silently keeps the old value"
+description: "RESOLVED (014ac83): `Array<T>` owns its storage (a `RawArray<T>` field), so a mutator replaces a field every alias shares; the compiler knows only `RawArray` (`{arr}`)"
 metadata:
-  node_type: memory
   type: project
 ---
 
-`Array<T>` is compiled as the bare wasm-GC array itself (`lib/array.ts`: `length` is `array.len`,
-`__get` is `array.get $this`), so capacity IS length and a mutator cannot grow it in place. `push`/
-`pop`/`shift`/`unshift` therefore allocate a new array and the CALL SITE writes it back to the
-receiver's lvalue ([[tison-towasm-capabilities]]'s `reassignsThis`, archived design memory
-`tison_towasm_array_mutators`). That is only correct when the receiver's binding is the array's ONLY
-reference. JS array identity is shared, so every alias diverges, silently:
+**Resolved in 014ac83 (2026-09-14).** `Array<T>` compiled to the bare wasm-GC array, so `push` & co.
+reallocated and wrote back to the receiver's lvalue only; every alias kept the old array (`const b = a;
+b.push(1); a.length` was 0; towasm's own `worklist` stayed empty). Tests: test-towasm.ts "array identity: ...".
 
-| shape | JS | towasm (2026-09-14) |
-|---|---|---|
-| `const b = a; b.push(1); a.length` | 1 | **0** |
-| `function add(v: number[]) { v.push(1) } add(a); a.length` | 1 | **0** |
-| `const f = () => { a.push(1) }; f(); a.length` | 1 | **0** |
-| `box.items.push(1); box.items.length` | 1 | 1 (a field IS the shared location) |
+**The design (settled with the user, after several rejected intermediate forms):**
+- `WasmType`'s `{arr}` means a WASM ARRAY and nothing else -- `RawArray<T>`, a string, an `ArrayBuffer`, a
+  bigint's limbs. A `grow` flag and a separate `vec` variant were both tried and rejected.
+- `Array<T>` is an ordinary lib class: `private data: RawArray<T>`, ordinary constructors, mutators do
+  `this.data = ...`. No `this =`, so arrays no longer touch `assignsToThis`/`reassignsThis`.
+- The compiler never names `Array`. A literal builds raw storage; `coerceTop` boxes/unwraps STRUCTURALLY
+  ("a class owning exactly one field of this type"); `emitAs` boxes a raw array before it is erased into a
+  non-raw slot -- the last point it has a single reference.
+- Rawness is NAMED (`RawArray<T>`), never inferred from the element: `u32[]` IS `Array<u32>`.
+- `Array.isArray` is `instanceof ArrayBase`, a field-less supertype of every instantiation.
 
-**This blocks the self-hosting goal outright**, independently of every row in the cause table. towasm.ts's
-own `const worklist: (()=>void)[] = []` (towasm.ts:1857) is pushed 15 times from nested functions; the
-reduced shape returns 0 where node returns 306, i.e. a self-compiled towasm would emit nothing at all.
-207 `.push(` sites across the target set.
+**Traps hit on the way (each cost a round):**
+- Deferring the box past erasure ("box on read if still raw") is unsound: each lazy box is a new identity,
+  so two readers of one `any` get two arrays. Asked by the user and answered.
+- Fixing erasure FLIPS `isArray`: raw storage in `any` was what made `ref.test (ref array)` answer true.
+- A type that merely RESOLVES to an array (alias, `N[K]`) must map like the `T[]` spelling, or it falls to
+  the module-level `wasmTypeOf`, which still answers raw storage.
+- Every "is it an array?" test (`'arr' in w`) had to become "does it OWN storage?" (`storageKindOf`).
 
-**Proper fix (not started):** give a growable array a stable identity — represent `Array<T>` as a struct
-`{ data: (array (mut T)), len: i32 }`, so a mutator replaces `data`/`len` IN PLACE and every alias sees it.
-Also makes `push` amortized O(1) (it is O(n) per call today) and retires `reassignsThis` for arrays.
-Blast radius is concentrated but real: ~100 sites in towasm.ts (`ARR_WTYPE` 25, `ensureArrayType` 30,
-`'arr' in` 22, the `array.*` emitters) plus most of `lib/array.ts` (366 lines). Strings share the wasm
-array form but are immutable, so they can stay bare; typed arrays are already structs over linear memory.
+**Predicted but did not happen:** distinct structs per instantiation (`Array<string>` vs `Array<any>`) did
+not break views through `any` -- an `any` receiver dispatches dynamically and never meets a `ref.cast`.
+Struct merging (the user's suggestion) was therefore NOT built; reach for it only on evidence.
 
-Found 2026-09-14 while clearing the cause table's top row (35f5b83): the void-return throw had been
-accidentally MASKING this for `forEach(x => out.push(x))`, which now compiles and answers wrongly.
+**Pre-existing bugs found, not fixed:** a nullable primitive box is unboxed on its way into `any`
+(`const x: any = m` with `m = undefined` traps, HEAD too); dynamic dispatch on `any` cannot call a rest
+method (`(y as T[]).push(x)`, HEAD too); `Array.isArray(5n)` was true (now false).
+
+**Instruments:** `assistant/suite-all.py` runs test-towasm.ts non-aborting, listing every failing block with
+its line. `assistant/probe-block.py <root> <N>` runs one block and prints its source, its error and, for a
+wasm trap, the trapping function's WAT. Follow-on: amortized `push` needs a separate `len` field, and every
+`array.len` bounds check would then have to route through it. See [[tison-type-vs-representation]].
