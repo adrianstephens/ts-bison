@@ -109,6 +109,14 @@ export function isLiteral<K extends keyof TypeOfMap>(t: Type|Expr, type: K): t i
 	return t.type === 'literal' && literalType(t) === type;
 }
 
+// A string literal's text, as a property key: a template counts only without substitutions (its parts' text); any other is `undefined`.
+export function literalString(t: Type|Expr): string | undefined {
+	if (t.type !== 'literal')
+		return undefined;
+	const v = t.value as unknown;
+	return typeof v === 'string' ? v : Array.isArray(v) && v.every(p => !p.exp) ? v.map(p => p.str).join('') : undefined;
+}
+
 // What `typeof` would report for a value of this type, or undefined when it can't be known statically --
 // which is also the only way to answer `'object'`/`'function'`, neither of which has a single physical
 // form for codegen to test for at runtime.
@@ -1590,9 +1598,8 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 					return resolve(scope, substituteType(peeled.valueType, new Map([[peeled.keyName, t.index]])), depth - 1, stopAtRef);
 
 				const object	= resolve(scope, t.object, depth - 1);
-				const keys		= isLiteral(index, 'string') ? [index.value]
-					: index.type === 'union' && index.types.every(m => isLiteral(m, 'string')) ? index.types.map(m => (m as { value: string }).value)
-					: undefined;
+				const indexKeys	= (index.type === 'union' ? index.types : [index]).map(m => literalString(m));
+				const keys		= indexKeys.every(k => k !== undefined) ? indexKeys as string[] : undefined;
 				if (keys) {
 					// An OPTIONAL property's own `T['k']` includes `undefined`, as TS gives it -- `lookupMember` answers with the
 					// declared type alone, so a `S['kind']` annotation read back a required type its own reads never have.

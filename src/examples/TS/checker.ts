@@ -929,7 +929,7 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 						// sub-variant(s) instead of keeping/discarding it whole; `l.object` may itself be a dotted path.
 						// `x[0] === literal` discriminates too -- a tuple's position, or an interface's numeric key.
 						const discKey = l.type === 'member' ? l.property
-							: l.type === 'index' && (T.isLiteral(l.index, 'number') || T.isLiteral(l.index, 'string')) ? String(l.index.value)
+							: l.type === 'index' ? (T.isLiteral(l.index, 'number') ? String(l.index.value) : T.literalString(l.index))
 							: undefined;
 						if ((l.type === 'member' || l.type === 'index') && discKey !== undefined && units) {
 							// `x?.prop === literal` truly holding also implies `x` itself is non-nullish -- a nullish `x` would
@@ -1027,8 +1027,8 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 							: sense ? narrowTo(scope, key, T.ANY, sense, cur) : scope;
 					}
 
-				} else if (test.operator === 'in' && T.isLiteral(test.left, 'string') && test.right.type === 'identifier') {
-					const prop = test.left.value, key = test.right.name;
+				} else if (test.operator === 'in' && T.literalString(test.left) !== undefined && test.right.type === 'identifier') {
+					const prop = T.literalString(test.left)!, key = test.right.name;
 					const t = scope.value(key);
 					const r = t && T.resolveOwn(t, scope);
 					// tsc's "unlisted property narrowing": `in` on a sealed object type that doesn't declare `prop` still narrows -- the truthy
@@ -1195,7 +1195,8 @@ function hoist(stmts: Stmt[], scope: Scope) {
 				let next = 0;
 				const memberTypes = stmt.members.map((m): Type => !m.init ? Literal(next++)
 					: T.isLiteral(m.init, 'number') ? Literal((next = m.init.value + 1, m.init.value))
-					: T.isLiteral(m.init, 'string') ? { ...Literal(m.init.value), fresh: true }
+					: T.literalString(m.init) !== undefined ? { ...Literal(T.literalString(m.init)!), fresh: true }
+					: T.isLiteral(m.init, 'string') ? T.STRING
 					: T.NUMBER
 				);
 				scope.addType(stmt.name, T.combineTypes(memberTypes));
@@ -1871,7 +1872,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				const atKey = objT.type !== 'tuple' && T.isLiteral(e.index, 'number') && T.lookupMember(objT, String(e.index.value), scope);
 				if (atKey)
 					return T.optional(atKey, chained);
-				const arrayUnion = !T.isLiteral(e.index, 'string') && T.arrayUnionAsArray(objT, scope);
+				const arrayUnion = T.literalString(e.index) === undefined && T.arrayUnionAsArray(objT, scope);
 				if (arrayUnion)
 					return T.optional(arrayUnion.element, chained);
 				// A tuple indexed by a COMPUTED number reads any of its positions, as TS's `T[number]` does -- towasm's own desugared
@@ -1891,18 +1892,19 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// Not a fallback from something more precise -- for a computed/non-literal numeric key there's
 				// no possible *named* property to prefer over it, so this is the only thing that can type
 				// `obj[i]` against an object-shaped (or intersection) type at all.
-				if (!T.isLiteral(e.index, 'string')) {
+				if (T.literalString(e.index) === undefined) {
 					const idxT = T.indexSignatureOf(objT, scope);
 					if (idxT)
 						return T.optional(idxT, chained);
 				}
-				if (T.isLiteral(e.index, 'string')) {
-					const t = T.lookupMember(objT, e.index.value, scope);
+				const literalKey = T.literalString(e.index);
+				if (literalKey !== undefined) {
+					const t = T.lookupMember(objT, literalKey, scope);
 					if (err && !t && T.sealed(objT, scope))
-						err(SEVERITY.ERROR, pos)`Property '${e.index.value}' does not exist on type '${show().type(objT)}'`;
+						err(SEVERITY.ERROR, pos)`Property '${literalKey}' does not exist on type '${show().type(objT)}'`;
 					if (!t)
 						return T.ANY;
-					return T.optional(t, chained || T.memberOptional(objT, e.index.value, scope));
+					return T.optional(t, chained || T.memberOptional(objT, literalKey, scope));
 				}
 				return T.ANY;
 			}
