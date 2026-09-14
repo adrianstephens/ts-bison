@@ -521,8 +521,8 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 	// one iteration's value to the next's read). The nearest ScopeMu ancestor always owns it.
 	function isLoopCarried(name: string): boolean {
 		for (let s: Scope | null = scope; s; s = s.parent) {
-			if (s instanceof ScopeMu)
-				return s.muNodes.has(name);
+			if (s instanceof ScopeMu && s.muNodes.has(name))
+				return true;
 		}
 		return false;
 	}
@@ -1517,22 +1517,8 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 					process(s);
 					expnodes.set(s, getExprNode(s.expressions.at(-1)!));
 					return false;
-
-//				default:
-//					// Still walk children of an unhandled node type so anything useful nested inside
-//					// (e.g. a call) is at least threaded into the graph, even though this node itself isn't.
-//					process(s);
-//					console.log(`not handling expr ${s.type}`);
-//					return false;
 			}
 		},
-		// on TYPE
-		//(m, process) => process(m),
-		// on CLASSMEMBER -- unreachable: 'class'/'class_decl' (see their own cases, above) walk their
-		// own members directly via buildClass/buildClassMember now, instead of going through
-		// process(s)'s generic per-member descent (which used to land here). Kept as a documented
-		// no-op, not deleted outright, in case that ever changes.
-		//() => false
 	).statements(ast);
 //	programStart.programEndId = end.id;
 	graph.root = end.id;
@@ -1585,6 +1571,7 @@ export function BuildProgram(
 	blocks?: BlockTree,
 	blockIds?: Map<BlockId, NodeId>
 ) {
+	const CONTROL = new Set(['effect', 'marker', 'gamma', 'gammaValue', 'mu', 'muValue', 'theta', 'thetaValue', 'break_scope', 'except', 'exceptValue', 'function', 'passthru', 'class_decl']);
 	const nodeVariableNames	= new Map<NodeId, string>();
 	const declaredNames		= new ScopedNames();
 	let tempVarCounter		= 0;
@@ -1625,7 +1612,6 @@ export function BuildProgram(
 	}
 
 	function valueConsumers(node: Node): Edge[] {
-		const CONTROL = new Set(['effect', 'marker', 'gamma', 'gammaValue', 'mu', 'muValue', 'theta', 'thetaValue', 'break_scope', 'except', 'exceptValue', 'function', 'passthru', 'class_decl']);
 		return (node.outputs[0] ?? []).filter(e => {
 			const target = graph.get(e.nodeId)!;
 			if (CONTROL.has(target.type) && e.port === 0)
