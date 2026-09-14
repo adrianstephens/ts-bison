@@ -39,5 +39,9 @@ never put them in the global auto-memory store.
 
 ## Scratch files
 
-Use `assistant/` (gitignored, disposable) for temporary/scratch files. Anything to keep under
-source control goes in `test/` or wherever is appropriate — not `assistant/`.
+Use `tison/assistant/` (gitignored, disposable) for temporary/scratch files, never the workspace
+root. Anything to keep under source control goes in `test/` or wherever is appropriate — not
+`assistant/`. Generated markdown gets an `.md` extension, not `.txt`.
+
+The instruments live there too and are run from the WORKSPACE ROOT, which is where `node_modules`
+is: `tison/assistant/{selfhost-survey,corpus-ab,difftest,self-errors}.sh`.

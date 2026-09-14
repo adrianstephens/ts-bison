@@ -106,7 +106,7 @@ async function testDir(dir: string) {
 	console.log(`\n${falsePositives.length} ERROR/throw on tsc-clean files (our false positives):`);
 
 	if (falsePositives.length) {
-		const dump = path.join(__dirname, '../../assistant/corpus-false-positives.txt');
+		const dump = path.join(__dirname, '../assistant/corpus-false-positives.txt');
 		try {
 			await fs.writeFile(dump, falsePositives.sort().join('\n') + '\n');
 			console.log(`  written to ${path.relative(process.cwd(), dump)}`);
