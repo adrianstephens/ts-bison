@@ -14,10 +14,17 @@ class Map<K, V> {
 	private keys_: K[] = [];
 	private values_: V[] = [];
 
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(entries: readonly (readonly [K, V])[] = []) {
 		const n = entries.length;
 		for (let i = 0; i < n; i++)
 			this.set(entries[i][0], entries[i][1]);
+	}
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(other: Map<K, V>) {
+		const n = other.keys_.length;
+		for (let i = 0; i < n; i++)
+			this.set(other.keys_[i], other.values_[i]);
 	}
 	get size(): number { return this.keys_.length; }
 

@@ -4259,6 +4259,22 @@ async function main() {
 	}
 
 	{
+		// `new Map(otherMap)` (peg.ts's `new Map<Terminal, ActionEntry>(skipOnly)`): a second constructor, picked statically by the
+		// argument's type. The entries form stays the one `new Map()` and `new Map([...])` pick.
+		const { mapCopy } = await compile(`
+			export function mapCopy(): number {
+				const a = new Map<string, number>([['x', 1], ['y', 2]]);
+				const b = new Map(a);
+				b.set('z', 3);
+				const c = new Map<string, number>(b);
+				const e = new Map<string, number>();
+				return a.size * 1000 + b.size * 100 + (c.get('y') ?? 0) * 10 + e.size;
+			}
+		`);
+		check('mapCopy()', mapCopy(), 2320);
+	}
+
+	{
 		// String integration: match/search/replace/split, all built on RegExp above.
 		const {
 			matchFound, matchNotFound, searchFound, searchNotFound,
