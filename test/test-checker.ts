@@ -36,6 +36,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 
 	// unannotated class members infer their return types at every use
 	['method and getter returns',	'class B { m() { return 1; } get g() { return "s"; } } const x: string = new B().m(); const y: number = new B().g;', [NOT_ASSIGNABLE('number', 'string'), NOT_ASSIGNABLE('string', 'number')]],
+	['static accessors see the constructor', 'class A { static #n: number; static get g(): string { return this.#n; } static set s(v: number) { const q: string = this.#n; } }', ["is not assignable to declared return type 'string'", NOT_ASSIGNABLE('number', 'string')]],
 	['static member returns its class', 'class A { static self = A; static make() { return A; } static me() { return this; } } const q: number = A.make();', [NOT_ASSIGNABLE('typeof A', 'number')]],
 
 	// strictNullChecks off: null/undefined belong to every type, and inferred null/undefined widen to `any`

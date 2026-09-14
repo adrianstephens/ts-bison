@@ -2666,10 +2666,10 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 				checkFunctionBody(m, m.body, hasMod(m, 'static') ? statScope : instScope, hasMod(m, 'async'), m.key === 'constructor' || hasMod(m, 'generator'), hasMod(m, 'generator'), err);
 				break;
 			case 'get':
-				checkFunctionBody(m, m.body, instScope, false, false, false, err);
+				checkFunctionBody(m, m.body, hasMod(m, 'static') ? statScope : instScope, false, false, false, err);
 				break;
 			case 'set':
-				checkFunctionBody(m, m.body, instScope, false, true, false, err);
+				checkFunctionBody(m, m.body, hasMod(m, 'static') ? statScope : instScope, false, true, false, err);
 				break;
 			case 'static_block':
 				checkBlock(m.body, new Scope(statScope), typeOf1(err), checkStmt1(err));
