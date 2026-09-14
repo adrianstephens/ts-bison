@@ -225,7 +225,7 @@ class ScopeMu extends Scope {
 	// treat anything depending on the mu as loop-invariant and float it out before the loop entirely.
 	// currentFunctionEntry is a live getter, not a captured value: a name looked up from a further
 	// nested function needs THAT function's entry, not whichever was current at construction.
-	constructor(parent: Scope, public makeNamedNode: (type: NodeType, name: string) => Node, public stateAnchor: Node, public currentFunctionEntry: () => Node | undefined) {
+	constructor(parent: Scope, public makeMu: (name: string) => Node, public stateAnchor: Node, public currentFunctionEntry: () => Node | undefined) {
 		super(parent);
 	}
 	public get(name: string): Node | undefined {
@@ -234,7 +234,7 @@ class ScopeMu extends Scope {
 			return node;
 		const old = this.parent?.get(name);
 		if (old) {
-			const mu = this.makeNamedNode('muValue', name);
+			const mu = this.makeMu(name);
 			// A captured (outer-scope) read touched inside a loop needs the same scopeAnchorId floor
 			// this/super get: without it, a value purely derived from this mu can be hoisted (loop-
 			// invariant) past the arrow/function it's lexically inside, into an enclosing scope that
@@ -333,15 +333,6 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 		graph.set(id, node);
 		return node;
 	}
-	// A node whose own payload is just a name: a slot name (var/muValue/thetaValue/gammaValue/
-	// named-except/member's property).
-	function makeNamedNode<T extends NodeType>(type: T, name: string) {
-		return makeNode({ type, name } as Extract<INode, { type: T }>);
-	}
-	// A node whose own payload is a raw statement (passthru/class_decl/a function declaration).
-	function makeStmtNode<T extends NodeType>(type: T, stmt: Stmt) {
-		return makeNode({ type, stmt } as Extract<INode, { type: T }>);
-	}
 	// An internal bookkeeping / state-chain anchor node.
 	function makeMarker(name: MarkerName) {
 		return makeNode({ type: 'marker', name });
@@ -350,27 +341,21 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 	// effect before the first function_decl has nothing valid to thread its first state edge from.
 	let end: Node = makeMarker('PROGRAM_START');
 
-	// True when the path just walked never falls through to its own lexical successor (it broke,
-	// continued, or returned) -- consulted by 'if' to decide whether a branch needs a real gamma
-	// even with no call in it, and to propagate "exited" to its own enclosing branch.
+	// True when the path just walked never falls through to its own lexical successor (it broke, continued, or returned)
+	// -- consulted by 'if' to decide whether a branch needs a real gamma even with no call in it, and to propagate "exited" to its own enclosing branch.
 	let exited = false;
 
-	// True specifically when `exited` was caused by `break`, not continue/return/throw: a break
-	// targets real code (an enclosing loop/switch) that reads a reassigned variable back through the
-	// graph, so its value must survive into the merge -- the others' targets don't, and threading
-	// their value through a graph-level merge too actively confuses GCM's own scheduling.
+	// True specifically when `exited` was caused by `break`, not continue/return/throw:
+	// a break targets real code (an enclosing loop/switch) that reads a reassigned variable back through the graph, so its value must survive into the merge
+	// -- the others' targets don't, and threading their value through a graph-level merge too actively confuses GCM's own scheduling.
 	let brokeOut = false;
 
-	// One entry per enclosing LOOP (switch is transparent to `continue`): a for-loop's own `update`
-	// expression, or undefined for while/do-while. `continue` -- lowered onto the same while-shaped
-	// graph while/do-while use -- would otherwise skip `update` entirely, so it re-walks a FRESH
-	// clone of it (the original was already walked once, for the normal path).
+	// One entry per enclosing LOOP (switch is transparent to `continue`): a for-loop's own `update` expression, or undefined for while/do-while. `continue`
+	// -- lowered onto the same while-shaped graph while/do-while use -- would otherwise skip `update` entirely, so it re-walks a FRESH clone of it (the original was already walked once, for the normal path).
 	const loopUpdateStack: (Expr | undefined)[] = [];
 
-	// 'floating' is the uniform tag for every ordinary, genuinely pure value-producing expression
-	// node; an assignment-operator binary or ++/-- unary gets 'mutation' instead, despite sharing
-	// the same AST shape -- both carry a real effect and must never be treated as an ordinary
-	// poolable value (constant-foldable/CSE-mergeable/freely inlinable) the way 'floating' is.
+	// 'floating' is the uniform tag for every ordinary, genuinely pure value-producing expression node; an assignment-operator binary or ++/-- unary gets 'mutation' instead, despite sharing the same AST shape
+	// -- both carry a real effect and must never be treated as an ordinary poolable value (constant-foldable/CSE-mergeable/freely inlinable) the way 'floating' is.
 	function makeExprNode<T extends NodeType = 'floating'>(expr: Expr, type: T = 'floating' as T) {
 		const node = makeNode({ type, expr } as Extract<INode, { type: T }>);
 		expnodes.set(expr, node);
@@ -380,15 +365,14 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 		if (expr.type === 'identifier') {
 			const found = scope.get(expr.name);
 			if (found) {
-				// See capturedRead's own comment: a read reaching outside its declaring function must
-				// never be statically inlined, since the reading function may run any number of times.
+				// See capturedRead's own comment: a read reaching outside its declaring function must never be statically inlined, since the reading function may run any number of times.
 				if (found.type === 'var' && !scope.isLocalToCurrentFunction(expr.name))
 					found.capturedRead = true;
 				return found;
 			}
 			let ext = externalNodes.get(expr.name);
 			if (!ext) {
-				ext = makeNamedNode('var', expr.name);
+				ext = makeNode({type: 'var', name: expr.name});
 				externalNodes.set(expr.name, ext);
 			}
 			return ext;
@@ -418,8 +402,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 	// check for a REAL effect (a call) -- used to decide whether an if/else branch needs a
 	// structural gamma, or whether its value is already fully captured by a per-variable named one.
 	function hasRealEffect(tail: Node, boundary: Node): boolean {
-		let cur = tail;
-		while (cur !== boundary) {
+		for (let cur = tail; cur !== boundary; ) {
 			if (!(cur.type === 'marker' && cur.name === 'MUTATION_MARKER'))
 				return true;
 			const pred = cur.inputs[0];
@@ -429,20 +412,17 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 		}
 		return false;
 	}
-	// A reassignment is an observable mutation, like a call, but wasn't threaded through the state
-	// chain -- without this, a later read of the same binding could be scheduled as if it ran BEFORE
-	// the reassignment. Threads a marker into the chain and hangs the node off it via a scheduling-
-	// only edge on its own unused port 2 (binary uses 0/1 for real operands, unary uses only 0).
-	// (A tighter, per-prior-effect version was tried and reverted: it also constrains scheduling
-	// DEPTH, pulling an unconditional reassignment inside a conditional its target effect happened
+	// A reassignment is an observable mutation, like a call, but wasn't threaded through the state chain
+	// -- without this, a later read of the same binding could be scheduled as if it ran BEFORE the reassignment.
+	// Threads a marker into the chain and hangs the node off it via a scheduling-only edge on its own unused port 2 (binary uses 0/1 for real operands, unary uses only 0).
+	// (A tighter, per-prior-effect version was tried and reverted: it also constrains scheduling DEPTH, pulling an unconditional reassignment inside a conditional its target effect happened
 	// to be nested in -- `if (i) { g(i); } i = i + 1;` became an infinite loop.)
 	function threadMutation(node: Node) {
 		const marker = makeMarker('MUTATION_MARKER');
 		connectValue(marker, 0, node, 2);
 		connectEnd(marker);
 	}
-	// The single place a name becomes (re)bound to a node: tags it for Output, updates scope, and
-	// orders it -- all three always travel together, so they live in one place instead of being
+	// The single place a name becomes (re)bound to a node: tags it for Output, updates scope, and orders it -- all three always travel together, so they live in one place instead of being
 	// duplicated (and easy to accidentally skip one of) at every call site that rebinds a variable.
 	function rebindVar(name: string, node: Node, isDeclaration = false) {
 		node.boundName = name;
@@ -458,25 +438,24 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 	function buildLoop(recurse: WalkerB, test: Expr, body: Stmt, isDoWhile: boolean, forUpdate?: Expr) {
 		const preLoop	= getState();
 		const muEnd		= makeNode({ type: 'mu' });
-		if (isDoWhile)
-			muEnd.loopKind = 'do';
-		const muScope	= new ScopeMu(scope, makeNamedNode, muEnd, () => currentFunctionEntry);
+		const muScope	= new ScopeMu(scope, name => makeNode({type: 'muValue', name}), muEnd, () => currentFunctionEntry);
 		scope	= muScope;
 		connectEnd(muEnd);
 
 		loopUpdateStack.push(forUpdate);
 		let testNode: Node;
 		if (isDoWhile) {
-			exited = false;
-			brokeOut = false;
+			muEnd.loopKind = 'do';
+			exited		= false;
+			brokeOut	= false;
 			recurse.statement(body);
 			recurse.expression(test);
-			testNode = getExprNode(test);
+			testNode	= getExprNode(test);
 		} else {
 			recurse.expression(test);
-			testNode = getExprNode(test);
-			exited = false;
-			brokeOut = false;
+			testNode	= getExprNode(test);
+			exited		= false;
+			brokeOut	= false;
 			recurse.statement(body);
 		}
 		loopUpdateStack.pop();
@@ -492,35 +471,32 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 		for (const [name, muNode] of muScope.muNodes) {
 			connectValue(muScope.bindings.get(name)!, 0, muNode, 1);		// Slot 1 = Feedback loop
 
-			const theta = makeNamedNode('thetaValue', name);
+			const theta = makeNode({type: 'thetaValue', name});
 			connectValue(testNode, 0, theta, 0);	// Slot 0 = Condition
 			connectValue(muNode, 0, theta, 1);		// Slot 1 = Value to pass out
 			connectValue(stateTheta, 0, theta, 2);	// Scheduling-only anchor, see ScopeMu's own
 			scope.set(name, theta);
 		}
-		// The loop AS A WHOLE always falls through to whatever follows it (from the enclosing
-		// context's perspective) regardless of whether break/continue happened inside its body.
+		// The loop AS A WHOLE always falls through to whatever follows it (from the enclosing context's perspective) regardless of whether break/continue happened inside its body.
 		exited = false;
 		brokeOut = false;
 	}
 
-	// Shared by 'if' and 'switch' (each case is structurally its own binary branch, chained forward
-	// into the next): resets scope/end/exited to `parent`, walks one branch, captures the result.
+	// Shared by 'if' and 'switch' (each case is structurally its own binary branch, chained forward into the next): resets scope/end/exited to `parent`, walks one branch, captures the result.
 	function walkBranch(parent: State, walk: () => void) {
 		setState(new Scope(parent.scope), parent.end);
 		walk();
 		return getState();
 	}
 
-	// The STATE-level half of reconciling two branches: does either side need a real structural
-	// gamma (a call, or an exit), or does state continue unchanged past a branch that only
+	// The STATE-level half of reconciling two branches: does either side need a real structural gamma (a call, or an exit), or does state continue unchanged past a branch that only
 	// reassigned variables. Sets `end`/`exited` for whatever comes next.
 	function mergeState(parent: State, test: Node, trueState: State, falseState: State): Node | undefined {
 		if (trueState.exited || falseState.exited || hasRealEffect(trueState.end, parent.end) || hasRealEffect(falseState.end, parent.end)) {
 			const gamma = makeNode({ type: 'gamma' });
 			connectValue(parent.end, 0, gamma, 0);		// Slot 0 = State predecessor
-			connectValue(test, 0, gamma, 1);				// Slot 1 = Condition
-			connectValue(trueState.end, 0, gamma, 2);		// Slot 2 = True State
+			connectValue(test, 0, gamma, 1);			// Slot 1 = Condition
+			connectValue(trueState.end, 0, gamma, 2);	// Slot 2 = True State
 			connectValue(falseState.end, 0, gamma, 3);	// Slot 3 = False State
 			end = gamma;
 			// Only counts as "exited" to whatever encloses it when BOTH sides did -- an implicit
@@ -534,8 +510,8 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 		// No real effect in either branch -- already fully captured by reconcileVariables's own
 		// per-variable named gamma. `end` still must reset, or it dangles off whichever branch's
 		// mutation-marker chain was walked last instead of the state that actually continues past it.
-		end = parent.end;
-		exited = trueState.exited && falseState.exited;
+		end		= parent.end;
+		exited	= trueState.exited && falseState.exited;
 		brokeOut = exited && trueState.brokeOut && falseState.brokeOut;
 		return undefined;
 	}
@@ -606,17 +582,8 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 				else if (falseVal.boundName === name && !(falseVal.type === 'var' && falseVal.declKind) && falseVal.type !== 'gammaValue' && falseVal.type !== 'exceptValue')
 					falseVal.boundName = undefined;
 
-				// When one side broke out, its operand still carries boundName === name -- printing
-				// the merge itself under that same name would be circular; neverMaterialize gets the
-				// same "never print by this name" outcome directly.
-				const gamma = makeNode({ type: 'gammaValue' });
-				// Set directly, not via rebindVar: this merge isn't itself a fresh mutation (each
-				// branch's own value already threaded its own threadMutation), so it shouldn't get
-				// its own MUTATION_MARKER -- only slotName()'s "this node owns printing under a name"
-				// signal.
-				gamma.boundName = name;
-				if (trueExitedViaBreak || falseExitedViaBreak)
-					gamma.neverMaterialize = true;
+				// When one side broke out, its operand still carries boundName === name -- printing the merge itself under that same name would be circular; neverMaterialize gets the same "never print by this name" outcome directly.
+				const gamma = makeNode({ type: 'gammaValue', boundName: name, neverMaterialize: trueExitedViaBreak || falseExitedViaBreak });
 				connectValue(test, 0, gamma, 0); 		// Condition
 				connectValue(trueVal, 0, gamma, 1);		// True path
 				connectValue(falseVal, 0, gamma, 2);	// False path
@@ -640,11 +607,10 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 
 		// Gives the body its own, unambiguous region root for regionRootOf (applyGlobalCodeMotion)
 		// to find -- entryNode's own block isn't safe to use for that.
-		const bodyStart = makeMarker('FUNCTION_BODY_START');
+		const bodyStart		= makeMarker('FUNCTION_BODY_START');
 		connectValue(entryNode, 0, bodyStart, 0);
 
-
-		const fnScope = new Scope(scope);
+		const fnScope		= new Scope(scope);
 		fnScope.isFunctionBoundary = true;
 
 		// A destructured param's own hidden temp binding is created below like any other param, but
@@ -657,12 +623,12 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 			let port = 1;
 			function addParam(key: JS.BindingTarget) {
 				if (typeof key === 'string') {
-					const paramNode = makeNamedNode('var', key);
+					const paramNode = makeNode({type: 'var', name: key});
 					connectValue(entryNode, port++, paramNode, 0);
 					fnScope.create(key, paramNode);
 				} else {
 					const tempName = `__destructure${nextId++}`;
-					const paramNode = makeNamedNode('var', tempName);
+					const paramNode = makeNode({type: 'var', name: tempName});
 					connectValue(entryNode, port++, paramNode, 0);
 					fnScope.create(tempName, paramNode);
 					pendingParamPatterns.push([key, tempName]);
@@ -848,7 +814,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 							// A dedicated wrapper node per declared variable, not an alias to the
 							// initializer's own node -- otherwise `let x = 5; let y = 5;` would bind both
 							// names to the same node, with no way to tell which name to print.
-							const varNode = makeNamedNode('var', v.name);
+							const varNode = makeNode({type: 'var', name: v.name});
 							if (v.init)
 								connectValue(getExprNode(v.init), 0, varNode, 0);
 							varNode.declKind = s.kind;
@@ -897,8 +863,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 					return false;
 
 				case 'do_while':
-					// The body runs BEFORE the test (using the mu's INITIAL value on the first
-					// pass), unlike `while` -- see buildLoop's own comment.
+					// The body runs BEFORE the test (using the mu's INITIAL value on the first pass), unlike `while`
 					buildLoop(recurse, s.test, s.body, true);
 					return false;
 
@@ -1105,10 +1070,10 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 					let catchParamName: string | undefined;
 					if (typeof handler.param === 'string') {
 						catchParamName = handler.param;
-						scope.create(catchParamName, makeNamedNode('var', catchParamName));
+						scope.create(catchParamName, makeNode({type: 'var', name: catchParamName}));
 					} else if (handler.param) {
 						catchParamName = `__destructure${nextId++}`;
-						scope.create(catchParamName, makeNamedNode('var', catchParamName));
+						scope.create(catchParamName, makeNode({type: 'var', name: catchParamName}));
 						for (const stmt of patternBindings('let', handler.param, Identifier(catchParamName)))
 							recurse.statement(stmt);
 					}
@@ -1213,10 +1178,10 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 					// earlier than the import that provides it. A type-only import binds no real
 					// runtime value, so it's skipped.
 					process(s);
-					connectEnd(makeStmtNode('passthru', s));
+					connectEnd(makeNode({type: 'passthru', stmt: s}));
 					if (!s.typeOnly) {
 						const bindImport = (name: string) => {
-							const varNode = makeNamedNode('var', name);
+							const varNode = makeNode({type: 'var', name});
 							threadMutation(varNode);
 							scope.create(name, varNode);
 						};
@@ -1242,7 +1207,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 						return false;
 					}
 					process(s);
-					connectEnd(makeStmtNode('passthru', s));
+					connectEnd(makeNode({type: 'passthru', stmt: s}));
 					return false;
 				}
 
@@ -1251,7 +1216,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 					// value-shape check to tell "resolved class" from "verbatim") makes "always needs
 					// rebuildClass" a property of the node itself. Anchored as a statement, not an
 					// 'effect' ('class' the expression uses that), since it produces no value.
-					const node = makeStmtNode('class_decl', s);
+					const node = makeNode({type: 'class_decl', stmt: s});
 					node.classInfo = buildClass(recurse, node, s);
 					connectEnd(node);
 					return false;
@@ -1260,7 +1225,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 				default:
 					// An unreferenced declaration is otherwise an unanchored island nothing schedules.
 					process(s);
-					connectEnd(makeStmtNode('passthru', s));
+					connectEnd(makeNode({type: 'passthru', stmt: s}));
 					return false;
 			}
 			return process(s);
@@ -1463,7 +1428,7 @@ export function BuildVSDG(ast: Stmt[]): VSDG {
 				}
 				case 'member': {
 					process(s);
-					const node = makeNamedNode('member', s.property);
+					const node = makeNode({type: 'member', name: s.property});
 					node.optional = s.optional;
 					expnodes.set(s, node);
 					connectValue(getExprNode(s.object), 0, node, 0);

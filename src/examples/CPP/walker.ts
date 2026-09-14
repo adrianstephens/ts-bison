@@ -67,6 +67,8 @@ export function walker(
 	// in whether they bottom out at `Identifier` or `undefined`, so they need two distinctly-typed mappers --
 	// a single function returning their union isn't assignable back into either one specifically.
 
+	const paramDecl			= (p: ParamDecl): ParamDecl => isPackParameter(p) ? p : mapObject(p, {specifiers: declSpec, declarator, default: mapExpression});
+
 	const declarator = (d: Declarator): Declarator => {
 		switch (d.type) {
 			case 'identifier':			return d;
@@ -92,58 +94,39 @@ export function walker(
 	// c-parser.ts's comment on `ArrayDecl` (the `[type_specifier]` array-size form is obscure enough that
 	// threading the cpp extension seam through the whole declarator system for it isn't worth it). Walking it
 	// with the wide `typeSpecifier` mapper is still correct behavior; only the field's *declared* type is narrower.
-	const arraySize = (s: C.TypeSpecifier | C.Expr): C.TypeSpecifier | C.Expr | undefined =>
-		isExpr(s) ? mapExpression(s as Expr) as unknown as C.Expr : typeSpecifier(s as TypeSpecifier) as unknown as C.TypeSpecifier;
+	const arraySize 		= (s: C.TypeSpecifier | C.Expr) => isExpr(s) ? mapExpression(s) : typeSpecifier(s) as C.TypeSpecifier;
+	const baseSpecifier		= (b: CPP.BaseSpecifier): CPP.BaseSpecifier => mapObject(b, {args: mapArray(a => mapObject(a, {value: typeNameOrExpr}))});
 
 	const typeSpecifier = (t: TypeSpecifier): TypeSpecifier => {
 		switch (t.type) {
 			case 'struct':
 			case 'union':
 			case 'class':	return mapObject(t, {bases: mapArray(baseSpecifier), body: mapArrayA(mapClassMemberA)});
-			case 'enum':	return mapObject(t, {base: typeSpecifier, members: mapArrayA(enumerator)});
+			case 'enum':	return mapObject(t, {base: typeSpecifier, members: mapArrayA(e => mapObject(e, {init: mapExpression}))});
 			default:		return t; // 'ref', and cpp's GenericType/QualifiedType/DecltypeSpecifier (structurally opaque here)
 		}
 	};
 
-	const enumerator = (e: C.Enumerator): C.Enumerator => mapObject(e, {init: mapExpression});
+	const declSpec			= <S extends DeclSpec>(s: S): S => mapObject(s, {type: typeSpecifier} as W.NodeMap<S>);
+	const typeName			= (t: TypeName): TypeName => mapObject(t, {specifiers: declSpec, declarator: abstractDeclarator});
+	const narrowTypeName	= (t: C.TypeName) => typeName(t) as C.TypeName;
+	const typeNameOrExpr	= (v: TypeName | Expr) => isExpr(v) ? mapExpression(v) : typeName(v);
+	const initDeclarator	= (d: InitDeclarator): InitDeclarator => isDeclarator(d) ? declarator(d) : mapObject(d, {declarator, initializer});
+	const initializer		= (i: C.Initializer<Expr>): C.Initializer<Expr> => isExpr(i) ? mapExpression(i)! : mapObject(i, {elements: mapArrayA(initializer)});
+	const memberInitializer	= (m: CPP.MemberInitializer): CPP.MemberInitializer => mapObject(m, {arguments: mapArrayA(mapExpressionA)});
 
-	const declSpec = <S extends DeclSpec>(s: S): S => mapObject(s, {type: typeSpecifier} as W.NodeMap<S>);
-
-	const typeName = (t: TypeName): TypeName => mapObject(t, {specifiers: declSpec, declarator: abstractDeclarator});
-	// C's plain `cast`/`sizeof_type` Expr variants keep C's narrow (never-extended) TypeName -- see the `Expr`
-	// comment on `cast`/`sizeof_type` above.
-	const narrowTypeName = (t: C.TypeName): C.TypeName => typeName(t as TypeName) as unknown as C.TypeName;
-
-	const typeNameOrExpr = (v: TypeName | Expr): TypeName | Expr | undefined => isExpr(v) ? mapExpression(v as Expr) : typeName(v as TypeName);
-
-	const paramDecl = (p: ParamDecl): ParamDecl =>
-		isPackParameter(p) ? p : mapObject(p, {specifiers: declSpec, declarator, default: mapExpression});
-
-	const initDeclarator = (d: InitDeclarator): InitDeclarator =>
-		isDeclarator(d) ? declarator(d as Declarator)
-			: mapObject(d, {declarator, initializer});
-
-	const initializer = (i: C.Initializer<Expr>): C.Initializer<Expr> =>
-		isExpr(i) ? mapExpression(i)!
-			: mapObject(i, {elements: mapArrayA(initializer)});
-
-	const memberInitializer = (m: CPP.MemberInitializer): CPP.MemberInitializer => mapObject(m, {arguments: mapArrayA(mapExpressionA)});
-
-	const templateArg = (a: CPP.TemplateArg): CPP.TemplateArg => mapObject(a, {value: typeNameOrExpr});
 	const templateParam = (p: CPP.TemplateParam): CPP.TemplateParam => mapObject(p, {
 		nonType: declSpec,
 		default: typeNameOrExpr,
 	});
-	const baseSpecifier = (b: CPP.BaseSpecifier): CPP.BaseSpecifier => mapObject(b, {args: mapArray(templateArg)});
-
-	const catchClause = (c: CPP.CatchClause): CPP.CatchClause => mapObject(c, {type: typeName, body});
+	const body = (b: Block) => mapObject(b, {body: mapArrayA(mapStatementA)});
+	const catchClause		= (c: CPP.CatchClause): CPP.CatchClause => mapObject(c, {type: typeName, body});
 
 	// A struct/class member's own declarators, and cpp's DeclaratorField (declarator + optional initializer).
 	const structDeclarator = (d: CPP.StructDeclarator): CPP.StructDeclarator =>
 		'declarator' in d ? mapObject(d, {declarator, initializer: mapExpression})
 			: mapObject(d, {width: mapExpression});
 
-	const body = (b: Block) => mapObject(b, {body: mapArrayA(mapStatementA)});
 
 	// ---- expressions ----
 
@@ -195,11 +178,14 @@ export function walker(
 		switch (x.type) {
 			case 'class':
 			case 'struct':
-			case 'union':		return classSpecifier(x);
+			case 'union':		return mapObject(x, {bases: mapArray(baseSpecifier), body: mapArrayA(mapClassMemberA)});
 			case 'using_alias': return mapObject(x, {target: typeName});
 			default:			return mapDefinition(x);
 		}
 	};
+
+	const methodTail	= (t: CPP.MethodTail): CPP.MethodTail => mapObject(t, {body});
+	const ctorTail		= (t: CPP.CtorTail): CPP.CtorTail => mapObject(t, {initializerList: mapArray(memberInitializer), body});
 
 	const definitionExtra = (d: Definition): Definition => {
 		switch (d.type) {
@@ -213,8 +199,8 @@ export function walker(
 			case 'using_decl':			return d;
 			case 'using_alias':			return mapObject(d, {target: typeName});
 			case 'template':			return mapObject(d, {
-				params:		mapArrayA(templateParam),
-				declaration: templateDeclaration,
+				params:			mapArrayA(templateParam),
+				declaration:	templateDeclaration,
 			});
 			case 'static_assert':		return mapObject(d, {condition: mapExpressionA});
 			case 'method_def':
@@ -230,8 +216,6 @@ export function walker(
 		}
 	};
 
-	const methodTail = (t: CPP.MethodTail): CPP.MethodTail => mapObject(t, {body});
-	const ctorTail = (t: CPP.CtorTail): CPP.CtorTail => mapObject(t, {initializerList: mapArray(memberInitializer), body});
 
 	const statementExtra = (s: Stmt): Stmt => {
 		switch (s.type) {
@@ -242,8 +226,7 @@ export function walker(
 			case 'while':
 			case 'do_while':			return mapObject(s, {test: mapExpressionA, body: mapStatementA});
 			case 'for':					return mapObject(s, {
-				init:		(i: Expr | Declaration | TypedefDecl): Expr | Declaration | TypedefDecl | undefined =>
-					isExpr(i) ? mapExpression(i) : declarationLike(i),
+				init:		i => isExpr(i) ? mapExpression(i) : declarationLike(i),
 				test:		mapExpression,
 				update:		mapExpression,
 				body:		mapStatementA,
@@ -269,8 +252,6 @@ export function walker(
 
 	// ---- class members (cpp) ----
 
-	const classSpecifier = (c: CPP.ClassSpecifier): CPP.ClassSpecifier => mapObject(c, {bases: mapArray(baseSpecifier), body: mapArrayA(mapClassMemberA)});
-
 	const classMember = (m: ClassMember | {type: 'member_typedef'; specifiers: DeclSpec; declarators: CPP.StructDeclarator[]}): ClassMember => {
 		switch (m.type) {
 			case 'struct_member':		return mapObject(m, {specifiers: declSpec, declarators: mapArrayA(structDeclarator)});
@@ -282,11 +263,10 @@ export function walker(
 			case 'conversion':			return mapObject(m, {target: typeName, body});
 			case 'using_decl':			return m;
 			case 'using_alias':			return mapObject(m, {target: typeName});
-			case 'member_template':		return mapObject(m, {params: mapArrayA(templateParam), declaration: classMemberU});
+			case 'member_template':		return mapObject(m, {params: mapArrayA(templateParam), declaration: classMember});
 			default:					return m;
 		}
 	};
-	const classMemberU = (m: ClassMember) => classMember(m);
 
 	const definitions = mapArrayA((d: Definition) => mapDefinition(d));
 	const recurse: Walker = {
@@ -302,7 +282,7 @@ export function walker(
 	const mapStatement		= makeProcess(statementExtra, onStatement, recurse, true);
 	const mapDefinition		= makeProcess(definitionExtra, onDefinition, recurse, true);
 	const mapExpression		= makeProcess(expression, onExpression, recurse);
-	const mapClassMember	= makeProcess(classMember as (x: ClassMember) => ClassMember, onClassMember, recurse, true);
+	const mapClassMember	= makeProcess(classMember, onClassMember, recurse, true);
 
 	const mapExpressionA	= mapDefined(mapExpression);
 	const mapStatementA		= mapDefined(mapStatement);
@@ -353,24 +333,24 @@ export function walkerB(
 			default:		return false;
 		}
 	};
-	const walkDeclSpec			= (s?: DeclSpec): boolean => !!s && walkTypeSpecifier(s.type);
-	const walkTypeName			= (t?: TypeName): boolean => !!t && (walkDeclSpec(t.specifiers) || walkDeclarator(t.declarator));
-	const walkParamDecl			= (p: ParamDecl): boolean => isPackParameter(p) ? false : walkDeclSpec(p.specifiers) || walkDeclarator(p.declarator) || walkExpression(p.default);
-	const walkInitDeclarator	= (d: InitDeclarator): boolean => isDeclarator(d) ? walkDeclarator(d as Declarator) : walkDeclarator(d.declarator) || walkInitializer(d.initializer);
-	const walkInitializer		= (i?: C.Initializer<Expr>): boolean => !i ? false : isExpr(i) ? walkExpression(i) : i.elements.some(walkInitializer);
-	const walkStructDeclarator	= (d: CPP.StructDeclarator): boolean => 'declarator' in d ? walkDeclarator(d.declarator) || walkExpression(d.initializer) : walkExpression(d.width);
-	const walkStructMember		= (m: CPP.StructMember): boolean => walkDeclSpec(m.specifiers) || m.declarators.some(walkStructDeclarator);
-	const walkTemplateArg		= (a: CPP.TemplateArg): boolean => isExpr(a.value) ? walkExpression(a.value) : walkTypeName(a.value);
-	const walkTemplateParam		= (p: CPP.TemplateParam): boolean => walkDeclSpec(p.nonType) || (!!p.default && (isExpr(p.default) ? walkExpression(p.default) : walkTypeName(p.default)));
-	const walkBaseSpecifier		= (b: CPP.BaseSpecifier): boolean => !!b.args?.some(walkTemplateArg);
-	const walkCatchClause		= (c: CPP.CatchClause): boolean => walkTypeName(c.type) || c.body.body.some(walkStatement);
-	const walkMemberInitializer	= (m: CPP.MemberInitializer): boolean => m.arguments.some(walkExpression);
-	const walkBlock				= (b?: Block): boolean => !!b && b.body.some(walkStatement);
-	const walkMethodOrCtorTail	= (t: CPP.MethodTail | CPP.CtorTail): boolean =>
+	const walkDeclSpec			= (s?: DeclSpec) => !!s && walkTypeSpecifier(s.type);
+	const walkTypeName			= (t?: TypeName) => !!t && (walkDeclSpec(t.specifiers) || walkDeclarator(t.declarator));
+	const walkParamDecl			= (p: ParamDecl) => isPackParameter(p) ? false : walkDeclSpec(p.specifiers) || walkDeclarator(p.declarator) || walkExpression(p.default);
+	const walkInitDeclarator	= (d: InitDeclarator) => isDeclarator(d) ? walkDeclarator(d) : walkDeclarator(d.declarator) || walkInitializer(d.initializer);
+	const walkInitializer		= (i?: C.Initializer<Expr>) => !i ? false : isExpr(i) ? walkExpression(i) : i.elements.some(walkInitializer);
+	const walkStructDeclarator	= (d: CPP.StructDeclarator) => 'declarator' in d ? walkDeclarator(d.declarator) || walkExpression(d.initializer) : walkExpression(d.width);
+	const walkStructMember		= (m: CPP.StructMember) => walkDeclSpec(m.specifiers) || m.declarators.some(walkStructDeclarator);
+	const walkTemplateArg		= (a: CPP.TemplateArg) => isExpr(a.value) ? walkExpression(a.value) : walkTypeName(a.value);
+	const walkTemplateParam		= (p: CPP.TemplateParam) => walkDeclSpec(p.nonType) || (!!p.default && (isExpr(p.default) ? walkExpression(p.default) : walkTypeName(p.default)));
+	const walkBaseSpecifier		= (b: CPP.BaseSpecifier) => !!b.args?.some(walkTemplateArg);
+	const walkCatchClause		= (c: CPP.CatchClause) => walkTypeName(c.type) || c.body.body.some(walkStatement);
+	const walkMemberInitializer	= (m: CPP.MemberInitializer) => m.arguments.some(walkExpression);
+	const walkBlock				= (b?: Block) => !!b && b.body.some(walkStatement);
+	const walkMethodOrCtorTail	= (t: CPP.MethodTail | CPP.CtorTail) =>
 		'initializerList' in t ? (!!t.initializerList?.some(walkMemberInitializer) || walkBlock(t.body))
 			: walkBlock((t as CPP.MethodTail).body);
 
-	const expression = (e: Expr): boolean => {
+	const expression = (e: Expr) => {
 		switch (e.type) {
 			case 'unary':
 			case 'unary_post':			return walkExpression(e.operand);
@@ -396,7 +376,7 @@ export function walkerB(
 		}
 	};
 
-	const declarationLike = (d: Declaration | TypedefDecl): boolean =>
+	const declarationLike = (d: Declaration | TypedefDecl) =>
 		walkDeclSpec(d.specifiers)
 		|| (d.type === 'typedef' ? d.declarators.some(walkInitDeclarator) : !!d.initDeclarators?.some(walkInitDeclarator));
 
@@ -433,8 +413,7 @@ export function walkerB(
 			case 'if':					return walkExpression(s.test) || walkStatement(s.consequent) || (!!s.alternate && walkStatement(s.alternate));
 			case 'while':
 			case 'do_while':			return walkExpression(s.test) || walkStatement(s.body);
-			case 'for':					return (s.init ? (isExpr(s.init) ? walkExpression(s.init) : declarationLike(s.init)) : false)
-				|| walkExpression(s.test) || walkExpression(s.update) || walkStatement(s.body);
+			case 'for':					return (s.init ? (isExpr(s.init) ? walkExpression(s.init) : declarationLike(s.init)) : false) || walkExpression(s.test) || walkExpression(s.update) || walkStatement(s.body);
 			case 'switch':				return walkExpression(s.discriminant) || walkStatement(s.body);
 			case 'case':				return walkExpression(s.test) || walkStatement(s.body);
 			case 'default':				return walkStatement(s.body);
