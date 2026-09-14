@@ -1854,6 +1854,32 @@ export function collectMembers(t: Type, scope: Scope): TS.TypeMember[] {
 	return out;
 }
 
+// A callee's construct signatures as TS resolves them on an intersection (resolveIntersectionTypeMembers): a MIXIN part -- one
+// construct signature taking only `...args: any[]` -- adds none of its own, and its instance type joins every other part's result.
+export function constructSignatures(t: Type, scope: Scope): TS.CallSig[] {
+	const parts: TS.CallSig[][] = [];
+	const collect = (x: Type, depth: number): void => {
+		const r = resolveOwn(x, scope);
+		if (r.type === 'intersection' && depth > 0)
+			r.types.forEach(p => collect(p, depth - 1));
+		else if (r.type === 'constructor')
+			parts.push([r]);
+		else if (r.type === 'object' && r.members.some(m => m.type === 'construct'))
+			parts.push(r.members.filter((m): m is TS.TypeMember & TS.CallSig => m.type === 'construct'));
+	};
+	collect(t, 8);
+	const isMixin = (sigs: TS.CallSig[]) => {
+		const rest = sigs.length === 1 && !sigs[0].params.length && sigs[0].rest?.typeAnnotation;
+		const r = rest && resolveOwn(rest, scope);
+		return !!r && r.type === 'array' && isAny(r.element);
+	};
+	const mixin = parts.map(isMixin);
+	if (mixin.length && mixin.every(m => m))
+		mixin[0] = false;
+	const mixed = parts.flatMap((sigs, i) => mixin[i] ? [sigs[0].returnType ?? ANY] : []);
+	return parts.flatMap((sigs, i) => mixin[i] ? [] : mixed.length ? sigs.map(s => ({ ...s, returnType: TS.IntersectionType([s.returnType ?? ANY, ...mixed]) })) : sigs);
+}
+
 export function isNullish(t: Type, scope: Scope): boolean {
 	const r = resolveOwn(t, scope);
 	return	r.type === 'literal'	? r.value === null

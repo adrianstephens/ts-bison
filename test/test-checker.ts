@@ -25,6 +25,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['for await over async gen',	'async function* ag() { yield 1; } async function f() { for await (const x of ag()) { const q: string = x; } }', [NOT_ASSIGNABLE('number', 'string')]],
 	['yield* in an async generator', 'async function* a(): AsyncGenerator<number> { yield* b(); } async function* b() { yield 1; }', []],
 	['user-defined iterator class',	'class It { next() { return { value: 1, done: false }; } [Symbol.iterator]() { return this; } } for (const v of new It) { const q: string = v; }', [NOT_ASSIGNABLE('number', 'string')]],
+	['mixin constructor intersection', 'declare class M { constructor(...args: any[]); p: number } declare class C { constructor(s: string); a: number } declare const X: typeof M & typeof C; const x = new X("a"); const q: string = x.p; const r: string = x.a;', [NOT_ASSIGNABLE('number', 'string'), NOT_ASSIGNABLE('number', 'string')]],
 	['template literal key',			'const o = { ab: 1 }; const q: string = o[`ab`];',												[NOT_ASSIGNABLE('number', 'string')]],
 	['template literal `in`',			'declare const o: { test: string } | {}; if (`test` in o) { const q: number = o.test; }',		[NOT_ASSIGNABLE('string', 'number')]],
 	['iterator through this["entries"]', 'class M { *entries(): Generator<[string, number], void> { yield ["a", 1]; } declare [Symbol.iterator]: this["entries"]; } for (const [k, v] of new M) { const q: string = v; }', [NOT_ASSIGNABLE('number', 'string')]],

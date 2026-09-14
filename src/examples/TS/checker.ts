@@ -1991,11 +1991,15 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// preference the member scan below implements. A primitive wrapper is exactly that shape -- `class
 				// BigInt`'s constructor alongside a `declare var BigInt` whose call signature returns `bigint`, so
 				// `BigInt(5)` must type as `bigint`, and its own call signature is found by that scan.
-				let sig: TS.CallSig|undefined = e.type === 'new'
-					? parts.find(p => p.type === 'constructor') ?? parts.find(p => p.type === 'function')
+				// `new` on an intersection of constructor types constructs what TS's mixin rule makes of it (`T.constructSignatures`).
+				const mixedCtors = e.type === 'new' && calleeT.type === 'intersection' ? T.constructSignatures(calleeT, scope) : [];
+				if (mixedCtors.length > 1)
+					overloads = mixedCtors;
+				let sig: TS.CallSig|undefined = mixedCtors.length === 1 ? mixedCtors[0] : mixedCtors.length ? undefined
+					: e.type === 'new' ? parts.find(p => p.type === 'constructor') ?? parts.find(p => p.type === 'function')
 					: parts.find(p => p.type === 'function');
-				sig ??= T.unionSignature(calleeT, e.type === 'new' ? 'construct' : 'call', scope);
-				if (!sig) {
+				sig ??= overloads ? undefined : T.unionSignature(calleeT, e.type === 'new' ? 'construct' : 'call', scope);
+				if (!sig && !overloads) {
 					// Each kind takes only its OWN signatures: TS rejects both cross directions -- a plain call on a
 					// construct-only value is TS2348, and `new` on a call-only one TS7009 (which still evaluates to `any`).
 					const members 		= T.collectMembers(calleeT, scope);
