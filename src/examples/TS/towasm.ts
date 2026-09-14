@@ -3253,8 +3253,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return matches.length === 1 ? matches[0] : matches.length === 0 ? fallback() : undefined;
 	}
 
-	// `cls.name`'s own `get(i)`/`set(i,v)` -- real index syntax dispatched generically to any class using
-	// this convention (typed-array views are just one user of it), whether inline-asm or a plain declared method.
+	// Index syntax (`a[i]`, `a[i] = v`) calls a class's own INDEX accessor, `__get`/`__set`, never a real API of that name
+	// (`Uint8Array.set(array, offset)`). An index-signature object is routed to `Map`, and indexes through its real `get`/`set`.
+	function indexAccessor(cls: ClassInfo, receiver: Expr, kind: 'get' | 'set', ctx: FunctionContext): string | undefined {
+		if (methodSig(cls, `__${kind}`, ctx))
+			return `__${kind}`;
+		return indexSignatureValueType(T.resolve(ctx.typeScope, narrowedTypeOf(receiver, ctx))) && methodSig(cls, kind, ctx) ? kind : undefined;
+	}
+
+	// `cls.name`'s own method signature -- whether inline-asm or a plain declared method.
 	function methodSig(cls: ClassInfo, name: string, ctx: FunctionContext): { params: WasmType[]; result: WasmType } | undefined {
 		const inline = cls.inlineMethods?.get(name);
 		if (inline) {
@@ -3332,9 +3339,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const t		= narrowedTypeOf(e, ctx);
 			const owner	= T.isAny(t) ? undefined : ownerFor(t);
 
-			const cls = classOfForIndexing(e.object, ctx);
-			const sig = cls && methodSig(cls, 'get', ctx);
-			if (cls && sig)
+			const cls		= classOfForIndexing(e.object, ctx);
+			const getter	= cls && indexAccessor(cls, e.object, 'get', ctx);
+			const sig		= cls && getter && methodSig(cls, getter, ctx);
+			if (sig)
 				return { wtype: sig.result, owner };
 
 			const kind = objectArrayKind(e.object, ctx);
@@ -5027,11 +5035,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			};
 			
 		} else if (target.type == 'index') {
-			// Any class with its own `get(i)`/`set(i,v)` (typed-array views, or any other class using the
-			// same convention -- see `methodSig`) -- real index syntax dispatched generically, not by name.
+			// A class's own index accessors (`indexAccessor`) -- real index syntax dispatched generically, not by name.
 			const cls		= classOfForIndexing(target.object, ctx);
-			const getSig 	= cls && methodSig(cls, 'get', ctx);
-			if (cls && getSig && methodSig(cls, 'set', ctx)) {
+			const getter	= cls && indexAccessor(cls, target.object, 'get', ctx);
+			const setter	= cls && indexAccessor(cls, target.object, 'set', ctx);
+			const getSig 	= cls && getter && methodSig(cls, getter, ctx);
+			if (cls && getter && setter && getSig) {
 				// `emitAs`, not a raw `emitExpr` -- same reasoning as the plain struct-field write path above.
 				const objWtype = cls.thisWtype!;
 				const obj = ctx.temp(scratchName('$obj', objWtype), objWtype);
@@ -5048,7 +5057,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					wtype,
 					old: captureOld(wtype, () => {
 						ctx.emit(I.local.get(obj));
-						emitMethodCall(cls, 'get', [idxExpr], ctx);
+						emitMethodCall(cls, getter, [idxExpr], ctx);
 					}),
 					write: makeWrite(wtype, () => {
 						ctx.emit(I.local.get(obj));
@@ -5057,7 +5066,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// but `Map.set()` (real JS's own convention) returns `this` for chaining, so its
 						// result needs an explicit drop here or the whole expression-statement's stack
 						// balance is wrong.
-						if (emitMethodCall(cls, 'set', [idxExpr, valExpr], ctx) !== 'void')
+						if (emitMethodCall(cls, setter, [idxExpr, valExpr], ctx) !== 'void')
 							ctx.emit(I.drop);
 					}),
 				};
@@ -6098,11 +6107,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 
 			case 'index': {
-				// Any class with its own `get(i)` (typed-array views, or any other class using the same
-				// convention) -- real index syntax dispatched generically, not by name.
-				const cls = classOfForIndexing(e.object, ctx);
-				const sig = cls && methodSig(cls, 'get', ctx);
-				if (cls && sig) {
+				// A class's own index accessor (`indexAccessor`) -- real index syntax dispatched generically, not by name.
+				const cls		= classOfForIndexing(e.object, ctx);
+				const getter	= cls && indexAccessor(cls, e.object, 'get', ctx);
+				const sig		= cls && getter && methodSig(cls, getter, ctx);
+				if (cls && getter && sig) {
 					// `isOptionalChainLink`, not a bare `e.optional` -- see `case 'member'`'s own comment.
 					if (isOptionalChainLink(e)) {
 						if (sig.result === 'void')
@@ -6114,7 +6123,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							// Receiver pushed directly, skipping `emitMethodCall`'s own receiver-push -- needs an
 							// explicit `ref.as_non_null` here, always sound since `readCore` only runs in the proven-non-null arm.
 							ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
-							coerceTop(emitMethodCall(cls, 'get', [e.index], ctx), ctx, resultWtype);
+							coerceTop(emitMethodCall(cls, getter, [e.index], ctx), ctx, resultWtype);
 						});
 					}
 					const thisW = cls.thisWtype!;
@@ -6122,12 +6131,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const resultWtype = nullableWtype(sig.result);
 						return emitBoundedRead(e, thisW, resultWtype, ctx, (obj, idx) => {
 							ctx.emit(I.local.get(obj.index));
-							coerceTop(emitMethodCall(cls, 'get', [{ type: 'identifier', name: idx.name }], ctx), ctx, resultWtype);
+							coerceTop(emitMethodCall(cls, getter, [{ type: 'identifier', name: idx.name }], ctx), ctx, resultWtype);
 						});
 					}
 					// `emitAs`, not a raw `emitExpr` -- `e.object` may itself be boxed `anyref` (`a[i][j]`), same reasoning as the field-read cast above.
 					emitAs(e.object, ctx, thisW);
-					return emitMethodCall(cls, 'get', [e.index], ctx);
+					return emitMethodCall(cls, getter, [e.index], ctx);
 				}
 				const kind = objectArrayKind(e.object, ctx);
 				if (!kind || kind === 'i16' || kind === 'i8') {
@@ -6141,7 +6150,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					const t = T.resolve(ctx.typeScope, narrowedTypeOf(e.object, ctx));
 					if (t.type === 'union') {
 						const owners = T.unionMembers(t, ctx.typeScope).filter(m => !T.isNullish(m, ctx.typeScope)).map(m => ownerFor(m));
-						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1 && methodSig(o, 'get', ctx))) {
+						if (owners.length > 1 && owners.every(o => o && o.typeIndex !== -1 && methodSig(o, '__get', ctx))) {
 							emitAs(e.object, ctx, REF_ANY);
 							emitAs(e.index, ctx, 'i32');
 							const info = ensureUnionIndexDispatch(owners as ClassInfo[]);
@@ -6168,7 +6177,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							alternate,
 						}) as Expr, { type: 'identifier', name: 'undefined' } as Expr), ctx, want ?? REF_ANY_NULLABLE);
 					}
-					throw `'${T.exprKey(e.object)}' is indexed but is not an array, a typed array, or a class with 'get' (its type: '${T.typeKey(narrowedTypeOf(e.object, ctx))}')`;
+					throw `'${T.exprKey(e.object)}' is indexed but is not an array, a typed array, or a class with index accessors (its type: '${T.typeKey(narrowedTypeOf(e.object, ctx))}')`;
 				}
 				// `nullable: true` on the 'ref' case -- `ensureArrayType`'s `'ref'`-kind field is declared
 				// nullable (shared physical storage for every non-scalar kind), so `array.get` always really
@@ -10626,13 +10635,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// signature) can be decided.
 		const dctx = new FunctionContext(key, new Scope(libGlobal), plainReturn(REF_ANY), undefined);
 
-		// Each member's own `get(i)` -- an internal inconsistency (not a real program error) if any member
-		// turns out not to have one, since the one real call site already required every member to satisfy
-		// `methodSig(o, 'get', ctx)` before ever calling this.
+		// Each member's own `__get(i)` -- its one real call site already required every member to have one.
 		const memberGets = members.map(m => {
-			const sig = methodSig(m, 'get', dctx);
+			const sig = methodSig(m, '__get', dctx);
 			if (!sig)
-				throw `internal: '${m.name}' (a member of a union type) has no 'get' method`;
+				throw `internal: '${m.name}' (a member of a union type) has no '__get' method`;
 			return { cls: m, wtype: sig.result };
 		});
 		// `combineUnionWtypes`, not the checker's own indexing type (unlike `ensureUnionFieldDispatch`'s
@@ -10662,7 +10669,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				dctx.emit(I.local.get(recv.index), I.ref.test(m.cls.typeIndex));
 				const _cond = dctx.swapOut();
 				dctx.emit(I.local.get(recv.index), I.ref.cast(m.cls.typeIndex));
-				emitMethodCall(m.cls, 'get', [{ type: 'identifier', name: '$idx' }], dctx);
+				emitMethodCall(m.cls, '__get', [{ type: 'identifier', name: '$idx' }], dctx);
 				coerceUnionArm(m.wtype, dctx, result);
 				return [..._cond, I.if(result === 'void' ? undefined : toValType(result), dctx.swapOut(), buildArm(i + 1))];
 			}

@@ -182,7 +182,7 @@ async function main() {
 		// `(array (mut f64))` its own declared `number[]` type alone would normally get. `x[0][1]`'s read-back
 		// used to resolve `x[0]`'s class via `classOf`'s *declared*-type-driven answer (`Array<number>`,
 		// standalone-correct but wrong here) instead of what it actually physically is (`Array<any>`) --
-		// calling `Array<number>.get(i)`'s own compiled body (hardcoded to `array.get` on a real f64-array
+		// calling `Array<number>.__get(i)`'s own compiled body (hardcoded to `array.get` on a real f64-array
 		// type) on a boxed-any array crashed at runtime ("illegal cast"). Fixed via `classOfForIndexing`
 		// (only overrides the built-in `Array` class, detected via the same "is my own container ref-kind"
 		// propagation `objectArrayKind` uses for the plain-raw-array path).
@@ -4267,7 +4267,7 @@ async function main() {
 				return t.length;
 			}
 			export function splitBasicCount(): number { const s: string = "a,b,c,d"; const re = new RegExp(","); const parts = s.split(re); return parts.length; }
-			export function splitBasicPart(): number { const s: string = "a,b,c,d"; const re = new RegExp(","); const parts = s.split(re); return parts.get(2).length; }
+			export function splitBasicPart(): number { const s: string = "a,b,c,d"; const re = new RegExp(","); const parts = s.split(re); return parts[2].length; }
 			export function splitWithLimit(): number { const s: string = "a,b,c,d"; const re = new RegExp(","); const parts = s.split(re, 2); return parts.length; }
 			export function splitOnWhitespace(): number { const s: string = "the quick brown fox"; const re = new RegExp("\\\\s+"); const parts = s.split(re); return parts.length; }
 		`);
@@ -4698,14 +4698,14 @@ async function main() {
 			function tag(strings: string[], ...values: number[]): number {
 				let sum = 0;
 				for (let i = 0; i < values.length; i++)
-					sum += values.get(i);
+					sum += values[i];
 				return sum + strings.length;
 			}
 			export function valuesSum(): number {
 				const a = 10, b = 20, c = 12;
 				return tag\`\${a}-\${b}-\${c}\`;
 			}
-			function justStrings(strings: string[]): number { return strings.get(0).length; }
+			function justStrings(strings: string[]): number { return strings[0].length; }
 			export function noInterpolation(): number {
 				return justStrings\`hello\`;
 			}

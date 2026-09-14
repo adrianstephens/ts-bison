@@ -108,7 +108,7 @@ export class String {
 	// `s[i]`. Was its own asm pair that read with `array.get` (illegal on a packed `i16` array -- V8
 	// rejected the whole module) and then wrote through `$this`, i.e. into the receiver rather than the
 	// fresh one-character result.
-	get(i: i32): string {
+	__get(i: i32): string {
 		return this.charAt(i);
 	}
 

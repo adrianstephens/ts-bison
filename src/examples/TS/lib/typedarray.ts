@@ -39,8 +39,8 @@ declare type i8 = number;
 export class ArrayBuffer {
 	get byteLength(): number	{ return __asm<[], u32>('array.len')(); }
 	[i: number]: u8;
-	get(i: i32): u8				{ return __asm<[i32], i32>('array.get_u $this')(i); }
-	set(i: i32, v: i32): void	{ return __asm<[i32, i32], void>('array.set $this')(i, v); }
+	__get(i: i32): u8			{ return __asm<[i32], i32>('array.get_u $this')(i); }
+	__set(i: i32, v: i32): void	{ return __asm<[i32, i32], void>('array.set $this')(i, v); }
 
 	constructor(byteLength: i32) {
 		return __asm<[i32], i8[]>('array.new_default $this')(byteLength) as unknown as ArrayBuffer;
@@ -160,23 +160,23 @@ export class TypedArray<T> {
 	// this is the whole point of a typed array, and it was missing entirely: `new Int8Array([200])[0]`
 	// read back 200 instead of -56, and `new Uint32Array([-1])[0]` read back -1 instead of 4294967295.
 	// Return type is `number`, not `i32`, because a full-width unsigned element does not fit in one.
-	get(i: i32): number {
+	__get(i: i32): number {
 		const elemSize: i32 = TypedArray.elemSize();
 		const base: i32 = this.byteOffset + i * elemSize;
 		if (TypedArray.isFloat() !== 0) {
 			let lo: i32 = 0;
 			for (let b: i32 = 0; b < 4; b++)
-				lo = lo | (this.buffer.get(base + b) << (b * 8));
+				lo = lo | (this.buffer.__get(base + b) << (b * 8));
 			if (elemSize === 4)
 				return f32FromBits(lo);
 			let hi: i32 = 0;
 			for (let b: i32 = 0; b < 4; b++)
-				hi = hi | (this.buffer.get(base + 4 + b) << (b * 8));
+				hi = hi | (this.buffer.__get(base + 4 + b) << (b * 8));
 			return f64FromBits(lo, hi);
 		}
 		let v: i32 = 0;
 		for (let b: i32 = 0; b < elemSize; b++)
-			v = v | (this.buffer.get(base + b) << (b * 8));
+			v = v | (this.buffer.__get(base + b) << (b * 8));
 		const bits: i32 = elemSize * 8;
 		if (TypedArray.signed() !== 0)
 			return bits < 32 ? (v << (32 - bits)) >> (32 - bits) : v;
@@ -187,7 +187,7 @@ export class TypedArray<T> {
 	// letting `>>>` do the narrowing gives real `ToInt32` (see `emitToInt32`), which is what JS
 	// specifies for a typed-array store. A narrower view was already correct, since its own `& 0xff`
 	// masking discarded the excess anyway.
-	set(i: i32, v: number): void {
+	__set(i: i32, v: number): void {
 		const elemSize: i32 = TypedArray.elemSize();
 		const base: i32 = this.byteOffset + i * elemSize;
 		if (TypedArray.isFloat() !== 0) {
@@ -195,16 +195,16 @@ export class TypedArray<T> {
 			// JS specifies -- and reads back as that rounded value, not the original double.
 			const lo: i32 = elemSize === 4 ? f32BitsOf(v) : f64BitsLo(v);
 			for (let b: i32 = 0; b < 4; b++)
-				this.buffer.set(base + b, (lo >>> (b * 8)) & 0xff);
+				this.buffer.__set(base + b, (lo >>> (b * 8)) & 0xff);
 			if (elemSize === 8) {
 				const hi: i32 = f64BitsHi(v);
 				for (let b: i32 = 0; b < 4; b++)
-					this.buffer.set(base + 4 + b, (hi >>> (b * 8)) & 0xff);
+					this.buffer.__set(base + 4 + b, (hi >>> (b * 8)) & 0xff);
 			}
 			return;
 		}
 		for (let b: i32 = 0; b < elemSize; b++)
-			this.buffer.set(base + b, (v >>> (b * 8)) & 0xff);
+			this.buffer.__set(base + b, (v >>> (b * 8)) & 0xff);
 	}
 
 	indexOf(x: number): i32 {

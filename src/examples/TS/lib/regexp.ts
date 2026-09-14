@@ -897,7 +897,7 @@ export class RegExpMatch {
 	// `m[0]`/`m[1]`: real JS hands back a `RegExpExecArray`, so indexing is how nearly every caller
 	// reads a capture. towasm routes `e[i]` through the receiver class's own `get(i)`, so this is all
 	// it takes -- without it `/a(b)/.exec(s)![1]` was rejected as "indexing is only supported on ...".
-	get(i: i32): string { return this.group(i); }
+	__get(i: i32): string { return this.group(i); }
 	groupStart(i: number): number { return this.offsets[i * 2]; }
 	groupEnd(i: number): number { return this.offsets[i * 2 + 1]; }
 	group(i: number): string {
