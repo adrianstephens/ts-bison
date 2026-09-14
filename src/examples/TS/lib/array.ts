@@ -58,11 +58,9 @@ export class Array<T> extends ArrayBase {
 	private static _copy<T>(dst: RawArray<T>, dstStart: i32, src: RawArray<T>, srcStart: i32, len: i32): void {
 		dst.copyFrom(dstStart, src, srcStart, len);
 	}
-	// `for (const k in arr)` enumerates INDICES, as strings. towasm desugars that loop into a
-	// `for...of` over this, so the number-to-string conversion happens in ordinary typed lib code
-	// rather than in a synthesized AST whose nodes the checker never stamped.
-	static _indexKeys<T>(a: T[]): string[] {
-		const n = a.length;
+	// `for (const k in x)` over anything read by position enumerates its INDICES, as strings. towasm desugars it into a `for...of`
+	// over this, given `x.length`, so the conversion happens in typed lib code rather than in an unstamped synthesized AST.
+	static _indexKeys(n: number): string[] {
 		const result: string[] = Array._make<string>(n);
 		for (let i = 0; i < n; i++)
 			result[i] = i.toString();

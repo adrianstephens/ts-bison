@@ -2854,10 +2854,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return T.unionMembers(a, scope).some(m => T.isAssignable(m, p, scope, scope, true) || T.isAssignable(p, m, scope, scope, true)) ? undefined : false;
 	}
 
-	// A non-array with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable; an array stays indexed.
+	// A value with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable; one without (an array: the lib
+	// declares it none) is read by position.
 	function iteratesByProtocol(e: Expr, ctx: FunctionContext): T.IterationTypes | undefined {
 		const t = narrowedTypeOf(e, ctx);
-		if (objectArrayKind(e, ctx) || !T.lookupMember(t, '[Symbol.iterator]', ctx.typeScope))
+		if (!T.lookupMember(t, '[Symbol.iterator]', ctx.typeScope))
 			return undefined;
 		const it = T.iterationTypes(t, ctx.typeScope);
 		if (!it)
@@ -3312,6 +3313,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (methodSig(cls, `__${kind}`, ctx))
 			return `__${kind}`;
 		return indexSignatureValueType(T.resolve(ctx.typeScope, narrowedTypeOf(receiver, ctx))) && methodSig(cls, kind, ctx) ? kind : undefined;
+	}
+
+	// A class read by POSITION, as JS's array-likes are: an index getter keyed by a number, and a real `length` (a field or
+	// `get length`) -- not a keyed `get`, whose index signature makes any name, `length` too, look like a member.
+	function isPositional(cls: ClassInfo, ctx: FunctionContext): boolean {
+		const sig = methodSig(cls, '__get', ctx);
+		const key = sig?.params[sig.params.length - 1];
+		return key !== undefined && scalarKind(key) !== undefined
+			&& (cls.fields.some(f => f.name === 'length') || !!methodSig(cls, accessorKey('get', 'length'), ctx));
 	}
 
 	// `cls.name`'s own method signature -- whether inline-asm or a plain declared method.
@@ -6269,10 +6279,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						});
 					}
 					const thisW = cls.thisWtype!;
-					// Past the end only means something for a POSITIONAL read of something with a real `length` (not a keyed `get`).
-					const key = sig.params[sig.params.length - 1];
-					if (readsPastEnd(e, ctx) && key !== undefined && scalarKind(key) !== undefined
-						&& (cls.fields.some(f => f.name === 'length') || methodSig(cls, accessorKey('get', 'length'), ctx))) {
+					if (readsPastEnd(e, ctx) && isPositional(cls, ctx)) {
 						const resultWtype = nullableWtype(sig.result);
 						return emitBoundedRead(e, thisW, resultWtype, ctx, (obj, idx) => {
 							ctx.emit(I.local.get(obj.index));
@@ -8064,16 +8071,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (s.init.type !== 'var_decl' || s.init.declarations.length !== 1)
 							throw "'for...in' loop variable must be a single declaration";
 
-						// A real ARRAY enumerates its INDICES, as strings. Falling through to
+						// Anything read by POSITION (`isPositional`) enumerates its INDICES, as strings. Falling through to
 						// `Object.entries` below bound the entries instead, so `for (const i in [5, 6])`
 						// gave the wrong values and the wrong count. `Array._indexKeys` builds them in
 						// ordinary typed lib code -- a synthesized `String(i)` here has no checker stamp
 						// to resolve `toString` through.
-						if (objectArrayKind(s.right, ctx)) {
+						const indexed = ownerOf(s.right, ctx);
+						if (indexed && isPositional(indexed, ctx)) {
 							emitStmt({
 								type: 'for', kind: 'of',
 								init: s.init,
-								right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Array' }, property: '_indexKeys' }, arguments: [s.right] },
+								right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Array' }, property: '_indexKeys' }, arguments: [JS.Member(s.right, 'length')] },
 								body: s.body,
 							}, ctx);
 							return;

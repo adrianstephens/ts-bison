@@ -3540,6 +3540,16 @@ async function main() {
 	}
 
 	{
+		// `for...in` over anything read by position enumerates its indices, as strings -- a typed array as well as an array.
+		const { forInArray, forInTyped } = await compile(`
+			export function forInArray(): number { let s = ''; for (const k in [5, 6, 7]) s += k; return s === '012' ? 1 : 0; }
+			export function forInTyped(): number { let n = 0; for (const k in new Uint8Array(3)) n += k.length; return n; }
+		`);
+		check('for...in over an array enumerates its indices as strings', forInArray(), 1);
+		check('for...in over a typed array enumerates its indices as strings', forInTyped(), 3);
+	}
+
+	{
 		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
 		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
 		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`
