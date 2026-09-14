@@ -113,6 +113,16 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   removing it broke towasm. `reduce` is now TS's real three overloads (6ee71c9).
 - var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked, nor are
   positional arguments filling a rest parameter: `declare function k(...args: number[]): number; k("x")` is clean (2026-09-13).
+- **A missing member on a CLASS instance is silently `any`** (2026-09-13): checker.ts `case 'member'` reports only when
+  `T.sealed`, which uses `resolveOwn` -- since bfd0aeb kept class refs nominal, a class ref is never sealed. The fix is one
+  line (`resolveMembers` in `sealed`), measured with corpus-ab: +44 tsc-clean ERROR, of which ~20 tsc also rejects (baselines
+  missing in the checkout) and 24 are real false positives from 8 gaps that must land FIRST: computed `[Symbol.iterator]`
+  methods missing from a class's members (6), mixin members (6), `this` in a static member (4), construct signatures on a
+  constructor-typed `T` / merged `new()` (3), polymorphic `this` returns (2), guard narrowing to a supertype keeps the
+  subtype (1), `this` in a nested `function` (1), `partiallyAnnotatedFunctionInferenceWithTypeParameter` (1, undiagnosed).
+  Our own sources gain only towasm.ts's `Uint8Array.set` (lib.d.ts lacks it); towasm's lib also needs `[Symbol.iterator]`
+  declared on `TypedArray` (test-towasm's for-of over a `Uint8Array` fails without it). Classify with real tsc per LINE, not
+  baseline presence: `assistant/corpus-ab.sh` now keeps `corpus-ab/base-false-positives.txt` for the diff.
 - Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2, 16 after the intersection work (dd1a676).
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested
