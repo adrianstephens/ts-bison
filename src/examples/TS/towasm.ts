@@ -3358,7 +3358,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// The element kind an array-valued expression resolves to -- raw storage's own, else its `Array` type's -- or `undefined`.
 	function arrayKindOf(e: Expr, ctx: FunctionContext): WasmElementI | undefined {
 		const wt = wtypeOf(e, ctx);
-		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : elementKindOfType(checkerTypeOf(e, ctx.scope), ctx.scope);
+		return storageKindOf(wt) ?? elementKindOfType(checkerTypeOf(e, ctx.scope), ctx.scope);
 	}
 
 	// `arrayKindOf` for a value about to be indexed into (`e[i]`). The ref-collapse below is DISABLED: an inner
@@ -3370,7 +3370,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// as the whole union there, so a field off it comes back `any` with no array kind (`[...a.rights, ...b.rights]` after `a && b`).
 		const nt = narrowedTypeOf(e, ctx);
 		const wt = typeOf(nt);
-		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : elementKindOfType(nt, ctx.scope);
+		return storageKindOf(wt) ?? elementKindOfType(nt, ctx.scope);
 	}
 
 	// `ownerOf` for a value about to be indexed into (`e[i]`) via generic class-method dispatch (`Array<T>.get(i)`).
