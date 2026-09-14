@@ -6505,8 +6505,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const contextualArr = arrayMembers.length === 1 ? arrayMembers[0] : contextual;
 				const contextualElement = contextualArr?.type === 'array' ? contextualArr.element : undefined;
 				const contextForcesAny = !contextualElement || T.isAny(T.resolve(ctx.scope, contextualElement));
+				// An empty literal has no elements for `arrayKindOf` to read, and the checker types it `never[]`/`any[]`
+				// (always 'ref') -- `want`'s kind, else the CONTEXTUAL element type, which is what its non-empty sibling
+				// would infer (`[]` beside `[1,2]` in `number[][]` must be the same `f64` array, not a boxed-any one).
 				const kind = wantArr === 'ref' || (typeof want === 'object' && 'ref' in want && want.ref === 'any' && contextForcesAny) ? 'ref'
-					: (e.elements.length === 0 && wantArr) ? wantArr : arrayKindOf(e, ctx);
+					: e.elements.length === 0 ? (wantArr ?? (contextualElement && elementKind(typeOf(T.resolve(ctx.scope, contextualElement)))) ?? arrayKindOf(e, ctx))
+					: arrayKindOf(e, ctx);
 				if (!kind || kind === 'i16' || kind === 'i8')
 					throw 'array literals are only supported for number[]/boolean[]/T[]';
 				emitArrayElements(e.elements, ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind), contextualElement);
