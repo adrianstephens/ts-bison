@@ -7,7 +7,7 @@
 //	BigInt
 //-----------------------------------------------------------------------------
 
-// Limbs are backed by a real `u32[]` (wasm-GC array, reclaimed by the host's GC when unreachable --
+// Limbs are backed by a real `RawArray<u32>` (wasm-GC array, reclaimed by the host's GC when unreachable --
 // unlike the old `Uint32Array`/linear-memory backing, which never freed). Every indexed read below is
 // still bound to an explicit `number` local before use in further arithmetic, rather than mixed directly
 // with a `number` local in one expression -- `arithInline` in towasm.ts dispatches purely on the *left*
@@ -34,7 +34,7 @@ export function bigFromNumber(n: number): bigint {
 	for (let t = Math.floor(n / 0x100000000); t > 0; t = Math.floor(t / 0x100000000))
 		++count;
 
-	const r: u32[] = new Array<u32>(count + 1);
+	const r: RawArray<u32> = new RawArray<u32>(count + 1);
 	for (let i = 0, m = n; i < count; i++) {
 		const t = Math.floor(m / 0x100000000);
 		r[i] = m - t * 0x100000000;
@@ -81,9 +81,9 @@ export function bigFromString(s: string): bigint {
 }
 
 export function bigToNumber(a: bigint): number {
-	const raw: u32[] = a as unknown as u32[];
+	const raw: RawArray<u32> = a as unknown as RawArray<u32>;
 	const neg: boolean = (raw[raw.length - 1] & 0x80000000) !== 0;
-	const limbs: u32[] = bigApplySign(raw, neg);
+	const limbs: RawArray<u32> = bigApplySign(raw, neg);
 	let result: number = 0;
 	let scale: number = 1;
 	for (let i = 0; i < limbs.length; i++) {
@@ -95,17 +95,17 @@ export function bigToNumber(a: bigint): number {
 	return result;
 }
 
-function bigSign(a: u32[]): boolean {
+function bigSign(a: RawArray<u32>): boolean {
 	return (a[a.length - 1] & 0x80000000) !== 0;
 }
 
-export function bigTrim(a: u32[]): u32[] {
+export function bigTrim(a: RawArray<u32>): RawArray<u32> {
 	let n = a.length;
 	while (n > 1 && a[n - 1] === ((a[n - 2] & 0x80000000) !== 0 ? 0xffffffff : 0))
 		n = n - 1;
 	if (n === a.length)
 		return a;
-	const r: u32[] = new Array<u32>(n);
+	const r: RawArray<u32> = new RawArray<u32>(n);
 	for (let i = 0; i < n; i++)
 		r[i] = a[i];
 	return r;
@@ -120,7 +120,7 @@ function toU32(x: i32): u32 {
 	return x;
 }
 
-function bigAdd(a: u32[], b: u32[], negb: boolean): u32[] {
+function bigAdd(a: RawArray<u32>, b: RawArray<u32>, negb: boolean): RawArray<u32> {
 	const	bx = negb ? 0xffffffff : 0;
 	let		carry = negb ? 1 : 0;
 
@@ -130,7 +130,7 @@ function bigAdd(a: u32[], b: u32[], negb: boolean): u32[] {
 	const	at = bigSign(a) ? 0xffffffff : 0;
 	const	bt = bigSign(b) !== negb ? 0xffffffff : 0;
 
-	const	r = new Array<u32>(n + 1);
+	const	r = new RawArray<u32>(n + 1);
 	for (let i = 0; i <= n; ++i) {
 		const sum = (i < na ? a[i] : at) + (i < nb ? toU32(b[i] ^ bx) : bt) + carry;
 		carry	= sum > 0xffffffff ? 1 : 0;
@@ -139,7 +139,7 @@ function bigAdd(a: u32[], b: u32[], negb: boolean): u32[] {
 	return r;
 }
 
-function bigCompare(a: u32[], b: u32[]): number {
+function bigCompare(a: RawArray<u32>, b: RawArray<u32>): number {
 	// SIGN FIRST. These limbs are two's complement -- `bigToNumber` reads the sign off the top bit of the
 	// highest limb -- so an unsigned walk gets every mixed-sign comparison wrong: `0n > -1n` was false,
 	// because `0 < 0xffffffff` as unsigned. Every `<`/`>`/`<=`/`>=`/`==`/`!=` on bigints comes through
@@ -151,7 +151,7 @@ function bigCompare(a: u32[], b: u32[]): number {
 
 	// SIGN-EXTENDED, so this compares VALUES rather than representations. Length alone cannot decide it:
 	// a `bigint` has two physical forms here -- a literal emits `i64.const`, the `BigInt` class holds
-	// `u32[]` -- so the same number reaches this with different limb counts, and `BigInt(0) === 0n` was
+	// `RawArray<u32>` -- so the same number reaches this with different limb counts, and `BigInt(0) === 0n` was
 	// false purely because one zero was one limb longer than the other.
 	let i = a.length > b.length ? a.length : b.length;
 	while (i--) {
@@ -163,11 +163,11 @@ function bigCompare(a: u32[], b: u32[]): number {
 	return 0;
 }
 
-function bigNeg(a: u32[]): u32[] {
-	return bigAdd(new Array<u32>(1), a, true);
+function bigNeg(a: RawArray<u32>): RawArray<u32> {
+	return bigAdd(new RawArray<u32>(1), a, true);
 }
 
-function bigApplySign(a: u32[], neg: boolean): u32[] {
+function bigApplySign(a: RawArray<u32>, neg: boolean): RawArray<u32> {
 	if (neg)
 		return bigNeg(a);
 	return a;
@@ -177,15 +177,15 @@ function bigApplySign(a: u32[], neg: boolean): u32[] {
 // exact 32x32->64 product per limb pair via `__towasm_mulWide` (real `i64.mul`, not `number` arithmetic
 // -- a raw 32x32 product needs up to 64 bits, past what `number` can hold exactly at 2^53) -- read back
 // as a 2-limb `bigint` (see towasm.ts's own comment on the intrinsic), low limb at index 0.
-function bigMulMag(a: u32[], b: u32[]): u32[] {
+function bigMulMag(a: RawArray<u32>, b: RawArray<u32>): RawArray<u32> {
 	const na = a.length;
 	const nb = b.length;
-	const r = new Array<u32>(na + nb + 1);
+	const r = new RawArray<u32>(na + nb + 1);
 	for (let i = 0; i < na; i++) {
 		let carry = 0;
 		let j = 0;
 		while (j < nb) {
-			const prod: u32[] = __towasm_mulWide(a[i], b[j]) as unknown as u32[];
+			const prod: RawArray<u32> = __towasm_mulWide(a[i], b[j]) as unknown as RawArray<u32>;
 			// Each limb bound to its own `number` local FIRST -- the idiom this file's header describes,
 			// and the reason for it: two limb reads added directly are both `u32`-kinded, so the add is
 			// done in `i32` and WRAPS. `t` then went negative, `Math.floor(t / 2^32)` gave -1 instead of
@@ -212,7 +212,7 @@ function bigMulMag(a: u32[], b: u32[]): u32[] {
 
 // `a >= b` by magnitude, MSB-first, where `a` may be longer than `b` (`bigDivModMag`'s remainder buffer
 // always carries one guard limb past the divisor's own length).
-function bigGeMag(a: u32[], b: u32[]): boolean {
+function bigGeMag(a: RawArray<u32>, b: RawArray<u32>): boolean {
 	const nb: number = b.length;
 	let i: number = a.length;
 	while (i > nb) {
@@ -228,10 +228,10 @@ function bigGeMag(a: u32[], b: u32[]): boolean {
 }
 
 // `a - b` by magnitude, assuming `a >= b` (no borrow past `a`'s own top limb) and `a.length >= b.length`.
-function bigSubMag(a: u32[], b: u32[]): u32[] {
+function bigSubMag(a: RawArray<u32>, b: RawArray<u32>): RawArray<u32> {
 	const n		= a.length;
 	const nb	= b.length;
-	const r		= new Array<u32>(n);
+	const r		= new RawArray<u32>(n);
 	let borrow = 0;
 	for (let i = 0; i < n; i++) {
 		const t = a[i] - (i < nb ? b[i] : 0) - borrow;
@@ -251,9 +251,9 @@ function bigSubMag(a: u32[], b: u32[]): u32[] {
 // fixed-capacity remainder buffer, which is sized with enough guard headroom that the discarded bit is
 // always 0 by construction (the remainder never exceeds twice the divisor, and the buffer holds one full
 // extra limb beyond the divisor's own length).
-function bigShl1(a: u32[], bit: number): u32[] {
+function bigShl1(a: RawArray<u32>, bit: number): RawArray<u32> {
 	const n = a.length;
-	const r = new Array<u32>(n);
+	const r = new RawArray<u32>(n);
 	let carry: number = bit;
 	for (let i = 0; i < n; i++) {
 		const v = a[i];
@@ -266,9 +266,9 @@ function bigShl1(a: u32[], bit: number): u32[] {
 // Magnitude of `2^k`, with one guard limb above the set bit so it's unambiguously non-negative even when
 // the set bit lands exactly on a limb's own top bit (e.g. `k=31` sets `0x80000000` in limb 0, which
 // needs a zero limb 1 above it to still read as +2147483648, not -2147483648).
-function bigPow2(k: number): u32[] {
+function bigPow2(k: number): RawArray<u32> {
 	const limb: number = k >> 5;
-	const r: u32[] = new Array<u32>(limb + 2);
+	const r: RawArray<u32> = new RawArray<u32>(limb + 2);
 	r[limb] = 1 << (k & 0x1f);
 	return r;
 }
@@ -278,10 +278,10 @@ function bigPow2(k: number): u32[] {
 // estimate (Knuth's algorithm D), but nothing here needs a digit *estimate* (and the correction step
 // that comes with one) -- each step's decision is an exact compare, so this is the version that's
 // actually easy to get right.
-function bigDivModMag(a: u32[], b: u32[], mod: boolean): u32[] {
+function bigDivModMag(a: RawArray<u32>, b: RawArray<u32>, mod: boolean): RawArray<u32> {
 	const na = a.length;
-	const q = new Array<u32>(na);
-	let r = new Array<u32>(b.length + 1);
+	const q = new RawArray<u32>(na);
+	let r = new RawArray<u32>(b.length + 1);
 
 	let bit = na * 32;
 	while (bit--) {
@@ -301,7 +301,7 @@ export class BigInt {
 	// its constructor, so a constructor that ignored `value` silently produced zero for every input.
 	// The `as unknown as` is for tsc's benefit only -- towasm reads the last statement's type with the
 	// casts stripped, so `bigFromNumber`'s own `bigint` is what determines this class's physical form
-	// (a `u32[]`, the same representation the arithmetic below reinterprets `this` as).
+	// (a `RawArray<u32>`, the same representation the arithmetic below reinterprets `this` as).
 	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(value: bigint) {
 		return value as unknown as BigInt;
@@ -319,33 +319,33 @@ export class BigInt {
 //	static readonly [Symbol.toStringTag]: "BigInt";
 
 	neg(): bigint {
-		return bigTrim(bigNeg(this as unknown as u32[])) as unknown as bigint;
+		return bigTrim(bigNeg(this as unknown as RawArray<u32>)) as unknown as bigint;
 	}
 	add(b: bigint): bigint {
-		return bigTrim(bigAdd(this as unknown as u32[], b as unknown as u32[], false)) as unknown as bigint;
+		return bigTrim(bigAdd(this as unknown as RawArray<u32>, b as unknown as RawArray<u32>, false)) as unknown as bigint;
 	}
 	sub(b: bigint): bigint {
-		return bigTrim(bigAdd(this as unknown as u32[], b as unknown as u32[], true)) as unknown as bigint;
+		return bigTrim(bigAdd(this as unknown as RawArray<u32>, b as unknown as RawArray<u32>, true)) as unknown as bigint;
 	}
 
 	mul(b: bigint): bigint {
-		const av = this as unknown as u32[];
-		const bv = b as unknown as u32[];
+		const av = this as unknown as RawArray<u32>;
+		const bv = b as unknown as RawArray<u32>;
 		const nega = bigSign(av);
 		const negb = bigSign(bv);
 		return bigTrim(bigApplySign(bigMulMag(bigApplySign(av, nega), bigApplySign(bv, negb)), nega !== negb)) as unknown as bigint;
 	}
 
 	div(b: bigint): bigint {
-		const av = this as unknown as u32[];
-		const bv = b as unknown as u32[];
+		const av = this as unknown as RawArray<u32>;
+		const bv = b as unknown as RawArray<u32>;
 		const nega = bigSign(av);
 		const negb = bigSign(bv);
 		return bigTrim(bigApplySign(bigDivModMag(bigApplySign(av, nega), bigApplySign(bv, negb), false), nega !== negb)) as unknown as bigint;
 	}
 	mod(b: bigint): bigint {
-		const av = this as unknown as u32[];
-		const bv = b as unknown as u32[];
+		const av = this as unknown as RawArray<u32>;
+		const bv = b as unknown as RawArray<u32>;
 		const nega = bigSign(av);
 		const negb = bigSign(bv);
 		return bigTrim(bigApplySign(bigDivModMag(bigApplySign(av, nega), bigApplySign(bv, negb), true), nega)) as unknown as bigint;
@@ -367,10 +367,10 @@ export class BigInt {
 		const k			= bigToNumber(b);
 		const limbShift = k >>> 5;
 		const bitShift	= k & 31;
-		const a			= this as unknown as u32[];
+		const a			= this as unknown as RawArray<u32>;
 		const na		= a.length;
 		const ext		= bigSign(a) ? 0xffffffff : 0;
-		const r			= new Array<u32>(na);
+		const r			= new RawArray<u32>(na);
 		for (let i = 0; i < na; i++) {
 			const srcLo = i + limbShift;
 			const lo = srcLo < na ? a[srcLo] : ext;
@@ -389,9 +389,9 @@ export class BigInt {
 		const k			= bigToNumber(b);
 		const limbShift = k >>> 5;
 		const bitShift	= k & 31;
-		const a			= this as unknown as u32[];
+		const a			= this as unknown as RawArray<u32>;
 		const na		= a.length;
-		const r			= new Array<u32>(na + 1);
+		const r			= new RawArray<u32>(na + 1);
 		for (let i = 0; i < na; i++) {
 			const srcLo = i + limbShift;
 			const lo = srcLo < na ? a[srcLo] : 0;
@@ -404,13 +404,13 @@ export class BigInt {
 	// wider length plus one guard limb -- which is what makes the infinite sign extension real JS
 	// specifies fall out for free, including for a negative operand. `toU32` because this compiler (like
 	// JS) gives a bitwise op a *signed* 32-bit result even for unsigned-meaning limbs.
-	private static bitwise(a: u32[], b: u32[], op: i32): u32[] {
+	private static bitwise(a: RawArray<u32>, b: RawArray<u32>, op: i32): RawArray<u32> {
 		const na = a.length;
 		const nb = b.length;
 		const n = (na > nb ? na : nb) + 1;
 		const aext: u32 = bigSign(a) ? 0xffffffff : 0;
 		const bext: u32 = bigSign(b) ? 0xffffffff : 0;
-		const r = new Array<u32>(n);
+		const r = new RawArray<u32>(n);
 		for (let i = 0; i < n; i++) {
 			const x: u32 = i < na ? a[i] : aext;
 			const y: u32 = i < nb ? b[i] : bext;
@@ -418,15 +418,15 @@ export class BigInt {
 		}
 		return bigTrim(r);
 	}
-	and(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as u32[], b as unknown as u32[], 0) as unknown as bigint; }
-	or(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as u32[], b as unknown as u32[], 1) as unknown as bigint; }
-	xor(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as u32[], b as unknown as u32[], 2) as unknown as bigint; }
+	and(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as RawArray<u32>, b as unknown as RawArray<u32>, 0) as unknown as bigint; }
+	or(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as RawArray<u32>, b as unknown as RawArray<u32>, 1) as unknown as bigint; }
+	xor(b: bigint): bigint	{ return BigInt.bitwise(this as unknown as RawArray<u32>, b as unknown as RawArray<u32>, 2) as unknown as bigint; }
 
 	// `~x` inverts every bit of the infinite two's-complement pattern, which is `-x - 1`.
 	not(): bigint {
-		const a = this as unknown as u32[];
+		const a = this as unknown as RawArray<u32>;
 		const n = a.length;
-		const r = new Array<u32>(n + 1);
+		const r = new RawArray<u32>(n + 1);
 		const ext: u32 = bigSign(a) ? 0xffffffff : 0;
 		for (let i = 0; i < n + 1; i++)
 			r[i] = toU32(~(i < n ? a[i] : ext));
@@ -452,7 +452,7 @@ export class BigInt {
 
 	// -1/0/1, comparing by magnitude.
 	compare(b: bigint): number {
-		return bigCompare(this as unknown as u32[], b as unknown as u32[]);
+		return bigCompare(this as unknown as RawArray<u32>, b as unknown as RawArray<u32>);
 	}
 
 	// `<`/`>`/`<=`/`>=`/`==`/`!=` on two `bigint`s all lower to one of these (see towasm.ts's

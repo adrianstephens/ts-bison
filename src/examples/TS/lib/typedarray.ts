@@ -43,7 +43,7 @@ export class ArrayBuffer {
 	__set(i: i32, v: i32): void	{ return __asm<[i32, i32], void>('array.set $this')(i, v); }
 
 	constructor(byteLength: i32) {
-		return __asm<[i32], i8[]>('array.new_default $this')(byteLength) as unknown as ArrayBuffer;
+		return __asm<[i32], RawArray<u8>>('array.new_default $this')(byteLength) as unknown as ArrayBuffer;
 	}
 }
 

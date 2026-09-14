@@ -267,6 +267,16 @@ declare var RegExp: RegExpConstructor;
 //	Array
 //-----------------------------------------------------------------------------
 
+// The raw fixed-length wasm array (see lib/array.ts). Opaque: everything that touches one goes through
+// `RawArray`'s own methods.
+declare class RawArray<T> {
+	constructor(n: number);
+	readonly length: number;
+	[i: number]: T;
+	copyFrom(dstStart: number, src: RawArray<T>, srcStart: number, len: number): void;
+	fillWith(start: number, val: T, len: number): void;
+}
+
 interface Array<T> {
 	[i: number]: T;
 	length: number;

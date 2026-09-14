@@ -347,6 +347,13 @@ function wasmTypeOf(t: Type, global: Scope): WasmType | undefined {
 	return undefined;
 }
 
+// The element kind of a `RawArray<T>`: a typed-array tag names its own PACKED kind directly, since
+// resolving it as a type would widen `u8` to `u32` and silently give byte storage an i32 element.
+function rawElemKind(a: Type | undefined, resolve: (t: Type) => WasmType | undefined): WasmElementI {
+	return a && a.type === 'ref' && !a.typeArgs && TYPED_ARRAY_TAGS.has(a.name)
+		? notUnsigned(a.name as WasmElement) : elementKind(a && resolve(a));
+}
+
 // Stable structural key for memoizing closure-type registration by TS function signature.
 function wasmTypeKey(w: WasmType): string {
 	if (typeof w === 'string')
@@ -1139,7 +1146,7 @@ function parseTypeExpr(text: string): Type | undefined {
 	return t;
 }
 
-function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, typeParams?: string[], retIndexOf?: (w: WasmType) => number | undefined): Builtin<Inline> {
+function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, typeParams?: string[], retIndexOf?: (w: WasmType) => number | undefined, resolveFallback?: (t: Type) => WasmType | undefined): Builtin<Inline> {
 	let		asm		= (call.arguments[0] as Literal<string | JS.TemplatePart<Expr>[]>).value;
 
 	if (typeof asm !== 'string') {
@@ -1160,6 +1167,8 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 			// caller below replace it with the argument's real physical type (`isOpen`).
 			if (typeParams?.includes(t.name))
 				return REF_ANY_NULLABLE;
+			if (t.name === 'RawArray')
+				return ARR_WTYPE[rawElemKind(t.typeArgs?.[0], resolveType)];
 			switch (t.name) {
 				case 'i8': case 'i16':	return 'i32';
 				case 'u8': case 'u16':	return 'u32';
@@ -1179,7 +1188,9 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 				return {arr};
 			return ARR_WTYPE.ref;
 		}
-		return undefined;
+		// A type this syntactic mapper has no case for (an indexed access `Record<K,V>[K]`, an alias) is a TYPE question
+		// the general mapping answers -- when the caller, compiling inside `TStoWasm`, has one to offer.
+		return resolveFallback?.(t);
 	};
 
 	// The asm's own declared param/result types, resolved with `subs` (the call site's type arguments)
@@ -2414,7 +2425,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A rest parameter's own physical type, which must be an array or `emitCallArgs` cannot pack into it.
 	function restParamWtype(t: Type): WasmType | undefined {
 		const wt = typeOf(t);
-		if (wt && typeof wt !== 'string' && 'arr' in wt)
+		if (storageKindOf(wt) !== undefined)
 			return wt;
 		const elems = restElementTypes(t);
 		return elems.length ? typeOf(TS.ArrayType(T.combineTypes(elems))) : wt;
@@ -2599,6 +2610,26 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 	}
 	function typeOfUncached(t: Type): WasmType | undefined {
+		if (t.type === 'ref' && t.name === 'RawArray')
+			return ARR_WTYPE[rawElemKind(t.typeArgs?.[0], typeOf)];
+
+		// `T[]` is `Array<T>`, an ORDINARY lib class -- the compiler has no array representation of its own
+		// for it (see [[tison-array-identity]]). `Array<T>`/`ReadonlyArray<T>` already reach the class via
+		// the generic-ref branch below; this is the same answer for the `T[]` spelling.
+		if (t.type === 'array') {
+			const cls = ensureClass('Array', [t.element]);
+			if (cls)
+				return ownerThisType(cls);
+		}
+		// A tuple is an array in TS too, and `ownerFor` already dispatches its methods through `Array`
+		// (`tupleArrayOwner`) -- so it gets the same representation, or a tuple read back out of one would
+		// be cast to a type nothing ever built.
+		if (t.type === 'tuple') {
+			const cls = tupleArrayOwner([t]);
+			if (cls)
+				return ownerThisType(cls);
+		}
+
 		if (t.type === 'ref' && t.typeArgs?.length) {
 			const name = READONLY_ALIAS.get(t.name) ?? t.name;
 			const decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
@@ -2611,6 +2642,20 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		const resolved = T.resolve(global, t);
 		switch (resolved.type) {
+			// A type that RESOLVES to an array or tuple (an alias, an indexed access `N[K]`) is an `Array` like the `T[]` spelling
+			// above -- falling through to `wasmTypeOf` gave it RAW storage, which nothing casts back to.
+			case 'array': {
+				const cls = ensureClass('Array', [resolved.element]);
+				if (cls)
+					return ownerThisType(cls);
+				break;
+			}
+			case 'tuple': {
+				const cls = tupleArrayOwner([resolved]);
+				if (cls)
+					return ownerThisType(cls);
+				break;
+			}
 			case 'object': {
 				const vt	= indexSignatureValueType(resolved);
 				const cls	= vt && ensureClass('Map', [TS.RefType('string'), vt]);
@@ -2639,14 +2684,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// Physically just the array -- the extra properties get no slot, so reading one is an honest
 			// `unknown field '...'` rather than a wrong answer, and erasing them here is exactly what keeps
 			// such a value assignable to a plain array parameter with no conversion, the way real TS's own
-			// subtyping already allows. `wasmTypeOf`, not `typeOf`: the object parts must not build (and
-			// register) anonymous shapes as a side effect of merely asking whether they're array-backed.
+			// subtyping already allows. Only the array part is typed -- an ordinary `Array` -- so the object parts never
+			// build (and register) anonymous shapes as a side effect of asking whether they're array-backed.
 			// Falls through to the flatten-and-merge path below when no part is array-backed at all (an
 			// interface extending another interface), or when two parts disagree on the element kind.
 			case 'intersection': {
 				const arr = arrayPartOf(resolved);
 				if (arr)
-					return wasmTypeOf(TS.ArrayType(arr.element), global);
+					return typeOf(TS.ArrayType(arr.element));
 				const prim = primitivePart(resolved);
 				if (prim)
 					return typeOf(prim);
@@ -3280,9 +3325,32 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// The array-kind (`{arr}`) a value expression resolves to, or `undefined` if it isn't one.
+	// The element kind of a value's STORAGE: either the value IS storage, or it is a class owning exactly
+	// one (an `Array<T>`, and a tuple, which shares that representation). Purely physical -- no TS type.
+	function storageKindOf(w: WasmType | undefined): WasmElementI | undefined {
+		if (typeof w === 'object' && w && 'arr' in w)
+			return w.arr;
+		const o = typeof w === 'object' && w && 'ref' in w ? classes.get(w.ref) : undefined;
+		const f = o && o.typeIndex !== -1 && o.fields.length === 1 ? o.fields[0].wtype : undefined;
+		return typeof f === 'object' && f && 'arr' in f ? f.arr : undefined;
+	}
+
+	// The ELEMENT representation of an array-ish value. A raw array (`RawArray`, a string, an `ArrayBuffer`)
+	// carries it in its own wtype; an `Array<T>` is an ordinary class, so its element kind is a fact about
+	// its TYPE, not about the struct on the stack -- see [[tison-type-vs-representation]].
+	function elementKindOfType(t: Type | undefined, scope: Scope): WasmElementI | undefined {
+		if (!t)
+			return undefined;
+		const r  = T.resolve(scope, t);
+		const el = r.type === 'array' ? r.element
+			: r.type === 'ref' && (r.name === 'Array' || r.name === 'ReadonlyArray' || r.name === 'RawArray') ? r.typeArgs?.[0]
+			: undefined;
+		return el ? elementKind(typeOf(el)) : undefined;
+	}
+
 	function arrayKindOf(e: Expr, ctx: FunctionContext): WasmElementI | undefined {
 		const wt = wtypeOf(e, ctx);
-		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : undefined;
+		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : elementKindOfType(checkerTypeOf(e, ctx.scope), ctx.scope);
 	}
 
 	// `arrayKindOf` for a value about to be indexed into (`e[i]`). The ref-collapse below is DISABLED: an inner
@@ -3292,8 +3360,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		//	return 'ref';
 		// `narrowedTypeOf`, not `arrayKindOf`'s plain `ctx.scope` view: a value NARROWED out of `T | undefined` still reads
 		// as the whole union there, so a field off it comes back `any` with no array kind (`[...a.rights, ...b.rights]` after `a && b`).
-		const wt = typeOf(narrowedTypeOf(e, ctx));
-		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : undefined;
+		const nt = narrowedTypeOf(e, ctx);
+		const wt = typeOf(nt);
+		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : elementKindOfType(nt, ctx.scope);
 	}
 
 	// `ownerOf` for a value about to be indexed into (`e[i]`) via generic class-method dispatch (`Array<T>.get(i)`).
@@ -3344,12 +3413,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return t.types.find(p => PRIMITIVE_TAGS.has(T.typeofName(p, global) ?? ''));
 	}
 
-	// A tuple is physically `arr:ref` whatever its elements (`wasmTypeOf`), so its owner is `Array` over a ref-kind element:
-	// the union of every position when that is one, else `any` (`[number, number]` would otherwise name `arr:f64`).
+	// A tuple is an `Array` over REF storage whatever its elements: its element is the union of every position when that is
+	// ref-kind, else `any` (`[number, number]` would otherwise name `f64` storage). Asked of the element -- no class built to ask.
 	function tupleArrayOwner(tuples: TupleT[]): ClassInfo | undefined {
 		const el = T.combineTypes(tuples.flatMap(tu => tu.elements.map(x => T.tupleElementType(x) ?? T.ANY)));
-		const wt = typeOf(TS.ArrayType(el));
-		return ensureClass('Array', [wt && typeof wt !== 'string' && 'arr' in wt && wt.arr === 'ref' ? el : T.ANY]);
+		return ensureClass('Array', [rawElemKind(el, typeOf) === 'ref' ? el : T.ANY]);
 	}
 
 	function ownerFor(t: Type): ClassInfo | undefined {
@@ -3846,6 +3914,29 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				case 'f32':	ctx.emit(I.f32.demote_f64); return;
 			}
 		}
+		// A raw wasm array meeting a class that OWNS exactly one -- `[1,2,3]` (physically `{arr:f64}`) where an
+		// `Array<number>` is wanted. The literal builds the cheap representation and only boxes when a context
+		// actually needs the class's identity; see [[tison-type-vs-representation]]. Structural, not by name:
+		// the target's single field IS this value's type, so there is one sound way to build it.
+		if (typeof got === 'object' && 'arr' in got && typeof want === 'object' && 'ref' in want) {
+			const owner = classes.get(want.ref);
+			if (owner && owner.typeIndex !== -1 && owner.fields.length === 1 && wasmTypeEq(owner.fields[0].wtype, got)) {
+				ctx.emit(I.struct.new(owner.typeIndex));
+				return;
+			}
+		}
+
+		// The reverse: reaching the storage a class owns (`[...a, b]` copying out of an `Array<T>`). Sound
+		// because a `RawArray` cannot RESIZE -- anything done through it is an in-place element access the
+		// owner sees too, so unwrapping can never strand the owner on a stale buffer.
+		if (typeof want === 'object' && 'arr' in want && typeof got === 'object' && 'ref' in got) {
+			const owner = classes.get(got.ref);
+			if (owner && owner.typeIndex !== -1 && owner.fields.length === 1 && wasmTypeEq(owner.fields[0].wtype, want)) {
+				ctx.emit(I.struct.get(owner.typeIndex, 0));
+				return;
+			}
+		}
+
 		// A bigint (its limb array) to a NUMBER -- the mirror of the `bigFromNumber` direction below, and
 		// the only conversion out of the limb representation there has ever been. `6 > 5n` needs it: a
 		// mixed comparison dispatches on the LEFT operand, so a number on the left never reaches
@@ -3969,6 +4060,21 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		} else {
 			let got = emitExpr(e, ctx, want);
+			// A raw array erased into a non-raw slot (`any`, a field, a `??=` default) is boxed first: read back, it is cast to an
+			// `Array` class -- its OWN type's if that owns this storage, else its context's, else (an array all the same) this storage's.
+			if (typeof got === 'object' && 'arr' in got && !(typeof want === 'object' && 'arr' in want)) {
+				const k = got.arr;
+				const owner = (t: Type | undefined) => { const w = t && typeOf(t); return w && typeof w === 'object' && 'ref' in w && storageKindOf(w) === k ? w : undefined; };
+				const ownT = checkerTypeOf(unwrapAs(e), ctx.scope);
+				const ownW = typeOf(ownT);
+				const isArrayValue = !!ownW && typeof ownW === 'object' && 'ref' in ownW && storageKindOf(ownW) !== undefined;
+				const own = owner(ownT) ?? owner(ctx.contextualReturn)
+					?? (isArrayValue && (k === 'ref' || k === 'f64') ? owner(TS.ArrayType(k === 'ref' ? T.ANY : T.NUMBER)) : undefined);
+				if (own && !wasmTypeEq(own, want)) {
+					coerceTop(got, ctx, own);
+					got = own;
+				}
+			}
 			// UNboxing from `any`, the mirror of the boxing rule just below: a number was boxed as `f64` whatever its compact
 			// integer storage, a real `boolean` as `i32`, so the checker's own type picks which box this value is in.
 			if ((want === 'i32' || want === 'u32') && typeof got !== 'string' && 'ref' in got && got.ref === 'any'
@@ -4560,14 +4666,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (fixedArgs.some(a => a.type === 'spread'))
 				throw `'${label}': a spread argument can only appear among the trailing rest arguments -- its length isn't known at compile time, so it can't fill a fixed parameter position`;
 			fixedArgs.forEach((a, i) => emitArg(i, a));
+			// The bundle is built as raw storage and then coerced to whatever the parameter actually is --
+			// a `RawArray` takes it as-is, an `Array<T>` boxes it (`coerceTop`), and neither needs a branch here.
 			const restArrWtype = params[fixedCount];
-			if (typeof restArrWtype === 'string' || !('arr' in restArrWtype))
+			const restTsType   = resolvedParams?.[fixedCount]?.tsType;
+			const kind = storageKindOf(restArrWtype) ?? elementKindOfType(restTsType, ctx.scope);
+			if (!kind)
 				throw `internal: '${label}' rest param has a non-array type`;
-			const kind = restArrWtype.arr;
 			if (kind === 'i16' || kind === 'i8')
 				throw `'${label}' rest param: a 'string[]'/packed-byte-array element is not supported`;
 			const restTs = resolvedParams?.[fixedCount]?.tsType;
 			emitArrayElements(args.slice(fixedCount), ctx, kind === 'ref' ? REF_ANY_NULLABLE : kind, kind, ensureArrayType(kind), restTs && (k => T.restArgType(restTs, k, ctx.typeScope)));
+			coerceTop(ARR_WTYPE[kind], ctx, restArrWtype);
 		}
 	}
 
@@ -5522,7 +5632,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		emitAs(e.object, ctx, objWtype);
 		ctx.emit(I.local.set(obj.index));
 		emitAs(e.index, ctx, 'i32');
-		ctx.emit(I.local.set(idx.index), I.local.get(idx.index), I.local.get(obj.index), I.array.len, I.i32.lt_u);
+		ctx.emit(I.local.set(idx.index), I.local.get(idx.index), I.local.get(obj.index));
+		// A class owning its storage (`Array<T>`) is unwrapped to it first -- `array.len` needs the storage itself.
+		const sk = storageKindOf(objWtype);
+		if (sk && typeof objWtype === 'object' && 'ref' in objWtype)
+			coerceTop(objWtype, ctx, ARR_WTYPE[sk]);
+		ctx.emit(I.array.len, I.i32.lt_u);
 		const _old = ctx.swapOut();
 		read(obj, idx);
 		const _then = ctx.swapOut();
@@ -5759,12 +5874,19 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								return ARR_WTYPE.i16;
 							}
 
+							// Resolved first: `stringTemplate` takes REAL arrays (`string[]`, `any[]`), so each storage array built below is
+							// coerced to its parameter as soon as it exists. A missing lib entry used to emit the arrays and silently skip the call.
+							const decl = LIB_DECL_MAP.get('stringTemplate');
+							const info = decl && decl.type === 'function_decl' ? ensureFunc('stringTemplate', decl) : undefined;
+							if (!info)
+								throw "internal: lib 'stringTemplate' is unavailable";
 							for (const p of e.value)
 								emitStringConst(p.str, ctx);
 							const hasTrailingLiteral = !e.value[e.value.length - 1].exp;
 							if (!hasTrailingLiteral)
 								emitStringConst('', ctx);
 							ctx.emit(I.array.new_fixed(ensureArrayType('ref'), e.value.length + (hasTrailingLiteral ? 0 : 1)));
+							coerceTop(ARR_WTYPE.ref, ctx, info.params[0]);
 							let valueCount = 0;
 							for (const p of e.value) {
 								if (p.exp) {
@@ -5773,12 +5895,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								}
 							}
 							ctx.emit(I.array.new_fixed(ensureArrayType('ref'), valueCount));
-							const decl = LIB_DECL_MAP.get('stringTemplate');
-							if (decl && decl.type === 'function_decl') {
-								const info = ensureFunc('stringTemplate', decl);
-								if (info)
-									ctx.emit(I.call(info.funcIndex));
-							}
+							coerceTop(ARR_WTYPE.ref, ctx, info.params[1]);
+							ctx.emit(I.call(info.funcIndex));
 							return ARR_WTYPE.i16;
 						}
 						throw `unsupported literal type '${typeof e.value}'`;
@@ -6109,7 +6227,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						});
 					}
 					const thisW = cls.thisWtype!;
-					if (typeof thisW !== 'string' && 'arr' in thisW && readsPastEnd(e, ctx)) {
+					if (storageKindOf(thisW) !== undefined && readsPastEnd(e, ctx)) {
 						const resultWtype = nullableWtype(sig.result);
 						return emitBoundedRead(e, thisW, resultWtype, ctx, (obj, idx) => {
 							ctx.emit(I.local.get(obj.index));
@@ -6477,7 +6595,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// declared/contextual type, when known) says `number[]`, not `any[]`. Only force boxed
 				// storage here when that contextual type is itself genuinely `any`/unknown, or unavailable
 				// (the same conservative default as before whenever there's nothing better to go on).
-				const wantArr = typeof want === 'object' && 'arr' in want ? want.arr : undefined;
+				// The wanted STORAGE kind: either `want` is the storage itself, or it is a class that owns some
+				// (an `Array<T>`), in which case its single field says which -- an empty literal has no
+				// elements to infer from and would otherwise default to boxed-`any`.
+				const wantArr = storageKindOf(want);
 				// A union context names the literal's own member, as the checker takes it (`string | number[]`): reads narrowed to that
 				// member expect its representation, whatever the union's storage.
 				const contextual	= ctx.contextualReturn && T.resolve(ctx.scope, ctx.contextualReturn);
@@ -7122,7 +7243,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						throw 'inline asm does not support spread call arguments';
 					const owner = ctx.owner;
 					try {
-						const builtin = makeAsm(e.callee, owner?.typeIndex ? {this: owner?.typeIndex} : {});
+						const builtin = makeAsm(e.callee, owner?.typeIndex ? {this: owner?.typeIndex} : {}, undefined, undefined, typeOf);
 						return emitInline('<inline>', builtin(e.arguments.map(a => operandInfo(a, ctx)), ctx), e.arguments, ctx);
 					} catch (e) {
 						throw `inline asm failed to resolve ${e}`;
@@ -9721,7 +9842,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const inlineMethods = new Map<string, Builtin<Inline>>();
 		for (const i of inlineDecls) {
 			try {
-				inlineMethods.set(i.key, makeAsm(i.value, defines, i.typeParams, w => typeof w === 'object' && 'arr' in w ? ensureArrayType(w.arr) : undefined));
+				inlineMethods.set(i.key, makeAsm(i.value, defines, i.typeParams, w => typeof w === 'object' && 'arr' in w ? ensureArrayType(w.arr) : undefined, typeOf));
 			} catch (err) {
 				throw new TSWError(err as any, i.value).inModule(info.homeModule ?? '.');
 			}
@@ -10109,11 +10230,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		};
 		probe(builtinTypeOwner('number'), ensureBoxType('f64'), true);
 		probe(builtinTypeOwner('boolean'), ensureBoxType('i32'), true);
-		// A string and a plain array are array values with no struct of their own, probed as `ensureAnyField` probes them.
+		// A string and a `RawArray` are bare wasm arrays with no struct of their own. An `Array<T>` is a struct (it owns a
+		// `RawArray`) and the class loop below covers it -- probing its storage AS an `Array` dispatched on the wrong type.
 		probe(builtinTypeOwner('string'), ensureArrayType('i16'), false);
 		for (const [kind, elem] of [['f64', T.NUMBER], ['ref', T.ANY]] as const) {
 			if (hasArrayType(kind))
-				probe(ensureClass('Array', [elem]), ensureArrayType(kind), false);
+				probe(ensureClass('RawArray', [elem]), ensureArrayType(kind), false);
 		}
 		for (const cls of classes.values()) {
 			if (cls.typeIndex !== -1)
@@ -10189,13 +10311,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			probe(builtinTypeOwner('bigint'), ensureArrayType('i32'));
 			probe(builtinTypeOwner('number'), ensureBoxType('f64'));
 			probe(builtinTypeOwner('boolean'), ensureBoxType('i32'));
-			// A plain array literal never reaches `ensureClass('Array', ...)` -- it is built straight into
-			// its physical array type -- so `Array<T>`'s own members are absent from `classes` however many
-			// arrays the program has. Gated on the array type ALREADY existing: if it does not, no value of
-			// that kind can be in an `any` slot, and asking would only add a type nothing uses.
+			// Bare storage (a `RawArray`) in an `any` slot has no struct of its own, so the class loop below never sees it; an
+			// `Array<T>` IS a struct and is covered there. Gated on the storage type ALREADY existing -- else no such value can.
 			for (const [kind, elem] of [['f64', T.NUMBER], ['ref', T.ANY]] as const) {
 				if (hasArrayType(kind))
-					probe(ensureClass('Array', [elem]), ensureArrayType(kind));
+					probe(ensureClass('RawArray', [elem]), ensureArrayType(kind));
 			}
 			for (const cls of classes.values()) {
 				// `-1` is `ensureClass`'s no-struct-of-its-own sentinel -- but that does not mean untestable:

@@ -4,51 +4,94 @@
 //	GC Array
 //-----------------------------------------------------------------------------
 
-export class Array<T> {
+// The raw fixed-length wasm-GC array -- exactly what `Array<T>` used to be, and the ONLY array the
+// compiler itself knows (`WasmType`'s `{arr}`). A string and an `ArrayBuffer` are this too. Fixed length
+// is the point: with no mutators it needs no identity of its own, so it stays the bare wasm array.
+export class RawArray<T> {
 	[i: number]: T;
 
-	get length(): number	{ return __asm<[], u32>('array.len')(); }
-	__get(i: i32): T		{ return __asm<[i32], T>('array.get $this')(i); }
+	get length(): number		{ return __asm<[], u32>('array.len')(); }
+	__get(i: i32): T			{ return __asm<[i32], T>('array.get $this')(i); }
 	__set(i: i32, v: T): void	{ return __asm<[i32, T], void>('array.set $this')(i, v); }
+
+	// `$this` IS the array type here, so these need no `TYPEINDEX`, and the operand order a receiver
+	// gives (`this` first) is exactly `array.copy`'s and `array.fill`'s own.
+	copyFrom(dstStart: i32, src: RawArray<T>, srcStart: i32, len: i32): void {
+		return __asm<[i32, RawArray<T>, i32, i32], void>('array.copy $this $this')(dstStart, src, srcStart, len);
+	}
+	fillWith(start: i32, val: T, len: i32): void {
+		return __asm<[i32, T, i32], void>('array.fill $this')(start, val, len);
+	}
+
+	constructor(n: i32) {
+		return __asm<[i32], RawArray<T>>('array.new_default $this')(n) as unknown as RawArray<T>;
+	}
+}
+
+// The one supertype every `Array<T>` instantiation shares, whatever its storage kind -- so `Array.isArray` is a single
+// `instanceof`, and never mistakes raw storage (a string, a bigint's limbs, a `RawArray`) for an array.
+export class ArrayBase {
+	constructor() {}
+}
+
+export class Array<T> extends ArrayBase {
+	[i: number]: T;
+
+	// An `Array<T>` OWNS its storage instead of being it. A wasm-GC array has a fixed length, so a mutator
+	// must reallocate; replacing `data` is an ordinary field write, so every alias of the array observes
+	// it -- which `this = result` could never do, since it reached only the receiver's own lvalue.
+	// Nothing here reassigns `this`, so `Array` no longer needs `assignsToThis`/`reassignsThis` at all.
+	private data: RawArray<T>;
+
+	get length(): number		{ return this.data.length; }
+	__get(i: i32): T			{ return this.data[i]; }
+	__set(i: i32, v: T): void	{ this.data[i] = v; }
 
 	// '$ret', not '$this': a static has no 'this', and this one's T is the METHOD's own -- '$this' named
 	// the enclosing class's array type, so 'map<U>' over a ref array allocated 'arr:ref' where 'U[]' is
 	// 'arr:f64'. '$ret' is the index of this asm's own declared return type, per call site.
-	private static _alloc<T>(n: i32): T[] { return __asm<[i32], T[]>('array.new_default TYPEINDEX("T[]")')(n); }
-	private static _copy<T>(dst: T[], dstStart: i32, src: T[], srcStart: i32, len: i32): void {
-		return __asm<[T[], i32, T[], i32, i32], void>('array.copy TYPEINDEX("T[]") TYPEINDEX("T[]")')(dst, dstStart, src, srcStart, len);
+	private static _alloc<T>(n: i32): RawArray<T> { return new RawArray<T>(n); }
+	// A real `Array<T>` of `n` elements, for every method whose RESULT is an array (a mutator wants bare
+	// storage instead, to adopt). `_raw` is just the storage property of one, for the bulk copies below.
+	private static _make<T>(n: i32): T[] { return new Array<T>(n) as unknown as T[]; }
+	private static _raw<T>(a: T[]): RawArray<T> { return (a as unknown as Array<T>).data; }
+	private static _copy<T>(dst: RawArray<T>, dstStart: i32, src: RawArray<T>, srcStart: i32, len: i32): void {
+		dst.copyFrom(dstStart, src, srcStart, len);
 	}
 	// `for (const k in arr)` enumerates INDICES, as strings. towasm desugars that loop into a
 	// `for...of` over this, so the number-to-string conversion happens in ordinary typed lib code
 	// rather than in a synthesized AST whose nodes the checker never stamped.
 	static _indexKeys<T>(a: T[]): string[] {
 		const n = a.length;
-		const result: string[] = Array._alloc<string>(n);
+		const result: string[] = Array._make<string>(n);
 		for (let i = 0; i < n; i++)
 			result[i] = i.toString();
 		return result;
 	}
-	// A string shares the wasm array form (`i16[]`), so "is any wasm array" alone would call `'abc'` an array.
-	// Typed arrays are structs here, so they correctly are not.
 	static isArray(x: any): x is any[] {
-		return typeof x !== 'string' && __asm<[any], boolean>('ref.test (ref array)')(x);
+		return x instanceof ArrayBase;
 	}
-	private static _fill<T>(dst: T[], start: i32, val: T, len: i32): void {
-		return __asm<[T[], i32, T, i32], void>('array.fill TYPEINDEX("T[]")')(dst, start, val, len);
+	private static _fill<T>(dst: RawArray<T>, start: i32, val: T, len: i32): void {
+		dst.fillWith(start, val, len);
 	}
 
-	// Not a real wasm-GC struct (see the header comment), so there's no `this` to default-init before this
-	// runs -- the body directly constructs and returns the value, same idea as `fill`'s `as unknown as T[]`.
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(n: number) {
-		return Array._alloc<T>(n) as unknown as Array<T>;
+		super();
+		this.data = new RawArray<T>(n);
+	}
+	// Adopts storage the caller already built.
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(d: RawArray<T>) {
+		super();
+		this.data = d;
 	}
 
 	grow(n: i32): i32 {
 		const len = this.length;
-		const result: T[] = Array._alloc<T>(len + n);
-		Array._copy(result, 0, this as unknown as T[], 0, len);
-		// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
-		this = result as unknown as Array<T>;
+		const result: RawArray<T> = Array._alloc<T>(len + n);
+		Array._copy(result, 0, this.data, 0, len);
+		this.data = result;
 		return len;
 	}
 
@@ -62,10 +105,9 @@ export class Array<T> {
 		const len = this.length;
 		if (len) {
 			const last = this[len - 1];
-			const result: T[] = Array._alloc<T>(len - 1);
-			Array._copy(result, 0, this as unknown as T[], 0, len - 1);
-			// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
-			this = result as unknown as Array<T>;
+			const result: RawArray<T> = Array._alloc<T>(len - 1);
+			Array._copy(result, 0, this.data, 0, len - 1);
+			this.data = result;
 			return last;
 		}
 		return undefined;
@@ -73,21 +115,19 @@ export class Array<T> {
 	push(...items: T[]): i32 {
 		const len = this.length;
 		const n = items.length;
-		const result: T[] = Array._alloc<T>(len + n);
-		Array._copy(result, 0, this as unknown as T[], 0, len);
-		Array._copy(result, len, items, 0, n);
-		// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
-		this = result as unknown as Array<T>;
+		const result: RawArray<T> = Array._alloc<T>(len + n);
+		Array._copy(result, 0, this.data, 0, len);
+		Array._copy(result, len, (items as unknown as Array<T>).data, 0, n);
+		this.data = result;
 		return len + n;
 	}
 	shift(): T | undefined {
 		const len = this.length;
 		if (len) {
 			const first = this[0];
-			const result: T[] = Array._alloc<T>(len - 1);
-			Array._copy(result, 0, this as unknown as T[], 1, len - 1);
-			// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
-			this = result as unknown as Array<T>;
+			const result: RawArray<T> = Array._alloc<T>(len - 1);
+			Array._copy(result, 0, this.data, 1, len - 1);
+			this.data = result;
 			return first;
 		}
 		return undefined;
@@ -95,22 +135,20 @@ export class Array<T> {
 	unshift(...items: T[]): i32 {
 		const len = this.length;
 		const n = items.length;
-		const result: T[] = Array._alloc<T>(len + n);
-		Array._copy(result, 0, items, 0, n);
-		Array._copy(result, n, this as unknown as T[], 0, len);
-		// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
-		this = result as unknown as Array<T>;
+		const result: RawArray<T> = Array._alloc<T>(len + n);
+		Array._copy(result, 0, (items as unknown as Array<T>).data, 0, n);
+		Array._copy(result, n, this.data, 0, len);
+		this.data = result;
 		return len + n;
 	}
     splice(start: i32, deleteCount: i32 = 0, ...items: T[]): T[] {
 		const len = this.length;
 		const n = items.length;
-		const result: T[] = Array._alloc<T>(len - deleteCount + n);
-		Array._copy(result, 0, this as unknown as T[], 0, start);
-		Array._copy(result, start, items, 0, n);
-		Array._copy(result, start + n - deleteCount, this as unknown as T[], start + deleteCount, len - start - deleteCount);
-		// @ts-expect-error - tison extension: reassigning `this` swaps the backing array
-		this = result as unknown as Array<T>;
+		const result: RawArray<T> = Array._alloc<T>(len - deleteCount + n);
+		Array._copy(result, 0, this.data, 0, start);
+		Array._copy(result, start, (items as unknown as Array<T>).data, 0, n);
+		Array._copy(result, start + n - deleteCount, this.data, start + deleteCount, len - start - deleteCount);
+		this.data = result;
 		return this as unknown as T[];
 	}
 
@@ -158,21 +196,21 @@ export class Array<T> {
 		to		= to < 0 ? 0 : to > len ? len : to;
 		const rlen = to > from ? to - from : 0;
 		start	= from;
-		const result: T[] = Array._alloc<T>(rlen);
-		Array._copy(result, 0, this as unknown as T[], start, rlen);
+		const result: T[] = Array._make<T>(rlen);
+		Array._copy(Array._raw(result), 0, this.data, start, rlen);
 		return result;
 	}
 	concat(b: T[]): T[] {
-		const result: T[] = Array._alloc<T>(this.length + b.length);
-		Array._copy(result, 0, this as unknown as T[], 0, this.length);
-		Array._copy(result, this.length, b, 0, b.length);
+		const result: T[] = Array._make<T>(this.length + b.length);
+		Array._copy(Array._raw(result), 0, this.data, 0, this.length);
+		Array._copy(Array._raw(result), this.length, Array._raw(b), 0, b.length);
 		return result;
 	}
 	fill(x: T, start: i32 = 0, end: i32 = 0x7fffffff): T[] {
 		const len = this.length;
 		start	= start < 0 ? start + len : start;
 		end		= end < 0 ? end + len : end > len ? len : end;
-		Array._fill(this as unknown as T[], start, x, end - start);
+		Array._fill(this.data, start, x, end - start);
 		return this as any;
 	}
 
@@ -186,9 +224,9 @@ export class Array<T> {
 			start += len;
 		if (end < 0)
 			end += len;
-		const me = this as unknown as T[];
+		const me = this.data;
 		Array._copy(me, target, me, start, end - start);
-		return me;
+		return this as unknown as T[];
 	}
 	every(callback: (value: T, index: number, array: this) => unknown, thisArg?: any): boolean {
 		for (let i = 0; i < this.length; i++) {
@@ -202,14 +240,14 @@ export class Array<T> {
 		// length is fixed at allocation, and the old code returned the SCRATCH, so `.length` was always the
 		// input's. Counting in a first pass instead would call `callback` twice per element, which is
 		// observable whenever the predicate has a side effect.
-		const scratch: T[] = Array._alloc<T>(this.length);
+		const scratch: T[] = Array._make<T>(this.length);
 		let n = 0;
 		for (let i = 0; i < this.length; i++) {
 			if (callback(this[i], i, this))
 				scratch[n++] = this[i];
 		}
-		const result: T[] = Array._alloc<T>(n);
-		Array._copy(result, 0, scratch, 0, n);
+		const result: T[] = Array._make<T>(n);
+		Array._copy(Array._raw(result), 0, Array._raw(scratch), 0, n);
 		return result;
 	}
 	find(callback: (value: T, index: number, array: this) => unknown, thisArg?: any): T | undefined {
@@ -251,7 +289,7 @@ export class Array<T> {
 	// per element (they have effects), and holding the parts to measure them would need a `U[][]`, whose
 	// `arr:ref` elements a concrete `number[]` part has no conversion into.
 	flatMap<U>(callback: (value: T, index: number, array: this) => U[], thisArg?: any): U[] {
-		let result: U[] = Array._alloc<U>(0);
+		let result: U[] = Array._make<U>(0);
 		for (let i = 0; i < this.length; i++) {
 			const part = callback(this[i], i, this);
 			for (let j = 0; j < part.length; j++)
@@ -274,7 +312,7 @@ export class Array<T> {
 	}
 	map<U>(callback: (value: T, index: number, array: this) => U, thisArg?: any): U[] {
 		//result.push(callback.call(thisArg, array[i], i, array));
-		const result = Array._alloc<U>(this.length);
+		const result: U[] = Array._make<U>(this.length);
 		for (let i = 0; i < this.length; i++)
 			result[i] = callback(this[i], i, this);
 		return result;
@@ -333,14 +371,14 @@ export class Array<T> {
 		const input = this.slice();
 
 		function merge(left: T[], right: T[]): T[] {
-			const result = Array._alloc<T>(left.length + right.length);
+			const result: T[] = Array._make<T>(left.length + right.length);
 			let i = 0, j = 0, k = 0;
 			while (i < left.length && j < right.length)
 				result[k++] = compareFn(left[i], right[j]) <= 0 ? left[i++] : right[j++];
 
 			// Append remaining items
-			Array._copy(result, k, left, i, left.length - i );
-			Array._copy(result, k + left.length - i, right, j, right.length - j);
+			Array._copy(Array._raw(result), k, Array._raw(left), i, left.length - i );
+			Array._copy(Array._raw(result), k + left.length - i, Array._raw(right), j, right.length - j);
 			return result;
 		}
 

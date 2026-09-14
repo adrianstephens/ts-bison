@@ -418,7 +418,7 @@ export class Math {
 		if (x === Infinity)
 			return Infinity;
 
-		const i = ieeeSplit(x) as unknown as u32[];
+		const i = ieeeSplit(x) as unknown as RawArray<u32>;
 		const e = (i[1] >>> 20) - 1023;
 		const m = ieeeFrom(i[0], (i[1] & 0x000FFFFF) | 0x3FF00000);		// Normalize mantissa to [1,2)
 	

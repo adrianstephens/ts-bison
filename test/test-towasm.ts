@@ -3484,6 +3484,38 @@ async function main() {
 	}
 
 	{
+		// `Array<T>` OWNS its storage (a `RawArray`) rather than being it, so a mutator that has to reallocate rewrites a
+		// field every alias shares. As the bare wasm array, `push` rebuilt it and wrote back only to its receiver's lvalue.
+		const { twoLocals, intoFunction, captured, worklist, isArrayShapes, tupleUnionRest } = await compile(`
+			export function twoLocals(): number { const a: number[] = []; const b = a; b.push(1); return a.length; }
+			export function intoFunction(): number { const a: number[] = []; function add(v: number[]) { v.push(1); } add(a); return a.length; }
+			export function captured(): number { const a: number[] = []; const f = () => { a.push(1); }; f(); return a.length; }
+			export function worklist(): number {
+				const w: (() => void)[] = [];
+				let total = 0;
+				function schedule(n: number) { w.push(() => { total += n; }); }
+				schedule(1); schedule(2); schedule(3);
+				for (const f of w)
+					f();
+				return w.length * 100 + total;
+			}
+			export function isArrayShapes(): number {
+				const s: any = 'ab', b: any = 5n, v: unknown = [1, 2];
+				return (Array.isArray([1, 2]) ? 1 : 0) + (Array.isArray(s) ? 10 : 0) + (Array.isArray(v) ? 100 : 0) + (Array.isArray(b) ? 1000 : 0);
+			}
+			function lenUnion(...args: [number] | [number, number]): number { return args.length; }
+			export function tupleUnionRest(): number { return lenUnion(1, 2) * 10 + lenUnion(3); }
+		`);
+		check('array identity: a push through a second local is seen by the first', twoLocals(), 1);
+		check('array identity: a push through a parameter is seen by the caller', intoFunction(), 1);
+		check('array identity: a push through a closure capture is seen outside it', captured(), 1);
+		check("array identity: towasm's own worklist shape (push from a nested function)", worklist(), 306);
+		// A string and a bigint's limbs are raw wasm arrays too; neither is an `Array` (the bigint used to say it was).
+		check('Array.isArray: true for arrays, false for a string and a bigint', isArrayShapes(), 101);
+		check('a tuple-union rest parameter has the same representation as its owner', tupleUnionRest(), 21);
+	}
+
+	{
 		// `new C` with no explicit type arguments. Both sources of the answer already existed -- the checker
 		// solves them from the constructor's own arguments, and `ctx.contextualReturn` carries the target's
 		// declared type -- but `case 'new'` asked neither, so every one of these threw "class 'C' needs N
