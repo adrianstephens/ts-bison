@@ -408,6 +408,13 @@ function flowContainer(scope: Scope): Scope {
 	return s;
 }
 
+// A non-arrow function's body: its own `this`, which TS types `any` absent a `this:` parameter (ts-parser drops those), never the
+// enclosing method's. An arrow keeps the enclosing `this`, so it does not come through here.
+function ownThis(scope: Scope): Scope {
+	scope.addValue('this', T.ANY);
+	return scope;
+}
+
 function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type } {
 	const members:			TS.TypeMember[] = [];
 	const staticMembers:	TS.TypeMember[] = [];
@@ -1264,7 +1271,7 @@ function hoist(stmts: Stmt[], scope: Scope) {
 			const d = chosen[0];
 			const t = TS.FunctionType(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope));
 			if (!d.returnType && d.body)
-				lazyReturnType(t, d, scope, () => checkFunctionBody(t, d.body, flowContainer(scope), hasMod(d, 'async'), hasMod(d, 'generator'), hasMod(d, 'generator')));
+				lazyReturnType(t, d, scope, () => checkFunctionBody(t, d.body, ownThis(flowContainer(scope)), hasMod(d, 'async'), hasMod(d, 'generator'), hasMod(d, 'generator')));
 			scope.addValue(name, t);
 			scope.addDecl(name, d);
 		}
@@ -1780,7 +1787,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 
 			case 'function': {
 				const csig = applyContextualParams(e.params, expected, scope);
-				checkFunctionBody(e, e.body, scope, hasMod(e, 'async'), hasMod(e, 'generator'), hasMod(e, 'generator'), err, shapedHint(csig?.returnType, scope));
+				checkFunctionBody(e, e.body, ownThis(new Scope(scope)), hasMod(e, 'async'), hasMod(e, 'generator'), hasMod(e, 'generator'), err, shapedHint(csig?.returnType, scope));
 				return TS.FunctionType(T.FixSig(e, T.ANY, e.returnType));
 			}
 			case 'arrow': {
@@ -2933,7 +2940,7 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 
 		case 'function_decl':
 			if (stmt.body)
-				checkFunctionBody(stmt, stmt.body, flowContainer(scope), hasMod(stmt, 'async'), hasMod(stmt, 'generator'), hasMod(stmt, 'generator'), err);
+				checkFunctionBody(stmt, stmt.body, ownThis(flowContainer(scope)), hasMod(stmt, 'async'), hasMod(stmt, 'generator'), hasMod(stmt, 'generator'), err);
 			break;
 
 		case 'class_decl':

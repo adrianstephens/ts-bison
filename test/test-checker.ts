@@ -41,6 +41,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['fluent this',					'class A { foo() { return this; } } class B extends A { bar() { return this; } } declare const b: B; const q: number = b.foo().bar();', ["Type 'B' is not assignable to type 'number'"]],
 	['a guard keeps a narrower type', 'class A { a = 1; } class C extends A { c = ""; } declare function isA(x: any): x is A; declare const s: C; if (isA(s)) { const q: number = s.c; }', [NOT_ASSIGNABLE('string', 'number')]],
 	['a guard keeps narrower members', 'class A { a = 1; } class B { b = 1; } class C extends A { c = ""; } declare function isA(x: any): x is A; declare const u: C | B; if (isA(u)) { const q: number = u.c; }', [NOT_ASSIGNABLE('string', 'number')]],
+	['a nested function has its own this', 'class Foo { x: number; bar() { function inner() { const q: string = this.x; } const g = function () { const r: string = this.x; }; } }', []],
 	['static member returns its class', 'class A { static self = A; static make() { return A; } static me() { return this; } } const q: number = A.make();', [NOT_ASSIGNABLE('typeof A', 'number')]],
 
 	// strictNullChecks off: null/undefined belong to every type, and inferred null/undefined widen to `any`
