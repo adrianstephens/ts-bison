@@ -94,7 +94,7 @@ export type Type =
 	| ConstructorType
 	| ObjectType
 	| MappedType
-	| { type: 'this' }
+	| { type: 'this'; of?: Type }		// `of`: the class whose polymorphic `this` it is, when known (an instance member's own)
 	| { type: 'tuple'; elements: TupleElement[]; readonly?: boolean }
 	| { type: 'keyof'; argument: Type }
 	| { type: 'typeof'; name: string; source?: string; typeArgs?: Type[]; declScope?: unknown }

@@ -1456,6 +1456,10 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 
 	function uncached(): Type {
 		switch (t.type) {
+			// A polymorphic `this` that knows its class resolves as that class; a declared `: this` has no class and stays opaque.
+			case 'this':
+				return t.of ? resolve(scope, t.of, depth - 1, stopAtRef) : t;
+
 			case 'literal':
 				return Array.isArray(t.value) ? expandTemplate(t.value, scope) ?? t : t;
 

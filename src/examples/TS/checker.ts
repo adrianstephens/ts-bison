@@ -387,8 +387,9 @@ function lazyReturnType(sig: TS.CallSig, decl: { returnType?: Type }, scope: Sco
 function classBodyScopes(c: TS.Class, scope: Scope, instance: Type, value: Type): { inst: Scope; stat: Scope } {
 	// A generic class's instance scope is flagged (`Scope.isGenericTemplate`): its method bodies are one template shared by every instantiation.
 	const inst = new Scope(scope, !!c.typeParams?.length);
-	// prefer the named entry: declaration merging can extend it beyond this declaration's shape
-	inst.addValue('this', c.name && scope.type(c.name) ? { type: 'ref', name: c.name } : instance);
+	// The polymorphic `this` type, so `return this` infers `this` and each call substitutes its receiver (TS's fluent `this`).
+	// Its class prefers the named entry: declaration merging can extend it beyond this declaration's shape.
+	inst.addValue('this', { type: 'this', of: c.name && scope.type(c.name) ? { type: 'ref', name: c.name } : instance });
 	// `addTypeParam`, as `checkFunctionBody` registers its own: an unregistered `K` stays opaque to every member read through it.
 	for (const p of c.typeParams ?? [])
 		inst.addTypeParam(p.name, p.constraint ?? T.ANY);
