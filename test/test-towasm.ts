@@ -619,13 +619,18 @@ async function main() {
 		}
 	`), /trailing rest arguments/);
 
-	await checkThrows('spreading a mismatched-kind array is rejected', () => compile(`
-		export function f(): number {
-			const a: boolean[] = [true, false];
-			const b: number[] = [1, ...(a as unknown as number[])];
-			return b.length;
-		}
-	`), /tsw/);
+	{
+		// A spread reads each element through its operand's own index, so storage of another kind is converted, not refused.
+		// `a` really holds booleans; JS's `1 + true + false` agrees with the converted numbers.
+		const { f } = await compile(`
+			export function f(): number {
+				const a: boolean[] = [true, false];
+				const b: number[] = [1, ...(a as unknown as number[])];
+				return b.length * 10 + b[0] + b[1] + b[2];
+			}
+		`);
+		check('a spread of boolean storage into a number literal', f(), 32);
+	}
 
 	{
 		// Array destructuring (var_decl + function params): plain positional binding, a hole, and a
@@ -3517,6 +3522,21 @@ async function main() {
 		check('a tuple-union rest parameter has the same representation as its owner', tupleUnionRest(), 21);
 		// `r ? [r] : []` is an `Array` that owns its storage; the spread check only recognised raw storage, so it had no element kind.
 		check('a spread of an array-valued union into an array literal', spreadUnion(), 21);
+	}
+
+	{
+		// A spread reads its operand through the operand's own `length` and index, converting each element; only storage of the
+		// literal's own kind is copied whole. A number tuple is ref storage, so `[0, ...t]` used to be refused.
+		const { spreadNumberTuple, spreadStringTuple, spreadThenPop, spreadMixed } = await compile(`
+			export function spreadNumberTuple(): number { const t: [number, number] = [1, 2]; const a = [0, ...t]; return a[0] + a[1] * 10 + a[2] * 100; }
+			export function spreadStringTuple(): number { const t: [string, string] = ['a', 'bc']; const a = ['z', ...t]; return a.length * 10 + a[2].length; }
+			export function spreadThenPop(): number { const a = [1, 2, 3]; const b = [...a, a.pop()!]; return b.length * 100 + b[3] * 10 + a.length; }
+			export function spreadMixed(): number { const n = [1, 2]; const a = ['x', ...n]; return a.length; }
+		`);
+		check('a number tuple spread into a number literal', spreadNumberTuple(), 210);
+		check('a string tuple spread into a string literal', spreadStringTuple(), 32);
+		check('a spread sees its operand before later elements of the literal change it', spreadThenPop(), 432);
+		check('a number array spread into a mixed literal', spreadMixed(), 3);
 	}
 
 	{

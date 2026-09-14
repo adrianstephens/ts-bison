@@ -4467,13 +4467,33 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 	}
 
+	// `value`'s elements, read through its own `length` and index and converted to `want`, into new storage `typeIndex` left in
+	// `dst`. Read where `value` is evaluated, so a later element of the same literal (`[...a, a.pop()]`) cannot change them.
+	function copyElements(value: Expr, got: WasmType, ctx: FunctionContext, want: WasmType, typeIndex: number, dst: number): void {
+		const n			= optionalTempCounter++;
+		const fromName	= `$spread$from$${n}`, atName = `$spread$at$${n}`;
+		const from: Expr	= { type: 'identifier', name: fromName };
+		const at: Expr		= { type: 'identifier', name: atName };
+		const slot		= wtypeOf(value, ctx) ?? got;
+		coerceTop(got, ctx, slot);
+		ctx.emit(I.local.set(ctx.declareValue(fromName, slot, narrowedTypeOf(value, ctx)).index));
+		const i = ctx.declareValue(atName, 'i32', T.NUMBER).index;
+		emitAs(JS.Member(from, 'length'), ctx, 'i32');
+		ctx.emit(I.array.new_default(typeIndex), I.local.set(dst), I.i32.const(0), I.local.set(i));
+		const _old = ctx.swapOut();
+		ctx.emit(I.local.get(i), I.local.get(dst), I.array.len, I.i32.ge_u, I.br_if(1), I.local.get(dst), I.local.get(i));
+		emitAs(JS.Index(from, at), ctx, want);
+		ctx.emit(I.array.set(typeIndex), I.local.get(i), I.i32.const(1), I.i32.add, I.local.set(i), I.br(0));
+		ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(_old))]));
+	}
+
 	// `elementTsType` may name each position separately -- a TUPLE rest parameter's arguments.
 	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElementI, typeIndex: number, elementTsType?: Type | ((i: number) => Type | undefined)): void {
 		const contextAt		= (el: Expr) => typeof elementTsType === 'function' ? elementTsType(elements.indexOf(el)) : elementTsType;
 		const emitElement	= (el: Expr) => withContext(ctx, contextAt(el), () => emitAs(el, ctx, want));
 		if (elements.some(el => el?.type === 'spread')) {
-			// A `[...]` array literal with at least one spread element. Every element is evaluated exactly once, in
-			// source order, into a scratch local before anything is allocated (side effects must not run twice). The real array is then `array.new_default`-allocated to the true runtime total and filled in a second pass.
+			// A `[...]` array literal with at least one spread element. Every element is evaluated exactly once, in source order, into a
+			// scratch local (a spread into storage of the literal's own kind); the result is then allocated to the true total and filled.
 			type Part = { spread: false; value: number } | { spread: true; src: number; len: number };
 			const parts: Part[] = [];
 
@@ -4484,14 +4504,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					ctx.emit(I.local.set(value));
 					parts.push({ spread: false, value });
 				} else if (el.type === 'spread') {
-					const operand = spreadSource(el.operand, ctx);
-					const srcKind = objectArrayKind(operand, ctx);
-					if (srcKind !== kind)
-						throw 'a spread element in an array literal must be an array of the same element type';
-					emitAs(operand, ctx, ARR_WTYPE[srcKind]);
-					const src = ctx.temp(`$spread$src$${i}`, ARR_WTYPE[srcKind]);
-					const len = ctx.temp(`$spread$len$${i}`, 'i32');
-					ctx.emit(I.local.set(src), I.local.get(src), I.array.len, I.local.set(len));
+					const operand	= spreadSource(el.operand, ctx);
+					const src		= ctx.temp(`$spread$src$${i}`, ARR_WTYPE[kind]);
+					const len		= ctx.temp(`$spread$len$${i}`, 'i32');
+					const got		= emitExpr(operand, ctx, ARR_WTYPE[kind]);
+					if (typeof got === 'object' && 'arr' in got && got.arr === kind) {
+						coerceTop(got, ctx, ARR_WTYPE[kind]);
+						ctx.emit(I.local.set(src));
+					} else {
+						copyElements(operand, got, ctx, want, typeIndex, src);
+					}
+					ctx.emit(I.local.get(src), I.array.len, I.local.set(len));
 					parts.push({ spread: true, src, len });
 				} else {
 					emitElement(el);
