@@ -1843,7 +1843,7 @@ export function collectMembers(t: Type, scope: Scope): TS.TypeMember[] {
 			if (seen.has(p))
 				continue;
 			seen.add(p);
-			const r = resolveOwn(p, scope);
+			const r = resolveMembers(p, scope);
 			if (r.type === 'object')
 				out.push(...r.members);
 			else if (r.type === 'intersection')
