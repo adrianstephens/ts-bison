@@ -384,7 +384,7 @@ function lazyReturnType(sig: TS.CallSig, decl: { returnType?: Type }, scope: Sco
 }
 
 // The scopes a class's member bodies are checked in: instance members see `this` as the instance and the class's type params, static ones the constructor.
-function classBodyScopes(c: TS.Class, scope: Scope, instance: Type, value: Type): { inst: Scope; stat: Scope } {
+function classBodyScopes(c: TS.Class, scope: Scope, instance: Type, value: Type, superType?: Type): { inst: Scope; stat: Scope } {
 	// A generic class's instance scope is flagged (`Scope.isGenericTemplate`): its method bodies are one template shared by every instantiation.
 	const inst = new Scope(scope, !!c.typeParams?.length);
 	// The polymorphic `this` type, so `return this` infers `this` and each call substitutes its receiver (TS's fluent `this`).
@@ -396,6 +396,14 @@ function classBodyScopes(c: TS.Class, scope: Scope, instance: Type, value: Type)
 	// `typeof C` when named, as TS types it: the structural value holds this very member, so a static `return this` would make a cyclic type.
 	const stat = new Scope(scope);
 	stat.addValue('this', c.name && scope.value(c.name) ? { type: 'typeof', name: c.name } : value);
+	// `super`: the base's instance side in an instance member, its static side in a static one. `super(...)` invokes the base
+	// CONSTRUCTOR instead, so the static side is bound for it too, under a key no identifier can spell.
+	if (superType) {
+		const staticSide: Type = superType.type === 'ref' && scope.value(superType.name) ? { type: 'typeof', name: superType.name } : T.ANY;
+		inst.addValue('super', superType);
+		inst.addValue('super()', staticSide);
+		stat.addValue('super', staticSide);
+	}
 	inst.flowBoundary = stat.flowBoundary = isClassDecl(c);
 	return { inst, stat };
 }
@@ -415,7 +423,7 @@ function ownThis(scope: Scope): Scope {
 	return scope;
 }
 
-function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type } {
+function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type; superType?: Type } {
 	const members:			TS.TypeMember[] = [];
 	const staticMembers:	TS.TypeMember[] = [];
 	const ctorMembers:		TS.ClassMethod[] = [];
@@ -575,12 +583,12 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type }
 	let bodyScopes: { inst: Scope; stat: Scope } | undefined;
 	for (const { sig, decl } of pendingReturns) {
 		lazyReturnType(sig, decl, scope, () => {
-			bodyScopes ??= classBodyScopes(c, scope, instance, value);
+			bodyScopes ??= classBodyScopes(c, scope, instance, value, superType);
 			const generator = hasMod(decl, 'generator');
 			checkFunctionBody(sig, decl.body, hasMod(decl, 'static') ? bodyScopes.stat : bodyScopes.inst, hasMod(decl, 'async'), generator, generator);
 		}, selfRefs);
 	}
-	return { instance, value };
+	return { instance, value, superType };
 }
 
 // ---- control-flow narrowing -----------------------------------------------------------------
@@ -1649,6 +1657,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				break;
 
 			case 'this':		return scope.value('this') ?? T.ANY;
+			case 'super':		return scope.value('super') ?? T.ANY;
 			case 'identifier':	{
 				// A name destructured from a union is its source path, read in the CURRENT (narrowed) scope.
 				const src = scope.source(e.name);
@@ -1934,9 +1943,15 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// second time -- re-evaluating the same receiver expression twice caused a real, observed
 				// regression (a duplicate diagnostic on one real corpus file, a genuine wrong-type result on
 				// another), root-caused via a real whole-workspace sweep, not assumed.
+				// `super(...)` invokes the base CONSTRUCTOR -- `case 'super'` yields the base's instance side, which `super.m` needs --
+				// so it resolves through the very path `new` does, against the constructor `classBodyScopes` bound for it.
+				const construct = e.type === 'new' || e.callee.type === 'super';
 				let calleeObjT: Type | undefined;
 				if (e.type === 'call' && e.callee.type === 'member') {
 					calleeObjT = recurse(e.callee.object);
+					// `super.m()`'s receiver is the DERIVED one: a base method returning `this` yields the current `this`, not the base instance.
+					if (e.callee.object.type === 'super')
+						calleeObjT = scope.value('this') ?? calleeObjT;
 					if (T.isRefOf(calleeObjT, TYPED_ARRAY_RANGES) && !calleeObjT.typeArgs) {
 						switch (e.callee.property) {
 							case 'indexOf': case 'lastIndexOf':	return TS.RangeType('number', -1, 0x7fffffff, true);
@@ -1958,7 +1973,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// nullish strip-and-reattach below never ran for it: `(() => number) | undefined` isn't
 				// function-shaped, signature lookup found nothing, and the whole call typed as `any`.
 				const calleeOptional = (e.callee.type === 'member' && isOptionalChainLink(e.callee)) || !!(e as { optional?: boolean }).optional;
-				let calleeT		= T.mergeIdenticalSignatures(T.resolveOwn(T.nonNullable(recurse(e.callee), scope, calleeOptional), scope));
+				let calleeT		= T.mergeIdenticalSignatures(T.resolveOwn(T.nonNullable(e.callee.type === 'super' ? scope.value('super()') ?? T.ANY : recurse(e.callee), scope, calleeOptional), scope));
 				if (calleeT.type === 'union' && calleeObjT && e.callee.type === 'member') {
 					const arr		= T.arrayUnionAsArray(T.nonNullable(calleeObjT, scope, calleeOptional), scope);
 					const method	= arr && T.lookupMember(arr, e.callee.property, scope);
@@ -1968,6 +1983,12 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// Explicit call-site type args (`f<Foo>(...)`) are raw AST, never stamped like a declaration's own annotations --
 				// unstamped, a ref substituted into the callee's generic body would resolve against the callee's scope, not the caller's.
 				let typeArgs	= e.typeArgs?.map(t => T.stampScope(t, scope));
+				// `super(...)` against a generic base is the base constructor instantiated by the EXTENDS clause's own type
+				// arguments (`extends A<string>`): those ARE this call's type arguments, so the base's `T` is fixed, not re-inferred.
+				if (!typeArgs && e.callee.type === 'super') {
+					const base = scope.value('super');
+					typeArgs = base?.type === 'ref' ? base.typeArgs : undefined;
+				}
 				// `new Promise((resolve, reject) => {...})` with no explicit `<T>`: real TS infers `T` by finding calls to
 				// `resolve` within the executor's own body and unioning their argument types -- ordinary structural/argument
 				// inference can't do this, since `resolve`'s own declared type (`(value: T | PromiseLike<T>) => void`) is
@@ -2004,30 +2025,30 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// BigInt`'s constructor alongside a `declare var BigInt` whose call signature returns `bigint`, so
 				// `BigInt(5)` must type as `bigint`, and its own call signature is found by that scan.
 				// `new` on an intersection of constructor types constructs what TS's mixin rule makes of it (`T.constructSignatures`).
-				const mixedCtors = e.type === 'new' && calleeT.type === 'intersection' ? T.constructSignatures(calleeT, scope) : [];
+				const mixedCtors = construct && calleeT.type === 'intersection' ? T.constructSignatures(calleeT, scope) : [];
 				if (mixedCtors.length > 1)
 					overloads = mixedCtors;
 				let sig: TS.CallSig|undefined = mixedCtors.length === 1 ? mixedCtors[0] : mixedCtors.length ? undefined
-					: e.type === 'new' ? parts.find(p => p.type === 'constructor') ?? parts.find(p => p.type === 'function')
+					: construct ? parts.find(p => p.type === 'constructor') ?? parts.find(p => p.type === 'function')
 					: parts.find(p => p.type === 'function');
-				sig ??= overloads ? undefined : T.unionSignature(calleeT, e.type === 'new' ? 'construct' : 'call', scope);
+				sig ??= overloads ? undefined : T.unionSignature(calleeT, construct ? 'construct' : 'call', scope);
 				if (!sig && !overloads) {
 					// Each kind takes only its OWN signatures: TS rejects both cross directions -- a plain call on a
 					// construct-only value is TS2348, and `new` on a call-only one TS7009 (which still evaluates to `any`).
 					const members 		= T.collectMembers(calleeT, scope);
 					const constructs	= members.filter(m => m.type === 'construct');
 					const callSigs		= members.filter(m => m.type === 'call');
-					const own			= e.type === 'new' ? constructs : callSigs;
+					const own			= construct ? constructs : callSigs;
 					// `new` still falls back to a call signature: TS reports that as TS7009, an IMPLICIT-ANY diagnostic that
 					// fires only under `noImplicitAny` (which this checker does not track yet) and still evaluates to `any` --
 					// erroring unconditionally cost 56 corpus false positives. A plain call on a construct-only value is
 					// different: TS2348 is unconditional, so that direction is rejected here.
-					const calls			= own.length || e.type !== 'new' ? own : callSigs;
+					const calls			= own.length || !construct ? own : callSigs;
 					if (calls.length === 1) {
 						sig = calls[0];
 					} else if (calls.length > 1) {
 						overloads = calls;		// resolved below, once argument types are known
-					} else if (e.type !== 'new' && (constructs.length > 0 || parts.some(p => p.type === 'constructor'))) {
+					} else if (!construct && (constructs.length > 0 || parts.some(p => p.type === 'constructor'))) {
 						if (err)
 							err(SEVERITY.ERROR, pos)`Type '${show().type(calleeT)}' is not callable without 'new' in '${show().expression(e)}'`;
 						return T.ANY;
@@ -2196,6 +2217,8 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// real call site -- `this` as a type is never eagerly resolved elsewhere (see
 					// `T.substituteThisType`'s own comment, `OPAQUE`'s inclusion of `'this'`), so a method
 					// call's return needs it substituted in here, using the receiver expression's own type.
+					if (e.callee.type === 'super')
+						return T.VOID;
 					return T.optional(e.callee.type === 'member' ? T.substituteThisType(result, calleeObjT ?? recurse(e.callee.object)) : result, calleeOptional);
 				}
 				return T.ANY;
@@ -2667,8 +2690,8 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 	}
 }
 function checkClass(c: TS.Class, scope: Scope, err?: Err) {
-	const { instance, value } = classShapes(c, scope);
-	const { inst: instScope, stat: statScope } = classBodyScopes(c, scope, instance, value);
+	const { instance, value, superType } = classShapes(c, scope);
+	const { inst: instScope, stat: statScope } = classBodyScopes(c, scope, instance, value, superType);
 
 	for (const m of c.body) {
 		switch (m.type) {

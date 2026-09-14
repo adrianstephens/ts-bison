@@ -44,6 +44,13 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a guard keeps narrower members', 'class A { a = 1; } class B { b = 1; } class C extends A { c = ""; } declare function isA(x: any): x is A; declare const u: C | B; if (isA(u)) { const q: number = u.c; }', [NOT_ASSIGNABLE('string', 'number')]],
 	['a nested function has its own this', 'class Foo { x: number; bar() { function inner() { const q: string = this.x; } const g = function () { const r: string = this.x; }; } }', []],
 	['an annotated sibling parameter infers', 'class C { test: string } class D extends C { test2: number } declare function test<T extends C>(a: (t: T, t1: T) => void): T; test((t1: D, t2) => { const q: string = t2.test2; });', [NOT_ASSIGNABLE('number', 'string')]],
+	['super reaches a generic base', 'declare class A<T> { constructor(x: T); m(): T; } class B extends A<string> { constructor() { super("s"); } n() { const q: number = super.m(); } }', [NOT_ASSIGNABLE('string', 'number')]],
+	['super() fixes the base type args', 'class A<T> { constructor(x: T) {} } class B extends A<string> { constructor() { super(1); } }', ["Argument of type '1' is not assignable to parameter 'x: string'"]],
+	['super reaches the base method', 'class A { m(): string { return ""; } } class B extends A { m(): number { return 1; } n() { const q: number = super.m(); } }', [NOT_ASSIGNABLE('string', 'number')]],
+	['super.m() has the derived this', 'class A { self(): this { return this; } } class B extends A { b = 1; n() { const q: number = super.self(); } }', [NOT_ASSIGNABLE('this', 'number')]],
+	['super() checks its arguments', 'class A { constructor(x: number) {} } class B extends A { constructor() { super("x"); } }', ["Argument of type '\"x\"' is not assignable to parameter 'x: number'"]],
+	['super() accepts the base arguments', 'class A { constructor(x: number) {} } class B extends A { constructor() { super(1); } }', []],
+	['static super reaches the base', 'class A { static s(): string { return ""; } } class B extends A { static t() { const q: number = super.s(); } }', [NOT_ASSIGNABLE('string', 'number')]],
 	['static member returns its class', 'class A { static self = A; static make() { return A; } static me() { return this; } } const q: number = A.make();', [NOT_ASSIGNABLE('typeof A', 'number')]],
 
 	// strictNullChecks off: null/undefined belong to every type, and inferred null/undefined widen to `any`
