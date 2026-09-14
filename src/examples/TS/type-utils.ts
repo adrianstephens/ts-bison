@@ -3011,7 +3011,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 
 // A callable candidate reachable through any nesting of unions/intersections/overload-objects -- used below to dig
 // out `.then`'s own signature regardless of how many lib files' worth of `Promise<T>` declaration merging it took.
-function findFunctionType(t: Type, scope: Scope): TS.CallSig | undefined {
+export function findFunctionType(t: Type, scope: Scope): TS.CallSig | undefined {
 	const r = resolveOwn(t, scope);
 	if (r.type === 'function')
 		return r;

@@ -42,6 +42,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a guard keeps a narrower type', 'class A { a = 1; } class C extends A { c = ""; } declare function isA(x: any): x is A; declare const s: C; if (isA(s)) { const q: number = s.c; }', [NOT_ASSIGNABLE('string', 'number')]],
 	['a guard keeps narrower members', 'class A { a = 1; } class B { b = 1; } class C extends A { c = ""; } declare function isA(x: any): x is A; declare const u: C | B; if (isA(u)) { const q: number = u.c; }', [NOT_ASSIGNABLE('string', 'number')]],
 	['a nested function has its own this', 'class Foo { x: number; bar() { function inner() { const q: string = this.x; } const g = function () { const r: string = this.x; }; } }', []],
+	['an annotated sibling parameter infers', 'class C { test: string } class D extends C { test2: number } declare function test<T extends C>(a: (t: T, t1: T) => void): T; test((t1: D, t2) => { const q: string = t2.test2; });', [NOT_ASSIGNABLE('number', 'string')]],
 	['static member returns its class', 'class A { static self = A; static make() { return A; } static me() { return this; } } const q: number = A.make();', [NOT_ASSIGNABLE('typeof A', 'number')]],
 
 	// strictNullChecks off: null/undefined belong to every type, and inferred null/undefined widen to `any`

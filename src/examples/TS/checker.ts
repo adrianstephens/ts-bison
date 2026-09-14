@@ -2085,6 +2085,16 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						: !inference ? declared : isContextSensitive(a) ? inference.contextFor(declared) : T.substituteType(declared, inference.current()));
 					const typeCallback = (a: Expr & { type: 'function' | 'arrow' }, i: number) => {
 						const declared		= declaredArg(i);
+						// TS's inferFromAnnotatedParameters: `(t1: D, t2) => ...` against `(t: T, t1: T) => void` fixes `T = D` from `t1`
+						// first, so `t2` sees `D`, not `T`'s constraint. (A callback's own `...rest` annotation is not a source yet.)
+						const declaredSig	= inference && declared && T.findFunctionType(declared, scope);
+						if (declaredSig)
+							a.params.forEach((p, k) => {
+								const target = declaredSig.params[k]?.typeAnnotation
+									?? (declaredSig.rest?.typeAnnotation && T.restArgType(declaredSig.rest.typeAnnotation, k - declaredSig.params.length, scope));
+								if (p.typeAnnotation && target)
+									inference!.infer(target, p.typeAnnotation);
+							});
 						const contextual	= contextOf(a, declared);
 						applyContextualParams(a.params, contextual, scope);
 						// For codegen, which compiles an overload's IMPLEMENTATION and so never sees this. Only once fully
