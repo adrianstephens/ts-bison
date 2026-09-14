@@ -3550,6 +3550,25 @@ async function main() {
 	}
 
 	{
+		// A computed string key on an `any` receiver (the checker's own `throughSources` shape): every class with fields is a
+		// `ref.test` arm chaining over its own field names, and a key no class declares reads `undefined`, as JS does.
+		const { anyKeyReadWrite } = await compile(`
+			export function anyKeyReadWrite(): number {
+				const e = { left: 5, right: 7 };
+				const out: any = { ...e };
+				let n = 0;
+				for (const k of ['left', 'right', 'missing'])
+					if (out[k])
+						n += out[k];
+				for (const k of ['left'])
+					out[k] = 100;
+				return n * 1000 + out.left;
+			}
+		`);
+		check('a computed string key on an any receiver reads and writes the runtime struct', anyKeyReadWrite(), 12100);
+	}
+
+	{
 		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
 		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
 		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`

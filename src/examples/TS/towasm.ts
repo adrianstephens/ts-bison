@@ -1895,6 +1895,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	const closureCoercionWrappers = new Map<string, { info: FuncInfo; wantStructTypeIndex: number; envTypeIndex: number }>();
 	// `adoptingDecl`'s answer per class, `null` for one that adopts no storage.
 	const adoptingDecls = new Map<ClassInfo, { decl: MethodMember; storage: WasmType & { arr: WasmElementI } } | null>();
+	const anyKeyFuncs = new Map<'get' | 'set', FuncInfo>();
 
 	const closureLiterals: FuncInfo[] = [];
 	const closureWasmTypes	= new Map<string, WasmType>();	// The `{closure: FuncSig}` wrapper object itself, memoized per signature
@@ -5245,6 +5246,23 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				};
 			}
 
+			// The WRITE half of `ensureAnyKey`, reached the same way its read half is.
+			if (T.isAny(narrowedTypeOf(target.object, ctx)) && T.isAssignable(narrowedTypeOf(target.index, ctx), T.STRING, ctx.typeScope)) {
+				const n			= optionalTempCounter++;
+				const keyWtype	= typeOf(T.STRING)!;
+				const objLocal	= ctx.declareValue(`#anykeyobj$${n}`, REF_ANY, T.ANY);
+				const keyLocal	= ctx.declareValue(`#anykey$${n}`, keyWtype, T.STRING);
+				emitAs(target.object, ctx, REF_ANY);
+				ctx.emit(I.local.set(objLocal.index));
+				emitAs(target.index, ctx, keyWtype);
+				ctx.emit(I.local.set(keyLocal.index));
+				return {
+					wtype:	REF_ANY_NULLABLE,
+					old:	captureOld(REF_ANY_NULLABLE, () => ctx.emit(I.local.get(objLocal.index), I.local.get(keyLocal.index), I.call(ensureAnyKey('get', ctx).funcIndex))),
+					write:	makeWrite(REF_ANY_NULLABLE, val => ctx.emit(I.local.get(objLocal.index), I.local.get(keyLocal.index), I.local.get(val), I.call(ensureAnyKey('set', ctx).funcIndex))),
+				};
+			}
+
 			const kind = objectArrayKind(target.object, ctx);
 			// `i16`/`i8` (`string`/packed-byte storage) rejected same as `case 'index'`'s own read side.
 			if (!kind || kind === 'i16' || kind === 'i8')
@@ -6326,6 +6344,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
 							alternate,
 						}) as Expr, { type: 'identifier', name: 'undefined' } as Expr), ctx, want ?? REF_ANY_NULLABLE);
+					}
+					// A computed key on an ERASED receiver: no single struct to chain over, so the arms are every class's own,
+					// picked by `ref.test` at run time -- `x[k]` as JS reads it (the checker's own `throughSources`).
+					if (T.isAny(narrowedTypeOf(e.object, ctx)) && T.isAssignable(narrowedTypeOf(e.index, ctx), T.STRING, ctx.typeScope)) {
+						emitAs(e.object, ctx, REF_ANY);
+						emitAs(e.index, ctx, typeOf(T.STRING)!);
+						ctx.emit(I.call(ensureAnyKey('get', ctx).funcIndex));
+						return REF_ANY_NULLABLE;
 					}
 					throw `'${T.exprKey(e.object)}' is indexed but is not an array, a typed array, or a class with index accessors (its type: '${T.typeKey(narrowedTypeOf(e.object, ctx))}')`;
 				}
@@ -10298,6 +10324,80 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				probe(cls, cls.typeIndex, false);
 		}
 		return [...found.values()];
+	}
+
+	// `x[k]` where `x`'s static type is `any` and `k` is a computed string -- the dynamic-key sibling of `ensureAnyField`.
+	// One shared function per direction, since no static name bounds the candidates: a `ref.test` cascade over every class
+	// with fields, each arm chaining over that class's OWN field names, which is what a known receiver's `x[k]` compiles to.
+	function ensureAnyKey(kind: 'get' | 'set', ctx: FunctionContext): FuncInfo {
+		const existing = anyKeyFuncs.get(kind);
+		if (existing)
+			return existing;
+
+		const keyWtype	= typeOf(T.STRING)!;
+		const result: WasmType = kind === 'get' ? REF_ANY_NULLABLE : 'void';
+		const params	= [{ key: 'recv', wtype: REF_ANY, tsType: T.ANY }, { key: 'key', wtype: keyWtype, tsType: T.STRING },
+			...(kind === 'set' ? [{ key: 'value', wtype: REF_ANY_NULLABLE, tsType: T.ANY }] : [])];
+		const { funcIndex, typeIndex } = registerFunc(toParams2(params), toResults(result));
+		const info: FuncInfo = { params: params.map(x => x.wtype), result, funcIndex, typeIndex };
+		anyKeyFuncs.set(kind, info);
+		funcs.set(`<any key ${kind}>`, info);
+
+		lateWorklist.push(() => {
+			const dctx	= new FunctionContext(`key_${kind}`, new Scope(libGlobal), plainReturn(result), undefined);
+			const recv	= dctx.declareLocal('$recv', REF_ANY);
+			const keyId: Expr = { type: 'identifier', name: '$key' };
+			const valId: Expr = { type: 'identifier', name: '$value' };
+			dctx.declareValue('$key', keyWtype, T.STRING);
+			if (kind === 'set')
+				dctx.declareValue('$value', REF_ANY_NULLABLE, T.ANY);
+
+			// Deduped by physical heap type, as the static-name cascades are: several owners can share one.
+			const seen = new Set<number>();
+			const candidates: { heap: wasm.HeapType; arm: () => void }[] = [];
+			for (const cls of classes.values()) {
+				if (cls.typeIndex === -1 || !cls.fields.length || !cls.thisTsType || seen.has(cls.typeIndex))
+					continue;
+				seen.add(cls.typeIndex);
+				const objName		= `$obj$${cls.typeIndex}`;
+				const objId: Expr	= { type: 'identifier', name: objName };
+				const isKey			= (f: string): Expr => ({ type: 'binary', operator: '===', left: keyId, right: Literal(f) } as Expr);
+				candidates.push({ heap: cls.typeIndex, arm: () => {
+					const obj = dctx.declareValue(objName, cls.thisWtype!, cls.thisTsType!);
+					dctx.emit(I.local.get(recv.index), I.ref.cast(cls.typeIndex), I.local.set(obj.index));
+					if (kind === 'get')
+						emitAs(cls.fields.reduce<Expr>((alternate, f) => ({ type: 'conditional',
+							test:		isKey(f.name),
+							consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
+							alternate,
+						}) as Expr, { type: 'identifier', name: 'undefined' } as Expr), dctx, REF_ANY_NULLABLE);
+					else
+						cls.fields.forEach(f => emitStmt({ type: 'if',
+							test:		isKey(f.name),
+							consequent:	{ type: 'expression', expression: { type: 'assign', target: { type: 'member', object: objId, property: f.name }, value: valId } as Expr } as Stmt,
+						} as Stmt, dctx));
+				} });
+			}
+
+			// A key no candidate declares reads `undefined`, exactly as JS does -- unlike the static-name cascades, whose
+			// name came from source and so must exist somewhere. A write still traps: there is no honest place to put it.
+			function buildArm(i: number): wasm.Instr[] {
+				if (i >= candidates.length) {
+					if (kind === 'set')
+						return [I.unreachable];
+					emitDefaultValue(REF_ANY_NULLABLE, dctx);
+					return dctx.swapOut();
+				}
+				const c = candidates[i];
+				dctx.emit(I.local.get(recv.index), I.ref.test(c.heap));
+				const _cond = dctx.swapOut();
+				c.arm();
+				return [..._cond, I.if(kind === 'get' ? toValType(REF_ANY_NULLABLE) : undefined, dctx.swapOut(), buildArm(i + 1))];
+			}
+			dctx.emit(...buildArm(0));
+			info.body = dctx.toFuncBody(params.length, toValType);
+		});
+		return info;
 	}
 
 	// `x.name` where `x`'s static type is genuinely `any` -- the FIELD sibling of `ensureAnyDispatch`, and
