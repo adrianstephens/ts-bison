@@ -3412,6 +3412,54 @@ async function main() {
 	}
 
 	{
+		// Three separate gaps, all on the same shape -- a `this`-reassigning method (`push` rebuilds a wasm
+		// array) reached through an ARRAY ELEMENT, as `vsdg.ts`'s own `(from.outputs[p] ??= []).push(...)` does:
+		//   1. `isPurePath` accepted only identifier/`this`/member chains, so an INDEX target of `??=` fell
+		//      through to "cannot assign to assign" -- re-reading `a[i]` is just as side-effect-free, as long
+		//      as the index is itself a pure path or a literal (`a[i++]` still, correctly, throws).
+		//   2. `emitAssignTarget('keep')`'s pushed receiver is a ref-kind element's boxed `anyref`; the call
+		//      needs the real narrowed type, the same cast the non-reassigning receiver path already did.
+		//   3. An EMPTY array literal ignored its contextual element type and always built a boxed-`any` array,
+		//      so `[[], []]` stored a different physical type than `[[1], [2]]` -- reading either back casts to
+		//      the declared element kind, so the empty one trapped ("illegal cast") on a plain read.
+		const { indexTarget, indexLiteralTarget, indexMemberPath, elementMethod, emptyNested } = await compile(`
+			export function indexTarget(i: number): number {
+				const a: (number[] | undefined)[] = [undefined, undefined, undefined];
+				(a[i] ??= []).push(10);
+				(a[i] ??= []).push(20);
+				return a[i]!.length * 100 + a[i]![1];
+			}
+			export function indexLiteralTarget(): number {
+				const a: (number[] | undefined)[] = [undefined, undefined];
+				(a[1] ??= []).push(7);
+				(a[1] ??= []).push(8);
+				return (a[0] === undefined ? 100 : 0) + a[1]!.length * 10 + a[1]![1];
+			}
+			class O { a: (number[] | undefined)[] = [undefined, undefined]; i = 1; }
+			export function indexMemberPath(): number {
+				const o = new O();
+				(o.a[o.i] ??= []).push(5);
+				(o.a[o.i] ??= []).push(6);
+				return o.a[o.i]!.length * 10 + o.a[o.i]![1];
+			}
+			export function elementMethod(): number {
+				const a: number[][] = [[1, 2], [3]];
+				a[1].push(4);
+				return a[1].length * 10 + a[1][1];
+			}
+			export function emptyNested(): number {
+				const a: number[][] = [[], [9]];
+				return a[0].length * 10 + a[1][0];
+			}
+		`);
+		check("'??=' into an array element, then a 'this'-reassigning method on the result", indexTarget(2), 220);
+		check("'??=' into an array element at a literal index", indexLiteralTarget(), 128);
+		check("'??=' into an array element reached by a member path", indexMemberPath(), 26);
+		check("a 'this'-reassigning method on an array element", elementMethod(), 24);
+		check('an empty nested array literal keeps its contextual element kind', emptyNested(), 9);
+	}
+
+	{
 		// `new C` with no explicit type arguments. Both sources of the answer already existed -- the checker
 		// solves them from the constructor's own arguments, and `ctx.contextualReturn` carries the target's
 		// declared type -- but `case 'new'` asked neither, so every one of these threw "class 'C' needs N

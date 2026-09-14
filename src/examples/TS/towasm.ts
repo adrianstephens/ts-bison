@@ -863,9 +863,17 @@ function unwrapAs(e: Expr): Expr {
 	return e;
 }
 
-// An identifier, `this`, or a non-optional member chain of one: reading it again has no side effect.
+// An identifier, `this`, or a non-optional member/index chain of one: reading it again has no side effect and
+// names the same storage both times. A literal is pure only as an INDEX -- a literal BASE (`/re/.lastIndex`) can be a fresh object each read.
 function isPurePath(e: Expr): boolean {
-	return e.type === 'identifier' || e.type === 'this' || (e.type === 'member' && !e.optional && isPurePath(e.object));
+	switch (e.type) {
+		case 'identifier':
+		case 'this':	return true;
+		case 'member':	return !e.optional && isPurePath(e.object);
+		// `typeof value !== 'object'` keeps out a regex (fresh each read) and a template's arbitrary sub-expressions.
+		case 'index':	return !e.optional && isPurePath(e.object) && (isPurePath(e.index) || (e.index.type === 'literal' && typeof e.index.value !== 'object'));
+		default:		return false;
+	}
 }
 
 // Whether expression tree `e` references identifier `name` anywhere, not descending into a nested
