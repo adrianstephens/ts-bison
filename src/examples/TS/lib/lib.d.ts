@@ -271,7 +271,6 @@ interface Array<T> {
 	[i: number]: T;
 	length: number;
 
-
 	grow(n: i32): i32;
 	toString(): string;
 	toLocaleString(): string;
