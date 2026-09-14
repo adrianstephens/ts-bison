@@ -3534,6 +3534,24 @@ async function main() {
 	}
 
 	{
+		// An EXPANDO on `Array` (`pos`, written with `Object.defineProperty` as the parser core does) gives every instantiation
+		// an optional second field. Storage identity demanded "exactly one field", so boxing, spread and rest params all broke.
+		const { expandoArray } = await compile(`
+			function sum(...xs: number[]): number { let s = 0; for (const x of xs) s += x; return s; }
+			const TABLE: Record<string, number> = { a: 1, b: 2 };
+			export function expandoArray(): number {
+				const a: number[] = [1, 2];
+				Object.defineProperty(a, 'pos', { value: 7 });
+				const b = a;
+				b.push(3);
+				const c = [...a, 4];
+				return a.length * 1000 + c.length * 100 + sum(1, 2, 3) * 10 + TABLE['b'];
+			}
+		`);
+		check('an expando on Array (defineProperty) keeps boxing, spread, rest params and aliasing working', expandoArray(), 3462);
+	}
+
+	{
 		// `new C` with no explicit type arguments. Both sources of the answer already existed -- the checker
 		// solves them from the constructor's own arguments, and `ctx.contextualReturn` carries the target's
 		// declared type -- but `case 'new'` asked neither, so every one of these threw "class 'C' needs N

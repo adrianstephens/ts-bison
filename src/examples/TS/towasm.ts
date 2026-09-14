@@ -3324,15 +3324,22 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return ensureMethod(cls, name, [], ctx);
 	}
 
-	// The array-kind (`{arr}`) a value expression resolves to, or `undefined` if it isn't one.
-	// The element kind of a value's STORAGE: either the value IS storage, or it is a class owning exactly
-	// one (an `Array<T>`, and a tuple, which shares that representation). Purely physical -- no TS type.
+	// The raw storage an `Array` owns: field 0 of a class deriving from `ArrayBase` -- the identity `Array.isArray` tests at
+	// run time, so codegen and run time share one definition, and no class whose first field happens to be raw (a string) passes.
+	function ownedStorage(o: ClassInfo | undefined): (WasmType & { arr: WasmElementI }) | undefined {
+		let base = o?.superClass;
+		while (base && base.decl.name !== 'ArrayBase')
+			base = base.superClass;
+		const f = base && o!.typeIndex !== -1 && o!.fields.length ? o!.fields[0].wtype : undefined;
+		return typeof f === 'object' && f && 'arr' in f ? f : undefined;
+	}
+
+	// The element kind of a value's STORAGE: the value IS storage, or it is an `Array` (a tuple too) that owns some.
 	function storageKindOf(w: WasmType | undefined): WasmElementI | undefined {
 		if (typeof w === 'object' && w && 'arr' in w)
 			return w.arr;
 		const o = typeof w === 'object' && w && 'ref' in w ? classes.get(w.ref) : undefined;
-		const f = o && o.typeIndex !== -1 && o.fields.length === 1 ? o.fields[0].wtype : undefined;
-		return typeof f === 'object' && f && 'arr' in f ? f.arr : undefined;
+		return ownedStorage(o)?.arr;
 	}
 
 	// The ELEMENT representation of an array-ish value. A raw array (`RawArray`, a string, an `ArrayBuffer`)
@@ -3348,6 +3355,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return el ? elementKind(typeOf(el)) : undefined;
 	}
 
+	// The element kind an array-valued expression resolves to -- raw storage's own, else its `Array` type's -- or `undefined`.
 	function arrayKindOf(e: Expr, ctx: FunctionContext): WasmElementI | undefined {
 		const wt = wtypeOf(e, ctx);
 		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : elementKindOfType(checkerTypeOf(e, ctx.scope), ctx.scope);
@@ -3918,13 +3926,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				case 'f32':	ctx.emit(I.f32.demote_f64); return;
 			}
 		}
-		// A raw wasm array meeting a class that OWNS exactly one -- `[1,2,3]` (physically `{arr:f64}`) where an
-		// `Array<number>` is wanted. The literal builds the cheap representation and only boxes when a context
-		// actually needs the class's identity; see [[tison-type-vs-representation]]. Structural, not by name:
-		// the target's single field IS this value's type, so there is one sound way to build it.
+		// A raw wasm array meeting the `Array` that owns such storage -- `[1,2,3]` (physically `{arr:f64}`) where an `Array<number>`
+		// is wanted. A literal stays the cheap form and boxes only where a context needs the class's identity.
 		if (typeof got === 'object' && 'arr' in got && typeof want === 'object' && 'ref' in want) {
 			const owner = classes.get(want.ref);
-			if (owner && owner.typeIndex !== -1 && owner.fields.length === 1 && wasmTypeEq(owner.fields[0].wtype, got)) {
+			const storage = ownedStorage(owner);
+			if (owner && storage && wasmTypeEq(storage, got)) {
+				// Its other fields (expandos) start absent. A REQUIRED one has no sound default, so it is refused, never guessed.
+				const rest = owner.fields.slice(1), required = rest.find(f => !f.optional);
+				if (required)
+					throw `internal: cannot box storage into '${owner.name}': its field '${required.name}' is required`;
+				rest.forEach(f => emitDefaultValue(f.wtype, ctx));
 				ctx.emit(I.struct.new(owner.typeIndex));
 				return;
 			}
@@ -3935,7 +3947,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// owner sees too, so unwrapping can never strand the owner on a stale buffer.
 		if (typeof want === 'object' && 'arr' in want && typeof got === 'object' && 'ref' in got) {
 			const owner = classes.get(got.ref);
-			if (owner && owner.typeIndex !== -1 && owner.fields.length === 1 && wasmTypeEq(owner.fields[0].wtype, want)) {
+			const storage = ownedStorage(owner);
+			if (owner && storage && wasmTypeEq(storage, want)) {
 				ctx.emit(I.struct.get(owner.typeIndex, 0));
 				return;
 			}
