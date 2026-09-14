@@ -3569,6 +3569,29 @@ async function main() {
 	}
 
 	{
+		// A short-circuiting operator builds its arms AT the caller's type rather than converting to it: an object literal that
+		// inferred its own shape can never be converted (struct fields are invariant). The checker's own `iterationTypes` shape.
+		const { andShape, nullishShape } = await compile(`
+			type Thing = { kind: 'x'; n: number } | { kind: 'y'; s: string };
+			interface Holder { a: Thing; b: Thing }
+			const NARROW: { kind: 'y'; s: string } = { kind: 'y', s: 'q' };
+			function viaAnd(pick: boolean): Holder | undefined {
+				const direct: Thing | undefined = pick ? { kind: 'x', n: 5 } : undefined;
+				return direct && { a: direct, b: NARROW };
+			}
+			export function andShape(): number { const h = viaAnd(true); return h && h.a.kind === 'x' ? h.a.n : -1; }
+			export function nullishShape(): number {
+				const direct: Thing = { kind: 'x', n: 7 };
+				const maybe: Holder | undefined = undefined;
+				const h = maybe ?? { a: direct, b: NARROW };
+				return h.a.kind === 'x' ? h.a.n : -1;
+			}
+		`);
+		check("'&&' builds its object-literal arm at the caller's type", andShape(), 5);
+		check("'??' builds its object-literal arm at the caller's type", nullishShape(), 7);
+	}
+
+	{
 		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
 		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
 		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`

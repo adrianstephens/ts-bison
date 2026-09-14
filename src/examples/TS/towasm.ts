@@ -4464,6 +4464,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// anything without a known one (a tuple's own per-position type doesn't come through this path at
 	// all, and `new Uint8Array([...])` never has one either) -- every existing call site keeps working
 	// unchanged.
+	// The type a short-circuiting operator (`&&`/`||`/`??`) gives both its arms: the caller's, when both it and the
+	// self-inferred one are object refs -- only then does building at it rather than converting to it matter (invariance).
+	function wantedShape(want: WasmType | undefined, self: WasmType): WasmType {
+		return typeof want === 'object' && 'ref' in want && typeof self === 'object' && 'ref' in self ? want : self;
+	}
+
 	function withContext<R>(ctx: FunctionContext, contextual: Type | undefined, fn: () => R): R {
 		const saved = ctx.contextualReturn;
 		ctx.contextualReturn = contextual;
@@ -6956,7 +6962,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// where its type for `&&` is narrower than the two operands together.
 						// A right operand with no representation of its own (a bare `undefined`/`null`) is emitted into the whole
 						// expression's type, as a conditional's branch is: `every(...) || undefined` is a nullable boolean.
-						const wtype = rightWtype && wasmTypeEq(leftWtype, rightWtype) ? leftWtype : (wtypeOf(e, ctx) ?? REF_ANY);
+						const self = rightWtype && wasmTypeEq(leftWtype, rightWtype) ? leftWtype : (wtypeOf(e, ctx) ?? REF_ANY);
+						// An object-shaped result is BUILT at the caller's type, not converted to it afterwards: struct fields are
+						// mutable, hence invariant, so a literal operand that inferred its own shape can never be converted at all.
+						const wtype = wantedShape(want, self);
 						const leftLocal = ctx.declareLocal(`$logic$left$${optionalTempCounter++}`, leftWtype);
 						emitAs(left, ctx, leftWtype);
 						ctx.emit(I.local.tee(leftLocal.index));
@@ -6991,9 +7000,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// check at all; `emitPatternBinding` relies on exactly this for a destructuring default on
 					// an already-non-nullable value (an ordinary array element, a non-optional object field).
 					case '??': {
-						const wtype = wtypeOf(e, ctx);
-						if (!wtype)
+						const self = wtypeOf(e, ctx);
+						if (!self)
 							throw "'??' has an unsupported result type";
+						const wtype = wantedShape(want, self);
 						const leftWtype = wtypeOf(left, ctx);
 						if (!leftWtype)
 							throw "'??' has an unsupported left-hand type";
