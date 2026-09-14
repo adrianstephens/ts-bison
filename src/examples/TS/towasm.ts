@@ -1893,6 +1893,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// number` fitting `(x: number) => number | undefined`) -- one shared coercing trampoline per
 	// (source signature, wanted result) pair, not one per use site. See `ensureClosureCoercionWrapper`.
 	const closureCoercionWrappers = new Map<string, { info: FuncInfo; wantStructTypeIndex: number; envTypeIndex: number }>();
+	// `adoptingDecl`'s answer per class, `null` for one that adopts no storage.
+	const adoptingDecls = new Map<ClassInfo, { decl: MethodMember; storage: WasmType & { arr: WasmElementI } } | null>();
 
 	const closureLiterals: FuncInfo[] = [];
 	const closureWasmTypes	= new Map<string, WasmType>();	// The `{closure: FuncSig}` wrapper object itself, memoized per signature
@@ -3334,22 +3336,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return ensureMethod(cls, name, [], ctx);
 	}
 
-	// The raw storage an `Array` owns: field 0 of a class deriving from `ArrayBase` -- the identity `Array.isArray` tests at
-	// run time, so codegen and run time share one definition, and no class whose first field happens to be raw (a string) passes.
-	function ownedStorage(o: ClassInfo | undefined): (WasmType & { arr: WasmElementI }) | undefined {
-		let base = o?.superClass;
-		while (base && base.decl.name !== 'ArrayBase')
-			base = base.superClass;
-		const f = base && o!.typeIndex !== -1 && o!.fields.length ? o!.fields[0].wtype : undefined;
-		return typeof f === 'object' && f && 'arr' in f ? f : undefined;
+	// The constructor by which `cls` adopts raw storage: its overload taking exactly one parameter, a `RawArray` (`Array`'s
+	// `constructor(d: RawArray<T>)`, a typed array's over an `ArrayBuffer`). Boxing raw storage into `cls` is a call to it.
+	function adoptingDecl(cls: ClassInfo): { decl: MethodMember; storage: WasmType & { arr: WasmElementI } } | undefined {
+		let found = adoptingDecls.get(cls);
+		if (found === undefined) {
+			found = null;
+			for (const decl of cls.methodDecls.get('constructor') ?? []) {
+				const w = decl.params.length === 1 && !decl.rest ? resolveParams(decl.params, cls.declScope ?? libGlobal)[0].wtype : undefined;
+				if (typeof w === 'object' && 'arr' in w) {
+					found = { decl, storage: w };
+					break;
+				}
+			}
+			adoptingDecls.set(cls, found);
+		}
+		return found ?? undefined;
 	}
 
-	// The element kind of a value's STORAGE: the value IS storage, or it is an `Array` (a tuple too) that owns some.
+	// The element kind of a value's STORAGE: the value IS storage, or its class adopts storage of that kind (`adoptingDecl`).
 	function storageKindOf(w: WasmType | undefined): WasmElementI | undefined {
 		if (typeof w === 'object' && w && 'arr' in w)
 			return w.arr;
 		const o = typeof w === 'object' && w && 'ref' in w ? classes.get(w.ref) : undefined;
-		return ownedStorage(o)?.arr;
+		return o && adoptingDecl(o)?.storage.arr;
 	}
 
 	// The ELEMENT representation of an array-ish value. A raw array (`RawArray`, a string, an `ArrayBuffer`)
@@ -3936,30 +3946,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				case 'f32':	ctx.emit(I.f32.demote_f64); return;
 			}
 		}
-		// A raw wasm array meeting the `Array` that owns such storage -- `[1,2,3]` (physically `{arr:f64}`) where an `Array<number>`
-		// is wanted. A literal stays the cheap form and boxes only where a context needs the class's identity.
+		// Raw storage meeting a class that adopts it (`adoptingDecl`) -- `[1,2,3]` (physically `{arr:f64}`) where an `Array<number>` is
+		// wanted -- is that class's own constructor call. A literal stays the cheap form and boxes only where a context needs the class.
 		if (typeof got === 'object' && 'arr' in got && typeof want === 'object' && 'ref' in want) {
 			const owner = classes.get(want.ref);
-			const storage = ownedStorage(owner);
-			if (owner && storage && wasmTypeEq(storage, got)) {
-				// Its other fields (expandos) start absent. A REQUIRED one has no sound default, so it is refused, never guessed.
-				const rest = owner.fields.slice(1), required = rest.find(f => !f.optional);
-				if (required)
-					throw `internal: cannot box storage into '${owner.name}': its field '${required.name}' is required`;
-				rest.forEach(f => emitDefaultValue(f.wtype, ctx));
-				ctx.emit(I.struct.new(owner.typeIndex));
-				return;
-			}
-		}
-
-		// The reverse: reaching the storage a class owns (`[...a, b]` copying out of an `Array<T>`). Sound
-		// because a `RawArray` cannot RESIZE -- anything done through it is an in-place element access the
-		// owner sees too, so unwrapping can never strand the owner on a stale buffer.
-		if (typeof want === 'object' && 'arr' in want && typeof got === 'object' && 'ref' in got) {
-			const owner = classes.get(got.ref);
-			const storage = ownedStorage(owner);
-			if (owner && storage && wasmTypeEq(storage, want)) {
-				ctx.emit(I.struct.get(owner.typeIndex, 0));
+			const adopt = owner && adoptingDecl(owner);
+			if (adopt && wasmTypeEq(adopt.storage, got)) {
+				ctx.emit(I.call(ensureCtorDecl(owner!, adopt.decl).funcIndex));
 				return;
 			}
 		}
@@ -4088,7 +4081,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		} else {
 			let got = emitExpr(e, ctx, want);
 			// A raw array erased into a non-raw slot (`any`, a field, a `??=` default) is boxed first: read back, it is cast to an
-			// `Array` class -- its OWN type's if that owns this storage, else its context's, else (an array all the same) this storage's.
+			// `Array` class -- its OWN type's if that adopts this storage, else its context's, else (an array all the same) this storage's.
 			if (typeof got === 'object' && 'arr' in got && !(typeof want === 'object' && 'arr' in want)) {
 				const k = got.arr;
 				const owner = (t: Type | undefined) => { const w = t && typeOf(t); return w && typeof w === 'object' && 'ref' in w && storageKindOf(w) === k ? w : undefined; };
@@ -10023,7 +10016,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!decls)
 			throw `class '${cls.name}' needs an explicit constructor`;
 
-		const ctor			= resolveOverload(`${cls.name}'s constructor`, decls, args, callerCtx);
+		return ensureCtorDecl(cls, resolveOverload(`${cls.name}'s constructor`, decls, args, callerCtx));
+	}
+
+	// One constructor overload's compiled function, however it was chosen: by a call's arguments, or as `adoptingDecl`'s.
+	function ensureCtorDecl(cls: ClassInfo, ctor: MethodMember): FuncInfo {
+		const decls			= cls.methodDecls.get('constructor')!;
 		const key			= decls.length > 1 ? `${cls.name}.constructor#${decls.indexOf(ctor)}` : `${cls.name}.constructor`;
 		const existing		= funcs.get(key);
 		if (existing)
