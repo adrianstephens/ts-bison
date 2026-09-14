@@ -27,6 +27,8 @@ b.push(1); a.length` was 0; towasm's own `worklist` stayed empty). Tests: test-t
 - A type that merely RESOLVES to an array (alias, `N[K]`) must map like the `T[]` spelling, or it falls to
   the module-level `wasmTypeOf`, which still answers raw storage.
 - Every "is it an array?" test (`'arr' in w`) had to become "does it OWN storage?" (`storageKindOf`).
+  Missed twice: the spread helpers `arrayKindOf`/`objectArrayKind` (9deefcb) -- seen only as the survey's spread
+  row jumping 3 -> 58. After any representation change, grep every `'arr' in` and diff the survey's cause rows.
 
 **Predicted but did not happen:** distinct structs per instantiation (`Array<string>` vs `Array<any>`) did
 not break views through `any` -- an `any` receiver dispatches dynamically and never meets a `ref.cast`.
@@ -35,6 +37,8 @@ Struct merging (the user's suggestion) was therefore NOT built; reach for it onl
 **Pre-existing bugs found:** a nullable primitive box was unboxed on its way into `any`, so one holding
 null trapped at any `any` local, element or argument -- FIXED 2026-09-14 (a box goes into `any` as-is).
 Still open: dynamic dispatch on `any` cannot call a rest method (`(y as T[]).push(x)`, HEAD too).
+Also open, verified identical at 4e26dd4: `[0, ...t]` for a number tuple (tuple storage is ref, the literal
+f64 -- needs a converting copy); `unknown method 'some'`; the `BigInt` ctor overload; `alwaysThrows`'s `out` index.
 `Array.isArray(5n)` was true; now false.
 
 **Instruments:** `assistant/suite-all.py` runs test-towasm.ts non-aborting, listing every failing block with
