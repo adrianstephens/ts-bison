@@ -3399,7 +3399,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const cls = ownerOf(e, ctx);
 		//if (cls?.decl.name === 'Array' && e.type === 'index' && objectArrayKind(e.object, ctx) === 'ref')
 		//	return ensureClass('Array', [T.ANY]);
-		return cls;
+		// A union of array types (`string[] | never[]`) names no single class, but its members share ONE physical class --
+		// dispatch through that one's own accessors. Members of genuinely different shapes are `any`, and dispatch below.
+		const w = cls ? undefined : wtypeOf(e, ctx);
+		return cls ?? (typeof w === 'object' && w && 'ref' in w ? classes.get(w.ref) : undefined);
 	}
 
 	// The `WasmType`/`MethodOwner` a builtin-operator operand resolves to -- `wtypeOf`/`ownerOf` alone can't see an indexed read's element kind, so `numericPairWtype`/etc would silently fall back to `f64`.
@@ -4510,7 +4513,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					const operand	= spreadSource(el.operand, ctx);
 					const src		= ctx.temp(`$spread$src$${i}`, ARR_WTYPE[kind]);
 					const len		= ctx.temp(`$spread$len$${i}`, 'i32');
-					const got		= emitExpr(operand, ctx, ARR_WTYPE[kind]);
+					// Hint the operand's OWN representation, never the storage this literal wants: a hard consumer of the hint (a
+					// conditional, whose arms must agree) would otherwise be asked for storage an `Array` arm cannot produce.
+					const got		= emitExpr(operand, ctx, wtypeOf(operand, ctx) ?? ARR_WTYPE[kind]);
 					if (typeof got === 'object' && 'arr' in got && got.arr === kind) {
 						coerceTop(got, ctx, ARR_WTYPE[kind]);
 						ctx.emit(I.local.set(src));
