@@ -185,3 +185,9 @@ class WeakSet<T> {
 	add(value: T): this				{ this.set_.add(value); return this; }
 	delete(value: T): boolean		{ return this.set_.delete(value); }
 }
+
+// `at(i)` while `i < size()`, both read on every step: how `Map`/`Set` iterate their own backing arrays live.
+export function* __towasm_indexed<T>(size: () => number, at: (i: number) => T): Generator<T, void, unknown> {
+	for (let i = 0; i < size(); i++)
+		yield at(i);
+}

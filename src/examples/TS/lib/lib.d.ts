@@ -115,6 +115,25 @@ interface Symbol {
 	valueOf(): symbol;
 }
 
+// `Symbol` as a VALUE, as far as the lib uses one: the well-known key `[Symbol.iterator]`. A `unique symbol`, so a
+// computed key made from it is a symbol key, never checked against a numeric index signature.
+interface SymbolConstructor {
+	readonly iterator: unique symbol;
+}
+declare var Symbol: SymbolConstructor;
+
+// The iteration protocol as the lib uses it. The implementations are lib/generator.ts's classes; that file is a module,
+// so tsc cannot see them from here, while tison flattens the lib into one scope and merges these with them.
+interface IteratorResult<Y, R> {
+	value: Y | R;
+	done: boolean;
+}
+interface Generator<Y, R, N> {
+	next(v: N): IteratorResult<Y, R>;
+	[Symbol.iterator](): Generator<Y, R, N>;
+}
+declare function __towasm_indexed<T>(size: () => number, at: (i: number) => T): Generator<T, void, unknown>;
+
 declare type PropertyKey = string | number | symbol;
 
 interface PropertyDescriptor {
