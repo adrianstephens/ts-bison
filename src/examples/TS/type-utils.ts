@@ -2381,7 +2381,7 @@ export function sealed(t: Type, scope: Scope, depth = 6): boolean {
 		scope.hitDepthLimit('sealed');
 		return false;
 	}
-	t = resolveOwn(t, scope);
+	t = resolveMembers(t, scope);
 	return t.type === 'object' || (t.type === 'intersection' && t.types.every(p => sealed(p, scope, depth - 1)));
 }
 
