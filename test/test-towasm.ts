@@ -3516,6 +3516,24 @@ async function main() {
 	}
 
 	{
+		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
+		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
+		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`
+			function takeAny(x: any): number { return x === undefined ? 1 : 0; }
+			export function nullableToAny(): number { const m: number | undefined = undefined; const x: any = m; return x === undefined ? 1 : 0; }
+			export function definedToAny(): number { const m: number | undefined = 7; const x: any = m; return x as number; }
+			export function nullableIntoAnyArray(): number { const m: number | undefined = undefined; const a: any[] = [m, 2]; return (a[0] === undefined ? 10 : 0) + a.length; }
+			export function nullableAsAnyArg(): number { const m: number | undefined = undefined; return takeAny(m); }
+			export function boolNullToAny(): number { const b: boolean | null = null; const x: any = b; return x === null ? 1 : 0; }
+		`);
+		check("a nullable number holding undefined reaches 'any' as undefined", nullableToAny(), 1);
+		check("a nullable number holding a value reaches 'any' and reads back", definedToAny(), 7);
+		check("a nullable number holding undefined as an 'any[]' element", nullableIntoAnyArray(), 12);
+		check("a nullable number holding undefined passed to an 'any' parameter", nullableAsAnyArg(), 1);
+		check("a nullable boolean holding null reaches 'any' as null", boolNullToAny(), 1);
+	}
+
+	{
 		// `new C` with no explicit type arguments. Both sources of the answer already existed -- the checker
 		// solves them from the constructor's own arguments, and `ctx.contextualReturn` carries the target's
 		// declared type -- but `case 'new'` asked neither, so every one of these threw "class 'C' needs N

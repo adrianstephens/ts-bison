@@ -32,9 +32,10 @@ b.push(1); a.length` was 0; towasm's own `worklist` stayed empty). Tests: test-t
 not break views through `any` -- an `any` receiver dispatches dynamically and never meets a `ref.cast`.
 Struct merging (the user's suggestion) was therefore NOT built; reach for it only on evidence.
 
-**Pre-existing bugs found, not fixed:** a nullable primitive box is unboxed on its way into `any`
-(`const x: any = m` with `m = undefined` traps, HEAD too); dynamic dispatch on `any` cannot call a rest
-method (`(y as T[]).push(x)`, HEAD too); `Array.isArray(5n)` was true (now false).
+**Pre-existing bugs found:** a nullable primitive box was unboxed on its way into `any`, so one holding
+null trapped at any `any` local, element or argument -- FIXED 2026-09-14 (a box goes into `any` as-is).
+Still open: dynamic dispatch on `any` cannot call a rest method (`(y as T[]).push(x)`, HEAD too).
+`Array.isArray(5n)` was true; now false.
 
 **Instruments:** `assistant/suite-all.py` runs test-towasm.ts non-aborting, listing every failing block with
 its line. `assistant/probe-block.py <root> <N>` runs one block and prints its source, its error and, for a

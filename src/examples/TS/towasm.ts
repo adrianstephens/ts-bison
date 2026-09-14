@@ -3807,13 +3807,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if ((got === 'u32' && want === 'i32') || (got === 'i32' && want === 'u32'))
 			return;
 
-		// A nullable primitive (`number | null`/`boolean | null`, boxed via `ensureBoxType`) meeting a
-		// bare-scalar consumer: unbox unconditionally, trusting the checker already required narrowing
-		// (same `ref.as_non_null`-traps-on-null contract `coerceTop` already uses for nullable objects).
-		// Reassigning `got` lets every scalar-conversion branch below run unmodified, as if `got` had
-		// been bare all along.
+		// A nullable primitive (`number | null`/`boolean | null`, boxed via `ensureBoxType`). Into `any` it goes as-is -- a box
+		// IS an `anyref`, and one holding null must arrive as that null. For a bare-scalar consumer it is unboxed, trusting the
+		// checker already required narrowing (the same `ref.as_non_null`-traps-on-null contract as for nullable objects);
+		// reassigning `got` lets every scalar-conversion branch below run as if `got` had been bare all along.
 		const gotBox = unboxedPrimitive(got);
 		if (gotBox) {
+			if (typeof want !== 'string' && 'ref' in want && want.ref === 'any') {
+				if (typeof got === 'object' && got.nullable && !want.nullable)
+					ctx.emit(I.ref.as_non_null);
+				return;
+			}
 			ctx.emit(I.ref.as_non_null, I.struct.get(gotBox.typeIndex, 0));
 			got = gotBox.kind;
 			if (wasmTypeEq(got, want))
