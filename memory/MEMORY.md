@@ -30,6 +30,7 @@
 
 ## TS-to-wasm compiler
 
+- [type vs representation](tison_type_vs_representation.md) — many-to-one and must stay separable; tags name representations, and it is what lets `Node[]`/`Foo[]` share one physical array type
 - [ARRAY IDENTITY — self-hosting blocker](tison_array_identity.md) — `push` reassigns the binding, so every alias (a 2nd local, a param, a capture) silently keeps the old array; towasm's own `worklist` is this shape
 - [towasm](tison_towasm.md) — **the authoritative gap list is towasm.ts's own header comment**; this covers design invariants
 - [module records](tison_module_records.md) — a module is `TS.Module` (body+scope+filename), not a bare `Stmt[]`; run all FOUR tsconfigs
