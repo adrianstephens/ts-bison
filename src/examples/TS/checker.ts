@@ -231,17 +231,42 @@ function isContextSensitive(a: Expr): a is Expr & { type: 'function' | 'arrow' }
 // What a context-sensitive callback fits as before its context is chosen: any function (TS's `anyFunctionType`).
 const ANY_FUNCTION = TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(T.ANY)) }, T.ANY);
 
+// A parameter type that is, or through a union may be, an array of TUPLES (Map's `entries?: readonly (readonly [K, V])[] | null`).
+function tupleShaped(t: Type, scope: Scope): boolean {
+	return T.unionMembers(t, scope).some(m => {
+		const r = T.resolveOwn(m, scope);
+		const el = r.type === 'tuple' ? r : r.type === 'array' ? r.element : !T.isAny(r) && T.iterationTypes(m, scope)?.yield;
+		return !!el && T.resolveOwn(el, scope).type === 'tuple';
+	});
+}
+
+// The context a non-callback argument is typed in against `sig`'s parameter `declared`: ONE rule for the overload trial and the
+// final pass, since a callback nested in the argument keeps the first context it is typed in (`new Map(xs.map(x => [a, b]))`).
+function argContext(a: Expr, declared: Type | undefined, sig: TS.CallSig, scope: Scope): Type | undefined {
+	if (!declared)
+		return undefined;
+	// A `const` type parameter (TS 5.0) infers from its argument AS IF it were written `as const`.
+	// Its constraint is the contextual type the const context stands in for: `const R extends readonly X[]` is readonly.
+	const constParam = declared.type === 'ref' && !declared.typeArgs ? sig.typeParams?.find(p => p.name === declared.name && p.const) : undefined;
+	if (constParam)
+		return constContext(constParam.constraint);
+	// A GENERIC parameter still gives its tuple SHAPE to an array literal or a call (its type params land only as inert per-position
+	// hints, so `[[k, v]]` and `xs.map(x => [a, b])` become tuples), and itself to an `as const` argument, which reads only mutability.
+	const generic	= !!sig.typeParams?.some(p => T.mentionsTypeParam(declared, p.name));
+	const constArg	= a.type === 'as' && isConstContext(a.typeAnnotation);
+	return !generic || constArg || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared, scope)) ? declared : undefined;
+}
+
 // Whether `args` fit candidate `c` as TS's overload resolution asks (checkExpressionWithContextualType): each argument typed
 // against the candidate's OWN parameter, since a literal's type depends on it (`new Map([['', true]])` fits only as tuples).
 export function candidateFits(c: TS.CallSig, args: Expr[], scope: Scope, typeArgs?: Type[], typedIn = args.map(() => new Map<Type | undefined, Type>()), yieldCollector?: Type[], pos: Location = { line: 0, col: 0 }): boolean {
 	const paramAt = (i: number) => c.params[i]?.typeAnnotation ?? (c.rest?.typeAnnotation && T.restArgType(c.rest.typeAnnotation, i - c.params.length, scope));
-	// A callback fits as any function (the chosen candidate fixes its parameters later); a parameter naming the candidate's own
-	// type parameters gives a non-literal no context yet. Muted and unwidened, typed once per distinct context (`typedIn`).
+	// A callback fits as any function (the chosen candidate fixes its parameters later); every other argument gets the final pass's
+	// own context (`argContext`). Muted and unwidened, typed once per distinct context (`typedIn`).
 	const ts = args.map((a, i) => {
 		if (a.type === 'spread' || isContextSensitive(a))
 			return undefined;
-		const p		= paramAt(i);
-		const ctx	= p && (a.type === 'array' || a.type === 'object' || !c.typeParams?.some(tp => T.mentionsTypeParam(p, tp.name))) ? p : undefined;
+		const ctx	= argContext(a, paramAt(i), c, scope);
 		let t = typedIn[i].get(ctx);
 		if (!t)
 			typedIn[i].set(ctx, t = typeOf(a, scope, false, ctx, yieldCollector, undefined));
@@ -2011,18 +2036,6 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// coincidence this stayed invisible). Skipped when the declared type still mentions one of *this* signature's own
 					// (not yet inferred) type params -- `preMap`, which resolves those, is itself built FROM this very pass below, so
 					// it isn't available yet, and threading a still-generic shape as `expected` risks a wrong contextual guess.
-					// An ARRAY LITERAL is the one argument shape whose own type depends on context even when
-					// the parameter is still generic: `case 'array'`'s `wantTuple` needs only the tuple
-					// SHAPE, and the type params inside `[K, V][]` land solely as per-position expected
-					// types, where an unresolved ref is an inert hint. Without this the literal typed as a
-					// plain array and every entries-style generic constructor (`new Map([[k, v]])`)
-					// inferred `<any, any>`.
-					// Through a union too: Map's `entries?: readonly (readonly [K, V])[] | null`.
-					const tupleShaped = (t: Type): boolean => T.unionMembers(t, scope).some(m => {
-						const r = T.resolveOwn(m, scope);
-						const el = r.type === 'tuple' ? r : r.type === 'array' ? r.element : !T.isAny(r) && T.iterationTypes(m, scope)?.yield;
-						return !!el && T.resolveOwn(el, scope).type === 'tuple';
-					});
 					// Past the fixed parameters the REST names the argument -- and where the rest is a tuple
 					// (or a union with one), that position's own element is the only thing that names a callback.
 					const declaredArg = (i: number) => sig!.params[i]?.typeAnnotation
@@ -2030,22 +2043,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					const preArgTs = e.arguments.map((a, i) => {
 						if (a.type === 'function' || a.type === 'arrow' || a.type === 'spread')
 							return undefined;
-						const declared = declaredArg(i);
-						// A `const` type parameter (TS 5.0) infers from its argument AS IF it were written `as const`.
-						// Its constraint is the contextual type the const context stands in for: `const R extends readonly X[]` is readonly.
-						const constParam = declared?.type === 'ref' && !declared.typeArgs ? sig.typeParams?.find(p => p.name === declared.name && p.const) : undefined;
-						if (constParam)
-							return arg(a, constContext(constParam.constraint));
-						const generic  = declared && !!sig!.typeParams?.some(p => T.mentionsTypeParam(declared, p.name));
-						// A CALL argument gets it too: that is how the shape reaches a callback nested inside
-						// it (`new Map(xs.map(x => [a, b]))`). The inner call reverse-matches its own `U`
-						// from this, contextually types its callback's return, and the literal becomes a
-						// tuple -- see `instantiate`'s `fromExpected`, which keeps that placeholder binding
-						// from escaping as the answer.
-						// An `as const` argument takes the generic shape too: it reads its context only for whether an array is mutable (TS's
-						// checkArrayLiteral) and passes its members' parts on the same way, never inferring from it.
-						const constArg = a.type === 'as' && isConstContext(a.typeAnnotation);
-						return arg(a, declared && (!generic || constArg || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared))) ? declared : undefined);
+						// The inner call of `new Map(xs.map(x => [a, b]))` reverse-matches its own `U` from the tuple shape -- see `instantiate`'s
+						// `fromExpected`, which keeps that placeholder binding from escaping as the answer.
+						return arg(a, argContext(a, declaredArg(i), sig!, scope));
 					});
 					// TS's two passes: every non-callback argument feeds the inference first, then each callback in order -- its
 					// context FIXES the type parameters its own parameters read, and its return feeds only the ones still open.

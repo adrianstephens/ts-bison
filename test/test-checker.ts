@@ -19,6 +19,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['spread of a Set',				'const s = [...new Set([1, 2])]; const q: string = s[0];',								[NOT_ASSIGNABLE('number', 'string')]],
 	['destructuring a Set',			'const [a] = new Set([1, 2]); const q: string = a;',									[NOT_ASSIGNABLE('number', 'string')]],
 	['Map inference via Iterable',	'const m = new Map([["a", 1]]); const q: boolean = m.get("a");',						[NOT_ASSIGNABLE('number | undefined', 'boolean')]],
+	['overload trial, final context', 'declare function mk<K, V>(entries: readonly (readonly [K, V])[]): Map<K, V>; declare function mk<K, V>(other: Map<K, V>): Map<K, V>; const m = mk([1, 2].map(x => [String(x), x])); const q: boolean = m.get("1");', [NOT_ASSIGNABLE('number | undefined', 'boolean')]],
 	['yield* delegates',			'function* g() { yield* new Set([1]); } for (const x of g()) { const q: string = x; }',	[NOT_ASSIGNABLE('number', 'string')]],
 	['yield* evaluates to TReturn',	'function* g(): Generator<number, string> { return "x"; } function* h() { const r = yield* g(); const q: number = r; }', [NOT_ASSIGNABLE('string', 'number')]],
 	['for await over async gen',	'async function* ag() { yield 1; } async function f() { for await (const x of ag()) { const q: string = x; } }', [NOT_ASSIGNABLE('number', 'string')]],
