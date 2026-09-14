@@ -2175,9 +2175,10 @@ callee -- a separate "apparent type" step was measured REDUNDANT and dropped rat
 inferFromAnnotatedParameters (5976c8c); plus the lib's typed-array `[Symbol.iterator]`. With the leniency out: corpus
 ERROR +25, every one a line real tsc rejects too (the harness counts them only because those files carry no error
 baseline here), GAP -2, our own sources unchanged at 11 checker errors.
-**The instrument that made this tractable**: `assistant/sealed-fps.py` switches the leniency on in place (self-restoring),
-checks only the ~15 corpus files whose false positives it exposed, and reports how many of the listed 23 remain: 23 -> 18
--> 12 -> 8 -> 5 -> 3 -> 0. Pair it with `assistant/sealed-fps.ts` (the lib loaded once, many files per run).
+**The instrument that made this tractable** (the TECHNIQUE; the script itself is deleted, its toggle no longer exists):
+a self-restoring python driver switched the leniency back on IN PLACE, checked only the ~15 corpus files whose false
+positives it exposed, and reported how many of the listed 23 remained: 23 -> 18 -> 12 -> 8 -> 5 -> 3 -> 0. Rebuild it the
+same way for the next removal, over `tison/assistant/check-corpus-files.ts` (the lib loaded once, many files per run).
 **Two traps worth keeping**: (a) a corpus file with no `.errors.txt` baseline in this checkout counts as tsc-CLEAN, so our
 correct new errors show up as "false positives" -- always classify per line against real tsc, and run tsc from
 `tests/cases` with a relative path (an absolute path or a bad `--target` prints an option error that a line-anchored
