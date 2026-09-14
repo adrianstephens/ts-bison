@@ -849,14 +849,14 @@ function scratchName(prefix: string, wtype: WasmType): string {
 	return `${prefix}$${wasmTypeKey(wtype)}`;
 }
 
-// `as` is a pure pass-through in codegen (`case 'as'` just compiles `e.expression`), but `checkerTypeOf`
-// still honors the asserted type -- any codegen-facing type/owner lookup must unwrap it first or it sees a fictional type, wrongly losing method/owner dispatch on the real underlying value.
 // A structural shape's expando identity: its member names. A named shape and its anonymous twin share it, so they get
 // the same expando fields and `layoutTwin` can still merge them.
 function shapeKey(members: readonly TS.TypeMember[]): string {
 	return `#shape#${members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string' ? [m.key] : []).sort().join(',')}`;
 }
 
+// `as` is a pure pass-through in codegen (`case 'as'` just compiles `e.expression`), but `checkerTypeOf` still honors the
+// asserted type -- any codegen-facing type/owner lookup must unwrap it first or it sees a fictional type, losing method/owner dispatch.
 function unwrapAs(e: Expr): Expr {
 	while (e.type === 'as')
 		e = e.expression;
@@ -3285,45 +3285,19 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : undefined;
 	}
 
-	// `arrayKindOf`, but for a value that's *about to be indexed into* (`e[i]`) -- unlike `arrayKindOf`'s
-	// own checker-type-driven answer (correct for a genuinely standalone value, e.g. a plain `number[]`
-	// local), a value that was itself just read out of a ref-kind array element (`x[0]` where `x:
-	// number[][]`) is *always* physically ref-kind too, regardless of what its own declared element type
-	// says in isolation: `case 'array'`'s own "want wins" construction rule already boxes a nested array
-	// literal's elements as `any` whenever the *outer* container is ref-kind (there's no dedicated
-	// "array of real unboxed inner arrays" physical representation in this compiler at all -- 'ref' is
-	// the one shared bucket for every non-scalar element, arrays included), so `x[0]`'s real storage is a
-	// boxed-any array, never a genuine `(array (mut f64))`, even though a *standalone* `number[]` would
-	// normally get exactly that. `arrayKindOf(x[0], ctx)` alone can't see this -- it re-derives `x[0]`'s
-	// kind fresh from `number[]`'s own checker type, one level from a scalar base, disagreeing with what
-	// `x`'s own (correctly ref-collapsed) `number[][]` type already implied one level up. Recurses through
-	// a chain of index expressions (`a[i][j][k]`) so every level after the first ref-kind one stays 'ref'.
+	// `arrayKindOf` for a value about to be indexed into (`e[i]`). The ref-collapse below is DISABLED: an inner
+	// array keeps its own declared kind (`x[0]` of `number[][]` is a real f64 array), and every read casts back down to it.
 	function objectArrayKind(e: Expr, ctx: FunctionContext): WasmElementI | undefined {
 		//if (e.type === 'index' && objectArrayKind(e.object, ctx) === 'ref')
 		//	return 'ref';
-		// `narrowedTypeOf`, not `arrayKindOf`'s plain `ctx.scope` view: a value NARROWED out of
-		// `T | undefined` still reads as the whole union there, so a field off it comes back `any` and
-		// has no array kind at all. `[...a.rights, ...b.rights]` after `a && b` then failed with "a
-		// spread element in an array literal must be an array of the same element type" -- a message
-		// about element kinds, for a value whose kind was simply never looked up under the right scope.
-		// The same root as the indexing gap `ownerOf` already avoids by going through `narrowedTypeOf`.
+		// `narrowedTypeOf`, not `arrayKindOf`'s plain `ctx.scope` view: a value NARROWED out of `T | undefined` still reads
+		// as the whole union there, so a field off it comes back `any` with no array kind (`[...a.rights, ...b.rights]` after `a && b`).
 		const wt = typeOf(narrowedTypeOf(e, ctx));
 		return wt && typeof wt !== 'string' && 'arr' in wt ? wt.arr : undefined;
 	}
 
-	// `classOf`, but for a value that's *about to be indexed into* (`e[i]`) via generic class-method
-	// dispatch (`Array<T>.get(i)`/`.set(i,v)`, the same mechanism a typed-array view uses) -- a plain
-	// array *literal* has no dedicated "array of real unboxed inner arrays" physical representation (see
-	// `objectArrayKind`'s own comment): a nested array literal embedded inside an outer ref-kind array
-	// always gets boxed-`any` storage, matching the outer container's own "want wins" construction rule,
-	// *regardless* of its own declared element type. `classOf(e, ctx)` alone doesn't see this -- it
-	// resolves `e`'s *declared* type (`number[]` = `Array<number>`) as if `e` were a genuine, standalone
-	// f64-backed array, which real-mismatches against `Array<number>.get(i)`'s own compiled body (its
-	// inline `array.get $this` is hardcoded to `Array<number>`'s own f64-array type index) when `e`'s
-	// real value is actually a boxed-any array. Only overrides the built-in `Array` class specifically --
-	// a real user class has no such dual representation (a `new Foo(...)` instance is always the same
-	// physical struct, regardless of context), so this is deliberately narrow, not a general `classOf`
-	// change.
+	// `ownerOf` for a value about to be indexed into (`e[i]`) via generic class-method dispatch (`Array<T>.get(i)`).
+	// The Array-at-`any` override below is DISABLED, same reason as `objectArrayKind`'s: an inner array is a real `Array<number>`.
 	function classOfForIndexing(e: Expr, ctx: FunctionContext): ClassInfo | undefined {
 		const cls = ownerOf(e, ctx);
 		//if (cls?.decl.name === 'Array' && e.type === 'index' && objectArrayKind(e.object, ctx) === 'ref')
@@ -6494,8 +6468,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// elements themselves, so it would otherwise build a real `number[]` -- a scalar-kind wasm
 				// array and a ref-kind one are physically incompatible types (not just a missing cast), so
 				// nothing later could ever treat it as the boxed/tuple value its position actually needs.
-				// Also wins outright for an *empty* literal (`[]`) -- there are no elements for
-				// `arrayKindOf` to infer anything from at all.
 				//
 				// The `{ref:'any'}` case specifically needs one more distinction, though: it also covers a
 				// literal that's merely an *element of an outer ref-kind array* (`[1,2]` inside

@@ -8,10 +8,13 @@ metadata:
 
 For `number[][]`, the outer array is ref-kind (one boxed `anyref` slot per element), but the inner
 arrays stored there keep their own **declared** element kind — a real `(array (mut f64))` — and every
-read casts back down to it. `objectArrayKind`'s own comment claims a value read out of a ref-kind
-element "is *always* physically ref-kind too, ... 'ref' is the one shared bucket"; that is **not** what
-the code does, and reading it as truth sends you the wrong way. The rule that actually holds: whatever
-constructs the inner value must honour the declared element type, because the read side casts to it.
+read casts back down to it. The rule: whatever constructs the inner value must honour the declared
+element type, because the read side casts to it.
+
+`objectArrayKind` and `classOfForIndexing` each carry a DISABLED ref-collapse override (commented out
+2026-08-28, e5c556d) that would have made every value read out of a ref-kind element 'ref'. Their
+header comments described that dead code as live fact — corrected 2026-09-14; if you re-enable either,
+the comments are what to update first.
 
 Verified 2026-09-14 while fixing `(a[i] ??= []).push(x)` (commits e879edc/362bfc7/66878d8): an empty
 inner literal ignored the contextual element type and built a boxed-any array, so `const a: number[][]
