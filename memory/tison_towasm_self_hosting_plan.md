@@ -2192,6 +2192,19 @@ to everything under non-strict rules, and nothing is assignable to it), so `x in
 to `A | undefined` -- the last two false positives on our own sources. A nullish member is never "narrower"; assignability
 is not subtyping where `undefined` is concerned.
 
+**Batch 16 (2026-09-14): `super` is the base class** (bb60138). The checker had no `case 'super'`, so every `super.m()`
+hit the expression switch's `default: return T.ANY`. `classShapes` now hands its base type back and `classBodyScopes`
+binds it like `this`: the base's instance side in instance members, `typeof Base` in static ones, and -- under the key
+`'super()'`, which no identifier can spell -- the constructor `super(...)` invokes. That call resolves through the very
+path `new` does (a `construct` flag replacing the case's `e.type === 'new'` tests); without the routing a bound `super`
+reads "not callable without 'new'", an A/B-confirmed false positive. Three TS rules fall out of the same binding: the
+call is `void`, `super.m()` substitutes the DERIVED receiver (a base method returning `this` gives the current `this`),
+and the extends clause's type args (`extends A<string>`) are the call's type args, so the base's `T` is fixed rather
+than re-inferred -- that last one was found by the instrument, not by reading: without it the corpus showed GAP +3
+("type parameter could not be inferred"), and adding it removed all three. Corpus ERROR +5, every one a line real tsc
+rejects at the same position; two of those files say so in their own comments. Survey 254 failures / 99 causes
+(from 256 / 100).
+
 ## Scope
 
 In: towasm.ts, checker.ts, type-utils.ts, walker.ts, transform.ts, tison.ts, ts-parser.ts,

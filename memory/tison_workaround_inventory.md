@@ -127,10 +127,12 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   x]))` infers `Map<any, any>` against lib.esnext.full, though a declared generic function and a declared overload pair of the same
   shapes both infer `<string, number>` (test-checker `overload trial, final context`). The multi-signature construct type resolves
   differently -- look at `T.unionSignature` pre-empting the overload path in checker.ts `case 'new'`.
-- **A `super` expression types as `any`** (2026-09-13, missed checking): the checker has no `super` case, so `super.m()`
-  and `super.x` go unchecked and `super.m()` returns `any` (a derived `returnThis() { return super.returnThis(); }` infers
-  `any`). TS types `super` as the base class, with `this` bound to the CURRENT `this` type -- so a base method returning
-  `this` gives the derived `this`. Found doing polymorphic `this`; not needed for the sealed prerequisites.
+- **`super` in an OBJECT LITERAL method reads as `any`** (2026-09-14, lenient): `{ __proto__: b, m() { super.n() } }` --
+  `classBodyScopes` binds `super` for classes only, so nothing else has a base to bind. Never a false positive.
+  (The class case was fixed in bb60138: `classShapes` hands its base type back, `classBodyScopes` binds the base's
+  instance side in instance members and `typeof Base` in static ones plus, under `'super()'`, the constructor
+  `super(...)` invokes through the `new` path. `super(...)` is `void`; `super.m()` substitutes the derived `this`;
+  the extends clause's type args fix the base's `T`. Five silent corpus acceptances became real diagnostics.)
 - **A declared `this:` parameter is dropped by ts-parser** (ts-parser.ts `this` rule, deliberately: TS erases it at every call
   site), so a non-arrow function's own `this` can only be `any` in its body -- TS's rule WITHOUT one, and lenient (never a
   false positive) with one. Keeping it needs a non-positional field on the signature (e.g. `thisType`), not a real `Param`.
