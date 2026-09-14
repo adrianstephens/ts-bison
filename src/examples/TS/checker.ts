@@ -1473,6 +1473,7 @@ function settleFromReturn(inference: T.Inference, scope: Scope) {
 function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, pos: Location, restElementTs?: Type[], expected?: Type, err?: Err, inference?: T.Inference): TS.CallSig {
 	let returnType	= sig.returnType ?? T.ANY;
 	let params		= sig.params;
+	let rest		= sig.rest;
 
 	if (sig.typeParams?.length) {
 		const map = new Map<string, Type>();
@@ -1515,10 +1516,11 @@ function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Typ
 			});
 		}
 		params		= params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p);
+		rest		= rest?.typeAnnotation ? { ...rest, typeAnnotation: T.substituteType(rest.typeAnnotation, map) } : rest;
 		returnType	= T.substituteType(returnType, map);
 	}
 	// `declScope` travels with the result -- e.g. into `argsFit`, which only ever sees this instantiated object, never `sig` itself.
-	return { params, rest: sig.rest, returnType, declScope: sig.declScope };
+	return { params, rest, returnType, declScope: sig.declScope };
 }
 
 // ---- expressions ----------------------------------------------------------------------------
