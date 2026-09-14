@@ -267,11 +267,10 @@ declare var RegExp: RegExpConstructor;
 //	Array
 //-----------------------------------------------------------------------------
 
-declare class Array<T> {
+interface Array<T> {
 	[i: number]: T;
 	length: number;
 
-	constructor(n: number);
 
 	grow(n: i32): i32;
 	toString(): string;
