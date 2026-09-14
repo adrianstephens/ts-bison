@@ -366,6 +366,8 @@ interface TypedArray<T> {
 	reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 	reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 	reverse(): this;
+	// Iterable, as TS's own typed arrays are; `lib/typedarray.ts` implements it as an indexed generator.
+	[Symbol.iterator](): Generator<number, void, unknown>;
 	set(array: ArrayLike<number>, offset?: number): void;
 	slice(start?: number, end?: number): TypedArray<T>;
 	some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;

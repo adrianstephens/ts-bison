@@ -409,6 +409,10 @@ export class TypedArray<T> {
 		for (let i = 0; i < array.length; i++)
 			this[offset + i] = array[i];
 	}
+	// Iterable, as TS's own typed arrays are -- the indexed generator `Map` iterates by.
+	[Symbol.iterator](): Generator<number, void, unknown> {
+		return __towasm_indexed<number>(() => this.length, i => this[i]);
+	}
 }
 
 
