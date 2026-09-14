@@ -724,6 +724,8 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 		const r = t && T.resolveOwn(t, scope);
 		if (!r || T.isAny(r))
 			return scope;
+		// Already strictly narrower than the guard (`C extends A` guarded by `x is A`): TS's getNarrowedType keeps it.
+		const narrower = (m: Type) => !T.isAny(target) && T.isAssignable(m, target, scope) && !T.isAssignable(target, m, scope);
 		// A matching member narrows to `target` itself (same as the non-union case below), not to its own
 		// wider original shape -- the whole point of a type guard is to say more than the union member's
 		// declared type alone does (e.g. `Literal<TypeOfMap[K]>` pinning `.value` past a real AST literal
@@ -733,9 +735,9 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 			// Excluding a member (the false branch) takes the EXACT relation: a widened `string` counting as a `"never"` (isAssignable's
 			// lenient widened-source rule) dropped `RefType` from `isRef(src, 'never')`'s else branch and left `src` as `never`.
 			return narrowValue(scope, name, sense
-				? m => T.isAssignable(m, target, scope) || T.isAssignable(target, m, scope) ? target : false
+				? m => narrower(m) ? m : T.isAssignable(m, target, scope) || T.isAssignable(target, m, scope) ? target : false
 				: m => !T.isAssignable(m, target, scope, scope, false, 10, true), t);
-		if (!sense)
+		if (!sense || narrower(r))
 			return scope;
 		const s = new Scope(scope);
 		s.addNarrowing(name, target);
