@@ -231,6 +231,25 @@ function isContextSensitive(a: Expr): a is Expr & { type: 'function' | 'arrow' }
 // What a context-sensitive callback fits as before its context is chosen: any function (TS's `anyFunctionType`).
 const ANY_FUNCTION = TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(T.ANY)) }, T.ANY);
 
+// Whether `args` fit candidate `c` as TS's overload resolution asks (checkExpressionWithContextualType): each argument typed
+// against the candidate's OWN parameter, since a literal's type depends on it (`new Map([['', true]])` fits only as tuples).
+export function candidateFits(c: TS.CallSig, args: Expr[], scope: Scope, typeArgs?: Type[], typedIn = args.map(() => new Map<Type | undefined, Type>()), yieldCollector?: Type[], pos: Location = { line: 0, col: 0 }): boolean {
+	const paramAt = (i: number) => c.params[i]?.typeAnnotation ?? (c.rest?.typeAnnotation && T.restArgType(c.rest.typeAnnotation, i - c.params.length, scope));
+	// A callback fits as any function (the chosen candidate fixes its parameters later); a parameter naming the candidate's own
+	// type parameters gives a non-literal no context yet. Muted and unwidened, typed once per distinct context (`typedIn`).
+	const ts = args.map((a, i) => {
+		if (a.type === 'spread' || isContextSensitive(a))
+			return undefined;
+		const p		= paramAt(i);
+		const ctx	= p && (a.type === 'array' || a.type === 'object' || !c.typeParams?.some(tp => T.mentionsTypeParam(p, tp.name))) ? p : undefined;
+		let t = typedIn[i].get(ctx);
+		if (!t)
+			typedIn[i].set(ctx, t = typeOf(a, scope, false, ctx, yieldCollector, undefined));
+		return t;
+	});
+	return T.argsFit(instantiate(c, ts, typeArgs, scope, pos), args.map((a, i) => isContextSensitive(a) ? ANY_FUNCTION : ts[i]), scope, args.some(a => a.type === 'spread'));
+}
+
 // Returns the contextual signature it resolved, so a caller can also take its RETURN type -- an
 // unannotated callback needs that to type its own body (`xs.map(x => [a, b])` against a `[K, V][]`
 // parameter), not just its parameters.
@@ -2098,28 +2117,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// those types, or the next is tried with the callbacks as they now are. No fit at all stays a warning (inventory C3).
 				if (overloads) {
 					const hasSpread = e.arguments.some(a => a.type === 'spread');
-					// Muted (`err` explicitly `undefined`, not `recurse`'s ambient one): a candidate not picked must report nothing. And
-					// precise (`widen: false`), as the final `argTs` are: a widened literal can fit a structurally narrow overload wrongly.
-					// Each candidate types an argument against its OWN parameter, as TS does (checkExpressionWithContextualType): a
-					// literal's type depends on it (`new Map([['', true]])` fits `readonly (readonly [K, V])[]` only as tuples), and so
-					// does a nested call's -- its callback's return is fixed by the first context it is typed in. A parameter naming the
-					// candidate's own type parameters gives a non-literal no context yet. Typed once per distinct context.
-					const paramAt		= (c: TS.CallSig, i: number) => c.params[i]?.typeAnnotation ?? (c.rest?.typeAnnotation && T.restArgType(c.rest.typeAnnotation, i - c.params.length, scope));
+					// A nested call's type depends on its context too: its callback's return is fixed by the first context it is typed in.
 					const typedIn		= e.arguments.map(() => new Map<Type | undefined, Type>());
-					const contextualTs	= (c: TS.CallSig) => e.arguments.map((a, i) => {
-						if (a.type === 'spread' || isContextSensitive(a))
-							return undefined;
-						const p		= paramAt(c, i);
-						const ctx	= p && (a.type === 'array' || a.type === 'object' || !c.typeParams?.some(tp => T.mentionsTypeParam(p, tp.name))) ? p : undefined;
-						let t = typedIn[i].get(ctx);
-						if (!t)
-							typedIn[i].set(ctx, t = typeOf(a, scope, false, ctx, yieldCollector, undefined));
-						return t;
-					});
-					const fits			= (c: TS.CallSig) => {
-						const ts = contextualTs(c);
-						return T.argsFit(instantiate(c, ts, typeArgs, scope, pos), e.arguments.map((a, i) => isContextSensitive(a) ? ANY_FUNCTION : ts[i]), scope, hasSpread);
-					};
+					const fits			= (c: TS.CallSig) => candidateFits(c, e.arguments, scope, typeArgs, typedIn, yieldCollector, pos);
 					sig = overloads.find((c, k) => {
 						if (!fits(c))
 							return false;

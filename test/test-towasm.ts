@@ -4226,6 +4226,21 @@ async function main() {
 	}
 
 	{
+		// An overloaded constructor is picked by the checker's rule: each argument typed against that body's own parameter, so the
+		// array literal fits the tuple-array form (typed without context it is `(string | number)[][]`, and fitted neither).
+		const { tupleOverload } = await compile(`
+			class Pairs {
+				n = 0;
+				constructor(entries: readonly (readonly [string, number])[] = []) { this.n = entries.length; }
+				// @ts-expect-error - tison extension: multiple constructor implementations
+				constructor(other: Pairs) { this.n = other.n * 10; }
+			}
+			export function tupleOverload(): number { const k: string = 'a'; return new Pairs(new Pairs([[k, 1], ['b', 2]])).n; }
+		`);
+		check('tupleOverload()', tupleOverload(), 20);
+	}
+
+	{
 		// String integration: match/search/replace/split, all built on RegExp above.
 		const {
 			matchFound, matchNotFound, searchFound, searchNotFound,

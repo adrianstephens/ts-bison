@@ -5,7 +5,7 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import * as Common from '../common';
 import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
-import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow } from './checker';
+import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, candidateFits } from './checker';
 import { Walker, walker, walkerB } from './walker';
 import { printer } from './printer';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
@@ -9099,16 +9099,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return info;
 	}
 
-	// Picks the declaration (from possibly several real bodies sharing a name, a genuine overload set) whose
-	// declared params fit `args`' actual types, mirroring the checker's own `T.argsFit`-based resolution -- resolves to the exact same overload the checker already validated the call against.
+	// Picks the body, of several sharing a name, that the checker's own rule picks: the first whose parameters fit, each argument
+	// typed against that body's own parameter (`candidateFits`) -- `[[k, v]]` fits a tuple-array parameter only as tuples.
 	function resolveOverload(label: string, decls: MethodMember[], args: Expr[], ctx: FunctionContext): MethodMember {
 		if (decls.length === 1)
 			return decls[0];
 		if (args.some(a => a.type === 'spread'))
 			throw `spread arguments are not supported in a call to overloaded '${label}'`;
-		const argTs = args.map(a => checkerTypeOf(a, ctx.scope));
-		// The checker's own rule: the first body whose declared parameters fit the arguments.
-		const found	= decls.find(d => d.body && T.argsFit(T.FixSig(d, T.ANY), argTs, ctx.scope));
+		const found	= decls.find(d => d.body && candidateFits(T.FixSig(d, T.ANY), args, ctx.scope));
 		if (!found)
 			throw `no overload of '${label}' matches this call`;
 		return found;
