@@ -4241,6 +4241,24 @@ async function main() {
 	}
 
 	{
+		// An overloaded method called with explicit type arguments (js-parser.ts's `dottedNameToExpr`): `<Ex>` fixes `U`, as the
+		// checker does. Inferred instead, `U` is both the callback's `Mem` and the initial `Ident`, and no body fits.
+		const { reduceTyped } = await compile(`
+			interface Ident { type: 'identifier'; name: string }
+			interface Mem { type: 'member'; object: Ex; property: string }
+			type Ex = Ident | Mem;
+			function ident(name: string): Ident { return { type: 'identifier', name }; }
+			function member(object: Ex, property: string): Mem { return { type: 'member', object, property }; }
+			function depth(e: Ex): number { return e.type === 'member' ? 1 + depth(e.object) : 0; }
+			export function reduceTyped(): number {
+				const parts = 'a.b.c'.split('.');
+				return depth(parts.slice(1).reduce<Ex>((object, property) => member(object, property), ident(parts[0])));
+			}
+		`);
+		check('reduceTyped()', reduceTyped(), 2);
+	}
+
+	{
 		// String integration: match/search/replace/split, all built on RegExp above.
 		const {
 			matchFound, matchNotFound, searchFound, searchNotFound,

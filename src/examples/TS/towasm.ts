@@ -9101,12 +9101,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// Picks the body, of several sharing a name, that the checker's own rule picks: the first whose parameters fit, each argument
 	// typed against that body's own parameter (`candidateFits`) -- `[[k, v]]` fits a tuple-array parameter only as tuples.
-	function resolveOverload(label: string, decls: MethodMember[], args: Expr[], ctx: FunctionContext): MethodMember {
+	// `typeArgs`: the call's explicit ones (`xs.reduce<Expr>(...)`), which the checker fixed the same way.
+	function resolveOverload(label: string, decls: MethodMember[], args: Expr[], ctx: FunctionContext, typeArgs?: Type[]): MethodMember {
 		if (decls.length === 1)
 			return decls[0];
 		if (args.some(a => a.type === 'spread'))
 			throw `spread arguments are not supported in a call to overloaded '${label}'`;
-		const found	= decls.find(d => d.body && candidateFits(T.FixSig(d, T.ANY), args, ctx.scope));
+		const found	= decls.find(d => d.body && candidateFits(T.FixSig(d, T.ANY), args, ctx.scope, typeArgs));
 		if (!found)
 			throw `no overload of '${label}' matches this call`;
 		return found;
@@ -10009,7 +10010,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// statically-resolved `call`, exactly as if there were no inheritance involved at all.
 		if (!decls)
 			return owner.superClass && ensureMethod(owner.superClass, name, args, callerCtx, typeArgs);
-		let decl = resolveOverload(fullName, decls, args, callerCtx);
+		let decl = resolveOverload(fullName, decls, args, callerCtx, typeArgs);
 		// Qualified so it can share `funcs` with plain top-level functions (bare identifiers can't contain
 		// '.') without colliding; only suffixed when there's a real overload set to disambiguate.
 		let key = decls.length > 1 ? `${fullName}#${decls.indexOf(decl)}` : fullName;
