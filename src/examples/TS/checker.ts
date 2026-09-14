@@ -732,7 +732,9 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 		if (!r || T.isAny(r))
 			return scope;
 		// Already strictly narrower than the guard (`C extends A` guarded by `x is A`): TS's getNarrowedType keeps it.
-		const narrower = (m: Type) => !T.isAny(target) && T.isAssignable(m, target, scope) && !T.isAssignable(target, m, scope);
+		// A NULLISH member is never "narrower": `undefined` is assignable to everything under non-strict rules, and a guard's
+		// true branch says the value is not nullish anyway -- it takes the target below, as every unrelated member does.
+		const narrower = (m: Type) => !T.isAny(target) && !T.isNullish(m, scope) && T.isAssignable(m, target, scope) && !T.isAssignable(target, m, scope);
 		// A matching member narrows to `target` itself (same as the non-union case below), not to its own
 		// wider original shape -- the whole point of a type guard is to say more than the union member's
 		// declared type alone does (e.g. `Literal<TypeOfMap[K]>` pinning `.value` past a real AST literal
