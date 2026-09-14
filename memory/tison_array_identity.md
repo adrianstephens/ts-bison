@@ -34,6 +34,10 @@ b.push(1); a.length` was 0; towasm's own `worklist` stayed empty). Tests: test-t
 - A type that merely RESOLVES to an array (alias, `N[K]`) must map like the `T[]` spelling, or it falls to
   the module-level `wasmTypeOf`, which still answers raw storage.
 - Every "is it an array?" test (`'arr' in w`) had to become "what storage does it hold?" (`storageKindOf`).
+- Removing the unbox (6c4b505) exposed two sites still demanding RAW storage from an `Array`: indexing a union of
+  array types (no single class at the TYPE level, one physical class) and the spread's hint, which a conditional
+  operand takes as a hard target. 72 declarations, fixed in a243791 -- suite, difftest and corpus gate were all
+  GREEN throughout; only the survey saw it. Re-survey after any representation change, whatever the gates say.
   Missed twice: the spread helpers `arrayKindOf`/`objectArrayKind` (9deefcb) -- seen only as the survey's spread
   row jumping 3 -> 58. After any representation change, grep every `'arr' in` and diff the survey's cause rows.
 
