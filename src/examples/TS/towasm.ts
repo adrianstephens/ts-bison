@@ -5644,17 +5644,19 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// past the end too), `null` otherwise.
 	function emitBoundedRead(e: Expr & { type: 'index' }, objWtype: WasmType, resultWtype: WasmType, ctx: FunctionContext, read: (obj: Local, idx: Local & { name: string }) => void): WasmType {
 		const n		= optionalTempCounter++;
-		const obj	= ctx.declareLocal(`$bobj$${n}`, objWtype);
-		const idx	= Object.assign(ctx.declareValue(`$bidx$${n}`, 'i32', T.NUMBER), { name: `$bidx$${n}` });
+		const objName	= `$bobj$${n}`;
+		const obj		= ctx.declareValue(objName, objWtype, narrowedTypeOf(e.object, ctx));
+		const idx		= Object.assign(ctx.declareValue(`$bidx$${n}`, 'i32', T.NUMBER), { name: `$bidx$${n}` });
 		emitAs(e.object, ctx, objWtype);
 		ctx.emit(I.local.set(obj.index));
 		emitAs(e.index, ctx, 'i32');
-		ctx.emit(I.local.set(idx.index), I.local.get(idx.index), I.local.get(obj.index));
-		// A class owning its storage (`Array<T>`) is unwrapped to it first -- `array.len` needs the storage itself.
-		const sk = storageKindOf(objWtype);
-		if (sk && typeof objWtype === 'object' && 'ref' in objWtype)
-			coerceTop(objWtype, ctx, ARR_WTYPE[sk]);
-		ctx.emit(I.array.len, I.i32.lt_u);
+		ctx.emit(I.local.set(idx.index), I.local.get(idx.index));
+		// Raw storage is its own bound; anything else answers through its own `length`, as JS reads it.
+		if (typeof objWtype === 'object' && 'arr' in objWtype)
+			ctx.emit(I.local.get(obj.index), I.array.len);
+		else
+			emitAs(JS.Member({ type: 'identifier', name: objName }, 'length'), ctx, 'i32');
+		ctx.emit(I.i32.lt_u);
 		const _old = ctx.swapOut();
 		read(obj, idx);
 		const _then = ctx.swapOut();
@@ -6244,7 +6246,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						});
 					}
 					const thisW = cls.thisWtype!;
-					if (storageKindOf(thisW) !== undefined && readsPastEnd(e, ctx)) {
+					// Past the end only means something for a POSITIONAL read of something with a real `length` (not a keyed `get`).
+					const key = sig.params[sig.params.length - 1];
+					if (readsPastEnd(e, ctx) && key !== undefined && scalarKind(key) !== undefined
+						&& (cls.fields.some(f => f.name === 'length') || methodSig(cls, accessorKey('get', 'length'), ctx))) {
 						const resultWtype = nullableWtype(sig.result);
 						return emitBoundedRead(e, thisW, resultWtype, ctx, (obj, idx) => {
 							ctx.emit(I.local.get(obj.index));
