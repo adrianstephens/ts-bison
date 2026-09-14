@@ -392,6 +392,23 @@ export class TypedArray<T> {
 		// @ts-expect-error - tison extension: multiple constructor implementations
 		return new TypedArray<T>(this.buffer, this.byteOffset + start, end - start);
 	}
+	// TS's copy form, one body per source kind, picked statically. A source viewing this same buffer is read out first:
+	// JS copies as if through a temporary.
+	// @ts-expect-error - tison extension: multiple method implementations
+	set(array: TypedArray<T>, offset: i32 = 0): void {
+		if (offset < 0 || offset + array.length > this.length)
+			throw new RangeError('offset is out of bounds');
+		const src = array.buffer === this.buffer ? array.slice() : array;
+		for (let i = 0; i < src.length; i++)
+			this[offset + i] = src[i];
+	}
+	// @ts-expect-error - tison extension: multiple method implementations
+	set(array: number[], offset: i32 = 0): void {
+		if (offset < 0 || offset + array.length > this.length)
+			throw new RangeError('offset is out of bounds');
+		for (let i = 0; i < array.length; i++)
+			this[offset + i] = array[i];
+	}
 }
 
 

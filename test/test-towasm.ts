@@ -2256,6 +2256,31 @@ async function main() {
 	}
 
 	{
+		// TS's `set(array, offset)` copy form (towasm.ts's own `addData`), two bodies picked statically: from a typed array, from a
+		// `number[]`, and from an overlapping view of the same buffer, which JS copies as if through a temporary (a forward loop gives 1111).
+		const { u8SetTyped, u8SetArray, u8SetOverlap } = await compile(`
+			export function u8SetTyped(): number {
+				const a = new Uint8Array(5);
+				a.set(new Uint8Array([7, 8]), 2);
+				return a[0] + a[2] * 10 + a[3] * 100;
+			}
+			export function u8SetArray(): number {
+				const a = new Uint8Array([1, 1, 1]);
+				a.set([4, 5]);
+				return a[0] * 100 + a[1] * 10 + a[2];
+			}
+			export function u8SetOverlap(): number {
+				const a = new Uint8Array([1, 2, 3, 4, 0]);
+				a.set(a.subarray(0, 4), 1);
+				return a[1] * 1000 + a[2] * 100 + a[3] * 10 + a[4];
+			}
+		`);
+		check('u8SetTyped()', u8SetTyped(), 870);
+		check('u8SetArray()', u8SetArray(), 451);
+		check('u8SetOverlap()', u8SetOverlap(), 1234);
+	}
+
+	{
 		// string non-callback methods
 		const {
 			strIndexOf, strLastIndexOf, strIncludes, strStartsWith, strEndsWith, strSlice,

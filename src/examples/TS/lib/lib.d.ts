@@ -366,7 +366,7 @@ interface TypedArray<T> {
 	reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 	reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 	reverse(): this;
-//	set(array: ArrayLike<number>, offset?: number): void;
+	set(array: ArrayLike<number>, offset?: number): void;
 	slice(start?: number, end?: number): TypedArray<T>;
 	some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 	sort(compareFn?: (a: number, b: number) => number): this;
