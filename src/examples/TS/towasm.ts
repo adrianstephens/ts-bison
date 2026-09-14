@@ -9234,25 +9234,38 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// that was only ever reached transitively (e.g. inferred off an imported function's own return type)
 	// without itself being explicitly imported by name. Defaults to `global`, matching every existing
 	// same-module caller unaffected by this.
+	// A type argument that changes a generic's physical layout: a value stored unboxed, or a typed-array tag. Any other
+	// occupies one ref slot whatever it is, and keying on the finite set of these also bounds `Box<T[]>`-style recursion.
+	function ownsLayout(t: Type, scope: Scope): boolean {
+		if (t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name))
+			return true;
+		const r = T.resolve(scope, t);
+		return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean' || r.name === 'any');
+	}
+
+	// The tag is read UNRESOLVED on purpose: `T.resolve` collapses every `TypedArray` tag alike to plain `number`.
+	function layoutArgKey(t: Type, scope: Scope): string {
+		return t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name) ? t.name : T.typeKey(T.resolve(scope, t));
+	}
+
 	function ensureObjectShape(name: string, typeArgs?: Type[], declScope?: Scope): ClassInfo | undefined {
 		const scope = declScope ?? global;
 		const entry = scope.type(name);
 		if (!entry)
 			return undefined;
 
-		// ERASURE: ONE physical layout per generic shape. A generic INTERFACE/ALIAS is a pure field layout
-		// with no compiled code of its own, and wasm struct fields are mutable, hence invariant -- so
-		// `Rest<ArrayType>` could never be a subtype of `Rest<Type>` no matter how the two were built, and
-		// keying per type argument only produced structs nothing could convert between (measured: four
-		// separate `Rest<...>`, two of them -- `<any>` and `<unknown>` -- already byte-identical).
-		// Every type-parameter position therefore takes the parameter's own constraint (`?? any`), the same
-		// erasure convention towasm already applies to generic FUNCTION bodies, so every instantiation
-		// shares one struct and a conversion between them is identity.
-		//
-		// `ensureClass` applies the same rule where it is sound (see its own comment): a generic CLASS owns
-		// method bodies monomorphized per instantiation, so only a method-free one can merge outright.
-		const erased	= entry.typeParams?.length ? entry.typeParams.map(p => p.constraint ?? T.ANY) : undefined;
-		const key		= name;
+		// One struct per LAYOUT (`ownsLayout`): `Box<number>`'s `T[]` is a real `number[]`, while every reference argument
+		// erases to its constraint -- wasm fields are invariant, so separate `R<C>`/`R<{x}>` could never convert.
+		const args: Type[] = [];
+		if (entry.typeParams?.length) {
+			const chosen = new Map<string, Type>();
+			entry.typeParams.forEach((p, i) => {
+				const arg = typeArgs?.[i] ?? (p.default ? T.substituteType(p.default, chosen) : p.constraint ?? T.ANY);
+				chosen.set(p.name, arg);
+				args.push(ownsLayout(arg, scope) ? arg : p.constraint ?? T.ANY);
+			});
+		}
+		const key		= args.length ? `${name}<${args.map(a => layoutArgKey(a, scope)).join(',')}>` : name;
 		const existing	= classes.get(key);
 		if (existing)
 			return existing;
@@ -9264,7 +9277,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// itself (a plain `TS.RefType` carries no scope of its own) -- this exact ref becomes `thisTsType`
 		// below, and `fieldDeclaredType`'s own later re-resolution of it needs to find `name` again from
 		// wherever it was actually declared, not wherever `global` (the entry module) happens to be.
-		const ref = TS.RefType(name, erased ?? typeArgs);
+		const ref = TS.RefType(name, args.length ? args : typeArgs);
 		ref.declScope = scope;
 		// `resolveObjectType` (not a hand-rolled intersection-flatten here) -- an interface `extends`ing
 		// another (`Method<T> extends CallSig<T>`) needs its own parts (`CallSig<T>` itself still an
@@ -9432,14 +9445,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// rule was always structural, and hardcoding one class's name left every other generic
 		// (`Terminal<T>`, `Rule<T>`, `Rest<T>`, ...) keyed per type argument. `Array`'s own behaviour is
 		// unchanged -- it is a one-parameter generic whose kept arguments are exactly these.
-		// The tag test reads the UNRESOLVED name on purpose: `T.resolve` collapses every `TypedArray` tag
-		// alike to plain `number`, which would wrongly merge `TypedArray<u8>` with `TypedArray<i32>`.
-		const ownsLayout = (t: Type) => {
-			if (t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name))
-				return true;
-			const r = T.resolve(global, t);
-			return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean' || r.name === 'any');
-		};
 		// Restricted to a class with no METHODS of its own. A method body is compiled against the
 		// instantiation it was reached through (`substElemMethods`), so merging two instantiations whose
 		// methods differ produces code built for one layout running against the other -- measured, as a
@@ -9448,10 +9453,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// to it; a DATA-shaped generic (`Terminal<T>`, `Rule<T>`) has no such code to disagree about.
 		const classDecl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name) ?? declScope?.decl(name);
 		if (name === 'Array' || (classDecl?.type === 'class_decl' && !classDecl.body.some(m => m.type === 'method')))
-			typeArgs = typeArgs?.map(t => ownsLayout(t) ? t : T.ANY);
-		const key = typeArgs?.length
-			? `${name}<${typeArgs.map(t => t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name) ? t.name : T.typeKey(T.resolve(global, t))).join(',')}>`
-			: name;
+			typeArgs = typeArgs?.map(t => ownsLayout(t, global) ? t : T.ANY);
+		const key = typeArgs?.length ? `${name}<${typeArgs.map(t => layoutArgKey(t, global)).join(',')}>` : name;
 		// A non-generic top-level class is seeded into `classes` *eagerly*, well before any `ensureClass`
 		// call ever reaches it (see `TStoWasm`'s own top-level seeding pass) -- `typeIndex` staying `-1` is
 		// what distinguishes "reserved but not yet processed" from "fully built" here, unlike

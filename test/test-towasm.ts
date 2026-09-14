@@ -7616,6 +7616,33 @@ async function main() {
 	}
 
 	{
+		// A generic interface is instantiated per layout: `Box<number>`'s own `T[]` field is a real `number[]`, and reading it
+		// back gets that, not an erased `any[]`. A reference argument (`Box<string>`) shares the erased struct.
+		const { genericInterfaceFields } = await compile(`
+			interface Box<T> { items: T[]; tag?: string }
+			function mk<T>(items: T[]): Box<T> { return { items }; }
+			export function genericInterfaceFields(): number {
+				const n = mk<number>([1, 2, 3]);
+				const s = mk<string>(['a', 'b']);
+				const total = n.items[0] + n.items[2];
+				return n.items.length * 100 + s.items.length * 10 + total;
+			}
+		`);
+		check('genericInterfaceFields()', genericInterfaceFields(), 300 + 20 + 4);
+	}
+
+	{
+		// Polymorphic recursion: `Box<number>` names `Box<number[]>`, which names `Box<number[][]>`, ... Keying instances
+		// by layout makes the family finite; keying by the TS argument overflowed the stack.
+		const { polyRec } = await compile(`
+			interface Box<T> { v: T; f: (b: Box<T[]>) => number }
+			function mk<T>(v: T): Box<T> { return { v, f: b => b.v.length }; }
+			export function polyRec(): number { const b = mk(3); return b.f(mk([1, 2])) * 10 + b.v; }
+		`);
+		check('polyRec()', polyRec(), 23);
+	}
+
+	{
 		// The global `parseInt`/`parseFloat` (js-parser.ts's numeric literals): a `0x` prefix with radix 16 or none, a sign
 		// and trailing junk, radix 36 letters, and NaN when no digit is read.
 		const { parseIntGlobal } = await compile(`
