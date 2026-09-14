@@ -123,6 +123,10 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   Our own sources gain only towasm.ts's `Uint8Array.set` (lib.d.ts lacks it); towasm's lib also needs `[Symbol.iterator]`
   declared on `TypedArray` (test-towasm's for-of over a `Uint8Array` fails without it). Classify with real tsc per LINE, not
   baseline presence: `assistant/corpus-ab.sh` now keeps `corpus-ab/base-false-positives.txt` for the diff.
+- **TS's own `MapConstructor` loses a mapped call's types** (2026-09-13, missed inference): `new Map([1, 2].map(x => [String(x),
+  x]))` infers `Map<any, any>` against lib.esnext.full, though a declared generic function and a declared overload pair of the same
+  shapes both infer `<string, number>` (test-checker `overload trial, final context`). The multi-signature construct type resolves
+  differently -- look at `T.unionSignature` pre-empting the overload path in checker.ts `case 'new'`.
 - Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2, 16 after the intersection work (dd1a676).
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested

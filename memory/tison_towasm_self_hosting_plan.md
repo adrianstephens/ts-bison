@@ -2149,6 +2149,21 @@ literal gets no context through `&&` and builds an anon shape (`assistant/repro-
 **Decision 2** (rename the index convention to `__get`/`__set`): `assistant/index-accessors.py`, structural fallback to
 `Map`'s real `get`/`set` only for an index-signature receiver (the `ownerFor` routing test).
 
+**Batch 14 (2026-09-13): static overloads, one rule for both halves.** Decision 2 landed (7d01f89), then overload resolution
+the user chose over a run-time `instanceof`/`Array.isArray` split: towasm picks a body with the CHECKER's own per-candidate test
+(`candidateFits`, b41dee7), passing the call's explicit type arguments (a34ece2); the checker's trial now types each argument in the
+context its final pass will (`argContext`, 05c9d55); `new Map(otherMap)` (d6c9357) and typed-array `set(array, offset)` (44145be)
+are plain second bodies. Survey: 99 compiled, unchanged; peg.ts's Map ERR gone; towasm.ts's `addData` `set` calls compile.
+**Invariant**: a callback nested in an argument keeps the FIRST context it is typed in -- any pass that types arguments before
+the final one (an overload trial, or towasm re-asking after the check) must use the final pass's context, or it silently fixes
+the wrong one. It hid behind single signatures: `Map`'s second constructor turned it into 73 survey blocks in one step.
+**Reading a survey after adding functions**: new top-level declarations add blocks of their own (337 -> 340 here, +3 blocks, all
+on causes that already existed) -- read the SITES before calling a "+N" a regression. And the `T'NNNNN` rows rename every run:
+normalize the counter before diffing two tables.
+**Lib hygiene**: a member with several bodies needs `@ts-expect-error` on EVERY body (TS2392/TS2393 flag the first too); the
+lib's own `tsc -p src/examples/TS/lib` must keep exactly HEAD's pre-existing error set. `corpus-ab.sh` now keeps the base run's
+false-positive list, and new corpus errors are classified against real tsc per LINE, not by baseline presence.
+
 ## Scope
 
 In: towasm.ts, checker.ts, type-utils.ts, walker.ts, transform.ts, tison.ts, ts-parser.ts,
