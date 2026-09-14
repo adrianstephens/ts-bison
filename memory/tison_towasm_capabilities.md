@@ -21,8 +21,13 @@ recoverable from the code. Full per-feature originals are in `../memory-archive/
   checking `arrayKind`.
 - **Indexing generalized** — `a[i]` / `a[i]=v` route through any class's own `get(i)`/`set(i,v)`,
   rather than being array syntax. String migrated the same way (non-generic, fixed `i16` elemKind).
-- **Typed arrays as real linear-memory views** — `Uint8Array`/`Int32Array`/`Uint32Array`/`ArrayBuffer`
-  with genuine cross-view aliasing, not wasm-GC arrays.
+- **Typed arrays keep genuine cross-view aliasing** — `Uint8Array`/`Int32Array`/`Uint32Array` are structs
+  (buffer/byteOffset/byteLength/length) over a shared `ArrayBuffer`. They WERE real linear-memory views;
+  `ArrayBuffer` is now a bare wasm-GC `i8` array instead, because nothing could detect when the last
+  reference to a linear-memory block was gone. **Do not read the old wording as current.** Going back needs
+  a way to observe that: wasm-GC's MVP has no finalizers and no weak references (both post-MVP), refcounting
+  has no chokepoint to count at (no destructors; refs flow through fields, closures and `any`), and a host
+  `FinalizationRegistry` works only under a JS host, so WASI would need a second representation anyway.
 - **`Array<T>` has a real u32 element kind**; bigint's limbs moved off linear-memory `Uint32Array`
   (never freed) onto a real GC-reclaimed `u32[]`.
 - **Self-reassigning methods** (`assignsToThis`/`reassignsThis`) via a real wasm multi-value result.
