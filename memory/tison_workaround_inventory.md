@@ -15,7 +15,8 @@ tsc-rejected and tsc-precise snippets through `assistant/corpus-one.ts` (lib.esn
 - Unresolved import -> `any` (checker 872-875), diagnosed at transform.ts:733. `any` operands propagate (1797, 1922, 1930).
 - Depth-limit bails (`hitDepthLimit`, 11 sites): bounded budget, reported -- TS has 2589 for the same.
 - towasm generic erasure (`p.constraint ?? T.ANY`, 2306/4768/4977/7701/7726): a codegen strategy, but it must
-  erase to ONE layout per generic shape -- see self-hosting NEXT #1 (Params<number> vs Params<any> trap).
+  erase to ONE layout per generic shape. Done for interfaces in 5a78c51: `ownsLayout` keys by layout, so a scalar argument
+  keeps its own struct (the Params<number> vs Params<any> trap) and a reference argument erases.
 - towasm's 45 `... not supported` throws: honest refusals, the header's gap list. Not silent.
 - `(x as any).pos` / `.scope` / `.contextualType` stamps: untyped stamping is the endorsed convention
   ([[feedback-no-checker-state]]). Cleanup only: `getPos()` (common.ts:39) already exists for pos; add one
@@ -110,7 +111,8 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   built, so `f.p` reads fall to B3's untyped absence and assignment narrowing is skipped for expandos.
 - arrayMethod's `map` model must stay until a type alias union (`Ty | Lit`) is flattened where towasm reads it;
   removing it broke towasm. `reduce` is now TS's real three overloads (6ee71c9).
-- var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked.
+- var_decl diagnostics land at the next token, not the declaration. Rest ARGUMENTS (`f(...xs)`) are not checked, nor are
+  positional arguments filling a rest parameter: `declare function k(...args: number[]): number; k("x")` is clean (2026-09-13).
 - Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2, 16 after the intersection work (dd1a676).
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested

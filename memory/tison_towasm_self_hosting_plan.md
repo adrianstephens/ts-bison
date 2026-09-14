@@ -2131,6 +2131,24 @@ relative paths (a survey "lost" its baseline JSON this way); run each in a `( cd
 my own grep filter (`grep -v 'free=\[\]'`) hid the decisive log line for three rounds: when a probe prints
 nothing, rerun it UNFILTERED before concluding a code path was never reached.
 
+**Batch 13 (2026-09-13)**: the user's decision "monomorphise generic interfaces" landed as ONE STRUCT PER LAYOUT (5a78c51):
+`ensureObjectShape` shares `ensureClass`'s `ownsLayout`/`layoutArgKey` -- a scalar or typed-array-tag argument gets its own
+struct, a reference argument erases to its constraint. Keying per TS argument was tried first and failed twice: `R<C>`/`R<{x}>`
+became unconvertible structs (test `ctxArg`), and polymorphic recursion (`Box<T[]>` naming `Box<T[][]>`...) overflowed the
+stack -- the user's `typeOf` -> `closureSigParts` -> `params.map` loop again (3a93dc4). `typeOfActive` catches only re-entry
+on the SAME node; any keying that can grow without bound needs a finite key set, not a guard. It exposed a checker bug:
+`instantiate` never substituted `rest`, so `count<number>` kept `SigArgs<T>` (b7956a8). Survey neutral (99/337).
+**Reading that survey**: 13 declarations "moved"; probing `hoist`/`iteratedContext` on a HEAD worktree showed identical
+failures on both -- a blocked closure reports whichever failure the worklist reaches first, so moves are not regressions
+(or fixes) until probed. **Next rows, both pre-existing**: (a) ts-parser.ts `type CallSig = JS.CallSig<Type>` builds its own
+struct, not a supertype of `Method<any>` (`hoist`/`classShapes`) -- an alias naming an instantiation should BE that
+instantiation's struct; (b) type-utils.ts:3092 `return direct && { yield, return: UNDEFINED, next: UNDEFINED }` -- the
+literal gets no context through `&&` and builds an anon shape (`assistant/repro-itertypes.ts` fails on HEAD too).
+**Trap**: the workaround guard (`.claude/hooks/workaround-guard.mjs`) matches `Workarounds:` in the Bash COMMAND text, so
+`git commit -F file` never satisfies it; pass the message inline (heredoc).
+**Decision 2** (rename the index convention to `__get`/`__set`): `assistant/index-accessors.py`, structural fallback to
+`Map`'s real `get`/`set` only for an index-signature receiver (the `ownerFor` routing test).
+
 ## Scope
 
 In: towasm.ts, checker.ts, type-utils.ts, walker.ts, transform.ts, tison.ts, ts-parser.ts,
