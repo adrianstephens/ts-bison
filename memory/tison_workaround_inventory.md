@@ -139,10 +139,6 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   read through a parameter (`static #n = 1`, `class D extends C { test2 = 1 }`). Both cost a test its discriminating power
   while doing the sealed prerequisites; the tests now annotate. Look at `pendingFieldInit`'s lazy getter firing for a read
   through a REFERENCE to the class rather than inside its own body.
-- **`instanceof` does not strip `undefined`** (2026-09-13, false positive on our own tsc-clean code): binary-libs wasm.ts
-  `constructor(arg?: bin._stream | Uint8Array | Partial<WasmModuleData>)` then `if (arg instanceof Uint8Array) arg = new
-  bin.stream(arg)` still reports `Uint8Array | undefined` for the argument. Pre-dates the `sealed` removal (self-errors
-  11 errors with and without it); the removal only made the reported type narrower.
 - Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2, 16 after the intersection work (dd1a676).
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested

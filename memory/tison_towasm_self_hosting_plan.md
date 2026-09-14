@@ -2186,7 +2186,11 @@ reworded message (`bin._stream | Uint8Array | undefined` -> `Uint8Array | undefi
 count, not the string.
 **Found and recorded, not fixed** (all in [[tison_workaround_inventory]]): `super` types as `any`; ts-parser drops a
 declared `this:` parameter; a class field typed only by its INITIALIZER reads as `any` (it silently cost two tests their
-discriminating power -- annotate fields in checker tests); `instanceof` does not strip `undefined`.
+discriminating power -- annotate fields in checker tests).
+**Caught and fixed the same day**: 916ef92's "keep a strictly narrower member" rule kept `undefined` too (it is assignable
+to everything under non-strict rules, and nothing is assignable to it), so `x instanceof A` narrowed `A | B | undefined`
+to `A | undefined` -- the last two false positives on our own sources. A nullish member is never "narrower"; assignability
+is not subtyping where `undefined` is concerned.
 
 ## Scope
 
