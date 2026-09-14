@@ -7383,6 +7383,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// the callee's own extra wasm-level updated-`this` result, leaving the declared result underneath. A receiver with nothing to write back to gets `emitAssignTarget`'s own error, for free.
 					if (ensureMethod(owner, e.callee.property, e.arguments, ctx, typeArgs)?.reassignsThis) {
 						const target = emitAssignTarget(obj, ctx, 'keep');
+						// The lvalue read may be a boxed `anyref` (every ref-kind array element is stored generically), so the
+						// pushed receiver needs the same narrowing cast the non-reassigning path below gets from its own `emitAs`.
+						coerceTop(target.wtype, ctx, (owner as ClassInfo).thisWtype!);
 						const result = emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
 						target.write(false);
 						return result;
