@@ -127,6 +127,22 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   x]))` infers `Map<any, any>` against lib.esnext.full, though a declared generic function and a declared overload pair of the same
   shapes both infer `<string, number>` (test-checker `overload trial, final context`). The multi-signature construct type resolves
   differently -- look at `T.unionSignature` pre-empting the overload path in checker.ts `case 'new'`.
+- **A `super` expression types as `any`** (2026-09-13, missed checking): the checker has no `super` case, so `super.m()`
+  and `super.x` go unchecked and `super.m()` returns `any` (a derived `returnThis() { return super.returnThis(); }` infers
+  `any`). TS types `super` as the base class, with `this` bound to the CURRENT `this` type -- so a base method returning
+  `this` gives the derived `this`. Found doing polymorphic `this`; not needed for the sealed prerequisites.
+- **A declared `this:` parameter is dropped by ts-parser** (ts-parser.ts `this` rule, deliberately: TS erases it at every call
+  site), so a non-arrow function's own `this` can only be `any` in its body -- TS's rule WITHOUT one, and lenient (never a
+  false positive) with one. Keeping it needs a non-positional field on the signature (e.g. `thisType`), not a real `Param`.
+- **A class field typed only by its INITIALIZER reads as `any`** (2026-09-13, missed inference, lib.esnext.full):
+  `class K { f = 1 } declare const k: K; const q: string = k.f` is clean, though `f: number` errs -- so does the same field
+  read through a parameter (`static #n = 1`, `class D extends C { test2 = 1 }`). Both cost a test its discriminating power
+  while doing the sealed prerequisites; the tests now annotate. Look at `pendingFieldInit`'s lazy getter firing for a read
+  through a REFERENCE to the class rather than inside its own body.
+- **`instanceof` does not strip `undefined`** (2026-09-13, false positive on our own tsc-clean code): binary-libs wasm.ts
+  `constructor(arg?: bin._stream | Uint8Array | Partial<WasmModuleData>)` then `if (arg instanceof Uint8Array) arg = new
+  bin.stream(arg)` still reports `Uint8Array | undefined` for the argument. Pre-dates the `sealed` removal (self-errors
+  11 errors with and without it); the removal only made the reported type narrower.
 - Self-hosting checker errors on tison's own sources (`assistant/self-errors.sh`): 74 -> 58 after 3f23a8a..9dd31d3, 55 after c10aec6, 38 after the const-context/overload-trial commits, 27 after 0dda90c, 21 after the lib/truthiness commits, 19 after a24a372 and after the freshness batch, 17 after c2fb0c2, 16 after the intersection work (dd1a676).
 - Overload resolution is TS's two passes since 81b535b (callbacks untyped, then fixed by the first fitting candidate).
   Type walks are DAG-aware since 0b78c11 (searchOnce/rewriteOnce); any NEW recursive type walk must be too, or nested

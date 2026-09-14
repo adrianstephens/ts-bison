@@ -2164,6 +2164,30 @@ normalize the counter before diffing two tables.
 lib's own `tsc -p src/examples/TS/lib` must keep exactly HEAD's pre-existing error set. `corpus-ab.sh` now keeps the base run's
 false-positive list, and new corpus errors are classified against real tsc per LINE, not by baseline presence.
 
+**Batch 15 (2026-09-13): the class-member `sealed` leniency is GONE.** `T.sealed` resolved with `resolveOwn`, so since
+bfd0aeb kept class refs nominal a missing member on a class instance was silently `any`. Removing it (one line,
+`resolveMembers`) first cost 44 corpus errors; per-LINE tsc classification split those into ~20 true positives and 24 real
+false positives from EIGHT modelling gaps, each then fixed and measured on its own: class iterators through `any`/`this`
+(68fb54a), TS's mixin rule for `new` on an intersection of constructor types (aaa14e1), a static accessor's `this`
+(370fd7e), construct signatures reached through `resolveMembers` (6e7b494, which also covers a constrained type-parameter
+callee -- a separate "apparent type" step was measured REDUNDANT and dropped rather than committed), polymorphic `this`
+(b00e4b2), a guard keeping an already-narrower type (916ef92), a non-arrow function's own `this` (71e955e), and TS's
+inferFromAnnotatedParameters (5976c8c); plus the lib's typed-array `[Symbol.iterator]`. With the leniency out: corpus
+ERROR +25, every one a line real tsc rejects too (the harness counts them only because those files carry no error
+baseline here), GAP -2, our own sources unchanged at 11 checker errors.
+**The instrument that made this tractable**: `assistant/sealed-fps.py` switches the leniency on in place (self-restoring),
+checks only the ~15 corpus files whose false positives it exposed, and reports how many of the listed 23 remain: 23 -> 18
+-> 12 -> 8 -> 5 -> 3 -> 0. Pair it with `assistant/sealed-fps.ts` (the lib loaded once, many files per run).
+**Two traps worth keeping**: (a) a corpus file with no `.errors.txt` baseline in this checkout counts as tsc-CLEAN, so our
+correct new errors show up as "false positives" -- always classify per line against real tsc, and run tsc from
+`tests/cases` with a relative path (an absolute path or a bad `--target` prints an option error that a line-anchored
+regex reads as "no errors", which misclassified all 25 entries once); (b) the survey compares cause rows by TEXT, so a
+reworded message (`bin._stream | Uint8Array | undefined` -> `Uint8Array | undefined`) reads as a NEW ERR row -- check the
+count, not the string.
+**Found and recorded, not fixed** (all in [[tison_workaround_inventory]]): `super` types as `any`; ts-parser drops a
+declared `this:` parameter; a class field typed only by its INITIALIZER reads as `any` (it silently cost two tests their
+discriminating power -- annotate fields in checker tests); `instanceof` does not strip `undefined`.
+
 ## Scope
 
 In: towasm.ts, checker.ts, type-utils.ts, walker.ts, transform.ts, tison.ts, ts-parser.ts,
