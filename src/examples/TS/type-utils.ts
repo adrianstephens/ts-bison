@@ -113,8 +113,18 @@ export function isLiteral<K extends keyof TypeOfMap>(t: Type|Expr, type: K): t i
 export function literalString(t: Type|Expr): string | undefined {
 	if (t.type !== 'literal')
 		return undefined;
-	const v = t.value as unknown;
-	return typeof v === 'string' ? v : Array.isArray(v) && v.every(p => !p.exp) ? v.map(p => p.str).join('') : undefined;
+	if (typeof t.value === 'string')
+		return t.value;
+	if (!Array.isArray(t.value))
+		return undefined;
+	const parts: readonly JS.TemplatePart<unknown>[] = t.value;
+	let text = '';
+	for (const p of parts) {
+		if (p.exp)
+			return undefined;
+		text += p.str;
+	}
+	return text;
 }
 
 // What `typeof` would report for a value of this type, or undefined when it can't be known statically --
