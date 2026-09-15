@@ -3191,7 +3191,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return undefined;
 	}
 
-	function matchObjectShape(e: JS.ObjectExpr<Type>, ctx: FunctionContext): ClassInfo | undefined {
+	function matchObjectShape(e: JS.ObjectExpr<Type>, ctx: FunctionContext, anon = true): ClassInfo | undefined {
 		// `props`: every key the literal PROVIDES, so a candidate's required fields can be satisfied by a
 		// spread. `explicit`: only the fields actually WRITTEN -- real TS never excess-property-checks a
 		// spread, so a spread's extra keys must not disqualify a candidate that lacks them.
@@ -3243,6 +3243,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// relies on. Also reached when the discriminant tiebreak below rules out every name-matching
 		// candidate (`matches.length === 0`) -- see `matchObjectShapeByType`'s own identical fallback for why.
 		const fallback = () => {
+			if (!anon)
+				return undefined;
 			const resolved = T.resolve(ctx.scope, checkerTypeOf(e, ctx.scope));
 			return resolved.type === 'object' && !indexSignatureValueType(resolved) ? ensureAnonObjectShape(resolved) : undefined;
 		};
@@ -6507,15 +6509,19 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// interface's "official" struct yet). Only once both give up does `matchObjectShape`'s own
 				// structural/discriminant match run (most commonly for a `REF_ANY` target, e.g. this literal
 				// is a generic callback's own return value, boxed as `any` per `typeOf`'s own union case).
-				const owner = (typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined)
+				// A DECLARED shape first, then the union-shaped path, and an anonymous shape only after both: a written
+				// discriminant whose value is a union of literals (`{ type: kind, ... }`, `kind: 'f' | 'c'`) fits no single
+				// member, and taken as anonymous it built a struct no reader of the union could ever test for.
+				const declared = (typeof want === 'object' && 'ref' in want ? ensureClass(want.ref) : undefined)
 					?? matchContextualUnionMember(e, ctx)
 					?? spreadOwner(e, ctx)
-					?? matchObjectShape(e, ctx);
-				if (!owner) {
+					?? matchObjectShape(e, ctx, false);
+				if (!declared) {
 					const variants = emitUnionShapedLiteral(e, ctx, want);
 					if (variants)
 						return variants;
 				}
+				const owner = declared ?? matchObjectShape(e, ctx);
 				if (!owner)
 					throw "an object literal needs a known target type (e.g. a 'const x: Point = {...}' with a plain 'type Point = {...}' alias) -- not supported here";
 

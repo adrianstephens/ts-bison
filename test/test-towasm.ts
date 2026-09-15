@@ -3836,6 +3836,27 @@ async function main() {
 	}
 
 	{
+		// A literal whose discriminant is a union of literals fits no single member, so no declared shape matched and
+		// the ANONYMOUS fallback won before the union-shaped path was ever tried: the value was built as a struct no
+		// reader of \`FT | CT\` tests for, and the first field read trapped in \`unreachable\`.
+		const { unionDiscriminantLiteral } = await compile(`
+			interface Base { a: number }
+			interface Sig extends Base { b?: number }
+			interface FT extends Sig { type: 'f' }
+			interface CT extends Sig { type: 'c' }
+			type Ty = FT | CT;
+			function inst(k: number): Sig { return { a: k }; }
+			function plain(kind: 'f' | 'c', k: number): Ty { return { type: kind, a: k }; }
+			function spread(kind: 'f' | 'c', k: number): Ty { return { type: kind, ...inst(k) }; }
+			export function unionDiscriminantLiteral(): number {
+				const x = plain('f', 3), y = spread('c', 4);
+				return x.a + (x.type === 'f' ? 10 : 0) + y.a * 100 + (y.type === 'c' ? 1000 : 0);
+			}
+		`);
+		check('a literal with a union discriminant builds one of the union members', unionDiscriminantLiteral(), 1413);
+	}
+
+	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
 		// takes: `statement` and `body` both lower to `(anyref?) => i32`, so `body`'s `x` became a `Stmt` and `Array.isArray(x)`
 		// narrowed it to `never` (walker.ts's `walkerB`). Only reachable where the checker left the arrows unannotated: an imported module.
