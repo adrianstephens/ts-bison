@@ -3714,6 +3714,35 @@ async function main() {
 	}
 
 	{
+		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
+		// takes: `statement` and `body` both lower to `(anyref?) => i32`, so `body`'s `x` became a `Stmt` and `Array.isArray(x)`
+		// narrowed it to `never` (walker.ts's `walkerB`). Only reachable where the checker left the arrows unannotated: an imported module.
+		const { importedContextual } = await compileMulti({
+			walk: `
+				interface A { type: 'a' }
+				type Stmt = A | string;
+				function isA(s?: Stmt): boolean { return typeof s === 'object' && s.type === 'a'; }
+				export interface Walker { statement: (x?: Stmt) => boolean; body: (x?: Stmt[] | number) => boolean }
+				export function makeWalker(): Walker {
+					const recurse: Walker = {
+						statement:	x => isA(x),
+						body:		x => Array.isArray(x) ? x.some(isA) : false,
+					};
+					return recurse;
+				}
+			`,
+			main: `
+				import { makeWalker } from './walk';
+				export function importedContextual(): number {
+					const w = makeWalker();
+					return (w.body(['s', { type: 'a' }]) ? 1 : 0) + (w.body(5) ? 10 : 0) + (w.body(['s']) ? 100 : 0) + (w.statement({ type: 'a' }) ? 1000 : 0);
+				}
+			`,
+		}, 'main');
+		check('closures sharing a physical signature keep their own contextual parameter types', importedContextual(), 1001);
+	}
+
+	{
 		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
 		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
 		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`

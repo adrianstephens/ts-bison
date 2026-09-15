@@ -1907,7 +1907,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	const anyKeyFuncs = new Map<'get' | 'set', FuncInfo>();
 
 	const closureLiterals: FuncInfo[] = [];
-	const closureWasmTypes	= new Map<string, WasmType>();	// The `{closure: FuncSig}` wrapper object itself, memoized per signature
 	const closureTypes		= new Map<string, ClosureTypeInfo>();
 	let closureCallTempCounter	= 0;
 
@@ -2686,11 +2685,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (sigs.every((s): s is FullSig => !!s)) {
 						const merged = mergeOverloadSigs(sigs);
 						if (merged) {
-							const key = `(${merged.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(merged.result)}${merged.hasRest ? '...' : ''}${merged.defaults.map(d => d ? `?${T.exprKey(d)}` : '.').join('')}`;
-							let wt = closureWasmTypes.get(key);
-							if (!wt)
-								closureWasmTypes.set(key, wt = { closure: merged });
-							return wt;
+							return { closure: merged };
 						}
 					}
 				}
@@ -2758,27 +2753,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (!parts)
 					throw `a function type has an unsupported return type: '${resolved.returnType ? T.typeKey(resolved.returnType) : 'void'}' in '${T.typeKey(resolved)}'`;
 				const { params, result, hasRest, defaults } = parts;
-				// `hasRest` folded into the memoization key too -- see `funcSigEq`'s own comment on why it's part
-				// of a closure's real type identity, not just incidental metadata. Which *positions* are
-				// omittable is folded in too (`defaults.map(...)`) -- two closure types can share an identical
-				// physical `WasmType` signature (a genuinely-nullable-but-required param and a truly optional
-				// one both widen to the same nullable wtype) while differing on whether a call site may omit
-				// the argument, so the physical signature alone isn't a safe cache key here. Each default's
-				// own TEXT is part of it as well, not just that a position has one: a call site synthesizes
-				// the omitted argument FROM this memoized signature, so `(a, by = 10)` and `(a, by = 10.5)`
-				// sharing an entry would silently hand one function the other's default.
-				// Parameter NAMES join the key only when a default reads one: `emitCallArgs` substitutes those
-				// references by name, so two otherwise-identical signatures whose parameters are named
-				// differently must not share an entry. Omitted otherwise, to keep the cache from fragmenting.
-				// Only a default that READS an earlier parameter makes names significant (`emitCallArgs`
-				// substitutes by name); folding them in always would fragment this cache for nothing.
-				const names = resolved.params.some(p => p.default && !isReemittableDefault(p.default))
-					? `[${parts.resolvedParams!.map(p => describeBinding(p.key)).join(',')}]` : '';
-				const key = `(${params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(result)}${hasRest ? '...' : ''}${defaults.map(d => d ? `?${T.exprKey(d)}` : '.').join('')}${names}`;
-				let wt = closureWasmTypes.get(key);
-				if (!wt)
-					closureWasmTypes.set(key, wt = { closure: { params, result, hasRest, defaults, resolvedParams: parts.resolvedParams, restElem: parts.restElem } });
-				return wt;
+				// Not memoized by physical signature: `resolvedParams` carries this signature's own TS types, and an unannotated
+				// closure parameter takes its type from them -- `(x?: Stmt) => boolean` and `(x?: Stmt[]) => boolean` share one physical shape.
+				return { closure: { params, result, hasRest, defaults, resolvedParams: parts.resolvedParams, restElem: parts.restElem } };
 			}
 		}
 		if (t.type === 'ref') {
