@@ -3701,6 +3701,19 @@ async function main() {
 	}
 
 	{
+		// `Object.is` is SameValue: `===` except that NaN equals itself and +0 differs from -0 -- decided at run time, since an
+		// operand is often a boxed union value (printer.ts's `Object.is(expr.value, -0)`).
+		const { objectIs } = await compile(`
+			function negZero(v: number | string): boolean { return Object.is(v, -0); }
+			export function objectIs(): number {
+				return (Object.is(-0, 0) ? 1 : 0) + (Object.is(NaN, NaN) ? 10 : 0) + (negZero(-0) ? 100 : 0) + (negZero(0) ? 1000 : 0)
+					+ (Object.is('a', 'a') ? 10000 : 0) + (negZero('x') ? 100000 : 0);
+			}
+		`);
+		check('Object.is: SameValue -- NaN, signed zero, a boxed union operand', objectIs(), 10110);
+	}
+
+	{
 		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
 		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
 		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`

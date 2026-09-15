@@ -1670,7 +1670,7 @@ function collectRangeWidenings(body: Stmt[], scope: Scope): Map<JS.Var<Type>, Ty
 // shape is recognized.
 // A call to one of `Object`'s compiler intrinsics (lib.d.ts's `declare var Object`): compiled by its own emitter, never
 // through `Object` as a value -- which has no runtime shape to build an owner from.
-const OBJECT_INTRINSICS = new Set(['entries', 'keys', 'values', 'defineProperty']);
+const OBJECT_INTRINSICS = new Set(['entries', 'keys', 'values', 'defineProperty', 'is']);
 function objectIntrinsic(e: Expr): string | undefined {
 	return e.type === 'call' && e.callee.type === 'member' && e.callee.object.type === 'identifier' && e.callee.object.name === 'Object'
 		&& OBJECT_INTRINSICS.has(e.callee.property) ? e.callee.property : undefined;
@@ -7543,7 +7543,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 									ctx.emit(I.call(ensureAnyDispatch(methodName, e.arguments.map(a => emitExpr(a, ctx)), e.arguments.map(a => narrowedTypeOf(a, ctx)), resultWtype, ctx).funcIndex));
 								});
 							}
-							throw `unknown method '${methodName}'`;
+							throw `unknown method '${methodName}' (its receiver's type: '${T.typeKey(narrowedTypeOf(objExpr, ctx)).slice(0, 160)}')`;
 						}
 						const objWtype = owner.thisWtype && typeof owner.thisWtype !== 'string' ? nullableWtype(owner.thisWtype) : physWtype;
 						const typeArgs = e.typeArgs;
@@ -7601,6 +7601,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const intrinsic = objectIntrinsic(e);
 						if (intrinsic === 'defineProperty')
 							return emitObjectDefineProperty(e.arguments, ctx);
+						// SameValue, decided at run time by typed lib code: an operand is often a boxed union value.
+						if (intrinsic === 'is')
+							return emitCall('__towasm_same_value', e.arguments, ctx);
 						if (intrinsic)
 							return emitObjectEntries(e.arguments, ctx, intrinsic as 'entries' | 'keys' | 'values');
 						// A namespace-import-qualified call (`NS.foo(...)`, `import * as NS from '...'`) into
@@ -7661,7 +7664,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							ctx.emit(...buildArm(0));
 							return result;
 						}
-						throw `unknown method '${e.callee.property}'`;
+						throw `unknown method '${e.callee.property}' (its receiver's type: '${T.typeKey(narrowedTypeOf(obj, ctx)).slice(0, 160)}')`;
 					}
 					// A method that reassigns `this` (`reassignsThis`/`assignsToThis`) needs its receiver's real
 					// physical lvalue -- `emitAssignTarget('keep')` pushes that value for the call and sets up the write-back, reusing the same machinery compound assignment/`++`/`--` use. `target.write` then consumes

@@ -598,3 +598,11 @@ export class Math {
 // The global functions JS defines as the same functions as `Number`'s.
 export function parseInt(s: string, radix?: number): number	{ return Number.parseInt(s, radix); }
 export function parseFloat(s: string): number				{ return Number.parseFloat(s); }
+
+// `Object.is` -- SameValue: `===`, except that NaN is itself and +0 and -0 differ. towasm lowers the intrinsic to this call;
+// the operands arrive boxed (printer.ts's `Object.is(expr.value, -0)` passes a union), so the number test is made at run time.
+export function __towasm_same_value(a: any, b: any): boolean {
+	if (typeof a === 'number' && typeof b === 'number')
+		return a === b ? (a !== 0 || 1 / a === 1 / b) : (a !== a && b !== b);
+	return a === b;
+}
