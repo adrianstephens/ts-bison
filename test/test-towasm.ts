@@ -3855,6 +3855,71 @@ async function main() {
 		`);
 		check('a literal with a union discriminant builds one of the union members', unionDiscriminantLiteral(), 1413);
 	}
+	{
+		// A namespace-qualified interface (`extends JS.CallSig<Type>`) was never identified with its own declaration:
+		// `ensureClassRef` followed a dotted name only to a class, so the base built as an anonymous stand-in, and the
+		// `everExtended` record kept the dotted spelling, so the real base's struct stayed final. Either way no subtype.
+		const { dottedInterfaceBase } = await compileMulti({
+			jsp: `
+				export interface Param<T> { name: string; typeAnnotation?: T }
+				export interface Params<T> { params: Param<T>[]; rest?: Param<T> }
+				export interface CallSig<T> extends Params<T> { returnType?: T }
+			`,
+			tsp: `
+				import * as JS from './jsp';
+				export interface FunctionType extends JS.CallSig<Type> { type: 'function' }
+				export interface ConstructorType extends JS.CallSig<Type> { type: 'constructor' }
+				export interface RefType { type: 'ref'; name: string }
+				export type Type = FunctionType | ConstructorType | RefType;
+				export function instantiate(k: number): JS.CallSig<Type> { return { params: [{ name: 'p' + k }] }; }
+			`,
+			main: `
+				import * as TS from './tsp';
+				import * as JS from './jsp';
+				function widen(c: TS.ConstructorType): number { const s: JS.CallSig<TS.Type> = c; return s.params.length; }
+				export function dottedInterfaceBase(): number {
+					const sig = TS.instantiate(2);
+					const lit = { type: 'function' as const, ...sig };
+					return sig.params.length + lit.params.length * 10 + widen({ type: 'constructor', params: [] }) * 100;
+				}
+			`,
+		}, 'main');
+		check('an interface extending a namespace-qualified interface is its wasm subtype', dottedInterfaceBase(), 11);
+	}
+
+	{
+		// Shapes were keyed by bare interface name, so common's `Member` and js-parser's own `Member` (which adds `optional?`)
+		// shared one struct once both were reachable: whichever was built first took the key, and the other's literal was
+		// checked against its fields. The declaring module is now part of the key (transform.ts's `patternBindings`).
+		const { sameNameShapes } = await compileMulti({
+			common: `
+				export interface Member<E> { type: 'member'; object: E; property: string }
+				export interface Index<E> { type: 'index'; object: E; index: E }
+			`,
+			jsp: `
+				import * as Common from './common';
+				export interface Lit { type: 'literal'; value: number }
+				export interface Member<T> extends Common.Member<Expr<T>> { optional?: boolean }
+				export interface Index<T> extends Common.Index<Expr<T>> { optional?: boolean }
+				export type Expr<T> = Member<T> | Index<T> | Lit;
+			`,
+			main: `
+				import * as JS from './jsp';
+				import * as Common from './common';
+				function prop(m: Common.Member<JS.Expr<Node>>): number { return m.property.length; }
+				function mk(object: JS.Expr<Node>, property: string, optional?: boolean): JS.Member<Node> { return { type: 'member', object, property, optional }; }
+				export function sameNameShapes(): number {
+					const lit: JS.Lit = { type: 'literal', value: 7 };
+					const c: Common.Member<JS.Expr<Node>> = { type: 'member', object: lit, property: 'abc' };
+					const first = prop(c);
+					const m = mk(lit, 'pq', true);
+					return first + prop(m) * 10 + (m.optional ? 100 : 0);
+				}
+			`,
+		}, 'main');
+		check('two modules declaring the same interface name keep their own shapes', sameNameShapes(), 123);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter

@@ -1908,6 +1908,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	const closureLiterals: FuncInfo[] = [];
 	const closureTypes		= new Map<string, ClosureTypeInfo>();
+	// Which DECLARATION each object shape was built from (`Scope.type`'s own entry, one object per
+	// declaration): two modules can declare the same name (`Common.Member` and js-parser's own `Member`,
+	// which adds `optional?`), and a shape keyed by name alone handed the second one the first's struct.
+	const shapeEntries		= new Map<ClassInfo, unknown>();
+	const shapeModuleTag	= new Map<unknown, string>();
+	const moduleTagOf = (name: string, entry: unknown): string => {
+		let tag = shapeModuleTag.get(entry);
+		if (tag === undefined) {
+			tag = '';
+			for (const [mod, body] of moduleBodies)
+				if (mod !== '.' && (body.scope as Scope | undefined)?.type(name) === entry) {
+					tag = mod;
+					break;
+				}
+			shapeModuleTag.set(entry, tag);
+		}
+		return tag;
+	};
+	// A hit on `name` that belongs to a DIFFERENT declaration of that name. Only a real type name can say so:
+	// `ensureClass` is also asked for a shape by its own key (`want.ref`), which names no declaration at all.
+	const otherDeclaration = (info: ClassInfo, name: string, declScope?: Scope): boolean => {
+		const asked = shapeEntries.has(info) ? (declScope ?? global).type(name) : undefined;
+		return !!asked && shapeEntries.get(info) !== asked;
+	};
 	let closureCallTempCounter	= 0;
 
 	let data				= new Uint8Array(0);
@@ -2599,7 +2623,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (dot > 0) {
 			const leaf	= t.name.slice(dot + 1);
 			const ns	= ((t.declScope as Scope | undefined) ?? global).lookupScope(t.name.slice(0, dot).split('.'));
-			if (ns?.decl(leaf)?.type === 'class_decl')
+			// A class by its declaration, an interface or alias by its TYPE entry (`JS.CallSig<Type>`): both resolve in the
+			// namespace's own scope, so the dotted and the bare spelling reach the one struct.
+			if (ns && (ns.decl(leaf)?.type === 'class_decl' || ns.type(leaf)))
 				return ensureClass(leaf, t.typeArgs, ns);
 		}
 		return ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
@@ -9686,7 +9712,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				args.push(ownsLayout(arg, scope) ? arg : p.constraint ?? T.ANY);
 			});
 		}
-		const key		= args.length ? `${name}<${args.map(a => layoutArgKey(a, scope)).join(',')}>` : name;
+		let key		= args.length ? `${name}<${args.map(a => layoutArgKey(a, scope)).join(',')}>` : name;
+		// Which MODULE declares the name is part of the key: two modules can declare the same one
+		// (`Common.Member` and js-parser's own `Member`, which adds `optional?`), and a shape keyed by
+		// name alone handed the second one the first's struct. The entry module and the lib keep bare keys.
+		const tag = moduleTagOf(name, entry);
+		if (tag)
+			key += `@${tag}`;
 		const existing	= classes.get(key);
 		if (existing)
 			return existing;
@@ -9728,6 +9760,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const shared		= classes.get(structural);
 		if (shared) {
 			classes.set(key, shared);
+			if (!shapeEntries.has(shared))
+				shapeEntries.set(shared, entry);
 			return shared;
 		}
 		// `interface X extends Y` puts Y's fields first, so X's struct can be a wasm SUBTYPE of Y's: an X then IS a Y.
@@ -9754,6 +9788,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			.map(f => TS.TypeProperty(f.name, hiddenFieldType(f.name), ['optional']));
 		const info		= buildObjectShape(key, base ? [...resolved.members, ...inherited].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name), shapeKey(resolved.members));
 		classes.set(structural, info);
+		shapeEntries.set(info, entry);
 		// Deferred: a shape merged into a twin could not take the supertype afterwards.
 		if (base && linkSupertype(info, base))
 			return info;
@@ -9881,6 +9916,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// its own template lives in `userGenericClassDecls`; each concrete instantiation is cached here
 		// lazily, by `ensureClass` itself, on first reference).
 		let info = classes.get(key);
+		if (info && otherDeclaration(info, name, declScope))
+			info = undefined;
 		if (info && info.typeIndex !== -1)
 			return info;
 
@@ -11916,7 +11953,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// An `extends`ed interface's shape must stay non-final, so the extending shape can name it as its supertype.
 	const markExtendedInterfaces = (body: readonly TS.Stmt[]): void => body.forEach(s => {
 		if (s.type === 'interface_decl')
-			s.extendsClause?.forEach(b => b.type === 'ref' && everExtended.add(b.name));
+			s.extendsClause?.forEach(b => b.type === 'ref' && everExtended.add(b.name.slice(b.name.lastIndexOf('.') + 1)));
 		else if (s.type === 'export_decl')
 			markExtendedInterfaces([s.declaration as TS.Stmt]);
 		else if (s.type === 'namespace_decl' || s.type === 'module_decl')
