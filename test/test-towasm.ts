@@ -3592,6 +3592,31 @@ async function main() {
 	}
 
 	{
+		// TS width subtyping: a value with every member of a structural shape IS one. wasm has no such subtyping -- a struct
+		// subtype's extra fields must FOLLOW the supertype's -- so a shape that receives another layout is stored as `any` and
+		// read dynamically (`openShapes`). A parameter is not such a slot: the callee monomorphizes (see `structuralParam`).
+		const { intoLocal, intoField, intoArray, twoLayouts } = await compile(`
+			interface Sig { params: number[] }
+			interface Meth { type: 'm'; key: string; params: number[] }
+			export function intoLocal(): number { const m: Meth = { type: 'm', key: 'k', params: [1, 2] }; const s: Sig = m; return s.params.length; }
+			export function intoField(): number { const m: Meth = { type: 'm', key: 'k', params: [1, 2] }; const h: { sig: Sig } = { sig: m }; return h.sig.params.length; }
+			export function intoArray(): number { const m: Meth = { type: 'm', key: 'k', params: [1, 2, 3] }; const a: Sig[] = [m]; return a[0].params.length; }
+			export function twoLayouts(): number {
+				const list: { sig: Sig; decl: Meth }[] = [];
+				const m: Meth = { type: 'm', key: 'k', params: [1] };
+				const s: Sig = { params: [2, 3] };
+				list.push({ sig: m, decl: m });
+				list.push({ sig: s, decl: m });
+				return list.length * 100 + list[0].sig.params.length * 10 + list[1].sig.params.length;
+			}
+		`);
+		check('a wider layout into a structural local', intoLocal(), 2);
+		check('a wider layout into a structural field', intoField(), 2);
+		check('a wider layout into a structural array element', intoArray(), 3);
+		check('one structural slot holding two layouts', twoLayouts(), 212);
+	}
+
+	{
 		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
 		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
 		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`

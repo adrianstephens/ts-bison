@@ -2660,6 +2660,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				break;
 			}
 			case 'object': {
+				if (openShapes.has(T.typeKey(resolved)))
+					return REF_ANY;
 				const vt	= indexSignatureValueType(resolved);
 				const cls	= vt && ensureClass('Map', [TS.RefType('string'), vt]);
 				if (cls)
@@ -3227,8 +3229,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// `new Set`: one `ClassInfo` can be reachable under more than one key (a named alias/interface and
 		// its structurally identical anonymous shape share one -- see `ensureObjectShape`), and counting it
 		// twice made the "exactly one candidate" test below fail for a shape that has exactly one.
+		// The field TYPES must accept this literal's own values, not just share their names -- the same check (and the same
+		// "unknown declared type is not judged" tolerance) `matchObjectShapeByType` makes against a type's members. Without
+		// it a literal matched any shape with the right names and then could not be stored in it (`{sig: Sig}` into `{sig: Meth}`).
+		const fits = (cls: ClassInfo) => [...explicit].every(k => {
+			const declared	= fieldDeclaredType(cls, k);
+			const value		= props.get(k);
+			return !declared || !value || T.isAssignable(checkerTypeOf(unwrapAs(value), ctx.scope), declared, ctx.typeScope);
+		});
 		const candidates = [...new Set(classes.values())].filter(cls =>
-			cls.typeIndex !== -1 && [...explicit].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
+			cls.typeIndex !== -1 && [...explicit].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional) && fits(cls)
 		);
 		if (candidates.length === 1)
 			return candidates[0];
@@ -3396,7 +3406,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// `ownerOf` for a value about to be indexed into (`e[i]`) via generic class-method dispatch (`Array<T>.get(i)`).
 	// The Array-at-`any` override below is DISABLED, same reason as `objectArrayKind`'s: an inner array is a real `Array<number>`.
+	// A value STORED as `any` has no statically bound members, whatever its checker type names -- an open shape
+	// (`openShapes`), or a genuinely dynamic value. Its members are reached by the runtime dispatchers instead.
+	function physicallyAny(e: Expr, ctx: FunctionContext): boolean {
+		const w = wtypeOf(e, ctx);
+		return typeof w === 'object' && !!w && 'ref' in w && w.ref === 'any';
+	}
+
 	function classOfForIndexing(e: Expr, ctx: FunctionContext): ClassInfo | undefined {
+		if (physicallyAny(e, ctx))
+			return undefined;
 		const cls = ownerOf(e, ctx);
 		//if (cls?.decl.name === 'Array' && e.type === 'index' && objectArrayKind(e.object, ctx) === 'ref')
 		//	return ensureClass('Array', [T.ANY]);
@@ -6234,8 +6253,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emit(I.struct.get(base, closureField!));
 						return 'u32';
 					}
-					// A genuinely dynamic receiver still has a real answer -- see `ensureAnyField`.
-					if (T.isAny(T.resolveOwn(narrowedTypeOf(e.object, ctx), ctx.typeScope))) {
+					// A genuinely dynamic receiver still has a real answer -- see `ensureAnyField`. One stored as `any` (an
+					// open shape) is the same question at run time, though its checker type names a shape.
+					if (T.isAny(T.resolveOwn(narrowedTypeOf(e.object, ctx), ctx.typeScope)) || physicallyAny(e.object, ctx)) {
 						emitAs(e.object, ctx, REF_ANY);
 						ctx.emit(I.call(ensureAnyField(e.property, ctx).funcIndex));
 						return REF_ANY_NULLABLE;
@@ -11049,6 +11069,106 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// wasm-GC has no way to change an allocated object's type, and `ref.cast` only TESTS one.
 	// Keyed by SHAPE, not by local, which is what makes a write through a PARAMETER work -- the object was
 	// allocated in some other function, or some other module, and the declaration site never sees it.
+	// TS width subtyping: `Meth` IS a `Sig` when it has every member of one. wasm has no such subtyping -- a struct subtype's
+	// extra fields must FOLLOW the supertype's, which no single ordering gives for several unrelated shapes -- so a shape that
+	// ever receives a value of another type is stored as `any`, its members read through the same dispatch an `any` gets.
+	const openShapes = new Set<string>();
+	function shapeIdentity(t: Type | undefined, scope: Scope): string | undefined {
+		const r = t && T.resolve(scope, t);
+		return r && r.type === 'object' ? T.typeKey(r) : undefined;
+	}
+	// A declared slot meeting a VALUE. An object/array literal has no layout of its own yet -- it is built AT the slot -- so
+	// only what it holds can widen anything, which is why this descends into one instead of comparing its inferred type.
+	// `erased`: the slot is an array ELEMENT, so it does not survive to the literal's emit site -- `Array<T>` collapses `T` to
+	// `any` -- and the literal builds its own shape instead of the slot's. Only then can a literal widen anything.
+	function noteSlot(slot: Type | undefined, value: Expr, scope: Scope, depth = 4, erased = false): void {
+		if (!slot || depth < 0)
+			return;
+		const s = T.resolve(scope, slot);
+		if (value.type === 'object' && s.type === 'object') {
+			for (const f of value.properties)
+				if (f.type === 'field' && typeof f.key === 'string' && f.value)
+					noteSlot(T.lookupMember(s, f.key, scope), f.value, scope, depth - 1);
+			// Literal types widened first, or every `const m: M = {...}` differs from `M` by its own `key: "k"` vs `string`.
+			if (erased)
+				noteTypes(slot, T.widenLiterals(checkerTypeOf(unwrapAs(value), scope)), scope, depth);
+			return;
+		}
+		if (value.type === 'array' && s.type === 'array') {
+			for (const el of value.elements)
+				if (el && el.type !== 'spread')
+					noteSlot(s.element, el, scope, depth - 1, true);
+			return;
+		}
+		noteTypes(slot, checkerTypeOf(unwrapAs(value), scope), scope, depth);
+	}
+	// The same question with no expression to descend: a value's TYPE meeting a slot's, member-wise and through elements.
+	function noteTypes(slot: Type | undefined, value: Type | undefined, scope: Scope, depth = 4): void {
+		if (!slot || !value || depth < 0)
+			return;
+		const s = T.resolve(scope, slot), v = T.resolve(scope, value);
+		if (T.typeKey(s) === T.typeKey(v))
+			return;
+		if (s.type === 'array' && v.type === 'array')
+			return noteTypes(s.element, v.element, scope, depth - 1);
+		if (s.type !== 'object')
+			return;
+		if (v.type === 'object')
+			for (const m of s.members)
+				if ((m.type === 'property' || m.type === 'method') && typeof m.key === 'string')
+					noteTypes(T.lookupMember(s, m.key, scope), T.lookupMember(v, m.key, scope), scope, depth - 1);
+		if (T.isAssignable(v, s, scope))
+			openShapes.add(T.typeKey(s));
+	}
+	function collectOpenShapes() {
+		for (const [moduleId, m] of moduleBodies) {
+			const modScope = moduleScopeOf(moduleId);
+			if (!modScope)
+				continue;
+			let scope = modScope;
+			walkerB(
+				(st, process) => {
+					const saved = scope;
+					scope = (st as unknown as { scope?: Scope }).scope ?? scope;
+					if (st.type === 'var_decl')
+						for (const d of st.declarations)
+							if (d.typeAnnotation && d.init)
+								noteSlot(d.typeAnnotation, d.init, scope);
+					const r = process(st);
+					scope = saved;
+					return r;
+				},
+				(e, process) => {
+					if (e.type === 'assign')
+						noteSlot(checkerTypeOf(unwrapAs(e.target), scope), e.value, scope);
+					// A plain call argument carries no contextual stamp this pass can read, so the parameter types come from
+					// the callee's own signature -- a rest parameter by its element type, which `push({ sig, decl })` needs.
+					else if (e.type === 'call') {
+						// A callee types either as a function or, for an overload set (`push`), as an object of `call` members.
+						// Every overload that could take this many arguments is noted: marking a shape open only costs speed.
+						const fn	= T.resolve(scope, checkerTypeOf(unwrapAs(e.callee), scope));
+						const sigs	= fn.type === 'function' ? [fn] : fn.type === 'object' ? fn.members.filter(m => m.type === 'call') : [];
+						for (const sig of sigs as TS.CallSig[]) {
+							if (!sig.rest && sig.params.length < e.arguments.length)
+								continue;
+							const restEl = sig.rest?.typeAnnotation && T.resolve(scope, sig.rest.typeAnnotation);
+							e.arguments.forEach((arg, i) => {
+								if (arg.type !== 'spread')
+								{
+									// A declared parameter is NOT a slot: the callee is monomorphized per argument layout, which keeps
+									// the caller's own object (test `structuralParam`). Only a rest parameter's bundle -- an array,
+									// so its element type is erased -- has to be widened.
+									if (!sig.params[i]?.typeAnnotation && restEl && restEl.type === 'array')
+										noteSlot(restEl.element, arg, scope, 4, true);
+								}
+							});
+						}
+					}
+					return process(e);
+				}).statements(m.body);
+		}
+	}
+
 	function collectExpandoFields() {
 		// A local's own declared ANNOTATION, by name. A PARAMETER types as its annotation already, but a
 		// `const p: P = {...}` types as the literal's own inferred shape -- the name is gone, and the name
@@ -11386,6 +11506,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			noteType(checkerTypeOf(e, s.scope), key, s.scope);
 		}
 	}
+	collectOpenShapes();
 	collectExpandoFields();
 
 	// Seed with every exported (real, user-level top-level) function and reserve every class name eagerly.
