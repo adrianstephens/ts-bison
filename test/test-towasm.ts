@@ -3968,6 +3968,20 @@ async function main() {
 		check('a nested function declaration types its returned literal by its declared return', nestedDeclaredReturn(), 2211);
 	}
 
+	{
+		// `object` had no built-in representation, so a generic closure bounded by it -- erased to that bound -- could not
+		// type its parameter (checker.ts's `<N extends object>(n: N) => Object.defineProperty(n, 'pos', ...)`).
+		const { objectBound } = await compile(`
+			interface Box { q: number }
+			export function objectBound(): number {
+				const at = <N extends object>(n: N): N => n;
+				const o = at<Box>({ q: 3 });
+				return o.q;
+			}
+		`);
+		check('a type parameter bounded by object erases to a reference', objectBound(), 3);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter

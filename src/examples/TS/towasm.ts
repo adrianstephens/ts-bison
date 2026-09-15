@@ -1454,6 +1454,9 @@ const builtinTypes = new Map<string, { wtype: WasmType; class?: string }>([
 	// checker's own `T.isAny` already treats the two alike), just without `any`'s implicit-assignability
 	// laxness on the *checking* side, which doesn't affect codegen at all.
 	['unknown',	{ wtype: REF_ANY_NULLABLE }],
+	// `object` is any non-primitive value and never null or undefined -- the same boxed storage as `any`, not nullable.
+	// Without it a type parameter bounded by `object` (`<N extends object>(n: N) => ...`, erased to its bound) had no representation.
+	['object',	{ wtype: REF_ANY }],
 	['boolean',	{ wtype: 'i32', 			class: 'Boolean' }],
 	['Boolean',	{ wtype: 'i32', 			class: 'Boolean' }],
 	['number',		{ wtype: 'f64', 			class: 'Number' }],
