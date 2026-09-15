@@ -3632,6 +3632,75 @@ async function main() {
 	}
 
 	{
+		// `Object.defineProperty` accessors (checker.ts's self-memoizing lazy types): a getter runs on every read until a later
+		// DATA definition replaces it; a setter runs on assignment; a spread copies the getter's VALUE, never the getter; and an
+		// accessor written as a METHOD closes over the same locals an arrow would -- mutations it makes are seen outside.
+		const { lazyGetter, plainStill, spreadGetter, methodGetterMemo, arrowGetterCount, methodGetterCount } = await compile(`
+			interface Prop { key: string; typeAnnotation: number }
+			interface Sig { returnType?: number }
+			export function lazyGetter(): number {
+				const box = { v: 1 };
+				const p: Prop = { key: 'k', typeAnnotation: 0 };
+				Object.defineProperty(p, 'typeAnnotation', { get: () => box.v, configurable: true, enumerable: true });
+				const first = p.typeAnnotation;
+				box.v = 5;
+				return first * 10 + p.typeAnnotation;
+			}
+			export function plainStill(): number { const q: Prop = { key: 'q', typeAnnotation: 7 }; return q.typeAnnotation; }
+			export function spreadGetter(): number {
+				const box = { v: 3 };
+				const p: Prop = { key: 'k', typeAnnotation: 0 };
+				Object.defineProperty(p, 'typeAnnotation', { get: () => box.v });
+				const c = { ...p };
+				box.v = 9;
+				return c.typeAnnotation;
+			}
+			export function methodGetterMemo(): number {
+				let calls = 0;
+				let resolving = false;
+				const sig: Sig = {};
+				Object.defineProperty(sig, 'returnType', {
+					configurable: true,
+					enumerable: true,
+					get(): number | undefined {
+						if (resolving)
+							return undefined;
+						resolving = true;
+						calls++;
+						sig.returnType = 42;
+						return sig.returnType;
+					},
+					set(value: number | undefined) {
+						Object.defineProperty(sig, 'returnType', { value, writable: true, configurable: true, enumerable: true });
+					},
+				});
+				const a = sig.returnType!, b = sig.returnType!;
+				return a + b + calls * 1000;
+			}
+			export function arrowGetterCount(): number {
+				let calls = 0;
+				const sig: Sig = {};
+				Object.defineProperty(sig, 'returnType', { get: () => { calls++; return 7; } });
+				const a = sig.returnType!, b = sig.returnType!;
+				return a + b + calls * 1000;
+			}
+			export function methodGetterCount(): number {
+				let calls = 0;
+				const sig: Sig = {};
+				Object.defineProperty(sig, 'returnType', { get() { calls++; return 7; } });
+				const a = sig.returnType!, b = sig.returnType!;
+				return a + b + calls * 1000;
+			}
+		`);
+		check('defineProperty: a getter is re-evaluated on every read', lazyGetter(), 15);
+		check('defineProperty: a field with no getter installed reads as before', plainStill(), 7);
+		check('defineProperty: a spread copies the getter value, not the getter', spreadGetter(), 3);
+		check('defineProperty: a setter redefining the key as data memoizes the getter', methodGetterMemo(), 1084);
+		check('defineProperty: an arrow getter mutates the locals it captures', arrowGetterCount(), 2014);
+		check('defineProperty: a method getter mutates the locals it captures', methodGetterCount(), 2014);
+	}
+
+	{
 		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
 		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
 		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`

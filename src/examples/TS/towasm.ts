@@ -1078,6 +1078,15 @@ function collectCapturedMutables(body: Stmt[]): Set<string> {
 				walkerB(undefined, (x, p) => { noteAssignExpr(x, assigned); return p(x); }).body(nested);
 				return false;
 			}
+			// An object literal's METHOD closes over this scope exactly as an arrow does -- a `defineProperty` accessor
+			// (`get() { resolving = true; ... }`) mutates the very locals it closes over, and a copy loses the write.
+			if (e.type === 'object')
+				for (const m of e.properties)
+					if (m.type === 'method' || m.type === 'get' || m.type === 'set') {
+						const nested = m.body ?? [];
+						collectFreeVars(ownBoundNames(paramNames(m.params, m.rest), nested, undefined), nested, captured);
+						walkerB(undefined, (x, p) => { noteAssignExpr(x, assigned); return p(x); }).statements(nested);
+					}
 			noteAssignExpr(e, assigned);
 			return process(e);
 		}
@@ -2366,6 +2375,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// `ensureClassExtension` reads this lazily, the first time this specific base class's own extension
 	// is ever needed, keyed the same bare-name way `everExtended` itself is.
 	const pendingExtensions = new Map<string, string[] | 'dynamic'>();
+	// `(shape or class name) -> keys` some `Object.defineProperty(x, 'k', { get })` turns into an ACCESSOR. Each gets a
+	// companion `#get:k` field holding the getter, which every read of `k` consults first (`emitFieldRead`).
+	const accessorKeys = new Map<string, Set<string>>();
 
 	// Whether *any* class textually declared anywhere in the program, transitively extending `className`,
 	// declares its own (non-static) `methodName` member -- decided purely from `directSubclasses` (whole-
@@ -4968,22 +4980,52 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const key = keyExpr.value;
 		if (descExpr.type !== 'object')
 			throw "'Object.defineProperty': the descriptor must be a literal object";
-		const valueProp = descExpr.properties.find((p): p is JS.Field<Type> => p.type === 'field' && p.key === 'value');
-		if (!valueProp?.value)
-			throw "'Object.defineProperty': only a plain value descriptor ({value: ...}) is supported, not an accessor (get/set) descriptor";
+		// Data (`value`) or an accessor (`get`/`set`, as arrow-valued fields or as methods). An accessor's halves land in the
+		// key's `#get:`/`#set:` companions (`accessorKeys`), which every read and write of the key consults first; a later DATA
+		// definition clears them, which is how a self-replacing lazy getter (`get() { ...; defineProperty(value) }`) memoizes.
+		const member	= (name: string) => descExpr.properties.find(p => (p.type === 'field' || p.type === 'method') && p.key === name);
+		const valueProp	= member('value'), getProp = member('get'), setProp = member('set');
+		const valueExpr	= valueProp?.type === 'field' ? valueProp.value : undefined;
+		if (valueProp && !valueExpr)
+			throw "'Object.defineProperty': a descriptor's `value` must be a plain property";
+		if (!valueExpr && !getProp && !setProp)
+			throw "'Object.defineProperty': the descriptor needs a `value`, a `get` or a `set`";
+		for (const p of [getProp, setProp])
+			if (p?.type === 'method' && walkerB(undefined, (x, process) => x.type === 'this' || process(x)).statements(p.body ?? []))
+				throw "'Object.defineProperty': an accessor method that uses `this` is not supported -- its `this` is the target, which a closure cannot bind";
+		// One accessor half: an arrow/function field as written, a method compiled as the closure it denotes.
+		const emitHalf = (p: NonNullable<typeof getProp>, want: WasmType) => {
+			if (p.type === 'method')
+				coerceTop(emitClosureLiteral(p, ctx, false, want), ctx, want);
+			else if (p.type === 'field' && p.value)
+				emitAs(p.value, ctx, want);
+			else
+				throw "'Object.defineProperty': an accessor must be a function";
+		};
 
 		// The target's own *real, physical* class -- not `ownerOf`'s checker-type-based resolution,
 		// which only ever sees the plain base class here: `case 'var_decl'`'s own extension redirect
 		// changes what this identifier's real wasm local physically is, not its checker-level TS type,
 		// which has no way to express that at all.
-		const local  = ctx.lookup(targetExpr.name);
-		const owner  = local && typeof local.wtype !== 'string' && 'ref' in local.wtype ? ensureClass(local.wtype.ref) : undefined;
+		// `resolvedWtype`, not `lookup`: the target may be CAPTURED by the closure this runs in (checker.ts's accessors redefine
+		// the `sig`/`prop` they close over), where it is a closure-env field rather than a real local.
+		const wt     = ctx.resolvedWtype(targetExpr.name);
+		const owner  = wt && typeof wt !== 'string' && 'ref' in wt ? ensureClass(wt.ref) : undefined;
 		// An erased receiver (a generic's `T`, `any`): the key's slot is on whichever structs reach it
 		// (`collectReceivedExpandos`), so the write dispatches on the runtime struct, as `(x as any).k = v` does.
-		if (!owner && local && typeof local.wtype !== 'string' && 'ref' in local.wtype && local.wtype.ref === 'any') {
-			emitAs(targetExpr, ctx, REF_ANY);
-			emitAs(valueProp.value, ctx, REF_ANY_NULLABLE);
-			ctx.emit(I.call(ensureAnyFieldWrite(key, ctx).funcIndex));
+		if (!owner && wt && typeof wt !== 'string' && 'ref' in wt && wt.ref === 'any') {
+			if (valueExpr) {
+				emitAs(targetExpr, ctx, REF_ANY);
+				emitAs(valueExpr, ctx, REF_ANY_NULLABLE);
+				ctx.emit(I.call(ensureAnyFieldWrite(key, ctx).funcIndex));
+			}
+			for (const [half, p, w] of [['get', getProp, getterWtype()], ['set', setProp, setterWtype()]] as const)
+				if (p) {
+					emitAs(targetExpr, ctx, REF_ANY);
+					emitHalf(p, w);
+					coerceTop(w, ctx, REF_ANY_NULLABLE);
+					ctx.emit(I.call(ensureAnyFieldWrite(`#${half}:${key}`, ctx).funcIndex));
+				}
 			return emitExpr(targetExpr, ctx);
 		}
 		if (!owner)
@@ -4991,14 +5033,36 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		const scratch = ctx.declareLocal(`$defineProperty$${closureCallTempCounter++}`, owner.thisWtype!);
 		emitAs(targetExpr, ctx, owner.thisWtype!);
-		ctx.emit(I.local.tee(scratch.index));
+		ctx.emit(I.local.set(scratch.index));
 
+		// An accessor sets both companions (a half not given is cleared, as JS makes it `undefined`); data clears whichever exist.
+		for (const [half, p] of [['get', getProp], ['set', setProp]] as const) {
+			const idx = owner.fieldIndex.get(`#${half}:${key}`);
+			if (idx === undefined) {
+				if (getProp || setProp)
+					throw `internal: '${owner.name}' has no ${half}ter slot for '${key}' -- every accessor target should have been collected`;
+				continue;
+			}
+			ctx.emit(I.local.get(scratch.index));
+			if (p && !valueExpr)
+				emitHalf(p, owner.fields[idx].wtype);
+			else
+				emitDefaultValue(owner.fields[idx].wtype, ctx);
+			ctx.emit(I.struct.set(owner.typeIndex, idx));
+		}
+		if (!valueExpr) {
+			ctx.emit(I.local.get(scratch.index));
+			return owner.thisWtype!;
+		}
+
+		// The receiver the field (or `#ext`) write below consumes -- it used to be left by a `local.tee`.
+		ctx.emit(I.local.get(scratch.index));
 		const fieldIdx = owner.fieldIndex.get(key);
 		if (fieldIdx !== undefined) {
 			// Already a real declared field -- inherited from the base, or one of this class's own
 			// synthesized extension fields (`ensureClassExtension`'s own comment); both are ordinary
 			// struct fields by this point, no distinction needed.
-			emitAs(valueProp.value, ctx, owner.fields[fieldIdx].wtype);
+			emitAs(valueExpr, ctx, owner.fields[fieldIdx].wtype);
 			ctx.emit(I.struct.set(owner.typeIndex, fieldIdx));
 		} else {
 			// The catch-all `Map<string, any>` extension field -- lazily allocated (nullable, see
@@ -5019,7 +5083,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const _allocBranch = ctx.swapOut();
 			ctx.emit(I.if(undefined, _cond, _allocBranch));
 			ctx.emit(I.local.get(scratch.index), I.struct.get(owner.typeIndex, extIdx), I.ref.as_non_null);
-			emitMethodCall(mapCls, 'set', [{ type: 'literal', value: key }, valueProp.value], ctx);
+			emitMethodCall(mapCls, 'set', [{ type: 'literal', value: key }, valueExpr], ctx);
 			ctx.emit(I.drop);
 		}
 		ctx.emit(I.local.get(scratch.index));
@@ -5196,8 +5260,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			ctx.emit(I.local.set(obj));
 			return {
 				wtype,
-				old:	captureOld(wtype, () => ctx.emit(I.local.get(obj), I.struct.get(cls.typeIndex, fieldIdx))),
-				write:	makeWrite(wtype, val => ctx.emit(I.local.get(obj), I.local.get(val), I.struct.set(cls.typeIndex, fieldIdx))),
+				old:	captureOld(wtype, () => { ctx.emit(I.local.get(obj)); emitFieldRead(cls, fieldIdx, ctx); }),
+				write:	makeWrite(wtype, val => emitFieldWrite(cls, fieldIdx, obj, val, wtype, ctx)),
 			};
 			
 		} else if (target.type == 'index') {
@@ -6205,8 +6269,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const physCls	= local && typeof local.wtype !== 'string' && 'ref' in local.wtype ? ensureClass(local.wtype.ref) : undefined;
 						const physIdx	= physCls?.fieldIndex.get(e.property);
 						if (physCls && physIdx !== undefined) {
-							ctx.emit(I.local.get(local!.index), I.struct.get(physCls.typeIndex, physIdx));
-							return physCls.fields[physIdx].wtype;
+							ctx.emit(I.local.get(local!.index));
+							return emitFieldRead(physCls, physIdx, ctx);
 						}
 						const extIdx = physCls?.fieldIndex.get('#ext');
 						if (physCls && extIdx !== undefined) {
@@ -6288,7 +6352,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					emitAs(e.object, ctx, objWtype);
 					const resultWtype = nullableWtype(fieldWtype);
 					return emitOptionalAccess(ctx, objWtype, resultWtype, objLocal => {
-						ctx.emit(I.local.get(objLocal), I.struct.get(cls.typeIndex, fieldIdx));
+						ctx.emit(I.local.get(objLocal));
+						emitFieldRead(cls, fieldIdx, ctx);
 						coerceTop(fieldWtype, ctx, resultWtype);
 					});
 				}
@@ -6296,7 +6361,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// `emitAs`, not a raw `emitExpr` -- `e.object` may itself be a ref-kind array element read,
 				// whose physical value is always boxed `anyref` -- `struct.get` needs the real narrowed `(ref cls)` first, or wasm validation rejects it. A no-op when already concretely typed (`coerceTop`'s short-circuit).
 				emitAs(e.object, ctx, { ref: cls.name });
-				ctx.emit(I.struct.get(cls.typeIndex, fieldIdx));
+				emitFieldRead(cls, fieldIdx, ctx);
 				return fieldWtype;
 			}
 
@@ -6611,7 +6676,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const readSpread = (src: FieldSource, name: string, want: WasmType): void => {
 					if (!src.unionCls) {
 						const idx = src.spreadCls!.fieldIndex.get(name)!;
-						ctx.emit(I.local.get(src.spreadLocal!.index), I.struct.get(src.spreadCls!.typeIndex, idx));
+						ctx.emit(I.local.get(src.spreadLocal!.index));
+						emitFieldRead(src.spreadCls!, idx, ctx);
 						coerceTop(src.spreadCls!.fields[idx].wtype, ctx, want);
 						return;
 					}
@@ -6625,7 +6691,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (idx === undefined) {
 							emitDefaultValue(want, ctx);
 						} else {
-							ctx.emit(I.local.get(src.spreadLocal!.index), I.ref.cast(m.typeIndex), I.struct.get(m.typeIndex, idx));
+							ctx.emit(I.local.get(src.spreadLocal!.index), I.ref.cast(m.typeIndex));
+							emitFieldRead(m, idx, ctx);
 							coerceTop(m.fields[idx].wtype, ctx, want);
 						}
 						return [..._cond, I.if(toValType(want), ctx.swapOut(), arm(i + 1))];
@@ -6639,7 +6706,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					ctx.emit(...arm(0));
 					ctx.emit(I.if(toValType(want), _then, ctx.swapOut(_old)));
 				};
+				// A spread copies VALUES: JS reads each property through [[Get]] into a plain data property, so an accessor's
+				// getter never carries over -- the key's own read (`emitFieldRead`) already called it, and the copy's slot stays empty.
+				const copiesGetter = (f: { name: string }) => f.name.startsWith('#get:') || f.name.startsWith('#set:');
 				const emitOne	= (src: FieldSource, f: { name: string; wtype: WasmType }) => {
+					if (!src.expr && copiesGetter(f))
+						return void emitDefaultValue(f.wtype, ctx);
 					if (src.expr) {
 						// The field's declared type is the value's context: a nested literal picks its union member from it.
 						withContext(ctx, fieldDeclaredType(owner, f.name), () => emitAs(src.expr!, ctx, f.wtype));
@@ -6649,6 +6721,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				};
 				// `last ?? (the one before it ?? ...)`, lowered exactly like the `??` operator itself.
 				const emitChain = (chain: FieldSource[], f: { name: string; wtype: WasmType }): void => {
+					if (copiesGetter(f))
+						return void emitDefaultValue(f.wtype, ctx);
 					const last = chain[chain.length - 1];
 					if (chain.length === 1 || certain(last, f.name))
 						return emitOne(last, f);
@@ -9346,6 +9420,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A field on the shape ITSELF, not on a subtype -- the decision is known before the type exists, so
 	// there is nothing to cast into and every instance simply has the slot.
 	function addExpandoFields(info: ClassInfo, name: string) {
+		for (const key of accessorKeys.get(name) ?? []) {
+			const slots: [string, WasmType][] = [[`#get:${key}`, getterWtype()], [`#set:${key}`, setterWtype()]];
+			for (const [slot, wtype] of slots)
+				if (!info.fieldIndex.has(slot)) {
+					info.fieldIndex.set(slot, info.fields.length);
+					info.fields.push({ name: slot, wtype, optional: true });
+				}
+		}
 		const spec = pendingExtensions.get(name);
 		if (!spec)
 			return;
@@ -9362,6 +9444,74 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (!info.fieldIndex.has(key))
 					addField(info, key, T.ANY, true);
 		}
+	}
+
+	// An accessor's halves as `Object.defineProperty` stores them: one canonical `() => any` getter and `(v: any) => void`
+	// setter, so every accessor slot of a kind shares one type whatever the descriptor's own closures declared.
+	function getterSig(): TS.FunctionType { return { type: 'function', params: [], returnType: T.ANY }; }
+	function setterSig(): TS.FunctionType { return { type: 'function', params: [{ key: 'v', typeAnnotation: T.ANY }], returnType: T.VOID }; }
+	function getterWtype(): WasmType { return nullableWtype(typeOf(getterSig())!); }
+	function setterWtype(): WasmType { return nullableWtype(typeOf(setterSig())!); }
+	// The TS type of a HIDDEN field (`#ext`, an accessor's `#get:`/`#set:` companion) -- named in one place, so a derived shape
+	// repeating its base's hidden fields repeats them exactly and stays that base's wasm subtype. Plain expandos are `any`.
+	function hiddenFieldType(name: string): Type {
+		return name === '#ext' ? TS.RefType('Map', [T.STRING, T.ANY])
+			: name.startsWith('#get:') ? getterSig()
+			: name.startsWith('#set:') ? setterSig()
+			: T.ANY;
+	}
+
+	// A field write; `obj`/`val` are locals holding the receiver and the value (typed `valWtype`). A key some `defineProperty`
+	// gave a setter (`accessorKeys`) has a `#set:k` companion: while that holds a setter the write CALLS it; otherwise the field.
+	function emitFieldWrite(cls: ClassInfo, idx: number, obj: number, val: number, valWtype: WasmType, ctx: FunctionContext): void {
+		const field	= cls.fields[idx];
+		const acc	= cls.fieldIndex.get(`#set:${field.name}`);
+		const plain	= () => {
+			ctx.emit(I.local.get(obj), I.local.get(val));
+			coerceTop(valWtype, ctx, field.wtype);
+			ctx.emit(I.struct.set(cls.typeIndex, idx));
+		};
+		if (acc === undefined)
+			return plain();
+		const setterW	= cls.fields[acc].wtype;
+		if (typeof setterW !== 'object' || !('closure' in setterW))
+			throw `internal: '${cls.name}'s '#set:${field.name}' is not a setter slot (${wasmTypeKey(setterW)})`;
+		const { funcTypeIndex, structTypeIndex } = ensureClosureType(setterW.closure);
+		const setter	= ctx.declareLocal(`$acc$set$${closureCallTempCounter++}`, setterW);
+		ctx.emit(I.local.get(obj), I.struct.get(cls.typeIndex, acc), I.local.tee(setter.index), I.ref.is_null);
+		const _old = ctx.swapOut();
+		plain();
+		const _plain = ctx.swapOut();
+		ctx.emit(I.local.get(setter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 1), I.local.get(val));
+		coerceTop(valWtype, ctx, setterW.closure.params[0]);
+		ctx.emit(I.local.get(setter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+		ctx.emit(I.if(undefined, _plain, ctx.swapOut(_old)));
+	}
+
+	// A field read, the receiver already on the stack. A field some `Object.defineProperty` gave a getter (`accessorKeys`) has
+	// a `#get:k` companion: while that holds a getter the read CALLS it, as JS reads an accessor property; otherwise the field.
+	function emitFieldRead(cls: ClassInfo, idx: number, ctx: FunctionContext): WasmType {
+		const field	= cls.fields[idx];
+		const acc	= cls.fieldIndex.get(`#get:${field.name}`);
+		if (acc === undefined) {
+			ctx.emit(I.struct.get(cls.typeIndex, idx));
+			return field.wtype;
+		}
+		const getterW	= cls.fields[acc].wtype;
+		if (typeof getterW !== 'object' || !('closure' in getterW))
+			throw `internal: '${cls.name}'s '#get:${field.name}' is not a getter slot (${wasmTypeKey(getterW)})`;
+		const { funcTypeIndex, structTypeIndex } = ensureClosureType(getterW.closure);
+		const obj		= ctx.declareLocal(`$acc$obj$${closureCallTempCounter++}`, nullableWtype(cls.thisWtype!));
+		const getter	= ctx.declareLocal(`$acc$get$${closureCallTempCounter++}`, getterW);
+		ctx.emit(I.local.tee(obj.index), I.struct.get(cls.typeIndex, acc), I.local.tee(getter.index), I.ref.is_null);
+		const _old = ctx.swapOut();
+		ctx.emit(I.local.get(obj.index), I.struct.get(cls.typeIndex, idx));
+		const _plain = ctx.swapOut();
+		ctx.emit(I.local.get(getter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 1),
+			I.local.get(getter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+		coerceTop(getterW.closure.result, ctx, field.wtype);
+		ctx.emit(I.if(toValType(field.wtype), _plain, ctx.swapOut(_old)));
+		return field.wtype;
 	}
 
 	function addField(info: ClassInfo, key: string, typeAnnotation?: Type, optional = false) {
@@ -9553,7 +9703,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// gains one would otherwise silently stop being this shape's wasm supertype.
 		const declared	= new Set(resolved.members.flatMap(m => 'key' in m && typeof m.key === 'string' ? [m.key] : []));
 		const inherited	= (base?.fields ?? []).filter(f => !declared.has(f.name))
-			.map(f => TS.TypeProperty(f.name, f.name === '#ext' ? TS.RefType('Map', [T.STRING, T.ANY]) : T.ANY, ['optional']));
+			.map(f => TS.TypeProperty(f.name, hiddenFieldType(f.name), ['optional']));
 		const info		= buildObjectShape(key, base ? [...resolved.members, ...inherited].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name), shapeKey(resolved.members));
 		classes.set(structural, info);
 		const baseType = base && types[base.typeIndex];
@@ -10461,7 +10611,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (idx !== undefined && cls.typeIndex !== -1) {
 					seen.add(heap);
 					candidates.push({ heap, read: () => {
-						dctx.emit(I.struct.get(cls.typeIndex, idx));
+						emitFieldRead(cls, idx, dctx);
 						coerceTop(cls.fields[idx].wtype, dctx, REF_ANY_NULLABLE);
 					} });
 				} else if (cls.getterNames?.has(name)) {
@@ -10568,13 +10718,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const value	= dctx.declareLocal('$value', REF_ANY_NULLABLE);
 
 			const seen = new Set<wasm.HeapType>();
-			const candidates: { heap: wasm.HeapType; typeIndex: number; index: number; wtype: WasmType }[] = [];
+			const candidates: { heap: wasm.HeapType; typeIndex: number; index: number; wtype: WasmType; cls: ClassInfo }[] = [];
 			for (const cls of classes.values()) {
 				const idx = cls.fieldIndex.get(name);
 				if (idx === undefined || cls.typeIndex === -1 || seen.has(cls.typeIndex))
 					continue;
 				seen.add(cls.typeIndex);
-				candidates.push({ heap: cls.typeIndex, typeIndex: cls.typeIndex, index: idx, wtype: cls.fields[idx].wtype });
+				candidates.push({ heap: cls.typeIndex, typeIndex: cls.typeIndex, index: idx, wtype: cls.fields[idx].wtype, cls });
 			}
 			if (!candidates.length)
 				throw `no reachable class declares a field '${name}' -- a dynamic write on 'any' needs at least one real candidate`;
@@ -10587,9 +10737,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const c = candidates[i];
 				dctx.emit(I.local.get(recv.index), I.ref.test(c.heap));
 				const _cond = dctx.swapOut();
-				dctx.emit(I.local.get(recv.index), I.ref.cast(c.heap), I.local.get(value.index));
-				coerceTop(REF_ANY_NULLABLE, dctx, c.wtype);
-				dctx.emit(I.struct.set(c.typeIndex, c.index));
+				// Through the candidate's own receiver type, so a key with a setter (`emitFieldWrite`) calls it here too.
+				const obj = dctx.declareLocal(`$wobj$${c.typeIndex}`, c.cls.thisWtype!);
+				dctx.emit(I.local.get(recv.index), I.ref.cast(c.heap), I.local.set(obj.index));
+				emitFieldWrite(c.cls, c.index, obj.index, value.index, REF_ANY_NULLABLE, dctx);
 				return [..._cond, I.if(undefined, dctx.swapOut(), buildArm(i + 1))];
 			}
 			dctx.emit(...buildArm(0));
@@ -10898,7 +11049,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (f.kind === 'getter')
 					emitMethodCall(f.cls, accessorKey('get', name), [], dctx);
 				else
-					dctx.emit(I.struct.get(f.cls.typeIndex, f.fieldIdx));
+					emitFieldRead(f.cls, f.fieldIdx, dctx);
 				coerceUnionArm(f.wtype, dctx, result);
 				return [..._cond, I.if(result === 'void' ? undefined : toValType(result), dctx.swapOut(), buildArm(i + 1))];
 			}
@@ -11226,7 +11377,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// array is `Array`'s. A shape with no name (an inline object type) or a type parameter has nowhere to put one.
 		// A structural shape (an interface, an alias, an inline object type) by its member names -- `shapeKey`, the
 		// identity `layoutTwin` merges by, so a named shape and its anonymous twin keep one layout. A class by name.
-		const noteType = (raw: Type, key: string | undefined, scope: Scope) => {
+		const noteType = (raw: Type, key: string | undefined, scope: Scope, accessor = false) => {
 			for (const member of T.unionMembers(raw, scope)) {
 				const part = member.type === 'array' || member.type === 'tuple' ? TS.RefType('Array') : member;
 				if (part.type === 'ref' && (T.isAny(part) || scope.type(part.name)?.isTypeParam))
@@ -11236,6 +11387,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const name		= shape ? shapeKey(shape.members) : part.type === 'ref' ? part.name : undefined;
 				if (!name)
 					continue;
+				if (accessor && key !== undefined)
+					(accessorKeys.get(name) ?? accessorKeys.set(name, new Set()).get(name)!).add(key);
 				const prior = pendingExtensions.get(name);
 				if (prior === 'dynamic')
 					continue;
@@ -11246,9 +11399,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 		};
 		// The RAW type, never `T.resolve`'s: resolving a ref expands it to its object shape and loses the NAME.
-		const note = (recv: Expr, key: string | undefined, scope: Scope) => {
+		const note = (recv: Expr, key: string | undefined, scope: Scope, accessor = false) => {
 			const bare = unwrapAs(recv);
-			noteType((bare.type === 'identifier' ? annots.get(bare.name) : undefined) ?? checkerTypeOf(bare, scope), key, scope);
+			noteType((bare.type === 'identifier' ? annots.get(bare.name) : undefined) ?? checkerTypeOf(bare, scope), key, scope, accessor);
 		};
 		for (const [moduleId, m] of moduleBodies) {
 			const modScope = moduleScopeOf(moduleId);
@@ -11273,8 +11426,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				(e, process) => {
 					if (e.type === 'assign' && e.target.type === 'member')
 						note(e.target.object, e.target.property, scope);
-					else if (isDefinePropertyCall(e) && e.arguments[0])
-						note(e.arguments[0], e.arguments[1]?.type === 'literal' && typeof e.arguments[1].value === 'string' ? e.arguments[1].value : undefined, scope);
+					else if (isDefinePropertyCall(e) && e.arguments[0]) {
+						const desc = e.arguments[2];
+						note(e.arguments[0], e.arguments[1]?.type === 'literal' && typeof e.arguments[1].value === 'string' ? e.arguments[1].value : undefined, scope,
+							desc?.type === 'object' && desc.properties.some(q => (q.type === 'field' || q.type === 'method') && (q.key === 'get' || q.key === 'set')));
+					}
 					return process(e);
 				}).statements(m.body);
 		}
