@@ -3746,6 +3746,19 @@ async function main() {
 	}
 
 	{
+		// A generic callee never took the structural path a plain one does: its parameter was substituted but not specialized,
+		// so a `Map` passed as `{ has(n: T): boolean }` needed a conversion that does not exist (checker.ts's `T.isRefOf(t, RANGES)`).
+		const { genericStructural } = await compile(`
+			function isIn<T extends string>(name: string, set: { has: (n: T) => boolean }): boolean { return set.has(name as T); }
+			const RANGES = new Map<string, number>([['a', 1], ['b', 2]]);
+			export function genericStructural(): number {
+				return (isIn('a', RANGES) ? 1 : 0) + (isIn('z', RANGES) ? 10 : 0) + (isIn('b', new Set(['b'])) ? 100 : 0);
+			}
+		`);
+		check('a generic callee specializes for a class-instance structural argument', genericStructural(), 101);
+	}
+
+	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
 		// takes: `statement` and `body` both lower to `(anyref?) => i32`, so `body`'s `x` became a `Stmt` and `Array.isArray(x)`
 		// narrowed it to `never` (walker.ts's `walkerB`). Only reachable where the checker left the arrows unannotated: an imported module.

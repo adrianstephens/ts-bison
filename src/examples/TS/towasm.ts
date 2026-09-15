@@ -4748,10 +4748,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// a `Param`): TS accepts it structurally and no conversion exists between two unrelated structs, so the callee is compiled
 	// once per concrete argument type, as a generic is. The same object goes in, not a copy.
 	function ensureStructuralInstance(name: string, decl: FunctionDecl, args: Expr[], ctx: FunctionContext, homeModule: string): FuncInfo | undefined {
-		if (!decl.body)
+		const params = decl.body && structuralParams(decl.params, args, ctx);
+		if (!params)
 			return undefined;
+		const key = structuralKey(name, params);
+		return funcs.get(homeKey(homeModule, key)) ?? compileFunc(key, { ...decl, params }, homeModule, name);
+	}
+
+	// `declared` with each parameter whose argument is a different struct retyped as that argument; `undefined` when none is.
+	function structuralParams(declared: JS.Param<Type>[], args: Expr[], ctx: FunctionContext): JS.Param<Type>[] | undefined {
 		let changed = false;
-		const params = decl.params.map((p, i) => {
+		const params = declared.map((p, i) => {
 			const arg = args[i];
 			// A literal is built AS the parameter's type (its context), and an index-signature parameter is a dynamic object read
 			// by key: neither is a struct to specialize for.
@@ -4765,10 +4772,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			changed = true;
 			return { ...p, typeAnnotation: narrowedTypeOf(arg, ctx) };
 		});
-		if (!changed)
-			return undefined;
-		const key = `${name}#struct<${params.map(p => p.typeAnnotation ? T.typeKey(p.typeAnnotation) : '_').join(',')}>`;
-		return funcs.get(homeKey(homeModule, key)) ?? compileFunc(key, { ...decl, params }, homeModule, name);
+		return changed ? params : undefined;
+	}
+
+	function structuralKey(name: string, params: JS.Param<Type>[]): string {
+		return `${name}#struct<${params.map(p => p.typeAnnotation ? T.typeKey(p.typeAnnotation) : '_').join(',')}>`;
 	}
 
 	// Dispatches every `builtins` entry, coercing args via `emitAs`; falls back to `ensureFunc` for a plain user-declared function not in `builtins` at all.
@@ -4826,7 +4834,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// touches WASI could be compiled at all.
 		const info = decl
 			? (decl.typeParams?.length
-				? ensureGenericFunc(name, decl, args, typeArgs, ctx.scope, expected, homeModule)
+				? ensureGenericFunc(name, decl, args, typeArgs, ctx, expected, homeModule)
 				: ensureStructuralInstance(name, decl, args, ctx, homeModule) ?? ensureFunc(name, decl, homeModule))
 			: funcs.get(name);
 		if (!info)
@@ -8785,12 +8793,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return inst;
 	}
 
-	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, homeModule = '.'): FuncInfo {
+	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, ctx: FunctionContext, expected?: Expected, homeModule = '.'): FuncInfo {
 		const typeParams	= decl.typeParams!;
-		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, scope, expected, decl.returnType as Type | undefined, decl.rest);
+		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, ctx.scope, expected, decl.returnType as Type | undefined, decl.rest);
+		// A class instance filling a structural parameter specializes the instantiation further, as it does a plain function.
+		const substituted	= decl.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p);
+		const structural	= decl.body && structuralParams(substituted, args, ctx);
 		// Bare (unmangled) composite key -- `compileFunc` applies `homeKey` itself when it caches, so this
 		// must match without a second wrapping here.
-		const key			= genericKey(name, typeParams, map, global);
+		const key			= structural ? structuralKey(genericKey(name, typeParams, map, global), structural) : genericKey(name, typeParams, map, global);
 		const existing		= funcs.get(homeKey(homeModule, key));
 		if (existing)
 			return existing;
@@ -8805,7 +8816,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (t.type === 'ref' && !t.typeArgs)
 					everExtended.add(t.name);
 		}
-		return compileFunc(key, instantiateDecl(decl, map, homeModule), homeModule, name)!;
+		const inst = instantiateDecl(decl, map, homeModule);
+		return compileFunc(key, structural ? { ...inst, params: inst.params.map((p, i) => structural[i] === substituted[i] ? p : structural[i]) } : inst, homeModule, name)!;
 	}
 
 	// `realName`: the function's own real, DECLARED name -- for a generic instantiation, `name` itself is
