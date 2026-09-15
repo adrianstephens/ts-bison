@@ -2055,11 +2055,21 @@ function matchInfer(pattern: Type, actual: Type, scope: Scope, out: Map<string, 
 		const named = actual.type === 'ref' && actual.typeArgs && actual.name === pattern.name ? actual
 			: a.type === 'ref' && a.typeArgs && a.name === pattern.name ? a
 			: undefined;
-		if (!named)
+		if (!named) {
+			// The pattern's own name may still describe a shape the actual can match: an interface or alias expands
+			// (`Term<infer U>` -> `{t: infer U}`), and the structural cases below then decide it properly. A class ref stays
+			// nominal through `resolve`, so this cannot loop. Without it a chain like `T extends Term<infer U> ? U : T extends
+			// (() => infer U) ? U : never` gave up at the FIRST branch (undecidable) instead of falling to the second.
+			const expanded = resolve(scope, pattern, depth - 1);
+			if (expanded.type !== 'ref' || expanded.name !== pattern.name)
+				return matchInfer(expanded, actual, scope, out, depth - 1);
 			// A resolved primitive (`string`, `number`, &c) can never structurally match a generic ref pattern
 			// like `PromiseLike<infer R>` -- no type arguments, no generic shape -- so this is a confident `false`,
-			// not the usual "differently-named, could still be an unresolved match" `undefined`.
-			return isPrimitive(a) ? false : undefined;
+			// not the usual "differently-named, could still be an unresolved match" `undefined`. A function type is the
+			// same answer for the same reason: it has no keyed members, and a class ref (kept nominal by `resolve`, so it
+			// never expanded above) is not something a function value is an instance of.
+			return isPrimitive(a) || a.type === 'function' || a.type === 'constructor' ? false : undefined;
+		}
 		return pattern.typeArgs.length === named.typeArgs!.length
 			&& pattern.typeArgs.every((p, i) => matchInfer(p, named.typeArgs![i], scope, out, depth - 1) !== false)
 			|| undefined;
@@ -2154,8 +2164,10 @@ function matchInfer(pattern: Type, actual: Type, scope: Scope, out: Map<string, 
 			}
 			if (m.type !== 'property' || typeof m.key !== 'string' || !containsInfer(m.typeAnnotation))
 				continue;
+			// A function/constructor type HAS no keyed members, so a required property is a confident miss -- same answer the
+			// absent-property case below gives. Anything else isn't a shape this can look a property up in at all.
 			if (!aMembers)
-				return undefined;	// `a` isn't a plain object/intersection -- can't look up a keyed property at all
+				return a.type === 'function' || a.type === 'constructor' ? (hasMod(m, 'optional') ? undefined : false) : undefined;
 			// `lookupMember` gets its own fresh budget, not `matchInfer`'s remaining `depth` -- unrelated recursions, same
 			// reasoning as `lookupMember`'s own `resolve()` call and `isAssignable`'s per-member `lookupMember` call.
 			const t = lookupMember(a, m.key, scope);

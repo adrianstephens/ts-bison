@@ -3617,6 +3617,21 @@ async function main() {
 	}
 
 	{
+		// A conditional chain whose first branch cannot match must fall through to the next, not give up: a function type
+		// against a class/interface pattern is "definitely not", where `matchInfer` used to answer "cannot tell" and leave
+		// the whole conditional unresolved -- which left the object literals in js-parser's grammar actions untypeable.
+		const { chainSecondBranch, chainRecursive } = await compile(`
+			interface Term<T> { t: T }
+			type E<T> = T extends Term<infer U> ? U : T extends (() => infer U) ? U : never;
+			type R<T> = T extends Term<infer U> ? U : T extends (() => infer U) ? R<U> : never;
+			export function chainSecondBranch(): number { const v: E<() => number> = 7; return v; }
+			export function chainRecursive(): number { const v: R<() => Term<number>> = 9; return v; }
+		`);
+		check('a conditional chain falls to its second branch', chainSecondBranch(), 7);
+		check('a conditional chain recurses through its second branch', chainRecursive(), 9);
+	}
+
+	{
 		// A nullable primitive's box IS an `anyref`, so it goes into an `any` slot as-is. It used to be unboxed on the way
 		// (`ref.as_non_null`), so one holding `undefined`/`null` trapped wherever it met `any` -- a local, an element, an argument.
 		const { nullableToAny, definedToAny, nullableIntoAnyArray, nullableAsAnyArg, boolNullToAny } = await compile(`
