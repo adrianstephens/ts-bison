@@ -3759,6 +3759,43 @@ async function main() {
 	}
 
 	{
+		// An interface extending one reached from the base's OWN field types (`CallSig.returnType: Type` is a union over
+		// `ConstructorType extends CallSig`) was laid out while that base was still building: it took the fields the base
+		// had then, and the base's own entry had no `final` yet, so it never became a wasm subtype of it -- ts-parser's
+		// `ConstructorType` was unconvertible to `CallSig` (28 declarations). `defineProperty` appends the base's accessor
+		// companions last, so the subtype must also be laid out again once the base is complete.
+		const { subtypeOfBuildingBase } = await compileMulti({
+			jsp: `
+				export interface Param<T> { name: string; typeAnnotation?: T }
+				export interface Params<T> { params: Param<T>[]; rest?: Param<T> }
+				export interface CallSig<T> extends Params<T> { returnType?: T }
+			`,
+			tsp: `
+				import * as JS from './jsp';
+				export type CallSig = JS.CallSig<Type>;
+				export interface FunctionType extends CallSig { type: 'function' }
+				export interface ConstructorType extends CallSig { type: 'constructor'; abstract?: boolean }
+				export interface RefType { type: 'ref'; name: string }
+				export type Type = FunctionType | ConstructorType | RefType;
+				export function makeSig(n: string): CallSig { return { params: [{ name: n }] }; }
+			`,
+			main: `
+				import * as TS from './tsp';
+				function widen(c: TS.ConstructorType): number { const s: TS.CallSig = c; return s.params.length; }
+				export function subtypeOfBuildingBase(): number {
+					const sig = TS.makeSig('a');
+					let calls = 0;
+					Object.defineProperty(sig, 'returnType', { get() { calls++; return { type: 'ref', name: 'r' } as TS.Type; } });
+					const seen = sig.returnType;
+					return widen({ type: 'constructor', params: [{ name: 'q' }, { name: 'r' }] })
+						+ (seen && seen.type === 'ref' && seen.name === 'r' ? 10 : 0) + calls * 100;
+				}
+			`,
+		}, 'main');
+		check('a subtype laid out inside its own base is still a wasm subtype of it', subtypeOfBuildingBase(), 112);
+	}
+
+	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
 		// takes: `statement` and `body` both lower to `(anyref?) => i32`, so `body`'s `x` became a `Stmt` and `Array.isArray(x)`
 		// narrowed it to `never` (walker.ts's `walkerB`). Only reachable where the checker left the arrows unannotated: an imported module.

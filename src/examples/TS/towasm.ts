@@ -9550,6 +9550,45 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// reasoning as `ensureClass`'s own placeholder-first ordering: a union type reachable again through one
 	// of its own members' fields (confirmed real: `Type`'s own recursive AST-node union in ts-parser.ts)
 	// finds `info` already in `classes` and returns immediately, well before this loop runs twice.
+	// `info`'s fields start with `base`'s, so its struct is a real wasm subtype of it. A base still being BUILT
+	// has no `final` yet (`buildObjectShape` writes its entry last) and its fields are still arriving, so the
+	// link waits for it: a base's own field type routinely reaches a subtype of it (`CallSig.returnType: Type`
+	// is a union over `ConstructorType extends CallSig`), which used to leave the subtype unlinked and
+	// `ConstructorType` unconvertible to `CallSig`. Answers whether it is now pending.
+	const pendingSupertypes = new Map<ClassInfo, ClassInfo[]>();
+	const subtypesOf		= new Map<ClassInfo, ClassInfo[]>();
+	function linkSupertype(info: ClassInfo, base: ClassInfo): boolean {
+		const baseType = types[base.typeIndex];
+		if (!baseType || !('final' in baseType)) {
+			pendingSupertypes.set(base, [...(pendingSupertypes.get(base) ?? []), info]);
+			return true;
+		}
+		if (!baseType.final && base.fields.every((f, i) =>
+			info.fields[i]?.name === f.name && !!info.fields[i].optional === !!f.optional && wasmTypeEq(info.fields[i].wtype, f.wtype))) {
+			info.superClass = base;
+			(types[info.typeIndex] as { supertypes: number[] }).supertypes = [base.typeIndex];
+			subtypesOf.set(base, [...(subtypesOf.get(base) ?? []), info]);
+		}
+		return false;
+	}
+
+	// Laid out again over a base that has since GAINED fields -- `addExpandoFields` appends its accessor
+	// companions last (`#get:returnType`, ts-parser's `CallSig`), well after a subtype reached from one of
+	// the base's own field types copied what the base had then. The subtype's own fields keep their order
+	// after the base's, so the base is an exact prefix again; a field it declares ITSELF must already agree.
+	function relayoutOverBase(info: ClassInfo, base: ClassInfo): void {
+		const inherited = new Map(base.fields.map(f => [f.name, f]));
+		if (!info.fields.every(f => !inherited.has(f.name)
+			|| (wasmTypeEq(f.wtype, inherited.get(f.name)!.wtype) && !!f.optional === !!inherited.get(f.name)!.optional)))
+			return;
+		info.fields		= [...base.fields.map(f => ({ name: f.name, wtype: f.wtype, optional: f.optional })), ...info.fields.filter(f => !inherited.has(f.name))];
+		info.fieldIndex	= new Map(info.fields.map((f, i) => [f.name, i]));
+		(types[info.typeIndex] as { type: { fields: { type: wasm.ValType; mut: boolean }[] } }).type.fields
+						= info.fields.map(f => ({ type: toValType(f.wtype), mut: true }));
+		linkSupertype(info, base);
+		(subtypesOf.get(info) ?? []).forEach(sub => relayoutOverBase(sub, info));
+	}
+
 	function buildObjectShape(key: string, members: TS.TypeMember[], thisTsType: Type, declName: string, everFinal: boolean, shape = shapeKey(members)): ClassInfo {
 		const info: ClassInfo = {
 			name:		key, thisTsType,
@@ -9590,6 +9629,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				fields: info.fields.map(f => ({ type: toValType(f.wtype), mut: true })),
 			}
 		};
+		const waiting = pendingSupertypes.get(info);
+		if (waiting) {
+			pendingSupertypes.delete(info);
+			waiting.forEach(w => relayoutOverBase(w, info));
+		}
 		return info;
 	}
 
@@ -9698,12 +9742,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			.map(f => TS.TypeProperty(f.name, hiddenFieldType(f.name), ['optional']));
 		const info		= buildObjectShape(key, base ? [...resolved.members, ...inherited].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name), shapeKey(resolved.members));
 		classes.set(structural, info);
-		const baseType = base && types[base.typeIndex];
-		if (base && baseType && 'final' in baseType && !baseType.final && base.fields.every((f, i) =>
-			info.fields[i]?.name === f.name && !!info.fields[i].optional === !!f.optional && wasmTypeEq(info.fields[i].wtype, f.wtype))) {
-			info.superClass = base;
-			(types[info.typeIndex] as { supertypes: number[] }).supertypes = [base.typeIndex];
-		}
+		// Deferred: a shape merged into a twin could not take the supertype afterwards.
+		if (base && linkSupertype(info, base))
+			return info;
 		return layoutTwin(info, key, structural);
 	}
 
