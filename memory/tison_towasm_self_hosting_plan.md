@@ -43,6 +43,12 @@ the next module-level statement was. The fixes were real; the multiplier was an 
   that crosses the wasm boundary unambiguously; string cases return `.length`).
 - **`assistant/corpus-ab.sh [base-rev]`** -- the checker A/B (see below).
 - **`tison/assistant/probe-decl.ts`** -- one declaration, seconds instead of ~10 min.
+- **`tison/assistant/parse-one.ts`** -- does tison's OWN parser read this file? Run it after every edit to a
+  surveyed file, towasm.ts included. Nothing else catches a parser gap: tsc accepts the file, and the suite,
+  difftest and corpus gate never parse it with tison's parser -- the survey does, and reports "does not parse",
+  dropping that file's whole declaration set (48 of them, 2026-09-14, 066d9b2). The construct that bit: a lone
+  spread in a parenthesized object literal, `l => ({ ...l })` -- a KNOWN js-parser gap documented above
+  `object_pattern`, ambiguous with its `'{' '...' IDENT '}'` rest-binding and not fixable by `ForceFork`.
 
 **Why difftest exists**: the two halves of the compiler were instrumented very unevenly --
 `test-ts-official` puts 13527 corpus files through the CHECKER and never calls `TStoWasm` at all, while
