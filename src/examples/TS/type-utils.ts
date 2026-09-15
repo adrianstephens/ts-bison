@@ -2576,8 +2576,10 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			return src.type === 'literal'
 				? src.value === dst.value
 				: !precise && src.type === 'ref' && dst.value !== null && src.name === typeof dst.value;	// widened source: lenient (inventory C1)
+		// A literal is never an array, and a type parameter is opaque; any other name still here could not be expanded, so stays unverifiable.
 		if (src.type === 'literal')
-			return dst.type === 'ref' && (!INTRINSIC_TYPES.has(dst.name) || dst.name === (src.value === null ? 'null' : typeof src.value));
+			return dst.type === 'ref' && (INTRINSIC_TYPES.has(dst.name) ? dst.name === (src.value === null ? 'null' : typeof src.value)
+				: dst.name !== 'Array' && dst.name !== 'ReadonlyArray' && !dstScope.type(dst.name)?.isTypeParam);
 
 		// `dst`/`src` can no longer be `'array'` here -- `normalizeArray` plus `resolve()` above already expanded that into the real
 		// lib.es5 structural body. Only tuple-vs-tuple is left to handle structurally.
