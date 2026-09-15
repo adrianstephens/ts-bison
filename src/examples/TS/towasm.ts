@@ -11067,7 +11067,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// runtime. Falls back to `REF_ANY` only if the property type genuinely couldn't be resolved here
 		// (shouldn't happen -- the one real call site already required `owners.every(o => ...)` to
 		// succeed, which needs the same property to exist on every member).
-		const result = resultTsType && typeOf(resultTsType) || REF_ANY;
+		// An OPTIONAL field may be absent, and the checker keeps optionality as a modifier rather than folding
+		// `| undefined` into the property's type (`addField`'s own comment) -- so the result is widened here the
+		// way `addField` widens the field itself, or each arm unboxed an absent `l.optional` with `ref.as_non_null`.
+		const declared	= resultTsType && typeOf(resultTsType) || REF_ANY;
+		const absent	= memberFields.some(f => f.kind === 'field' && f.cls.fields[f.fieldIdx].optional);
+		const result	= absent && declared !== 'void' ? nullableWtype(declared) : declared;
 		dctx.onReturn = plainReturn(result);
 
 		const { funcIndex, typeIndex } = registerFunc(toParams2([{ key: 'recv', wtype: REF_ANY, tsType: T.ANY }]), toResults(result));

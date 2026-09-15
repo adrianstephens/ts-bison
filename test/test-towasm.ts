@@ -3817,6 +3817,25 @@ async function main() {
 	}
 
 	{
+		// A union's field dispatch typed its result from the property's checker type alone -- `boolean` for `optional?:
+		// boolean` -- so each arm unboxed the stored nullable box with `ref.as_non_null`, and an omitted field trapped.
+		const { absentOptionalOnUnion } = await compile(`
+			interface Lit { type: 'literal'; value: number }
+			interface Member { type: 'member'; object: Lit; property: string; optional?: boolean }
+			interface Index { type: 'index'; object: Lit; index: Lit; optional?: boolean }
+			function chained(l: Member | Index): number { return l.optional ? 1 : 2; }
+			export function absentOptionalOnUnion(): number {
+				const lit: Lit = { type: 'literal', value: 7 };
+				const i: Index = { type: 'index', object: lit, index: lit };
+				const m: Member = { type: 'member', object: lit, property: 'p', optional: true };
+				const n: Member = { type: 'member', object: lit, property: 'q', optional: false };
+				return chained(i) + chained(m) * 10 + chained(n) * 100;
+			}
+		`);
+		check('an optional field read through a union may be absent', absentOptionalOnUnion(), 212);
+	}
+
+	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
 		// takes: `statement` and `body` both lower to `(anyref?) => i32`, so `body`'s `x` became a `Stmt` and `Array.isArray(x)`
 		// narrowed it to `never` (walker.ts's `walkerB`). Only reachable where the checker left the arrows unannotated: an imported module.
