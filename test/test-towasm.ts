@@ -3796,6 +3796,27 @@ async function main() {
 	}
 
 	{
+		// `wtypeOf` answers with the UNNARROWED type when the narrowed one is nullish -- and counted `void` as nullish.
+		// A call that yields nothing, whose receiver is only known by narrowing, then had to produce a boxed value, which
+		// the union-receiver dispatch compiling it never had (checker.ts's own `members.forEach(push)`, 31 declarations).
+		const { voidOnNarrowedUnion } = await compile(`
+			interface P { p: number }
+			interface Q { q: number }
+			export function voidOnNarrowedUnion(): number {
+				let out = 0;
+				const ps: P[] = [{ p: 1 }];
+				const qs: Q[] = [{ q: 2 }, { q: 3 }];
+				const xs: P[] | Q[] | undefined = ps.length > 2 ? ps : qs;
+				if (!xs)
+					return -1;
+				xs.forEach(() => { out++; });
+				return out;
+			}
+		`);
+		check('a void call on a receiver known only by narrowing', voidOnNarrowedUnion(), 2);
+	}
+
+	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
 		// takes: `statement` and `body` both lower to `(anyref?) => i32`, so `body`'s `x` became a `Stmt` and `Array.isArray(x)`
 		// narrowed it to `never` (walker.ts's `walkerB`). Only reachable where the checker left the arrows unannotated: an imported module.

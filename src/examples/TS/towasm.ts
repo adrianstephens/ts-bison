@@ -2807,8 +2807,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!T.isAny(base))
 			return typeOf(base);
 		// A narrowing to just null/undefined (`a = undefined`) says nothing about the slot, which is still `any`.
+		// `void` is not one of those: it is a real answer. A call that yields nothing (`u.forEach(...)`, whose
+		// receiver `ctx.scope` alone sees as possibly-undefined, so `base` is `any`) must stay `void`, or the
+		// union dispatch that compiles it asks every arm for a boxed value it never had.
 		const narrowed = narrowedTypeOf(e, ctx);
-		return typeOf(T.isNullish(narrowed, ctx.scope) ? base : narrowed);
+		const isVoid   = T.isRef(T.resolveOwn(narrowed, ctx.scope), 'void');
+		return typeOf(isVoid || !T.isNullish(narrowed, ctx.scope) ? narrowed : base);
 	}
 
 	// Like `checkerTypeOf(e, ctx.scope)`, but for a receiver whose *unnarrowed* type is a real union,
@@ -5530,8 +5534,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// `void` as `any` rather than reject otherwise-valid source.
 			const wt = annotated || ctx?.wtype;
 			const boxed = wt === 'void' ? REF_ANY : wt;
-			if (!boxed)
+			if (!boxed) {
+				if (process.env.SHOWPARAM) console.error(`PARAM '${describeBinding(p.key)}' of ${e.name ?? '<anon>'}: want=${want ? wasmTypeKey(want) : '-'} wantSig=${!!wantSig} fromWantTs=${ctx ? T.typeKey(ctx.tsType).slice(0, 100) : '-'} ann=${p.typeAnnotation ? T.typeKey(p.typeAnnotation).slice(0, 100) : '-'}`);
 				throw `closure parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
+			}
 			// A bare `p?: T` param here just needs a nullable physical slot to receive whatever a *caller*
 			// passes for an omitted argument -- omission itself is entirely the caller's own concern
 			// (`closureFuncSigType`'s `defaults`, built from the field/variable's own declared TYPE, not
