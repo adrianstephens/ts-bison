@@ -4144,7 +4144,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// string to exist at all. Leaves an `i32` on the stack; returns false (emitting nothing) when the tag
 	// has neither a static answer nor a physical form, so the caller falls through to its own error.
 	function emitTypeofTest(operand: Expr, tag: string, ctx: FunctionContext): boolean {
-		const t		= checkerTypeOf(unwrapAs(operand), ctx.scope);
+		const t		= narrowedTypeOf(operand, ctx);
 		const answer = (v: 0 | 1) => {
 			// Still evaluated, for its side effects, exactly as an expression statement would.
 			if (emitExpr(operand, ctx, 'void') !== 'void')
@@ -4203,7 +4203,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// tested (`emitTypeofTest`), 'object' last and untested, being the complement. A null slot is `null` or `undefined` by the
 	// type alone -- the two share one representation -- so a type admitting both cannot be answered.
 	function emitTypeofValue(operand: Expr, ctx: FunctionContext): WasmType {
-		const t			= checkerTypeOf(unwrapAs(operand), ctx.scope);
+		const t			= narrowedTypeOf(operand, ctx);
 		const members	= T.unionMembers(t, ctx.scope);
 		const hasNull	= members.some(m => T.isLiteral(m, 'null') || T.isRef(m, 'null'));
 		if (hasNull && members.some(m => T.isRef(m, 'undefined') || T.isRef(m, 'void')))
@@ -6819,7 +6819,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// A bare `typeof x` as a VALUE: the tag itself when the checker's type gives every inhabitant the same one, else a
 				// run-time cascade over the tags its type allows (`emitTypeofValue`).
 				if (e.operator === 'typeof') {
-					const known = T.typeofName(checkerTypeOf(unwrapAs(e.operand), ctx.scope), ctx.scope);
+					const known = T.typeofName(narrowedTypeOf(e.operand, ctx), ctx.scope);
 					if (known !== undefined) {
 						if (emitExpr(e.operand, ctx, 'void') !== 'void')
 							ctx.emit(I.drop);

@@ -3714,6 +3714,38 @@ async function main() {
 	}
 
 	{
+		// `typeof` asked the checker in the function's whole, unnarrowed scope: a field read off a union narrowed by its discriminant
+		// has no type there, so every tag was tested and a `null` field answered 'undefined' (checker.ts's `case 'literal'`).
+		const { typeofNarrowed } = await compile(`
+			interface L { type: 'l'; value: number | string | null | RegExp | number[] }
+			interface I { type: 'i'; name: string }
+			type E = L | I;
+			function kind(e: E): number {
+				switch (e.type) {
+					case 'l':
+						if (Array.isArray(e.value))
+							return 1;
+						switch (typeof e.value) {
+							case 'string':	return 2;
+							case 'number':	return 3;
+							case 'object':	return e.value === null ? 4 : 5;
+						}
+						break;
+					case 'i':	return 6;
+				}
+				return 7;
+			}
+			function tag(e: E): string { return e.type === 'l' ? typeof e.value : 'none'; }
+			export function typeofNarrowed(): number {
+				return kind({ type: 'l', value: [1] }) + kind({ type: 'l', value: 's' }) * 10 + kind({ type: 'l', value: 1 }) * 100
+					+ kind({ type: 'l', value: null }) * 1000 + kind({ type: 'l', value: /a/ }) * 10000 + kind({ type: 'i', name: 'x' }) * 100000
+					+ (tag({ type: 'l', value: null }) === 'object' ? 1000000 : 0);
+			}
+		`);
+		check('typeof: a field read off a discriminant-narrowed union', typeofNarrowed(), 1654321);
+	}
+
+	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
 		// takes: `statement` and `body` both lower to `(anyref?) => i32`, so `body`'s `x` became a `Stmt` and `Array.isArray(x)`
 		// narrowed it to `never` (walker.ts's `walkerB`). Only reachable where the checker left the arrows unannotated: an imported module.
