@@ -3920,6 +3920,30 @@ async function main() {
 		check('two modules declaring the same interface name keep their own shapes', sameNameShapes(), 123);
 	}
 
+	{
+		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
+		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
+		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').
+		const { overloadedImported } = await compileMulti({
+			tu: `
+				export interface NumRange { base: 'number' | 'bigint'; min?: number | bigint; max?: number | bigint; integer: boolean }
+				export function rangeToType(r: NumRange): number;
+				export function rangeToType(r?: NumRange): number | undefined;
+				export function rangeToType(r?: NumRange): number | undefined {
+					return r ? (r.integer ? 1 : 2) + (r.base === 'number' ? 10 : 20) : undefined;
+				}
+			`,
+			main: `
+				import * as T from './tu';
+				export function overloadedImported(): number {
+					const r: T.NumRange = { base: 'number', min: 0, max: 5, integer: true };
+					return T.rangeToType(r) + (T.rangeToType(undefined) ?? 100);
+				}
+			`,
+		}, 'main');
+		check('an imported overloaded function resolves its own parameter types', overloadedImported(), 111);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter

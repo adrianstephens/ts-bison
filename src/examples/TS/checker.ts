@@ -1275,8 +1275,15 @@ function hoist(stmts: Stmt[], scope: Scope) {
 			// The real, compilable implementation (the one non-bodyless declaration a real overload group
 			// always has) -- there's no single decl a bodyless *signature* alone could resolve to.
 			const impl = decls.find(d => d.body);
-			if (impl)
+			if (impl) {
+				// The IMPLEMENTATION's own annotations resolve in this module too -- only the signatures above were
+				// stamped, so a consumer reading the decl (towasm's `resolveParams`) looked an imported param type
+				// up in its own module instead, and had no wasm type for it.
+				impl.params.forEach(p => p.typeAnnotation && T.stampScope(p.typeAnnotation, scope));
+				if (impl.returnType)
+					T.stampScope(impl.returnType, scope);
 				scope.addDecl(name, impl);
+			}
 		} else {
 			const d = chosen[0];
 			const t = TS.FunctionType(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope));
