@@ -11932,7 +11932,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							const ft	= funcType(callee)!;
 							const base	= localCount(caller);
 							caller.body!.locals.push(...ft.params.map(p => ({ count: 1, type: valOf(p) })),
-								...callee.body!.locals.map(l => ({ ...l })));
+								// Written out rather than `{ ...l }`: a lone spread in a parenthesized literal is a known js-parser gap.
+								...callee.body!.locals.map(l => ({ count: l.count, type: l.type })));
 							for (let p = ft.params.length - 1; p >= 0; p--)
 								out.push(I.local.set(base + p));
 							out.push(I.block(ft.results.length ? valOf(ft.results[0]) : undefined, rebase(callee.body!.body as wasm.Instr[], base, 0)));
