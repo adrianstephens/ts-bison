@@ -11073,6 +11073,46 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// extra fields must FOLLOW the supertype's, which no single ordering gives for several unrelated shapes -- so a shape that
 	// ever receives a value of another type is stored as `any`, its members read through the same dispatch an `any` gets.
 	const openShapes = new Set<string>();
+	// Would these two types occupy the same wasm slot? Answered WITHOUT building a shape -- this runs before codegen -- by the
+	// same collapse `ensureClass` applies: a reference type argument erases, so `TemplatePart<unknown>` and `TemplatePart<Type>`
+	// are one layout (and widening one of them would leave its struct unbuilt, with nothing for a dynamic read to find).
+	function layoutSketch(t: Type | undefined, scope: Scope, depth = 3): string {
+		if (!t || depth < 0)
+			return 'any';
+		// A GENERIC's reference is sketched unresolved: `ensureClass` collapses reference type arguments, so
+		// `TemplatePart<unknown>` and `TemplatePart<Type>` are one instantiation, which substituting them apart would hide.
+		if (t.type === 'ref' && t.typeArgs?.length && !scope.type(t.name)?.isTypeParam)
+			return `${t.name}<${t.typeArgs.map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
+		const r = T.resolve(scope, t);
+		const members = T.unionMembers(r, scope).filter(m => !T.isNullish(m, scope));
+		// A union of references is one `anyref`, and so is `any`/`unknown`/`object` -- `TemplatePart<unknown>`'s `exp?` and
+		// `TemplatePart<Type>`'s (a union) are the same slot, while `Sig` and `Meth` are two distinct struct references.
+		if (members.length > 1)
+			return members.every(m => !!typeOfScalar(m, scope)) ? 'num' : 'any';
+		if (r.type === 'ref') {
+			if (T.isAny(r) || r.name === 'unknown' || r.name === 'object')
+				return 'any';
+			const scalar = typeOfScalar(r, scope);
+			return scalar ?? `${r.name}<${(r.typeArgs ?? []).map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
+		}
+		if (r.type === 'array' || r.type === 'tuple') {
+			// A tuple is an `Array` of its combined element type, which is a reference whenever the positions differ.
+			const el = r.type === 'array' ? r.element : T.ANY;
+			return `arr:${ownsLayout(el, scope) ? layoutSketch(el, scope, depth - 1) : 'ref'}`;
+		}
+		if (r.type === 'object')
+			return `{${r.members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string'
+				? [`${m.key}:${layoutSketch(T.lookupMember(r, m.key, scope), scope, depth - 1)}`] : []).sort().join(',')}}`;
+		return 'ref';
+	}
+	// `number`/`boolean` are the only types stored unboxed; everything else is one reference slot.
+	function typeOfScalar(t: Type, scope: Scope): string | undefined {
+		const r = T.resolve(scope, t);
+		return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean') ? r.name
+			: r.type === 'literal' ? (typeof r.value === 'number' ? 'number' : typeof r.value === 'boolean' ? 'boolean' : undefined)
+			: undefined;
+	}
+
 	function shapeIdentity(t: Type | undefined, scope: Scope): string | undefined {
 		const r = t && T.resolve(scope, t);
 		return r && r.type === 'object' ? T.typeKey(r) : undefined;
@@ -11117,7 +11157,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			for (const m of s.members)
 				if ((m.type === 'property' || m.type === 'method') && typeof m.key === 'string')
 					noteTypes(T.lookupMember(s, m.key, scope), T.lookupMember(v, m.key, scope), scope, depth - 1);
-		if (T.isAssignable(v, s, scope))
+		// An `any` value is the program's own promise about what it holds, kept by the `ref.cast` every read of one already
+		// emits -- widening on it would open nearly every shape, since `any` reaches everywhere.
+		if (T.isAny(v) || (v.type === 'ref' && v.name === 'unknown'))
+			return;
+		// Only a value of a genuinely different LAYOUT widens: two types that share one are already interchangeable.
+		if (layoutSketch(s, scope) !== layoutSketch(v, scope) && T.isAssignable(v, s, scope))
 			openShapes.add(T.typeKey(s));
 	}
 	function collectOpenShapes() {
