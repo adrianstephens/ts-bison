@@ -1754,12 +1754,25 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					}
 					members.push(m);
 				};
+				// An interface that EXTENDS another resolves to an INTERSECTION, never a plain object (ts-parser's
+				// `CallSig`, spread by `checkCall`'s own `settle`): each part contributes its members, a later
+				// part winning as spreading each in turn would. `undefined` where they aren't determinable.
+				const intersectionMembers = (t: Type, depth = 4): TS.TypeMember[] | undefined => {
+					if (!depth)
+						return undefined;
+					const parts = T.flattenIntersection(t, scope).map(x => {
+						const r = T.resolveMembers(x, scope);
+						return r.type === 'object' ? r.members : r.type === 'intersection' ? intersectionMembers(r, depth - 1) : undefined;
+					});
+					return parts.every(m => !!m) ? parts.flat() as TS.TypeMember[] : undefined;
+				};
 				for (const p of e.properties) {
 					if (p.type === 'spread') {
-						const t = T.resolveOwn(recurse(p.operand), scope);
-						if (t.type !== 'object')
+						const t		 = T.resolveOwn(recurse(p.operand), scope);
+						const members = t.type === 'object' ? t.members : t.type === 'intersection' ? intersectionMembers(t) : undefined;
+						if (!members)
 							return T.ANY;	// not a determinable object shape -- shape unknowable here, as before
-						t.members.forEach(push);
+						members.forEach(push);
 					} else {
 						// A `satisfies`/annotated-`var_decl` `expected` type propagates member-by-member: an unannotated arrow/method
 						// value (`{read: (pe, data) => ...}`) otherwise types its own params as `any`, same gap `applyContextualParams`

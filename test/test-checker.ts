@@ -124,6 +124,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a literal index path narrows its reads',	'declare const args: [{ a: 1 }] | [number[]]; if (Array.isArray(args[0])) { const q: number[] = args[0]; }', []],
 	['null is not an array',					'const c: number[] = null;', [NOT_ASSIGNABLE('null', 'number[]')]],
 	["an array guard's false branch keeps null",	'declare const v: number | null | RegExp | string[]; if (!Array.isArray(v) && typeof v === "object") { const q: RegExp = v; }', [NOT_ASSIGNABLE('null | RegExp', 'RegExp')]],
+	['a spread of an interface that extends another keeps its shape',	'interface B { b: number } interface D extends B { d: number } declare const d: D; const o = { ...d, e: 1 }; const q: string = o.b;', [NOT_ASSIGNABLE('number', 'string')]],
 	['an assignment target is its declared type', 'let x: { o: boolean } = { o: false }; if (x["o"] === false) { x["o"] = true; } const y: [number, number] = [0, 0]; if (y[0] === 0) { y[0] = -1; }', []],
 	// literal freshness: only a literal written as an expression widens (TS's fresh vs regular literal types)
 	['a declared literal stays literal',	'declare const c: "this"; const a = [c]; const q: boolean = a; declare const k: { kind: "a" | "b" }; let s = k.kind; s = "c";', [NOT_ASSIGNABLE('"this"[]', 'boolean'), "Type '\"c\"' is not assignable to type '\"a\" | \"b\"'"]],
