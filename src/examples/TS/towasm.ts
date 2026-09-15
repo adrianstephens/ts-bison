@@ -5640,7 +5640,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// The checker's own contextual type wins: it saw the chosen OVERLOAD, where `ctx` only has the implementation's.
 		const contextFn		= (e as { contextualType?: Type }).contextualType ?? ctx.contextualReturn;
 		const fnContext		= contextFn && T.resolve(ctx.typeScope, contextFn);
-		const returnContext	= fnContext?.type === 'function' ? fnContext.returnType : undefined;
+		// This function's OWN declared return type is the literal's context: `return { type: kind, ...sig }` against a
+		// declared union picks the member it names (`matchContextualUnionMember`), where an untargeted literal matches
+		// every same-shaped class in the program and shape matching then refuses to guess.
+		const returnContext	= (e.returnType as Type | undefined) ?? (fnContext?.type === 'function' ? fnContext.returnType : undefined);
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 		const { funcIndex, typeIndex }	= registerFuncAtType(funcTypeIndex);
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex };

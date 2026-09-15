@@ -3944,6 +3944,30 @@ async function main() {
 		check('an imported overloaded function resolves its own parameter types', overloadedImported(), 111);
 	}
 
+	{
+		// A nested FUNCTION DECLARATION's own declared return type was never its returned literal's context (a `const` arrow
+		// got one through the variable), so `return { type: kind, ...sig(k) }` against `Ty` matched every same-shaped class
+		// in the program -- here `FunctionExpr` too -- and shape matching refused to guess (checker.ts's `recurseUncached`).
+		const { nestedDeclaredReturn } = await compile(`
+			interface Params { params: number[]; rest?: number; declScope?: number; pos?: number; typeParams?: number[]; scope?: number; pure?: boolean }
+			interface CallSig extends Params { returnType?: number }
+			interface FunctionType extends CallSig { type: 'function' }
+			interface ConstructorType extends CallSig { type: 'constructor' }
+			interface RefType { type: 'ref'; name: string }
+			type Ty = FunctionType | ConstructorType | RefType;
+			interface FunctionExpr extends CallSig { type: 'function'; body?: number }
+			function sig(k: number): CallSig { return { params: [k] }; }
+			function other(f: FunctionExpr): number { return f.params.length; }
+			export function nestedDeclaredReturn(): number {
+				function rebuild(kind: 'function' | 'constructor', k: number): Ty { return { type: kind, ...sig(k) }; }
+				const f = rebuild('function', 3), c = rebuild('constructor', 4);
+				const n = (t: Ty) => t.type === 'ref' ? 0 : t.params.length;
+				return (f.type === 'function' ? 1 : 0) + (c.type === 'constructor' ? 10 : 0) + (n(f) + n(c)) * 100 + other({ type: 'function', params: [1, 2] }) * 1000;
+			}
+		`);
+		check('a nested function declaration types its returned literal by its declared return', nestedDeclaredReturn(), 2211);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
