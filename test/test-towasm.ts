@@ -4029,6 +4029,22 @@ async function main() {
 		check('a statement assigning a narrowed name still reads it narrowed', narrowedThenAssigned(), 7);
 	}
 
+	{
+		// The lib declared Number.isInteger/isNaN/isSafeInteger/isFinite as taking a number, but TS declares them over
+		// unknown and answers false for anything else -- so checker.ts own `Number.isInteger(v)` on a `string | number |
+		// bigint` value was rejected outright (35 declarations).
+		const { numberStatics } = await compile(`
+			export function numberStatics(): number {
+				const v: string | number | boolean = 4;
+				const w: string | number | boolean = 'x';
+				return (Number.isInteger(v) ? 1 : 0) + (Number.isInteger(w) ? 10 : 0)
+					+ (Number.isFinite(v) ? 100 : 0) + (Number.isNaN(w) ? 1000 : 0)
+					+ (Number.isSafeInteger(v) ? 10000 : 0);
+			}
+		`);
+		check('Number statics accept any value and answer false for non-numbers', numberStatics(), 10101);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter

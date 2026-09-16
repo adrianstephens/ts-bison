@@ -248,12 +248,12 @@ export class Number {
     static readonly POSITIVE_INFINITY	= 0;
 
 	// `x === Math.floor(x)` alone is true for the infinities, which JS says are not integers.
-	static isInteger(x: number): boolean		{ return Number.isFinite(x) && x === Math.floor(x); }
-	static isNaN(x: number): boolean			{ return x !== x; }
+	static isInteger(x: unknown): boolean		{ return typeof x === 'number' && Number.isFinite(x) && x === Math.floor(x); }
+	static isNaN(x: unknown): boolean			{ return typeof x === 'number' && x !== x; }
 	// An INTEGER within the safe range, inclusive: the magnitude test alone called `1.5` safe and
 	// `MAX_SAFE_INTEGER` itself unsafe.
-	static isSafeInteger(x: number): boolean	{ return Number.isInteger(x) && Math.abs(x) <= Number.MAX_SAFE_INTEGER; }
-	static isFinite(x: number): boolean			{ return Math.abs(x) < Infinity; }
+	static isSafeInteger(x: unknown): boolean	{ return typeof x === 'number' && Number.isInteger(x) && Math.abs(x) <= Number.MAX_SAFE_INTEGER; }
+	static isFinite(x: unknown): boolean		{ return typeof x === 'number' && Math.abs(x) < Infinity; }
 
 	// Leading whitespace is skipped by both, per JS. Only here, not inside `getInt`/`getFloat`
 	// themselves -- `getInt` also reads a float's exponent, where `1e 5` is not `1e5`.
