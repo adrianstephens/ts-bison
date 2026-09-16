@@ -1794,8 +1794,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// That module's own scope, straight off its record -- the entry's from its own `Program`, an imported
 	// one put there by `makeScope` from `exportScope`'s `inner` (see `compileFunc`'s own note on why a
 	// module body needs one at all).
-	function moduleScopeOf(homeModule: string): Scope | undefined {
-		return homeModule === '.' ? global : moduleBodies.get(homeModule)?.scope as Scope | undefined;
+	// `homeModule` is optional on a `ClassInfo` (a lib/synthesized class has none), and "no module" and
+	// "a module with no scope yet" both mean the same thing to every caller: fall back to your own.
+	function moduleScopeOf(homeModule: string | undefined): Scope | undefined {
+		return homeModule === undefined ? undefined : homeModule === '.' ? global : moduleBodies.get(homeModule)?.scope as Scope | undefined;
 	}
 
 	// Where each module really lives -- `collectModules` puts it on the record, and the ENTRY's own comes
