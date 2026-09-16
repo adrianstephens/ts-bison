@@ -4076,6 +4076,21 @@ async function main() {
 		check('an alias of a generic interface shares its target shape', aliasOfGenericInterface(), 11);
 	}
 
+	{
+		// `'k' in x` over a value typed as a BASE that does not declare the key: the runtime struct decides, since it
+		// may be a subtype that does -- and the read the narrowing then allows (`c.type`) is answered the same way.
+		// Both used to be refused outright (checker.ts's own `'type' in c && c.type === 'class_decl'`, 31 declarations).
+		const { inOnBaseTyped } = await compile(`
+			interface Base { body: number[] }
+			interface Decl extends Base { type: 'class_decl'; name: string }
+			function decl(n: number): Decl { return { type: 'class_decl', name: 'A', body: [n] }; }
+			function plain(n: number): Base { return { body: [n, n] }; }
+			function kind(c: Base): number { return 'type' in c && c.type === 'class_decl' ? c.body.length : -1; }
+			export function inOnBaseTyped(): number { return kind(decl(3)) + kind(plain(1)) * 10; }
+		`);
+		check('in over a base-typed value tests the runtime shape', inOnBaseTyped(), -9);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter

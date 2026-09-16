@@ -6349,6 +6349,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emit(I.call(ensureAnyField(e.property, ctx).funcIndex));
 						return REF_ANY_NULLABLE;
 					}
+					// A field the receiver's own shape does not declare, but its NARROWED type does (`'type' in c` narrows
+					// `c` to a `Class` that has one): the runtime struct decides, exactly as `in` itself answered. Only
+					// when the narrowing ADDED it -- a field missing from the declared type too is still an honest error.
+					const refined = ctx.stmtScope && checkerTypeOf(unwrapAs(e.object), ctx.stmtScope);
+					if (refined && T.lookupMember(refined, e.property, ctx.typeScope)
+						&& !T.lookupMember(checkerTypeOf(unwrapAs(e.object), ctx.scope), e.property, ctx.typeScope)) {
+						emitAs(e.object, ctx, REF_ANY);
+						ctx.emit(I.call(ensureAnyField(e.property, ctx).funcIndex));
+						return REF_ANY_NULLABLE;
+					}
 					throw `unknown field '${e.property}'`;
 				}
 				const fieldWtype = cls.fields[fieldIdx].wtype;
@@ -7224,8 +7234,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						}
 						const cls = ownerOf(right, ctx);
 						if (!cls?.methodDecls.get('has')) {
-							// A genuinely dynamic receiver still has a real answer -- see `ensureAnyIn`.
-							if (key !== undefined && T.isAny(checkerTypeOf(unwrapAs(right), ctx.scope))) {
+							// The runtime struct decides: a value typed as a BASE (`TS.Class`) may be a subtype that declares
+							// the key (`ClassDecl`), and a dynamic receiver has no static shape at all -- `ensureAnyIn`'s
+							// `ref.test` over every shape declaring it answers both. A scalar or array receiver has no such
+							// test and still says so, rather than answering a silent `false`.
+							const recvWtype = key === undefined ? undefined : wtypeOf(right, ctx);
+							if (key !== undefined && recvWtype && typeof recvWtype === 'object' && 'ref' in recvWtype) {
 								emitAs(right, ctx, REF_ANY_NULLABLE);
 								ctx.emit(I.call(ensureAnyIn(key).funcIndex));
 								return 'i32';
