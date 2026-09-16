@@ -6,7 +6,9 @@
 - [src/examples needs its own tsconfig](feedback_tison_examples_needs_own_tsconfig.md) — RECURRED 2×: always spell out `cd src/examples && tsc -p .`
 - [no JSON.stringify on AST/Type](feedback_no_json_stringify_ast.md) — bigints throw; print with `T.typeKey` / `T.exprKey` / `T.stmtKey`
 - [no unimplemented-throws tests](feedback_no_unimplemented_throws_tests.md) — `checkThrows` is for permanent enforced behavior only
-- [two-tier gates](feedback_two_tier_gates.md) — fast gates while iterating, full set once before the commit; measured 10.1 gate runs per commit, survey ~3× more than its delta means
+- [SESSION HANDOFF](tison_session_handoff.md) — **read this at cold start**, before the 2233-line plan: live row state, what's deliberately unfixed, what the user hasn't decided
+- [session boundaries](feedback_session_boundaries.md) — when the user asks "continue or start fresh?", recommend; default fresh after a committed fix, always after a compaction
+- [two-tier gates](feedback_two_tier_gates.md) — fast gates while iterating, full set once before the commit; measured 10.1 gate runs per commit. **`test-towasm.ts` reads `dist/` — `npm run examples` first**
 - [index towasm.ts before hunting](feedback_towasm_symbol_index.md) — one-off `grep -n` symbol index; the file was named in 575 separate read/grep calls over 8 sessions
 - **Scratch and instruments live in `tison/assistant/`** (2026-09-14, d8f407c; the workspace root is not a project). Older memories write instrument paths as `assistant/…` — read those as `tison/assistant/…`. They are still RUN from the workspace root, where `node_modules` is: `bash tison/assistant/selfhost-survey.sh`. Generated markdown gets `.md`, not `.txt`.
 - [cloud-agent deps](tison_cloud_agent_deps.md) — no devDependencies on purpose; a standalone clone needs `npm install --no-save` first

@@ -24,6 +24,13 @@ slow gates mid-iteration cannot tell you anything the fast ones didn't, because 
 decided yet — it just resends their output into context, and context resent per turn is what
 actually dominates token cost.
 
+**TRAP — `test/test-towasm.ts` imports from `dist/`, not `src/`.** Editing `src/examples/TS/*.ts` and
+running the towasm tests measures the PREVIOUS build. Always `npm run examples` first. This is not
+theoretical: `tsc -b src/examples` (stricter than the root `tsc -p`, which is what `dist/` is built
+with) silently stopped emitting on an error introduced in `540e0ed`, and the towasm gate then ran
+against pre-fix code for many commits until `7d8a74c` fixed it on 2026-09-16. A build error there is
+easy to miss because the root typecheck stays green.
+
 **How to apply:** don't re-run a gate to confirm a result it already gave for the same tree state.
 `git commit` failing is loud; so is a red gate. The one case that justifies an extra full run is a
 gate that was green before an edit and is expected to change because of it.
