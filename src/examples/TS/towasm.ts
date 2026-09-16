@@ -1889,6 +1889,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// field name alone keys it too.
 	const anyFieldFuncs		= new Map<string, FuncInfo>();
 	const anyFieldWriteFuncs = new Map<string, FuncInfo>();
+	const anyEntriesFuncs	= new Map<string, FuncInfo>();
 	// `ensureUnionFieldDispatch`'s own cache -- keyed by field name + the exact, bounded member set (not
 	// "every class ever reached" like `anyDispatchFuncs`), so a real union type's own field access never
 	// silently succeeds via some unrelated third class that happens to share the same field name.
@@ -4928,16 +4929,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// `Object.entries(x)` -- a known, fixed-identity global intrinsic (`declare var Object: {...}` in
 	// lib.d.ts, same category as `Math`, not a name to special-case the way a *user* method name would
 	// be), not expressible as ordinary generic TS source at all: what fields exist depends on `x`'s own
-	// concrete type at each call site, which only the compiler itself can see. For a `Map`-backed
-	// dynamic object, real `entries()` already exists and is already the efficient, correct answer, so
-	// this just forwards to it. For a real struct (class or plain object-shape), only the *sealed*
-	// case (never subclassed elsewhere, `!everExtended`) is handled for now -- an extended class's own
-	// instances may carry more fields at runtime than its static type declares, which would need the
-	// same `ref.test` cascade `ensureVirtualDispatch` already uses for virtual method calls; deferred,
-	// not attempted here. The sealed case needs no runtime reflection at all: `owner.fields` is a real,
-	// compile-time-known list, so this synthesizes a real `[string, any][]` array literal -- one
-	// `[fieldName, obj.field]` tuple per declared field -- and hands it to the ordinary array-literal
-	// codegen, the same "synthesize AST, reuse existing codegen" idiom already used for spread/for-in.
+	// concrete type, which only the compiler itself can see. For a `Map`-backed dynamic object, real
+	// `entries()` already exists and is already the efficient, correct answer, so this just forwards to
+	// it. For a real struct whose concrete type is statically known and never subclassed
+	// (`!everExtended`), `emitEntriesOf` reads `owner.fields` directly -- no runtime reflection at all.
+	// Anything else -- a receiver with no static field list (`object`, a narrowed `unknown`), or a class
+	// whose instances may really be a subclass carrying more fields -- goes through `ensureAnyEntries`'
+	// `ref.test` cascade, which recovers the real runtime type first.
 	// `which` selects the projection: `Object.entries`/`keys`/`values` differ only in what each element
 	// is, and `Map` implements all three by name already.
 	function emitObjectEntries(args: Expr[], ctx: FunctionContext, which: 'entries' | 'keys' | 'values' = 'entries'): WasmType {
@@ -4945,20 +4943,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			throw `'Object.${which}' takes exactly one argument`;
 		const arg	= args[0];
 		const owner = ownerOf(arg, ctx);
-		if (!owner)
-			throw `'Object.${which}' needs a known object/class type`;
-
-		if (owner.decl.name === 'Map') {
-			emitAs(arg, ctx, owner.thisWtype!);
-			return emitMethodCall(owner, which, [], ctx);
+		// No static field list at all (`object`, a narrowed `unknown`), or a class whose own instances may
+		// really be a subclass carrying more fields -- either way only the RECEIVER'S RUNTIME TYPE answers
+		// this, so box and go through the `ref.test` cascade.
+		if (!owner || (owner.decl.name && everExtended.has(owner.decl.name))) {
+			emitAs(arg, ctx, REF_ANY);
+			ctx.emit(I.call(ensureAnyEntries(which).funcIndex));
+			return ARR_WTYPE.ref;
 		}
-		if (owner.decl.name && everExtended.has(owner.decl.name))
-			throw `'Object.${which}' on '${owner.name}' isn't supported yet -- '${owner.decl.name}' may be subclassed elsewhere, and a correct result needs the receiver's real runtime type, not just its declared one`;
 
-		const n			= closureCallTempCounter++;
-		const objName	= `#objEntries$${n}`;
-		const objLocal	= ctx.declareValue(objName, owner.thisWtype!, owner.thisTsType!);
 		emitAs(arg, ctx, owner.thisWtype!);
+		if (owner.decl.name === 'Map')
+			return emitMethodCall(owner, which, [], ctx);
+		return emitEntriesOf(owner, which, ctx);
+	}
+
+	// The projection itself, for a receiver whose concrete struct type is already known and already on the
+	// stack: `owner.fields` is a real, compile-time-known list, so this synthesizes a real array literal --
+	// one `fieldName` / `obj.field` / `[fieldName, obj.field]` element per declared field -- and hands it to
+	// the ordinary array-literal codegen, the same "synthesize AST, reuse existing codegen" idiom already
+	// used for spread/for-in. Shared by the static path above and every arm of `ensureAnyEntries` below, so
+	// the two can never disagree about what a given class's own entries are.
+	function emitEntriesOf(owner: ClassInfo, which: 'entries' | 'keys' | 'values', ctx: FunctionContext): WasmType {
+		const objName	= `#objEntries$${closureCallTempCounter++}`;
+		const objLocal	= ctx.declareValue(objName, owner.thisWtype!, owner.thisTsType!);
 		ctx.emit(I.local.set(objLocal.index));
 
 		// The outer array's own kind is always `ref` (a `[string, T]` tuple per field, boxed regardless
@@ -4969,8 +4977,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// `emitArrayElements` call: that lets the ordinary per-element `emitAs` this already goes through
 		// (inside `emitArrayElements`'s own loop) delegate back to `case 'array'` for it, reusing the same
 		// coercion logic every other array literal already relies on instead of duplicating it here.
-		// `keys` is a plain `string[]`, so it takes the ordinary array-literal path with its own element
-		// kind rather than the boxed `ref` one the tuple/value forms need.
 		if (which === 'keys') {
 			emitArrayElements(owner.fields.map((f): Expr => Literal(f.name)), ctx, ARR_WTYPE.i16, 'ref', ensureArrayType('ref'));
 			return ARR_WTYPE.ref;
@@ -10895,6 +10901,57 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						dctx.emit(I.i32.or);
 				});
 			}
+			info.body = dctx.toFuncBody(1, toValType);
+		});
+		return info;
+	}
+
+	// `Object.keys/values/entries(x)` where `x`'s static type names no field list at all (the `object`
+	// keyword, a narrowed `unknown`) or names a class that is extended somewhere: what fields exist is a
+	// property of the receiver's REAL runtime type, so this is the same `ref.test` cascade
+	// `ensureAnyDispatch`/`ensureVirtualDispatch` already use. Deepest-first for the reason
+	// `ensureVirtualDispatch` gives: a subclass instance passes its base's own `ref.test` too, so a
+	// shallower arm tested first would answer with the base's shorter field list.
+	// Candidates are every reachable STRUCT-backed class; an array-, string- or boxed-scalar-backed one has
+	// no struct fields to read and is excluded, and so is `Map`, whose real answer is its own
+	// `keys`/`values`/`entries` method returning a `K[]`/`V[]` whose element KIND (`f64` for `Map<number,_>`)
+	// has no conversion to this function's single `any[]` result type. Both fall through to the final arm
+	// and trap rather than answer with a struct's internal fields.
+	function ensureAnyEntries(which: 'entries' | 'keys' | 'values'): FuncInfo {
+		const existing = anyEntriesFuncs.get(which);
+		if (existing)
+			return existing;
+
+		const result = ARR_WTYPE.ref;
+		const { funcIndex, typeIndex } = registerFunc(toParams2([{key: 'recv', wtype: REF_ANY, tsType: T.ANY}]), toResults(result));
+		const info: FuncInfo = { params: [REF_ANY], result, funcIndex, typeIndex };
+		anyEntriesFuncs.set(which, info);
+		funcs.set(`<any ${which}>`, info);
+
+		lateWorklist.push(() => {
+			const dctx	= new FunctionContext(`any_${which}`, new Scope(libGlobal), plainReturn(result), undefined);
+			const recv	= dctx.declareLocal('$recv', REF_ANY);
+			const depthOf = (c: ClassInfo) => {
+				let d = 0;
+				for (let p = c.superClass; p; p = p.superClass)
+					++d;
+				return d;
+			};
+			const candidates = [...classes.values()]
+				.filter(c => c.typeIndex !== -1 && c.decl.name !== 'Map' && typeof c.thisWtype === 'object' && 'ref' in c.thisWtype)
+				.sort((a, b) => depthOf(b) - depthOf(a));
+
+			const buildArm = (i: number): wasm.Instr[] => {
+				if (i >= candidates.length)
+					return [I.unreachable];
+				const c = candidates[i];
+				dctx.emit(I.local.get(recv.index), I.ref.test(c.typeIndex));
+				const _cond = dctx.swapOut();
+				dctx.emit(I.local.get(recv.index), I.ref.cast(c.typeIndex));
+				emitEntriesOf(c, which, dctx);
+				return [..._cond, I.if(toValType(result), dctx.swapOut(), buildArm(i + 1))];
+			};
+			dctx.emit(...buildArm(0));
 			info.body = dctx.toFuncBody(1, toValType);
 		});
 		return info;

@@ -3,13 +3,13 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import v8 from 'v8';
-import * as TS from '../src/examples/TS/ts-parser';
-import * as T from '../src/examples/TS/type-utils';
-import { TStoWasm, makeLibScope } from '../src/examples/TS/towasm';
-import { quoteString } from '../src/examples/TS/printer';
-import { TStypeCheck, TStypeCheckAsync } from '../src/examples/TS/transform';
-import { ModuleLoader, collectModules } from '../src/examples/TS/module-loader';
-import { SEVERITY } from '../src/examples/TS/checker';
+import * as TS from '../dist/examples/TS/ts-parser';
+import * as T from '../dist/examples/TS/type-utils';
+import { TStoWasm, makeLibScope } from '../dist/examples/TS/towasm';
+import { quoteString } from '../dist/examples/TS/printer';
+import { TStypeCheck, TStypeCheckAsync } from '../dist/examples/TS/transform';
+import { ModuleLoader, collectModules } from '../dist/examples/TS/module-loader';
+import { SEVERITY } from '../dist/examples/TS/checker';
 
 // `try`/`catch` compiles to the exnref/try_table exception-handling proposal (Wasm 3.0), which
 // this Node's V8 doesn't enable by default -- must be set before the first `WebAssembly.Module`
@@ -4934,18 +4934,30 @@ async function main() {
 		check("for...in: falls back to Object.entries for a sealed struct (no 'keys()' method)", forInSealed(), 2);
 		check("for...in: a dynamic object still takes the efficient .keys() path, unchanged", forInDynamicUnchanged(), 3);
 
-		// A genuine, permanent safety net (like arg-count validation elsewhere in this file), not a bare
-		// "unimplemented feature throws": a subclassed receiver's real runtime type isn't visible here,
-		// only its declared one, so refusing outright is deliberately safer than silently producing the
-		// wrong field set.
-		await checkThrows('Object.entries: an extended class is rejected, not silently mis-handled', () => compile(`
-			class Animal { constructor() {} }
-			class Dog extends Animal { constructor() { super(); } }
-			export function test(): number {
-				const a: Animal = new Animal();
-				return Object.entries(a).length;
+		// An extended class, and a receiver with no static field list at all (`object`, a narrowed
+		// `unknown`): the declared type can't answer either, so both go through `ensureAnyEntries`'
+		// deepest-first `ref.test` cascade and read the fields the value REALLY has at runtime.
+		const { subclassThroughBase, opaqueObject, narrowedUnknown } = await compile(`
+			class Animal { legs: number; constructor(legs: number) { this.legs = legs; } }
+			class Dog extends Animal { tail: number; constructor() { super(4); this.tail = 1; } }
+			export function subclassThroughBase(): number {
+				const a: Animal = new Dog();
+				return Object.keys(a).length * 10 + Object.values(a).length;
 			}
-		`), /isn't supported yet/);
+			export function opaqueObject(): number {
+				const o: object = { a: 1, b: 2, c: 3 };
+				return Object.keys(o).length;
+			}
+			export function narrowedUnknown(): number {
+				const u: unknown = { p: 1, q: 2 };
+				if (!u || typeof u !== 'object')
+					return -1;
+				return Object.entries(u).length;
+			}
+		`);
+		check('Object.keys/values: a subclass seen through its base reads its REAL runtime fields', subclassThroughBase(), 22);
+		check("Object.keys: an 'object'-typed receiver resolves its shape at runtime", opaqueObject(), 3);
+		check('Object.entries: a narrowed `unknown` resolves its shape at runtime', narrowedUnknown(), 2);
 	}
 
 	{
