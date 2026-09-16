@@ -4045,6 +4045,37 @@ async function main() {
 		check('Number statics accept any value and answer false for non-numbers', numberStatics(), 10101);
 	}
 
+	{
+		// An alias was mapped to its target only when the target RESOLVED to a plain ref -- an interface that extends
+		// another resolves to an intersection, so `type CallSig = JS.CallSig<Type>` built a second struct, and a value
+		// of one spelling could not be stored where the other was expected (36 declarations).
+		const { aliasOfGenericInterface } = await compileMulti({
+			jsp: `
+				export interface Params<T> { params: T[] }
+				export interface CallSig<T> extends Params<T> { returnType?: T }
+			`,
+			tsp: `
+				import * as JS from './jsp';
+				export interface RefType { type: 'ref'; name: string }
+				export type Type = RefType;
+				export type CallSig = JS.CallSig<Type>;
+				export interface Method { name: string; sig: CallSig }
+				export function makeRaw(n: number): JS.CallSig<Type> { return { params: [{ type: 'ref', name: 'p' + n }] }; }
+				export function method(name: string, sig: JS.CallSig<Type>): Method { return { name, sig }; }
+			`,
+			main: `
+				import * as TS from './tsp';
+				function widthOf(m: TS.Method): number { return m.sig.params.length; }
+				export function aliasOfGenericInterface(): number {
+					const m = TS.method('a', TS.makeRaw(1));
+					const direct: TS.CallSig = TS.makeRaw(2);
+					return widthOf(m) + direct.params.length * 10;
+				}
+			`,
+		}, 'main');
+		check('an alias of a generic interface shares its target shape', aliasOfGenericInterface(), 11);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter

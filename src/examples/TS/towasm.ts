@@ -9775,8 +9775,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// `interface X extends Y` puts Y's fields first, so X's struct can be a wasm SUBTYPE of Y's: an X then IS a Y.
 		const top		= T.resolve(scope, ref);
 		// An alias of a named shape IS that shape (`type CallSig = JS.CallSig<Type>`): same struct, same supertype.
-		if (top.type === 'ref' && top.name !== name) {
-			const target = ensureClassRef(top);
+		// Read off what the alias DECLARES, not what `resolve` expands it to -- an interface that extends another
+		// expands to an intersection, and the alias then built a SECOND struct nothing could convert to the first.
+		const aliased	= entry.typeParams?.length ? T.substituteType(entry.type, T.typeArgMap(entry.typeParams, typeArgs)) : entry.type;
+		const aliasRef	= aliased.type === 'ref' && aliased.name !== name ? aliased
+						: top.type === 'ref' && top.name !== name ? top : undefined;
+		if (aliasRef) {
+			const target = ensureClassRef({ ...aliasRef, declScope: (aliasRef.declScope as Scope | undefined) ?? scope });
 			if (target) {
 				classes.set(key, target);
 				return target;
