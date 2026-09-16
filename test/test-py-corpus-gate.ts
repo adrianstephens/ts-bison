@@ -15,8 +15,8 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { parse } from '../src/examples/PY/py-parser';
-import { printer } from '../src/examples/PY/printer';
+import { parse } from '../dist/examples/PY/py-parser';
+import { printer } from '../dist/examples/PY/printer';
 import { corpusPresent, corpusFiles, unsupportedMap } from './py-corpus';
 
 const BASELINE = path.join(__dirname, 'py-corpus-gate-baseline.json');

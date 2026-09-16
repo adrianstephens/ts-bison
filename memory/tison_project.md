@@ -33,8 +33,21 @@ engine `src/tison.ts`; PEG back end `src/peg.ts` (see [[tison-peg-backend]]). Gr
 - `defaultMerge` collapses structurally-equal GLR-converged values (JSON equality) instead of always
   wrapping them in an array. Relevant whenever a new `forceFork` produces a "both branches parse to
   the same thing" convergence rather than the usual "one branch dies downstream".
-- **Run tests via `ts-node`, not `tsc` + `node`** — `test-ts-parser.ts` reads source via paths
-  relative to `__dirname`; a custom `outDir` breaks that with an unrelated-looking `ENOENT`.
+- **The suite imports the BUILT package** (`'../dist/...'`, switched 2026-09-15), still run by ts-node `-T`,
+  so a run tests what ships and `test/tsconfig.json` type-checks against `dist/**/*.d.ts` (src type errors no
+  longer leak into a test run). `npm run build` in tison is now the COMPLETE build -- `copylib && tsc &&
+  examples` -- and it copies the lib FIRST, because a failing `tsc -b` skips npm's `postexamples` and would
+  otherwise leave dist half-complete (stale lib = silently wrong checker/towasm counts). It is strict (exits
+  nonzero on type errors); `npm run build:emit` is the tolerant twin (`tsc; examples; copylib`) used by
+  `gate`/`checker`/`libdecls`/`ast-gate.sh` so those still run while src is red. **How tests are launched**:
+  the WORKSPACE config (`packages.code-workspace`) -- "Test current" runs `${file}` under ts-node with
+  `preLaunchTask: build-current-folder` = `npm run build` in the file's folder (its `debug.onTaskErrors:
+  debugAnyway` lets the launch continue while that build reports errors). `tison/.vscode/launch.json`'s own
+  "Test" config runs a `test/test.ts` that does not exist -- vestigial, nobody uses it.
+- **`dist/examples/TS/lib` is a COPY** (`copylib`, via `postexamples` and `build:emit`), and it arms two traps
+  that hid it for weeks: `cp -r src/.../lib dist/.../lib` nests `lib/lib` when the target exists, and npm
+  SKIPS `postexamples` entirely when `tsc -b` exits nonzero. Both fixed 2026-09-15 -- `towasm.ts` reads that
+  lib at runtime, so a stale copy silently shifts checker/towasm results (it moved test-ts-parser's counts).
 - `src/examples` needs its own tsconfig invocation: **`cd src/examples && tsc -p .`**. See
   [[feedback-tison-examples-needs-own-tsconfig]] — this has bitten more than once.
 

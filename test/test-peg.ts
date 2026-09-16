@@ -1,4 +1,4 @@
-import { makeParser, makePegParser, pegDiagnostics, Rules, Rule, WithPrec, MaybeList, Maybe, And, Not, terminal, type GrammarSpec } from '../src/tison';
+import { makeParser, makePegParser, pegDiagnostics, Rules, Rule, WithPrec, MaybeList, Maybe, And, Not, terminal, type GrammarSpec } from '../dist/tison';
 
 let failures = 0;
 

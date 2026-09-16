@@ -1,7 +1,7 @@
-import {preprocess} from '../src/examples/CPP/preprocessor';
-import {fileResolver} from '../src/examples/CPP/include-resolver';
-import {cParser} from '../src/examples/CPP/c-parser';
-import {parse as cppParse} from '../src/examples/CPP/cpp-parser';
+import {preprocess} from '../dist/examples/CPP/preprocessor';
+import {fileResolver} from '../dist/examples/CPP/include-resolver';
+import {cParser} from '../dist/examples/CPP/c-parser';
+import {parse as cppParse} from '../dist/examples/CPP/cpp-parser';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';

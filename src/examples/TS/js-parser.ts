@@ -172,8 +172,6 @@ export interface ExportSpecifier	{ local: string; exported: string; typeOnly?: b
 export interface Import				{ type: 'import'; specifiers?: ImportSpecifier[]; source:  string; namespace?: string; typeOnly?: boolean; default?: string; attributes?: {key: string, value: string}[] }
 export interface Export<T>			{ type: 'export'; specifiers?: ExportSpecifier[]; source?: string; namespace?: string; typeOnly?: boolean; default?: Expr<T>|Declaration<T> }
 
-export function Expression<T>(expression: Expr<T>) { return { type: 'expression', expression } as const; }
-
 export type ForInit<T> = Expr<T> | VarDecl<T>;
 export interface SwitchCase<T, S = Stmt<T>> { test?: Expr<T>; consequent: S[]; }
 export function SwitchCase<T, S>(test: Expr<T>, ...consequent: S[]) : SwitchCase<T, S> { return { test, consequent }; }
@@ -390,7 +388,7 @@ const object_pattern_property = Rules<ObjectPatternProperty>(
 	// single token disambiguates) -- same shape as `binding_target`'s own `ForceFork(Rule([IDENT], ...))`
 	// just above. Recorded as `kind:'reduce-reduce', resolution:'earlier rule wins'` when unfixed (verified
 	// via a direct, uncached `makeParser` build -- `tables.conflicts` is NOT populated on a table loaded
-	// from `.tables-cache/*.json.gz`, so checking a cached parser's `conflicts` always looks empty).
+	// from `.tables-cache/*.tables`, so checking a cached parser's `conflicts` always looks empty).
 	ForceFork(Rule([IDENT], 											$ => ({ key: $[0], value: $[0] } as const))),
 	Rule([IDENT, '=', fwd_assignment_expression], 						$ => ({ key: $[0], value: $[0], default: $[2] } as const)),
 	Rule([IDENT, ':', binding_target], 									$ => ({ key: $[0], value: $[2] } as const)),
@@ -1261,8 +1259,10 @@ export function make() {
 	}, {
 		recover,
 		merge,
-	},
-	path.join(__dirname, '../../../.tables-cache/js-parser.json.gz'));
+	}, {
+		sources:	__filename,
+		cachePath:	path.join(__dirname, '../../../.tables-cache/js-parser.tables'),
+	});
 }
 
 export const parser = make();

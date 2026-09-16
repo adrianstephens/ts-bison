@@ -1,4 +1,4 @@
-import { parseWat, toWasm } from '../src/examples/wat-parser';
+import { parseWat, toWasm } from '../dist/examples/wat-parser';
 
 function test(name: string, run: () => void) {
 	console.log(`=== Test: ${name} ===`);

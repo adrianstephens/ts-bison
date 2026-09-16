@@ -1,10 +1,10 @@
-import * as JSX from '../src/examples/TS/jsx-parser';
-import * as TS from '../src/examples/TS/ts-parser';
-import * as T from '../src/examples/TS/type-utils';
-import { SEVERITY, checkBlock } from '../src/examples/TS/checker';
+import * as JSX from '../dist/examples/TS/jsx-parser';
+import * as TS from '../dist/examples/TS/ts-parser';
+import * as T from '../dist/examples/TS/type-utils';
+import { SEVERITY, checkBlock } from '../dist/examples/TS/checker';
 
-import { TStypeCheckAsync } from '../src/examples/TS/transform';
-import { ModuleLoader } from '../src/examples/TS/module-loader';
+import { TStypeCheckAsync } from '../dist/examples/TS/transform';
+import { ModuleLoader } from '../dist/examples/TS/module-loader';
 
 import * as fs from 'fs/promises';
 import * as path from 'path';

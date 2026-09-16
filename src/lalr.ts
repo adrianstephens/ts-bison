@@ -428,8 +428,9 @@ function eliminateUnitGotos(tables: ParseTables): number {
 // `buildTables` (the LR(0)/LALR automaton construction) depends only on grammar *shape* -- which
 // terminals/nonterminals appear where, precedence, `lalr`/`optimize` -- never on the action closures
 // themselves. So a cache only needs `action`/`goto`; `rules` (which carries the live `.action` closures)
-// is regenerated for free as a side effect of reconstructing `GrammarBuilder` from the spec, which
-// callers must do anyway to get a fingerprint to validate the cache against.
+// is regenerated for free as a side effect of reconstructing `GrammarBuilder` from the spec, which a cache
+// caller must do anyway to supply the terminal/nonterminal namespaces. Deciding whether a file on disk is
+// still current is the caller's business (see `tableCache.ts`).
 
 export const TABLE_FORMAT_VERSION = 4;
 
@@ -601,30 +602,36 @@ export function deserializeTables(g: GrammarBuilder, s: SerializedTables): Parse
 	};
 }
 
-// A plain JSON-serializable snapshot of everything that can affect `buildTables`'s output. Callers hash
-// this (e.g. sha256 of `JSON.stringify(...)`) to decide whether a cached `SerializedTables` is still
-// valid for the current grammar -- cheaper and more robust than a source-file mtime check, since it
-// also catches grammar-equivalent edits (renames, reformatting) that don't need to invalidate the cache,
-// and is naturally versioned via TABLE_FORMAT_VERSION for engine-side algorithm changes.
-export function grammarFingerprint(g: GrammarBuilder, spec: GrammarSpec<any>): unknown {
+// A 32-bit FNV-1a digest of everything that can change what `buildTables` produces: the terminals and their
+// patterns, the always/skip lists, and every rule with its precedence and symbol order. A disk cache stores
+// it so a grammar that changed IN MEMORY is a miss, not a silent mismatch -- `jsx-parser`'s `add()` pushes
+// rules into the shared objects after the first `make()`, and no source timestamp can see that.
+export function grammarDigest(g: GrammarBuilder): number {
 	const ntIndex = indexNonTerminals(g);
 	const symKey = (sym: InternalSym): string =>
 		sym instanceof Terminal				? `t:${sym.name}`
 		: sym instanceof InternalPredicate	? `p:${sym.negate ? '!' : '&'}${symKey(sym.sym)}`
 		: `n:${ntIndex.get(sym)}`;
-	return {
-		version:			TABLE_FORMAT_VERSION,
-		terminals:			[...g.terminalsByName.values()].map(t => [t.name, t.pattern?.source ?? null]),
-		alwaysTerminals:	g.alwaysTerminals.map(t => t.name),
-		alwaysSkip:			g.alwaysSkip.map(t => t.name),
-		rules:				g.rules.map(r => [symKey(r.lhs), r.rhs.map(symKey), r.prec ?? null]),
+	let hash = 0x811c9dc5;
+	const mix = (text: string) => {
+		for (let i = 0; i < text.length; i++)
+			hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
 	};
+	mix(`v${TABLE_FORMAT_VERSION}`);
+	for (const t of g.terminalsByName.values())
+		mix(`\u0000t${t.name}\u0001${t.pattern?.source ?? ''}`);
+	for (const t of g.alwaysTerminals)
+		mix(`\u0000a${t.name}`);
+	for (const t of g.alwaysSkip)
+		mix(`\u0000s${t.name}`);
+	for (const r of g.rules)
+		mix(`\u0000r${symKey(r.lhs)}\u0002${r.rhs.map(symKey).join(',')}\u0003${r.prec ? `${r.prec.assoc}${r.prec.level ?? ''}` : ''}`);
+	return hash >>> 0;
 }
 
 // ===================================================================
 //  Parser
 // ===================================================================
-
 function runParser(tables: ParseTables, stream: Lexer, ctx: any, recover: InternalRecoveryCallback, merge: MergeValues, forkCtx: (ctx: any) => any, prefixMode?: boolean) {
 	const stack: StackEntry[] = [{ state: 0, value: undefined }];
 

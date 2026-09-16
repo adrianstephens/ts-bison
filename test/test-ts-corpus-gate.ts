@@ -15,7 +15,7 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import * as TS from '../src/examples/TS/ts-parser';
+import * as TS from '../dist/examples/TS/ts-parser';
 import { corpusFiles, corpusPresent, readSource, splitTestFile, isSource, syntaxErrorsSet, usesUnsupportedSyntax, TS_REPO } from './ts-corpus';
 
 const BASELINE	= path.join(__dirname, 'ts-corpus-gate-baseline.json');

@@ -931,7 +931,10 @@ export const parser = makeCachedParser({
 	rules,
 }, {
 	recover,
-}, path.join(__dirname, '../../../.tables-cache/py-parser.json.gz'));
+}, {
+	sources:	__filename,
+	cachePath:	path.join(__dirname, '../../../.tables-cache/py-parser.tables'),
+});
 
 export function parse(code: string): Module<Stmt> {
 	return parser.parse(code, newCtx());

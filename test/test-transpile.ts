@@ -1,4 +1,4 @@
-import * as TR from '../src/examples/transpile';
+import * as TR from '../dist/examples/transpile';
 
 const ts =`
 

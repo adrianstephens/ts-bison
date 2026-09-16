@@ -50,8 +50,11 @@ export function getPos(node: unknown): Location | undefined {
 // asserted even once it's nested inside a container (an array/object/union) that's itself later widened.
 // `fresh`: a literal TYPE produced by a literal expression, which widens where TS widens one (a `let`, an array element);
 // a literal named in a type annotation is regular and never widens. `frozen` (`as const`) never widens either.
-export interface Literal<T> { type: 'literal'; value: T; frozen?: boolean; fresh?: boolean }
-export function  Literal<T>(value: T): Literal<T> { return { type: 'literal', value }; }
+// `raw`: the literal's own source spelling. Set by C++, where a suffix IS the literal's type (`1u`, `1.0f`) and
+// the decimal expansion of a value is not always what the source said (`1L`); unset by js/py, whose spelling is
+// always derivable from `value` alone.
+export interface Literal<T> { type: 'literal'; value: T; raw?: string; frozen?: boolean; fresh?: boolean }
+export function  Literal<T>(value: T, raw?: string): Literal<T> { return raw === undefined ? { type: 'literal', value } : { type: 'literal', value, raw }; }
 
 export interface Identifier {type: 'identifier', name: string}
 export function  Identifier(name: string) { return {type: 'identifier', name} as const; }

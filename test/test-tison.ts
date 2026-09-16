@@ -1,5 +1,5 @@
-import {makeParser, Ref, Rules, Rule, WithPrec, ForceFork} from '../src/tison';
-import { RuleR } from '../src/rrule';
+import {makeParser, Ref, Rules, Rule, WithPrec, ForceFork} from '../dist/tison';
+import { RuleR } from '../dist/rrule';
 
 // ===================================================================
 //  Self-test

@@ -1,6 +1,6 @@
-import { parse, Expr, Stmt } from '../src/examples/PY/py-parser';
-import { printer } from '../src/examples/PY/printer';
-import { walk, walkB } from '../src/examples/PY/walker';
+import { parse, Expr, Stmt } from '../dist/examples/PY/py-parser';
+import { printer } from '../dist/examples/PY/printer';
+import { walk, walkB } from '../dist/examples/PY/walker';
 
 let pass = 0, fail = 0;
 const dump = process.argv.includes('-v');

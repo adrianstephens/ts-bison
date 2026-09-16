@@ -634,6 +634,10 @@ export function printer(opts1: Options = {}) {
 					: expr.value instanceof RegExp	? '/' + expr.value.source + '/' + (expr.value.flags || '')
 					: Array.isArray(expr.value)		?  templateParts(expr.value, print)
 					: '?';
+			case 'number':
+				if (Object.is(expr.value, -0))	//stupid
+					return '-0';
+				// fallthrough
 			default:
 				return String(expr.value);
 		}

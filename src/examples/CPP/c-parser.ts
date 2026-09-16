@@ -286,7 +286,7 @@ fwd_type_name = Forward<TypeName>(()=>type_name),
 // (function arguments, declarator lists, initializers, ...) and never accidentally absorbs into a comma-expression; only the dedicated parenthesized-expression and subscript positions reach for full `expression` instead
 assignment_expression = Rules<Expr>(self => [
 	Forward<Expr>(()=>postfix_expression),
-	WithPrec(Rule([OneOf(['+', '-', '!', '~', '*', '&', '++', '--']), self], 	$ => Unary('+', $[1])), PREC.unary),
+	WithPrec(Rule([OneOf(['+', '-', '!', '~', '*', '&', '++', '--']), self], 	$ => Unary($[0], $[1])), PREC.unary),
 	// 'sizeof' spelled standalone, NOT inside the OneOf group: the sizeof_type rule below also spells it
 	// standalone, and a OneOf-vs-literal tie starves whichever loses (`sizeof(expr)` never parsed).
 	WithPrec(Rule(['sizeof', self], 							$ => ({ type: 'unary',			operator: 'sizeof', operand: $[1] })), 	PREC.unary),
@@ -325,8 +325,10 @@ constant_expression = Rules(
 
 primary_expression = Rules(
 	Rule([IDENT], 												$ => Identifier($[0])),
-	Rule([INT_LITERAL],											$ => Literal(parseInt($[0], 10))),
-	Rule([FLOAT_LITERAL], 										$ => Literal(parseFloat($[0]))),
+	// `$[0]` (the spelling, suffix and all) is kept alongside the value: a C++ literal's suffix is its
+	// TYPE, and the VSDG's constant folder needs it -- `1u` and `1` are not the same constant.
+	Rule([INT_LITERAL],											$ => Literal(parseInt($[0], 10), $[0])),
+	Rule([FLOAT_LITERAL], 										$ => Literal(parseFloat($[0]), $[0])),
 	Rule([STRING_LITERAL], 										$ => Literal(unquoteCString($[0]))),
 	Rule([CHAR_LITERAL], 										$ => ({ type: 'char_literal', value: unquoteCString($[0]) } as const)),
 	Rule(['(', expression, ')'], 								$ => $[1]),
@@ -576,7 +578,10 @@ const parser = makeCachedParser({
 	precedence: PREC,
 	start: translation_unit,
 	rules: {translation_unit}
-}, {}, path.join(__dirname, '../../../.tables-cache/c-parser.json.gz'));
+}, {}, {
+	sources:	__filename,
+	cachePath:	path.join(__dirname, '../../../.tables-cache/c-parser.tables'),
+});
 
 export const cParser = {
 	...parser,

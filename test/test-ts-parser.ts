@@ -1,15 +1,16 @@
-import * as JSX from '../src/examples/TS/jsx-parser';
-import * as TS from '../src/examples/TS/ts-parser';
-import * as T from '../src/examples/TS/type-utils';
-import * as vsdg from '../src/examples/TS/vsdg';
+import * as JSX from '../dist/examples/TS/jsx-parser';
+import * as TS from '../dist/examples/TS/ts-parser';
+import * as T from '../dist/examples/TS/type-utils';
+import * as vsdg from '../dist/examples/TS/vsdg';
+import { applyGlobalCodeMotion } from '../dist/examples/vsdg';
 
-import { printer } from '../src/examples/TS/printer';
-import { TStoDecl, TStoJS, TStypeCheck, TStypeCheckAsync, loadLib } from '../src/examples/TS/transform';
-import { ModuleLoader } from '../src/examples/TS/module-loader';
+import { printer } from '../dist/examples/TS/printer';
+import { TStoDecl, TStoJS, TStypeCheck, TStypeCheckAsync, loadLib } from '../dist/examples/TS/transform';
+import { ModuleLoader } from '../dist/examples/TS/module-loader';
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { SEVERITY } from '../src/examples/TS/checker';
+import { SEVERITY } from '../dist/examples/TS/checker';
 
 const output = printer();
 const total_sev = [] as number[];
@@ -46,7 +47,7 @@ function test(name: string, code: string, format = 20) {
 				console.log(output.module(program));
 				const graph		= vsdg.BuildVSDG(program.body);
 				vsdg.Optimize(graph);
-				const { blocks, blockIds } = vsdg.applyGlobalCodeMotion(graph);
+				const { blocks, blockIds } = applyGlobalCodeMotion(graph);
 				const stmts = vsdg.BuildProgram(graph, blocks, blockIds);
 				console.log('==== VSDG');
 				console.log(output.statements(stmts));
@@ -90,7 +91,7 @@ async function testAsync(parser: Parser, name: string, filename: string, format 
 				console.log(output.module(program));
 				const graph		= vsdg.BuildVSDG(program.body);
 				vsdg.Optimize(graph);
-				const { blocks, blockIds } = vsdg.applyGlobalCodeMotion(graph);
+				const { blocks, blockIds } = applyGlobalCodeMotion(graph);
 				const stmts = vsdg.BuildProgram(graph, blocks, blockIds);
 				//console.log('==== VSDG');
 				console.log(output.statements(stmts));

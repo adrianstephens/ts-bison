@@ -22,6 +22,7 @@
 ## Engine and parsers
 
 - [tison project](tison_project.md) — **start here**: architecture facts (LALR(1) by default, silent shift-default), forceFork, the grammar-restructuring verification recipe
+- [table cache](tison_table_cache.md) — `.tables-cache/*.tables`: binary, no JSON, keyed by grammar-source mtimes + a grammar digest; ts-parser/cpp-parser must list the second module
 - [debugging technique](tison_debugging_technique.md) — root-cause wrong-parses via table/state dumps; turning a missing transition into a forkable conflict
 - [PEG back end](tison_peg_backend.md) — src/peg.ts over the same GrammarSpec; design limits, and why reusing an LR grammar as a PEG is a real porting job
 - [Manual() terminal primitive](tison_manual_terminal_primitive.md) — hand-parsed-island escape hatch + `Parser.parsePrefix()`
@@ -37,6 +38,7 @@
 - [type vs representation](tison_type_vs_representation.md) — many-to-one and must stay separable; tags name representations, and it is what lets `Node[]`/`Foo[]` share one physical array type
 - [array identity — RESOLVED](tison_array_identity.md) — `Array<T>` owns a `RawArray` field; the compiler knows only `RawArray`; the traps hit, the pre-existing bugs found, and why struct merging wasn't built
 - [towasm](tison_towasm.md) — **the authoritative gap list is towasm.ts's own header comment**; this covers design invariants
+- [CROSS-LANGUAGE PLAN](tison_towasm_cross_language_plan.md) — **PLAN ONLY, nothing built**: making the wasm backend drive PY/CPP too. Measured cost (515 `.type` tests, 62 tags, 398 `T.` refs, 51 `typeOf` sites; no PY/CPP checker or type model), the two-seam design, and the 6 gated steps
 - [module records](tison_module_records.md) — a module is `TS.Module` (body+scope+filename), not a bare `Stmt[]`; run all FOUR tsconfigs
 - [nested array element kind](tison_nested_array_element_kind.md) — inner arrays keep their DECLARED kind (`objectArrayKind`'s comment lies); `a.push([])` into `number[][]` still traps
 - [towasm capabilities](tison_towasm_capabilities.md) — index of closed feature work + the checker fixes whose blast radius exceeded their bug report
@@ -51,8 +53,11 @@
 - [scope stamping](tison_scope_stamping.md) — how checker scopes reach towasm (statement/branch stamps); **don't "fix" `narrowedTypeOf`**; why block-node scopes were measured and declined
 - [checker narrowing plan](tison_checker_narrowing_plan.md) — user plans integer/range narrowing in the checker (not started as of 2026-07-31)
 - [ReadType resolution](tison_readtype_resolution.md) — OPEN: opt's spurious `_` key; the reverted fix regressed other fields
-- [vsdg node type](tison_vsdg_node_type.md) — RawNode & INode discriminated union; gate = `assistant/vsdg-check.sh`
+- [vsdg dialects](tison_vsdg_dialects.md) — **the VSDG is language-neutral now**: `src/examples/vsdg.ts` core + `TS/vsdg.ts` + `PY/vsdg.ts` + `CPP/vsdg.ts`; the verbatim-fallback rule, the shape stamps, and the SIX pre-existing bugs the split surfaced
+- [vsdg C++ dialect](tison_vsdg_cpp.md) — the widened top level (`Definition | Stmt`), what's modelled vs verbatim, and the C++-specific bugs/limits found (incl. a shared verbatim-reader bug TS/PY still have)
+- [vsdg node type](tison_vsdg_node_type.md) — RawNode & INode discriminated union; gate = `assistant/vsdg-check.sh` (48 TS + 28 PY + 15 CPP cases)
 
+- [object shapes keyed by bare name](tison_shape_key_collision.md) — same-named interfaces in two modules share one struct; qualify by module
 ---
 
 *`archive/` holds full originals of the four largest memories (~650KB of dated per-fix changelog,

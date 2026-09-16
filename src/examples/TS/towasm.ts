@@ -2716,9 +2716,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// whatever error the caller's own unresolved-type handling already gives.
 					if (sigs.every((s): s is FullSig => !!s)) {
 						const merged = mergeOverloadSigs(sigs);
-						if (merged) {
+						if (merged)
 							return { closure: merged };
-						}
 					}
 				}
 				break;
@@ -5574,7 +5573,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const wt = annotated || ctx?.wtype;
 			const boxed = wt === 'void' ? REF_ANY : wt;
 			if (!boxed) {
-				if (process.env.SHOWPARAM) console.error(`PARAM '${describeBinding(p.key)}' of ${e.name ?? '<anon>'}: want=${want ? wasmTypeKey(want) : '-'} wantSig=${!!wantSig} fromWantTs=${ctx ? T.typeKey(ctx.tsType).slice(0, 100) : '-'} ann=${p.typeAnnotation ? T.typeKey(p.typeAnnotation).slice(0, 100) : '-'}`);
+				if (process.env.SHOWPARAM)
+					console.error(`PARAM '${describeBinding(p.key)}' of ${e.name ?? '<anon>'}: want=${want ? wasmTypeKey(want) : '-'} wantSig=${!!wantSig} fromWantTs=${ctx ? T.typeKey(ctx.tsType).slice(0, 100) : '-'} ann=${p.typeAnnotation ? T.typeKey(p.typeAnnotation).slice(0, 100) : '-'}`);
 				throw `closure parameter '${describeBinding(p.key)}' needs an explicit number/boolean/object type`;
 			}
 			// A bare `p?: T` param here just needs a nullable physical slot to receive whatever a *caller*
@@ -11516,11 +11516,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					return r;
 				},
 				(e, process) => {
-					if (e.type === 'assign')
+					if (e.type === 'assign') {
 						noteSlot(checkerTypeOf(unwrapAs(e.target), scope), e.value, scope);
 					// A plain call argument carries no contextual stamp this pass can read, so the parameter types come from
 					// the callee's own signature -- a rest parameter by its element type, which `push({ sig, decl })` needs.
-					else if (e.type === 'call') {
+					} else if (e.type === 'call') {
 						// A callee types either as a function or, for an overload set (`push`), as an object of `call` members.
 						// Every overload that could take this many arguments is noted: marking a shape open only costs speed.
 						const fn	= T.resolve(scope, checkerTypeOf(unwrapAs(e.callee), scope));
@@ -11605,9 +11605,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					return r;
 				},
 				(e, process) => {
-					if (e.type === 'assign' && e.target.type === 'member')
+					if (e.type === 'assign' && e.target.type === 'member') {
 						note(e.target.object, e.target.property, scope);
-					else if (isDefinePropertyCall(e) && e.arguments[0]) {
+					} else if (isDefinePropertyCall(e) && e.arguments[0]) {
 						const desc = e.arguments[2];
 						note(e.arguments[0], e.arguments[1]?.type === 'literal' && typeof e.arguments[1].value === 'string' ? e.arguments[1].value : undefined, scope,
 							desc?.type === 'object' && desc.properties.some(q => (q.type === 'field' || q.type === 'method') && (q.key === 'get' || q.key === 'set')));

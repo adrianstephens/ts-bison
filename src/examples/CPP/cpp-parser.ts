@@ -1,6 +1,6 @@
 import * as path from 'path';
 import { makeRule, Rules, List, OneOf, termOneOf, terminal, WithPrec, removeRules, ForceFork} from '../../tison';
-import { makeCachedParser } from '../../tableCache';
+import { makeCachedParser, siblingSource } from '../../tableCache';
 import { preprocess, PreprocessOptions } from './preprocessor';
 import { Module, Literal, Identifier, stampPos } from '../common';
 import type * as Common from '../common';
@@ -1233,7 +1233,11 @@ export const parser = makeCachedParser({
 	// each GLR branch mutates its own ctx (typedef registration, templateDepth); a dying branch's
 	// mutations no longer leak into the survivor
 	forkCtx: (ctx: CppCtx) => ({...ctx, typedefNames: new Set(ctx.typedefNames)}),
-}, path.join(__dirname, '../../../.tables-cache/cpp-parser.json.gz'));
+}, {
+	// C's rules are pushed onto here, so an edit to either grammar has to invalidate this cache
+	sources:	[__filename, siblingSource(__filename, 'c-parser')],
+	cachePath:	path.join(__dirname, '../../../.tables-cache/cpp-parser.tables'),
+});
 
 export interface Options extends PreprocessOptions {
 	knownTypes?: Iterable<string>;

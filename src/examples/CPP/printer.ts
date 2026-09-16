@@ -386,7 +386,11 @@ export function printer(opts1: Options = {}) {
 	//  Expressions
 	// ===================================================================
 
-	function literal(e: {value: number | string | boolean}): string {
+	function literal(e: {value: number | string | boolean, raw?: string}): string {
+		// A source literal prints exactly as it was written (`1u`, `1L`, `1.0f`): the spelling is the only
+		// place this AST records a literal's type, and re-deriving one from `value` would drop it.
+		if (e.raw !== undefined)
+			return e.raw;
 		switch (typeof e.value) {
 			case 'string':	return JSON.stringify(e.value);
 			case 'boolean':	return e.value ? 'true' : 'false';

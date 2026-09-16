@@ -67,7 +67,7 @@ official-test failures are single-decorator-per-class patterns (`@Component`, `@
 Member/parameter decorators remain a real, well-characterized, but open gap for a dedicated future session.
 
 **Debugging technique note for next time**: `TS.make()`/`JS.make()`'s cached tables
-(`.tables-cache/*.json.gz`, gitignored) never carry real `conflicts` data — `SerializedTables` doesn't
+(`.tables-cache/*.tables`, gitignored) never carry real `conflicts` data — `SerializedTables` doesn't
 round-trip it. To inspect real conflicts or `lr0States`, add a temporary `makeDebug()` export calling
 `makeParser(spec)` directly (bypassing `makeCachedParser`), same technique used earlier this session for
 the arrow-function reduce-reduce fix — **remove it again before finishing**, it's diagnostic-only.

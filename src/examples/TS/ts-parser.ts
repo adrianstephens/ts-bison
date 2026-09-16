@@ -1,6 +1,6 @@
 import * as path from 'path';
 import { Rules, Forward, Maybe, List, MaybeList, OneOf, terminal, ForceFork } from '../../tison';
-import { makeCachedParser } from '../../tableCache';
+import { makeCachedParser, siblingSource } from '../../tableCache';
 import * as JS from './js-parser';
 import { IDENT, NUM, STR, EXPORT_KW, unquoteString, Rule } from './js-parser';
 import * as Common from '../common';
@@ -924,8 +924,11 @@ export function make() {
 	}, {
 		recover:	JS.recover,
 		merge:		JS.merge,
-	},
-	path.join(__dirname, '../../../.tables-cache/ts-parser.json.gz'));
+	}, {
+		// ts-parser.ts's own rules are js-parser.ts's, so an edit to either has to invalidate this cache
+		sources:	[__filename, siblingSource(__filename, 'js-parser')],
+		cachePath:	path.join(__dirname, '../../../.tables-cache/ts-parser.tables'),
+	});
 }
 
 const parser = make();

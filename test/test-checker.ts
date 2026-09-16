@@ -2,11 +2,11 @@
 // must produce (a substring each, in order) -- `[]` means it must be clean. A deliberately wrong annotation is how a
 // case proves the checker computed the precise type rather than `any`, which would pass silently.
 import * as path from 'path';
-import * as TS from '../src/examples/TS/ts-parser';
-import * as T from '../src/examples/TS/type-utils';
-import { checkBlock, SEVERITY } from '../src/examples/TS/checker';
-import { TStypeCheckAsync } from '../src/examples/TS/transform';
-import { ModuleLoader } from '../src/examples/TS/module-loader';
+import * as TS from '../dist/examples/TS/ts-parser';
+import * as T from '../dist/examples/TS/type-utils';
+import { checkBlock, SEVERITY } from '../dist/examples/TS/checker';
+import { TStypeCheckAsync } from '../dist/examples/TS/transform';
+import { ModuleLoader } from '../dist/examples/TS/module-loader';
 
 const NOT_ASSIGNABLE = (from: string, to: string) => `Type '${from}' is not assignable to type '${to}'`;
 

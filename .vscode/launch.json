@@ -11,7 +11,7 @@
             "runtimeExecutable": "ts-node",
             "cwd": "${workspaceFolder}/test",
             "args": ["test.ts"],
-            "preLaunchTask": "npm: build",
+            "preLaunchTask": "build for test",
 			"console": "integratedTerminal"
         },
 

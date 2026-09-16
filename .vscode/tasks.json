@@ -24,6 +24,15 @@
 			"label": "build examples",
 		},
 		{
+			// What a test run needs: the suites import `dist`, so make it current before launching. `build:emit`
+			// emits even while src has type errors (its own problem matcher still reports them here).
+			"type": "npm",
+			"script": "build:emit",
+			"group": "build",
+			"problemMatcher": "$tsc",
+			"label": "build for test",
+		},
+		{
 			"type": "shell",
 			"label": "prepublish",
 			"command": "git add .; npm version ${input:version} --force",

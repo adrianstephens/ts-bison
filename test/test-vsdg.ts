@@ -1,7 +1,8 @@
 import assert from 'assert';
-import * as TS from '../src/examples/TS/ts-parser';
-import { BuildVSDG, Optimize, applyGlobalCodeMotion, BuildProgram } from '../src/examples/TS/vsdg';
-import { printer as codePrinter } from '../src/examples/TS/printer';
+import * as TS from '../dist/examples/TS/ts-parser';
+import { BuildVSDG, Optimize, BuildProgram } from '../dist/examples/TS/vsdg';
+import { applyGlobalCodeMotion } from '../dist/examples/vsdg';
+import { printer as codePrinter } from '../dist/examples/TS/printer';
 
 // Regression suite for vsdg.ts's BuildVSDG -> applyGlobalCodeMotion -> Output pipeline: builds
 // the VSDG for a program, schedules it, and reconstructs source from the result, then checks the
@@ -70,6 +71,11 @@ export async function main() {
 			console.error(`FAIL - ${name}:\n  expected:\n${indent(wantExpected)}\n  actual:\n${indent(actual)}`);
 		}
 	};
+	check('nested 1/-0', `
+		function f() { const z = -0; return 1 / z; }
+	`, `
+		g(h());
+	`);
 
 	// A nested call's argument was, before the double-process fix, walked twice by the expression
 	// hook (once via an explicit `process(s)` inside the case, once more via an unconditional
@@ -394,6 +400,87 @@ export async function main() {
 		h(i);
 	`);
 
+	// POSTFIX ++/-- is the one rebind that is NOT a `mutation` -- it lowers to a `unary_post` node --
+	// so this is exactly where `rebindVar`'s guard and `slotName`'s own list of bindable tags can
+	// drift apart. When they did, the name went unset and the increment was folded into its consumer
+	// instead, moving the WRITE after the read: `g(i++); h(i);` became `g(i); h(i++);`. The
+	// old-value snapshot (`unary_post_old`) must also print BEFORE the increment -- that freeze is
+	// its entire purpose. The suite had only prefix cases, which is how the drift got through.
+	check('postfix increment as a bare statement', `
+		function f() {
+			let i = 0;
+			i++;
+			h(i);
+		}
+	`, `
+		function f() {
+			let i = 0;
+			i++;
+			h(i);
+		}
+	`);
+
+	check('postfix increment read as a value keeps the pre-increment value', `
+		function f() {
+			let i = 0;
+			g(i++);
+			h(i);
+		}
+	`, `
+		function f() {
+			let i = 0;
+			var t0 = i;
+			g(t0);
+			i++;
+			h(i);
+		}
+	`);
+
+	// The snapshot's PLACEMENT, not just its existence: the increment is a real graph consumer of it
+	// (scheduling-only -- `isVestigialEdge` calls that port vestigial so it never looks like a value
+	// read, while `isSchedulingRelevant` still counts it). Without that edge, GCM sank the snapshot
+	// down to its own consumer, which can sit PAST the increment, so `g` read the new value: this
+	// loop case printed `i++; var t0 = i; g(t0);` and the straight-line one only worked by luck.
+	check('postfix increment inside a loop still reads the pre-increment value', `
+		function f() {
+			let i = 0;
+			while (i < 3) {
+				g(i++);
+			}
+		}
+	`, `
+		function f() {
+			let i = 0;
+			while (true) {
+				if (!(i < 3)) {
+					break;
+				}
+				var t0 = i;
+				i++;
+				g(t0);
+			}
+		}
+	`);
+
+	// A non-identifier target has no name to rebind, so its own old-value path is separate: the target
+	// read is materialised once (`t0`) and the snapshot freezes that same read (`t1 = t0`) rather than
+	// evaluating the property a second time. `t1 = t0` being kept is incidental -- it is the
+	// snapshot's own temp -- but what matters is that BOTH reads precede the increment.
+	check('unary_post: member target used as a VALUE reads the property before mutating it', `
+		function f(o) {
+			g(o.count++);
+			h(o.count);
+		}
+	`, `
+		function f(o) {
+			var t0 = o.count;
+			var t1 = t0;
+			o.count++;
+			g(t1);
+			h(o.count);
+		}
+	`);
+
 	// `break`/`continue` didn't exist as statement types at all before this batch -- the `if` handler
 	// now treats a branch that exited (break/continue/return) the same way it treats a real effect:
 	// it forces a structural gamma (so the break's own marker survives to be printed), and whatever
@@ -569,6 +656,71 @@ export async function main() {
 		h(1 ? 10 : 2 ? 20 : 30);
 	`);
 
+	// A branch pair whose only content is the value it merges -- `r = g(x)` in each arm -- reconstructs
+	// at that value's own consumer (`return r`), leaving neither arm a statement of its own: the
+	// mutations behind a merged value hang off the VALUE edge, not the state chain, so nothing of
+	// theirs ever reaches the state chain the arms are walked from. The anchoring `if` used to print
+	// regardless, an empty `if (c) { } else { }` repeating a condition the merged value already prints.
+	// emitControlNode drops it now when neither arm has anything to print -- unless the condition is
+	// itself the effect that forced a structural gamma, since then it prints nowhere else.
+	check('if: a branch pair with no statements of its own prints no empty husk', `
+		function f(x, y, c) {
+			let r = 0;
+			if (c) r = g(x); else r = h(y);
+			return r;
+		}
+	`, `
+		function f(x, y, c) {
+			return c ? g(x) : h(y);
+		}
+	`);
+
+	// The same branch-pair shape with an IMPURE condition: `g(c)` is what the `if` tested, and the merged
+	// `r` prints as a ternary -- so the call has to be materialised, or the ternary's own condition prints
+	// it a second time (before this: `if (g(c)) { } else { } return g(c) ? h(x) : h(y);`).
+	check('if: an impure condition of a merged value runs once', `
+		function f(x, y, c) {
+			let r = 0;
+			if (g(c)) r = h(x); else r = h(y);
+			return r;
+		}
+	`, `
+		function f(x, y, c) {
+			var t0 = g(c);
+			return t0 ? h(x) : h(y);
+		}
+	`);
+
+	// A store nothing reads is dead, but its right-hand side is not: the call had deferred to the
+	// assignment, and the assignment then went -- so `g(x)` went with it.
+	check('if: a dead store still evaluates its right-hand side', `
+		function f(x) {
+			let r = 0;
+			r = g(x);
+			return 0;
+		}
+	`, `
+		function f(x) {
+			g(x);
+			return 0;
+		}
+	`);
+
+	// Both arms here resolve to the same bare `i` (the increments and the store are all dead), and
+	// `cond ? x : x` collapses to `x` -- but only while the condition is PURE: collapsing dropped the one
+	// place `g()` was ever printed.
+	check('if: an identical merge keeps an impure condition', `
+		function f(i, c) {
+			let a = 0;
+			if (g()) a = i++; else a = i++;
+			return a;
+		}
+	`, `
+		function f(i, c) {
+			return g() ? i : i;
+		}
+	`);
+
 	// `switch` didn't exist as a statement type at all before this batch (and had a prerequisite:
 	// break/continue support, above). It's lowered into an ordinary `if` cascade with a synthetic
 	// `__hit` fallthrough flag, fed back through `recurse` -- reusing the if-handler's own
@@ -606,8 +758,8 @@ export async function main() {
 		}
 		h(x);
 	`, `
-		let __disc_var4 = 1;
-		switch (__disc_var4) {
+		let __disc_4 = 1;
+		switch (__disc_4) {
 			case 1:
 				g(1);
 				break;
@@ -640,8 +792,8 @@ export async function main() {
 		}
 		h(x);
 	`, `
-		let __disc_var4 = 2;
-		switch (__disc_var4) {
+		let __disc_4 = 2;
+		switch (__disc_4) {
 			case 1:
 				g(1);
 			case 2:
@@ -700,7 +852,7 @@ export async function main() {
 	// and each is genuinely read twice (once by its own case's match test, once more by default's
 	// own "did nothing else match" exclusion test), so needsTemp correctly keeps them named.
 	//
-	// The discriminant's own wrapper (`__disc_varN`, real in the graph -- see BuildVSDG's own
+	// The discriminant's own wrapper (`__disc_N`, real in the graph -- see BuildVSDG's own
 	// 'switch' case) no longer needs a name here: it has exactly one real graph consumer (the
 	// match test) plus the switch header's own read, and isInlinableVarDecl's own reuse-count
 	// check already handles that correctly (both end up reading `i` directly). It USED to stay
@@ -729,8 +881,8 @@ export async function main() {
 			if (!(i < 3)) {
 				break;
 			}
-			let __match0_var8 = i === 1;
-			let __hit_var8 = false;
+			let __match0_12 = i === 1;
+			let __hit_15 = false;
 			var t0 = i + 1;
 			switch (i) {
 				case 1:
@@ -756,10 +908,10 @@ export async function main() {
 	// carry it forward, so it's just as safe to fold straight into the merge, exactly like default's
 	// `-1` already did. forcedPrint is now conditional on the reassignment being loop-carried
 	// (isLoopCarried) -- so case 1/2's own `total = ...;` folds directly into the return ternary too.
-	// switch's own internal bookkeeping (__hit_var8's `hit = true;`) is unaffected by this relaxation
+	// switch's own internal bookkeeping (__hit_19's `hit = true;`) is unaffected by this relaxation
 	// -- it's tagged switchInternal specifically so it keeps resolving by name regardless, which is
 	// what keeps t0/t1/t2 computing the same independent, one-shot match flags as before (a real bug
-	// this session: relaxing forcedPrint without that tag let __hit_var8's value get folded into a
+	// this session: relaxing forcedPrint without that tag let __hit_19's value get folded into a
 	// genuine "did an earlier case already match" merge, which is wrong for these pre-switch flags).
 	// With every case's own value elided, each case's body reduces to a bare `break;` -- and once
 	// EVERY case (including default) is in that shape, the whole dispatch is observably a no-op
@@ -772,7 +924,7 @@ export async function main() {
 	// which reads them as ITS condition), so they inline straight into the return ternary too,
 	// instead of needing their own `var tN = ...;` statement.
 	//
-	// __hit_var8's own gammaValue merge (per case) still collapses to a bare `Identifier('__hit_var8')`
+	// __hit_19's own gammaValue merge (per case) still collapses to a bare `Identifier('__hit_19')`
 	// -- isInlinableVarDecl's own literal exemption (letting a genuinely-read literal declaration
 	// drop when nothing ELSE needs it named) would otherwise make the ORIGINAL declaration resolve
 	// straight to the literal `false` instead, breaking the "both branches are the exact same
@@ -797,11 +949,11 @@ export async function main() {
 		}
 	`, `
 		function f(x) {
-			let __disc_var8 = x;
-			let __match0_var8 = __disc_var8 === 1;
-			let __match1_var8 = __disc_var8 === 2;
-			let __hit_var8 = false;
-			return (__hit_var8 || !(__match0_var8 || __match1_var8)) ? -1 : (__hit_var8 || __match1_var8) ? 20 : (__hit_var8 || __match0_var8) ? 10 : 0;
+			let __disc_8 = x;
+			let __match0_12 = __disc_8 === 1;
+			let __match1_16 = __disc_8 === 2;
+			let __hit_19 = false;
+			return (__hit_19 || !(__match0_12 || __match1_16)) ? -1 : (__hit_19 || __match1_16) ? 20 : (__hit_19 || __match0_12) ? 10 : 0;
 		}
 	`);
 
@@ -818,7 +970,7 @@ export async function main() {
 	// own computation (an isPureSubgraph fix: threadMutation's own scheduling-only marker edge was
 	// wrongly making every rebindVar'd declaration look impure). t0/t1 themselves are then also
 	// single-use once more (total's own merge is their only real reader, same reasoning as the
-	// previous test's own), so they inline straight into the return ternary too. __hit_var8's own
+	// previous test's own), so they inline straight into the return ternary too. __hit_19's own
 	// per-case merge still collapses to the bare name too, same hasForcedSibling-gated reasoning as
 	// the previous test's own comment.
 	check('switch: internal hit/match bookkeeping stays independent when case values are elided', `
@@ -836,9 +988,72 @@ export async function main() {
 		}
 	`, `
 		function f(x) {
-			let __disc_var8 = x;
-			let __hit_var8 = false;
-			return (__hit_var8 || (__disc_var8 === 2)) ? 20 : (__hit_var8 || (__disc_var8 === 1)) ? 10 : 0;
+			let __disc_8 = x;
+			let __hit_19 = false;
+			return (__hit_19 || (__disc_8 === 2)) ? 20 : (__hit_19 || (__disc_8 === 1)) ? 10 : 0;
+		}
+	`);
+
+	// A declaration inside a case. This CRASHED before the cases got scopes of their own:
+	// reconcileVariables reached the branch merge holding a binding the other branch never had, and
+	// threw on `undefined.boundName` (walker.ts's own Scope only ever holds one binding per name, so
+	// a declaration made in a case -- which is walked as a BRANCH, not a nested block -- landed
+	// directly in the switch's own scope, outside the merge's reach either way). Two cases here, each
+	// with its OWN declaration, pins that the scopes are genuinely separate: both survive as real,
+	// named declarations (each read twice, so needsTemp keeps them named) and neither leaks.
+	check('switch: a declaration inside a case is scoped to that case', `
+		function f(x) {
+			switch (x) {
+				case 1:
+					let a = h(1);
+					g(a, a);
+					break;
+				case 2:
+					let b = h(2);
+					g(b, b);
+					break;
+			}
+		}
+	`, `
+		function f(x) {
+			let __disc_5 = x;
+			switch (__disc_5) {
+				case 1:
+					let a = h(1);
+					g(a, a);
+					break;
+				case 2:
+					let b = h(2);
+					g(b, b);
+					break;
+			}
+		}
+	`);
+
+	// The same scope, in the direction that would hide a bug: a case-local declaration SHADOWING an
+	// outer local of the same name must bind to the case's own scope only. The case's `y` is its own
+	// `h(1)` (kept named -- read twice), while the outer `y` is untouched by the case's declaration
+	// and still inlines its own declared value into `h(y)` after the switch.
+	check('switch: a case-local declaration shadows an outer local without disturbing it', `
+		function f(x) {
+			let y = 9;
+			switch (x) {
+				case 1:
+					let y = h(1);
+					g(y, y);
+					break;
+			}
+			h(y);
+		}
+	`, `
+		function f(x) {
+			switch (x) {
+				case 1:
+					let y = h(1);
+					g(y, y);
+					break;
+			}
+			h(9);
 		}
 	`);
 
@@ -970,8 +1185,8 @@ export async function main() {
 			if (!(i < 5)) {
 				break;
 			}
-			let __match0_var8 = i === 2;
-			let __hit_var8 = false;
+			let __match0_12 = i === 2;
+			let __hit_15 = false;
 			var t0 = i + 1;
 			switch (i) {
 				case 2:

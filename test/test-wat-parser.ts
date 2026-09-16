@@ -1,5 +1,5 @@
 import assert from 'assert';
-import { parseWat, toWasm, parseAsmBody, TYPE_EXPR } from '../src/examples/wat-parser';
+import { parseWat, toWasm, parseAsmBody, TYPE_EXPR } from '../dist/examples/wat-parser';
 
 function testWat(name: string, wat: string) {
 	console.log(`=== Test: ${name} ===`);

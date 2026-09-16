@@ -1,5 +1,5 @@
-import {parse} from '../src/examples/TS/js-parser';
-import { printer } from '../src/examples/TS/printer';
+import {parse} from '../dist/examples/TS/js-parser';
+import { printer } from '../dist/examples/TS/printer';
 const output = printer();
 
 function test(name: string, code: string) {

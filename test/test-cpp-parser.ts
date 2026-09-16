@@ -1,5 +1,5 @@
-import * as CPP from '../src/examples/CPP/cpp-parser';
-import {fileResolver} from '../src/examples/CPP/include-resolver';
+import * as CPP from '../dist/examples/CPP/cpp-parser';
+import {fileResolver} from '../dist/examples/CPP/include-resolver';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 

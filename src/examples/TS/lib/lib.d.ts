@@ -119,6 +119,20 @@ interface Symbol {
 // computed key made from it is a symbol key, never checked against a numeric index signature.
 interface SymbolConstructor {
 	readonly iterator: unique symbol;
+	readonly hasInstance: unique symbol;
+	readonly isConcatSpreadable: unique symbol;
+	readonly match: unique symbol;
+	readonly replace: unique symbol;
+	readonly search: unique symbol;
+	readonly species: unique symbol;
+	readonly split: unique symbol;
+	readonly toPrimitive: unique symbol;
+	readonly toStringTag: unique symbol;
+	readonly unscopables: unique symbol;
+	readonly asyncIterator: unique symbol;
+	readonly matchAll: unique symbol;
+	readonly dispose: unique symbol;
+	readonly asyncDispose: unique symbol;
 }
 declare var Symbol: SymbolConstructor;
 

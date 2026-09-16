@@ -22,9 +22,9 @@
 
 import fs from 'fs';
 import path from 'path';
-import * as TS from '../src/examples/TS/ts-parser';
+import * as TS from '../dist/examples/TS/ts-parser';
 
-const LIB_DIR	= path.join(__dirname, '../src/examples/TS/lib');
+const LIB_DIR	= path.join(__dirname, '../dist/examples/TS/lib');
 // Same glob and the same order towasm.ts itself uses, so this reads exactly the set that gets linked.
 const LIB_FILES	= ['lib.d.ts', ...fs.readdirSync(LIB_DIR).filter(f => f.endsWith('.ts') && f !== 'lib.d.ts').sort()];
 
