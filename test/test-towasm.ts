@@ -4010,6 +4010,25 @@ async function main() {
 		check('a class body sees its own module imports', namespaceInClassBody(), 21);
 	}
 
+	{
+		// A statement that assigns a narrowed name rewrote the scope stamped on it, so the RIGHT-HAND SIDE was
+		// compiled against the post-assignment type: `stmt = stmt.declaration` lost the narrowing that made the read
+		// legal, and no member of the union had that field (checker.ts own export_decl unwrapping, 36 declarations).
+		const { narrowedThenAssigned } = await compile(`
+			interface VarDecl { type: 'var_decl'; n: number }
+			interface FnDecl { type: 'fn_decl'; name: string }
+			interface ExportDecl { type: 'export_decl'; declaration: VarDecl | FnDecl }
+			type Decl = VarDecl | FnDecl | ExportDecl;
+			export function narrowedThenAssigned(): number {
+				let stmt: Decl = { type: 'export_decl', declaration: { type: 'var_decl', n: 7 } };
+				if (stmt.type === 'export_decl')
+					stmt = stmt.declaration;
+				return stmt.type === 'var_decl' ? stmt.n : -1;
+			}
+		`);
+		check('a statement assigning a narrowed name still reads it narrowed', narrowedThenAssigned(), 7);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter

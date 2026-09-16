@@ -1668,7 +1668,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				};
 				const keys = objectKeyNames(arg, scope, depth - 1);
 				if (keys)
-					return resolve(scope, combineTypes(keys.map(Literal)), depth - 1, stopAtRef);
+					return resolve(scope, combineTypes(keys.map(k => Literal(k))), depth - 1, stopAtRef);
 				break;
 			}
 			case 'conditional': {
@@ -3410,7 +3410,7 @@ export class Scope {
 	
 
 	// Every name narrowed anywhere between this scope and `base` (exclusive); used to combine two independently-narrowed branches of a `||`/`&&` test.
-	narrowedNames(base: Scope): Set<string> {
+	narrowedNames(base?: Scope): Set<string> {
 		const names = new Set<string>();
 		for (let s: Scope | undefined = this; s && s !== base; s = s.parent)
 			for (const name of s.narrowings?.keys() ?? [])

@@ -631,6 +631,24 @@ function writesAny(body: JS.Stmt<any>[] | Expr, names: Set<string>): boolean {
 	return found;
 }
 
+
+// A statement that ASSIGNS a narrowed name rewrites the very scope it was stamped with (`case 'assign'`'s
+// own `scope.addNarrowing`), so a later reader of that stamp -- towasm compiling the right-hand side --
+// saw the POST-assignment type: `stmt = stmt.declaration` lost the narrowing that made `.declaration`
+// legal at all. The stamp keeps the state at the START of the statement; the narrowing still reaches
+// every statement after it, as JS assignment semantics require.
+function stampedScope(s: Stmt, scope: Scope): Scope {
+	const narrowed = scope.narrowedNames();
+	if (!narrowed.size || !writesAny([s] as JS.Stmt<any>[], narrowed))
+		return scope;
+	const frozen = new Scope(scope);
+	for (const name of narrowed) {
+		const t = scope.value(name);
+		if (t)
+			frozen.addNarrowing(name, t);
+	}
+	return frozen;
+}
 // A name destructured from a union narrows as its source path (`kind` as `x.kind`), so the rest of `x` narrows with it.
 function throughSources(e: Expr, scope: Scope): Expr {
 	if (e.type === 'identifier')
@@ -2563,7 +2581,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 	// `??=`, not `=`: the first (real, unmuted) check wins, the same reasoning as `fn.scope ??=` above --
 	// a speculative (muted) re-walk always reaches a statement only after the real pass already has, and
 	// must not overwrite what that concluded.
-	const stamp: (s: Stmt, scope: Scope) => void = noStamp ? _ => {} : (s, scope) => {(s as any).scope ??= scope;};
+	const stamp: (s: Stmt, scope: Scope) => void = noStamp ? _ => {} : (s, scope) => {(s as any).scope ??= stampedScope(s, scope);};
 
 	// The per-STATEMENT stamp is a wrapper this walk either composes or does not (see `stampScopes`),
 	// rather than a flag threaded through `checkStmt` and `checkBlock`. `fn.scope` just above is the
@@ -2795,7 +2813,7 @@ function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; ri
 // stamping) writes its own and calls `checkStmt` from it -- and since `err` is in scope there, the
 // wrapper re-supplies it on every entry, which is why `err` need not be part of `checkStmt`'s own type.
 export const checkStmt1 = (err?: Err): checkStmt => (s, scope, typeOf, self) => {
-	(s as any).scope ??= scope;
+	(s as any).scope ??= stampedScope(s, scope);
 	checkStmt(s, scope, typeOf, self, err);
 };
 
