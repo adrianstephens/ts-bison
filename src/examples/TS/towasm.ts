@@ -10356,7 +10356,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// constructor body naming something only its own file declares (a non-exported module-level
 			// const, a sibling class) must resolve it there. Same pairing `compileFunc` gives a top-level
 			// function; `libGlobal` remains the fallback for a lib class or a synthesized shape.
-			const ctx		= new FunctionContext(key, new Scope(cls.declScope ?? libGlobal), plainReturn(thisWtype), cls, cls.homeModule);
+			// The DECLARING module's own scope: `declScope` is whatever type reference first built this class, which
+			// need not be its own module (a helper `use(h: Holder)` in another file), and then its body could not see
+			// its own imports at all -- an `import * as TS` call inside it read as an unresolved identifier.
+			const ctx		= new FunctionContext(key, new Scope(moduleScopeOf(cls.homeModule) ?? cls.declScope ?? libGlobal), plainReturn(thisWtype), cls, cls.homeModule);
 			ctx.widenedTypes = collectRangeWidenings(ctor.body!, ctx.scope);
 			ctx.ownBody = ctor.body!;
 			ctx.declareParams(params).forEach(st => emitStmt(st, ctx));
@@ -10536,7 +10539,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		funcs.set(key, info);
 		worklist.push(withCatch(() => {
 			// See `ensureCtor`'s own note -- a method body resolves against its class's declaring module too.
-			const ctx	= new FunctionContext(key, new Scope(owner.declScope ?? libGlobal), plainReturn(result, decl.returnType as Type | undefined), owner, owner.homeModule);
+			const ctx	= new FunctionContext(key, new Scope(moduleScopeOf(owner.homeModule) ?? owner.declScope ?? libGlobal), plainReturn(result, decl.returnType as Type | undefined), owner, owner.homeModule);
 			if (!isStatic)
 				ctx.declareValue('this', thisWtype, owner.thisTsType);
 			if (reassignsThis) {

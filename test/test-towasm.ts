@@ -3982,6 +3982,34 @@ async function main() {
 		check('a type parameter bounded by object erases to a reference', objectBound(), 3);
 	}
 
+	{
+		// A class body was compiled in whatever scope the type reference that first built the class carried -- reaching
+		// `Holder` through a helper's parameter type builds it from another module -- so its own `import * as TS` was
+		// invisible inside it ('unresolved identifier TS', 31 declarations: type-utils' `Scope` methods).
+		const { namespaceInClassBody } = await compileMulti({
+			tsp: `
+				export interface Inter { type: 'intersection'; value: number }
+				export function Inter(value: number): Inter { return { type: 'intersection', value }; }
+			`,
+			tu: `
+				import * as TS from './tsp';
+				export class Holder {
+					last: TS.Inter = TS.Inter(0);
+					merge(n: number): number {
+						this.last = TS.Inter(n);
+						return this.last.value;
+					}
+				}
+			`,
+			main: `
+				import { Holder } from './tu';
+				function use(h: Holder): number { return h.merge(1) + h.merge(2) * 10; }
+				export function namespaceInClassBody(): number { return use(new Holder()); }
+			`,
+		}, 'main');
+		check('a class body sees its own module imports', namespaceInClassBody(), 21);
+	}
+
 
 	{
 		// Closure WasmTypes were memoized by PHYSICAL signature, yet carried the TS parameter types an unannotated closure parameter
