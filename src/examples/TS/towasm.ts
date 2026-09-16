@@ -10796,11 +10796,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (!candidates.length)
 				throw `no reachable class declares a field '${name}' -- a dynamic read on 'any' needs at least one real candidate`;
 
-			// A receiver matching nothing reaches `unreachable` and traps, exactly as `ensureAnyDispatch`
-			// does -- reading a field that isn't there has no honest answer.
+			// A receiver matching nothing is a real object that simply doesn't declare this field, and JS
+			// defines that read as `undefined` -- which this function's own nullable result already
+			// represents. A NULL receiver is the separate case JS throws on, and keeps trapping.
+			const missing: wasm.Instr[] = [
+				I.local.get(recv.index), I.ref.is_null,
+				I.if(toValType(REF_ANY_NULLABLE), [I.unreachable], [I.ref.null(heapTypeIndexOf(REF_ANY_NULLABLE))]),
+			];
 			function buildArm(i: number): wasm.Instr[] {
 				if (i >= candidates.length)
-					return [I.unreachable];
+					return missing;
 				const c = candidates[i];
 				dctx.emit(I.local.get(recv.index), I.ref.test(c.heap));
 				const _cond = dctx.swapOut();

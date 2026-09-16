@@ -4934,6 +4934,24 @@ async function main() {
 		check("for...in: falls back to Object.entries for a sealed struct (no 'keys()' method)", forInSealed(), 2);
 		check("for...in: a dynamic object still takes the efficient .keys() path, unchanged", forInDynamicUnchanged(), 3);
 
+		// A dynamic field read whose receiver turns out not to declare the field: JS defines that as
+		// `undefined`, which the cascade's own nullable result already represents -- it must not trap.
+		const { absentField, presentField } = await compile(`
+			const seen = (v: unknown): boolean => {
+				if (!v || typeof v !== 'object')
+					return false;
+				if (typeof (v as {op?: unknown}).op === 'string')
+					return true;
+				return Object.values(v).some(seen);
+			};
+			export function absentField(): number { return seen({ a: 1, b: 2 }) ? 1 : 0; }
+			export function presentField(): number { return seen({ a: { op: 'x' } }) ? 1 : 0; }
+		`);
+		check("a dynamic field read on an object lacking it is `undefined`, not a trap", absentField(), 0);
+		check('the same read still finds the field on a receiver that does declare it', presentField(), 1);
+	}
+
+	{
 		// An extended class, and a receiver with no static field list at all (`object`, a narrowed
 		// `unknown`): the declared type can't answer either, so both go through `ensureAnyEntries`'
 		// deepest-first `ref.test` cascade and read the fields the value REALLY has at runtime.
