@@ -6505,7 +6505,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// `as`/`as unknown as X` is compile-time-only in real TS too -- a no-op here: compile the inner
 			// expression and pass its actual `WasmType` straight through, ignoring the asserted one entirely.
 			case 'as':
-				return emitExpr(e.expression, ctx, want);
+				// The asserted type is the expression's own context: `{ type: 'array', ... } as Expr` names the union
+				// member to build, where an untargeted literal matches every same-shaped class in the program.
+				return withContext(ctx, e.typeAnnotation, () => emitExpr(e.expression, ctx, want));
 
 			// `f<A>` / `NS.f<A>` read as a VALUE (ts-parser.ts `export const CallSig = JS.CallSig<Type>`): the generic function
 			// instantiated at those type arguments, as a closure. A call through one goes the same way.
