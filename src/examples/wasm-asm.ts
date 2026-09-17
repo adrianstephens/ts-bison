@@ -29,10 +29,6 @@ function isNumericType(t: WT.Type | undefined): t is NumericType { return NUMERI
 // this plus the argument-binding payload an asm body never reads, so this is its projection, not a copy.
 interface AsmInline extends WT.ClosureSig { inline: wasm.Instr[] }
 
-// One call-site argument, as far as codegen is concerned: its physical type. `OperandInfo` in the language
-// half is this plus the class that owns the method, so it satisfies this structurally.
-interface AsmOperand { wtype: WT.Type | undefined }
-
 // The one piece of codegen state an asm body touches: named scratch locals.
 interface AsmCtx { temp(name: string, wtype: WT.Type): number }
 
@@ -40,12 +36,12 @@ interface AsmCtx { temp(name: string, wtype: WT.Type): number }
 // on its side -- plus the `TYPEINDEX` resolver that belongs to it. The two travel together because a
 // `TYPEINDEX` operand must agree with the very signature its own call settled on (an `array.copy`'s operand
 // types are read against it), which is a fact about the types involved and so only the language can answer.
-interface AsmDecl extends WT.ClosureSig {
+export interface AsmDecl extends WT.ClosureSig {
 	typeIndex(text: string): number | undefined;
 }
 
 // What the language knows about an island before any call site exists.
-interface AsmSource {
+export interface AsmSource {
 	asm: string;
 	defines?: Record<string, string | number>;
 	// Whether the declared signature depends on the call site's type arguments: a generic owner, or a body
@@ -60,8 +56,8 @@ interface AsmSource {
 // its signature -- so the two shapes are distinguished here rather than by an optional argument the caller
 // could get wrong.
 type PreparedAsm =
-	| { switched: true;	render(args: AsmOperand[], ctx: AsmCtx): AsmInline }
-	| { switched: false;	render(args: AsmOperand[], ctx: AsmCtx, decl: AsmDecl): AsmInline };
+	| { switched: true;		render(args: (WT.Type | undefined)[], ctx: AsmCtx): AsmInline }
+	| { switched: false;	render(args: (WT.Type | undefined)[], ctx: AsmCtx, decl: AsmDecl): AsmInline };
 
 // One numeric type's expansion of a `$T`-switch body.
 type TypeSwitchVariants = Partial<Record<NumericType, { locals: WAT.WatLocal[]; body: wasm.Instr[] }>>;
@@ -80,21 +76,6 @@ function assertFlatInstrs(instrs: WAT.WatInstr[], asm: string): wasm.Instr[] {
 			throw `inline asm '${asm}': '${i.localIndex}' needs an enclosing '(switch $T ...)' declaring which types it's for`;
 		return i;
 	});
-}
-
-// The instruction a `$T.<oper>` operand names. `I`'s per-numeric-type tables also hold instruction
-// BUILDERS (`I.f64.const(x)`), which an operand slot with no immediates cannot mean, so only an
-// object-shaped entry answers; a builder makes the arm fail to resolve, exactly as an operator the type
-// has no entry for already does.
-type NumericOp = wasm.Instr | ((...args: never[]) => unknown);
-function typeOp(type: NumericType, oper: string): wasm.Instr | undefined {
-	// The one thing `I`'s own type cannot express: each table is a hundred-deep intersection of per-op
-	// literal types (`{op: 'i32.add'} & ...`), so a runtime key has no index signature to use. The claim
-	// below is true of every value in those tables (instructions and builders alike), and `typeof` is what
-	// actually decides -- the proper fix is a keyed accessor exported beside `I`.
-	const table: object = I[type];
-	const op: NumericOp | undefined = (table as Record<string, NumericOp>)[oper];
-	return typeof op === 'object' ? op : undefined;
 }
 
 // A `$T`-keyed switch, expanded once per numeric type its arms declare. An arm's own body can declare
@@ -119,10 +100,10 @@ function expandTypeSwitch(parsed: { locals: WAT.WatLocal[]; body: WAT.WatInstr[]
 				if (i.op === '__local') {
 					addLocals([i]);
 				} else if (i.op === 'local.get' && typeof i.localIndex === 'string' && i.localIndex.startsWith('$T.')) {
-					const instr = typeOp(type, i.localIndex.slice('$T.'.length));
-					if (!instr)
+					const oper = i.localIndex.slice(3);
+					if (!(oper in I[type]))
 						return false;
-					body.push(instr);
+					body.push((I[type] as any)[oper]);
 				} else if (i.op === '__switch' && i.key === '$T') {
 					const arm = i.arms.find(a => a.values.includes(`$${type}`));
 					if (!arm)
@@ -196,7 +177,7 @@ function resolveTypeExprs(instrs: wasm.Instr[], resolveIndex: (text: string) => 
 // The three shapes an asm body takes. A generic body's signature and type operands depend on the call
 // site's type arguments, so its operands are resolved per call; a `$T` body's signature is the numeric type
 // its arguments agree on; anything else is resolved once.
-function makeAsm(src: AsmSource): PreparedAsm {
+export function makeAsm(src: AsmSource): PreparedAsm {
 	const { asm } = src;
 	const parsed = WAT.parseAsmBody(asm, src.defines);
 
@@ -205,7 +186,7 @@ function makeAsm(src: AsmSource): PreparedAsm {
 		const locals = parsed.locals.map(l => ({ id: l.id, count: l.count, type: l.type as wasm.ValType }));
 		return {
 			switched: false,
-			render: (args, ctx, decl) => ({
+			render: (_args, ctx, decl) => ({
 				params: decl.params, result: decl.result,
 				inline: resolveAsmLocals(resolveTypeExprs(flat, decl.typeIndex), locals, ctx, asm)
 			})
@@ -219,8 +200,8 @@ function makeAsm(src: AsmSource): PreparedAsm {
 		return {
 			switched: true,
 			render: (args, ctx) => {
-				let t = args[0]?.wtype;
-				if (!isNumericType(t) || !variants[t] || args.length !== paramCount || !args.every(a => a.wtype === t)) {
+				let t = args[0];
+				if (!isNumericType(t) || !variants[t] || args.length !== paramCount || !args.every(a => a === t)) {
 					t = NUMERIC_TYPES.find(nt => variants[nt]);
 					if (!t)
 						throw 'no numeric type supports this operation';
@@ -244,6 +225,3 @@ function makeAsm(src: AsmSource): PreparedAsm {
 		render: (_args, ctx, decl) => ({ params: decl.params, result: decl.result, inline: resolveAsmLocals(body.body, body.locals, ctx, asm) })
 	};
 }
-
-export { makeAsm };
-export type { AsmDecl, AsmCtx, AsmInline, AsmOperand, AsmSource, PreparedAsm };

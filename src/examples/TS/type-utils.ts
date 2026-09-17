@@ -4,7 +4,7 @@ import * as JS from './js-parser';
 import { Literal, hasMod } from '../common';
 import { Expr, BindingTarget } from './js-parser';
 import { Type } from './ts-parser';
-import { walker, walkerB, WalkerB } from './walker';
+import { Walker, walker, walkerB, WalkerB } from './walker';
 import { printer } from './printer';
 import * as WT from '../wasm-types';
 
@@ -231,9 +231,12 @@ export function rangeIntersect(a: NumRange, b: NumRange): NumRange | undefined {
 export function rangeUnion(a: NumRange, b: NumRange): NumRange | undefined {
 	if (a.base !== b.base)
 		return undefined;
-	const min = a.min === undefined || b.min === undefined ? undefined : a.min < b.min ? a.min : b.min;
-	const max = a.max === undefined || b.max === undefined ? undefined : a.max > b.max ? a.max : b.max;
-	return { base: a.base, min, max, integer: a.integer && b.integer };
+	return {
+		base:	a.base,
+		min:	a.min === undefined || b.min === undefined ? undefined : a.min < b.min ? a.min : b.min,
+		max:	a.max === undefined || b.max === undefined ? undefined : a.max > b.max ? a.max : b.max,
+		integer: a.integer && b.integer
+	};
 }
 
 // Same-typed `number`/`bigint` arithmetic on a `number | bigint`-typed value, without mixing the two at the type level.
@@ -811,7 +814,6 @@ function combineUnionParameters(left: TS.CallSig, right: TS.CallSig, scope: Scop
 	const both		= (a: Type | undefined, b: Type | undefined) => !a ? b ?? ANY : !b ? a : intersectTypes([a, b]);
 	const [longest, shorter] = count(left) >= count(right) ? [left, right] : [right, left];
 	const n			= count(longest);
-	const extraRest	= !longest.rest && !!shorter.rest;
 	const params: TS.Param[] = [];
 	let rest: TS.CallSig['rest'];
 	for (let i = 0; i < n; i++) {
@@ -821,7 +823,7 @@ function combineUnionParameters(left: TS.CallSig, right: TS.CallSig, scope: Scop
 		else
 			params.push(JS.Param((longest.params[i] ?? shorter.params[i]).key, type, i >= required(longest) && i >= required(shorter) ? ['optional'] : []));
 	}
-	if (extraRest)
+	if (!longest.rest && !!shorter.rest)
 		rest = JS.Rest(shorter.rest!.key, TS.ArrayType(typeAt(shorter, n) ?? ANY));
 	return { params, rest };
 }
@@ -1971,6 +1973,53 @@ export function isTruthy(t: Type, scope: Scope): boolean {
 		:	r.type === 'ref'			? isObjectRef(r, scope)
 		:	['object', 'array', 'tuple', 'function', 'constructor'].includes(r.type);
 }
+
+
+
+// True when a value of this type is truthy whenever it is non-null -- an object, an array, a tuple, a
+// function. Never a `string` (`''` is falsy), a `number` (`0`, `NaN`), a `boolean`, a literal, or a
+// genuinely dynamic `any`/type parameter, for all of which truthiness is a property of the VALUE.
+// Answered from the CHECKER's type, which is the only thing that still knows a boxed `any` slot holds
+// `Stmt | undefined` rather than something that could be `0`.
+export function alwaysTruthy(t: Type, scope: Scope): boolean {
+	const r = resolve(scope, t);
+	switch (r.type) {
+		case 'object': case 'array': case 'tuple':	case 'function': case 'constructor':
+			return true;
+		case 'union':
+			// An all-nullish union lands here as `true`, which is still correct: the null test below
+			// answers `false` for it, which is what it always is. `T.unionMembers` drops `never` and
+			// flattens nested aliases -- see its own comment.
+			return unionMembers(r, scope).every(m => isNullish(m, scope) || alwaysTruthy(m, scope));
+		case 'intersection':
+			// A value satisfying an intersection satisfies every part, so one object-ish part is enough
+			// to make it an object -- unless another part makes it a PRIMITIVE (a branded
+			// `string & {brand}`), where truthiness is still the primitive's own. An interface that
+			// `extends` another resolves to exactly this (`FunctionType` = `{type:'function'} & CallSig`).
+			return r.types.some(m => alwaysTruthy(m, scope))
+				&& !r.types.some(m => ['ref', 'literal'].includes(resolve(scope, m).type));
+		case 'ref':
+			// `never` is uninhabited, so no value can BE the falsy one -- vacuously true, and a union
+			// member `JS.Stmt<any>` really has (a generic parameter substituted away). Every other `ref`
+			// surviving `resolve` is a primitive or an unresolved name, neither decidable here.
+			return r.name === 'never';
+		default:
+			// A literal, `keyof`, a conditional, a type parameter: not decidable here either.
+			return false;
+	}
+}
+export function isNullLiteral(e: Expr): boolean {
+	return nullLiteralKind(e) !== undefined;
+}
+
+// Which of the two nullish literals `e` is, if either. They share one physical form here (`ref.null`),
+// so only a STRICT comparison ever has to tell them apart, and only statically -- see `case '==='`.
+export function nullLiteralKind(e: Expr): 'null' | 'undefined' | undefined {
+	return	e.type === 'literal' && e.value === null			? 'null'
+		:	e.type === 'identifier' && e.name === 'undefined'	? 'undefined'
+		:	undefined;
+}
+
 // A class or interface instance is an object, never falsy -- TS's object type facts. Not an empty shape (`{}`, `Object`),
 // which a primitive satisfies, nor anything unresolved.
 function isObjectRef(r: TS.RefType, scope: Scope): boolean {
@@ -3497,3 +3546,293 @@ export function makeGlobal() {
 */
 	return global;
 }
+
+// JS `fn.length`: the parameters before the first defaulted one; a rest parameter and a TS `this` parameter never count.
+export function jsLength(params: { key: unknown; default?: unknown }[]): number {
+	const own = params.filter(p => p.key !== 'this');
+	const i = own.findIndex(p => p.default !== undefined);
+	return i < 0 ? own.length : i;
+}
+
+// A `get`/`set` accessor's `methodDecls`/`inlineMethods`/`funcs` key, mangled apart from a plain same-named
+// method so a getter and a setter for one property can coexist as two entries instead of overwriting each other.
+export function accessorKey(kind: 'get' | 'set', name: string): string {
+	return `${kind}:${name}`;
+}
+
+// A structural shape's expando identity: its member names. A named shape and its anonymous twin share it, so they get
+// the same expando fields and `layoutTwin` can still merge them.
+export function shapeKey(members: readonly TS.TypeMember[]): string {
+	return `#shape#${members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string' ? [m.key] : []).sort().join(',')}`;
+}
+
+// Substitutes a generic class's own single type parameter (`PARAM`) for `subs` throughout its decl -- shared
+// by `builtinOwner` and `ensureClass`. `thisTsType`, when given, also substitutes a `T[]`-shaped member type for the whole instantiation itself -- specific to `Array<T>`'s own shape, ordinary callers omit it.
+export function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<string, Type>): JS.ClassDecl<Type> {
+	const out = walker(undefined, undefined, (t, process) =>
+		t.type === 'ref' && map.has(t.name) ? map.get(t.name) : process(t)
+	).statement(decl)!;
+	// A STATIC member is restored verbatim: real TS forbids one referencing its class's type parameters, so
+	// substituting into one can only corrupt a static's OWN same-named type parameter -- `Array<any>`'s
+	// `_alloc<T>(n): T[]` became `any[]`, allocating `arr:ref` whatever it was called with, so `$ret` never had a chance to resolve it.
+	// Order is structural, so `out.body[i]` is `decl.body[i]` throughout.
+	out.body = out.body.map((m, i) => hasMod(decl.body[i] as { modifiers?: string[] }, 'static') ? decl.body[i] : m);
+	return out;
+}
+
+// Applies a whole set of type-param substitutions in one `walk` pass; unlike `substituteClassTypeParam` (one name,
+// re-invoked once per class type param), the caller resolves `map` for both the explicit-type-args and
+// inferred-from-arguments cases (see `ensureGenericFunc`).
+export function substituteTypeParams(map: ReadonlyMap<string, Type>): Walker {
+	return walker(
+		// The checker's stamps are the TEMPLATE's scopes, where `T` is opaque: stale for an instance, which `instantiateDecl`
+		// re-checks so its own narrowing (on the concrete types) is stamped afresh.
+		(s, process) => { const built = process(s); delete (built as any).scope; return built; },
+		(e, process) => { const built = process(e); delete (built as any).scope; return built; },
+		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
+	);
+}
+
+export function isAsm(e?: Expr): e is JS.Call<Type> {
+	return e?.type === 'call' && e.callee.type === 'identifier' && e.callee.name === '__asm';
+}
+
+export function isAsmMethod(m: JS.Method<Type>): JS.Call<Type> | undefined {
+	if (m.body?.[0]?.type === 'return') {
+		const outer = m.body[0].argument;
+		if (outer?.type === 'call' && isAsm(outer.callee)) {
+			const paramNames = m.params.map(p => typeof p.key === 'string' ? p.key : undefined);
+			const argNames = outer.arguments.map(a => a.type === 'identifier' ? a.name : undefined);
+			if (paramNames.length === argNames.length && paramNames.every((p, i) => p !== undefined && p === argNames[i]))
+				return outer.callee;
+		}
+	}
+}
+
+export function genericKey(name: string, typeParams: readonly TS.TypeParam[], map: Map<string, Type>, scope: Scope) {
+	return `${name}<${typeParams.map(p => typeKey(resolve(scope, map.get(p.name)!))).join(',')}>`;
+}
+
+export function homeKey(homeModule: string, name: string) {
+	return homeModule === '.' ? name : homeModule + '\0' + name;
+}
+
+// A structural `{[k: string]: V}` type has no nominal class, so it gets no owner; routed to `Map<string, V>`, whose `get`/`set` (`case 'index'`) plus `delete`/`has`/`keys` already cover it.
+// Purely a shared-implementation choice, invisible to the source: real `{}`/bracket/`delete`/`in`/`for...in` stays genuine syntax.
+export function indexSignatureValueType(w: Type): Type | undefined {
+	if (w.type !== 'object' || w.members.length !== 1)
+		return undefined;
+	const m = w.members[0];
+	return m.type === 'index' && m.paramType.type === 'ref' && m.paramType.name === 'string' ? m.typeAnnotation : undefined;
+}
+
+// A guard can refine a union member past anything physical (`Lit<string>` out of `Lit<string | number>`),
+// but a value's struct is fixed when it is built: each refined part maps back to the one member it came from.
+export function backToDeclaredMembers(narrowed: Type, base: Type, scope: Scope): Type {
+	const r = resolve(scope, base);
+	if (r.type !== 'union')
+		return narrowed;
+	const members	= unionMembers(r, scope);
+	const declared	= new Set(members.map(m => typeKey(m)));
+	const refined	= unionMembers(resolve(scope, narrowed), scope);
+	const parts		= refined.map(p => {
+		if (declared.has(typeKey(p)))
+			return p;
+		const from = members.filter(m => !isAny(m) && isAssignable(p, m, scope));
+		return from.length === 1 ? from[0] : p;
+	});
+	return parts.some((p, i) => p !== refined[i]) ? combineTypes(parts) : narrowed;
+}
+
+// The possible values for a field whose declared type is a pure literal or union of literals (a real discriminant, e.g. a
+// class member's `type: 'method'|'get'|'set'`); `undefined` for anything else (an ordinary wider field that merely happens
+// to hold a constant-looking value at one call site), meaning "no signal, doesn't rule a candidate in or out". Shared by every
+// discriminant tiebreak in this file (`matchObjectShape`/`matchObjectShapeByType`/`matchContextualUnionMember`); checking
+// only `declType.type === 'literal'` independently misses a union of literal tags (any real discriminated union with >2 arms
+// sharing one field), silently treating a candidate that can never hold the value as an unconstrained match rather than a definite mismatch.
+export function literalValues(t: Type): unknown[] | undefined {
+	return t.type === 'literal' ? [t.value]
+		: t.type === 'union' && t.types.every((m): m is Literal<string | number | boolean | null | JS.TemplatePart<Type>[]> => m.type === 'literal') ? t.types.map(m => m.value)
+		: undefined;
+}
+
+// Resolves any `Type` down to a real flat `ObjectType`, if possible: a plain `'object'` already is one; an `extends`
+// intersection's own parts can still be unresolved refs (`CallSig<T>`) -- `T.flattenIntersection`'s `resolveOwn`
+// handles that, and `T.mergeIntersection` folds the flattened parts into one flat object. Shared by `ownerFor`'s
+// `'intersection'` case and `matchContextualUnionMember` below, so both agree on the exact same flat shape (and the
+// same `T.typeKey`/struct) for a given declared type; duplicating the merge risks subtly different shapes for one interface.
+export function resolveObjectType(t: Type, scope: Scope): TS.ObjectType | undefined {
+	const w = resolve(scope, t);
+	if (w.type === 'object')
+		return w;
+	if (w.type === 'intersection') {
+		const merged = mergeIntersection(TS.IntersectionType(flattenIntersection(w, scope)));
+		return merged.type === 'object' ? merged : undefined;
+	}
+	return undefined;
+}
+
+// Emits a call's arguments, shared by every call site (`emitCall`/`emitMethodCall`/`new`/a closure value's own call): a rest
+// param's trailing arguments (a compile-time-known count in this subset) bundle into one array via `emitArrayElements`, the
+// same machinery an array *literal*'s own `[...a, b]` uses, so a spread there Just Works. A spread crossing into the *fixed*
+// portion (`f(...a, b)`) is unsupported -- its runtime length can't tell how many fixed params it fills. A default reading an
+// earlier parameter (`b.length`) has its references rewritten to the scratch local `emitCallArgs` binds into, matching the
+// grammar `isReemittableDefault` accepts.
+export function substituteEarlierParamRefs(e: Expr, rename: ReadonlyMap<string, string>): Expr {
+	const sub = (x: Expr) => substituteEarlierParamRefs(x, rename);
+	// A node actually REBUILT here loses its branch stamp (`stampBranch`, checker.ts), same as `substituteTypeParams`: the
+	// stamp was taken where the original parameter names were bound and cannot resolve the scratch locals they become at the
+	// call site. A node returned untouched was not rewritten, so its stamp still means what it said.
+	const out = rebuild();
+	if (out !== e)
+		delete (out as any).scope;
+	return out;
+
+	function rebuild(): Expr {
+		switch (e.type) {
+			case 'identifier': {
+				const to = rename.get(e.name);
+				return to ? { ...e, name: to } : e;
+			}
+			case 'member':		return { ...e, object: sub(e.object) };
+			// The operator shapes `isReemittableDefault` accepts must be descended into as well, or the
+			// `a` in `b = a * 2` stayed pointing at a name the call site has never heard of.
+			case 'binary':		return { ...e, left: sub(e.left), right: sub(e.right) };
+			case 'unary':		return { ...e, operand: sub(e.operand) };
+			case 'conditional':	return { ...e, test: sub(e.test), consequent: sub(e.consequent), alternate: sub(e.alternate) };
+			case 'array':		return { ...e, elements: e.elements.map(el => el && el.type !== 'spread' ? sub(el) : el) };
+			default:			return e;
+		}
+	}
+}
+
+export function structuralKey(name: string, params: JS.Param<Type>[]): string {
+	return `${name}#struct<${params.map(p => p.typeAnnotation ? typeKey(p.typeAnnotation) : '_').join(',')}>`;
+}
+
+// Returns both the resolved `Type` and its `WasmType` -- a caller declaring this param as a real local (`declareParams`) needs the former too, and re-deriving it
+// would need a `checker` instance FuncCtx doesn't have. A default is re-emitted verbatim at each omitted call site (`emitCallArgs`), so it may reference only
+// its own literal value or an *earlier* parameter (`earlierNames`, e.g. `updateBuffer(b: Uint8Array, off = 0, len = b.length)`); anything else would resolve
+// against the *call site's* scope, not the declaring function's, so it is applied in the callee instead. Literals, recursively-safe array literals, and a
+// plain (possibly chained) non-optional property read off an earlier parameter are all safe the same way -- no call, no side effect. `emitCallArgs` is what
+// makes an earlier-parameter reference resolve correctly (see its own comment); this only decides whether the *shape* is safe to attempt. A CLOSURE default
+// (`sort(compareFn = (a, b) => ...)`) is judged instead by what it CAPTURES: only its own params and the earlier params those call sites already pass --
+// anything else is an enclosing local re-emitted out of scope. `Array.sort`'s own `(a, b) => a < b ? -1 : ...` default captures nothing.
+export function closureDefaultIsSelfContained(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
+	if (e.type !== 'arrow' && e.type !== 'function')
+		return false;
+	const bound = new Set<string>(earlierNames);
+	for (const p of e.params)
+		if (typeof p.key === 'string')
+			bound.add(p.key);
+	let ok = true;
+	walker(undefined, (x, process) => {
+		if (x.type === 'identifier' && !bound.has(x.name))
+			ok = false;
+		return process(x);
+	}).body(e.body);
+	return ok;
+}
+
+export function isReemittableDefault(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
+	return e.type === 'literal'
+		// `undefined` is a language CONSTANT, not a name to resolve: self-contained and side-effect-free, which is the property this predicate actually tests.
+		// The AST has a `null` literal but no `undefined` one, so it arrives as an identifier -- and `defaultsWithImplicitUndefined` synthesizes exactly this node.
+		|| (e.type === 'identifier' && e.name === 'undefined')
+		|| closureDefaultIsSelfContained(e, earlierNames)
+		|| (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el, earlierNames)))
+		// Same reasoning as the array case, and `{}` -- an all-defaults options bag -- is the common one.
+		|| (e.type === 'object' && e.properties.every(pr => pr.type === 'field' && typeof pr.key === 'string' && !!pr.value && isReemittableDefault(pr.value, earlierNames)))
+		|| (e.type === 'identifier' && !!earlierNames?.has(e.name))
+		|| (e.type === 'member' && !e.optional && isReemittableDefault(e.object, earlierNames))
+		// An OPERATOR over things already re-emittable (`b = a * 2`, `n = -1`, `x = a ? 1 : 2`) adds no new name to resolve at the call site,
+		// so it carries none of the cross-module hazard a default that *called* something would.
+		|| (e.type === 'binary' && isReemittableDefault(e.left, earlierNames) && isReemittableDefault(e.right, earlierNames))
+		|| (e.type === 'unary' && isReemittableDefault(e.operand, earlierNames))
+		|| (e.type === 'conditional' && isReemittableDefault(e.test, earlierNames) && isReemittableDefault(e.consequent, earlierNames) && isReemittableDefault(e.alternate, earlierNames));
+}
+
+// A bare `p?: T` (optional, no `= value`) is valid TS distinct from `p: T = value`, and `emitCallArgs` only ever consulted a real default expression,
+// so an optional-but-defaultless trailing param could never be omitted at a call site -- found via `lib/map.ts`'s `entries()` calling `.map()` with `thisArg` omitted.
+// Synthesizes a real `undefined` identifier as its default; `emitAs`'s own `isNullLiteral` handling already accepts a bare `undefined` wherever a nullable (or plain `any`) target is expected,
+// so this needs no further codegen support. A default only the callee can evaluate (`calleeDefault`) is applied there, so callers pass `undefined` for it too.
+export function defaultsWithImplicitUndefined(params: readonly { key: BindingTarget; default?: Expr; modifiers?: string[] }[]): (Expr | undefined)[] {
+	return params.map((p, i) => p.default && isReemittableDefault(p.default, new Set(params.slice(0, i).flatMap(q => typeof q.key === 'string' ? [q.key] : []))) ? p.default
+		: p.default || hasMod(p, 'optional') ? { type: 'identifier', name: 'undefined' } : undefined);
+}
+
+// An accessor's halves as `Object.defineProperty` stores them: one canonical `() => any` getter and `(v: any) => void`
+// setter, so every accessor slot of a kind shares one type whatever the descriptor's own closures declared.
+export function getterSig(): TS.FunctionType { return { type: 'function', params: [], returnType: ANY }; }
+
+export function setterSig(): TS.FunctionType { return { type: 'function', params: [{ key: 'v', typeAnnotation: ANY }], returnType: VOID }; }
+
+// The TS type of a HIDDEN field (`#ext`, an accessor's `#get:`/`#set:` companion) -- named in one place, so a derived shape
+// repeating its base's hidden fields repeats them exactly and stays that base's wasm subtype. Plain expandos are `any`.
+export function hiddenFieldType(name: string): Type {
+	return name === '#ext' ? TS.RefType('Map', [STRING, ANY])
+		: name.startsWith('#get:') ? getterSig()
+		: name.startsWith('#set:') ? setterSig()
+		: ANY;
+}
+
+// `declScope`: a cross-module reference (`t.declScope` on the original `RefType`, see checker.ts's/type-utils.ts's `withScope`/`declScopeOf`)
+// resolves `name` where it was declared, not where referenced -- `global` never sees a type reached only transitively (e.g. inferred off an
+// imported function's own return type) without itself being imported by name. Defaults to `global`, as every same-module caller expects.
+// A type argument that changes a generic's physical layout: a value stored unboxed, or a typed-array tag. Any other
+// occupies one ref slot whatever it is, and keying on the finite set of these also bounds `Box<T[]>`-style recursion.
+export function ownsLayout(t: Type, scope: Scope): boolean {
+	if (t.type === 'ref' && !t.typeArgs && WASM_PSEUDO_TYPES.has(t.name))
+		return true;
+	const r = resolve(scope, t);
+	return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean' || r.name === 'any');
+}
+
+// The tag is read UNRESOLVED on purpose: `T.resolve` collapses every `TypedArray` tag alike to plain `number`.
+export function layoutArgKey(t: Type, scope: Scope): string {
+	return t.type === 'ref' && !t.typeArgs && WASM_PSEUDO_TYPES.has(t.name) ? t.name : typeKey(resolve(scope, t));
+}
+
+// Would these two types occupy the same wasm slot? Answered WITHOUT building a shape -- this runs before codegen -- by the same collapse `ensureClass`
+// applies: a reference type argument erases, so `TemplatePart<unknown>` and `TemplatePart<Type>` are one layout (widening one would leave it unbuilt, with nothing for a dynamic read to find).
+export function layoutSketch(t: Type | undefined, scope: Scope, depth = 3): string {
+	if (!t || depth < 0)
+		return 'any';
+	// A GENERIC's reference is sketched unresolved: `ensureClass` collapses reference type arguments, so
+	// `TemplatePart<unknown>` and `TemplatePart<Type>` are one instantiation, which substituting them apart would hide.
+	if (t.type === 'ref' && t.typeArgs?.length && !scope.type(t.name)?.isTypeParam)
+		return `${t.name}<${t.typeArgs.map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
+	const r = resolve(scope, t);
+	const members = unionMembers(r, scope).filter(m => !isNullish(m, scope));
+	// A union of references is one `anyref`, and so is `any`/`unknown`/`object` -- `TemplatePart<unknown>`'s `exp?` and
+	// `TemplatePart<Type>`'s (a union) are the same slot, while `Sig` and `Meth` are two distinct struct references.
+	if (members.length > 1)
+		return members.every(m => !!typeOfScalar(m, scope)) ? 'num' : 'any';
+	if (r.type === 'ref') {
+		if (isAny(r) || r.name === 'unknown' || r.name === 'object')
+			return 'any';
+		const scalar = typeOfScalar(r, scope);
+		return scalar ?? `${r.name}<${(r.typeArgs ?? []).map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
+	}
+	if (r.type === 'array' || r.type === 'tuple') {
+		// A tuple is an `Array` of its combined element type, which is a reference whenever the positions differ.
+		const el = r.type === 'array' ? r.element : ANY;
+		return `arr:${ownsLayout(el, scope) ? layoutSketch(el, scope, depth - 1) : 'ref'}`;
+	}
+	if (r.type === 'object')
+		return `{${r.members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string'
+			? [`${m.key}:${layoutSketch(lookupMember(r, m.key, scope), scope, depth - 1)}`] : []).sort().join(',')}}`;
+	return 'ref';
+}
+
+// `number`/`boolean` are the only types stored unboxed; everything else is one reference slot.
+export function typeOfScalar(t: Type, scope: Scope): string | undefined {
+	const r = resolve(scope, t);
+	return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean') ? r.name
+		: r.type === 'literal' ? (typeof r.value === 'number' ? 'number' : typeof r.value === 'boolean' ? 'boolean' : undefined)
+		: undefined;
+}
+
+// Declared exactly when the compiled code actually touches memory, whatever emitted it -- keying off the
+// `heap` global's NAME instead missed a linear-memory read that never allocates (`String.fromCharCodesAt`).
+export const memOp		= (op: string) => op.startsWith('memory.') || /^(i32|i64|f32|f64|v128)\.(load|store)/.test(op);
