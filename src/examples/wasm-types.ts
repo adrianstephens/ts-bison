@@ -65,6 +65,23 @@ function elementKind(wtype: Type | undefined): ElementI {
 	return typeof wtype === 'string' && wtype !== 'void' ? notUnsigned(wtype) : 'ref';
 }
 
+// Wasm's own pseudo-type vocabulary: the value types a language's `declare type i32 = number`-style alias
+// stands for, so a field/method's storage can be something other than the usual `number`->f64 mapping. The
+// NAMES are wasm's, so they are owned here and a language views them (`T.WASM_PSEUDO_TYPES`) rather than
+// spelling them a second time.
+const PSEUDO_TYPES = ['i8', 'u8', 'i16', 'u16', 'i32', 'i64', 'f32', 'f64', 'u32', 'u64'] as const;
+type PseudoType = typeof PSEUDO_TYPES[number];
+function isPseudoType(name: string): name is PseudoType { return (PSEUDO_TYPES as readonly string[]).includes(name); }
+
+// The VALUE type a pseudo-type occupies in a slot: wasm has no sub-32-bit value types, so the packed 8/16-bit
+// kinds widen (`i8`/`i16` -> i32, `u8`/`u16` -> u32) and every other name is its own value type. Distinct
+// from an element's physical STORAGE kind, which keeps `u8` as `u8` -- see `rawElemKind` on the language side.
+function pseudoValueType(name: PseudoType): Scalar {
+	return name === 'i8' || name === 'i16' ? 'i32'
+		: name === 'u8' || name === 'u16' ? 'u32'
+		: name;
+}
+
 // If `wtype` is a boxed nullable primitive (see `nullableWtype`/`ensureBoxType`), its underlying
 // scalar kind and box type index; otherwise `undefined` (a real class/array/closure-env-struct, or
 // already a bare scalar). Structural (checks `primKind` on the object itself), not a lookup table --
@@ -159,6 +176,7 @@ const CLOSURE_FIELDS = new Map([['length', 2]]);
 
 export {
 	ScalarI, Scalar, ElementI, Element, ClosureSig, Type,
+	PSEUDO_TYPES, PseudoType, isPseudoType, pseudoValueType,
 	ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN,
 	scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType,
 	wasmTypeKey, combineUnionWtypes, storageTypeKey, wTypeKey, CLOSURE_FIELDS,

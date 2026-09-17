@@ -201,8 +201,11 @@ const maybe_id	= Maybe(id);
 // `$`, so a `type:`-prefixed string can never collide with a real name, and if one ever escapes
 // unresolved it fails loudly as an unknown name rather than silently meaning something else.
 const TYPE_EXPR_PREFIX = 'type:';
+// The macro's own name. Exported because the embedder that RESOLVES the sentinel has to recognise the
+// source spelling that produced it: an asm body naming no `TYPEINDEX` needs no per-call signature.
+export const TYPEINDEX_MACRO = 'TYPEINDEX';
 const idx		= Rules<index>(
-	Rule(['TYPEINDEX', '(', str, ')'], $ => TYPE_EXPR_PREFIX + $[2]),
+	Rule([TYPEINDEX_MACRO, '(', str, ')'], $ => TYPE_EXPR_PREFIX + $[2]),
 	Rule([ID],  	($, ctx) => ctx.defines.get($[0]) ?? $[0]),
 	nat
 );

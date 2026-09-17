@@ -358,6 +358,10 @@ name/free-variable functions (`unwrapAs`, `isPurePath`, `exprMentionsName`, `ass
 `collectClosureFreeVars`, `collectCapturedMutables`, `noteAssignExpr`) — pure AST queries, no wasm concepts.
 They were MOVED with a **named** import, which is why no call site changed: worth remembering as the rule
 of thumb, because a namespace import would have cost ~30 qualification edits to save 12 import names.
+**It is a PER-LANGUAGE component, not a neutral one** (stated explicitly 2026-09-17, because the phrase "no
+wasm concepts" invited the opposite reading): every function answers a question about the TypeScript/JS-parser
+AST, so each language's backend needs its own. "No wasm concepts" means it does not belong *inside*
+`towasm.ts`, not that it belongs in the examples root.
 
 **`TS/towasm-types.ts` was created and then FOLDED BACK the same day — see the rule below.** Its
 ~99 declarations (the `FuncSig` family, `Local`/`Global`/`ResolvedParam`/`ClosureEnv`/`FinallyGuard`,
@@ -368,11 +372,60 @@ types for ONE consumer, and splitting them from the code that uses them bought n
 
 **`towasm-builtins.ts` is DROPPED as a target.** Builtins are anticipated to be language-specific and to live
 *in* the language-specific code generation — so by the rule below they stay in `towasm.ts`.
-**`towasm-asm.ts` is the one remaining component split worth considering**, and its reasoning is subtler: the
-inline-`__asm` machinery is a *component* the per-language half uses rather than part of generic compilation.
-It is not urgent, and it now imports `Builtin`/`FunctionContext`/`ClassInfo` as TYPES from `towasm.ts` (a
-`import type` edge, erased at runtime) while `towasm.ts` imports its functions — legal, but worth doing
-slowly, because a real runtime cycle is the one thing that would break it.
+**`wasm-asm.ts` is the component split the plan keeps, and it is the NEUTRAL half that moves.** The earlier
+wording here — "a component the per-language half uses" — was ambiguous and was read as "belongs to one
+language" (2026-09-17). It meant that each language *uses the single* module: the island is the one channel
+every language needs (§6: "every language needs a spelling of it"), so its machinery is the most clearly
+*shared* component in the backend, and only its spelling is per-language.
+
+**The test for a component's axis, settled 2026-09-17** (the same test as for the whole file): a component is
+neutral iff it only ever manipulates neutral representations (WAT/wasm instructions) and *asks* the language
+for every source-language type question, through a host. What stays per-language is the spelling (`__asm`
+recognition, declared type syntax, what a `TYPEINDEX` names) and the type→representation answers. Applied
+here: the asm machinery is neutral (it is `src/examples/wasm-asm.ts`); `towasm-analysis.ts` is NOT (its
+answers are about the TS/JS-parser AST — see Step 1b above).
+
+**LANDED 2026-09-17 — the asm machinery is neutral, in the examples root.** `src/examples/wasm-asm.ts` (162
+code lines) holds the island: `assertFlatInstrs`, `expandTypeSwitch`, `resolveAsmLocals`,
+`resolveTypeExprs`, the three-shape dispatch, and nothing that reasons about a type. It imports only `wasm`,
+`wat-parser` and `wasm-types`, and nothing from the language half at all — not even types: `Inline` in
+`towasm.ts` is structurally the `AsmInline` it returns. `WAT.TYPEINDEX_MACRO` is exported so the
+"is this a generic asm" test names the macro structurally rather than copying its spelling.
+
+**The seam is a concrete base interface, never a type parameter** (§3's idiom, and the correction that
+matters most). `AsmDecl extends WT.ClosureSig` adds exactly one thing: `typeIndex(text)`. The language lowers
+its declared signature and hands over representations; no `Type`, no `TA`, no `unknown`, no callback bag
+crosses. A `$T`-switched body needs no signature at all, and `PreparedAsm` distinguishes that case from the
+two that do instead of taking an optional argument the caller could get wrong. An earlier cut of this work
+was generic over the language's type (`AsmTypes<TA>` + a 6-member adapter) — that is the idiom §3 rules out,
+and it was *larger* (280 code lines against 272) as well as forced.
+
+**What is per-language is the SPELLING plus its type answers, and it is back in the single TS module** (§6's
+rule: one consumer and no enforcement earns no module — the first cut's `TS/towasm-asm.ts` is deleted). The
+`Inline \`__asm\`` section in `towasm.ts` is 110 code lines: `isAsm`/`isAsmMethod` and the call reading
+(~25), `asmDeclaredType` (~20, the declared-type lowering), and `declFor` (~45: substitution, the
+open-parameter argument override, the `TYPEINDEX` map — all of it about TypeScript's generics), plus the
+dispatch (~8). There is no edge back into `towasm.ts` at all.
+
+**The packed-kind rule and the pseudo-type NAMES moved to the neutral vocabulary.** `wasm-types.ts` now owns
+`PSEUDO_TYPES`/`isPseudoType`/`pseudoValueType` (`i8`/`i16` -> i32, `u8`/`u16` -> u32 — wasm has no
+sub-32-bit value types), and `type-utils.ts`'s `WASM_PSEUDO_TYPES` is derived from it, so the plan's
+"declared three times" pseudo-type names have one owner. That deleted a hand-written name switch from the TS
+half. Three other improvements fell out of the work: the `(I[type] as any)[oper] as WAT.WatInstr` lookup is
+now one documented downcast (`object` → `Record<string, Instr | builder>`) and REJECTS a builder entry
+instead of pushing a function as an instruction (a late NaN becomes an early "arm doesn't resolve");
+`Array(n).fill(t)`, a silent `any[]`, is `Array.from({length: n}, () => t)`; and the `rawElemKind` host
+parameter is gone, since the declared-type mapping sits beside it.
+
+**`asmDeclaredType` is now ~20 lines and is NOT a duplicate of `typeOf`/`wasmTypeOf`:** `builtinTypes`
+(towasm.ts 774) holds only `i32/i64/f32/f64/u32`, and `T.resolve` deliberately leaves the pseudo-type names
+unresolved, so `typeOf(RefType('i8'))` is `undefined` while an asm signature declaring `i8` means `i32` (the
+neutral helper above answers that part now). Deleting the rest means teaching the GENERAL mapper the
+pseudo-type spellings — a general codegen change, difftest-gated, not part of this axis.
+
+Remaining: the survey's TARGETS now include `wasm-types.ts`/`wasm-asm.ts`/`towasm-analysis.ts` (they were
+invisible to the work queue, so a declaration moved out of a surveyed file read as progress when it was a
+scope change). The remaining downcast's proper fix is a keyed accessor exported beside `I` in `wasm.ts`.
 
 **Step 2 — relocate into the TS files that already exist (§3).** This is the user's insight and it is the
 cheapest part of the whole plan, because it needs no new module and no boundary decision: ~326 lines to
@@ -399,13 +452,14 @@ can land in any order; they are the only extractions with a *proven* second user
 and the diagnostics apparatus alone — each has exactly one possible user today, and a core with one user is
 not a core.
 
-**Step 4 — the boundary enforced by imports, not by a lint rule.** No custom eslint rule is needed: the
-neutral module imports only `common.ts`, the wasm package and its own submodules, and the language module
-imports *it*, never the reverse. That makes the separation a property of the module graph, checked by the
-compiler, with no judgement to drift. The one rule to write down (in the neutral module's header) is the
-§3 divider: **ask about types freely; answering with a representation is codegen.**
+**The boundary is enforced by imports, not by a lint rule** (true of every step here; stated once). No custom
+eslint rule is needed: a neutral module imports only `common.ts`/`wasm-types.ts`/`wasm`/`wat-parser` and its
+own submodules, and the language module imports *it*, never the reverse. That makes the separation a property
+of the module graph, checked by the compiler, with no judgement to drift. The one rule to write down (in the
+neutral module's header) is the §3 divider: **ask about types freely; answering with a representation is
+codegen.**
 
-**Step 3 — neutralise the shared SHAPES (the pivot, now specified in §3).** In order:
+**Step 4 — neutralise the shared SHAPES (the pivot, now specified in §3).** In order:
 
 1. `Local`/`ClosureEnv`/`FinallyGuard` are already neutral — move them with the first extraction.
 2. Split `FuncSig`/`FuncInfo`/`Inline`/`ClosureTypeInfo`/`MethodDelegate`/`OperandInfo`/`ResolvedParam` into
@@ -421,15 +475,20 @@ that reaches for a TS field stops compiling.
 
 Do this **before** moving any function body: it is what converts the sieve of §3 into a line.
 
-**Step 4 — the real 2-way split.** Convert `TStoWasm`'s body to a class — base = module-level state + the
+**Step 5 — the real 2-way split.** Convert `TStoWasm`'s body to a class — base = module-level state + the
 emission algorithm, subclass = TS dispatch and type lowering — which is exactly the `Emitter`/`TSEmitter`
 shape the VSDG already proved, with §3.4's 16-member context as the base's state. Expect roughly
 **1,500–2,500 neutral / 10,000+ TS**: honest two files, and deliberately *not* two equal halves — the axis is
 TS-specificity, so the lopsidedness is the point rather than a defect. Navigation benefit should be treated
 as a hoped-for side effect, per the axis decision in §3.
 
-**Step 5+ — the seam proper, only if a second language is still wanted:** §2's `TypeOracle`, then the IR,
+**Step 6+ — the seam proper, only if a second language is still wanted:** §2's `TypeOracle`, then the IR,
 then one vertical slice plus a cross-language differential instrument modelled on `difftest.sh`.
+
+**Step numbering fixed 2026-09-17:** Steps 3 and 4 each appeared twice (the generic-core extraction and the
+shape neutralisation were both "Step 3"; the imports rule and the 2-way split were both "Step 4"). The order
+above is the intended one: 3 (independent extractions) → 4 (neutral shapes, the pivot) → 5 (the split, whose
+enforcement is the imports rule) → 6+ (the seam).
 
 # 6. Refuse these (they are the workarounds this plan exists to avoid)
 
@@ -444,8 +503,12 @@ then one vertical slice plus a cross-language differential instrument modelled o
   language-neutral vocabulary, expected to serve the common code generation *and* each per-language one,
   and it enforces that nothing in it names a language type (the compiler rejects it).
 - **Builtins stay in the language's code generation** (anticipated to be language-specific).
-- A cohesive *component* (the asm machinery, the AST analysis) is the subtler case: the reason to separate
-  it is that it is a component other parts use, not that it is small.
+- A cohesive *component* is the subtler case: the reason to separate it is that it is a component other parts
+  use, not that it is small — and **the axis for a component is the same as for the whole file** (§5's test,
+  settled 2026-09-17). The asm machinery is neutral, so it is ONE module in the examples root that each
+  language uses; the AST analysis is per-language, so it stays in `TS/`. "Every language uses it" and "every
+  language owns a copy" are opposite conclusions from the same fact, which is exactly the ambiguity that put
+  `towasm-asm.ts` in `TS/` for a day.
 
 - Adding PY/CPP case labels to the existing 9 switches (option A).
 - An unmodeled construct silently lowered as `any`/default instead of refused.

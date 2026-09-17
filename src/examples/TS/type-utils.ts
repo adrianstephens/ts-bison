@@ -6,6 +6,7 @@ import { Expr, BindingTarget } from './js-parser';
 import { Type } from './ts-parser';
 import { walker, walkerB, WalkerB } from './walker';
 import { printer } from './printer';
+import * as WT from '../wasm-types';
 
 // ===================================================================
 //  Type utilities
@@ -40,7 +41,7 @@ const INTRINSIC_TYPES	= PRIMITIVES.or(TOP_TYPES);
 // folded into `resolve`'s general unwrapping or into `ALL_PRIMITIVES` itself: doing either globally breaks
 // every *other* place a resolved `number` was relied on to unify structurally with an `i32` (e.g. a
 // ternary's two branches, one `i32` one `number`, need to combine into one type same as before).
-export const WASM_PSEUDO_TYPES	= new Set(['i8', 'u8', 'i16', 'u16', 'i32', 'i64', 'f32', 'f64', 'u32', 'u64']);
+export const WASM_PSEUDO_TYPES	= new Set<string>(WT.PSEUDO_TYPES);
 const OPAQUE		= new Set(['keyof', 'indexed_access', 'conditional', 'infer', 'mapped', 'this', 'predicate']);
 
 // The subset of `OPAQUE` that's a genuinely unevaluated computation, as opposed to `this`/`predicate` (opaque by design, not a gap).
