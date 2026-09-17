@@ -3158,6 +3158,11 @@ function globalIterationTypes(t: Type, scope: Scope, async: boolean, generatorRe
 
 // What iterating `t` yields, and returns once done (TS's iteration types): read off its `[Symbol.iterator]()` iterator's
 // `next()` result (`for await` tries `[Symbol.asyncIterator]` first). Without the protocol (an ES5 lib) only arrays and strings iterate.
+// `iterator.next()`: JS sends `undefined` to a `next` that takes a value (a generator's).
+export function nextCall(iterator: Expr, it: IterationTypes, typeScope: Scope): Expr {
+	return JS.Call(JS.Member(iterator, 'next'), isNullish(it.next, typeScope) ? [] : [{ type: 'identifier', name: 'undefined' }]);
+}
+
 export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6, generatorReturn = false): IterationTypes | undefined {
 	const fast = globalIterationTypes(t, scope, async, generatorReturn);
 	if (fast)
@@ -3836,3 +3841,75 @@ export function typeOfScalar(t: Type, scope: Scope): string | undefined {
 // Declared exactly when the compiled code actually touches memory, whatever emitted it -- keying off the
 // `heap` global's NAME instead missed a linear-memory read that never allocates (`String.fromCharCodesAt`).
 export const memOp		= (op: string) => op.startsWith('memory.') || /^(i32|i64|f32|f64|v128)\.(load|store)/.test(op);
+
+// A readonly view is a checker-only distinction over the very same physical container; a primitive tag names a
+// scalar that is stored unboxed, which `typeOfScalar` and `primitivePart` are the two readers of.
+export const READONLY_ALIAS = new Map([['ReadonlyArray', 'Array'], ['ReadonlyMap', 'Map'], ['ReadonlySet', 'Set']]);
+export const PRIMITIVE_TAGS = new Set(['string', 'number', 'boolean', 'bigint']);
+
+// The element types a REST parameter can hold, across every shape its annotation may take: a rest is physically
+// ALWAYS one array, but a tuple or tuple/array union has no array type of its own.
+export function restElementTypes(t: Type, scope: Scope, out: Type[] = [], depth = 4): Type[] {
+	const r = resolveOwn(t, scope);
+	if (r.type === 'array')
+		out.push(r.element);
+	else if (r.type === 'ref' && r.name === 'Array' && r.typeArgs?.length === 1)
+		out.push(r.typeArgs[0]);
+	else if (r.type === 'tuple')
+		out.push(...r.elements.map(el => el.type === 'labeled' || el.type === 'optional' ? el.element : el.type === 'spread' ? el.argument : el));
+	else if (r.type === 'union' && depth > 0)
+		r.types.forEach(m => restElementTypes(m, scope, out, depth - 1));
+	return out;
+}
+
+// The array-backed part of an intersection with one physical shape (an ARRAY carrying extra properties, e.g.
+// `TemplateStringsArray`): the value IS the array. Flattened over the RAW parts, never `flattenIntersection`.
+export function arrayPartOf(t: Type, scope: Scope): { part: Type; element: Type } | undefined {
+	const parts: Type[] = [];
+	const flatten = (x: Type): void => {
+		if (x.type === 'intersection')
+			x.types.forEach(flatten);
+		else
+			parts.push(x);
+	};
+	flatten(t);
+	// Matched on the part's own written shape, never through `resolve` -- that expands `Array<string>` into the
+	// class's own object shape and loses the very thing being looked for. A TUPLE part is physically the same
+	// `arr:ref`, its element the union of every position.
+	const elementOf = (x: Type) => x.type === 'array' ? x.element
+		: x.type === 'tuple' ? combineTypes(x.elements.map(el => tupleElementType(el) ?? ANY))
+		: x.type === 'ref' && x.typeArgs?.length === 1 && (READONLY_ALIAS.get(x.name) ?? x.name) === 'Array' ? x.typeArgs[0]
+		: undefined;
+	const arrays = parts.flatMap(part => {
+		// A part whose array-ness is one resolution step away -- an alias, or a mapped type over an array.
+		const element = elementOf(part) ?? elementOf(resolve(scope, part));
+		return element ? [{ part, element }] : [];
+	});
+	return arrays.length && new Set(arrays.map(a => typeKey(a.element))).size === 1 ? arrays[0] : undefined;
+}
+
+// The primitive member of an intersection, by its own `typeofName`.
+export function primitivePart(t: TS.IntersectionType, scope: Scope): Type | undefined {
+	return t.types.find(p => PRIMITIVE_TAGS.has(typeofName(p, scope) ?? ''));
+}
+
+// Every object shape a type expands to as a union member, each beside its own RAW member type. A consumer matching on
+// nominal identity must be handed the raw member -- `raw` still names a real interface, which an owner lookup resolves
+// by NAME to the one class the dispatch side builds too, where the name-stripped shape alone would build a structural twin.
+export function objectShapes(t: Type, scope: Scope): { raw: Type; objT: TS.ObjectType }[] {
+	return unionMembers(t, scope).flatMap(raw => {
+		const objT = resolveObjectType(raw, scope);
+		return objT ? [{ raw, objT }] : [];
+	});
+}
+
+// The object shape two types share field-wise, each field widened to their union.
+export function unionShapes(a: Type, b: Type, scope: Scope): TS.ObjectType | undefined {
+	const ra = resolveObjectType(a, scope), rb = resolveObjectType(b, scope);
+	if (!ra || !rb)
+		return undefined;
+	const other = new Map(rb.members.flatMap(m => m.type === 'property' && typeof m.key === 'string' ? [[m.key, m.typeAnnotation] as const] : []));
+	return TS.ObjectType(ra.members.map(m => m.type === 'property' && typeof m.key === 'string' && other.has(m.key)
+		? { ...m, typeAnnotation: combineTypes([m.typeAnnotation, other.get(m.key)!]) }
+		: m));
+}

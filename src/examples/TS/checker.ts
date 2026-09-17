@@ -257,6 +257,19 @@ function argContext(a: Expr, declared: Type | undefined, sig: TS.CallSig, scope:
 	return !generic || constArg || ((a.type === 'array' || a.type === 'call') && tupleShaped(declared, scope)) ? declared : undefined;
 }
 
+// Which overload a call resolves to: the first whose signature `candidateFits` accepts. `label` is for the
+// diagnostic only -- `decls` may be an inherited set, so the callee's own name would often be wrong.
+export function resolveOverload(label: string, decls: JS.Method<Type>[], args: Expr[], scope: Scope, typeArgs?: Type[]): JS.Method<Type> {
+	if (decls.length === 1)
+		return decls[0];
+	if (args.some(a => a.type === 'spread'))
+		throw `spread arguments are not supported in a call to overloaded '${label}'`;
+	const found = decls.find(d => d.body && candidateFits(T.FixSig(d, T.ANY), args, scope, typeArgs));
+	if (!found)
+		throw `no overload of '${label}' matches this call`;
+	return found;
+}
+
 // Whether `args` fit candidate `c` as TS's overload resolution asks (checkExpressionWithContextualType): each argument typed
 // against the candidate's OWN parameter, since a literal's type depends on it (`new Map([['', true]])` fits only as tuples).
 export function candidateFits(c: TS.CallSig, args: Expr[], scope: Scope, typeArgs?: Type[], typedIn = args.map(() => new Map<Type | undefined, Type>()), yieldCollector?: Type[], pos: Location = { line: 0, col: 0 }): boolean {

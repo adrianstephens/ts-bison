@@ -84,7 +84,7 @@ function pseudoValueType(name: PseudoType): Scalar {
 		: name;
 }
 
-// If `wtype` is a boxed nullable primitive (see `nullableWtype`/`ensureBoxType`), its underlying
+// If `wtype` is a boxed nullable primitive (see `Types.nullable`/`Types.box`), its underlying
 // scalar kind and box type index; otherwise `undefined` (a real class/array/closure-env-struct, or
 // already a bare scalar). Structural (checks `primKind` on the object itself), not a lookup table --
 // `registerType`'s structural memoization means an unrelated single-scalar-field struct (e.g. a
@@ -288,6 +288,26 @@ export class ClassInfo {
 	get thisType(): Type {
 		return this.thisWtype ?? { ref: this.name };
 	}
+
+	// The field-table invariant lives with the table: a name that would redeclare an inherited field is an
+	// error rather than a silent second slot. What a declared type RESOLVES to stays the caller's job.
+	addField(name: string, wtype: Type, optional = false): void {
+		if (this.fieldIndex.has(name))
+			throw `field '${name}' redeclares an inherited field -- not supported`;
+		this.fieldIndex.set(name, this.fields.length);
+		this.fields.push({ name, wtype, optional });
+	}
+
+	isSubclassOf(cls: ClassInfo | undefined): boolean {
+		while (cls) {
+			// By identity too: a shared object shape is reachable under more than one key.
+			if (cls.name === this.name || cls === this)
+				return true;
+			cls = cls.superClass;
+		}
+		return false;
+	}
+
 }
 
 export class FunctionContext {
@@ -407,7 +427,7 @@ export class FunctionContext {
 		const prev = this.lookup(name);
 		if (prev) {
 			// Structurally, as the name itself was built (`scratchName` keys by `wasmTypeKey`): two equal types
-			// need not be one object -- a fresh `nullableWtype(REF_ANY)` and the `REF_ANY_NULLABLE` constant.
+			// need not be one object -- a fresh `Types.nullable(REF_ANY)` and the `REF_ANY_NULLABLE` constant.
 			if (wasmTypeKey(prev.wtype) !== wasmTypeKey(wtype))
 				throw `local '${name}' redeclared with different type`;
 			return prev.index;
@@ -451,6 +471,24 @@ export class FunctionContext {
 		return this.closureEnv?.fields.get(name)?.wtype ?? this.lookup(name)?.wtype;
 	}
 
+	// Reads a name's own storage slot: a captured name lives in `closureEnv`, everything else in a local.
+	rawSlot(name: string) {
+		const captured = this.closureEnv?.fields.get(name);
+		if (captured) {
+			this.emit(I.local.get(this.closureEnv!.envLocal.index), I.struct.get(this.closureEnv!.envTypeIndex, captured.index));
+			return;
+		}
+		this.emit(I.local.get(this.lookup(name)!.index));
+	}
+
+	// A holder's field is nullable because it must be allocatable empty, but `holderInner` is the logical
+	// non-null type, so the read unwraps -- sound because the filling declaration always runs first.
+	emitHolderRead(holderType: number, inner: Type) {
+		this.emit(I.struct.get(holderType, 0));
+		if (typeof inner !== 'string' && !inner.nullable)
+			this.emit(I.ref.as_non_null);
+	}
+
 	swapOut(out: wasm.Instr[] = []) {
 		const _old	= this.out;
 		this.out	= out;
@@ -464,6 +502,13 @@ export class FunctionContext {
 	toFuncBody(numParams: number, toValType: (t: Type) => wasm.ValType): wasm.FuncBody & {id: string} {
 		return { id: this.name.replace(/[^a-zA-Z0-9_]/g, '_'), locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
 	}
+	// A non-`void` body doesn't necessarily end in a top-level `return` -- `if`/`while`/`switch` compile to a `void`-typed block wrapping their branches, leaving wasm's trailing-fallthrough check unsatisfied.
+	// No full "does every path return" analysis to avoid it -- a trailing `unreachable` is always safe (dead code whenever a real return already covers every path).
+	emitTrailingUnreachable(result: Type): void {
+		if (result !== 'void')
+			this.emit(I.unreachable);
+	}
+	
 }
 
 
@@ -495,6 +540,36 @@ export class Types extends Array<wasm.SubType> {
 	hasArray(kind: ElementI): boolean	{ return this.has(this.arrayDesc(kind)); }
 	box(kind: ScalarI): number			{ return this.register(this.boxDesc(kind)); }
 	hasBox(kind: ScalarI): boolean		{ return this.has(this.boxDesc(kind)); }
+
+	// The nullable form of a representation. A scalar must BOX -- a nullable f64 is a ref to a one-field
+	// struct, not a nullable value type, and `u32`/`u64` share their signed twin's box; a reference takes the flag.
+	nullable(base: Type): Type {
+		if (typeof base !== 'string')
+			return { ...base, nullable: true };
+		if (base === 'void')
+			throw "a nullable 'void' value is not supported -- 'void' has no value representation to box";
+		const kind = notUnsigned(base);
+		return { typeIndex: this.box(kind), nullable: true, primKind: kind };
+	}
+
+	// The common supertype every closure literal's env struct extends: zero fields, non-`final` (wasm-GC
+	// width-subtyping needs the supertype's fields as a prefix, which is vacuous here).
+	envBase(): number {
+		return this.register({ final: false, supertypes: [], type: { kind: 'struct', fields: [] } });
+	}
+
+	// Function indices come off the same per-compile counter as the type section, since a func's type is
+	// registered first and its index taken second: `func` is the pair every caller wants.
+	private nextFunc = 0;
+	funcType(params: wasm.ParamType[], results: wasm.ValType[]): number {
+		return this.register({ final: true, supertypes: [], type: { kind: 'func', params, results } });
+	}
+	funcAt(typeIndex: number): { funcIndex: number; typeIndex: number } {
+		return { funcIndex: this.nextFunc++, typeIndex };
+	}
+	func(params: wasm.ParamType[], results: wasm.ValType[]): { funcIndex: number; typeIndex: number } {
+		return this.funcAt(this.funcType(params, results));
+	}
 
 	private arrayDesc(kind: ElementI): wasm.SubType {
 		return { final: true, supertypes: [], type: { kind: 'array', field: { type: kind === 'ref' ? { ref: 'any', nullable: true } : kind, mut: true } } };
