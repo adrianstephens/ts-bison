@@ -1558,53 +1558,66 @@ function settleFromReturn(inference: T.Inference, scope: Scope) {
 	}
 }
 
-// `inference`: the call site's own, already fed its arguments and callbacks in TS's order (see `case 'call'`); a bare trial
-// (an overload fit, an instantiation expression) infers from `argTs` here.
+// The type-argument map a generic call instantiates with: the explicit args outright, else TS's own
+// inference (`T.Inference`) over the argument types, with the contextual result type settling what the
+// arguments left open and the deferred callback-return candidates replayed last. Exported because
+// `towasm.ts`'s monomorphization needs the same answer -- it used to re-implement exactly this policy.
+// `restElementTs`: a spread argument's element type(s), since `argTs` leaves a spread position `undefined`.
+// `inference`: the call site's own, already fed its arguments and callbacks in TS's order (see `case 'call'`);
+// a bare trial (an overload fit, an instantiation expression) infers from `argTs` here.
+export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, restElementTs?: Type[], expected?: Type, inference?: T.Inference, err?: Err, pos?: Location): Map<string, Type> {
+	const map = new Map<string, Type>();
+	if (!sig.typeParams?.length)
+		return map;
+	if (typeArgs) {
+		sig.typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
+		return map;
+	}
+	// A callback's own return, when the callback wasn't typed in order by the call site: heard only after the destination.
+	const deferred: T.Deferred[] = [];
+	if (!inference) {
+		inference = new T.Inference(sig.typeParams, scope, T.declScopeOf(sig, scope));
+		argTs.forEach((t, i) => {
+			const p = sig.params[i];
+			if (t && p?.typeAnnotation)
+				inference!.infer(p.typeAnnotation, t, deferred);
+		});
+		if (expected && sig.returnType)
+			inference.inferReturn(sig.returnType, expected);
+		settleFromReturn(inference, scope);
+	}
+	// Rest arguments are ONE candidate, as TS's synthesized array of them: `new Array(false, 1, 'x')` is `T = boolean | number | string`.
+	if (sig.rest?.typeAnnotation && restElementTs?.length) {
+		const t = sig.rest.typeAnnotation;
+		inference.infer(t.type === 'array' ? t.element : t, T.combineTypes(restElementTs), deferred);
+	}
+	for (const { paramT, argT, contra } of deferred)
+		inference.infer(paramT, argT, undefined, contra);
+	const inferred = inference.current();
+	sig.typeParams.forEach(p => {
+		const t = inferred.get(p.name);
+		if (t && !inference!.wasDefaulted(p.name)) {
+			map.set(p.name, t);
+			return;
+		}
+		const assumed = t ?? p.default ?? p.constraint ?? T.ANY;
+		map.set(p.name, assumed);
+		// A declared default is a correct, unremarkable fallback (real TS does it silently too) -- only worth flagging when
+		// some supplied argument's type actually mentions `p.name` and still couldn't pin it down.
+		if (err && pos && !p.default && sig.params.some((prm, i) => argTs[i] && prm.typeAnnotation && T.mentionsTypeParam(prm.typeAnnotation, p.name)))
+			err(SEVERITY.GAP, pos)`Type parameter '${p.name}' could not be inferred from the arguments; assumed '${show().type(assumed)}'`;
+	});
+	return map;
+}
+
+// Instantiates `sig` against `argTs`, substituting type params through params/return type. Pure -- doesn't validate (see `argsFit`).
 function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, pos: Location, restElementTs?: Type[], expected?: Type, err?: Err, inference?: T.Inference): TS.CallSig {
 	let returnType	= sig.returnType ?? T.ANY;
 	let params		= sig.params;
 	let rest		= sig.rest;
 
 	if (sig.typeParams?.length) {
-		const map = new Map<string, Type>();
-		if (typeArgs) {
-			sig.typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
-		} else {
-			// A callback's own return, when the callback wasn't typed in order by the call site: heard only after the destination.
-			const deferred: T.Deferred[] = [];
-			if (!inference) {
-				inference = new T.Inference(sig.typeParams, scope, T.declScopeOf(sig, scope));
-				argTs.forEach((t, i) => {
-					const p = params[i];
-					if (t && p?.typeAnnotation)
-						inference!.infer(p.typeAnnotation, t, deferred);
-				});
-				if (expected && sig.returnType)
-					inference.inferReturn(sig.returnType, expected);
-				settleFromReturn(inference, scope);
-			}
-			// Rest arguments are ONE candidate, as TS's synthesized array of them: `new Array(false, 1, 'x')` is `T = boolean | number | string`.
-			if (sig.rest?.typeAnnotation && restElementTs?.length) {
-				const t = sig.rest.typeAnnotation;
-				inference.infer(t.type === 'array' ? t.element : t, T.combineTypes(restElementTs), deferred);
-			}
-			for (const { paramT, argT, contra } of deferred)
-				inference.infer(paramT, argT, undefined, contra);
-			const inferred = inference.current();
-			sig.typeParams.forEach(p => {
-				const t = inferred.get(p.name);
-				if (t && !inference!.wasDefaulted(p.name)) {
-					map.set(p.name, t);
-					return;
-				}
-				const assumed = t ?? p.default ?? p.constraint ?? T.ANY;
-				map.set(p.name, assumed);
-				// A declared default is a correct, unremarkable fallback (real TS does it silently too) -- only worth flagging when
-				// some supplied argument's type actually mentions `p.name` and still couldn't pin it down.
-				if (err && !p.default && params.some((prm, i) => argTs[i] && prm.typeAnnotation && T.mentionsTypeParam(prm.typeAnnotation, p.name)))
-					err(SEVERITY.GAP, pos)`Type parameter '${p.name}' could not be inferred from the arguments; assumed '${show().type(assumed)}'`;
-			});
-		}
+		const map	= inferTypeArgMap(sig, argTs, typeArgs, scope, restElementTs, expected, inference, err, pos);
 		params		= params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p);
 		rest		= rest?.typeAnnotation ? { ...rest, typeAnnotation: T.substituteType(rest.typeAnnotation, map) } : rest;
 		returnType	= T.substituteType(returnType, map);

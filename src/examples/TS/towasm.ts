@@ -8,7 +8,7 @@ import * as Common from '../common';
 import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
 import * as WT from '../wasm-types';
 import { ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, wTypeKey, CLOSURE_FIELDS } from '../wasm-types';
-import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, candidateFits } from './checker';
+import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, candidateFits, inferTypeArgMap as checkerInferTypeArgMap } from './checker';
 import { Walker, walker, walkerB } from './walker';
 import { printer } from './printer';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
@@ -428,9 +428,8 @@ class FunctionContext {
 	// A one-shot hint for the *very next* expression about to be compiled: the enclosing declaration's
 	// own real TS type (e.g. a var_decl's `Expr[]`, or one array literal element's own `Expr`), used
 	// only to contextually infer a generic call's own type param when its declared signature has no
-	// other way to determine it (`case 'call'`, `ensureGenericFunc`/`inferTypeArgMap` -- mirrors
-	// checker.ts's own `expected` vs `sig.returnType` contextual step, which this file's own, separate
-	// generic-instantiation codegen doesn't otherwise have access to). Set by the few producers that
+	// other way to determine it (`inferCallTypeArgs` feeds it to the checker's own `inferTypeArgMap`,
+	// the `expected` vs `sig.returnType` contextual step). Set by the few producers that
 	// have a real TS type on hand (`case 'var_decl'`, `case 'array'`'s own per-element loop) and always
 	// consumed-then-cleared immediately by whoever reads it (`case 'call'`), so it never leaks into an
 	// unrelated sub-expression (a call's own arguments, a nested literal, ...) -- not a general
@@ -8396,69 +8395,30 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		});
 	}
 
-	// Resolves the type-argument substitution map for a generic call (top-level function or method) --
-	// shared by `ensureGenericFunc` and `ensureMethod`'s own generic-method case. Explicit call-site type
-	// args win outright; otherwise each param's declared type is matched against its argument's real type
-	// via the exact inference the checker itself uses (`T.inferTypeArgs`), matching checker.ts's own
-	// `instantiate`, not a reimplementation. Falls back to each remaining type param's own `default`/
-	// `constraint`/`any` in turn when nothing inferred it, same as the checker's own final fallback.
-	// Contextual/expected-return-type inference (`instantiate`'s own `expected` param, checker.ts): `want`
-	// -- towasm's codegen equivalent, `ctx.contextualReturn` (see its own comment) -- reaches here as
-	// `expected`/`returnType` when the call site had a real one on hand (currently only `case 'array'`'s
-	// own per-element loop and `case 'var_decl'` seed it). Matched with the *same* priority checker.ts's
-	// own `instantiate` uses: an ordinary direct param (`x: T`) still resolves first and wins outright
-	// (`T.inferTypeArgs`'s own `out`-already-has-it guard) -- only a generic callback argument's own
-	// *return*-position inference is deferred until after this contextual step gets a chance, since an
-	// unannotated callback's own inferred return is otherwise whatever anonymous, non-nominal structural
-	// shape its body happened to produce (found via `Rule([...], $ => ({type:'spread', ...}))`-shaped
-	// calls, `Rule<T>`'s `T` only ever knowable from the surrounding array literal's own declared element
-	// type). `libGlobal` doubles as both `scope` (resolving each argument's own type) and `declScope`
-	// (resolving the declared param types a type param is matched against) -- every declaration this is
-	// ever called for (a top-level function, or a class method -- its class's own type params already
-	// concrete by the time `ensureMethod` reaches here) is declared relative to the one module scope this
-	// file ever has, same as `paramType`/`compileFunc` already assume elsewhere -- no separate "declaring
-	// module" to track the way `T.declScopeOf` exists for (a cross-module signature, which nothing here
-	// ever is).
+	// Converts a generic call's arguments into the `(argTs, restElementTs)` shape the checker's own
+	// `inferTypeArgMap` takes, and lets that answer: explicit call-site type args win outright; otherwise
+	// each param's declared type is matched against its argument's real type by the checker's own policy
+	// (`T.Inference`, the contextual result type settling what the arguments left open, the deferred
+	// callback-return candidates replayed last). This used to re-implement that policy here, which is why
+	// the two could disagree about which instantiation a call picks.
+	// `expected` is towasm's codegen equivalent of the checker's contextual type -- `ctx.contextualReturn`
+	// (see its own comment) -- reaching here as `expected`/`returnType` when the call site had a real one
+	// on hand (currently only `case 'array'`'s own per-element loop and `case 'var_decl'` seed it).
 	type Expected = Type | (() => Type);
-	function inferTypeArgMap(typeParams: readonly TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, returnType?: Type, rest?: JS.Rest<Type>): Map<string, Type> {
-		const map = new Map<string, Type>();
-		if (typeArgs) {
-			typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
-		} else {
-			// The checker's own inference (`T.Inference`: candidates by polarity, TS's common supertype), fed the same way.
-			const inference	= new T.Inference(typeParams, libGlobal, libGlobal);
-			const deferred: T.Deferred[] = [];
-			const restArgs: Type[] = [];
-			args.forEach((a, i) => {
-				const p = params[i];
-				if (p?.typeAnnotation && a.type !== 'spread')
-					inference.infer(p.typeAnnotation, checkerTypeOf(a, scope), deferred);
-				// `sig(...args)` with `args: CallSigParams<number>` against `...args: CallSigParams<T>`: the spread IS the rest.
-				else if (a.type === 'spread' && i === params.length && rest?.typeAnnotation)
-					inference.infer(rest.typeAnnotation, checkerTypeOf(a.operand, scope), deferred);
-				else if (a.type !== 'spread' && i >= params.length && rest?.typeAnnotation)
-					restArgs.push(checkerTypeOf(a, scope));
-			});
-			// Positional rest arguments are one candidate, as the checker takes them.
-			if (restArgs.length && rest?.typeAnnotation)
-				inference.infer(rest.typeAnnotation.type === 'array' ? rest.typeAnnotation.element : rest.typeAnnotation, T.combineTypes(restArgs), deferred);
-			// Where the result is going also REPLACES an `any` the arguments left: the instantiation built has to be
-			// the one its destination can hold, and the checker's own type for the call already solved it.
-			if (expected && returnType && typeParams.some(p => !inference.inferred(p.name) || T.isAny(inference.inferred(p.name)!))) {
-				const fromExpected = new Map<string, Type>();
-				T.inferTypeArgs(returnType, typeof expected === 'function' ? expected() : expected, inference.names, fromExpected, libGlobal);
-				for (const [k, v] of fromExpected) {
-					const got = inference.inferred(k);
-					if (!got || (T.isAny(got) && !T.isAny(v)))
-						inference.fix(k, v);
-				}
-			}
-			for (const { paramT, argT, contra } of deferred)
-				inference.infer(paramT, argT, undefined, contra);
-			const inferred = inference.current();
-			typeParams.forEach(p => map.set(p.name, inferred.get(p.name) ?? p.default ?? p.constraint ?? T.ANY));
-		}
-		return map;
+	function inferCallTypeArgs(typeParams: TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, scope: Scope, expected?: Expected, returnType?: Type, rest?: JS.Rest<Type>): Map<string, Type> {
+		// A spread position has no single argument type (`instantiate`'s own `argTs` convention); its element
+		// type goes into `restElementTs`, one candidate as TS synthesizes the rest array.
+		const argTs: (Type | undefined)[] = args.map(a => a.type === 'spread' ? undefined : checkerTypeOf(a, scope));
+		const restElementTs: Type[] = [];
+		args.forEach((a, i) => {
+			const t = a.type === 'spread' ? T.resolveOwn(checkerTypeOf(a.operand, scope), scope) : i >= params.length ? argTs[i] : undefined;
+			const el = a.type === 'spread' && t ? t.type === 'array' ? t.element
+				: t.type === 'tuple' ? T.combineTypes(t.elements.map(e => T.tupleElementType(e)).filter(x => !!x)) : undefined
+				: t;
+			if (el)
+				restElementTs.push(el);
+		});
+		return checkerInferTypeArgMap({ params, rest, returnType, typeParams }, argTs, typeArgs, scope, restElementTs, typeof expected === 'function' ? expected() : expected);
 	}
 
 	function ensureFunc(name: string, decl: FunctionDecl, homeModule = '.'): FuncInfo {
@@ -8468,7 +8428,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// Resolves a generic top-level function call to its monomorphized `FuncInfo`, cached under the same
 	// composite-key shape `ensureClass` already uses for `Box<number>` (`identity<number>`) -- one real
 	// difference from a class reference: a function's type arguments are usually left implicit at the call
-	// site, inferred from the arguments (`inferTypeArgMap`, above). Explicit call-site type args
+	// site, inferred from the arguments (`inferCallTypeArgs`, above). Explicit call-site type args
 	// (`identity<number>(5)`) are honored too, same as a class's are.
 	// A generic function's instance, checked as a declaration of its own: its narrowing depends on the type arguments
 	// (`typeof x === 'string'` on `T | string`, js-parser.ts `CallSig<T>`'s `args[0]` after `Array.isArray`), which the template can't see.
@@ -8480,7 +8440,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, ctx: FunctionContext, expected?: Expected, homeModule = '.'): FuncInfo {
 		const typeParams	= decl.typeParams!;
-		const map			= inferTypeArgMap(typeParams, decl.params, args, typeArgs, ctx.scope, expected, decl.returnType as Type | undefined, decl.rest);
+		const map			= inferCallTypeArgs(typeParams, decl.params, args, typeArgs, ctx.scope, expected, decl.returnType as Type | undefined, decl.rest);
 		// A class instance filling a structural parameter specializes the instantiation further, as it does a plain function.
 		const substituted	= decl.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p);
 		const structural	= decl.body && structuralParams(substituted, args, ctx);
@@ -10134,7 +10094,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// exact same per-piece substitution for a signature), the body still through `substituteTypeParams`
 		// (a plain `Statement[]`, which `walk` does accept directly).
 		if (decl.typeParams?.length) {
-			const map = inferTypeArgMap(decl.typeParams, decl.params, args, typeArgs, callerCtx.scope, undefined, undefined, decl.rest);
+			const map = inferCallTypeArgs(decl.typeParams, decl.params, args, typeArgs, callerCtx.scope, undefined, undefined, decl.rest);
 			key		= genericKey(key, decl.typeParams, map, global);
 			decl	= {
 				...decl,
