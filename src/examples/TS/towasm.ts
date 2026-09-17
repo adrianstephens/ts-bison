@@ -1111,19 +1111,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const asked = shapeEntries.has(info) ? (declScope ?? global).type(name) : undefined;
 		return !!asked && shapeEntries.get(info) !== asked;
 	};
-	let closureCallTempCounter	= 0;
-
 	let data				= new Uint8Array(0);
 	const strings			= new Map<string, number>;
 	const globals			= new Map<string, Global>;
 	// `ensureLazyGlobal`'s own wrapper `FuncInfo`s, keyed the same `homeKey` way as `funcs` itself.
 	const lazyGlobals		= new Map<string, FuncInfo>;
-
-	let forTempCounter			= 0;
-	let destructureTempCounter	= 0;
-	let optionalTempCounter 	= 0;
-	let switchTempCounter		= 0;
-	let defaultArgTempCounter	= 0;
 
 	const types	= new WT.Types;
 
@@ -1724,7 +1716,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// Every remaining value of an iterator, into a new array: what JS's `...` does with an iterable, and a rest pattern.
 	function drainIterator(iterator: Expr, it: T.IterationTypes, ctx: FunctionContext): Expr {
-		const arrName = `#iter$${destructureTempCounter++}`, rName = `#iter$${destructureTempCounter++}`;
+		const arrName = `#iter$${ctx.tempCounter++}`, rName = `#iter$${ctx.tempCounter++}`;
 		const arr: Expr = { type: 'identifier', name: arrName }, r: Expr = { type: 'identifier', name: rName };
 		emitStmt(JS.VarDecl('const', JS.Var(arrName, { type: 'array', elements: [] } as Expr, TS.ArrayType(it.yield))), ctx);
 		emitStmt(JS.For(
@@ -1741,7 +1733,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const it = iteratesByProtocol(operand, ctx);
 		if (!it)
 			return operand;
-		const itName = `#iter$${destructureTempCounter++}`;
+		const itName = `#iter$${ctx.tempCounter++}`;
 		emitStmt(JS.VarDecl('const', JS.Var(itName, JS.Call(JS.Member(operand, '[Symbol.iterator]'), []))), ctx);
 		return drainIterator({ type: 'identifier', name: itName }, it, ctx);
 	}
@@ -1753,7 +1745,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			emitStmt(JS.VarDecl(kind, JS.Var(target, value, typeAnnotation)), ctx);
 			return;
 		}
-		const temp = (): Expr => ({ type: 'identifier', name: `#destructure$${destructureTempCounter++}` });
+		const temp = (): Expr => ({ type: 'identifier', name: `#destructure$${ctx.tempCounter++}` });
 		const declare = (id: Expr, init: Expr, type?: Type) => emitStmt(JS.VarDecl('const', JS.Var((id as { name: string }).name, init, type)), ctx);
 		const tmp = temp();
 		declare(tmp, value, typeAnnotation);
@@ -1891,7 +1883,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const owners	= members.map(m => ownerFor(m));
 				if (members.length < 2 || !owners.every(o => o && o.typeIndex !== -1))
 					continue;
-				const n		= optionalTempCounter++;
+				const n		= ctx.tempCounter++;
 				const src	= ctx.declareLocal(`$usrc$${n}`, REF_ANY_NULLABLE);
 				emitAs(p.operand, ctx, REF_ANY_NULLABLE);
 				ctx.emit(I.local.set(src.index));
@@ -1910,7 +1902,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const values	= T.unionMembers(T.resolve(ctx.typeScope, precise), ctx.typeScope).map(m => T.resolveOwn(m, ctx.typeScope));
 				if (values.length < 2 || !values.every(v => v.type === 'literal'))
 					continue;
-				const name	= `$udisc$${optionalTempCounter++}`;
+				const name	= `$udisc$${ctx.tempCounter++}`;
 				const wt	= wtypeOf(p.value, ctx) ?? REF_ANY;
 				emitAs(p.value, ctx, wt);
 				ctx.emit(I.local.set(ctx.declareValue(name, wt, precise).index));
@@ -2439,8 +2431,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// Looked up by name against `classes` rather than taking `ClassInfo`s, since `coerceTop`'s callers only ever have the bare
 	// `WasmType`'s own ref name. Every class named here is already resolved -- a value of a class ref type requires `ensureClass`.
 	function isSubclassOf(subName: string, baseName: string): boolean {
-		const base = classes.get(baseName);
-		return base?.isBaseOf(classes.get(subName)) ?? false;
+		return classes.get(baseName)?.isBaseOf(classes.get(subName)) ?? false;
 	}
 
 	function coerceTop(got: WT.Type, ctx: FunctionContext, want: WT.Type): void {
@@ -2474,7 +2465,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				return (!!d && T.isReemittableDefault(d)) || (typeof p !== 'string' && !!p.nullable);
 			})) && !!gotSig.hasRest === !!wantSig.hasRest
 				&& gotSig.params.slice(0, wantSig.params.length).every(paramFits)) {
-				const orig = ctx.temp(`$origClosure$${closureCallTempCounter++}`, got);
+				const orig = ctx.temp(`$origClosure$${ctx.tempCounter++}`, got);
 				ctx.emit(I.local.set(orig));
 				const { info, wantStructTypeIndex, envTypeIndex } = ensureClosureCoercionWrapper(gotSig, wantSig);
 				// The wrapper is the same JS function, so it keeps the original's `length`.
@@ -2798,7 +2789,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// branching (`guard()`'s own `typeof node === 'object'` is the shape). A null slot reads as `'undefined'` here, so JS's
 		// `typeof null === 'object'` is deliberately not reproduced -- that value cannot be told from a real `undefined` either way.
 		if (tag === 'object') {
-			const tmp = ctx.temp(`$typeofobj$${optionalTempCounter++}`, REF_ANY_NULLABLE);
+			const tmp = ctx.temp(`$typeofobj$${ctx.tempCounter++}`, REF_ANY_NULLABLE);
 			emitAs(operand, ctx, REF_ANY_NULLABLE);
 			ctx.emit(I.local.set(tmp), I.local.get(tmp), I.ref.is_null);
 			for (const h of [types.box('f64'), types.box('i32'), types.array('i16'), ensureClosureBase()])
@@ -2821,7 +2812,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const ALL		= ['undefined', 'number', 'boolean', 'string', 'bigint', 'function', 'object'];
 		const named		= members.map(m => T.isNullish(m, ctx.scope) ? (hasNull ? 'object' : 'undefined') : T.typeofName(m, ctx.scope));
 		const tags		= named.some(n => n === undefined) ? ALL : ALL.filter(tag => named.includes(tag));
-		const held		= `#typeof$${optionalTempCounter++}`;
+		const held		= `#typeof$${ctx.tempCounter++}`;
 		emitStmt(JS.VarDecl('const', JS.Var(held, operand, t)), ctx);
 		const id: Expr	= { type: 'identifier', name: held };
 		const str		= typeOf(T.STRING)!;
@@ -2852,7 +2843,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	function emitAnyTruthy(got: WT.Type, ctx: FunctionContext): void {
 		// Always the NULLABLE slot: a non-nullable local is not defaultable, and a null test costs nothing
 		// to skip below when `got` already rules null out.
-		const tmp		= ctx.temp(`$anytruthy$${optionalTempCounter++}`, REF_ANY_NULLABLE);
+		const tmp		= ctx.temp(`$anytruthy$${ctx.tempCounter++}`, REF_ANY_NULLABLE);
 		const boxI32	= types.box('i32');
 		const boxF64	= types.box('f64');
 		const str		= types.array('i16');
@@ -2911,7 +2902,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const box = unboxedPrimitive(got);
 		if (box) {
 			if (typeof got === 'object' && got.nullable) {
-				const tmp = ctx.declareLocal(`$numtruthy$${optionalTempCounter++}`, got);
+				const tmp = ctx.declareLocal(`$numtruthy$${ctx.tempCounter++}`, got);
 				ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
 				const old = ctx.swapOut();
 				ctx.emit(I.i32.const(0));
@@ -2942,7 +2933,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// is falsy when null too, and `array.len` would trap there -- hence the null test first.
 		if (T.isStringLike(t, ctx.scope) && typeof got === 'object' && 'arr' in got) {
 			if (got.nullable) {
-				const tmp = ctx.declareLocal(`$strtruthy$${optionalTempCounter++}`, got);
+				const tmp = ctx.declareLocal(`$strtruthy$${ctx.tempCounter++}`, got);
 				ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
 				const old = ctx.swapOut();
 				ctx.emit(I.i32.const(0));
@@ -2990,7 +2981,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// Shared by every optional (`?.`) lowering -- `objectExpr` must only ever be evaluated once, so this
 	// materializes it into a scratch local up front and hands that off to `emitOptionalGuard`.
 	function emitOptionalAccess(ctx: FunctionContext, objWtype: WT.Type, resultWtype: WT.Type, readCore: (objLocal: number) => void): WT.Type {
-		const objLocal = ctx.temp(`$opt$obj$${optionalTempCounter++}`, objWtype);
+		const objLocal = ctx.temp(`$opt$obj$${ctx.tempCounter++}`, objWtype);
 		ctx.emit(I.local.set(objLocal), I.local.get(objLocal), I.ref.is_null);
 		const _old = ctx.swapOut();
 		ctx.emit(I.ref.null(heapTypeIndexOf(resultWtype)));
@@ -3030,7 +3021,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// `value`'s elements, read through its own `length` and index and converted to `want`, into new storage `typeIndex` left in
 	// `dst`. Read where `value` is evaluated, so a later element of the same literal (`[...a, a.pop()]`) cannot change them.
 	function copyElements(value: Expr, got: WT.Type, ctx: FunctionContext, want: WT.Type, typeIndex: number, dst: number): void {
-		const n			= optionalTempCounter++;
+		const n			= ctx.tempCounter++;
 		const fromName	= `$spread$from$${n}`, atName = `$spread$at$${n}`;
 		const from		= Common.Identifier(fromName);
 		const slot		= wtypeOf(value, ctx) ?? got;
@@ -3177,7 +3168,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					const locals = resolvedParams.map((p, i) => {
 						const a = i < args.length ? args[i] : T.substituteEarlierParamRefs(missing[i - args.length]!, rename);
 						emitAs(a, ctx, params[i]);
-						const name = `$default$${defaultArgTempCounter++}`;
+						const name = `$default$${ctx.tempCounter++}`;
 						const local = ctx.declareLocal(name, params[i]);
 						ctx.scope.addValue(name, p.tsType);
 						ctx.emit(I.local.set(local.index));
@@ -3325,7 +3316,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const sig = closureSigOf(fieldWtype);
 				const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 				ctx.emit(I.struct.get(owner.typeIndex, fieldIndex!));
-				const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, fieldWtype);
+				const scratch = ctx.declareLocal(`$closure$${ctx.tempCounter++}`, fieldWtype);
 				ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
 				emitCallArgs(name, sig.params, sig.defaults, !!sig.hasRest, args, ctx, sig.resolvedParams);
 				ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
@@ -3366,7 +3357,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// compile-time-known list, so this synthesizes a real array literal and hands it to the ordinary array-literal codegen.
 	// Shared by the static path and every `ensureAnyEntries` arm, so the two cannot disagree about a class's entries.
 	function emitEntriesOf(owner: ClassInfo, which: 'entries' | 'keys' | 'values', ctx: FunctionContext): WT.Type {
-		const objName	= `#objEntries$${closureCallTempCounter++}`;
+		const objName	= `#objEntries$${ctx.tempCounter++}`;
 		const objLocal	= ctx.declareValue(objName, owner.thisWtype!, owner.thisTsType!);
 		ctx.emit(I.local.set(objLocal.index));
 
@@ -3446,7 +3437,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!owner)
 			throw `'Object.defineProperty': '${targetExpr.name}' needs a known class type`;
 
-		const scratch = ctx.declareLocal(`$defineProperty$${closureCallTempCounter++}`, owner.thisWtype!);
+		const scratch = ctx.declareLocal(`$defineProperty$${ctx.tempCounter++}`, owner.thisWtype!);
 		emitAs(targetExpr, ctx, owner.thisWtype!);
 		ctx.emit(I.local.set(scratch.index));
 
@@ -3714,7 +3705,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// struct has no slot to grow.
 			const byNameOwner = ownerOf(target.object, ctx);
 			if (byNameOwner && byNameOwner.typeIndex !== -1 && byNameOwner.fields.length && T.isAssignable(ctx.narrowedTypeOf(target.index), T.STRING, ctx.typeScope)) {
-				const n			= optionalTempCounter++;
+				const n			= ctx.tempCounter++;
 				const objId		= { type: 'identifier', name: `#keyobj$${n}` } as Expr;
 				const keyId		= { type: 'identifier', name: `#key$${n}` } as Expr;
 				const valId		= { type: 'identifier', name: `#keyval$${n}` } as Expr;
@@ -3744,7 +3735,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 			// The WRITE half of `ensureAnyKey`, reached the same way its read half is.
 			if (T.isAny(ctx.narrowedTypeOf(target.object)) && T.isAssignable(ctx.narrowedTypeOf(target.index), T.STRING, ctx.typeScope)) {
-				const n			= optionalTempCounter++;
+				const n			= ctx.tempCounter++;
 				const keyWtype	= typeOf(T.STRING)!;
 				const objLocal	= ctx.declareValue(`#anykeyobj$${n}`, REF_ANY, T.ANY);
 				const keyLocal	= ctx.declareValue(`#anykey$${n}`, keyWtype, T.STRING);
@@ -3795,7 +3786,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// `(c ? a : b).push(x)` (type-utils.ts `iterationTypes`): a `this`-reassigning method's write-back goes to whichever
 			// branch the receiver came from, so the test is held and both the read and the write branch on it.
 			if (target.type === 'conditional') {
-				const test = ctx.temp(`$ctarget$${optionalTempCounter++}`, 'i32');
+				const test = ctx.temp(`$ctarget$${ctx.tempCounter++}`, 'i32');
 				emitTruthy(target.test, ctx);
 				ctx.emit(I.local.set(test));
 				const _outer	= ctx.swapOut();
@@ -4135,7 +4126,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// `e.object[e.index]` held in locals, `read` run only when the index is below the length (unsigned, so a negative index is past the end too), `null` otherwise.
 	function emitBoundedRead(e: Expr & { type: 'index' }, objWtype: WT.Type, resultWtype: WT.Type, ctx: FunctionContext, read: (obj: WT.Local, idx: WT.Local & { name: string }) => void): WT.Type {
-		const n		= optionalTempCounter++;
+		const n		= ctx.tempCounter++;
 		const objName	= `$bobj$${n}`;
 		const obj		= ctx.declareValue(objName, objWtype, ctx.narrowedTypeOf(e.object));
 		const idx		= Object.assign(ctx.declareValue(`$bidx$${n}`, 'i32', T.NUMBER), { name: `$bidx$${n}` });
@@ -4241,7 +4232,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// where JS specifies it, the bitwise operators. A non-finite input has no meaningful `i64` truncation, so it answers 0, as JS says.
 	function emitToInt32(e: Expr, ctx: FunctionContext): void {
 		emitAs(e, ctx, 'f64');
-		const tmp = ctx.temp(`$toint32$${optionalTempCounter++}`, 'f64');
+		const tmp = ctx.temp(`$toint32$${ctx.tempCounter++}`, 'f64');
 		ctx.emit(I.local.set(tmp), I.local.get(tmp), I.f64.abs, I.f64.const(Infinity), I.f64.lt);
 		const _old = ctx.swapOut();
 		ctx.emit(I.local.get(tmp), I.i64.trunc_sat_f64_s, I.i32.wrap_i64);
@@ -4696,7 +4687,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// over the class's own field names -- synthesized, so the ordinary member reads and conditional lowering compile it. A key naming no field reads `undefined`, as JS does.
 					const byName = ownerOf(e.object, ctx);
 					if (byName && byName.typeIndex !== -1 && byName.fields.length && T.isAssignable(ctx.narrowedTypeOf(e.index), T.STRING, ctx.typeScope)) {
-						const n			= optionalTempCounter++;
+						const n			= ctx.tempCounter++;
 						const objId		= { type: 'identifier', name: `#keyobj$${n}` } as Expr;
 						const keyId		= { type: 'identifier', name: `#key$${n}` } as Expr;
 						const keyWtype	= typeOf(T.STRING)!;
@@ -4816,7 +4807,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// `{...other, k: v}` -- spreading one dynamic object's own live entries into another needs a real loop over the keys `other` currently holds, so the map
 					// instance needs a real local to reference across iterations (the stack-chaining above, `set`'s own `this` return feeding the next call, only works for a
 					// fixed, statically-known sequence of calls). Each spread argument is evaluated once into a local, matching JS's one-evaluation-per-spread semantics,
-					const n			= closureCallTempCounter++;
+					const n			= ctx.tempCounter++;
 					const mapName	= `#dynobj$${n}`;
 					const mapLocal	= ctx.declareValue(mapName, owner.thisWtype!, owner.thisTsType!);
 					ctx.emit(I.local.set(mapLocal.index));
@@ -4890,7 +4881,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							const unionCls	= solid.flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
 							if (!unionCls.length || !unionCls.every(o => o && o.typeIndex !== -1))
 								throw `object literal for '${owner.name}': a spread operand needs a known object type, got '${T.typeKey(spreadT)}'`;
-							const spreadLocal = ctx.declareLocal(`$spread$${closureCallTempCounter++}`, REF_ANY_NULLABLE);
+							const spreadLocal = ctx.declareLocal(`$spread$${ctx.tempCounter++}`, REF_ANY_NULLABLE);
 							emitAs(p.operand, ctx, REF_ANY_NULLABLE);
 							ctx.emit(I.local.set(spreadLocal.index));
 							const src: FieldSource = { spreadLocal, unionCls: unionCls as ClassInfo[], nullable: solid.length < parts.length };
@@ -4898,7 +4889,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								addSource(name, src);
 							continue;
 						}
-						const spreadLocal = ctx.declareValue(`$spread$${closureCallTempCounter++}`, spreadCls.thisWtype!, spreadCls.thisTsType!);
+						const spreadLocal = ctx.declareValue(`$spread$${ctx.tempCounter++}`, spreadCls.thisWtype!, spreadCls.thisTsType!);
 						emitAs(p.operand, ctx, spreadCls.thisWtype!);
 						ctx.emit(I.local.set(spreadLocal.index));
 						for (const f of spreadCls.fields)
@@ -4971,7 +4962,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (chain.length === 1 || certain(last, f.name))
 						return emitOne(last, f);
 					const srcWtype	= last.unionCls ? types.nullable(f.wtype) : rawWtype(last, f.name);
-					const tmp		= ctx.declareLocal(`$spread$${f.name}$${optionalTempCounter++}`, srcWtype);
+					const tmp		= ctx.declareLocal(`$spread$${f.name}$${ctx.tempCounter++}`, srcWtype);
 					readSpread(last, f.name, srcWtype);
 					ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
 					const old = ctx.swapOut();
@@ -5176,7 +5167,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// `a &&= b` assigns only when `a` is TRUTHY, `a ||= b` only when it is falsy, and in the other case `b` is not evaluated at all -- the same `if`-based
 						// shape `??=` uses below, keyed off truthiness rather than nullishness.
 						const isAnd	= operator === '&&';
-						const cur	= ctx.declareLocal(`$logical$assign$${optionalTempCounter++}`, wtype);
+						const cur	= ctx.declareLocal(`$logical$assign$${ctx.tempCounter++}`, wtype);
 						ctx.emit(I.local.tee(cur.index));
 						emitTruthyOf(wtype, ctx.narrowedTypeOf(target), ctx);
 						const _old = ctx.swapOut();
@@ -5195,7 +5186,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// own `if`-based lowering, just feeding `target.write` instead of returning the value directly.
 						if (typeof wtype === 'string' || !wtype.nullable)
 							throw "'??=' needs a nullable object-typed target (no boxing in this subset)";
-						const leftLocal = ctx.declareLocal(`$nullish$assign$${optionalTempCounter++}`, wtype);
+						const leftLocal = ctx.declareLocal(`$nullish$assign$${ctx.tempCounter++}`, wtype);
 						ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
 						const _old = ctx.swapOut();
 						emitValue();
@@ -5271,7 +5262,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// An object-shaped result is BUILT at the caller's type: struct fields are mutable, hence invariant, so a literal operand that inferred its own shape can
 						// never be converted afterwards.
 						const wtype = WT.wantedShape(want, self);
-						const leftLocal = ctx.declareLocal(`$logic$left$${optionalTempCounter++}`, leftWtype);
+						const leftLocal = ctx.declareLocal(`$logic$left$${ctx.tempCounter++}`, leftWtype);
 						emitAs(left, ctx, leftWtype);
 						ctx.emit(I.local.tee(leftLocal.index));
 						emitTruthyOf(leftWtype, ctx.narrowedTypeOf(left), ctx);
@@ -5314,7 +5305,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							return wtype;
 						}
 						emitAs(left, ctx, leftWtype);
-						const leftLocal = ctx.declareLocal(`$nullish$left$${optionalTempCounter++}`, leftWtype);
+						const leftLocal = ctx.declareLocal(`$nullish$left$${ctx.tempCounter++}`, leftWtype);
 						ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
 						const _old = ctx.swapOut();
 						emitAs(right, ctx, wtype);
@@ -5375,7 +5366,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 									ctx.emit(I.i32.const(declaring.length ? 1 : 0));
 									return 'i32';
 								}
-								const recv = ctx.declareLocal(`$in$${optionalTempCounter++}`, REF_ANY_NULLABLE);
+								const recv = ctx.declareLocal(`$in$${ctx.tempCounter++}`, REF_ANY_NULLABLE);
 								emitAs(right, ctx, REF_ANY_NULLABLE);
 								ctx.emit(I.local.set(recv.index));
 								declaring.forEach((o, i) => {
@@ -5642,7 +5633,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								});
 							}
 							emitExpr(e.callee, ctx);
-							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
+							const scratch = ctx.declareLocal(`$closure$${ctx.tempCounter++}`, calleeWtype);
 							ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
 							// A closure *literal*'s own params still can't be optional (a real, separate
 							// restriction, unaffected) -- `sig.defaults` is only ever populated when this closure's
@@ -5661,7 +5652,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							const sig = closureSigOf(narrowedWtype);
 							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 							emitExpr(e.callee, ctx);
-							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, narrowedWtype);
+							const scratch = ctx.declareLocal(`$closure$${ctx.tempCounter++}`, narrowedWtype);
 							ctx.emit(I.ref.cast(structTypeIndex), I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
 							emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 							ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
@@ -5677,7 +5668,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							const sig = closureSigOf(calleeWtype);
 							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 							ctx.emit(I.call(lazy.wrapper.funcIndex));
-							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
+							const scratch = ctx.declareLocal(`$closure$${ctx.tempCounter++}`, calleeWtype);
 							ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
 							emitCallArgs(e.callee.name, sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 							ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
@@ -5728,7 +5719,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// As a statement the value is discarded, so a `void` method needs no `void | undefined`: just the guarded call.
 						if (want === 'void') {
 							emitAs(objExpr, ctx, objWtype);
-							const objLocal = ctx.declareLocal(`$optcall$${optionalTempCounter++}`, objWtype);
+							const objLocal = ctx.declareLocal(`$optcall$${ctx.tempCounter++}`, objWtype);
 							ctx.emit(I.local.tee(objLocal.index), I.ref.is_null, I.i32.eqz);
 							const _old = ctx.swapOut();
 							ctx.emit(I.local.get(objLocal.index), I.ref.as_non_null);
@@ -5819,7 +5810,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (unionOwners) {
 							const args = e.arguments;
 							const result = wtypeOf(e, ctx) ?? want ?? REF_ANY;
-							const recv = ctx.declareLocal(`$udisp$${optionalTempCounter++}`, REF_ANY_NULLABLE);
+							const recv = ctx.declareLocal(`$udisp$${ctx.tempCounter++}`, REF_ANY_NULLABLE);
 							emitAs(obj, ctx, REF_ANY_NULLABLE);
 							ctx.emit(I.local.set(recv.index));
 							const buildArm = (i: number): wasm.Instr[] => {
@@ -5866,7 +5857,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// `emitAs`, not a raw `emitExpr`: an array element read is a boxed `anyref` (every ref-kind element is stored generically), so the call needs the
 						// real narrowed closure type first, same as `case 'call'`'s member-callee receiver above.
 						emitAs(e.callee, ctx, calleeWtype);
-						const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
+						const scratch = ctx.declareLocal(`$closure$${ctx.tempCounter++}`, calleeWtype);
 						ctx.emit(I.local.tee(scratch.index), I.struct.get(structTypeIndex, 1));
 						emitCallArgs('<indexed closure>', sig.params, sig.defaults, !!sig.hasRest, e.arguments, ctx, sig.resolvedParams);
 						ctx.emit(I.local.get(scratch.index), I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
@@ -6264,7 +6255,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							throw "'for...of' loop variable must be a single declaration";
 
 						const v			= s.init.declarations[0];
-						const n			= forTempCounter++;
+						const n			= ctx.tempCounter++;
 						// A non-array with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable: `next()` until
 						// `done`. `for...of` sends `undefined` to a `next` that takes a value (a generator's). Arrays stay indexed below.
 						const it = iteratesByProtocol(s.right, ctx);
@@ -6420,7 +6411,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// One shared scope for the whole switch -- real JS gives every case a common lexical scope unless a case wraps its body in `{}`,
 				// which nests its own block via `case 'block'` as usual.
 				ctx.inScope(() => {
-					const discName = `#switch$${switchTempCounter++}`;
+					const discName = `#switch$${ctx.tempCounter++}`;
 					emitStmt(JS.VarDecl('const', JS.Var(discName, s.discriminant)), ctx);
 					const discId: Expr = { type: 'identifier', name: discName };
 
@@ -7333,7 +7324,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (typeof setterW !== 'object' || !('closure' in setterW))
 			throw `internal: '${cls.name}'s '#set:${field.name}' is not a setter slot (${wasmTypeKey(setterW)})`;
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(setterW.closure);
-		const setter	= ctx.declareLocal(`$acc$set$${closureCallTempCounter++}`, setterW);
+		const setter	= ctx.declareLocal(`$acc$set$${ctx.tempCounter++}`, setterW);
 		ctx.emit(I.local.get(obj), I.struct.get(cls.typeIndex, acc), I.local.tee(setter.index), I.ref.is_null);
 		const _old = ctx.swapOut();
 		plain();
@@ -7357,8 +7348,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (typeof getterW !== 'object' || !('closure' in getterW))
 			throw `internal: '${cls.name}'s '#get:${field.name}' is not a getter slot (${wasmTypeKey(getterW)})`;
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(getterW.closure);
-		const obj		= ctx.declareLocal(`$acc$obj$${closureCallTempCounter++}`, types.nullable(cls.thisWtype!));
-		const getter	= ctx.declareLocal(`$acc$get$${closureCallTempCounter++}`, getterW);
+		const obj		= ctx.declareLocal(`$acc$obj$${ctx.tempCounter++}`, types.nullable(cls.thisWtype!));
+		const getter	= ctx.declareLocal(`$acc$get$${ctx.tempCounter++}`, getterW);
 		ctx.emit(I.local.tee(obj.index), I.struct.get(cls.typeIndex, acc), I.local.tee(getter.index), I.ref.is_null);
 		const _old = ctx.swapOut();
 		ctx.emit(I.local.get(obj.index), I.struct.get(cls.typeIndex, idx));
@@ -8621,7 +8612,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const c = candidates[i];
 				dctx.emit(I.local.get(callee.index), I.ref.test(c.structTypeIndex));
 				const _cond = dctx.swapOut();
-				const held = dctx.temp(`$closure$${closureCallTempCounter++}`, { typeIndex: c.structTypeIndex, nullable: false });
+				const held = dctx.temp(`$closure$${dctx.tempCounter++}`, { typeIndex: c.structTypeIndex, nullable: false });
 				dctx.emit(I.local.get(callee.index), I.ref.cast(c.structTypeIndex), I.local.tee(held), I.struct.get(c.structTypeIndex, 1));
 				c.sig.params.forEach((p, j) => {
 					if (j < argLocals.length) {

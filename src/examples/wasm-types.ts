@@ -323,6 +323,9 @@ export class FunctionContext {
 	// so `freeSlots` (keyed by `wasmTypeKey`) only ever offers back a same-typed index for reuse.
 	slotTypes:	Type[] = [];
 	freeSlots	= new Map<string, number[]>();
+	// One number for every generated scratch-local name in this function (`$anytruthy$3`, `#switch$0`): a local only
+	// has to be unique within its own function, so all the naming purposes share it instead of a module-wide counter each.
+	tempCounter	= 0;
 	out:		wasm.Instr[]	= [];
 	ctorThis?:	Local;
 
