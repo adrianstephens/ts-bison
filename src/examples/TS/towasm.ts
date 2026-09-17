@@ -1111,8 +1111,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const asked = shapeEntries.has(info) ? (declScope ?? global).type(name) : undefined;
 		return !!asked && shapeEntries.get(info) !== asked;
 	};
-	let data				= new Uint8Array(0);
-	const strings			= new Map<string, number>;
+	const data				= new WT.DataSection;
 	const globals			= new Map<string, Global>;
 	// `ensureLazyGlobal`'s own wrapper `FuncInfo`s, keyed the same `homeKey` way as `funcs` itself.
 	const lazyGlobals		= new Map<string, FuncInfo>;
@@ -1349,38 +1348,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			|| (e.type === 'identifier' && scope.decl(e.name)?.type === 'function_decl')
 			|| (e.type === 'member' && e.object.type === 'identifier' && !!scope.namespace(e.object.name));
 	}
-
-	function addData(newdata: Uint8Array, align = 1): number {
-		const adjust = data.byteLength % align;
-		const offset = data.byteLength + (adjust ? align - adjust : 0);
-		const total	= offset + newdata.byteLength;
-		
-		if (data.buffer.byteLength < total) {
-			const buffer = new Uint8Array(Math.max(data.buffer.byteLength * 2, total));
-			buffer.set(data, 0);
-			data = buffer.subarray(0, total);
-		}
-		data = new Uint8Array(data.buffer, 0, total);
-		data.set(newdata, offset);
-		return offset;
-	}
-
-	function internString(value: string): number {
-		const existing = strings.get(value);
-		if (existing !== undefined)
-			return existing;
-		// UTF-16LE, not `TextEncoder`'s UTF-8 -- `emitStringConst` builds the `i16`-element array straight
-		// from these bytes via `array.new_data`, so they need to already be one 16-bit code unit each (matching `charCodeAt`).
-		const bytes = new Uint8Array(value.length * 2);
-		const view = new DataView(bytes.buffer);
-		for (let i = 0; i < value.length; i++)
-			view.setUint16(i * 2, value.charCodeAt(i), true);
-		const offset = addData(bytes, 2);
-		strings.set(value, offset);
-		return offset;
-	}
-
-
 
 	// Every class in the program, scanned once for a plain named `superClass` reference: shared by `ensureClass`'s `final` flag and virtual dispatch, which both need the whole inheritance graph known up front.
 	// `final` can't be decided lazily: wasm-GC only lets a non-final struct be another's `supertypes` entry once its type is registered. Keyed by bare declared name (`Box<T>` matches `Box`).
@@ -2403,7 +2370,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	function emitStringConst(s: string, ctx: FunctionContext): void {
 		// `array.new_data`'s two `i32` operands are a byte offset and an *element* count into the module's
 		// one shared passive data segment -- `internString`'s return value and `s.length` already match both, no conversion needed.
-		ctx.emit(I.i32.const(internString(s)), I.i32.const(s.length), I.array.new_data(types.array('i16'), 0));
+		ctx.emit(I.i32.const(data.intern(s)), I.i32.const(s.length), I.array.new_data(types.array('i16'), 0));
 	}
 
 	// Looked up by name against `classes` rather than taking `ClassInfo`s, since `coerceTop`'s callers only ever have the bare
@@ -9502,7 +9469,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		throw `global '${name}' needs a compile-time-constant initializer`;
 	});
 
-	mod.datas			= [{ mode: 'passive', bytes: data }];
+	mod.datas			= [{ mode: 'passive', bytes: data.bytes }];
 	if (tags.length)
 		mod.tags		= tags;
 

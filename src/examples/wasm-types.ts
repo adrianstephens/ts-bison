@@ -774,3 +774,40 @@ export class Types extends Array<wasm.SubType> {
 	}
 	
 }
+
+// The module's one passive data segment: a growable byte buffer plus the string table over it. Strings are
+// UTF-16LE, matching `charCodeAt`, so an `i16`-element array can be built straight from the bytes.
+export class DataSection {
+	private buffer	= new Uint8Array(0);
+	private strings	= new Map<string, number>();
+
+	// Appends `newdata` and returns its offset. `align` is 2 for the strings: a code unit must not straddle.
+	add(newdata: Uint8Array, align = 1): number {
+		const adjust = this.buffer.byteLength % align;
+		const offset = this.buffer.byteLength + (adjust ? align - adjust : 0);
+		const total	= offset + newdata.byteLength;
+		if (this.buffer.buffer.byteLength < total) {
+			const grown = new Uint8Array(Math.max(this.buffer.buffer.byteLength * 2, total));
+			grown.set(this.buffer, 0);
+			this.buffer = grown.subarray(0, total);
+		}
+		this.buffer = new Uint8Array(this.buffer.buffer, 0, total);
+		this.buffer.set(newdata, offset);
+		return offset;
+	}
+
+	intern(value: string): number {
+		const existing = this.strings.get(value);
+		if (existing !== undefined)
+			return existing;
+		const bytes = new Uint8Array(value.length * 2);
+		const view	= new DataView(bytes.buffer);
+		for (let i = 0; i < value.length; i++)
+			view.setUint16(i * 2, value.charCodeAt(i), true);
+		const offset = this.add(bytes, 2);
+		this.strings.set(value, offset);
+		return offset;
+	}
+
+	get bytes(): Uint8Array { return this.buffer; }
+}
