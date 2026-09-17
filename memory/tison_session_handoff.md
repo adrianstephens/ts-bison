@@ -4,53 +4,51 @@ description: LIVE cold-start state for the self-hosting work — where the row s
 metadata:
   node_type: memory
   type: project
-  modified: 2026-09-16
+  modified: 2026-09-17
 ---
 
 **Read this first, and usually instead of [[tison-towasm-self-hosting-plan]]** (2233 lines — open it
 only when you need the accumulated history of a specific row). This file is the live state and
 nothing else: it is rewritten wholesale, not appended to.
 
-## As of 2026-09-16
+## As of 2026-09-17
 
-**HEAD `d40a84d` (`presplit`)** — the commit the towasm split starts from. Last real towasm fix was
-`08e1c0e` (a dynamic field read on a missing field returns `undefined`, not a trap); before it `7d8a74c`
-had broken `tsc -b src/examples`, so `dist/` was stale for many commits. The `Object.keys` row (35
-declarations) is closed.
+**HEAD `64dab09`.** The cross-language split is at the end of Step 2 (see
+[[tison-towasm-cross-language-plan]]). `d40a84d` (`presplit`) was the baseline; `ec2a21f` landed Step 1
+(the neutral `wasm-types.ts` + the `towasm-analysis.ts` component); then Step 2 landed in two commits:
 
-**The survey is STALE — re-run it first.** The cause table predates those three fixes. The last
-table (102/344 compiled) was headed by: Object.keys 35 (now closed), object literal needing a known
-target 23 (ts-parser/type-utils), `cannot convert ref:Array<any> to ref:{...}` 11 (js-parser),
-`Array.from` missing 10, `no overload of 'BigInt's constructor' matches this call` 6.
+- **`cd1001f` — checker owns `makeLibScope`, pseudo-type names have one owner.** `checker.ts` exports
+  `makeLibScope(libAst)`; `towasm.ts` exports `LIB_AST` and every caller passes it. The plan said "one
+  caller"; there were **24** (all the gitignored `assistant/` instruments), so all were updated —
+  `assistant/` is untracked, so none of that shows in the commit. `TYPED_ARRAY_TAGS` was deleted in
+  favour of `T.WASM_PSEUDO_TYPES`. Also fixed: `assistant/corpus-ab.sh` never built its base worktree,
+  so its base run always died on the gitignored `dist/` and the A/B compared nothing.
+- **`64dab09` — one generic-call inference policy.** `instantiate`'s map-building core is now the
+  exported `inferTypeArgMap` in `checker.ts`; `towasm.ts`'s `inferCallTypeArgs` adapts codegen's own
+  `Expr[]` arguments to it. This deleted towasm's duplicate of the checker's inference (and its already
+  drifted contextual step), so it is a real behaviour change — deliberate, and every gate was identical.
 
-**Gate status at that point:** towasm 915 checks green, checker green, difftest 2182/2191 agree ·
-0 disagree · 9 unsupported. Corpus A/B not run — the changes were towasm-only, which does not
-require it.
+**Gates at `64dab09`:** build clean · test-towasm 915 · test-checker green · difftest **2182/2191 agree
+· 0 disagree** · corpus-ab identical (all buckets +0) · self-host survey **103/324** declarations compile
+in isolation, 259 failures from 168 causes, no regressions.
 
-## Current thread: the towasm split — Step 1 LANDED, uncommitted
+## Next, by value
 
-Separating the TS-specific code out of `towasm.ts` (axis: **TS-specificity**). **Plan, the measured cut,
-the blocker and all four closed decisions: [[tison-towasm-cross-language-plan]]; working tables:
-`assistant/towasm-split-inventory.md`.** That plan records the verified gate baseline at `d40a84d`.
-
-Landed 2026-09-16, gates green (build clean · test-towasm 915 · difftest 2182/2191 · 0 disagree, identical
-to baseline): **`src/examples/wasm-types.ts`** (165 lines, language-NEUTRAL) holds the physical type
-vocabulary (`Type`/`ClosureSig`/`ARR_WTYPE`/`REF_*`/the helpers); **`TS/towasm-analysis.ts`** (260 lines)
-holds the 12 name/free-variable AST queries. `TS/towasm.ts` 12,411 → **12,063**. `TS/towasm-types.ts` was
-created and folded back the same day — see the file-splitting rule in the plan (¾6): don't split without a
-reason, so TS types + TS codegen stay together. `WasmType`/`FuncSig` were split so the closure payload
-carries no TS types (identity-keyed `closureBindings` + `closureWtype`/`closureSigOf`) — that is what
-unblocked neutrality. Next, by value: the relocation into `checker.ts` (which is imported by NAME, so no
-call-site churn) including `inferTypeArgMap`, whose move deletes a re-implementation of the checker's own
-inference policy; then `towasm-asm.ts` as the one remaining component split; then the ~326 lines toward
-`type-utils` (namespace-imported as `T`, so that one DOES cost call-site qualification).
+- **`towasm-asm.ts`** — the one remaining component split the plan keeps. The inline-`__asm` machinery
+  is a component the language half uses; it must stay `import type`-only from `towasm.ts` so no runtime
+  cycle forms (it is not urgent — do it slowly).
+- **Step 3's three generic cores** (independent, any order): `src/examples/layout.ts` (the printer
+  skeleton, `Printer<K>` finally implemented), `guard<R>` into `walker.ts`, `buildStateMachine` into
+  `src/examples/statemachine.ts`.
+- The plan's Step 4 (the real 2-way split) stays on the shelf; §2's `TypeOracle`/IR is the destination,
+  only if a second language is still wanted.
+- The **`WT` prefix rename** (~459 refs) was explicitly handed to the user — an editor find/replace, not
+  agent work.
 
 ## Open, waiting on the user — do not assume
 
-- The BigInt row (6 declarations) is a real overload-*resolution* gap in `candidateFits`. Proposed
-  as the next row; not chosen.
-- The split work above takes precedence until its four stages land — do not start a self-hosting row
-  without checking which stage the tree is at.
+- The BigInt row (6 declarations) is a real overload-*resolution* gap in `candidateFits`. Proposed as
+  the next self-hosting row; not chosen. The split work above takes precedence until its stages land.
 
 ## Deliberately unfixed, each its own row
 
@@ -64,11 +62,10 @@ inference policy; then `towasm-asm.ts` as the one remaining component split; the
 
 ## Tree state
 
-HEAD `d40a84d`. **The user edits and commits concurrently — re-check `git status`; never trust this line.**
-At the time of writing the only uncommitted files were the assistant's two `memory/` edits plus the user's
-`memory/tison_vsdg_cpp.md` + `test/test-vsdg-cpp.ts`. Treat any other modified file as theirs.
-`memory/MEMORY.md` carries uncommitted index lines for still-untracked memory files — leave them; stage only
-your own hunk.
+HEAD `64dab09`. **The user edits and commits concurrently — re-check `git status`; never trust this
+line.** At the time of writing the only uncommitted files are the user's own
+`memory/tison_vsdg_cpp.md` + `test/test-vsdg-cpp.ts` (the `++`/`--` boundary tests). Treat any other
+modified file as theirs.
 
 ## Keeping this current
 

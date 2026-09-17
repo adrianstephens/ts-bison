@@ -3,7 +3,7 @@ name: tison-towasm-cross-language-plan
 description: "PLAN, nothing built: separating the TS-specific half of the wasm backend out, starting with a 2-file split along TS-specificity. Scope decisions (all four closed), the MEASURED cut (94/6, so cut at the TYPES not the functions), what can relocate into type-utils/checker (~524–616 lines), which TS files have REAL generic cores (printer layout, guard, state machine), and the 4-step route."
 metadata:
   type: project
-  modified: 2026-09-16
+  modified: 2026-09-17
 ---
 
 Written 2026-09-16 from the tree at that date (towasm.ts 12,410 lines). **No code has been written for
@@ -381,6 +381,16 @@ than treat as extras, since they are the same edit: (a) `inferTypeArgMap`'s move
 checker's own inference policy; (b) give the wasm pseudo-type names one owner instead of three; (c) record
 the `alwaysTruthy`/`T.isTruthy` and `PRIMITIVE_TAGS`/`SIMPLE_TYPES` traps in the commit message so a later
 tidy-up does not "fix" them.
+
+**Step 2 COMPLETE 2026-09-17 — both surviving items, in two commits.** `cd1001f`: `makeLibScope` now
+lives in `checker.ts` as `makeLibScope(libAst)`, with `towasm.ts` exporting `LIB_AST`; the `TYPED_ARRAY_TAGS`
+duplicate of `WASM_PSEUDO_TYPES` is gone (one owner). The "one caller" estimate was wrong — **24**
+(tsw.ts, test-towasm.ts, and 23 gitignored `assistant/` instruments all pass `LIB_AST` now);
+`assistant/corpus-ab.sh` also had to be fixed to build its base worktree, or its base run always died on the
+gitignored `dist/`. `64dab09`: `instantiate`'s map-building core is the exported `inferTypeArgMap` in
+`checker.ts`, and `towasm.ts`'s `inferCallTypeArgs` adapts codegen's arguments to it — the duplicate and its
+already-drifted contextual step are deleted. Gates identical throughout: difftest 2182/2191 · 0 disagree;
+corpus-ab all buckets +0; self-host survey 103/324, no regressions, the two moved functions now probeable.
 
 **Step 3 — extract the three real generic cores (§3).** `src/examples/layout.ts` (the printer skeleton,
 ≈60–80 lines out of three files, plus `Printer<K>` finally given an implementation), `guard<R>` into
