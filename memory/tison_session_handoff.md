@@ -29,20 +29,18 @@ method; no registries and no language type, generic wasm over the context's own 
 single dependency is a LEAD, not a verdict — signature-local types count (`mergeOverloadSigs` depends only
 on `types` but returns `FullSig`, so it stays free), and "reads only base members" != "belongs on the base".
 
-**The method, which is the thing to reuse:** `assistant/towasm-hoist-survey.ts` resolves every identifier
-with the checker, so "does this need the scope?" is answered by the binding, not by a name. `--module`
-classifies module-level declarations by their externals with a transitive fixed point (a declaration moves
-only with everything it leans on), `--move --write` relocates to `type-utils.ts`, and `--dump`/`--apply`
-does the `TStoWasm`-child hoist (41 of 209 functions needed nothing and moved; a second pass found 0 more).
-`assistant/towasm-comment-pass.js` is the comment tool (449 blocks >2 lines -> 274, with a printer-based
-code-identity gate).
+**The method to reuse:** `assistant/towasm-hoist-survey.ts` resolves every identifier with the checker, so
+"does this need the scope?" is answered by the binding, not a name: `--module` classifies module-level
+declarations by their externals with a transitive fixed point, `--move --write` relocates to
+`type-utils.ts`, `--dump`/`--apply` does the `TStoWasm`-child hoist (41 of 209 needed nothing; a second
+pass found 0 more), `--single` lists functions with exactly one in-scope dependency.
+`assistant/towasm-comment-pass.js` is the comment tool (449 blocks >2 lines -> 274).
 
-**Shape facts that are structural, not stylistic:** `declScope?: Scope` can never be neutral (`Scope` is
-type-utils', and type-utils imports wasm-types); a language subtype must RE-NARROW a base's recursive member
-(`declare superClass?: ClassInfo`) or every chain walk degrades to the base — and `declare` is required,
-because a plain (or `!`) field definition emits after `super()` and clobbers what the base constructor
-assigned (verified; TS2612 names it); `typeIndex: -1` on `ClassInfo` is a real state (a class whose
-constructor returns a scalar never gets a struct type index).
+**Structural, not stylistic:** `declScope?: Scope` can never be neutral (`Scope` is type-utils', and
+type-utils imports wasm-types); a subtype must RE-NARROW a base's recursive member (`declare superClass?:
+ClassInfo`) or every chain walk degrades to the base — `declare`, never `!`, because a field initializer
+emits after `super()` and clobbers what the constructor assigned (verified; TS2612); `typeIndex: -1` on
+`ClassInfo` is a real state (a scalar-returning constructor never gets a struct type index).
 
 **Gates at `0fcf399`:** build clean · test-towasm green · test-checker green · difftest **2182/2191 · 0
 disagree · 9 unsupported** (baseline, unchanged by the batch). At `bce6f7d`, corpus-ab vs `7b6e3fc` was
@@ -50,16 +48,12 @@ every bucket **+0** (tested 13,527 · threw 345 · GAP 346 · WARNING 1,469 · E
 
 ## The survey is PARKED (user's call, 2026-09-17) — do not wait on it
 
-The first full survey after `bce6f7d` reads **134/391**, 297 failures / 190 causes, and **10 REGRESSED**
-(`towasm-analysis.ts`'s six `walkerB` users + `wasm-types.ts`'s `notUnsigned`, `elementKind`, `wasmTypeKey`,
-`combineUnionWtypes`), all failing `Cannot read properties of undefined (reading 'scope')`. **That is the
-instrument, not a regression:** `selfhost-survey.sh tison/src/examples/TS/towasm-analysis.ts` alone compiles
-all six, and a two-file run fails a DIFFERENT set with a DIFFERENT message. Per-declaration results are
-order/state-dependent beyond the `935a4e1` import-cycle fix, so a single-run `REGRESSED` line is noise.
-**The user's direction is to keep moving code rather than wait ~10 minutes per survey run**, so: while
-relocating, run only the fast set — `npx tsc -b src/examples`, `test-towasm`, `test-checker`,
-`difftest.sh` (all under ~2 min) and on a move they must be identical to baseline. Fix the determinism
-later; until then never read a survey delta as progress or regression.
+The first full survey after `bce6f7d` reads **134/391** with **10 REGRESSED**, all `Cannot read properties
+of undefined (reading 'scope')` — **the instrument, not a regression** (one file alone compiles all six; a
+two-file run fails a different set with a different message), so per-declaration results are order/state-
+dependent and a single-run `REGRESSED` line is noise. Keep moving code: while relocating run only the fast
+set — `npx tsc -b src/examples`, `test-towasm`, `test-checker`, `difftest.sh` (~2 min), identical to
+baseline on a move. Fix the determinism later; never read a survey delta as progress or regression.
 
 ## Next, by value
 
