@@ -7,6 +7,7 @@
 - [no JSON.stringify on AST/Type](feedback_no_json_stringify_ast.md) — bigints throw; print with `T.typeKey` / `T.exprKey` / `T.stmtKey`
 - [no unimplemented-throws tests](feedback_no_unimplemented_throws_tests.md) — `checkThrows` is for permanent enforced behavior only
 - [SESSION HANDOFF](tison_session_handoff.md) — **read this at cold start**, before the 2233-line plan: live row state, what's deliberately unfixed, what the user hasn't decided
+- [harness portability](tison_harness_portability.md) — for running tison under a DIFFERENT agent harness: cwd, gate order, the acceptance numbers at `ec2a21f`, which instruments gate by EXIT CODE (difftest and vsdg-check do; the survey is a probe to be read), and what does not travel (the transcript)
 - [session boundaries](feedback_session_boundaries.md) — when the user asks "continue or start fresh?", recommend; default fresh after a committed fix, always after a compaction
 - [two-tier gates](feedback_two_tier_gates.md) — fast gates while iterating, full set once before the commit; measured 10.1 gate runs per commit. **`test-towasm.ts` reads `dist/` — `npm run examples` first**
 - [index towasm.ts before hunting](feedback_towasm_symbol_index.md) — one-off `grep -n` symbol index; the file was named in 575 separate read/grep calls over 8 sessions

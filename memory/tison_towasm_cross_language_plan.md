@@ -218,6 +218,21 @@ re-implementation of the checker's own inference policy** (`instantiate` at 1563
 the `expected`/`returnType` contextual step and the deferred contravariant second pass). Moving it to
 `checker.ts` is not a move — it deletes the duplicate.
 
+**PRUNED by the file-splitting rule (§6), 2026-09-16 — the table above is a catalogue, not a work list.**
+The rule's test is *does separating this have a reason*, and for most of these the honest answer is no:
+`collectRangeWidenings` (choosing a local's i32/u32/f64) and the `ownerFor`/`arrayKindOf`-style helpers are
+codegen *policy* that consumes type facts — they read like type algebra but belong with the codegen. The same
+holds for `staticGuard`/`iteratesByProtocol`/`narrowedTypeOf`/`narrowedValueTypeOf`, which are queries about
+codegen's own `stmtScope`. So they stay. **What survives, and why:**
+
+- **`inferTypeArgMap`'s duplication** — the reason is two implementations of one policy, not file size.
+  This is a real compiler change (it can change which instantiation a generic call picks), so it wants its
+  own session and the full gate set rather than a tidying pass.
+- **`makeLibScope`** — a checker *setup* call (`checkBlock`) exported for `tsw.ts`; it takes `LIB_AST` as a
+  parameter and moves, with one caller to update.
+- The rest of the table is evidence for *why* the neutral cut sits where it does, and should not be acted on
+  without a new reason.
+
 **Traps recorded so they are not "fixed" into bugs:**
 - `alwaysTruthy` (4279) vs `T.isTruthy` (1964) — the *same question* with deliberately *different answers*,
   because a boxed `any` slot may hold `Stmt | undefined`. Never fold them together.
