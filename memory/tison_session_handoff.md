@@ -11,73 +11,74 @@ metadata:
 only when you need the accumulated history of a specific row). This file is the live state and
 nothing else: it is rewritten wholesale, not appended to.
 
-## As of 2026-09-17
+## As of 2026-09-17 (evening)
 
-**HEAD `8a3da35` — "the asm island is neutral, and its seam is a concrete signature".** Steps 1–2 of the
-cross-language split are landed (see [[tison-towasm-cross-language-plan]]), and the inline-`__asm` island is
-now `src/examples/wasm-asm.ts` (neutral) plus an `Inline __asm` section in `TS/towasm.ts`. The two commits
-that first held this work (`82a292f`, `1435768`) were REWRITTEN AWAY, so hashes in older notes point at
-nothing; §5 of the plan records the design.
+**HEAD `bce6f7d` — "pull the neutral half out of towasm.ts, in measured steps".** The extraction is under
+way by a repeatable method rather than by hand, and the neutral half now has real homes:
+`wasm-types.ts` (vocabulary, `TSWError`/`withCatch*`, `Local`/`ClosureEnv`/`FinallyGuard`, the
+`FunctionContext` base, `Types` (the type section), `ClassInfo` (a class), `wantedShape`,
+`mentionsTypeIndex`, `ownerThisType`), `wasm-asm.ts` (the island), `type-utils.ts` (the TS type model — 26
+declarations moved in), and `towasm.ts` = the TypeScript-specific codegen (10,001 lines; wasm-types 532,
+type-utils 3,839).
 
-**The seam rule this settled — reuse it for Steps 4/5.** Neutral code manipulates representations only, and
-the language hands over a CONCRETE base interface (`AsmDecl extends WT.ClosureSig`, one method); never a
-parameter over the language's type. A first cut used `AsmTypes<TA>` plus a six-member adapter — the idiom
-§3 rules out ("a base interface plus a language subtype, never a type parameter") — and was *larger*
-(280 code lines against 272). **If sharing something needs a type parameter, the logic is on the wrong side:
-leave the few lines of policy with the language and share the representation work.** Corollary from the
-user: don't spend code forcing neutrality; if it isn't simple and clean it isn't useful.
+**The method, which is the thing to reuse:** `assistant/towasm-hoist-survey.ts` resolves every identifier
+with the checker, so "does this need the scope?" is answered by the binding, not by a name. `--module`
+classifies module-level declarations by their externals with a transitive fixed point (a declaration moves
+only with everything it leans on), `--move --write` relocates to `type-utils.ts`, and `--dump`/`--apply`
+does the `TStoWasm`-child hoist (41 of 209 functions needed nothing and moved; a second pass found 0 more).
+`assistant/towasm-comment-pass.js` is the comment tool (449 blocks >2 lines -> 274, with a printer-based
+code-identity gate).
 
-**Gates at `8a3da35`:** build clean · test-towasm all green · test-checker green · difftest **2182/2191
-agree · 0 disagree · 9 unsupported** — identical to baseline, so no codegen bytes moved. Self-host survey
-**125/355** declarations compile in isolation, 84 more need a driver, **270 failures from 177 causes**, with
-`wasm-types.ts`/`wasm-asm.ts`/`towasm-analysis.ts` now IN TARGETS (they were invisible to the work queue, so
-a declaration moved out of a surveyed file used to read as progress when it was a scope change).
+**Shape facts that are structural, not stylistic:** `declScope?: Scope` can never be neutral (`Scope` is
+type-utils', and type-utils imports wasm-types); a language subtype must RE-NARROW a base's recursive member
+(`declare superClass?: ClassInfo`) or every chain walk degrades to the base — and `declare` is required,
+because a plain (or `!`) field definition emits after `super()` and clobbers what the base constructor
+assigned (verified; TS2612 names it); `typeIndex: -1` on `ClassInfo` is a real state (a class whose
+constructor returns a scalar never gets a struct type index).
 
-**Instrument fix (`assistant/selfhost-survey.ts`, untracked):** the aggregate read EVERY per-file report on
-disk, so a file dropped from TARGETS kept rendering a PHANTOM row — the deleted `TS/towasm-asm.ts` was still
-counted, its 2 failures included. Reports are kept across runs on purpose (`knownHeavy` reads one to skip a
-doomed full attempt), so the fix prunes non-target reports on a whole-TARGETS run rather than clearing the
-directory. The corrected run's "Since the previous run" now names the 4 declarations that went with the file.
+**Gates at `bce6f7d`:** build clean · test-towasm green · test-checker green · difftest **2182/2191 · 0
+disagree · 9 unsupported** (baseline) · corpus-ab vs `7b6e3fc` every bucket **+0** (tested 13,527 · threw
+345 · GAP 346 · WARNING 1,469 · ERROR 864 · false-positive 1,209).
+
+## The survey's delta is NOT trustworthy — new, and the next real row
+
+The first full survey after `bce6f7d` reads **134/391** compile in isolation, 297 failures / 190 causes, and
+**10 REGRESSED** (`towasm-analysis.ts`'s six `walkerB` users + `wasm-types.ts`'s `notUnsigned`, `elementKind`,
+`wasmTypeKey`, `combineUnionWtypes`), every one failing `Cannot read properties of undefined (reading
+'scope')`. **That is not a regression, it is the instrument.** `selfhost-survey.sh
+tison/src/examples/TS/towasm-analysis.ts` alone compiles all six; a two-file run
+(`wasm-types.ts` + `towasm-analysis.ts`) fails a DIFFERENT set (`storageTypeKey`, `wTypeKey`, `withCatchAt`,
+`withCatch`, `mentionsTypeIndex`) with a DIFFERENT message (`object literal for
+'{ref:HeapType;nullable:boolean}' is missing property 'nullable'`). So per-declaration results are
+order/state-dependent beyond the `935a4e1` import-cycle fix (concurrent import resolution was only one
+source), and a single-run `REGRESSED` line is noise. Re-run 3-5x before reading any delta — the rule the
+handoff already carried, now with an instance.
+**Next row: make the survey deterministic.** Suspects are the shared `parser`/`libScope` (and the per-probe
+re-check) in `assistant/selfhost-survey.ts`; until it is fixed, treat the delta column as a hint, never a
+gate, and never record it as progress or regression.
 
 ## Next, by value
 
-- **The general pseudo-type mapper.** `asmDeclaredType` (~20 lines) exists only because `builtinTypes` holds
-  i32/i64/f32/f64/u32 and `T.resolve` deliberately leaves the pseudo-type names unresolved, so
-  `typeOf(RefType('i8'))` is `undefined` while an asm signature declaring `i8` means `i32`. Teaching
-  `typeOf`/`wasmTypeOf` those spellings deletes it — a GENERAL codegen change, difftest-gated. Offered.
-- **`TS/towasm-analysis.ts` (261 lines, 11/12 compile).** Per-language AST queries with one consumer. The
-  user's stated expectation is a SINGLE TS module for all TypeScript-specific compilation, which folds it
-  into `towasm.ts`; asked, not decided.
-- **Step 3's three generic cores** (independent, any order): `src/examples/layout.ts` (the printer skeleton,
-  `Printer<K>` finally implemented), `guard<R>` into `walker.ts`, `buildStateMachine` into
-  `src/examples/statemachine.ts`.
-- **Step 4 → Step 5** are the route to the user's goal (towasm's core in the examples root, TS wrappers):
-  neutralise the SHAPES first (`FuncCtx`, `ClassInfo`, `FuncSig` base + language subtype), then the
-  `Emitter`/`TSEmitter` split. Apply the seam rule above: the base emits, the language subclass lowers types.
-  The plan's numbering was fixed 2026-09-17 (it had two Step 3s and two Step 4s).
+- **Retune functions to the neutral base.** `FunctionContext` is already split, but functions that take the
+  local subclass and only use base members (e.g. `emitRawSlot`, `emitHolderRead`, `emitTrailingUnreachable`,
+  maybe `numericOpInline`/`isNamespaceValue`) can be retyped `ctx: WT.FunctionContext` and move — the same
+  move `ClassInfo`/`ownerThisType` just made. `ClassInfo` is now a class, so neutral methods go ON it.
+- **`towasm-analysis.ts`** (261 lines) is per-language AST queries with one consumer; the user's stated
+  expectation is ONE TS module, which folds it into `towasm.ts` — asked, not decided.
+- **`rawElemKind`/`asmDeclaredType` stay TS-side deliberately** (they reason about TS type spellings).
+- **Step 3's three generic cores** (independent): `src/examples/layout.ts`, `guard<R>` into `walker.ts`,
+  `buildStateMachine` into `src/examples/statemachine.ts`.
 
 ## Open, waiting on the user — do not assume
 
-- The **BigInt row** (6 declarations) is a real overload-*resolution* gap in `candidateFits`; still unchosen.
-- Whether to do the general pseudo-type mapper, and whether to fold `towasm-analysis.ts` (both above).
+- The **BigInt row** (6 declarations) is a real overload-*resolution* gap in `candidateFits`; unchosen.
+- Whether to fold `towasm-analysis.ts` (above).
 - The **`WT` prefix rename** (~459 refs) was explicitly handed to the user — an editor find/replace.
-
-## Deliberately unfixed, each its own row
-
-- `Object.keys/values/entries` counts a struct's OPTIONAL fields that were never assigned —
-  `Partial<Record<NumericType, T>>` with one key set answers 4, not 1. Both the static and cascade
-  paths build a fixed-length literal from `owner.fields`; a correct answer needs a null test per
-  optional field and a dynamically built array.
-- The same intrinsics trap (do not answer wrongly) for an array-, string- or boxed-scalar-backed
-  receiver, and for a `Map` reached through an `object`/`unknown`-typed value.
 
 ## Tree state
 
-HEAD `8a3da35`. **The user edits and commits concurrently — re-check `git status`; never trust this
-line.** At the time of writing the only uncommitted files are the user's own
-`memory/tison_vsdg_cpp.md` + `test/test-vsdg-cpp.ts` (the `++`/`--` boundary tests) — which is also why the
-survey header says "2 uncommitted files; numbers describe a tree mid-edit": neither file is surveyed, so the
-numbers are the committed tree's.
+HEAD `bce6f7d`, working tree clean at the time of writing (`42c3cd6` added the VSDG C++ `++`/`--` pins).
+**The user edits and commits concurrently — re-check `git status`; never trust this line.**
 
 ## Keeping this current
 
