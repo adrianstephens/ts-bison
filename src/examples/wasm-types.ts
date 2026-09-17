@@ -503,6 +503,17 @@ export class FunctionContext {
 		this.out.push(...instr.flat());
 	}
 
+	// Emits exactly one of two arms and leaves its value on the stack. Each arm goes into its own instruction
+	// list, so neither can run before the condition's own code has; an omitted (or empty) else stays a 2-arg `if`.
+	emitIf(vt: wasm.ValType | undefined, then: () => void, els?: () => void): void {
+		const outer		= this.swapOut();
+		then();
+		const thenArm	= this.swapOut();
+		els?.();
+		const elseArm	= this.swapOut(outer);
+		this.emit(elseArm.length ? I.if(vt, thenArm, elseArm) : I.if(vt, thenArm));
+	}
+
 	toFuncBody(numParams: number, toValType: (t: Type) => wasm.ValType): wasm.FuncBody & {id: string} {
 		return { id: this.name.replace(/[^a-zA-Z0-9_]/g, '_'), locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
 	}
@@ -593,12 +604,9 @@ export function emitDefaultValue(want: Type, ctx: FunctionContext, types: Types,
 // instead of running the read. Shared so every optional access -- field, call, index -- guards identically.
 export function emitOptionalAccess(ctx: FunctionContext, objWtype: Type, resultWtype: Type, toValType: (t: Type) => wasm.ValType, readCore: (objLocal: number) => void): Type {
 	const objLocal = ctx.temp(`$opt$obj$${ctx.tempCounter++}`, objWtype);
+	const vt = toValType(resultWtype);
 	ctx.emit(I.local.set(objLocal), I.local.get(objLocal), I.ref.is_null);
-	const _old = ctx.swapOut();
-	ctx.emit(I.ref.null(heapTypeOf(toValType(resultWtype))));
-	const _then = ctx.swapOut();
-	readCore(objLocal);
-	ctx.emit(I.if(toValType(resultWtype), _then, ctx.swapOut(_old)));
+	ctx.emitIf(vt, () => ctx.emit(I.ref.null(heapTypeOf(vt))), () => readCore(objLocal));
 	return resultWtype;
 }
 

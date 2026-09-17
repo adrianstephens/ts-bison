@@ -1258,11 +1258,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// can't see `slotName` at all (never real source the checker type-checked); only `d.init` itself goes through the
 			// checker-aware `emitAs`. Emits `if (slot === null) slot = <init>; return slot!;`.
 			ctx.emit(I.global.get(g.index), I.ref.is_null);
-			const old = ctx.swapOut();
-			// The declared type is the initializer's context, as for a local: `[{...}]` builds `Rules<Mod>`'s own shape.
-			ctx.withContext(checkedType, () => emitAs(d.init!, ctx, g.wtype));
-			ctx.emit(I.global.set(g.index));
-			ctx.emit(I.if(undefined, ctx.swapOut(old)));
+			ctx.emitIf(undefined, () => {
+				// The declared type is the initializer's context, as for a local: `[{...}]` builds `Rules<Mod>`'s own shape.
+				ctx.withContext(checkedType, () => emitAs(d.init!, ctx, g.wtype));
+				ctx.emit(I.global.set(g.index));
+			});
 			// `coerceTop`, not a bare `ref.as_non_null`: `types.nullable` BOXES a scalar slot, so for an
 			// `i32`/`f64` const the slot holds a box while this wrapper's signature promises the scalar.
 			ctx.emit(I.global.get(g.index));
@@ -2789,11 +2789,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// A null slot is tested by `emitTypeofTest('undefined')`; its tag is the type's own null tag.
 			if (!emitTypeofTest(id, tag === 'object' && hasNull ? 'undefined' : tag, ctx))
 				throw `'typeof' of '${T.typeKey(t)}' cannot be told apart at run time (tag '${tag}')`;
-			const _old = ctx.swapOut();
-			emitAs(Literal(tag), ctx, str);
-			const _then = ctx.swapOut();
-			cascade(i + 1);
-			ctx.emit(I.if(toValType(str), _then, ctx.swapOut(_old)));
+			ctx.emitIf(toValType(str), () => emitAs(Literal(tag), ctx, str), () => cascade(i + 1));
 		};
 		cascade(0);
 		return str;
@@ -2804,11 +2800,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// lowering rather than materialising the operand `case 'binary'` yields; neither side needs a representable value type.
 		if (e.type === 'binary' && (e.operator === '&&' || e.operator === '||')) {
 			emitTruthy(e.left, ctx);
-			const _old = ctx.swapOut();
-			ctx.inNarrowed(e.right, e.left, e.operator === '&&', () => emitTruthy(e.right, ctx));
-			ctx.emit(e.operator === '&&'
-				? I.if('i32', ctx.swapOut(_old), [I.i32.const(0)])
-				: I.if('i32', [I.i32.const(1)], ctx.swapOut(_old)));
+			const isAnd	= e.operator === '&&';
+			const test	= () => ctx.inNarrowed(e.right, e.left, isAnd, () => emitTruthy(e.right, ctx));
+			ctx.emitIf('i32', isAnd ? test : () => ctx.emit(I.i32.const(1)), isAnd ? () => ctx.emit(I.i32.const(0)) : test);
 			return;
 		}
 		emitTruthyOf(emitExpr(e, ctx), ctx.narrowedTypeOf(e), ctx);
@@ -2826,13 +2820,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (typeof got === 'object' && got.nullable) {
 				const tmp = ctx.declareLocal(`$numtruthy$${ctx.tempCounter++}`, got);
 				ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
-				const old = ctx.swapOut();
-				ctx.emit(I.i32.const(0));
-				const _then = ctx.swapOut();
-				ctx.emit(I.local.get(tmp.index));
-				coerceTop(got, ctx, box.kind);
-				emitTruthyOf(box.kind, t, ctx);
-				ctx.emit(I.if('i32', _then, ctx.swapOut(old)));
+				ctx.emitIf('i32', () => ctx.emit(I.i32.const(0)), () => {
+					ctx.emit(I.local.get(tmp.index));
+					coerceTop(got, ctx, box.kind);
+					emitTruthyOf(box.kind, t, ctx);
+				});
 				return;
 			}
 			coerceTop(got, ctx, box.kind);
@@ -2857,11 +2849,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (got.nullable) {
 				const tmp = ctx.declareLocal(`$strtruthy$${ctx.tempCounter++}`, got);
 				ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
-				const old = ctx.swapOut();
-				ctx.emit(I.i32.const(0));
-				const _then = ctx.swapOut();
-				ctx.emit(I.local.get(tmp.index), I.ref.as_non_null, I.array.len, I.i32.const(0), I.i32.ne);
-				ctx.emit(I.if('i32', _then, ctx.swapOut(old)));
+				ctx.emitIf('i32',
+					() => ctx.emit(I.i32.const(0)),
+					() => ctx.emit(I.local.get(tmp.index), I.ref.as_non_null, I.array.len, I.i32.const(0), I.i32.ne));
 			} else {
 				ctx.emit(I.array.len, I.i32.const(0), I.i32.ne);
 			}
@@ -4021,11 +4011,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		else
 			emitAs(JS.Member({ type: 'identifier', name: objName }, 'length'), ctx, 'i32');
 		ctx.emit(I.i32.lt_u);
-		const _old = ctx.swapOut();
-		read(obj, idx);
-		const _then = ctx.swapOut();
-		emitDefaultValue(resultWtype, ctx, types, toValType);
-		ctx.emit(I.if(toValType(resultWtype), _then, ctx.swapOut(_old)));
+		ctx.emitIf(toValType(resultWtype), () => read(obj, idx), () => emitDefaultValue(resultWtype, ctx, types, toValType));
 		return resultWtype;
 	}
 
@@ -4115,11 +4101,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		emitAs(e, ctx, 'f64');
 		const tmp = ctx.temp(`$toint32$${ctx.tempCounter++}`, 'f64');
 		ctx.emit(I.local.set(tmp), I.local.get(tmp), I.f64.abs, I.f64.const(Infinity), I.f64.lt);
-		const _old = ctx.swapOut();
-		ctx.emit(I.local.get(tmp), I.i64.trunc_sat_f64_s, I.i32.wrap_i64);
-		const _then = ctx.swapOut();
-		ctx.emit(I.i32.const(0));
-		ctx.emit(I.if(toValType('i32'), _then, ctx.swapOut(_old)));
+		ctx.emitIf(toValType('i32'),
+			() => ctx.emit(I.local.get(tmp), I.i64.trunc_sat_f64_s, I.i32.wrap_i64),
+			() => ctx.emit(I.i32.const(0)));
 	}
 
 	const BITWISE_METHODS = new Set(['and', 'or', 'xor', 'shl', 'shr_s', 'shr_u']);
@@ -4427,12 +4411,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								// way -- matching real JS's never-set-property semantics: `Map.get` already gives that for a missing key on an
 								// allocated map, so only the map itself never allocated needs this branch.
 								ctx.emit(I.local.get(local!.index), I.struct.get(physCls.typeIndex, extIdx), I.ref.is_null);
-								const _old = ctx.swapOut();
-								emitAs({ type: 'identifier', name: 'undefined' }, ctx, REF_ANY);
-								const _isNullBranch = ctx.swapOut();
-								ctx.emit(I.local.get(local!.index), I.struct.get(physCls.typeIndex, extIdx), I.ref.as_non_null);
-								emitMethodCall(mapCls, 'get', [{ type: 'literal', value: e.property }], ctx);
-								ctx.emit(I.if(toValType(REF_ANY), _isNullBranch, ctx.swapOut(_old)));
+								ctx.emitIf(toValType(REF_ANY), () => emitAs({ type: 'identifier', name: 'undefined' }, ctx, REF_ANY), () => {
+									ctx.emit(I.local.get(local!.index), I.struct.get(physCls.typeIndex, extIdx), I.ref.as_non_null);
+									emitMethodCall(mapCls, 'get', [{ type: 'literal', value: e.property }], ctx);
+								});
 								return REF_ANY;
 							}
 						}
@@ -4816,11 +4798,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (!src.nullable)
 						return void ctx.emit(...arm(0));
 					ctx.emit(I.local.get(src.spreadLocal!.index), I.ref.is_null);
-					const _old = ctx.swapOut();
-					emitDefaultValue(want, ctx, types, toValType);
-					const _then = ctx.swapOut();
-					ctx.emit(...arm(0));
-					ctx.emit(I.if(toValType(want), _then, ctx.swapOut(_old)));
+					ctx.emitIf(toValType(want), () => emitDefaultValue(want, ctx, types, toValType), () => ctx.emit(...arm(0)));
 				};
 				// A spread copies VALUES: JS reads each property through [[Get]] into a plain data property, so an accessor's getter never carries over -- the key's own
 				// read (`emitFieldRead`) already called it, and the copy's slot stays empty.
@@ -4846,12 +4824,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					const tmp		= ctx.declareLocal(`$spread$${f.name}$${ctx.tempCounter++}`, srcWtype);
 					readSpread(last, f.name, srcWtype);
 					ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
-					const old = ctx.swapOut();
-					emitChain(chain.slice(0, -1), f);
-					const _then = ctx.swapOut();
-					ctx.emit(I.local.get(tmp.index));
-					coerceTop(srcWtype, ctx, f.wtype);
-					ctx.emit(I.if(toValType(f.wtype), _then, ctx.swapOut(old)));
+					ctx.emitIf(toValType(f.wtype), () => emitChain(chain.slice(0, -1), f), () => {
+						ctx.emit(I.local.get(tmp.index));
+						coerceTop(srcWtype, ctx, f.wtype);
+					});
 				};
 				for (const f of owner.fields) {
 					const chain = sources.get(f.name);
@@ -5054,14 +5030,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							const cur	= ctx.declareLocal(`$logical$assign$${ctx.tempCounter++}`, wtype);
 							ctx.emit(I.local.tee(cur.index));
 							emitTruthyOf(wtype, ctx.narrowedTypeOf(target), ctx);
-							const _old = ctx.swapOut();
 							// The truthy arm assigns for `&&=` and keeps the old value for `||=`, the falsy arm is the mirror, and `emitValue()` is reached only in the arm that
 							// actually assigns -- which is what leaves the right-hand side unevaluated in the other one.
 							const keep	= () => ctx.emit(I.local.get(cur.index));
-							(isAnd ? emitValue : keep)();
-							const _then = ctx.swapOut();
-							(isAnd ? keep : emitValue)();
-							ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+							ctx.emitIf(toValType(wtype), isAnd ? emitValue : keep, isAnd ? keep : emitValue);
 							break;
 						}
 
@@ -5072,11 +5044,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								throw "'??=' needs a nullable object-typed target (no boxing in this subset)";
 							const leftLocal = ctx.declareLocal(`$nullish$assign$${ctx.tempCounter++}`, wtype);
 							ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
-							const _old = ctx.swapOut();
-							emitValue();
-							const _then = ctx.swapOut();
-							ctx.emit(I.local.get(leftLocal.index));
-							ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+							ctx.emitIf(toValType(wtype), emitValue, () => ctx.emit(I.local.get(leftLocal.index)));
 							break;
 						}
 
@@ -5129,10 +5097,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							emitTruthy(left, ctx);
 							if (!isAnd)
 								ctx.emit(I.i32.eqz);
-							const _old = ctx.swapOut();
-							if (ctx.inNarrowed(right, left, isAnd, () => emitExpr(right, ctx, 'void')) !== 'void')
-								ctx.emit(I.drop);
-							ctx.emit(I.if(undefined, ctx.swapOut(_old)));
+							ctx.emitIf(undefined, () => {
+								if (ctx.inNarrowed(right, left, isAnd, () => emitExpr(right, ctx, 'void')) !== 'void')
+									ctx.emit(I.drop);
+							});
 							return 'void';
 						}
 						const leftWtype		= wtypeOf(left, ctx);
@@ -5161,18 +5129,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							ctx.emit(I.local.get(leftLocal.index));
 							coerceTop(leftWtype, ctx, wtype);
 						};
-						const _old = ctx.swapOut();
 						const emitRight = () => ctx.inNarrowed(right, left, isAnd, () => emitAs(right, ctx, wtype));
-						if (isAnd)
-							emitRight();
-						else
-							keepLeft();
-						const _then = ctx.swapOut();
-						if (isAnd)
-							keepLeft();
-						else
-							emitRight();
-						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+						ctx.emitIf(toValType(wtype), isAnd ? emitRight : keepLeft, isAnd ? keepLeft : emitRight);
 						return wtype;
 					}
 					// `a ?? b` -- a left that can never actually be null/undefined makes `b` provably dead code (as real TS's checker concludes), so it is evaluated and
@@ -5192,12 +5150,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						emitAs(left, ctx, leftWtype);
 						const leftLocal = ctx.declareLocal(`$nullish$left$${ctx.tempCounter++}`, leftWtype);
 						ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
-						const _old = ctx.swapOut();
-						emitAs(right, ctx, wtype);
-						const _then = ctx.swapOut();
-						ctx.emit(I.local.get(leftLocal.index));
-						coerceTop(leftWtype, ctx, wtype);
-						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+						ctx.emitIf(toValType(wtype), () => emitAs(right, ctx, wtype), () => {
+							ctx.emit(I.local.get(leftLocal.index));
+							coerceTop(leftWtype, ctx, wtype);
+						});
 						return wtype;
 					}
 
@@ -5420,12 +5376,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (!wtype)
 					throw 'conditional expression has an unsupported type';
 				emitTruthy(e.test, ctx);
-				const _old = ctx.swapOut();
-				ctx.inNarrowed(e.consequent, e.test, true, () => emitAs(e.consequent, ctx, wtype));
-				const _then = ctx.swapOut();
-				ctx.inNarrowed(e.alternate, e.test, false, () => emitAs(e.alternate, ctx, wtype));
-				const _else = ctx.swapOut(_old);
-				ctx.emit(I.if(toValType(wtype), _then, _else));
+				ctx.emitIf(toValType(wtype),
+					() => ctx.inNarrowed(e.consequent, e.test, true, () => emitAs(e.consequent, ctx, wtype)),
+					() => ctx.inNarrowed(e.alternate, e.test, false, () => emitAs(e.alternate, ctx, wtype)));
 				return wtype;
 			}
 
@@ -5606,11 +5559,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							emitAs(objExpr, ctx, objWtype);
 							const objLocal = ctx.declareLocal(`$optcall$${ctx.tempCounter++}`, objWtype);
 							ctx.emit(I.local.tee(objLocal.index), I.ref.is_null, I.i32.eqz);
-							const _old = ctx.swapOut();
-							ctx.emit(I.local.get(objLocal.index), I.ref.as_non_null);
-							if (emitMethodCall(owner, methodName, e.arguments, ctx, typeArgs) !== 'void')
-								ctx.emit(I.drop);
-							ctx.emit(I.if(undefined, ctx.swapOut(_old)));
+							ctx.emitIf(undefined, () => {
+								ctx.emit(I.local.get(objLocal.index), I.ref.as_non_null);
+								if (emitMethodCall(owner, methodName, e.arguments, ctx, typeArgs) !== 'void')
+									ctx.emit(I.drop);
+							});
 							return 'void';
 						}
 						if (method.result === 'void')
@@ -6036,18 +5989,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					return;
 				}
 				emitTruthy(s.test, ctx);
-				const old = ctx.swapOut();
 				ctx.enterLabel();
-				emitStmt(s.consequent, ctx);
-				if (s.alternate) {
-					const _then = ctx.swapOut();
-					emitStmt(s.alternate, ctx);
-					ctx.exitLabel();
-					ctx.emit(I.if(undefined, _then, ctx.swapOut(old)));
-				} else {
-					ctx.exitLabel();
-					ctx.emit(I.if(undefined, ctx.swapOut(old)));
-				}
+				const alternate = s.alternate;
+				ctx.emitIf(undefined, () => emitStmt(s.consequent, ctx), alternate ? () => emitStmt(alternate, ctx) : undefined);
+				ctx.exitLabel();
 				return;
 			}
 
@@ -6503,11 +6448,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// Exactly one action code is ever set, and each arm is gated by its own 'if' so the validator only checks one small branch at a time.
 					const dispatch = (code: number, build: () => void) => {
 						ctx.emit(I.local.get(actionLocal.index), I.i32.const(code), I.i32.eq);
-						const old = ctx.swapOut();
 						ctx.enterLabel();			// this 'if''s own implicit level -- a depth-relative 'br' built by `build()` (e.g. a nested try/finally's own redispatch) needs it counted
-						build();
+						ctx.emitIf(undefined, build);
 						ctx.exitLabel();
-						ctx.emit(I.if(undefined, ctx.swapOut(old)));
 					};
 					dispatch(1, () => outerOnReturn.emit(ctx, returnValueLocal ? { type: 'identifier', name: '#finally$retval' } : undefined));
 					// Skip an arm entirely when no such target was enclosing this construct (those action codes can then never be set), since
@@ -7214,13 +7157,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(setterW.closure);
 		const setter	= ctx.declareLocal(`$acc$set$${ctx.tempCounter++}`, setterW);
 		ctx.emit(I.local.get(obj), I.struct.get(cls.typeIndex, acc), I.local.tee(setter.index), I.ref.is_null);
-		const _old = ctx.swapOut();
-		plain();
-		const _plain = ctx.swapOut();
-		ctx.emit(I.local.get(setter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 1), I.local.get(val));
-		coerceTop(valWtype, ctx, setterW.closure.params[0]);
-		ctx.emit(I.local.get(setter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
-		ctx.emit(I.if(undefined, _plain, ctx.swapOut(_old)));
+		ctx.emitIf(undefined, plain, () => {
+			ctx.emit(I.local.get(setter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 1), I.local.get(val));
+			coerceTop(valWtype, ctx, setterW.closure.params[0]);
+			ctx.emit(I.local.get(setter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+		});
 	}
 
 	// A field read, the receiver already on the stack. A field some `Object.defineProperty` gave a getter (`accessorKeys`) has
@@ -7239,13 +7180,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const obj		= ctx.declareLocal(`$acc$obj$${ctx.tempCounter++}`, types.nullable(cls.thisWtype!));
 		const getter	= ctx.declareLocal(`$acc$get$${ctx.tempCounter++}`, getterW);
 		ctx.emit(I.local.tee(obj.index), I.struct.get(cls.typeIndex, acc), I.local.tee(getter.index), I.ref.is_null);
-		const _old = ctx.swapOut();
-		ctx.emit(I.local.get(obj.index), I.struct.get(cls.typeIndex, idx));
-		const _plain = ctx.swapOut();
-		ctx.emit(I.local.get(getter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 1),
-			I.local.get(getter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
-		coerceTop(getterW.closure.result, ctx, field.wtype);
-		ctx.emit(I.if(toValType(field.wtype), _plain, ctx.swapOut(_old)));
+		ctx.emitIf(toValType(field.wtype),
+			() => ctx.emit(I.local.get(obj.index), I.struct.get(cls.typeIndex, idx)),
+			() => {
+				ctx.emit(I.local.get(getter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 1),
+					I.local.get(getter.index), I.ref.as_non_null, I.struct.get(structTypeIndex, 0), I.call_ref(funcTypeIndex));
+				coerceTop(getterW.closure.result, ctx, field.wtype);
+			});
 		return field.wtype;
 	}
 
