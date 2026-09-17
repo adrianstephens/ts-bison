@@ -13,14 +13,15 @@ nothing else: it is rewritten wholesale, not appended to.
 
 ## As of 2026-09-17 (evening)
 
-**HEAD `0fcf399` — "give each helper its owner and each module its own helpers".** Two strands landed
-together, both instances of the one rule: a method goes on the state it reads, a free function goes in the
-module whose vocabulary it speaks. `ClassInfo.addField`/`fieldDeclaredType`, `Types.func`/`funcAt`/
-`nullable`/`envBase` and `narrowedTypeOf`/`narrowedValueTypeOf`/`inNarrowed`/`staticGuard` are methods now;
-`withContext`/`emitTrailingUnreachable`/`emitResumableDispatch` stayed on the TS subclass (async/generator
-lowering is TS-only); `resolveOverload` went to `checker.ts`, where `candidateFits` lives (so it takes a
-`scope`); `nextCall`, four helpers that took `global` only to pass it on, and `objectShapes` went to
-`type-utils.ts`. Sizes: towasm 9,802 · type-utils 3,915 · wasm-types 605 · wasm-asm 227.
+**HEAD `02279f5` — "an assignment expression's scratch locals die with the expression".** `0fcf399` landed
+the placement batch: `ClassInfo.addField`/`fieldDeclaredType`/`isBaseOf`, `Types.func`/`funcAt`/`nullable`/
+`envBase` and `narrowedTypeOf`/`narrowedValueTypeOf`/`inNarrowed`/`staticGuard` are methods; `withContext`/
+`emitTrailingUnreachable`/`emitResumableDispatch` stayed on the TS subclass (async/generator lowering is
+TS-only); `resolveOverload` went to `checker.ts`, where `candidateFits` lives (so it takes a `scope`);
+`nextCall`, four helpers that took `global` only to pass it on, `objectShapes` and `emitAnyTruthy` went to
+the neutral modules. Since then: one `FunctionContext.tempCounter` replaced six module-wide counters AND
+`scratchName`, and assignment expressions run in their own scope so their scratch slots are freed. Sizes:
+towasm 9,760 · type-utils 3,915 · wasm-types 642 · wasm-asm 227.
 
 **The placement rule, for every future candidate** (the user endorsed it): needs `TStoWasm`'s registries
 (`classes`, `types`, `ensureClass`) -> stays a free function taking `ctx` for now, because Step 5's
@@ -42,9 +43,19 @@ ClassInfo`) or every chain walk degrades to the base — `declare`, never `!`, b
 emits after `super()` and clobbers what the constructor assigned (verified; TS2612); `typeIndex: -1` on
 `ClassInfo` is a real state (a scalar-returning constructor never gets a struct type index).
 
-**Gates at `0fcf399`:** build clean · test-towasm green · test-checker green · difftest **2182/2191 · 0
-disagree · 9 unsupported** (baseline, unchanged by the batch). At `bce6f7d`, corpus-ab vs `7b6e3fc` was
-every bucket **+0** (tested 13,527 · threw 345 · GAP 346 · WARNING 1,469 · ERROR 864 · false-positive 1,209).
+**Locals are named and freed by `FunctionContext`.** `tempCounter` names every generated local, unique per
+context, so nothing is kept apart by a name any more (`scratchName` is gone). What keeps the count down is
+LIFETIME, not naming: `closeScope` is the only thing that returns a slot to `freeSlots`, so the assignment
+sites wrap the whole expression in `ctx.inScope` — a write's `$old`/`$new`/`$obj` are dead once it has
+written back. Without that, one local per same-typed write site survives until the block closes (measured:
+a 40-write probe function 7 -> 45 locals; with the scope, 7, and `lib/node/path.ts` 320 -> 319).
+`assistant/local-count.ts` measures this (`mod.code[].locals`); `local-probe.ts` is its stress input.
+
+**Gates at `02279f5`:** build clean · eslint clean on both touched files · test-towasm green ·
+test-checker green · difftest **2191/2200 · 0 disagree · 9 unsupported**. The corpus is 2200 cases only
+with the nine assignment-order cases added to `assistant/difftest.ts` — that file is GITIGNORED, so a tree
+without them reports 2182/2191. At `bce6f7d`, corpus-ab vs `7b6e3fc` was every bucket **+0** (tested
+13,527 · threw 345 · GAP 346 · WARNING 1,469 · ERROR 864 · false-positive 1,209).
 
 ## The survey is PARKED (user's call, 2026-09-17) — do not wait on it
 
@@ -81,7 +92,7 @@ baseline on a move. Fix the determinism later; never read a survey delta as prog
 
 ## Tree state
 
-HEAD `0fcf399`, working tree clean at the time of writing. **The user edits and commits concurrently —
+HEAD `02279f5`, working tree clean at the time of writing. **The user edits and commits concurrently —
 re-check `git status`; never trust this line.**
 
 ## Keeping this current
