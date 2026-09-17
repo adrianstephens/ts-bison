@@ -429,8 +429,8 @@ export class FunctionContext {
 	temp(name: string, wtype: Type): number {
 		const prev = this.lookup(name);
 		if (prev) {
-			// Structurally, as the name itself was built (`scratchName` keys by `wasmTypeKey`): two equal types
-			// need not be one object -- a fresh `Types.nullable(REF_ANY)` and the `REF_ANY_NULLABLE` constant.
+			// Structurally: two equal types need not be one object -- a fresh `Types.nullable(REF_ANY)` and
+			// the `REF_ANY_NULLABLE` constant.
 			if (wasmTypeKey(prev.wtype) !== wasmTypeKey(wtype))
 				throw `local '${name}' redeclared with different type`;
 			return prev.index;
@@ -514,12 +514,45 @@ export class FunctionContext {
 	
 }
 
+// Truthiness of a value whose physical slot is a boxed `any`, decided at RUNTIME -- the checker's type rules nothing out,
+// so `alwaysTruthy` can never answer. `0n` shares `arr:i32` with `Int32Array` and so reads as truthy: the one wrong answer.
+export function emitAnyTruthy(got: Type, ctx: FunctionContext, types: Types): void {
+	// Always the NULLABLE slot: a non-nullable local is not defaultable, and a null test costs nothing
+	// to skip below when `got` already rules null out.
+	const tmp		= ctx.temp(`$anytruthy$${ctx.tempCounter++}`, REF_ANY_NULLABLE);
+	const boxI32	= types.box('i32');
+	const boxF64	= types.box('f64');
+	const str		= types.array('i16');
+	ctx.emit(I.local.set(tmp));
 
-// Qualifies a scratch local's name by its own wtype -- a bare fixed name would collide (`FuncCtx.local`
-// throws on a same-name-different-type redeclare) once one function writes to two differently-typed targets.
-export function scratchName(prefix: string, wtype: Type): string {
-	return `${prefix}$${wasmTypeKey(wtype)}`;
+	const arms: (() => void)[][] = [
+		// A boxed `i32` is a `boolean` or an `i32`-kind number, and `0` is the falsy one for both.
+		[()	=> ctx.emit(I.local.get(tmp), I.ref.test(boxI32)),
+		()	=> ctx.emit(I.local.get(tmp), I.ref.cast(boxI32), I.struct.get(boxI32, 0), I.i32.const(0), I.i32.ne)],
+		// `abs(x) > 0`, for the same NaN/`-0` reasons the bare-`f64` case above gives.
+		[()	=> ctx.emit(I.local.get(tmp), I.ref.test(boxF64)),
+		()	=> ctx.emit(I.local.get(tmp), I.ref.cast(boxF64), I.struct.get(boxF64, 0), I.f64.abs, I.f64(0), I.f64.gt)],
+		// A string is falsy when EMPTY -- same `arr:i16` test the checker-typed path above makes statically.
+		[()	=> ctx.emit(I.local.get(tmp), I.ref.test(str)),
+		()	=> ctx.emit(I.local.get(tmp), I.ref.cast(str), I.array.len, I.i32.const(0), I.i32.ne)],
+	];
+	if (typeof got === 'object' && got.nullable)
+		arms.unshift([() => ctx.emit(I.local.get(tmp), I.ref.is_null), () => ctx.emit(I.i32.const(0))]);
+
+	// Nested `if`s, innermost last: everything that matched no box is a real object/array/closure.
+	const chain = (i: number): void => {
+		if (i === arms.length)
+			return ctx.emit(I.i32.const(1));
+		arms[i][0]();
+		const _old = ctx.swapOut();
+		arms[i][1]();
+		const _then = ctx.swapOut();
+		chain(i + 1);
+		ctx.emit(I.if('i32', _then, ctx.swapOut(_old)));
+	};
+	chain(0);
 }
+
 
 // The type a short-circuiting operator (`&&`/`||`/`??`) gives both its arms: the caller's, when both it and the
 // self-inferred one are object refs -- only then does building at it rather than converting to it matter (invariance).

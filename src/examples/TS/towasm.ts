@@ -7,7 +7,7 @@ import { unwrapAs, isPurePath, exprMentionsName, assignsToThis, describeBinding,
 import * as Common from '../common';
 import { Literal, Binary, Assign, Member, hasMod } from '../common';
 import * as WT from '../wasm-types';
-import { TSWError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS } from '../wasm-types';
+import { TSWError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy } from '../wasm-types';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
 import { walker, walkerB } from './walker';
 import { AsmDecl, makeAsm as makeAsm0 } from '../wasm-asm';
@@ -2835,48 +2835,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return str;
 	}
 
-	// Truthiness of a value whose physical slot is a boxed `any`, decided at RUNTIME -- `guard()`'s own `node && typeof node ===
-	// 'object' && ...` is the shape, where the checker's type really is `any`, so `alwaysTruthy` can never answer. `ref.test`
-	// against the boxes a scalar takes on entering an `any` slot (`coerceTop`) separates the falsy candidates from a real object,
-	// which is unconditionally truthy. A `bigint` shares `arr:i32` with `Int32Array` (see `typeofHeapType`), so `0n` reaches the
-	// object arm and reads as truthy -- the one wrong answer this cascade can give.
-	function emitAnyTruthy(got: WT.Type, ctx: FunctionContext): void {
-		// Always the NULLABLE slot: a non-nullable local is not defaultable, and a null test costs nothing
-		// to skip below when `got` already rules null out.
-		const tmp		= ctx.temp(`$anytruthy$${ctx.tempCounter++}`, REF_ANY_NULLABLE);
-		const boxI32	= types.box('i32');
-		const boxF64	= types.box('f64');
-		const str		= types.array('i16');
-		ctx.emit(I.local.set(tmp));
-
-		const arms: (() => void)[][] = [
-			// A boxed `i32` is a `boolean` or an `i32`-kind number, and `0` is the falsy one for both.
-			[()	=> ctx.emit(I.local.get(tmp), I.ref.test(boxI32)),
-			()	=> ctx.emit(I.local.get(tmp), I.ref.cast(boxI32), I.struct.get(boxI32, 0), I.i32.const(0), I.i32.ne)],
-			// `abs(x) > 0`, for the same NaN/`-0` reasons the bare-`f64` case above gives.
-			[()	=> ctx.emit(I.local.get(tmp), I.ref.test(boxF64)),
-			()	=> ctx.emit(I.local.get(tmp), I.ref.cast(boxF64), I.struct.get(boxF64, 0), I.f64.abs, I.f64(0), I.f64.gt)],
-			// A string is falsy when EMPTY -- same `arr:i16` test the checker-typed path above makes statically.
-			[()	=> ctx.emit(I.local.get(tmp), I.ref.test(str)),
-			()	=> ctx.emit(I.local.get(tmp), I.ref.cast(str), I.array.len, I.i32.const(0), I.i32.ne)],
-		];
-		if (typeof got === 'object' && got.nullable)
-			arms.unshift([() => ctx.emit(I.local.get(tmp), I.ref.is_null), () => ctx.emit(I.i32.const(0))]);
-
-		// Nested `if`s, innermost last: everything that matched no box is a real object/array/closure.
-		const chain = (i: number): void => {
-			if (i === arms.length)
-				return ctx.emit(I.i32.const(1));
-			arms[i][0]();
-			const _old = ctx.swapOut();
-			arms[i][1]();
-			const _then = ctx.swapOut();
-			chain(i + 1);
-			ctx.emit(I.if('i32', _then, ctx.swapOut(_old)));
-		};
-		chain(0);
-	}
-
 	function emitTruthy(e: Expr, ctx: FunctionContext): void {
 		// In a CONDITION `a && b` only has to decide the branch -- both readings agree there -- so this keeps the cheap boolean
 		// lowering rather than materialising the operand `case 'binary'` yields; neither side needs a representable value type.
@@ -2972,7 +2930,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 		// A genuinely dynamic `any` slot -- the checker's type rules nothing out, so decide it at runtime.
 		if (typeof got === 'object' && 'ref' in got && got.ref === 'any') {
-			emitAnyTruthy(got, ctx);
+			emitAnyTruthy(got, ctx, types);
 			return;
 		}
 		throw `'${T.typeKey(t)}' (${wasmTypeKey(got)}) cannot be used as a boolean condition`;
@@ -3502,17 +3460,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (old !== 'none') {
 				readCore();
 				if (old === 'keep') {
-					savedOld = ctx.temp(WT.scratchName('$old', wtype), wtype);
+					savedOld = ctx.temp(`$old$${ctx.tempCounter++}`, wtype);
 					ctx.emit(I.local.tee(savedOld));
 				}
 			}
 			return savedOld;
 		}
-		function makeWrite(wtype: WT.Type, storeCore: (val: number) => void): (tee: boolean) => number {
+		function makeWrite(wtype: WT.Type, storeCore: (val: number, name: string) => void): (tee: boolean) => number {
 			return tee => {
-				const val = ctx.temp(WT.scratchName('$new', wtype), wtype);
+				const name	= `$new$${ctx.tempCounter++}`;
+				const val	= ctx.temp(name, wtype);
 				ctx.emit(I.local.set(val));
-				storeCore(val);
+				storeCore(val, name);
 				if (tee)
 					ctx.emit(I.local.get(val));
 				return val;
@@ -3608,11 +3567,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (!setSig)
 					throw `internal: setter '${target.property}' has no signature`;
 				const wtype = setSig.params[0];
-				const valExpr: Expr = { type: 'identifier', name: WT.scratchName('$new', wtype) };
 
 				// `emitAs`, not a raw `emitExpr` -- `target.object` may itself be a ref-kind array element read, boxed `anyref` regardless of its declared class (same reasoning as the plain struct-field write below).
 				const objWtype = cls.thisWtype!;
-				const obj = ctx.temp(WT.scratchName('$obj', objWtype), objWtype);
+				const obj = ctx.temp(`$obj$${ctx.tempCounter++}`, objWtype);
 				emitAs(target.object, ctx, objWtype);
 				ctx.emit(I.local.set(obj));
 				return {
@@ -3623,9 +3581,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emit(I.local.get(obj));
 						emitMethodCall(cls, T.accessorKey('get', target.property), [], ctx);
 					}),
-					write: makeWrite(wtype, () => {
+					write: makeWrite(wtype, (val, name) => {
 						ctx.emit(I.local.get(obj));
-						emitMethodCall(cls, T.accessorKey('set', target.property), [valExpr], ctx);
+						emitMethodCall(cls, T.accessorKey('set', target.property), [{ type: 'identifier', name }], ctx);
 					}),
 				};
 			}
@@ -3655,7 +3613,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 			// `emitAs`, not a raw `emitExpr` -- `target.object` may be a ref-kind array element read, boxed `anyref`; `struct.set` needs the real narrowed `(ref cls)` first, same as the read-side fix in `case 'member'`.
 			const objWtype = cls.thisWtype!;
-			const obj = ctx.temp(WT.scratchName('$obj', objWtype), objWtype);
+			const obj = ctx.temp(`$obj$${ctx.tempCounter++}`, objWtype);
 			emitAs(target.object, ctx, objWtype);
 			ctx.emit(I.local.set(obj));
 			return {
@@ -3673,15 +3631,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (cls && getter && setter && getSig) {
 				// `emitAs`, not a raw `emitExpr` -- same reasoning as the plain struct-field write path above.
 				const objWtype = cls.thisWtype!;
-				const obj = ctx.temp(WT.scratchName('$obj', objWtype), objWtype);
+				const obj = ctx.temp(`$obj$${ctx.tempCounter++}`, objWtype);
 				emitAs(target.object, ctx, objWtype);
 				ctx.emit(I.local.set(obj));
 				emitAs(target.index, ctx, getSig.params[0]);
-				const indexName = WT.scratchName('$index', getSig.params[0]);
+				const indexName = `$index$${ctx.tempCounter++}`;
 				ctx.emit(I.local.set(ctx.temp(indexName, getSig.params[0])));
 				const idxExpr: Expr = { type: 'identifier', name: indexName };
 				const wtype = getSig.result;
-				const valExpr: Expr = { type: 'identifier', name: WT.scratchName('$new', wtype) };
 
 				return {
 					wtype,
@@ -3689,12 +3646,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emit(I.local.get(obj));
 						emitMethodCall(cls, getter, [idxExpr], ctx);
 					}),
-					write: makeWrite(wtype, () => {
+					write: makeWrite(wtype, (val, name) => {
 						ctx.emit(I.local.get(obj));
 						// `storeCore`'s own contract (see `makeWrite`) is to leave nothing on the stack -- true for free for a `void`-returning
 						// `set(i,v)`, but `Map.set()` returns `this` for chaining, so its result needs an explicit drop or the whole
 						// expression-statement's stack balance is wrong.
-						if (emitMethodCall(cls, setter, [idxExpr, valExpr], ctx) !== 'void')
+						if (emitMethodCall(cls, setter, [idxExpr, { type: 'identifier', name }], ctx) !== 'void')
 							ctx.emit(I.drop);
 					}),
 				};
@@ -3759,7 +3716,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// Mirrors `case 'index'`'s own read-side result exactly -- a ref-kind array's write target is a boxed `any`, not a raw i32.
 			const wtype		= kind === 'ref' ? REF_ANY_NULLABLE : kind;
 			const objWtype	= emitExpr(target.object, ctx);
-			const obj		= ctx.temp(WT.scratchName('$obj', objWtype), objWtype);
+			const obj		= ctx.temp(`$obj$${ctx.tempCounter++}`, objWtype);
 			ctx.emit(I.local.set(obj));
 			emitAs(target.index, ctx, 'i32');
 			// Always `i32` (an array index), so unlike `$obj`/`$new`/`$old` it genuinely cannot collide across two index writes in the same function.
@@ -3797,11 +3754,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (!wasmTypeEq(a.wtype, b.wtype))
 					throw `cannot assign to a conditional whose branches differ ('${wasmTypeKey(a.wtype)}' and '${wasmTypeKey(b.wtype)}')`;
 				ctx.emit(I.local.get(test), I.if(old === 'none' ? undefined : toValType(a.wtype), _readA, _readB));
-				const savedOld = old === 'keep' ? ctx.temp(WT.scratchName('$old', a.wtype), a.wtype) : undefined;
+				const savedOld = old === 'keep' ? ctx.temp(`$old$${ctx.tempCounter++}`, a.wtype) : undefined;
 				if (savedOld !== undefined)
 					ctx.emit(I.local.tee(savedOld));
 				return { wtype: a.wtype, old: savedOld, write: tee => {
-					const val = ctx.temp(WT.scratchName('$new', a.wtype), a.wtype);
+					const val = ctx.temp(`$new$${ctx.tempCounter++}`, a.wtype);
 					ctx.emit(I.local.set(val));
 					const _o = ctx.swapOut();
 					ctx.emit(I.local.get(val));
