@@ -3,8 +3,11 @@ import * as path from 'path';
 import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
+import { unwrapAs, isPurePath, exprMentionsName, assignsToThis, describeBinding, paramNames, ownBoundNames, collectFreeVars, namesSelfAsValue, collectClosureFreeVars, collectCapturedMutables, noteAssignExpr } from './towasm-analysis';
 import * as Common from '../common';
 import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
+import * as WT from '../wasm-types';
+import { ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, wTypeKey, CLOSURE_FIELDS } from '../wasm-types';
 import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, candidateFits } from './checker';
 import { Walker, walker, walkerB } from './walker';
 import { printer } from './printer';
@@ -166,6 +169,98 @@ class TSWError {
 	}
 }
 
+// ===================================================================
+//  The TypeScript-side vocabulary
+// ===================================================================
+// The language-neutral half -- the physical type vocabulary and its pure helpers -- lives in
+// `../wasm-types`, imported as `WT`. What is left here is either about a compiled FUNCTION's shape
+// (`FuncSig` and friends, `Local`/`Global`) or a rule about TypeScript's own type *spellings*
+// (`TYPED_ARRAY_TAGS`, `PRIMITIVE_TAGS`, `READONLY_ALIAS`, `isNullLiteral`, `rawElemKind`); neither belongs
+// in a language-neutral module. `FuncSig` extends `WT.ClosureSig` with the binding data only
+// argument-binding reads (`defaults`/`resolvedParams`/`restElem`), which is what lets `WT.Type` name no
+// language type at all; that binding data is kept BESIDE each closure payload (`closureWtype`), not in it.
+
+const TYPED_ARRAY_TAGS = new Set(['i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'f32', 'f64']);
+
+const PRIMITIVE_TAGS = new Set(['string', 'number', 'boolean', 'bigint']);
+
+// None of these has a declaration of its own: a readonly view is a checker-only distinction over the
+// very same physical container, which is the treatment `ownerFor` has always given `ReadonlyArray`.
+const READONLY_ALIAS = new Map([['ReadonlyArray', 'Array'], ['ReadonlyMap', 'Map'], ['ReadonlySet', 'Set']]);
+
+// null parses as a literal; undefined is a real identifier -- both need ref.null with a heap type.
+function isNullLiteral(e: Expr): boolean {
+	return nullLiteralKind(e) !== undefined;
+}
+
+// Which of the two nullish literals `e` is, if either. They share one physical form here (`ref.null`),
+// so only a STRICT comparison ever has to tell them apart, and only statically -- see `case '==='`.
+function nullLiteralKind(e: Expr): 'null' | 'undefined' | undefined {
+	return	e.type === 'literal' && e.value === null			? 'null'
+		:	e.type === 'identifier' && e.name === 'undefined'	? 'undefined'
+		:	undefined;
+}
+
+// The element kind of a `RawArray<T>`: a typed-array tag names its own PACKED kind directly, since
+// resolving it as a type would widen `u8` to `u32` and silently give byte storage an i32 element.
+function rawElemKind(a: Type | undefined, resolve: (t: Type) => WT.Type | undefined): WT.ElementI {
+	return a && a.type === 'ref' && !a.typeArgs && TYPED_ARRAY_TAGS.has(a.name)
+		? WT.notUnsigned(a.name as WT.Element) : WT.elementKind(a && resolve(a));
+}
+
+
+// `defaults`: only ever set for a function TYPE with a bare `p?: T` (optional, no `=`) trailing param --
+// see `case 'function'`'s own comment. A closure *literal*'s own params can never be optional (a real,
+// separate restriction, unaffected), so this stays `undefined` for every other `FuncSig` producer.
+// `resolvedParams`: the same params `defaults` came from, before flattening to bare `WasmType`s --
+// only actually needed by `emitCallArgs` when a default value itself reads an earlier parameter
+// (`resolveParams`'s own comment) rather than standing alone as a literal. Set for a real user
+// function/method/constructor, and for a function TYPE that carries defaults of its own -- which one
+// can, since a type derived from a declaration (`typeof f`, a method's type) keeps them.
+interface FuncSig extends WT.ClosureSig	{ defaults?: (Expr | undefined)[]; resolvedParams?: ResolvedParam[]; restElem?: ResolvedParam }
+// A signature with `hasRest`/`defaults` definitely settled -- but `resolvedParams`/`restElem` are
+// genuinely absent (no params at all, no rest), so they stay optional through `Required`.
+type FullSig = Required<Omit<FuncSig, 'resolvedParams' | 'restElem'>> & Pick<FuncSig, 'resolvedParams' | 'restElem'>;
+interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; reassignsThis?: boolean }
+interface Inline extends FuncSig	{ inline: wasm.Instr[] }
+interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number; sig: FuncSig }
+type TupleT = Extract<Type, { type: 'tuple' }>;
+// JS `fn.length`: the parameters before the first defaulted one; a rest parameter and a TS `this` parameter never count.
+function jsLength(params: { key: unknown; default?: unknown }[]): number {
+	const own = params.filter(p => p.key !== 'this');
+	const i = own.findIndex(p => p.default !== undefined);
+	return i < 0 ? own.length : i;
+}
+
+interface Local			{ wtype: WT.Type, index: number; holderInner?: WT.Type; }
+interface Global extends Local {init: Expr, mut: boolean}
+
+// `calleeDefault`: a default no call site can re-emit (a call, a capture, `this`). Its slot is an optional one and
+// `declareParams` applies the default in the callee, which is where JS evaluates it anyway.
+interface ResolvedParam { key: BindingTarget; wtype: WT.Type; tsType: Type; calleeDefault?: { value: Expr; tsType: Type } }
+
+interface ClosureEnv {
+	envLocal:		Local;
+	envTypeIndex:	number;
+	fields:			Map<string, Local>
+};
+
+// Pushed by `case 'try'` while compiling a `try`/`catch` that has a `finally` -- `emitBreak`/
+// `emitContinue` check this first (innermost guard): real JS semantics require `finally` to run
+// before either actually completes, so one whose real target lies outside this specific
+// `try`/`finally`'s own span stashes an action code and branches to the shared landing point
+// instead of exiting directly. Popped before that landing point's own re-dispatch code is built, so
+// a `br` built there targets the next-outer guard (or ordinary behavior once none remain) --
+// composes for nested `try`/`finally` without any extra bookkeeping. `return`'s own equivalent
+// redirect is a temporary `ctx.onReturn` swap instead (see `case 'try'`), not part of this guard --
+// unlike a loop/switch target, there's only ever one "current" return meaning at a time, no stack needed.
+interface FinallyGuard {
+	actionLocal:				Local;
+	breakTargetsLenAtEntry:		number;
+	continueTargetsLenAtEntry:	number;
+	landingDepth:				number
+};
+
 // lib files concatenated into one flat declaration list.
 const LIB_DIR		= path.join(__dirname, 'lib');
 // Globbed, not listed: a hardcoded list fails SILENTLY when a new lib file is forgotten -- the
@@ -211,111 +306,8 @@ function hostImportsIn(body: TS.Stmt[]): HostImport[] {
 
 const LIB_HOST_IMPORTS: HostImport[] = hostImportsIn(LIB_AST);
 
-type WasmScalarI	= 'i32' | 'i64' | 'f32' | 'f64'
-type WasmScalar		= WasmScalarI | 'u32' | 'u64'
-type WasmElementI	= WasmScalarI | 'i8' | 'i16' | 'ref';
-type WasmElement	= WasmElementI | 'u8' | 'u16' | 'u32' | 'u64';
-type WasmType		= WasmScalar
-	| 'void'	// only valid as a function result, never a param/local/field.
-	| { ref:		string; nullable?: boolean }
-	| { arr:		WasmElementI; nullable?: boolean }
-	| { closure:	FuncSig; nullable?: boolean }
-	| { typeIndex:	number; nullable?: boolean }
-	// A boxed nullable primitive ('number | null'/'boolean | null'): a real class/closure env struct
-	// never sets `primKind`, so it's what tells a `typeIndex`-shaped type apart from those -- see
-	// `unboxedPrimitive`. Structural, not a side-table, since `registerType`'s memoization could
-	// otherwise coincidentally share a type index with an unrelated single-scalar-field struct.
-	| { typeIndex:	number; nullable?: boolean; primKind: WasmScalarI };
-
-const TYPED_ARRAY_TAGS = new Set(['i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'f32', 'f64']);
-const PRIMITIVE_TAGS = new Set(['string', 'number', 'boolean', 'bigint']);
-
-// Shared singletons -- ctx.local compares WasmType by object identity
-const ARR_WTYPE: Record<WasmElementI, WasmType> = {
-	i8: { arr: 'i8' },
-	i16: { arr: 'i16' },
-	i32: { arr: 'i32' },
-	i64: { arr: 'i64' },
-	f32: { arr: 'f32' },
-	f64: { arr: 'f64' },
-	ref: { arr: 'ref' },
-};
-const REF_ANY:			WasmType = { ref: 'any' };
-const REF_ANY_NULLABLE: WasmType = { ref: 'any', nullable: true };
-const REF_EXN:			WasmType = { ref: 'exn', nullable: true };
-
-// The plain scalar kind a value acts as for arithmetic/comparison dispatch -- unwraps a boxed
-// nullable primitive the same way `coerceTop` does, or passes a bare scalar through unchanged.
-// `undefined` for anything else (a real class/array/closure).
-// None of these has a declaration of its own: a readonly view is a checker-only distinction over the
-// very same physical container, which is the treatment `ownerFor` has always given `ReadonlyArray`.
-const READONLY_ALIAS = new Map([['ReadonlyArray', 'Array'], ['ReadonlyMap', 'Map'], ['ReadonlySet', 'Set']]);
-
-function scalarKind(wtype: WasmType | undefined): WasmScalar | undefined {
-	return typeof wtype === 'string' ? (wtype !== 'void' ? wtype : undefined) : wtype && unboxedPrimitive(wtype)?.kind;
-}
-function notUnsigned(wtype: WasmScalar): WasmScalarI;
-function notUnsigned(wtype: WasmScalar | undefined): WasmScalarI  | undefined;
-function notUnsigned(wtype: WasmElement): WasmElementI;
-function notUnsigned(wtype: string | undefined) {
-	return wtype && wtype[0] === 'u' ? `i${wtype.slice(1)}` : wtype;
-}
-function elementKind(wtype: WasmType | undefined): WasmElementI {
-	return typeof wtype === 'string' && wtype !== 'void' ? notUnsigned(wtype) : 'ref';
-}
-
-// If `wtype` is a boxed nullable primitive (see `nullableWtype`/`ensureBoxType`), its underlying
-// scalar kind and box type index; otherwise `undefined` (a real class/array/closure-env-struct, or
-// already a bare scalar). Structural (checks `primKind` on the object itself), not a lookup table --
-// `registerType`'s structural memoization means an unrelated single-scalar-field struct (e.g. a
-// closure's env struct capturing exactly one `f64`) could otherwise coincidentally share a box's
-// type index, which a table keyed by type index alone couldn't tell apart.
-function unboxedPrimitive(wtype: WasmType): { kind: WasmScalarI; typeIndex: number } | undefined {
-	return typeof wtype !== 'string' && 'primKind' in wtype ? { kind: wtype.primKind, typeIndex: wtype.typeIndex } : undefined;
-}
-
-function wasmTypeEq(a: WasmType, b: WasmType): boolean {
-	if (typeof a === 'string' || typeof b === 'string')
-		return a === b;
-	if ('ref' in a && 'ref' in b)
-		return a.ref === b.ref && !a.nullable === !b.nullable;
-	if ('arr' in a && 'arr' in b)
-		return a.arr === b.arr && !a.nullable === !b.nullable;
-	if ('typeIndex' in a && 'typeIndex' in b)
-		return a.typeIndex === b.typeIndex && !a.nullable === !b.nullable;
-	if ('closure' in a && 'closure' in b)
-		return !a.nullable === !b.nullable
-			&& a.closure.params.length === b.closure.params.length
-			&& wasmTypeEq(a.closure.result, b.closure.result)
-			&& a.closure.params.every((p, i) => wasmTypeEq(p, b.closure.params[i]))
-			&& !a.closure.hasRest === !b.closure.hasRest;
-
-	return false;
-}
-// Picks the tightest integer wasm type for a known range: i32, u32, or f64.
-function intWasmType(min: number, max: number): WasmType {
-	if (min >= -0x80000000 && max <= 0x7fffffff)
-		return 'i32';
-	if (min >= 0 && max <= 0xffffffff)
-		return 'u32';
-	return 'f64';
-}
-
-// null parses as a literal; undefined is a real identifier -- both need ref.null with a heap type.
-function isNullLiteral(e: Expr): boolean {
-	return nullLiteralKind(e) !== undefined;
-}
-
-// Which of the two nullish literals `e` is, if either. They share one physical form here (`ref.null`),
-// so only a STRICT comparison ever has to tell them apart, and only statically -- see `case '==='`.
-function nullLiteralKind(e: Expr): 'null' | 'undefined' | undefined {
-	return	e.type === 'literal' && e.value === null			? 'null'
-		:	e.type === 'identifier' && e.name === 'undefined'	? 'undefined'
-		:	undefined;
-}
-
 // Checks builtinTypes before T.resolve to avoid expanding a hoisted class name and losing it.
-function wasmTypeOf(t: Type, global: Scope): WasmType | undefined {
+function wasmTypeOf(t: Type, global: Scope): WT.Type | undefined {
 	if (t.type === 'ref' && !t.typeArgs && builtinTypes.has(t.name))
 		return builtinTypes.get(t.name)!.wtype;
 	if (t.type === 'range' && t.base === 'number')
@@ -347,95 +339,9 @@ function wasmTypeOf(t: Type, global: Scope): WasmType | undefined {
 	return undefined;
 }
 
-// The element kind of a `RawArray<T>`: a typed-array tag names its own PACKED kind directly, since
-// resolving it as a type would widen `u8` to `u32` and silently give byte storage an i32 element.
-function rawElemKind(a: Type | undefined, resolve: (t: Type) => WasmType | undefined): WasmElementI {
-	return a && a.type === 'ref' && !a.typeArgs && TYPED_ARRAY_TAGS.has(a.name)
-		? notUnsigned(a.name as WasmElement) : elementKind(a && resolve(a));
-}
-
-// Stable structural key for memoizing closure-type registration by TS function signature.
-function wasmTypeKey(w: WasmType): string {
-	if (typeof w === 'string')
-		return w;
-	if ('ref' in w)
-		return `ref:${w.ref}:${!!w.nullable}`;
-	if ('arr' in w)
-		return `arr:${w.arr}:${!!w.nullable}`;
-	if ('closure' in w)
-		return `(${w.closure.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(w.closure.result)}:${!!w.nullable}`;
-	if ('typeIndex' in w)
-		return `typeIndex:${w.typeIndex}:${!!w.nullable}`;
-	return '?';
-}
-
-// The one shared `WasmType` a union of >=2 members' own physical representations collapses to --
-// `typeOf`'s own 'union' case, and `ensureUnionIndexDispatch`'s own per-member `get(i)` result
-// (`case 'member'`'s sibling `ensureUnionFieldDispatch` instead goes through the checker's own
-// `T.lookupMember`, since a named property's type unions cleanly there; indexing has no such
-// checker-side precision for a union receiver yet, so this compares physical wtypes directly, same
-// as before that fix existed). Members that already physically agree stay exactly as they are (a
-// degenerate union like `IteratorResult<Y,R>.value: Y | R` monomorphized with `Y`/`R` both `number`
-// must stay a plain `f64`, not box as `any` just because a union with >1 syntactic member showed up).
-// Members that only differ by a wasm-pseudo-type-vs-real-type spelling of the same scalar (`i32` vs
-// `number`/`f64` -- the top-of-file `WASM_PSEUDO_TYPES` comment's own ternary example, also hit by
-// `Uint8Array.length: i32` vs `Array<T>.length: number`) widen to the one canonical `f64`. Anything
-// else (class vs. class, scalar vs. struct/array, ...) boxes as `any`, the same physical
-// representation this compiler already gives every other "could be one of several shapes" value.
-function combineUnionWtypes(wtypes: readonly WasmType[]): WasmType {
-	if (new Set(wtypes.map(w => wasmTypeKey(w))).size === 1)
-		return wtypes[0];
-	if (wtypes.every(w => scalarKind(w) !== undefined))
-		return 'f64';
-	return REF_ANY;
-}
-
-function storageTypeKey(v: wasm.StorageType): string {
-	return typeof v === 'string' ? v : `ref:${v.ref}:${v.nullable}`;
-}
-function wTypeKey(type: wasm.SubType): string|undefined {
-	const comp = 'type' in type ? type.type : type;
-	return comp.kind === 'func' ? `func(${comp.params.map(p => storageTypeKey(p.type)).join(',')})=>(${comp.results.map(storageTypeKey).join(',')})`
-		: comp.kind === 'array' ? `array(${storageTypeKey(comp.field.type)}:${comp.field.mut})`
-		// Field MUTABILITY is part of a struct's identity in wasm, exactly as it already is for an array
-		// above -- omitting it silently merged two genuinely different types. It bit as soon as a scalar
-		// holder (`ensureHolderType`, one mutable f64 field) appeared: identical to the immutable `f64` BOX
-		// (`ensureBoxType`) under the old key, so a holder became a box and `ref.test` for `typeof x ===
-		// 'number'` started matching holders too. `final`/`supertypes` likewise: a subtype is not its base.
-		: comp.kind === 'struct' ? `struct(${comp.fields.map(f => `${storageTypeKey(f.type)}:${f.mut}`).join(',')})${'final' in type && type.final ? ':final' : ''}${'supertypes' in type && type.supertypes.length ? ':<' + type.supertypes.join(',') : ''}`
-		: undefined;
-}
-
-
-// `defaults`: only ever set for a function TYPE with a bare `p?: T` (optional, no `=`) trailing param --
-// see `case 'function'`'s own comment. A closure *literal*'s own params can never be optional (a real,
-// separate restriction, unaffected), so this stays `undefined` for every other `FuncSig` producer.
-// `resolvedParams`: the same params `defaults` came from, before flattening to bare `WasmType`s --
-// only actually needed by `emitCallArgs` when a default value itself reads an earlier parameter
-// (`resolveParams`'s own comment) rather than standing alone as a literal. Set for a real user
-// function/method/constructor, and for a function TYPE that carries defaults of its own -- which one
-// can, since a type derived from a declaration (`typeof f`, a method's type) keeps them.
-interface FuncSig					{ params: WasmType[]; result: WasmType; hasRest?: boolean; defaults?: (Expr | undefined)[]; resolvedParams?: ResolvedParam[]; restElem?: ResolvedParam }
-// A signature with `hasRest`/`defaults` definitely settled -- but `resolvedParams`/`restElem` are
-// genuinely absent (no params at all, no rest), so they stay optional through `Required`.
-type FullSig = Required<Omit<FuncSig, 'resolvedParams' | 'restElem'>> & Pick<FuncSig, 'resolvedParams' | 'restElem'>;
-interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; reassignsThis?: boolean }
-interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
-interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number; sig: FuncSig }
-type TupleT = Extract<Type, { type: 'tuple' }>;
-// A function value's own properties that its closure struct stores, by field index (after `code` and `env`).
-const CLOSURE_FIELDS = new Map([['length', 2]]);
-
-// JS `fn.length`: the parameters before the first defaulted one; a rest parameter and a TS `this` parameter never count.
-function jsLength(params: { key: unknown; default?: unknown }[]): number {
-	const own = params.filter(p => p.key !== 'this');
-	const i = own.findIndex(p => p.default !== undefined);
-	return i < 0 ? own.length : i;
-}
-
 // Per-operand info for builtin dispatch -- wtype for kind-polymorphic dispatch, owner for identity dispatch.
-interface OperandInfo { wtype: WasmType | undefined; owner?: ClassInfo }
+interface OperandInfo { wtype: WT.Type | undefined; owner?: ClassInfo }
 // `typeArgs`: the call site's own type arguments, for an inline whose declared types mention the
 // METHOD's own type parameters (`Array._alloc<T>(n): T[]`). Class-level defines are baked once per
 // instantiation and cannot carry these -- see `makeAsm`'s `$ret`.
@@ -470,11 +376,11 @@ interface ClassInfo extends MethodOwner {
 	// `optional`: only ever set for an object-shape's own `key?: T` member (`ensureObjectShape`) -- a real
 	// class field is never itself optional (TS requires either a declared initializer or assignment in
 	// every constructor path), so every other `fields` producer leaves this `undefined`/falsy.
-	fields:			{ name: string; wtype: WasmType; optional?: boolean }[];
+	fields:			{ name: string; wtype: WT.Type; optional?: boolean }[];
 	fieldIndex:		Map<string, number>;
 	// This class's own real physical `this`-type -- `{ref: name}` for an ordinary struct, or whatever its constructor's own `return` compiles to (`ensureCtor`) -- never guessed from the name.
 	// `undefined` only while that constructor is still being compiled (`ownerThisType` falls back to `{ref: name}` then, safe since only a static method's own unused this-type can be in flight).
-	thisWtype?:		WasmType;
+	thisWtype?:		WT.Type;
 	// Set once, in `ensureClass`, only for a real `extends`. `fields`/`fieldIndex` are pre-seeded with the
 	// superclass's own (in order, so wasm-GC struct subtyping's "subtype's fields are the supertype's
 	// fields as an ordered prefix, plus its own appended" requirement holds automatically) -- so most code
@@ -482,42 +388,6 @@ interface ClassInfo extends MethodOwner {
 	// *class* hierarchy (constructor `super(...)` inlining, method-resolution delegation, `super.method()`).
 	superClass?:	ClassInfo;
 }
-
-// `holderInner`: set only for a name `ensureForwardHolder` had to promote into a shared, heap-allocated
-// "holder" (a real closure/local forward-referenced by an EARLIER sibling closure in the same block,
-// e.g. walker.ts's own `mapStatementC` capturing `mapStatement`, declared several statements later) --
-// `wtype` itself is then the *holder's* own physical type (what this storage slot really, physically
-// is), and `holderInner` is the logical value's own real type once unboxed. Left `undefined` for the
-// overwhelmingly common case (an ordinary local/capture, never forward-referenced), where `wtype`
-// alone is the whole story, exactly as before.
-interface Local			{ wtype: WasmType, index: number; holderInner?: WasmType; }
-interface Global extends Local {init: Expr, mut: boolean}
-
-// `calleeDefault`: a default no call site can re-emit (a call, a capture, `this`). Its slot is an optional one and
-// `declareParams` applies the default in the callee, which is where JS evaluates it anyway.
-interface ResolvedParam { key: BindingTarget; wtype: WasmType; tsType: Type; calleeDefault?: { value: Expr; tsType: Type } }
-
-interface ClosureEnv {
-	envLocal:		Local;
-	envTypeIndex:	number;
-	fields:			Map<string, Local>
-};
-
-// Pushed by `case 'try'` while compiling a `try`/`catch` that has a `finally` -- `emitBreak`/
-// `emitContinue` check this first (innermost guard): real JS semantics require `finally` to run
-// before either actually completes, so one whose real target lies outside this specific
-// `try`/`finally`'s own span stashes an action code and branches to the shared landing point
-// instead of exiting directly. Popped before that landing point's own re-dispatch code is built, so
-// a `br` built there targets the next-outer guard (or ordinary behavior once none remain) --
-// composes for nested `try`/`finally` without any extra bookkeeping. `return`'s own equivalent
-// redirect is a temporary `ctx.onReturn` swap instead (see `case 'try'`), not part of this guard --
-// unlike a loop/switch target, there's only ever one "current" return meaning at a time, no stack needed.
-interface FinallyGuard {
-	actionLocal:				Local;
-	breakTargetsLenAtEntry:		number;
-	continueTargetsLenAtEntry:	number;
-	landingDepth:				number
-};
 
 // What a plain `return expr;` actually means here -- ordinarily just "coerce `expr` to `ctx.result`
 // and emit a wasm `return`" (`plainReturn`, below), but a generator/async function's own resumable
@@ -528,7 +398,7 @@ interface FinallyGuard {
 // with a `finally`, which needs the *outer* meaning to reconstruct a real return once `finally` has
 // run (see `case 'try'`), not a fresh mechanism of its own.
 interface ReturnHandler {
-	wtype(ctx: FunctionContext): WasmType | undefined;
+	wtype(ctx: FunctionContext): WT.Type | undefined;
 	emit(ctx: FunctionContext, argument: Expr | undefined): void;
 };
 
@@ -543,7 +413,7 @@ class FunctionContext {
 	scopeStack: number[] = [];
 	// One entry per real wasm local index (params included); a slot's type is fixed for the whole function,
 	// so `freeSlots` (keyed by `wasmTypeKey`) only ever offers back a same-typed index for reuse.
-	slotTypes:	WasmType[] = [];
+	slotTypes:	WT.Type[] = [];
 	freeSlots	= new Map<string, number[]>();
 	out:		wasm.Instr[]	= [];
 	ctorThis?:	Local;
@@ -623,11 +493,11 @@ class FunctionContext {
 		return undefined;
 	}
 
-	private allocLocal(wtype: WasmType): number {
+	private allocLocal(wtype: WT.Type): number {
 		const free = this.freeSlots.get(wasmTypeKey(wtype));
 		return free?.length ? free.pop()! : this.slotTypes.push(wtype) - 1;
 	}
-	private freeLocal(wtype: WasmType, index: number) {
+	private freeLocal(wtype: WT.Type, index: number) {
 		const key	= wasmTypeKey(wtype);
 		const free	= this.freeSlots.get(key);
 		if (free)
@@ -691,7 +561,7 @@ class FunctionContext {
 			this.emit(I.br(this.depth - this.continueTargets.at(-1)!));
 	}
 	// a still-visible same-name entry is reused rather than rejected
-	temp(name: string, wtype: WasmType): number {
+	temp(name: string, wtype: WT.Type): number {
 		const prev = this.lookup(name);
 		if (prev) {
 			// Structurally, as the name itself was built (`scratchName` keys by `wasmTypeKey`): two equal types
@@ -705,7 +575,7 @@ class FunctionContext {
 		return index;
 	}
 
-	declareLocal(name: string, wtype: WasmType, pinned = false): Local {
+	declareLocal(name: string, wtype: WT.Type, pinned = false): Local {
 		const scopeStart = this.scopeStack.at(-1) ?? 0;
 		for (let i = this.declared.length - 1; i >= scopeStart; i--) {
 			const d = this.declared[i];
@@ -717,7 +587,7 @@ class FunctionContext {
 		return local;
 	}
 
-	declareValue(name: string, wtype: WasmType, tsType: Type, pinned = false): Local {
+	declareValue(name: string, wtype: WT.Type, tsType: Type, pinned = false): Local {
 		this.scope.addValue(name, tsType);
 		return this.declareLocal(name, wtype, pinned);
 	}
@@ -734,7 +604,7 @@ class FunctionContext {
 	// The WasmType a name's real, logical VALUE has -- real local/closureEnv field, or (see `Local`'s own
 	// comment) a forward-holder's own inner type once unboxed. This is what any ordinary consumer of a
 	// name's type wants (e.g. deciding how to *call* it) -- `rawWtype`, below, is the one exception.
-	resolvedWtype(name: string): WasmType | undefined {
+	resolvedWtype(name: string): WT.Type | undefined {
 		const captured = this.closureEnv?.fields.get(name);
 		if (captured)
 			return captured.holderInner ?? captured.wtype;
@@ -745,7 +615,7 @@ class FunctionContext {
 	// unboxed. Only ever needed by `emitClosureLiteral`'s own env-capture step: capturing a forward-
 	// holder's real (shared, mutable) storage into an outer closure's env is the one place that needs the
 	// holder ITSELF, not the value it currently (or eventually) holds.
-	rawWtype(name: string): WasmType | undefined {
+	rawWtype(name: string): WT.Type | undefined {
 		return this.closureEnv?.fields.get(name)?.wtype ?? this.lookup(name)?.wtype;
 	}
 	// Destructured params get a hidden #param$<i> local; returns var_decl stmts to bind the real names.
@@ -779,7 +649,7 @@ class FunctionContext {
 		this.out.push(...instr.flat());
 	}
 
-	toFuncBody(numParams: number, toValType: (t: WasmType) => wasm.ValType): wasm.FuncBody & {id: string} {
+	toFuncBody(numParams: number, toValType: (t: WT.Type) => wasm.ValType): wasm.FuncBody & {id: string} {
 		return { id: this.name.replace(/[^a-zA-Z0-9_]/g, '_'), locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
 	}
 
@@ -852,7 +722,7 @@ class FunctionContext {
 
 // Qualifies a scratch local's name by its own wtype -- a bare fixed name would collide (`FuncCtx.local`
 // throws on a same-name-different-type redeclare) once one function writes to two differently-typed targets.
-function scratchName(prefix: string, wtype: WasmType): string {
+function scratchName(prefix: string, wtype: WT.Type): string {
 	return `${prefix}$${wasmTypeKey(wtype)}`;
 }
 
@@ -860,246 +730,6 @@ function scratchName(prefix: string, wtype: WasmType): string {
 // the same expando fields and `layoutTwin` can still merge them.
 function shapeKey(members: readonly TS.TypeMember[]): string {
 	return `#shape#${members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string' ? [m.key] : []).sort().join(',')}`;
-}
-
-// `as` is a pure pass-through in codegen (`case 'as'` just compiles `e.expression`), but `checkerTypeOf` still honors the
-// asserted type -- any codegen-facing type/owner lookup must unwrap it first or it sees a fictional type, losing method/owner dispatch.
-function unwrapAs(e: Expr): Expr {
-	while (e.type === 'as')
-		e = e.expression;
-	return e;
-}
-
-// An identifier, `this`, or a non-optional member/index chain of one: reading it again has no side effect and
-// names the same storage both times. A literal is pure only as an INDEX -- a literal BASE (`/re/.lastIndex`) can be a fresh object each read.
-function isPurePath(e: Expr): boolean {
-	switch (e.type) {
-		case 'identifier':
-		case 'this':	return true;
-		case 'member':	return !e.optional && isPurePath(e.object);
-		// `typeof value !== 'object'` keeps out a regex (fresh each read) and a template's arbitrary sub-expressions.
-		case 'index':	return !e.optional && isPurePath(e.object) && (isPurePath(e.index) || (e.index.type === 'literal' && typeof e.index.value !== 'object'));
-		default:		return false;
-	}
-}
-
-// Whether expression tree `e` references identifier `name` anywhere, not descending into a nested
-// arrow/function's own body (closure boundary) -- same idiom as the named-function self-reference
-// check a few hundred lines down (`e.type === 'identifier' && e.name === selfName`).
-function exprMentionsName(name: string, e: Expr): boolean {
-	return walkerB(undefined, (ex, process) =>
-		ex.type === 'identifier' && ex.name === name ? true
-		: (ex.type === 'arrow' || ex.type === 'function') ? false
-		: process(ex)).expression(e);
-}
-
-// Whether `body` assigns to `this` anywhere -- real TS never allows this, so it has exactly one meaning
-// here: "this method replaces its own receiver's physical value" (a wasm-GC array/struct can't resize in place). Detected structurally -- any method on any class doing this gets the same treatment, not a hardcoded list.
-function assignsToThis(body: Stmt[]): boolean {
-	return walkerB(undefined, (e, process) => e.type === 'assign' && !e.operator && e.target.type === 'this' ? true : process(e)).statements(body);
-}
-
-
-// For error messages only.
-function describeBinding(t: BindingTarget): string {
-	return typeof t === 'string' ? t : t.type === 'array_pattern' ? '[...]' : '{...}';
-}
-
-// ===================================================================
-//  Closures -- free-variable analysis
-// ===================================================================
-
-function paramNames(params: JS.Param<Type>[], rest?: JS.Rest<Type>): string[] {
-	const names = params.flatMap(p => T.bindingNames(p.key));
-	return rest ? [...names, ...T.bindingNames(rest.key)] : names;
-}
-
-// Every name body binds directly (own params + var_decls), not descending into nested arrow/function bodies.
-function ownBoundNames(names: string[], body: Stmt[] | Expr, selfName?: string): Set<string> {
-	const bound = new Set(names);
-	if (selfName)
-		bound.add(selfName);
-	// A `for`'s own `init` (e.g. `for (let i = ...)`) reaches this same `var_decl` case too -- walker.ts
-	// routes it through the real statement walk, not just a bare declarator walk, so no separate case is
-	// needed here to keep a closure's own loop variable from being mistaken for a free (captured) one.
-	walkerB(
-		(s, process) => {
-			// A nested `function_decl` binds its own name in the enclosing scope (like a `var_decl`
-			// would), but its body is a separate closure boundary -- its own params/locals/further-nested
-			// declarations must not leak into `bound` here, same reasoning as the `arrow`/`function` stop below.
-			if (s.type === 'function_decl') {
-				bound.add(s.name);
-				return false;
-			}
-			if (s.type === 'var_decl') {
-				for (const d of s.declarations)
-					T.bindingNames(d.name).forEach(n => bound.add(n));
-			}
-			return process(s);
-		},
-		(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
-	).body(body);
-	return bound;
-}
-
-// Recursively collects free variables into `free`. A nested closure's bound names merge into `bound`
-// before recursing, so a level-2 capture of a level-0 variable transitively appears in level-1's set.
-function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<string>) {
-	walkerB(
-		(s, process) => {
-			// Mirrors the `arrow`/`function` expression handling below, but for a nested function
-			// *declaration* statement -- its own name is already bound (see `ownBoundNames`), so this only
-			// needs to stop descent and collect its body's free vars under its own (merged) bound set.
-			if (s.type === 'function_decl') {
-				collectClosureFreeVars(bound, s, s.name, free);
-				return false;
-			}
-			return process(s);
-		},
-		(e, process) => {
-			if (e.type === 'identifier') {
-				if (!bound.has(e.name))
-					free.add(e.name);
-				return false;
-			}
-			if (e.type === 'this') {
-				if (!bound.has('this'))
-					free.add('this');
-				return false;
-			}
-			if (e.type === 'arrow' || e.type === 'function') {
-				collectClosureFreeVars(bound, e, e.type === 'function' ? e.name : undefined, free);
-				return false;
-			}
-			return process(e);
-		}
-	).body(body);
-}
-
-// Whether a nested function's body names it other than as the callee of a direct self-call: a value use, or any mention
-// inside a closure within it (a capture). Such a body needs its own name bound (`emitClosureLiteral`).
-function namesSelfAsValue(body: Stmt[] | Expr, name: string): boolean {
-	let found = false;
-	const inClosure = (fn: Parameters<typeof collectClosureFreeVars>[1], self: string | undefined) => {
-		const free = new Set<string>();
-		collectClosureFreeVars(new Set(), fn, self, free);
-		return free.has(name);
-	};
-	walkerB(
-		(st, process) => {
-			if (found)
-				return false;
-			if (st.type === 'function_decl') {
-				found = inClosure(st, st.name);
-				return false;
-			}
-			return process(st);
-		},
-		(e, process) => {
-			if (found)
-				return false;
-			if (e.type === 'identifier') {
-				found = e.name === name;
-				return false;
-			}
-			if (e.type === 'arrow' || e.type === 'function') {
-				found = inClosure(e, e.type === 'function' ? e.name : undefined);
-				return false;
-			}
-			if (e.type === 'call' && e.callee.type === 'identifier' && e.callee.name === name) {
-				found = e.arguments.some(a => namesSelfAsValue(a as Expr, name));
-				return false;
-			}
-			return process(e);
-		}
-	).body(body);
-	return found;
-}
-
-// A closure's free variables: its body's and its parameter defaults', since a default runs inside the callee.
-function collectClosureFreeVars(outer: Set<string>, fn: { params: JS.Param<Type>[]; rest?: JS.Rest<Type>; body?: Stmt[] | Expr }, selfName: string | undefined, free: Set<string>) {
-	const body = fn.body ?? [];
-	const bound = new Set([...outer, ...ownBoundNames(paramNames(fn.params, fn.rest), body, selfName)]);
-	collectFreeVars(bound, body, free);
-	for (const p of fn.params)
-		if (p.default)
-			collectFreeVars(bound, p.default, free);
-}
-
-// Names this body declares that a nested closure captures AND something assigns -- the locals that must
-// become shared heap holders rather than plain wasm locals. A closure captures a BINDING in JS, not a
-// value: `let n = 1; const f = () => n + 1; n = 4;` must have `f()` see 4, and a write inside the
-// closure must be visible outside it (the counter idiom). Copying the value into the env struct gives
-// neither. `ensureForwardHolder` already builds exactly the right thing -- and `emitClosureLiteral`
-// already captures the HOLDER rather than its contents -- but only ever fired for a name used before its
-// own declaration ran, so a local declared before the closure was silently captured by value.
-// Deliberately over-approximate: a name assigned anywhere at all (including only inside the closure, or
-// only before it is ever captured) is holder-backed, and an outer-scope name reaching the set is harmless
-// because the answer is only ever consulted when DECLARING a local of that name here. A needless holder
-// costs an allocation and an indirection; a missing one is a wrong answer.
-// Not yet applied to a captured+mutated PARAMETER, which has the same problem and no `var_decl` to hang
-// the holder off.
-function collectCapturedMutables(body: Stmt[]): Set<string> {
-	const captured	= new Set<string>();
-	const assigned	= new Set<string>();
-	// A `for (let i = ...)` binding is PER-ITERATION in JS: every iteration gets a fresh one, so each
-	// closure created in the loop captures its own. Copying the value into the env -- what capture already
-	// did -- is therefore already right, and one shared holder is actively wrong: every closure would then
-	// see the loop's final value. `Promise.all`'s own `promises[i].then(v => { values[i] = v; })` is
-	// exactly this, and a shared holder had it writing past the end of `values`.
-	// (A body that REASSIGNS the variable after creating the closure still isn't modelled -- that needs a
-	// fresh holder per iteration, which is the real general answer.)
-	// `var` is the exact opposite and must NOT be listed here: it is function-scoped, so the whole loop
-	// shares ONE binding and every closure sees its final value -- the shared holder is the correct answer
-	// there, and copying by value gave `for (var i...) fs.push(() => i)` a 0 where JS says 3.
-	const perIteration = new Set<string>();
-	walkerB(
-		(st, process) => {
-			// A nested function is a closure boundary: everything free in it is captured from here (or
-			// from further out, which is harmless -- an outer name simply isn't one of our locals).
-			if (st.type === 'for' && st.init && !Array.isArray(st.init) && st.init.type === 'var_decl' && st.init.kind !== 'var') {
-				for (const d of st.init.declarations)
-					if (typeof d.name === 'string')
-						perIteration.add(d.name);
-			}
-			if (st.type === 'function_decl') {
-				const nested = st.body ?? [];
-				collectFreeVars(ownBoundNames(paramNames(st.params, st.rest), nested, st.name), nested, captured);
-				walkerB(undefined, (e, p) => { noteAssignExpr(e, assigned); return p(e); }).statements(nested);
-				return false;
-			}
-			return process(st);
-		},
-		(e, process) => {
-			if (e.type === 'arrow' || e.type === 'function') {
-				const nested = e.body ?? [];
-				collectFreeVars(ownBoundNames(paramNames(e.params, e.rest), nested, e.type === 'function' ? e.name : undefined), nested, captured);
-				// ...and assignments INSIDE the closure count too: `() => { n = n + 1; }` is the whole point.
-				walkerB(undefined, (x, p) => { noteAssignExpr(x, assigned); return p(x); }).body(nested);
-				return false;
-			}
-			// An object literal's METHOD closes over this scope exactly as an arrow does -- a `defineProperty` accessor
-			// (`get() { resolving = true; ... }`) mutates the very locals it closes over, and a copy loses the write.
-			if (e.type === 'object')
-				for (const m of e.properties)
-					if (m.type === 'method' || m.type === 'get' || m.type === 'set') {
-						const nested = m.body ?? [];
-						collectFreeVars(ownBoundNames(paramNames(m.params, m.rest), nested, undefined), nested, captured);
-						walkerB(undefined, (x, p) => { noteAssignExpr(x, assigned); return p(x); }).statements(nested);
-					}
-			noteAssignExpr(e, assigned);
-			return process(e);
-		}
-	).statements(body);
-	return new Set([...captured].filter(n => assigned.has(n) && !perIteration.has(n)));
-}
-
-// Every identifier this expression assigns to -- `x = v`, any compound form, and `++`/`--`.
-function noteAssignExpr(e: Expr, into: Set<string>) {
-	if (e.type === 'assign' && e.target.type === 'identifier')
-		into.add(e.target.name);
-	else if ((e.type === 'unary' || e.type === 'unary_post') && (e.operator === '++' || e.operator === '--') && e.operand.type === 'identifier')
-		into.add(e.operand.name);
 }
 
 // ===================================================================
@@ -1155,7 +785,7 @@ function parseTypeExpr(text: string): Type | undefined {
 	return t;
 }
 
-function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, typeParams?: string[], retIndexOf?: (w: WasmType) => number | undefined, resolveFallback?: (t: Type) => WasmType | undefined): Builtin<Inline> {
+function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, typeParams?: string[], retIndexOf?: (w: WT.Type) => number | undefined, resolveFallback?: (t: Type) => WT.Type | undefined): Builtin<Inline> {
 	let		asm		= (call.arguments[0] as Literal<string | JS.TemplatePart<Expr>[]>).value;
 
 	if (typeof asm !== 'string') {
@@ -1168,7 +798,7 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 		}
 	}
 
-	const resolveType = (t: Type): WasmType | undefined => {
+	const resolveType = (t: Type): WT.Type | undefined => {
 		if (t.type === 'ref') {
 			// An OPEN type parameter, unsubstituted because this call site gave no explicit type
 			// arguments. `T[]` already falls back to `arr:ref` here for exactly the same reason; a bare
@@ -1191,7 +821,7 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 		}
 		if (t.type === 'array') {
 			if (t.element.type === 'ref' && TYPED_ARRAY_TAGS.has(t.element.name))
-				return ARR_WTYPE[notUnsigned(t.element.name as WasmElement)];
+				return ARR_WTYPE[notUnsigned(t.element.name as WT.Element)];
 			const arr = notUnsigned(scalarKind(resolveType(t.element)));
 			if (arr)
 				return {arr};
@@ -1247,7 +877,7 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 	// opaquely (it knows nothing of TypeScript types, and `toWasm`'s own note keeps it that way), exactly
 	// as it leaves a `$name` for a later pass. The sibling of `resolveAsmLocals`, one operand slot over.
 	// `subs`: the call site's type arguments, so `T[]` names a different type at each instantiation.
-	const resolveTypeExprs = (instrs: wasm.Instr[], known: Map<string, WasmType>): wasm.Instr[] => {
+	const resolveTypeExprs = (instrs: wasm.Instr[], known: Map<string, WT.Type>): wasm.Instr[] => {
 		// Looked up against the SIGNATURE this call settled on, keyed by the type expression itself (not by
 		// position). That matters where a type parameter is still open: `_copy(dst, 0, src, 0, n)` passes no
 		// type arguments, so `T[]` alone resolves to the `arr:ref` fallback while the signature has already
@@ -1309,7 +939,7 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 			const sig = subs || !typeParams?.length ? base
 				: { result: base.result, params: base.params.map((w, i) => isOpen(declared[i]) && args[i]?.wtype ? args[i].wtype : w) };
 			// Every declared type this call has an answer for, keyed by the type as written.
-			const known = new Map<string, WasmType>();
+			const known = new Map<string, WT.Type>();
 			declared.forEach((t, i) => { if (t) known.set(T.typeKey(t), sig.params[i]); });
 			const retType = call.typeArgs?.[1];
 			if (retType)
@@ -1325,7 +955,7 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 		// real instruction -- f64 first, since widening i32/i64/f32 up to it is exact or an already-accepted tradeoff.
 		const NUMERIC_TYPES = ['f64', 'f32', 'i64', 'i32'] as const;
 		type NumericType = typeof NUMERIC_TYPES[number];
-		function isNumericType(t: WasmType | undefined): t is NumericType { return NUMERIC_TYPES.includes(t as NumericType); }
+		function isNumericType(t: WT.Type | undefined): t is NumericType { return NUMERIC_TYPES.includes(t as NumericType); }
 
 		//generic case
 		const variants: Partial<Record<NumericType, { locals: WAT.WatLocal[]; body: wasm.Instr[] }>> = {};
@@ -1444,7 +1074,7 @@ function substituteTypeParams(map: ReadonlyMap<string, Type>): Walker {
 // `class` names which real lib class backs a primitive-level type, resolved lazily through `ensureClass`
 // (`builtinTypeOwner`) for all of them alike; `Boolean` simply has none (no decl exists at all).
 // Maps, not objects, here and below: indexed by names from source, where `constructor`/`toString` must not find `Object.prototype`'s.
-const builtinTypes = new Map<string, { wtype: WasmType; class?: string }>([
+const builtinTypes = new Map<string, { wtype: WT.Type; class?: string }>([
 	['void',		{ wtype: 'void' }],
 	// No `class` -- `any` has no single owner to dispatch a method call against (`ensureAnyDispatch` handles
 	// that dynamically); this entry only gives a genuinely `any`-typed local/param/field a real `WasmType`.
@@ -1517,7 +1147,7 @@ const builtins = new Map<string, Builtin>([
 	}),
 ]);
 
-interface AssignTarget { wtype: WasmType; old?: number; write(tee: boolean): number }
+interface AssignTarget { wtype: WT.Type; old?: number; write(tee: boolean): number }
 
 function genericKey(name: string, typeParams: readonly TS.TypeParam[], map: Map<string, Type>, scope: Scope) {
 	return `${name}<${typeParams.map(p => T.typeKey(T.resolve(scope, map.get(p.name)!))).join(',')}>`;
@@ -1539,7 +1169,7 @@ function arrowOrFunctionToDecl(name: string, e: JS.Arrow<Type> | JS.FunctionExpr
 	};
 }
 
-interface LocalField { index: number; wtype: WasmType; tsType: Type }
+interface LocalField { index: number; wtype: WT.Type; tsType: Type }
 
 // For every `let`/`var` declarator with no explicit annotation, widens the numeric range beyond
 // what its own initializer alone gives, by unioning in every later reassignment provably safe to
@@ -1825,7 +1455,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	const enumNames				= new Set<string>();
 	// The backing slot of each `ensureLazyGlobal` wrapper, so a WRITE can reach the same storage the
 	// wrapper reads. Keyed exactly like `lazyGlobals`.
-	const lazyGlobalSlots		= new Map<string, { index: number; wtype: WasmType }>();
+	const lazyGlobalSlots		= new Map<string, { index: number; wtype: WT.Type }>();
 
 	function homeKey(homeModule: string, name: string) {
 		return homeModule === '.' ? name : homeModule + '\0' + name;
@@ -1909,7 +1539,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// (source signature, wanted result) pair, not one per use site. See `ensureClosureCoercionWrapper`.
 	const closureCoercionWrappers = new Map<string, { info: FuncInfo; wantStructTypeIndex: number; envTypeIndex: number }>();
 	// `adoptingDecl`'s answer per class, `null` for one that adopts no storage.
-	const adoptingDecls = new Map<ClassInfo, { decl: MethodMember; storage: WasmType & { arr: WasmElementI } } | null>();
+	const adoptingDecls = new Map<ClassInfo, { decl: MethodMember; storage: WT.Type & { arr: WT.ElementI } } | null>();
 	const anyKeyFuncs = new Map<'get' | 'set', FuncInfo>();
 
 	const closureLiterals: FuncInfo[] = [];
@@ -1968,10 +1598,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return typeIndex;
 	}
 
-	const arrayTypeDesc = (kind: WasmElementI): wasm.SubType =>
+	const arrayTypeDesc = (kind: WT.ElementI): wasm.SubType =>
 		({ final: true, supertypes: [], type: { kind: 'array', field: { type: kind === 'ref' ? { ref: 'any', nullable: true } : kind, mut: true } } });
 
-	function ensureArrayType(kind: WasmElementI): number {
+	function ensureArrayType(kind: WT.ElementI): number {
 		return registerType(arrayTypeDesc(kind));
 	}
 
@@ -1982,12 +1612,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const key = wTypeKey(desc);
 		return key !== undefined && typeMap.has(key);
 	}
-	function hasArrayType(kind: WasmElementI): boolean {
+	function hasArrayType(kind: WT.ElementI): boolean {
 		return hasType(arrayTypeDesc(kind));
 	}
-	const boxTypeDesc = (kind: WasmScalarI): wasm.SubType =>
+	const boxTypeDesc = (kind: WT.ScalarI): wasm.SubType =>
 		({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } });
-	function ensureBoxType(kind: WasmScalarI): number {
+	function ensureBoxType(kind: WT.ScalarI): number {
 		return registerType(boxTypeDesc(kind));
 	}
 
@@ -2000,7 +1630,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return exceptionTagIndex;
 	}
 
-	function nullableWtype(base: WasmType): WasmType {
+	function nullableWtype(base: WT.Type): WT.Type {
 		if (typeof base !== 'string')
 			return { ...base, nullable: true };
 		// Every scalar kind, not just `f64`/`i32`: a box is a one-field struct and there is nothing
@@ -2028,7 +1658,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// defaultable and must stay RAW: `nullableWtype` would box it, and then `holderInner` -- which every
 	// read and write of a holder-backed name trusts as the logical type -- would describe the box rather than
 	// the value. Only ever reference holders existed until captured mutables started using these.
-	function ensureHolderType(wt: WasmType): number {
+	function ensureHolderType(wt: WT.Type): number {
 		return registerType({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: toValType(typeof wt === 'string' ? wt : nullableWtype(wt)), mut: true }] } });
 	}
 
@@ -2077,7 +1707,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// logical (non-null) type every consumer works with -- so the read unwraps. Sound by the same
 	// contract forward holders already rely on: the declaration that fills the holder always runs before any
 	// read of the name can.
-	function emitHolderRead(holderType: number, inner: WasmType, ctx: FunctionContext) {
+	function emitHolderRead(holderType: number, inner: WT.Type, ctx: FunctionContext) {
 		ctx.emit(I.struct.get(holderType, 0));
 		if (typeof inner !== 'string' && !inner.nullable)
 			ctx.emit(I.ref.as_non_null);
@@ -2085,7 +1715,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// Promotes `name` to a shared, heap-allocated one-field holder -- the physical form a captured BINDING
 	// needs, so that a write from either side of the capture is seen by the other.
-	function declareHolder(ctx: FunctionContext, name: string, wt: WasmType, tsType: Type): Local {
+	function declareHolder(ctx: FunctionContext, name: string, wt: WT.Type, tsType: Type): Local {
 		if (process.env.DBGHOLDER)
 			console.error(`HOLDER ${ctx.name}.${name}`);
 		const holderTypeIndex = ensureHolderType(wt);
@@ -2107,10 +1737,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return ctx.holderNames.has(name);
 	}
 
-	function toResults(result: WasmType): wasm.ValType[] {
+	function toResults(result: WT.Type): wasm.ValType[] {
 		return result === 'void' ? [] : [toValType(result)];
 	}
-	function toParams(params: WasmType[]): wasm.ParamType[] {
+	function toParams(params: WT.Type[]): wasm.ParamType[] {
 		return params.map(p => ({ type: toValType(p) }));
 	}
 	function toParams2(params: ResolvedParam[]): wasm.ParamType[] {
@@ -2166,7 +1796,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			? folded : undefined;
 	}
 
-	function ensureGlobal(name: string, wtype: WasmType, init: Expr, mut: boolean) {
+	function ensureGlobal(name: string, wtype: WT.Type, init: Expr, mut: boolean) {
 		if (!globals.has(name))
 			globals.set(name, {wtype, index: globals.size, init, mut});
 		return globals.get(name)!;
@@ -2467,7 +2097,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// A rest parameter's own physical type, which must be an array or `emitCallArgs` cannot pack into it.
-	function restParamWtype(t: Type): WasmType | undefined {
+	function restParamWtype(t: Type): WT.Type | undefined {
 		const wt = typeOf(t);
 		if (storageKindOf(wt) !== undefined)
 			return wt;
@@ -2561,7 +2191,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (!sigs.length)
 			return undefined;
 		const maxParams = Math.max(...sigs.map(s => s.params.length));
-		const params: WasmType[] = [];
+		const params: WT.Type[] = [];
 		const defaults: (Expr | undefined)[] = [];
 		for (let i = 0; i < maxParams; i++) {
 			const present = sigs.filter(s => s.params.length > i);
@@ -2645,7 +2275,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// checkStmt)`): `typeOf` -> `case 'function'` -> `closureSigParts` -> `params.map` -> `typeOf` on the
 	// very same annotation. That overflowed the stack for all 25 of checker.ts's declarations at once.
 	const typeOfActive = new Set<Type>();
-	function typeOf(t: Type): WasmType | undefined {
+	function typeOf(t: Type): WT.Type | undefined {
 		if (typeOfActive.has(t))
 			return REF_ANY;
 		typeOfActive.add(t);
@@ -2655,7 +2285,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			typeOfActive.delete(t);
 		}
 	}
-	function typeOfUncached(t: Type): WasmType | undefined {
+	function typeOfUncached(t: Type): WT.Type | undefined {
 		if (t.type === 'ref' && t.name === 'RawArray')
 			return ARR_WTYPE[rawElemKind(t.typeArgs?.[0], typeOf)];
 
@@ -2717,7 +2347,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (sigs.every((s): s is FullSig => !!s)) {
 						const merged = mergeOverloadSigs(sigs);
 						if (merged)
-							return { closure: merged };
+							return closureWtype(merged);
 					}
 				}
 				break;
@@ -2766,7 +2396,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// case, or a genuinely unrepresentable shape) is trivially "not the same physical type as
 					// everything else" -- still a real reason to box as `any`, not a reason to give up on the
 					// whole union.
-					if (!memberWtypes.every((w): w is WasmType => w !== undefined))
+					if (!memberWtypes.every((w): w is WT.Type => w !== undefined))
 						return REF_ANY;
 					return combineUnionWtypes(memberWtypes);
 				}
@@ -2786,7 +2416,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const { params, result, hasRest, defaults } = parts;
 				// Not memoized by physical signature: `resolvedParams` carries this signature's own TS types, and an unannotated
 				// closure parameter takes its type from them -- `(x?: Stmt) => boolean` and `(x?: Stmt[]) => boolean` share one physical shape.
-				return { closure: { params, result, hasRest, defaults, resolvedParams: parts.resolvedParams, restElem: parts.restElem } };
+				return closureWtype({ params, result, hasRest, defaults, resolvedParams: parts.resolvedParams, restElem: parts.restElem });
 			}
 		}
 		if (t.type === 'ref') {
@@ -2821,13 +2451,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// `this`'s `WasmType`. A real `ClassInfo` carries its own already-resolved `thisWtype` directly (never
 	// guessed from its name); a builtin (non-class) owner has no such field, so it derives one from `thisTsType`.
-	function ownerThisType(owner: ClassInfo): WasmType {
+	function ownerThisType(owner: ClassInfo): WT.Type {
 		return owner.thisWtype ?? { ref: owner.name };
 	}
 
 	// The `WasmType` a value expression resolves to -- `classOf`/`arrayKindOf` below are thin discriminating views over this one (previously identical) checker walk.
 	// `unwrapAs`: see that function's own comment -- the checker's `typeOf` must see the real (post-`as`) expression, not the asserted one.
-	function wtypeOf(e: Expr, ctx: FunctionContext): WasmType | undefined {
+	function wtypeOf(e: Expr, ctx: FunctionContext): WT.Type | undefined {
 		// `ctx.scope` FIRST: a value's physical type is its slot's, and control-flow narrowing never
 		// changes that. Asking `narrowedTypeOf` outright broke `let p: Point | null = null; p = new
 		// Point(...); p === null` -- the narrowed type is `Point`, so the comparison was rejected as
@@ -3048,7 +2678,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// the contextual one filling an `any`, because for some real call site each is the only one that knows.
 	// Learning nothing from either deliberately falls through to `ensureClass`'s own "needs N explicit type
 	// argument(s)" throw, rather than silently building an `any`-typed instance.
-	function newTypeArgs(name: string, explicit: Type[] | undefined, e: Expr, ctx: FunctionContext, want?: WasmType): Type[] | undefined {
+	function newTypeArgs(name: string, explicit: Type[] | undefined, e: Expr, ctx: FunctionContext, want?: WT.Type): Type[] | undefined {
 		if (explicit?.length)
 			return explicit;
 		// Headed for another instantiation of this same class (`Map<string, Ty>` from `[[k, lit]]`): build that
@@ -3150,9 +2780,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// evaluated once, then one arm per possibility rebuilds the literal with it pinned -- a typed local for the
 	// spread, the literal itself for the discriminant -- so ordinary shape matching picks that arm's struct.
 	// Only when every earlier property is effect-free, so evaluating the deciding one first reorders nothing.
-	function emitUnionShapedLiteral(e: JS.ObjectExpr<Type>, ctx: FunctionContext, want: WasmType | undefined): WasmType | undefined {
+	function emitUnionShapedLiteral(e: JS.ObjectExpr<Type>, ctx: FunctionContext, want: WT.Type | undefined): WT.Type | undefined {
 		const pure = (x: Expr): boolean => x.type === 'literal' || x.type === 'identifier' || x.type === 'this' || (x.type === 'member' && pure(x.object));
-		const result: WasmType = want && typeof want === 'object' && 'ref' in want && want.ref === 'any' ? want : REF_ANY;
+		const result: WT.Type = want && typeof want === 'object' && 'ref' in want && want.ref === 'any' ? want : REF_ANY;
 		// What `f` emits, as instructions, leaving the context's own buffer as it was.
 		const capture = (f: () => void): wasm.Instr[] => {
 			const outer = ctx.swapOut();
@@ -3364,7 +2994,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// `cls.name`'s own method signature -- whether inline-asm or a plain declared method.
-	function methodSig(cls: ClassInfo, name: string, ctx: FunctionContext): { params: WasmType[]; result: WasmType } | undefined {
+	function methodSig(cls: ClassInfo, name: string, ctx: FunctionContext): { params: WT.Type[]; result: WT.Type } | undefined {
 		const inline = cls.inlineMethods?.get(name);
 		if (inline) {
 			const b = inline([], ctx);
@@ -3375,7 +3005,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// The constructor by which `cls` adopts raw storage: its overload taking exactly one parameter, a `RawArray` (`Array`'s
 	// `constructor(d: RawArray<T>)`, a typed array's over an `ArrayBuffer`). Boxing raw storage into `cls` is a call to it.
-	function adoptingDecl(cls: ClassInfo): { decl: MethodMember; storage: WasmType & { arr: WasmElementI } } | undefined {
+	function adoptingDecl(cls: ClassInfo): { decl: MethodMember; storage: WT.Type & { arr: WT.ElementI } } | undefined {
 		let found = adoptingDecls.get(cls);
 		if (found === undefined) {
 			found = null;
@@ -3392,7 +3022,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// The element kind of a value's STORAGE: the value IS storage, or its class adopts storage of that kind (`adoptingDecl`).
-	function storageKindOf(w: WasmType | undefined): WasmElementI | undefined {
+	function storageKindOf(w: WT.Type | undefined): WT.ElementI | undefined {
 		if (typeof w === 'object' && w && 'arr' in w)
 			return w.arr;
 		const o = typeof w === 'object' && w && 'ref' in w ? classes.get(w.ref) : undefined;
@@ -3402,7 +3032,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// The ELEMENT representation of an array-ish value. A raw array (`RawArray`, a string, an `ArrayBuffer`)
 	// carries it in its own wtype; an `Array<T>` is an ordinary class, so its element kind is a fact about
 	// its TYPE, not about the struct on the stack -- see [[tison-type-vs-representation]].
-	function elementKindOfType(t: Type | undefined, scope: Scope): WasmElementI | undefined {
+	function elementKindOfType(t: Type | undefined, scope: Scope): WT.ElementI | undefined {
 		if (!t)
 			return undefined;
 		const r  = T.resolve(scope, t);
@@ -3413,14 +3043,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// The element kind an array-valued expression resolves to -- raw storage's own, else its `Array` type's -- or `undefined`.
-	function arrayKindOf(e: Expr, ctx: FunctionContext): WasmElementI | undefined {
+	function arrayKindOf(e: Expr, ctx: FunctionContext): WT.ElementI | undefined {
 		const wt = wtypeOf(e, ctx);
 		return storageKindOf(wt) ?? elementKindOfType(checkerTypeOf(e, ctx.scope), ctx.scope);
 	}
 
 	// `arrayKindOf` for a value about to be indexed into (`e[i]`). The ref-collapse below is DISABLED: an inner
 	// array keeps its own declared kind (`x[0]` of `number[][]` is a real f64 array), and every read casts back down to it.
-	function objectArrayKind(e: Expr, ctx: FunctionContext): WasmElementI | undefined {
+	function objectArrayKind(e: Expr, ctx: FunctionContext): WT.ElementI | undefined {
 		//if (e.type === 'index' && objectArrayKind(e.object, ctx) === 'ref')
 		//	return 'ref';
 		// `narrowedTypeOf`, not `arrayKindOf`'s plain `ctx.scope` view: a value NARROWED out of `T | undefined` still reads
@@ -3772,7 +3402,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// Populated by the "index space" pass below, before any body is built -- a class ref's `WasmType`
 	// only carries its *name*, but the binary format needs the struct's numeric type index.
-	function toValType(w: WasmType): wasm.ValType {
+	function toValType(w: WT.Type): wasm.ValType {
 		if (w === 'void')
 			throw 'internal: void has no value representation';
 		if (w === 'u32')
@@ -3800,7 +3430,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// The heap type a `ref.null` needs -- just `toValType`'s `.ref`, unwrapped from the `wasm.ValType` shape.
-	function heapTypeIndexOf(w: WasmType): wasm.HeapType {
+	function heapTypeIndexOf(w: WT.Type): wasm.HeapType {
 		const vt = toValType(w);
 		if (typeof vt === 'string' || !('ref' in vt))
 			throw 'internal: expected a reference type';
@@ -3833,7 +3463,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return false;
 	}
 
-	function coerceTop(got: WasmType, ctx: FunctionContext, want: WasmType): void {
+	function coerceTop(got: WT.Type, ctx: FunctionContext, want: WT.Type): void {
 		if (wasmTypeEq(got, want))
 			return;
 
@@ -3850,7 +3480,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					ctx.emit(I.ref.as_non_null);
 				return;
 			}
-			const gotSig = got.closure, wantSig = want.closure;
+			const gotSig = closureSigOf(got), wantSig = closureSigOf(want);
 			// A shared param may DIFFER, so long as adapting it is a reference narrowing the wrapper can do
 			// with a cast: `Array<T>`'s methods are compiled at `T = any` for every non-scalar element (one
 			// physical `arr:ref` store for all of them), so a callback honestly declared `(x: string)` meets
@@ -3858,8 +3488,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// a scalar mismatch (`f64` caller, `i32` callback) would be a lossy narrowing, and silently
 			// truncating an argument is worse than the error it replaces.
 			// A scalar on one side and a boxed `any` on the other converts too, by (un)boxing in the wrapper.
-			const isAnyRef = (w: WasmType) => typeof w !== 'string' && 'ref' in w && w.ref === 'any';
-			const paramFits = (p: WasmType, i: number) => wasmTypeEq(p, wantSig.params[i])
+			const isAnyRef = (w: WT.Type) => typeof w !== 'string' && 'ref' in w && w.ref === 'any';
+			const paramFits = (p: WT.Type, i: number) => wasmTypeEq(p, wantSig.params[i])
 				|| (typeof p !== 'string' && typeof wantSig.params[i] !== 'string')
 				|| (typeof p === 'string' && isAnyRef(wantSig.params[i])) || (typeof wantSig.params[i] === 'string' && isAnyRef(p));
 			// MORE params than the slot offers still fits when the wrapper can supply every extra one: checker.ts passes
@@ -4104,7 +3734,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// caller's `ref.cast` traps on whichever one didn't match what it assumed. Widening every scalar arm
 	// to `f64` first (a real, cheap numeric conversion, not a box) before the actual `coerceTop` to
 	// `result` makes every scalar arm agree on one box shape regardless of which member produced it.
-	function coerceUnionArm(got: WasmType, ctx: FunctionContext, result: WasmType): void {
+	function coerceUnionArm(got: WT.Type, ctx: FunctionContext, result: WT.Type): void {
 		if (typeof result !== 'string' && 'ref' in result && result.ref === 'any' && !result.nullable && got !== 'f64' && scalarKind(got) !== undefined) {
 			coerceTop(got, ctx, 'f64');
 			got = 'f64';
@@ -4112,7 +3742,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		coerceTop(got, ctx, result);
 	}
 
-	function emitAs(e: Expr, ctx: FunctionContext, want: WasmType): WasmType {
+	function emitAs(e: Expr, ctx: FunctionContext, want: WT.Type): WT.Type {
 		// `null`/`undefined` alone (`emitExpr` has no target type to pick a heap type from) -- only legal
 		// into a nullable slot, same restriction `typeOf`'s union handling already enforces -- except a
 		// non-nullable `any` target (see `emitDefaultValue`'s own identical case): that's specifically
@@ -4239,7 +3869,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// `typeof x` as a VALUE when its type allows several tags: the operand is held once, then each tag that type allows is
 	// tested (`emitTypeofTest`), 'object' last and untested, being the complement. A null slot is `null` or `undefined` by the
 	// type alone -- the two share one representation -- so a type admitting both cannot be answered.
-	function emitTypeofValue(operand: Expr, ctx: FunctionContext): WasmType {
+	function emitTypeofValue(operand: Expr, ctx: FunctionContext): WT.Type {
 		const t			= narrowedTypeOf(operand, ctx);
 		const members	= T.unionMembers(t, ctx.scope);
 		const hasNull	= members.some(m => T.isLiteral(m, 'null') || T.isRef(m, 'null'));
@@ -4311,7 +3941,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// slot (`coerceTop`) separates the falsy candidates from a real object, which is unconditionally truthy.
 	// A `bigint` shares `arr:i32` with `Int32Array` (see `typeofHeapType`) so it reaches the object arm:
 	// `0n` in a dynamic slot reads as truthy, the one wrong answer this cascade can give.
-	function emitAnyTruthy(got: WasmType, ctx: FunctionContext): void {
+	function emitAnyTruthy(got: WT.Type, ctx: FunctionContext): void {
 		// Always the NULLABLE slot: a non-nullable local is not defaultable, and a null test costs nothing
 		// to skip below when `got` already rules null out.
 		const tmp		= ctx.temp(`$anytruthy$${optionalTempCounter++}`, REF_ANY_NULLABLE);
@@ -4367,7 +3997,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// The truthiness test for a value ALREADY on the stack, of physical type `got` and checker type `t`.
 	// Split out of `emitTruthy` so `&&`/`||` can test their left operand after teeing it into a local --
 	// re-emitting the expression would evaluate its side effects twice.
-	function emitTruthyOf(gotIn: WasmType, t: Type, ctx: FunctionContext): void {
+	function emitTruthyOf(gotIn: WT.Type, t: Type, ctx: FunctionContext): void {
 		let got = gotIn;
 		// A boxed primitive (`number | undefined`, `boolean | null`) has no truthiness of its own -- unbox
 		// it and test the underlying scalar. A NULLABLE one tests for null first and answers falsy, which
@@ -4460,7 +4090,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// Shared by every optional (`?.`) lowering -- `objectExpr` must only ever be evaluated once, so this
 	// materializes it into a scratch local up front and hands that off to `emitOptionalGuard`.
-	function emitOptionalAccess(ctx: FunctionContext, objWtype: WasmType, resultWtype: WasmType, readCore: (objLocal: number) => void): WasmType {
+	function emitOptionalAccess(ctx: FunctionContext, objWtype: WT.Type, resultWtype: WT.Type, readCore: (objLocal: number) => void): WT.Type {
 		const objLocal = ctx.temp(`$opt$obj$${optionalTempCounter++}`, objWtype);
 		ctx.emit(I.local.set(objLocal), I.local.get(objLocal), I.ref.is_null);
 		const _old = ctx.swapOut();
@@ -4476,7 +4106,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// way to represent a genuinely distinct "empty" slot here). A non-nullable ref/array/closure element
 	// has no such value at all -- same "no defaultable zero for a non-null ref" restriction an object-typed
 	// class field already has (`ensureCtor`'s own `struct.new` vs. `struct.new_default` split).
-	function emitDefaultValue(want: WasmType, ctx: FunctionContext): void {
+	function emitDefaultValue(want: WT.Type, ctx: FunctionContext): void {
 		if (typeof want === 'string') {
 			switch (want) {
 				case 'f64': ctx.emit(I.f64.const(0)); return;
@@ -4511,7 +4141,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// unchanged.
 	// The type a short-circuiting operator (`&&`/`||`/`??`) gives both its arms: the caller's, when both it and the
 	// self-inferred one are object refs -- only then does building at it rather than converting to it matter (invariance).
-	function wantedShape(want: WasmType | undefined, self: WasmType): WasmType {
+	function wantedShape(want: WT.Type | undefined, self: WT.Type): WT.Type {
 		return typeof want === 'object' && 'ref' in want && typeof self === 'object' && 'ref' in self ? want : self;
 	}
 
@@ -4527,7 +4157,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// `value`'s elements, read through its own `length` and index and converted to `want`, into new storage `typeIndex` left in
 	// `dst`. Read where `value` is evaluated, so a later element of the same literal (`[...a, a.pop()]`) cannot change them.
-	function copyElements(value: Expr, got: WasmType, ctx: FunctionContext, want: WasmType, typeIndex: number, dst: number): void {
+	function copyElements(value: Expr, got: WT.Type, ctx: FunctionContext, want: WT.Type, typeIndex: number, dst: number): void {
 		const n			= optionalTempCounter++;
 		const fromName	= `$spread$from$${n}`, atName = `$spread$at$${n}`;
 		const from: Expr	= { type: 'identifier', name: fromName };
@@ -4546,7 +4176,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	// `elementTsType` may name each position separately -- a TUPLE rest parameter's arguments.
-	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WasmType, kind: WasmElementI, typeIndex: number, elementTsType?: Type | ((i: number) => Type | undefined)): void {
+	function emitArrayElements(elements: readonly (Expr | undefined)[], ctx: FunctionContext, want: WT.Type, kind: WT.ElementI, typeIndex: number, elementTsType?: Type | ((i: number) => Type | undefined)): void {
 		const contextAt		= (el: Expr) => typeof elementTsType === 'function' ? elementTsType(elements.indexOf(el)) : elementTsType;
 		const emitElement	= (el: Expr) => withContext(ctx, contextAt(el), () => emitAs(el, ctx, want));
 		if (elements.some(el => el?.type === 'spread')) {
@@ -4622,7 +4252,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 	}
 
-	function emitInline(name: string, inline: Inline, args: Expr[], ctx: FunctionContext): WasmType {
+	function emitInline(name: string, inline: Inline, args: Expr[], ctx: FunctionContext): WT.Type {
 		if (args.length !== inline.params.length)
 			throw `'${name}' takes exactly ${inline.params.length} argument(s)`;
 		args.forEach((a, i) => emitAs(a, ctx, inline.params[i]));
@@ -4693,12 +4323,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		});
 	}
 
-	function emitCallArgs(label: string, params: WasmType[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FunctionContext, resolvedParams?: ResolvedParam[]): void {
+	function emitCallArgs(label: string, params: WT.Type[], defaults: (Expr | undefined)[] | undefined, hasRest: boolean, args: Expr[], ctx: FunctionContext, resolvedParams?: ResolvedParam[]): void {
 		// A closure literal passed where the parameter is a UNION with a function member (`String.replace`'s
 		// `string | ((substring: string, ...args: any[]) => string)`) must compile to THAT member's physical
 		// signature, not to its own parameter list -- the callee only ever calls it through the declared one.
 		// The union's physical type is a boxed `any`, which says nothing, so the TS type is what decides.
-		const wantForArg = (i: number, a: Expr): WasmType => {
+		const wantForArg = (i: number, a: Expr): WT.Type => {
 			const declared = resolvedParams?.[i]?.tsType;
 			if (declared && (a.type === 'arrow' || a.type === 'function')) {
 				const r = T.resolveOwn(declared, ctx.typeScope);
@@ -4824,7 +4454,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// -- defaults to the calling function's own (`ctx.homeModule`); a namespace-qualified call site
 	// (`NS.foo(...)`) passes the *target* module explicitly instead, so `foo` resolves against the
 	// declaring file's own top level, not the caller's.
-	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Expected, homeModule: string = ctx.homeModule): WasmType {
+	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Expected, homeModule: string = ctx.homeModule): WT.Type {
 		let decl;
 		const builtin = builtins.get(name) ?? moduleAsmBuiltins.get(homeKey(homeModule, name));
 		if (builtin) {
@@ -4887,7 +4517,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// a real user method call (an inline/accessor/index/operator dispatch is never independently generic).
 	// `bypassVirtual`: set only by `super.method(...)`'s own call site -- by definition never virtual (see
 	// that call site's own comment), regardless of whether `owner` has overriding subclasses elsewhere.
-	function emitMethodCall(owner: ClassInfo, name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], bypassVirtual?: boolean): WasmType {
+	function emitMethodCall(owner: ClassInfo, name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], bypassVirtual?: boolean): WT.Type {
 		const inline = owner.inlineMethods?.get(name);
 		if (inline) {
 			if (args.some(a => a.type === 'spread'))
@@ -4909,7 +4539,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const fieldIndex = owner.fieldIndex.get(name);
 			const fieldWtype = fieldIndex !== undefined ? owner.fields[fieldIndex].wtype : undefined;
 			if (fieldWtype && typeof fieldWtype !== 'string' && 'closure' in fieldWtype) {
-				const sig = fieldWtype.closure;
+				const sig = closureSigOf(fieldWtype);
 				const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 				ctx.emit(I.struct.get(owner.typeIndex, fieldIndex!));
 				const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, fieldWtype);
@@ -4937,7 +4567,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// `ref.test` cascade, which recovers the real runtime type first.
 	// `which` selects the projection: `Object.entries`/`keys`/`values` differ only in what each element
 	// is, and `Map` implements all three by name already.
-	function emitObjectEntries(args: Expr[], ctx: FunctionContext, which: 'entries' | 'keys' | 'values' = 'entries'): WasmType {
+	function emitObjectEntries(args: Expr[], ctx: FunctionContext, which: 'entries' | 'keys' | 'values' = 'entries'): WT.Type {
 		if (args.length !== 1)
 			throw `'Object.${which}' takes exactly one argument`;
 		const arg	= args[0];
@@ -4963,7 +4593,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// the ordinary array-literal codegen, the same "synthesize AST, reuse existing codegen" idiom already
 	// used for spread/for-in. Shared by the static path above and every arm of `ensureAnyEntries` below, so
 	// the two can never disagree about what a given class's own entries are.
-	function emitEntriesOf(owner: ClassInfo, which: 'entries' | 'keys' | 'values', ctx: FunctionContext): WasmType {
+	function emitEntriesOf(owner: ClassInfo, which: 'entries' | 'keys' | 'values', ctx: FunctionContext): WT.Type {
 		const objName	= `#objEntries$${closureCallTempCounter++}`;
 		const objLocal	= ctx.declareValue(objName, owner.thisWtype!, owner.thisTsType!);
 		ctx.emit(I.local.set(objLocal.index));
@@ -4996,7 +4626,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// one). `target` must be a plain local variable, the same one `collectDefinePropertyTargets`/
 	// `case 'var_decl'`'s own extension redirect already required for its declaration to have a real
 	// slot to write into at all.
-	function emitObjectDefineProperty(args: Expr[], ctx: FunctionContext): WasmType {
+	function emitObjectDefineProperty(args: Expr[], ctx: FunctionContext): WT.Type {
 		if (args.length !== 3)
 			throw "'Object.defineProperty' takes exactly 3 arguments";
 		const [targetExpr, keyExpr, descExpr] = args;
@@ -5021,7 +4651,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (p?.type === 'method' && walkerB(undefined, (x, process) => x.type === 'this' || process(x)).statements(p.body ?? []))
 				throw "'Object.defineProperty': an accessor method that uses `this` is not supported -- its `this` is the target, which a closure cannot bind";
 		// One accessor half: an arrow/function field as written, a method compiled as the closure it denotes.
-		const emitHalf = (p: NonNullable<typeof getProp>, want: WasmType) => {
+		const emitHalf = (p: NonNullable<typeof getProp>, want: WT.Type) => {
 			if (p.type === 'method')
 				coerceTop(emitClosureLiteral(p, ctx, false, want), ctx, want);
 			else if (p.type === 'field' && p.value)
@@ -5121,7 +4751,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// and whether it needs preserving for `.old` (`'keep'`, only postfix `++`/`--`) or just combining once (`'discard'`, every compound op and prefix `++`/`--`) -- `'discard'` skips the extra scratch `'keep'` needs.
 	function emitAssignTarget(target: Expr, ctx: FunctionContext, old: 'none' | 'discard' | 'keep'): AssignTarget {
 
-		function captureOld(wtype: WasmType, readCore: () => void): number | undefined {
+		function captureOld(wtype: WT.Type, readCore: () => void): number | undefined {
 			let savedOld: number | undefined;
 			if (old !== 'none') {
 				readCore();
@@ -5132,7 +4762,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 			return savedOld;
 		}
-		function makeWrite(wtype: WasmType, storeCore: (val: number) => void): (tee: boolean) => number {
+		function makeWrite(wtype: WT.Type, storeCore: (val: number) => void): (tee: boolean) => number {
 			return tee => {
 				const val = ctx.temp(scratchName('$new', wtype), wtype);
 				ctx.emit(I.local.set(val));
@@ -5472,8 +5102,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		e: TS.CallSig & {type: string, name?: string, modifiers?: string[], body?: Stmt[] | Expr },
 		ctx: FunctionContext,
 		allowSelfCall: boolean,
-		want?: WasmType,
-	): WasmType {
+		want?: WT.Type,
+	): WT.Type {
 		if (hasMod(e, 'async'))
 			throw 'an async arrow/function expression is not supported';
 		if (hasMod(e, 'generator'))
@@ -5531,7 +5161,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// the two physical wtypes are equivalent here anyway (this compiler's whole "upcast is free"
 		// contract) -- and if a *later*, different use of the same closure value ever wants a genuinely
 		// different (but still compatible) signature, `coerceTop`'s own wrapper mechanism still applies.
-		const wantSig	= want && typeof want !== 'string' && 'closure' in want ? want.closure : undefined;
+		const wantSig	= want && typeof want !== 'string' && 'closure' in want ? closureSigOf(want) : undefined;
 		const result	= wantSig?.result ?? (e.returnType ? typeOf(e.returnType) : 'void');
 		if (!result)
 			throw 'closure has an unsupported return type';
@@ -5630,7 +5260,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// from any other function's body, regardless of this closure's own lexical nesting.
 		const envBase		= ensureEnvBase();
 		const capturedNames = [...free].filter(name => ctx.resolvesName(name));
-		const fields		= capturedNames.length ? new Map<string, { index: number; wtype: WasmType; holderInner?: WasmType }>() : undefined;
+		const fields		= capturedNames.length ? new Map<string, { index: number; wtype: WT.Type; holderInner?: WT.Type }>() : undefined;
 		let envTypeIndex	= envBase;
 		if (fields) {
 			// `rawWtype` (not `resolvedWtype`) -- a forward-holder's own real, physical storage type is
@@ -5688,7 +5318,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				fnCtx.selfCall = info;
 			if (selfType) {
 				fnCtx.emit(I.ref.func(funcIndex), I.local.get(envParam.index), I.i32.const(jsLength(e.params)), I.struct.new(structTypeIndex));
-				fnCtx.emit(I.local.set(fnCtx.declareValue(e.name!, { closure: sig }, selfType).index));
+				fnCtx.emit(I.local.set(fnCtx.declareValue(e.name!, closureWtype(sig), selfType).index));
 			}
 			for (const name of capturedNames) {
 				const tsType = ctx.scope.value(name);
@@ -5724,7 +5354,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 		ctx.emit(fields ? I.struct.new(envTypeIndex) : I.struct.new_default(envBase));
 		ctx.emit(I.i32.const(jsLength(e.params)), I.struct.new(structTypeIndex));
-		return { closure: sig };
+		return closureWtype(sig);
 	}
 
 	// A plain named function used as a *value* -- passed as a callback, assigned, returned, etc. --
@@ -5735,7 +5365,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// zero-capture trampoline per function name instead: same shape `emitClosureLiteral`'s own
 	// zero-capture case builds (`env` ignored, `envBase` reused directly, no distinct env type), just
 	// forwarding straight through to the real, already-compiled (or newly compiled here) function.
-	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl, homeModule = '.', want?: WasmType, typeArgs?: Type[]): { info: FuncInfo; structTypeIndex: number } {
+	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl, homeModule = '.', want?: WT.Type, typeArgs?: Type[]): { info: FuncInfo; structTypeIndex: number } {
 		const key = typeArgs ? `${homeKey(homeModule, name)}<${typeArgs.map(T.typeKey).join(',')}>` : homeKey(homeModule, name);
 		const existing = functionValueWrappers.get(key);
 		if (existing) {
@@ -5813,7 +5443,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// `e.object[e.index]` held in locals, `read` run only when the index is below the length (unsigned: a negative one is
 	// past the end too), `null` otherwise.
-	function emitBoundedRead(e: Expr & { type: 'index' }, objWtype: WasmType, resultWtype: WasmType, ctx: FunctionContext, read: (obj: Local, idx: Local & { name: string }) => void): WasmType {
+	function emitBoundedRead(e: Expr & { type: 'index' }, objWtype: WT.Type, resultWtype: WT.Type, ctx: FunctionContext, read: (obj: Local, idx: Local & { name: string }) => void): WT.Type {
 		const n		= optionalTempCounter++;
 		const objName	= `$bobj$${n}`;
 		const obj		= ctx.declareValue(objName, objWtype, narrowedTypeOf(e.object, ctx));
@@ -5853,10 +5483,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return e.object.type === 'identifier' && !ctx.lookup(e.object.name) && ctx.scope.namespace(e.object.name)?.decl(e.property)?.type === 'var_decl';
 	}
 
-	function emitFunctionValue(fn: { name: string; decl: FunctionDecl; module: string }, want: WasmType | undefined, ctx: FunctionContext, typeArgs?: Type[]): WasmType {
+	function emitFunctionValue(fn: { name: string; decl: FunctionDecl; module: string }, want: WT.Type | undefined, ctx: FunctionContext, typeArgs?: Type[]): WT.Type {
 		const { info, structTypeIndex } = ensureFunctionValueWrapper(fn.name, fn.decl, fn.module, want, typeArgs);
 		ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(ensureEnvBase()), I.i32.const(jsLength(fn.decl.params)), I.struct.new(structTypeIndex));
-		return { closure: { params: info.params, result: info.result, hasRest: info.hasRest, defaults: info.defaults } };
+		return closureWtype({ params: info.params, result: info.result, hasRest: info.hasRest, defaults: info.defaults });
 	}
 
 	// A closure *value* whose own concrete signature doesn't match some slot it's being coerced into, but
@@ -5949,7 +5579,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	const BITWISE_METHODS = new Set(['and', 'or', 'xor', 'shl', 'shr_s', 'shr_u']);
 
 	// A numeric/bitwise binary op's instructions as data (`Inline`), keyed by `BINARY_OP_NAMES`'s method name
-	function numericOpInline(method: string, a: WasmType | undefined, b: WasmType | undefined, ctx: FunctionContext): Inline {
+	function numericOpInline(method: string, a: WT.Type | undefined, b: WT.Type | undefined, ctx: FunctionContext): Inline {
 		const at = scalarKind(a), bt = scalarKind(b);
 		const t	=	at === 'i64' || bt === 'i64' ? 'i64'
 			:		(at === 'i32' || at === 'u32') && (bt === 'i32' || bt === 'u32') ? 'i32'
@@ -5985,7 +5615,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// `want`, when passed, is a hint only -- lets a literal pick its physical representation directly instead
 	// of `coerceTop` immediately converting it back. The returned `WasmType` is always the actual physical type left on the stack.
-	function emitExpr(e: Expr, ctx: FunctionContext, want?: WasmType): WasmType {
+	function emitExpr(e: Expr, ctx: FunctionContext, want?: WT.Type): WT.Type {
 		try { switch (e.type) {
 			case 'literal':
 				switch (typeof e.value) {
@@ -6492,7 +6122,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// `nullable: true` on the 'ref' case -- `ensureArrayType`'s `'ref'`-kind field is declared
 				// nullable (shared physical storage for every non-scalar kind), so `array.get` always really
 				// produces a nullable `anyref`, whatever the caller's declared TS element type claims.
-				const elemWtype: WasmType = kind === 'ref' ? { ref: 'any', nullable: true } : kind;
+				const elemWtype: WT.Type = kind === 'ref' ? { ref: 'any', nullable: true } : kind;
 				// `isOptionalChainLink`, not a bare `e.optional` -- see `case 'member'`'s own comment.
 				if (isOptionalChainLink(e)) {
 					const objWtype = wtypeOf(e.object, ctx);
@@ -6722,7 +6352,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					: !src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].optional);
 				const rawWtype	= (src: FieldSource, name: string) => src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].wtype;
 				// A spread source's field, as `want`: a union's off whichever member the value is, the absent default where it has none.
-				const readSpread = (src: FieldSource, name: string, want: WasmType): void => {
+				const readSpread = (src: FieldSource, name: string, want: WT.Type): void => {
 					if (!src.unionCls) {
 						const idx = src.spreadCls!.fieldIndex.get(name)!;
 						ctx.emit(I.local.get(src.spreadLocal!.index));
@@ -6758,7 +6388,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// A spread copies VALUES: JS reads each property through [[Get]] into a plain data property, so an accessor's
 				// getter never carries over -- the key's own read (`emitFieldRead`) already called it, and the copy's slot stays empty.
 				const copiesGetter = (f: { name: string }) => f.name.startsWith('#get:') || f.name.startsWith('#set:');
-				const emitOne	= (src: FieldSource, f: { name: string; wtype: WasmType }) => {
+				const emitOne	= (src: FieldSource, f: { name: string; wtype: WT.Type }) => {
 					if (!src.expr && copiesGetter(f))
 						return void emitDefaultValue(f.wtype, ctx);
 					if (src.expr) {
@@ -6769,7 +6399,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 				};
 				// `last ?? (the one before it ?? ...)`, lowered exactly like the `??` operator itself.
-				const emitChain = (chain: FieldSource[], f: { name: string; wtype: WasmType }): void => {
+				const emitChain = (chain: FieldSource[], f: { name: string; wtype: WT.Type }): void => {
 					if (copiesGetter(f))
 						return void emitDefaultValue(f.wtype, ctx);
 					const last = chain[chain.length - 1];
@@ -7311,7 +6941,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 						// With a boxed `any` or a nullable ref on either side, what `===` means is only known at runtime --
 						// and a method dispatch (`String.eq`) would trap on a null receiver: `x?.type === 'a'`.
-						const isRuntimeEq = (w: WasmType | undefined) => !!w && typeof w !== 'string' && (('ref' in w && w.ref === 'any') || !!w.nullable);
+						const isRuntimeEq = (w: WT.Type | undefined) => !!w && typeof w !== 'string' && (('ref' in w && w.ref === 'any') || !!w.nullable);
 						if ((method === 'eq' || method === 'ne') && (isRuntimeEq(leftInfo.wtype) || isRuntimeEq(rightInfo.wtype))) {
 							emitAs(left, ctx, REF_ANY_NULLABLE);
 							emitAs(right, ctx, REF_ANY_NULLABLE);
@@ -7388,7 +7018,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const inline	= numericOpInline(method, leftInfo.wtype, rightInfo.wtype, ctx);
 						// Only a FLOAT-kinded operand needs the real `ToInt32` sequence; one that is already
 						// `i32`/`u32` is exactly its own low 32 bits, so it costs nothing there.
-						const asInt32	= (x: Expr, w: WasmType | undefined, want: WasmType) =>
+						const asInt32	= (x: Expr, w: WT.Type | undefined, want: WT.Type) =>
 							BITWISE_METHODS.has(method) && want === 'i32' && (scalarKind(w) === 'f64' || scalarKind(w) === 'f32')
 								? emitToInt32(x, ctx)
 								: emitAs(x, ctx, want);
@@ -7499,7 +7129,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (ctx.resolvesName(e.callee.name)) {
 						const calleeWtype = ctx.resolvedWtype(e.callee.name);
 						if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
-							const sig = calleeWtype.closure;
+							const sig = closureSigOf(calleeWtype);
 							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 							// `f?.()` on a NULLABLE closure: the whole call short-circuits to `undefined`,
 							// so it needs the same guard `a?.[i]`/`a?.m()` already use. Without it the call
@@ -7536,7 +7166,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// be cast back out of it before the same `call_ref` dance as above.
 						const narrowedWtype = typeOf(narrowedTypeOf(e.callee, ctx));
 						if (narrowedWtype && typeof narrowedWtype !== 'string' && 'closure' in narrowedWtype) {
-							const sig = narrowedWtype.closure;
+							const sig = closureSigOf(narrowedWtype);
 							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 							emitExpr(e.callee, ctx);
 							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, narrowedWtype);
@@ -7552,7 +7182,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const lazy = lazyGlobalFor(e.callee.name, ctx);
 						const calleeWtype = lazy?.wrapper.result;
 						if (lazy && calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
-							const sig = calleeWtype.closure;
+							const sig = closureSigOf(calleeWtype);
 							const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 							ctx.emit(I.call(lazy.wrapper.funcIndex));
 							const scratch = ctx.declareLocal(`$closure$${closureCallTempCounter++}`, calleeWtype);
@@ -7745,7 +7375,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				{
 					const calleeWtype = wtypeOf(e.callee, ctx);
 					if (calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
-						const sig = calleeWtype.closure;
+						const sig = closureSigOf(calleeWtype);
 						const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 						// `emitAs`, not a raw `emitExpr` -- an array element read is a boxed `anyref` (every
 						// ref-kind element is stored generically), the call needs the real narrowed closure
@@ -7798,7 +7428,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// resumable step function, passes) -- normalized to `undefined` right here, once, rather than
 	// trusting every caller to already agree on which spelling they're using.
 	// `context`: the returned value's TS target, so a literal or generic call there builds what the caller reads.
-	function plainReturn(result?: WasmType, context?: Type): ReturnHandler {
+	function plainReturn(result?: WT.Type, context?: Type): ReturnHandler {
 		if (result === 'void')
 			result = undefined;
 		return {
@@ -8631,9 +8261,32 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// A non-`void` body doesn't necessarily end in a top-level `return` -- `if`/`while`/`switch` compile to a `void`-typed block wrapping their branches, leaving wasm's trailing-fallthrough check unsatisfied.
 	// No full "does every path return" analysis to avoid it -- a trailing `unreachable` is always safe (dead code whenever a real return already covers every path).
-	function emitTrailingUnreachable(ctx: FunctionContext, result: WasmType): void {
+	function emitTrailingUnreachable(ctx: FunctionContext, result: WT.Type): void {
 		if (result !== 'void')
 			ctx.emit(I.unreachable);
+	}
+
+	// A closure `WasmType` plus the language's own binding data for it. `WasmType.closure` is only the
+	// PHYSICAL shape (`ClosureSig`), so `defaults`/`resolvedParams`/`restElem` live beside the payload
+	// rather than in it -- keyed by the payload OBJECT, not by its physical shape: two same-shaped
+	// signatures legitimately differ in `resolvedParams` (see `case 'function'`), while
+	// `ensureClosureType` already memoizes by shape, so a shape-keyed store would answer with the wrong
+	// one.
+	const closureBindings = new WeakMap<ClosureSig, FuncSig>();
+	function closureWtype(sig: FuncSig): WT.Type {
+		closureBindings.set(sig, sig);
+		return { closure: sig };
+	}
+	// The binding data for a closure wtype. Total for anything `closureWtype` built, so a miss is an
+	// internal inconsistency rather than a case to answer -- throwing keeps a payload assembled some
+	// other way from silently looking like "no defaults".
+	function closureSigOf(w: WT.Type): FuncSig {
+		if (typeof w === 'string' || !('closure' in w))
+			throw 'internal: expected a closure WasmType';
+		const sig = closureBindings.get(w.closure);
+		if (!sig)
+			throw 'internal: closure WasmType was not built by closureWtype';
+		return sig;
 	}
 
 	// One shared pair of wasm types per distinct TS function signature (memoized by `wasmTypeKey` -- every
@@ -9285,7 +8938,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// *which* resume state that call will land on (the frame's own state field, set before `.then()`
 			// was ever called, already says so).
 			const trampolines = new Map<string, { funcIndex: number; structTypeIndex: number }>();
-			const ensureTrampoline = (tWtype: WasmType) => {
+			const ensureTrampoline = (tWtype: WT.Type) => {
 				const key = wasmTypeKey(tWtype);
 				let info = trampolines.get(key);
 				if (!info) {
@@ -9317,7 +8970,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// ever transitioning; re-writing it here from `#sent` too would clobber that with whatever
 			// `#sent` happened to hold from a *previous, unrelated* resume (confirmed the hard way -- a
 			// non-Promise `await x; output = v;` silently read back the wrong value).
-			const sentBindings = new Map<number, { index: number; wtype: WasmType }>();
+			const sentBindings = new Map<number, { index: number; wtype: WT.Type }>();
 			for (const seg of machine.segments) {
 				if (seg.next.type === 'suspend' && seg.next.resultVar && T.asPromiseRef(checkerTypeOf(seg.next.operand!, fnCtx.scope), fnCtx.scope))
 					sentBindings.set(seg.next.resumeId, fnCtx.closureEnv!.fields.get(seg.next.resultVar)!);
@@ -9481,7 +9134,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// there is nothing to cast into and every instance simply has the slot.
 	function addExpandoFields(info: ClassInfo, name: string) {
 		for (const key of accessorKeys.get(name) ?? []) {
-			const slots: [string, WasmType][] = [[`#get:${key}`, getterWtype()], [`#set:${key}`, setterWtype()]];
+			const slots: [string, WT.Type][] = [[`#get:${key}`, getterWtype()], [`#set:${key}`, setterWtype()]];
 			for (const [slot, wtype] of slots)
 				if (!info.fieldIndex.has(slot)) {
 					info.fieldIndex.set(slot, info.fields.length);
@@ -9510,8 +9163,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// setter, so every accessor slot of a kind shares one type whatever the descriptor's own closures declared.
 	function getterSig(): TS.FunctionType { return { type: 'function', params: [], returnType: T.ANY }; }
 	function setterSig(): TS.FunctionType { return { type: 'function', params: [{ key: 'v', typeAnnotation: T.ANY }], returnType: T.VOID }; }
-	function getterWtype(): WasmType { return nullableWtype(typeOf(getterSig())!); }
-	function setterWtype(): WasmType { return nullableWtype(typeOf(setterSig())!); }
+	function getterWtype(): WT.Type { return nullableWtype(typeOf(getterSig())!); }
+	function setterWtype(): WT.Type { return nullableWtype(typeOf(setterSig())!); }
 	// The TS type of a HIDDEN field (`#ext`, an accessor's `#get:`/`#set:` companion) -- named in one place, so a derived shape
 	// repeating its base's hidden fields repeats them exactly and stays that base's wasm subtype. Plain expandos are `any`.
 	function hiddenFieldType(name: string): Type {
@@ -9523,7 +9176,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// A field write; `obj`/`val` are locals holding the receiver and the value (typed `valWtype`). A key some `defineProperty`
 	// gave a setter (`accessorKeys`) has a `#set:k` companion: while that holds a setter the write CALLS it; otherwise the field.
-	function emitFieldWrite(cls: ClassInfo, idx: number, obj: number, val: number, valWtype: WasmType, ctx: FunctionContext): void {
+	function emitFieldWrite(cls: ClassInfo, idx: number, obj: number, val: number, valWtype: WT.Type, ctx: FunctionContext): void {
 		const field	= cls.fields[idx];
 		const acc	= cls.fieldIndex.get(`#set:${field.name}`);
 		const plain	= () => {
@@ -9550,7 +9203,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// A field read, the receiver already on the stack. A field some `Object.defineProperty` gave a getter (`accessorKeys`) has
 	// a `#get:k` companion: while that holds a getter the read CALLS it, as JS reads an accessor property; otherwise the field.
-	function emitFieldRead(cls: ClassInfo, idx: number, ctx: FunctionContext): WasmType {
+	function emitFieldRead(cls: ClassInfo, idx: number, ctx: FunctionContext): WT.Type {
 		const field	= cls.fields[idx];
 		const acc	= cls.fieldIndex.get(`#get:${field.name}`);
 		if (acc === undefined) {
@@ -9836,7 +9489,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const sub = types[info.typeIndex];
 		if (info.superClass || !('final' in sub) || !sub.final)
 			return info;
-		const fieldKey	= (w: WasmType) => typeof w === 'object' && 'ref' in w && classes.get(w.ref) ? `ref:${classes.get(w.ref)!.name}:${!!w.nullable}` : wasmTypeKey(w);
+		const fieldKey	= (w: WT.Type) => typeof w === 'object' && 'ref' in w && classes.get(w.ref) ? `ref:${classes.get(w.ref)!.name}:${!!w.nullable}` : wasmTypeKey(w);
 		const layout	= `#layout#${info.fields.map(f => `${f.name}${f.optional ? '?' : ''}:${fieldKey(f.wtype)}`).sort().join(',')}`;
 		const twin		= classes.get(layout);
 		if (!twin) {
@@ -10635,7 +10288,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return existing;
 
 		const keyWtype	= typeOf(T.STRING)!;
-		const result: WasmType = kind === 'get' ? REF_ANY_NULLABLE : 'void';
+		const result: WT.Type = kind === 'get' ? REF_ANY_NULLABLE : 'void';
 		const params	= [{ key: 'recv', wtype: REF_ANY, tsType: T.ANY }, { key: 'key', wtype: keyWtype, tsType: T.STRING },
 			...(kind === 'set' ? [{ key: 'value', wtype: REF_ANY_NULLABLE, tsType: T.ANY }] : [])];
 		const { funcIndex, typeIndex } = registerFunc(toParams2(params), toResults(result));
@@ -10843,7 +10496,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const value	= dctx.declareLocal('$value', REF_ANY_NULLABLE);
 
 			const seen = new Set<wasm.HeapType>();
-			const candidates: { heap: wasm.HeapType; typeIndex: number; index: number; wtype: WasmType; cls: ClassInfo }[] = [];
+			const candidates: { heap: wasm.HeapType; typeIndex: number; index: number; wtype: WT.Type; cls: ClassInfo }[] = [];
 			for (const cls of classes.values()) {
 				const idx = cls.fieldIndex.get(name);
 				if (idx === undefined || cls.typeIndex === -1 || seen.has(cls.typeIndex))
@@ -11004,7 +10657,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A call through a callee whose type is `any` (core.ts `params[0](...)`): the function it holds is known only at run time, so
 	// a dispatch per call shape tests it against every closure type the program has, converts each argument to that type's
 	// parameter (one the call leaves out must take `undefined`), and the result to what the call wants. None traps.
-	function ensureAnyCallDispatch(argWtypes: WasmType[], want: WasmType): FuncInfo {
+	function ensureAnyCallDispatch(argWtypes: WT.Type[], want: WT.Type): FuncInfo {
 		const key = `#call(${argWtypes.map(wasmTypeKey).join(',')})=>${wasmTypeKey(want)}`;
 		const existing = anyDispatchFuncs.get(key);
 		if (existing)
@@ -11018,11 +10671,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		lateWorklist.push(() => {
 			// Only candidates every argument converts to physically: a branch that cannot compile is never the callee of a
 			// correct program. `any` on either side boxes or casts; two structs only upcast; closures by the wrapper's own rule.
-			const isAnyRef = (w: WasmType) => typeof w !== 'string' && 'ref' in w && w.ref === 'any';
-			const kind = (w: WasmType) => typeof w === 'string' ? 'scalar' : 'closure' in w ? 'closure' : 'arr' in w ? `arr:${w.arr}` : 'ref';
+			const isAnyRef = (w: WT.Type) => typeof w !== 'string' && 'ref' in w && w.ref === 'any';
+			const kind = (w: WT.Type) => typeof w === 'string' ? 'scalar' : 'closure' in w ? 'closure' : 'arr' in w ? `arr:${w.arr}` : 'ref';
 			const closureFits = (got: FuncSig, param: FuncSig): boolean => got.params.length <= param.params.length && !!got.hasRest === !!param.hasRest
 				&& got.params.every((g, i) => fits(param.params[i], g));
-			const fits = (got: WasmType, param: WasmType): boolean => got !== 'void' && param !== 'void' && (wasmTypeEq(got, param) || isAnyRef(got) || isAnyRef(param)
+			const fits = (got: WT.Type, param: WT.Type): boolean => got !== 'void' && param !== 'void' && (wasmTypeEq(got, param) || isAnyRef(got) || isAnyRef(param)
 				|| (kind(got) === kind(param) && (kind(got) === 'scalar' || kind(got).startsWith('arr')
 					|| (typeof got !== 'string' && typeof param !== 'string' && 'closure' in got && 'closure' in param && closureFits(got.closure, param.closure))
 					|| (typeof got !== 'string' && typeof param !== 'string' && 'ref' in got && 'ref' in param && isSubclassOf(got.ref, param.ref)))));
@@ -11065,7 +10718,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A method call on an `any`/`unknown` receiver: which class's method runs is known only at run time, so a dispatch per
 	// call shape tests the receiver against every reachable owner of `name` (strings and arrays too), converts each argument
 	// from its own static representation to that candidate's parameter, and the result to what the call wants. None traps.
-	function ensureAnyDispatch(name: string, argWtypes: WasmType[], argTs: Type[], want: WasmType, ctx: FunctionContext): FuncInfo {
+	function ensureAnyDispatch(name: string, argWtypes: WT.Type[], argTs: Type[], want: WT.Type, ctx: FunctionContext): FuncInfo {
 		const key = `${name}(${argWtypes.map(wasmTypeKey).join(',')})=>${wasmTypeKey(want)}`;
 		const existing = anyDispatchFuncs.get(key);
 		if (existing)

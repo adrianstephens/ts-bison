@@ -1,15 +1,33 @@
 ---
 name: tison-towasm-cross-language-plan
-description: "PLAN ONLY (nothing built): how to make the TS→wasm backend drive the PY and CPP front ends. The measured cost, the three candidate seams, the recommended two-seam split, and the staged route with gates."
+description: "PLAN, nothing built: separating the TS-specific half of the wasm backend out, starting with a 2-file split along TS-specificity. Scope decisions (all four closed), the MEASURED cut (94/6, so cut at the TYPES not the functions), what can relocate into type-utils/checker (~524–616 lines), which TS files have REAL generic cores (printer layout, guard, state machine), and the 4-step route."
 metadata:
   type: project
   modified: 2026-09-16
 ---
 
 Written 2026-09-16 from the tree at that date (towasm.ts 12,410 lines). **No code has been written for
-this** — it is a plan, and section 7 lists what has to be decided before any of it starts.
+this** — it is a plan.
 Read [[tison-session-handoff]] first for where the live work is; this plan must not silently displace
 the self-hosting row.
+
+**Scope was cut back on 2026-09-16 (see §3):** the destination is still §2's seam, but the work that is
+actually wanted *now* is separating the TS-specific code out, beginning with a two-file split.
+§2 is the design; §3 is the scope; §5 is the route. **The axis is TS-specificity; navigation ease is a
+hoped-for by-product and must not be allowed to choose the axis.**
+
+## Baseline — verified green 2026-09-16 at `d40a84d` ("presplit")
+
+| gate | result |
+|---|---|
+| `npm run examples` (`tsc -b src/examples`) | green |
+| `test/test-towasm.ts` | all towasm tests passed (915 checks) |
+| `bash assistant/difftest.sh` (from the workspace root) | 2182/2191 agree · 0 disagree · 9 unsupported · 0 bad cases |
+
+Working tree at that point: nothing of the user's in `towasm.ts`, so the move starts clean. **Step 1 has
+NOT been started.** The one outstanding Step-0 item is a `selfhost-survey.sh` re-run — the existing table
+(Sep 15) predates three landed towasm commits and is the instrument that proves a move is MOVED-only
+rather than a behaviour change.
 
 # 1. What "cross-language" actually costs — measured, not guessed
 
@@ -66,29 +84,229 @@ Why C wins: the per-language obligation becomes "lower your AST to a small IR an
 not "implement TS's type system"; it matches the proven idiom in this repo; and the boundary is
 *checkable* (§5, step 2).
 
-# 3. Why not just use the existing VSDG?
+# 3. Scope decisions (2026-09-16), and the measured cut
 
-It is the right *shape* of answer and the wrong *artifact*, today:
+**The VSDG is out of scope.** The user's model: an independent optimisation pass that may or may not run
+before type checking and compilation — *not* a phase the backend consumes. If things happen to converge
+later, take advantage of it then; do not design for it. So no relaxed-VSDG option, and §2's IR sits
+beside it rather than on it. (For the record, the reasons it is not usable as a backend input today: it is
+syntax-preserving *by design* — `passthru`/`verbatim`/`suppressed` give up on a construct and pass it
+through opaquely, which a backend cannot tolerate; types are not first-class, the entire type vocabulary
+being one optional `typeAnnotation?: T` on `var`; payloads *are* the surface AST; and nothing consumes it —
+`towasm.ts` imports it **0 times**.)
 
-- **It is syntax-preserving by design.** `passthru`/`verbatim`/`suppressed` exist so a construct the
-  dialect can't model is passed through as opaque text. A backend cannot tolerate an opaque node — that is
-  precisely the silent-hole failure mode the project rules forbid.
-- **Types are not first-class.** The whole type vocabulary is one optional `typeAnnotation?: T` on the
-  `var` variant; the core asks the `Dialect` for 12 *syntax* facts and none about types. Codegen needs
-  types everywhere.
-- **Payloads are the surface AST** (`floating.expr`, `effect.expr`), so "language-neutral" currently means
-  "the core doesn't *look inside*", not "the payload is neutral".
-- **Nothing consumes it.** VSDG's only output is source text via `BuildProgram → printer`; no file under
-  `src/` imports it except the three dialects, and `towasm.ts` imports it **0 times**. So there is no
-  product pressure, and changing it is free of users — which cuts both ways: it is also unproven as a
-  backend.
+**`lib` is per language.** `TS/lib/**` (15 files), `LIB_DIR`/`LIB_FILES`/`LIB_AST`/`LIB_DECLS`/
+`LIB_DECL_MAP`/`LIB_AMBIENT_MODULES`/`hostImportsIn`/`makeLibScope` all travel with the TS half. A future
+language brings its own stdlib surface over the same wasm-level runtime. This also settles the `LIB_AST`
+eager-parse-at-module-load question: it stays where the language is.
 
-What to reuse from it: the **seam discipline** (facts object vs un-interfaced lowering vs reconstruction),
-the **entry-point shape** (`BuildVSDG → Optimize → GCM → Build*`, already identical across the three
-dialects), the **shape-stamp idiom** (stamp the fact on the node rather than teaching the core to read a
-surface shape), and, later, the optimiser. Decision point in §7.
+**No second backend language is being built now.** The near-term goal is *separating the TS-specific code
+out* — **TS-specificity is the first axis to cut along**, settled 2026-09-16 — and splitting `towasm.ts` into
+two files is part of doing that. Navigation ease is expected to fall out of it, but it is not the driver and
+must not be allowed to choose the axis. §2's `TypeOracle`/IR is the destination, not this pass.
 
-# 4. Per-language static-subset contract (each language needs one, in its own words)
+## The measured cut: the TS-vs-neutral axis does NOT give a usable 2-way split
+
+Computed mechanically over all 323 declarations (109 top-level + 214 nested), a declaration counting as
+CORE (language-neutral) iff its body names none of `TS.`/`JS.`/`T.`/`checkerTypeOf`/`narrow`/
+`candidateFits`/`Type`/`Expr`/`Stmt`/a quoted AST tag:
+
+| | declarations | lines | % of file |
+|---|---|---|---|
+| **CORE by rule** | ≈110 | **≈705** (855 with the 9 helpers embedded in TS parents) | **5.7%** |
+| **TS** | ≈220 | **≈11,705** | **94.3%** |
+
+Four findings that decide the route:
+
+1. **The rule cuts through inseparable clusters, so it is not a cut line.** It puts `toValType` in CORE and
+   its only data source `ensureClass` in TS; `emitStringConst` in CORE and its only caller `emitExpr` in TS;
+   `emitHolderRead` + `ensureHolderType` in CORE and their only callers in TS. CORE comes out as ~49 tiny
+   disjoint blocks, median 6 lines. Nothing resembling "module assembly" is in it: `mod` is created at
+   11393 and populated entirely at 12022–12407, all TS by rule.
+2. **The drag is the TYPE MODEL, not the functions** — §1's verdict again, now with names. The pivot is
+   `FunctionContext` (535; TS by rule, yet taken as a *parameter* by 14 CORE members): count it as TS and
+   CORE collapses to ~30 declarations / ~180 lines; split it into a codegen-only part and a TS part and the
+   function cut becomes clean. The other drag is the shape of `ClassInfo` (469), then
+   `FuncSig`/`ResolvedParam`/`FuncInfo`/`ClosureTypeInfo` (418–426, 498) — mechanically CORE, but every one
+   carries `Expr`/`Type`/`ClassInfo` in its *shape* — then 4 rules into the builtin/inline-asm registry
+   (`numericOpInline` → `builtins`; `methodSig` → `inlineMethods`; `getterWtype`/`setterWtype` → `typeOf`).
+3. **Two facts make the split more favourable than the 94/6 suggests, and both are decisive.** (a) **The
+   checker boundary is entirely inside TS declarations** — not one rule-CORE declaration calls
+   `checkerTypeOf`/`narrow`/`candidateFits`; the only top-level checker uses are `collectRangeWidenings`
+   (1598–1660) and `makeLibScope` (1729), both already TS. (b) **The dependency is one-way, TS → CORE**:
+   `mod`, `funcs`, `globals`, `closureLiterals` and `lazyGlobals` are pure TS-side sinks with **0** CORE
+   references, and nothing in the core calls back into the front end except through 6 named callbacks.
+4. **The state object the split needs is small.** 16 data members (10 mutable: `types`, `typeMap`,
+   `nextFunc`, `tags`, `exceptionTagIndex`, `strings`, `data`, `closureTypes`, `classes`, `adoptingDecls`;
+   4 read-only) + 6 injected callbacks — because **38 of the 62 locals `TStoWasm` captures are never touched
+   by any CORE declaration**. The closure-capture hazard is real but bounded; it is not a reason to avoid
+   the split.
+
+**Consequence for the plan:** build the 2-file split by moving the *types* across the line first
+(`FunctionContext`, then `ClassInfo`/`FuncSig`/`ResolvedParam`), not by moving the leaf functions the rule
+picks out.
+
+## The pivot, resolved: the neutral side is bigger than 6% once the SHAPES are neutral
+
+Reading `FunctionContext` (535–853) and the shared structs (418–533) member by member changes the estimate,
+because the taint is a *few fields*, not the substance:
+
+`FunctionContext` splits **≈250 neutral / ≈60 TS**. Neutral: `declared`, `scopeStack`, `slotTypes`,
+`freeSlots`, `out`, `ctorThis`, `ctorFields`, `depth`, `breakTargets`, `continueTargets`, `closureEnv`,
+`finallyGuards`, `holderNames`, `name`, `homeModule`, and every method (`lookup`, `allocLocal`/`freeLocal`,
+`enter`/`exitLabel`, `enter`/`exitBreakTarget`, `enter`/`exitContinueTarget`, `openScope`/`closeScope`/
+`inScope`, `temp`, `emitBreak`/`emitContinue` — the last two only touch guards and targets). TS: the three
+constructor params (`scope: Scope`, `onReturn: ReturnHandler`, `owner?: ClassInfo`) plus
+`contextualReturn`, `stmtScope`/`typeScope`, `selfCall`, `widenedTypes`, `ownBody`, `initializing`.
+
+**The idiom that keeps the neutral side concrete — a base interface plus a language subtype, never a
+type parameter.** This is already how the parsers do it (`JS.Statement<T, X>`, `C.Statement<D, X>`):
+
+| shared type | neutral part (the core names only this) | TS part (extra fields on the subtype) |
+|---|---|---|
+| `ClassInfo` | `name`, `typeIndex`, `fields`/`fieldIndex`, `thisWtype`, `superClass`, `getterNames`/`setterNames`, `funcs` | `decl: TS.Class`, `thisTsType: Type`, `methodDecls: Map<string, MethodMember[]>`, `inlineMethods: Map<string, Builtin<Inline>>`, `declScope`, `homeModule` |
+| `FuncSig` / `FuncInfo` / `Inline` / `ClosureTypeInfo` | `params: WasmType[]`, `result`, `hasRest`, `funcIndex`, `typeIndex`, `body`, `reassignsThis` | `defaults: (Expr\|undefined)[]`, `resolvedParams`, `restElem` |
+| `ResolvedParam` | `wtype: WasmType` (all `toParams`/`toParams2`/`ensureClosureType` read) | `key: BindingTarget`, `tsType: Type`, `calleeDefault: {value, tsType}` |
+| `Local` / `ClosureEnv` / `FinallyGuard` | already fully neutral | — |
+| `FunctionContext` | `class FuncCtx` (as above) | `class FunctionContext extends FuncCtx` adds the fields *and* the three constructor params |
+
+Rules this gives the split, and they are checkable: the neutral module may not name a type parameter that
+carries a language payload, may not use `any`/`unknown` for a payload, and may not cast. Where neutral code
+must *construct* one of these, it calls a factory the language supplies (part of the 6 callbacks), rather
+than growing a generic. Where neutral code needs a TS fact, it goes through one of the 6 callbacks.
+
+With the shapes neutral, the **`Core*` set of §3.2 largely comes across too**: `toValType`,
+`heapTypeIndexOf`, `ensureHolderType`, `isSubclassOf`, `storageKindOf`, `isPositional`,
+`methodSig`, `adoptingDecl`, `getterWtype`/`setterWtype`, `coerceUnionArm`, `numericOpInline`,
+`ensureClosureType`, `toParams2`, `moduleFilename`, `resolveDecl`, `needsHolder`, `place` — each either
+neutral as written or neutral once one call is a callback. Corrected estimate for the neutral half:
+**≈1,500–2,500 lines (~15–20% of the file)**, not 705, and — the part that matters — a boundary that can
+actually be *drawn* rather than a sieve.
+
+## Relocation: what can leave `towasm.ts` for the TS files it already has
+
+Measured 2026-09-16 over the candidate declarations, reading each body. **~524 lines move as-is or after a
+one-parameter refactor (4.2% of the file); ~616 with the companions and the two borderline cases.**
+
+| destination | lines | what | what the refactor is |
+|---|---|---|---|
+| `type-utils.ts` | **326** (272 as-is) | the free-variable cluster (`paramNames`/`ownBoundNames`/`collectFreeVars`/`namesSelfAsValue`, **plus** the four companions `assignsToThis`/`collectClosureFreeVars`/`collectCapturedMutables`/`noteAssignExpr`, which cannot be split up) — 98; `isNullLiteral`/`nullLiteralKind`/`TupleT`/`jsLength`/`unwrapAs`/`isPurePath`/`exprMentionsName`/`describeBinding`/`parseTypeExpr`/`substituteClassTypeParam`/`substituteTypeParams`/`genericKey` — 72; `indexSignatureValueType`/`literalValues`/`primitivePart`/`alwaysTruthy`/`backToDeclaredMembers`/`resolveObjectType`/`shapeIdentity` — 102; `restElementTypes`/`arrayPartOf`/`unionShapes` — 54 | thread `scope` where it closed over `global` (3 fns); export the private `T.arrayLikeElement` |
+| `checker.ts` | **198** | `collectRangeWidenings` (88), `staticGuard` (26), `narrowedValueTypeOf` (14), `iteratesByProtocol` (11), `narrowedTypeOf` (7), `makeLibScope` (11), `inferTypeArgMap` (41) | take `{scope, stmtScope}` or an injected `typeOf` instead of `ctx: FunctionContext`; `makeLibScope` takes `LIB_AST` as a parameter; `inferTypeArgMap` takes `global` |
+
+**The import graph is the whole constraint, and it is one-directional: `type-utils` imports `TS`, `JS`,
+`common`, `walker`, `printer` and does NOT import `checker`; `checker` imports `type-utils`.** So nothing that
+calls `checkerTypeOf`/`narrow`/`candidateFits` may go to `type-utils` — it would create a cycle — and that
+single test routes all seven checker-bound declarations to `checker.ts`. **This corrects a premise of §1 and
+§2:** `TS.`/`JS.` AST nodes and `common` are *not* blockers for `type-utils` (it already imports all three),
+and `Scope` is *defined* there. The real blockers are `WasmType`/`wasm.*`/`WAT`, `ClassInfo`/`MethodOwner`,
+`FuncSig`/`ResolvedParam`/`Local`, `FunctionContext`, and the codegen registries (`classes`, `types`,
+`openShapes`, `moduleBodies`, `adoptingDecls`).
+
+**The rule this gives, and it is the same divider as type-vs-representation:** *a declaration belongs to the
+type layer iff its values, its answer and its decisions are TS `Type`s/signatures — no `WasmType`/`ClassInfo`/
+`FunctionContext` in its signature or body — and it does not call the checker; anything that **answers with a
+representation** (a `WasmType`, a `ClassInfo`, an index, an instruction) is codegen, however type-flavoured
+its reasoning.* `wasmTypeOf` reasons purely about TS types yet is unmoveable because its output domain is a
+representation. Note the constraint that made this look bigger than it is: the 6 checker-bound candidates
+thread `ctx: FunctionContext` and **only ask about narrowed TS types** — they move once `{scope, stmtScope}`
+is passed instead of the whole codegen context — whereas `wtypeOf`, `arrayKindOf`, `objectArrayKind`,
+`operandInfo`, `ownerOf`, `storageKindOf` thread the same `ctx` *and answer with a representation*, so they
+stay. `FunctionContext` drags by exactly three fields (`scope`, `stmtScope`, `contextualReturn`).
+
+**The biggest single find is a duplication, not a relocation: `inferTypeArgMap` (8806, 41 lines) is a
+re-implementation of the checker's own inference policy** (`instantiate` at 1563 + `T.Inference`, including
+the `expected`/`returnType` contextual step and the deferred contravariant second pass). Moving it to
+`checker.ts` is not a move — it deletes the duplicate.
+
+**Traps recorded so they are not "fixed" into bugs:**
+- `alwaysTruthy` (4279) vs `T.isTruthy` (1964) — the *same question* with deliberately *different answers*,
+  because a boxed `any` slot may hold `Stmt | undefined`. Never fold them together.
+- `primitivePart`'s `PRIMITIVE_TAGS` (231) is `{string,number,boolean,bigint}` but `T.SIMPLE_TYPES` (33) adds
+  `symbol,undefined` — unifying them changes behaviour on `symbol`.
+- `elementKindOfType`'s first half duplicates the *private* `T.arrayLikeElement`; `literalValues` overlaps
+  the private `constituents`/`unitOf`; `shapeKey`/`layoutArgKey` are deliberately weaker keys than `T.typeKey`
+  (names-only / layout-only) — five key functions over three vocabularies, do not merge.
+- `indexSignatureValueType` vs `T.indexSignatureOf`, and `arrayPartOf` vs `T.arrayUnionAsArray`, are
+  complementary because codegen needs the **unresolved, as-written** view that `T.resolve` destroys (a `u8`
+  tag vs `number`; a tag vs a class name). Not duplicates; the resolution difference is load-bearing.
+
+## Generic cores in the TS files — which are real
+
+A core is real only if a **second user exists**. Measured against PY and CPP:
+
+| candidate | lines | second user | verdict |
+|---|---|---|---|
+| **`printer` layout skeleton** → `src/examples/layout.ts` | **≈60–80 out of 3 files** | **certain — 2 exist, byte-identical** | **Do it.** `indented` is the same 5 lines in `TS/printer.ts` 171, `PY/printer.ts` 98, `CPP/printer.ts` 113; `withParens`/`poss`/`maybe`/`operator` likewise; the `Options` keys match. Drags nothing (strings + options). Two bonuses: it is the one place to fix the shared-`newline` state leak that made a `DoWhile` arg-order bug cascade into ~14 later failures, and `Printer<K>` already exists at `walker.ts:6` with **zero implementations** — a ready-made contract. Must NOT absorb precedence tables, operator tables or node cases. |
+| **`guard<R>(types)`** → `walker.ts` | 5 | **certain — 1 exists, byte-identical** (`CPP/walker.ts:29` vs `TS/walker.ts:11`) | Do it with the above. |
+| **`buildStateMachine`** → `src/examples/statemachine.ts` | **≈226** | none today, but PY already parses `await`/`yield`/`yield from`/`is_async` | Worth doing **as separation, not as reuse** (the stated goal). It is genuinely neutral: it builds only its own `StateMachineSegment[]`, never an AST, and its whole AST surface is ~4 facts + `common.bodyOf`/`withBody` + a `walkerB`. `StateMachineToAST` (70 lines, builds a JS AST, **no callers anywhere**) stays behind. |
+| diagnostics (`SEVERITY`/`Err`/`Diagnostic`/`makeDiagnostic`) | ≈39 | none | **Only with a second checker** — and it drags the TS printer, since `show()` holds one. |
+| `Inference` (`type-utils` 2718–2793) | 76 neutral + ~280 per-language | none | **Blocked, not work.** Best *shape* in `type-utils.ts` — it is a candidate-set bookkeeper with one tag test — but a generic core with one possible user, and §4's PEP-484 route for PY rejects "each language implements TS's type system". |
+| `Scope` (`type-utils` 3253–3447) | ≈21 of 195 | none | **Do not extract.** Its storage is generic; every rule it answers is TS's (`globalSpace` script augmentation, `strictNullChecks` inheritance, the 4.4 alias and 4.6 destructured-union narrowing tables), and `toObject()` reconstructs a `TS.TypeMember`. |
+| `bindingNames`, `pathKey`, `withScope`/`declScopeOf`/`ownScope` | 5 / 26 / 23 | none | Leave; neutral-*shaped*, so a future front end need not re-derive them. |
+
+Already correct, and the model for what "done" looks like: `stampPos`/`getPos`/`Location` (4 parsers) and
+`Dialect.exprKey`/`stmtKey` (3 dialects). Note `vsdg.ts`'s `Dialect.foldable`/`foldValue` already *is* the
+neutral constant-folding seam for the four per-language arithmetic models, so there is nothing to extract
+there. `transpile.ts` is the inverse case: `makeProcess`/`mapObject`/`mapArray` exist for AST-to-AST
+rewriting and its four translators do not use them, but its real duplication (two type-name maps, one
+context triple) is too small to justify a framework — leave it.
+
+**One thing nobody owns:** the wasm pseudo-type names are declared three times —
+`WASM_PSEUDO_TYPES` (`type-utils` 43), `TYPED_ARRAY_TAGS` (`towasm` 230), and `checker.ts`'s
+`stopAtPseudoType` guard (1325), which exists purely so `i32` stays unresolvable-by-name for towasm's
+`builtinTypes`. Same 10 names, three sites, and `T.literalTypeOf` already types integer literals as
+`RefType('i32')`. Give it one owner as part of Step 2.
+
+## The blocker — RESOLVED 2026-09-16, and the neutral module is now unblocked
+
+Extraction #1 was first attempted as planned — `wasm-types.ts` with a thin neutral `ClosureSig` that
+`FuncSig` would extend — and **failed**: `WasmType` and `FuncSig` are mutually recursive and `FuncSig`
+carried TS types, so a thin payload produced 12 errors across 2 producer sites and 6 readers, two of them
+*object literals* constructing the payload.
+
+The user's suggestion fixed it: **`FuncSig` keeps only the language-neutral shape and the language owns the
+rest.** Implemented as:
+
+- `ClosureSig { params: WasmType[]; result: WasmType; hasRest? }` — the PHYSICAL shape. `WasmType.closure`
+names only this.
+- `FuncSig extends ClosureSig` adds `defaults`/`resolvedParams`/`restElem` (TS exprs and TS types).
+- `towasm.ts` keeps those **beside** each payload rather than in it: `closureBindings`, a
+  `WeakMap<ClosureSig, FuncSig>`, with every closure wtype built by one `closureWtype(sig)` (5 producer
+  sites: `typeOf`'s 'function' case, `typeOf`'s all-call-members object case, `emitClosureLiteral` ×2,
+  `emitFunctionValue`) and read back through `closureSigOf(w)`, which **throws** on a miss so a payload
+  assembled some other way can't masquerade as "no defaults".
+- **Keyed by object IDENTITY, not physical shape** — deliberately. `ensureClosureType` already memoizes by
+  shape, and `typeOf`'s own comment says two same-shaped signatures legitimately differ in `resolvedParams`
+  (`(x?: Stmt) => boolean` vs `(x?: Stmt[]) => boolean`), so a shape-keyed store would answer with the wrong
+  one. This is why the store is not simply the existing `ClosureTypeInfo`.
+
+Gates: build clean, test-towasm all green, difftest **2182/2191 · 0 disagree** — identical to baseline.
+**`WasmType` + `ClosureSig` + the pure helpers are now self-contained and language-free**, so the neutral
+module §3 wanted is available as a pure move: `src/examples/wasm-types.ts` can take `WasmScalarI`…`WasmType`,
+`ClosureSig`, `TYPED_ARRAY_TAGS`, `ARR_WTYPE`/`REF_*`, `CLOSURE_FIELDS` and the 10 helpers, while
+`TS/towasm-types.ts` keeps `FuncSig`/`ResolvedParam`/`Global`/`TupleT`/`jsLength` and the semantically
+front-end `PRIMITIVE_TAGS`/`READONLY_ALIAS`/`isNullLiteral`/`nullLiteralKind`/`rawElemKind`. Splitting the
+import in `towasm.ts` between the two modules is what makes the boundary visible in the module graph.
+
+**Still a prerequisite, still not done:** `emitCallArgs` takes a signature's four parts rather than the
+signature, so 11 call sites spell out a sig's fields. That is now only duplication, not a blocker.
+
+**Step 1 COMPLETE 2026-09-16 — the neutral module exists.** `src/examples/wasm-types.ts` (166 lines) holds
+`WasmScalarI`…`WasmType`, `ClosureSig`, `TYPED_ARRAY_TAGS`, `ARR_WTYPE`/`REF_*`, `CLOSURE_FIELDS` and the 10
+helpers — with **no language types in it**, checked by the compiler. `TS/towasm-types.ts` (244 → 99 lines)
+keeps `FuncSig`/`ResolvedParam`/`Global`/`TupleT`/`jsLength` and the rules about TypeScript's type
+*spellings* (`PRIMITIVE_TAGS`, `READONLY_ALIAS`, `isNullLiteral`, `nullLiteralKind`, `rawElemKind`), and
+imports `WasmType`/`ClosureSig` from the neutral module — one direction only. `TS/towasm.ts` 12,411 →
+12,210. The boundary is now visible in the module graph: towasm.ts has one import from each side.
+Gates: build clean, test-towasm green, difftest **2182/2191 · 0 disagree** — identical to baseline.
+
+**Remaining, handed to the user:** the `WT` prefix conversion (`WasmType` → `WT.Type`). A TypeScript
+namespace import requires every use to be qualified, so this is **459 reference sites** for the neutral
+module plus ~100 for the TS-side one — i.e. a find-and-replace-per-identifier pass in the editor (one
+regex per exported name), not something the one-literal-at-a-time edit tools can do efficiently. The names
+are unchanged deliberately, so that pass is a clean symbol rename with nothing else moving underneath it.
+
+# 4. Per-language static-subset contract (deferred — needed only when a language is added)
 
 The backend's value is that it is *narrow and loud*. Each front end must state what it accepts, and
 refuse the rest rather than guessing:
@@ -102,50 +320,107 @@ refuse the rest rather than guessing:
 That PY row is the load-bearing one: it converts "write a Python type checker" into "read the annotations
 and check them", which is what makes PY reachable at all.
 
-# 5. Staged route (every step gated, TS keeps working throughout)
+# 5. Revised route
 
-**Step 1 — write the contract down. No code.** `tison/memory/towasm_seam_contract.md`: (a) the implicit
-checker→towasm stamp protocol, (b) the 62-tag vocabulary with a per-language "shared / TS-only / PY-only /
-CPP-only" column, (c) the list of type facts codegen actually reads. Plus a `grep`-based count script so
-the seam's size is *measurable over time* instead of felt. Zero risk, no behaviour change, no survey
-impact. This is the deliverable that turns the question into a number.
+**Step 0 — commit the tree, then re-baseline.** Non-negotiable before a 12k-line move: `git status` shows
+`src/examples/TS/towasm.ts` **itself** modified, plus ~28 other files, and `assistant/selfhost-survey.md`
+(Sep 15) predates HEAD's three landed towasm commits. Commit, then `bash assistant/selfhost-survey.sh` from
+the workspace root, and record the table so the move's delta is readable as *MOVED* only.
 
-**Step 2 — make the boundary a checkable invariant.** Declare `TypeOracle` and the IR types, used by
-nothing yet, and add an eslint rule (the custom-rule hook already exists: root `eslint-custom.mjs`, loaded
-by `tison/eslint.config.mjs`) forbidding the language-free files from referencing `TS.`/`JS.`/`T.`/`checker`.
-Convergence then cannot drift, and the refactor is driven by errors rather than by memory.
+**Step 1 — the backend's type vocabulary and state shapes: DONE 2026-09-16, landed TS-side.**
+`TS/towasm-types.ts` (244 lines) now holds `WasmScalar`…`wTypeKey` with their helpers, `FuncSig`/
+`FullSig`/`FuncInfo`/`Inline`/`ClosureTypeInfo`/`TupleT`/`CLOSURE_FIELDS`/`jsLength`, and
+`Local`/`Global`/`ResolvedParam`/`ClosureEnv`/`FinallyGuard`. `towasm.ts` went 12,411 → **12,186**
+lines. It is **not** the neutral module §3 originally proposed — see the blocker above; the type model
+is pinned to the TS half by the closure payload. Stayed behind deliberately: `wasmTypeOf` (reads
+`builtinTypes`), and `MethodDelegate`/`OperandInfo`/`Builtin`/`MethodOwner`/`ClassInfo`/`ReturnHandler`
+(they need `ClassInfo` or `FunctionContext`, a later chunk with the same one-directional-import shape).
+Gates: build clean, test-towasm all green, difftest **2182/2191 · 0 disagree** — identical to baseline.
 
-**Step 3 — hoist the dispatch, TS only, behaviour-identical.** Give the 9 switches one home per language
-(`lowerStatement`/`lowerExpression`/`lowerType`), moving the *bodies* unchanged and leaving the helpers
-they call shared. This is the split the VSDG made, and it is also a *structured answer* to the open
-"splitting towasm.ts into modules" question in the handoff — split by impedance, not by size.
-Gate: `npm run examples` then the full `test-towasm.ts` suite + `difftest.sh` byte-identical, and a survey
-re-baseline (`selfhost-survey.sh` reports declarations MOVED, which is exactly this delta).
-Caveat: towasm.ts is a survey target, so **never leave an A/B toggle in it** (established trap); do this as
-a pure move.
+**Step 1b — the analysis cluster DONE 2026-09-16.** `TS/towasm-analysis.ts` (260 lines) took the 12
+name/free-variable functions (`unwrapAs`, `isPurePath`, `exprMentionsName`, `assignsToThis`,
+`describeBinding`, `paramNames`, `ownBoundNames`, `collectFreeVars`, `namesSelfAsValue`,
+`collectClosureFreeVars`, `collectCapturedMutables`, `noteAssignExpr`) — pure AST queries, no wasm concepts.
+They were MOVED with a **named** import, which is why no call site changed: worth remembering as the rule
+of thumb, because a namespace import would have cost ~30 qualification edits to save 12 import names.
 
-**Step 4 — flip the type access to the oracle.** Re-express `wtypeOf`/`resolveObjectType`/`ownerFor`/
-`closureSigParts` against `TypeOracle`, with the TS oracle backed by today's `T.` + checker. This is where
-the real design work is, and it is independently valuable: it makes towasm's type dependence explicit,
-enumerable and testable for the first time.
-Gate: `test-towasm.ts` + the wasm type-key coverage; watch `anyleak-probe.sh` — the temptation here is to
-answer `any` for a fact the language can't supply, which is the silent-modeling-gap failure.
+**`TS/towasm-types.ts` was created and then FOLDED BACK the same day — see the rule below.** Its
+~99 declarations (the `FuncSig` family, `Local`/`Global`/`ResolvedParam`/`ClosureEnv`/`FinallyGuard`,
+`TYPED_ARRAY_TAGS`/`PRIMITIVE_TAGS`/`READONLY_ALIAS`/`isNullLiteral`/`nullLiteralKind`/`rawElemKind`) are
+types for ONE consumer, and splitting them from the code that uses them bought nothing.
+`TS/towasm.ts` 12,411 → **12,063** (12,411 at session start). Gates: build clean, test-towasm green, difftest
+**2182/2191 · 0 disagree** — identical to baseline.
 
-**Step 5 — one vertical slice in a second language.** Not "C++ support" — one program, all the way to
-*instantiated* wasm. Pick the cheapest witness: a C function of arithmetic and a loop, or an
-annotation-only Python equivalent. Deliverable: a `tsw`-style driver for that language plus a
-**cross-language differential instrument** modelled on `difftest.sh`: compile the same semantics written in
-two languages and compare *runtime results*, not text.
-Gate: the new instrument green, TS suite unchanged.
+**`towasm-builtins.ts` is DROPPED as a target.** Builtins are anticipated to be language-specific and to live
+*in* the language-specific code generation — so by the rule below they stay in `towasm.ts`.
+**`towasm-asm.ts` is the one remaining component split worth considering**, and its reasoning is subtler: the
+inline-`__asm` machinery is a *component* the per-language half uses rather than part of generic compilation.
+It is not urgent, and it now imports `Builtin`/`FunctionContext`/`ClassInfo` as TYPES from `towasm.ts` (a
+`import type` edge, erased at runtime) while `towasm.ts` imports its functions — legal, but worth doing
+slowly, because a real runtime cycle is the one thing that would break it.
 
-**Step 6 — parity survey.** Generalise `selfhost-survey.sh` into a per-construct `construct × language`
-support table, so "add C++ classes" is a row with a number, not a vibe. Instruments must not reward
-silence: a construct that lowers by emitting `any` must not count as supported.
+**Step 2 — relocate into the TS files that already exist (§3).** This is the user's insight and it is the
+cheapest part of the whole plan, because it needs no new module and no boundary decision: ~326 lines to
+`type-utils.ts`, ~198 to `checker.ts`, each behind a one-parameter refactor. Three things to fold in rather
+than treat as extras, since they are the same edit: (a) `inferTypeArgMap`'s move deletes a duplicate of the
+checker's own inference policy; (b) give the wasm pseudo-type names one owner instead of three; (c) record
+the `alwaysTruthy`/`T.isTruthy` and `PRIMITIVE_TAGS`/`SIMPLE_TYPES` traps in the commit message so a later
+tidy-up does not "fix" them.
 
-Only after step 5 should classes/methods/generics/exception handling be attempted per language — they are
-each a row of that table.
+**Step 3 — extract the three real generic cores (§3).** `src/examples/layout.ts` (the printer skeleton,
+≈60–80 lines out of three files, plus `Printer<K>` finally given an implementation), `guard<R>` into
+`walker.ts`, and `buildStateMachine` into `src/examples/statemachine.ts`. These are independent of towasm and
+can land in any order; they are the only extractions with a *proven* second user. Leave `Inference`, `Scope`
+and the diagnostics apparatus alone — each has exactly one possible user today, and a core with one user is
+not a core.
+
+**Step 4 — the boundary enforced by imports, not by a lint rule.** No custom eslint rule is needed: the
+neutral module imports only `common.ts`, the wasm package and its own submodules, and the language module
+imports *it*, never the reverse. That makes the separation a property of the module graph, checked by the
+compiler, with no judgement to drift. The one rule to write down (in the neutral module's header) is the
+§3 divider: **ask about types freely; answering with a representation is codegen.**
+
+**Step 3 — neutralise the shared SHAPES (the pivot, now specified in §3).** In order:
+
+1. `Local`/`ClosureEnv`/`FinallyGuard` are already neutral — move them with the first extraction.
+2. Split `FuncSig`/`FuncInfo`/`Inline`/`ClosureTypeInfo`/`MethodDelegate`/`OperandInfo`/`ResolvedParam` into
+a neutral base + a TS subtype carrying `defaults`/`resolvedParams`/`restElem`/`key`/`tsType`/`calleeDefault`.
+3. Split `ClassInfo` the same way (§3's table), keeping the method table (`funcs`) on the neutral side and
+`decl`/`thisTsType`/`methodDecls`/`inlineMethods`/`declScope`/`homeModule` on the TS side, keyed by the same
+class key.
+4. Split `FunctionContext` into `class FuncCtx` (neutral, ≈250 lines: the whole local/slot/scope/label
+machinery) + `class FunctionContext extends FuncCtx` (TS, ≈60 lines: `scope`, `onReturn`, `owner`,
+`contextualReturn`, `stmtScope`/`typeScope`, `selfCall`, `widenedTypes`, `ownBody`, `initializing`).
+Typing the neutral members' parameter as `ctx: FuncCtx` is what *enforces* the boundary — a neutral member
+that reaches for a TS field stops compiling.
+
+Do this **before** moving any function body: it is what converts the sieve of §3 into a line.
+
+**Step 4 — the real 2-way split.** Convert `TStoWasm`'s body to a class — base = module-level state + the
+emission algorithm, subclass = TS dispatch and type lowering — which is exactly the `Emitter`/`TSEmitter`
+shape the VSDG already proved, with §3.4's 16-member context as the base's state. Expect roughly
+**1,500–2,500 neutral / 10,000+ TS**: honest two files, and deliberately *not* two equal halves — the axis is
+TS-specificity, so the lopsidedness is the point rather than a defect. Navigation benefit should be treated
+as a hoped-for side effect, per the axis decision in §3.
+
+**Step 5+ — the seam proper, only if a second language is still wanted:** §2's `TypeOracle`, then the IR,
+then one vertical slice plus a cross-language differential instrument modelled on `difftest.sh`.
 
 # 6. Refuse these (they are the workarounds this plan exists to avoid)
+
+**The file-splitting rule (settled 2026-09-16 by the user), which governs every step here:**
+**don't split files without a reason.** A module earns its existence either by having (or anticipating)
+**more than one consumer**, or by **enforcing** something that would otherwise be a convention. So:
+
+- **TS-specific types and TS-specific code generation stay in the same file.** They are firmly tied
+  together; a vocabulary bucket whose only consumer is the file next door is indirection, and was folded
+  back (`towasm-types.ts`, created and removed the same day).
+- **`src/examples/wasm-types.ts` stays**, because it is not a bucket *for* `towasm.ts` — it is the
+  language-neutral vocabulary, expected to serve the common code generation *and* each per-language one,
+  and it enforces that nothing in it names a language type (the compiler rejects it).
+- **Builtins stay in the language's code generation** (anticipated to be language-specific).
+- A cohesive *component* (the asm machinery, the AST analysis) is the subtler case: the reason to separate
+  it is that it is a component other parts use, not that it is small.
 
 - Adding PY/CPP case labels to the existing 9 switches (option A).
 - An unmodeled construct silently lowered as `any`/default instead of refused.
@@ -157,19 +432,24 @@ each a row of that table.
   text): "I can't model this" is spelled *in the source language*, at the source, visibly — not as an
   opaque node the backend quietly accepts. Every language needs a spelling of it; that is a feature, not a gap.
 
-# 7. Decisions needed before step 3
+# 7. Decisions — all four closed
 
-1. **Does the backend IR become a relaxed VSDG, or sit below it?** Relaxed-VSDG shares the optimiser and
-   GCM; a separate IR keeps the source-to-source path untouched. Recommend deciding *after* step 4, when
-   the oracle's shape is known — but before step 5, because the IR is what languages lower into.
-2. **Does the seam land before or after the current self-hosting row?** Step 3 rewrites the file the survey
-   measures. Recommend: land the current row, then step 3 as one pure move with a re-baseline.
-3. **Is the `lib/` layer (TS/lib/*.ts, 15 files) shared or re-specified per language?** It is currently
-   TS source that towasm compiles, so a C++ or Python program would need its own stdlib surface over the
-   same wasm-level runtime. This is a scope decision, not a detail.
-4. **Is a second backend language actually the goal**, or is the goal "no TS-specific assumptions in the
-   backend" (self-hosting pressure) with PY/CPP merely the *test* that the seam is real? Step 2–4 deliver
-   the second reading; step 5–6 the first. The plan is the same either way up to step 4.
+1. ~~Relaxed VSDG, or an IR beside it?~~ **CLOSED (2026-09-16): the VSDG is an unrelated optimisation
+   pass.** If convergence happens, take it then.
+2. ~~Before or after the current self-hosting row?~~ **CLOSED 2026-09-16 — the structural work lands first,
+   in four separately-committed stages (Steps 0–3), then self-hosting resumes.** The reasoning: every later
+   row is worked *in this file*, so removing ~1,500 lines and three whole clusters from it makes all of them
+   cheaper, while deferring just moves the same cost downstream; the work is now pure and independently
+   gated rather than a big-bang, so the usual argument for deferring does not apply; and part of it *is*
+   self-hosting work (`inferTypeArgMap`'s move deletes a duplicate of the checker's own inference policy, and
+   `checker.ts` is a survey target at 0). The safety comes from Step 0 — commit, re-baseline once, then one
+   commit per destination with a re-run, so no row's attribution is ever in doubt. If a self-hosting row must
+   interleave, the natural boundary is after Step 1: it is pure extraction with no closure work.
+3. ~~Shared `lib`, or per language?~~ **CLOSED: per language.**
+4. ~~Is a second backend language the goal?~~ **CLOSED: not now.** The goal at this point is separating the
+   TS-specific code out, and splitting the file in two for navigation is part of doing that. §2's
+   `TypeOracle`/IR stays on the shelf as the destination; steps 1–4 are worth doing regardless, since they
+   are the same work viewed as hygiene instead of as porting.
 
 Related: [[tison-towasm]], [[tison-vsdg-dialects]], [[tison-vsdg-node-type]], [[tison-ast-convergence]],
 [[tison-towasm-self-hosting-plan]], [[tison-session-handoff]].
