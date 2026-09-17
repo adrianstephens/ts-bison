@@ -4974,25 +4974,26 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 
 			case 'unary': {
-				if (e.operator === '++' || e.operator === '--') {
-					const target = emitAssignTarget(e.operand, ctx, 'discard');
-					const wtype = target.wtype;
-					if (wtype !== 'i32' && wtype !== 'f64') {
-						// A nullable primitive gets a specific, actionable message -- narrowing it (`if (x !== null)`) to a real non-null occurrence would need per-read
-						// narrowing tracking, which codegen does for no type (see `coerceTop`'s soundness contract).
-						if (unboxedPrimitive(wtype))
-							throw "'++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then";
-						throw "'++'/'--' is only supported on number/boolean-kind locals";
-					}
+				if (e.operator === '++' || e.operator === '--')
+					return ctx.inScope((): WT.Type => {
+						const target = emitAssignTarget(e.operand, ctx, 'discard');
+						const wtype = target.wtype;
+						if (wtype !== 'i32' && wtype !== 'f64') {
+							// A nullable primitive gets a specific, actionable message -- narrowing it (`if (x !== null)`) to a real non-null occurrence would need per-read
+							// narrowing tracking, which codegen does for no type (see `coerceTop`'s soundness contract).
+							if (unboxedPrimitive(wtype))
+								throw "'++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then";
+							throw "'++'/'--' is only supported on number/boolean-kind locals";
+						}
 
-					ctx.emit(I[wtype].const(1), I[wtype][e.operator === '++' ? 'add' : 'sub']);
-					if (want === 'void') {
-						target.write(false);
-						return want;
-					}
-					target.write(true);
-					return wtype;
-				}
+						ctx.emit(I[wtype].const(1), I[wtype][e.operator === '++' ? 'add' : 'sub']);
+						if (want === 'void') {
+							target.write(false);
+							return want;
+						}
+						target.write(true);
+						return wtype;
+					});
 
 				// `delete obj[k]`, like `++`/`--`, needs the target's own object+key rather than its evaluated value, so it gets its own branch before the generic
 				// operand dispatch below. Only a dynamic object has a real `delete` to dispatch to.
@@ -5067,24 +5068,25 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			case 'unary_post':
 				if (e.operator === '!')
 					return emitExpr(e.operand, ctx, want);
-				if (e.operator === '++' || e.operator === '--') {
-					const target = emitAssignTarget(e.operand, ctx, 'keep');
-					const wtype = target.wtype;
-					if (wtype !== 'i32' && wtype !== 'f64') {
-						// A nullable primitive gets a specific, actionable message -- narrowing it (`if (x !== null)`) to a real non-null occurrence would need per-read
-						// narrowing tracking, which codegen does for no type (see `coerceTop`'s soundness contract).
-						if (unboxedPrimitive(wtype))
-							throw "'++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then";
-						throw "'++'/'--' is only supported on number/boolean-kind locals";
-					}
+				if (e.operator === '++' || e.operator === '--')
+					return ctx.inScope((): WT.Type => {
+						const target = emitAssignTarget(e.operand, ctx, 'keep');
+						const wtype = target.wtype;
+						if (wtype !== 'i32' && wtype !== 'f64') {
+							// A nullable primitive gets a specific, actionable message -- narrowing it (`if (x !== null)`) to a real non-null occurrence would need per-read
+							// narrowing tracking, which codegen does for no type (see `coerceTop`'s soundness contract).
+							if (unboxedPrimitive(wtype))
+								throw "'++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then";
+							throw "'++'/'--' is only supported on number/boolean-kind locals";
+						}
 
-					ctx.emit(I[wtype].const(1), I[wtype][e.operator === '++' ? 'add' : 'sub']);
-					target.write(false);
-					if (want === 'void')
-						return want;
-					ctx.emit(I.local.get(target.old!));
-					return wtype;
-				}
+						ctx.emit(I[wtype].const(1), I[wtype][e.operator === '++' ? 'add' : 'sub']);
+						target.write(false);
+						if (want === 'void')
+							return want;
+						ctx.emit(I.local.get(target.old!));
+						return wtype;
+					});
 				throw `unsupported postfix operator '${e.operator}'`;
 
 			case 'assign': {
@@ -5103,75 +5105,77 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				}
 
 
-				const slot		= emitAssignTarget(target, ctx, operator ? 'discard' : 'none');
-				const wtype		= slot.wtype;
+				return ctx.inScope((): WT.Type => {
+					const slot		= emitAssignTarget(target, ctx, operator ? 'discard' : 'none');
+					const wtype		= slot.wtype;
 
-				// The target's own declared type is the value's contextual type -- the same channel `case 'var_decl'` seeds from an annotation, which a bare `new C` on
-				// the value needs to find its own type arguments (`scope.resolveCache ??= new WeakMap`).
-				const emitValue = () => {
-					const saved = ctx.contextualReturn;
-					ctx.contextualReturn = checkerTypeOf(target, ctx.scope);
-					emitAs(value, ctx, wtype);
-					ctx.contextualReturn = saved;
-				};
+					// The target's own declared type is the value's contextual type -- the same channel `case 'var_decl'` seeds from an annotation, which a bare `new C` on
+					// the value needs to find its own type arguments (`scope.resolveCache ??= new WeakMap`).
+					const emitValue = () => {
+						const saved = ctx.contextualReturn;
+						ctx.contextualReturn = checkerTypeOf(target, ctx.scope);
+						emitAs(value, ctx, wtype);
+						ctx.contextualReturn = saved;
+					};
 
-				// Both arms unbraced: a braced `if` with a bare `switch` for its `else` is the one shape `custom-control-block-style` rejects.
-				if (!operator)
-					emitValue();
-				else switch (operator) {
-					case '&&':
-					case '||': {
-						// `a &&= b` assigns only when `a` is TRUTHY, `a ||= b` only when it is falsy, and in the other case `b` is not evaluated at all -- the same `if`-based
-						// shape `??=` uses below, keyed off truthiness rather than nullishness.
-						const isAnd	= operator === '&&';
-						const cur	= ctx.declareLocal(`$logical$assign$${ctx.tempCounter++}`, wtype);
-						ctx.emit(I.local.tee(cur.index));
-						emitTruthyOf(wtype, ctx.narrowedTypeOf(target), ctx);
-						const _old = ctx.swapOut();
-						// The truthy arm assigns for `&&=` and keeps the old value for `||=`, the falsy arm is the mirror, and `emitValue()` is reached only in the arm that
-						// actually assigns -- which is what leaves the right-hand side unevaluated in the other one.
-						const keep	= () => ctx.emit(I.local.get(cur.index));
-						(isAnd ? emitValue : keep)();
-						const _then = ctx.swapOut();
-						(isAnd ? keep : emitValue)();
-						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
-						break;
-					}
-
-					case '??': {
-						// `a ??= b` short-circuits -- `b` is only evaluated when `a` is null/undefined, unlike every other compound-assignment op. Mirrors the plain `??` binary-op's
-						// own `if`-based lowering, just feeding `target.write` instead of returning the value directly.
-						if (typeof wtype === 'string' || !wtype.nullable)
-							throw "'??=' needs a nullable object-typed target (no boxing in this subset)";
-						const leftLocal = ctx.declareLocal(`$nullish$assign$${ctx.tempCounter++}`, wtype);
-						ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
-						const _old = ctx.swapOut();
+					// Both arms unbraced: a braced `if` with a bare `switch` for its `else` is the one shape `custom-control-block-style` rejects.
+					if (!operator)
 						emitValue();
-						const _then = ctx.swapOut();
-						ctx.emit(I.local.get(leftLocal.index));
-						ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
-						break;
-					}
+					else switch (operator) {
+						case '&&':
+						case '||': {
+							// `a &&= b` assigns only when `a` is TRUTHY, `a ||= b` only when it is falsy, and in the other case `b` is not evaluated at all -- the same `if`-based
+							// shape `??=` uses below, keyed off truthiness rather than nullishness.
+							const isAnd	= operator === '&&';
+							const cur	= ctx.declareLocal(`$logical$assign$${ctx.tempCounter++}`, wtype);
+							ctx.emit(I.local.tee(cur.index));
+							emitTruthyOf(wtype, ctx.narrowedTypeOf(target), ctx);
+							const _old = ctx.swapOut();
+							// The truthy arm assigns for `&&=` and keeps the old value for `||=`, the falsy arm is the mirror, and `emitValue()` is reached only in the arm that
+							// actually assigns -- which is what leaves the right-hand side unevaluated in the other one.
+							const keep	= () => ctx.emit(I.local.get(cur.index));
+							(isAnd ? emitValue : keep)();
+							const _then = ctx.swapOut();
+							(isAnd ? keep : emitValue)();
+							ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+							break;
+						}
 
-					default: {
-						const method	= BINARY_OP_NAMES[operator as keyof typeof BINARY_OP_NAMES];
-						const owner		= ownerOf(target, ctx);
-						if (owner && owner.methodDecls?.get(method)) {
-							emitMethodCall(owner, method, [value], ctx);
+						case '??': {
+							// `a ??= b` short-circuits -- `b` is only evaluated when `a` is null/undefined, unlike every other compound-assignment op. Mirrors the plain `??` binary-op's
+							// own `if`-based lowering, just feeding `target.write` instead of returning the value directly.
+							if (typeof wtype === 'string' || !wtype.nullable)
+								throw "'??=' needs a nullable object-typed target (no boxing in this subset)";
+							const leftLocal = ctx.declareLocal(`$nullish$assign$${ctx.tempCounter++}`, wtype);
+							ctx.emit(I.local.tee(leftLocal.index), I.ref.is_null);
+							const _old = ctx.swapOut();
+							emitValue();
+							const _then = ctx.swapOut();
+							ctx.emit(I.local.get(leftLocal.index));
+							ctx.emit(I.if(toValType(wtype), _then, ctx.swapOut(_old)));
+							break;
+						}
 
-						} else {
-							const inline = numericOpInline(method, wtype, rightInfo.wtype, ctx);
-							coerceTop(wtype, ctx, inline.params[0]);
-							emitAs(value, ctx, inline.params[1]);
-							ctx.emit(...inline.inline);
-							coerceTop(inline.result, ctx, wtype);
+						default: {
+							const method	= BINARY_OP_NAMES[operator as keyof typeof BINARY_OP_NAMES];
+							const owner		= ownerOf(target, ctx);
+							if (owner && owner.methodDecls?.get(method)) {
+								emitMethodCall(owner, method, [value], ctx);
+
+							} else {
+								const inline = numericOpInline(method, wtype, rightInfo.wtype, ctx);
+								coerceTop(wtype, ctx, inline.params[0]);
+								emitAs(value, ctx, inline.params[1]);
+								ctx.emit(...inline.inline);
+								coerceTop(inline.result, ctx, wtype);
+							}
 						}
 					}
-				}
 
-				const tee = want !== 'void';
-				slot.write(tee);
-				return tee ? wtype : 'void';
+					const tee = want !== 'void';
+					slot.write(tee);
+					return tee ? wtype : 'void';
+				});
 			}
 
 			case 'binary': {
@@ -5789,14 +5793,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// `emitAssignTarget('keep')` pushes that value and sets up the write-back (same machinery compound
 					// assignment/`++`/`--` use); `target.write` then consumes the callee's extra updated-`this` result, leaving the
 					// declared result underneath. A receiver with nothing to write back to gets `emitAssignTarget`'s own error, for free.
-					if (ensureMethod(owner, e.callee.property, e.arguments, ctx, typeArgs)?.reassignsThis) {
-						const target = emitAssignTarget(obj, ctx, 'keep');
-						// The lvalue read may be a boxed `anyref` (every ref-kind array element is stored generically), so the pushed
-						// receiver needs the same narrowing cast the non-reassigning path below gets from its own `emitAs`.
-						coerceTop(target.wtype, ctx, (owner as ClassInfo).thisWtype!);
-						const result = emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
-						target.write(false);
-						return result;
+					const property	= e.callee.property;
+					const args		= e.arguments;
+					if (ensureMethod(owner, property, args, ctx, typeArgs)?.reassignsThis) {
+						return ctx.inScope((): WT.Type => {
+							const target = emitAssignTarget(obj, ctx, 'keep');
+							// The lvalue read may be a boxed `anyref` (every ref-kind array element is stored generically), so the pushed
+							// receiver needs the same narrowing cast the non-reassigning path below gets from its own `emitAs`.
+							coerceTop(target.wtype, ctx, (owner as ClassInfo).thisWtype!);
+							const result = emitMethodCall(owner, property, args, ctx, typeArgs);
+							target.write(false);
+							return result;
+						});
 					}
 					// `emitAs`, not a raw `emitExpr` -- `obj` may be a ref-kind array element read, boxed `anyref` -- the call needs the real narrowed receiver type first, same as `case 'member'`'s getter/field reads.
 					emitAs(obj, ctx, (owner as ClassInfo).thisWtype!);
@@ -6411,9 +6419,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					return;
 				// A sibling created earlier already captured this name's forward holder (`ensureForwardHolder`): fill that.
 				if (ctx.lookup(s.name)?.holderInner) {
-					const target = emitAssignTarget({ type: 'identifier', name: s.name }, ctx, 'none');
-					coerceTop(emitClosureLiteral(s, ctx, true), ctx, target.wtype);
-					target.write(false);
+					ctx.inScope(() => {
+						const target = emitAssignTarget({ type: 'identifier', name: s.name }, ctx, 'none');
+						coerceTop(emitClosureLiteral(s, ctx, true), ctx, target.wtype);
+						target.write(false);
+					});
 					return;
 				}
 				ctx.emit(I.local.set(ctx.declareLocal(s.name, emitClosureLiteral(s, ctx, true)).index));

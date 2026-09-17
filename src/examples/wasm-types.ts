@@ -405,10 +405,11 @@ export class FunctionContext {
 		return this;
 	}
 
-	inScope(fn: (ctx: FunctionContext)=>void) {
+	inScope<T>(fn: (ctx: FunctionContext) => T): T {
 		this.openScope();
-		fn(this);
+		const result = fn(this);
 		this.closeScope();
+		return result;
 	}
 
 	emitBreak() {
