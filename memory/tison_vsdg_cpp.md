@@ -251,3 +251,14 @@ calls scheduling-only, and dropping `for (...; i++)`'s update on that basis is a
 briefly); (2) the operand read is now a real edge of its own (port 1 of the effect; nothing reads it, the
 payload prints verbatim) -- without it a later `i++`'s dependence on an earlier one is INVISIBLE, so the
 earlier one looked dead and `i++; auto a = i++; return g(i++) + a;` dropped its first increment.
+
+Boundary, measured (`assistant/cpp-incdec-shapes-probe.ts`): the increment is KEPT whenever the name is
+read by anything that prints -- a later `g(i)`, a store (`a = i`), a loop-carried read, or even a VERBATIM
+statement's mention of it (`i++; switch (i) {...}`, where the readOnly reader counts) -- and dropped when
+its only readers are themselves dead. WART (cosmetic, not a miscompile, pinned as `KNOWN WART`): that
+check is per-node rather than transitive, so `i++; i++; return 0;` keeps the FIRST increment -- the second
+one reads it, and a reader that is itself dropped still counts as one. Unobservable either way (`i` is
+dead), just odd. Twelve live shapes all print verbatim and are now pinned in the suite (loop TEST, ternary
+condition, two arguments, two in one expression, member/index targets, prefix, pre-increment value read
+later): this is the area where two live miscompiles were found on 2026-09-16 *because* nothing here was
+pinned, so it is deliberately over-covered now.

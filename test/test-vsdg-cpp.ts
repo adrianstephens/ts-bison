@@ -353,6 +353,55 @@ async function main() {
 		}
 	`));
 
+	// The rest of `++`'s live shapes, pinned together because this is where the two miscompiles above were
+	// found: an increment whose TEXT is what carries it can only ever be right if every position it can
+	// appear in is tested. In a loop TEST it must re-evaluate on every iteration (the rotated-while idiom), and in
+	// a ternary/argument position each increment keeps its own node -- two identical `i++` texts must never
+	// be CSE-merged into one, which is why effects are outside CSE entirely.
+	await check('inc/dec in a loop test re-evaluates each iteration', 'int f(int i) { int s = 0; while (i++ < 3) { s = s + i; } return s; }\n', dedent(`
+		int f(int i) {
+		  int s = 0;
+		  while (true) {
+		    if (!(i++ < 3)) {
+		      break;
+		    }
+		    s = s + i;
+		  }
+		  return s;
+		}
+	`));
+
+	await check('inc/dec as a ternary condition, and as two arguments', 'int f(int i) { return g(i++, i++) + (i++ ? 1 : 2); }\n', dedent(`
+		int f(int i) {
+		  return g(i++, i++) + (i++ ? 1 : 2);
+		}
+	`));
+
+	await check('two increments in one expression keep their own nodes', 'int f(int i) { int a = i++ + i++; return a; }\n', dedent(`
+		int f(int i) {
+		  int a = i++ + i++;
+		  return a;
+		}
+	`));
+
+	await check('the pre-increment value is still readable afterwards', 'int f(int i) { int a = i++; int b = a + i; return b; }\n', dedent(`
+		int f(int i) {
+		  int a = i++;
+		  int b = a + i;
+		  return b;
+		}
+	`));
+
+	// KNOWN WART (cosmetic, not a miscompile): the chain rule is not transitive. The second increment is
+	// dropped (nothing reads `i` afterwards), but the first is kept because that second one READS it -- and
+	// a dropped reader still counts as a reader. Unobservable either way (`i` is a dead parameter), just odd.
+	await check('KNOWN WART: one of two dead increments survives', 'int f(int i) { i++; i++; return 0; }\n', dedent(`
+		int f(int i) {
+		  i++;
+		  return 0;
+		}
+	`));
+
 	// ---- constant folding (cppDialect's own "C++ constant folding" section) ----
 	// Each of these has a WRONG answer under js arithmetic, which is the point: the folder has to
 	// implement C++'s own conversions, wrapping, truncation and UB rules, not reuse js's.
