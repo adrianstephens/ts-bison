@@ -638,6 +638,26 @@ export function mentionsTypeIndex(t: wasm.SubType, index: number): boolean {
 		: comp.kind === 'func' && (comp.params.some(p => is(p.type)) || comp.results.some(is)));
 }
 
+// Whether an op reads or writes linear memory -- the module needs a memory section (and an exported `memory`)
+// exactly when the compiled code touches one, whatever emitted it. The `heap` global's NAME is not a proxy: a
+// read that never allocates (`String.fromCharCodesAt`) emitted no such global.
+export const memOp = (op: string) => op.startsWith('memory.') || /^(i32|i64|f32|f64|v128)\.(load|store)/.test(op);
+
+// Whether any instruction in this tree touches memory. Objects are shared between instruction lists, so a
+// value already visited is not re-walked (a cycle too, if one ever appeared).
+export function touchesMemory(instrs: unknown): boolean {
+	const seen = new Set<object>();
+	const walk = (v: unknown): boolean => {
+		if (!v || typeof v !== 'object' || seen.has(v))
+			return false;
+		seen.add(v);
+		if (typeof (v as {op?: unknown}).op === 'string' && memOp((v as {op: string}).op))
+			return true;
+		return (Array.isArray(v) ? v : Object.values(v)).some(walk);
+	};
+	return walk(instrs);
+}
+
 export class Types extends Array<wasm.SubType> {
 	typeMap			= new Map<string, number>();
 

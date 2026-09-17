@@ -9494,17 +9494,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 	mod.types			= { types, groupSizes };
 
-	const seenInstr	= new Set<object>();
-	const touchesMemory = (v: unknown): boolean => {
-		if (!v || typeof v !== 'object' || seenInstr.has(v))
-			return false;
-		seenInstr.add(v);
-		if (typeof (v as {op?: unknown}).op === 'string' && T.memOp((v as {op: string}).op))
-			return true;
-		return (Array.isArray(v) ? v : Object.values(v)).some(touchesMemory);
-	};
-
-	if (touchesMemory(mod.code)) {
+	if (WT.touchesMemory(mod.code)) {
 		mod.memories	= [{ min: 1 }];
 		// So a host can actually read back what got written to it (e.g. console.log's fd_write buffer) --
 		// any consumer of real linear memory benefits, not just console.log specifically.

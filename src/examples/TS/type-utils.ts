@@ -3838,10 +3838,6 @@ export function typeOfScalar(t: Type, scope: Scope): string | undefined {
 		: undefined;
 }
 
-// Declared exactly when the compiled code actually touches memory, whatever emitted it -- keying off the
-// `heap` global's NAME instead missed a linear-memory read that never allocates (`String.fromCharCodesAt`).
-export const memOp		= (op: string) => op.startsWith('memory.') || /^(i32|i64|f32|f64|v128)\.(load|store)/.test(op);
-
 // A readonly view is a checker-only distinction over the very same physical container; a primitive tag names a
 // scalar that is stored unboxed, which `typeOfScalar` and `primitivePart` are the two readers of.
 export const READONLY_ALIAS = new Map([['ReadonlyArray', 'Array'], ['ReadonlyMap', 'Map'], ['ReadonlySet', 'Set']]);
