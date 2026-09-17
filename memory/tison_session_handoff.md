@@ -13,15 +13,18 @@ nothing else: it is rewritten wholesale, not appended to.
 
 ## As of 2026-09-17 (evening)
 
-**HEAD `02279f5` — "an assignment expression's scratch locals die with the expression".** `0fcf399` landed
+**HEAD `3793591` — "drop the inlineSmallCalls pass; inlining belongs in a prepass".** `0fcf399` landed
 the placement batch: `ClassInfo.addField`/`fieldDeclaredType`/`isBaseOf`, `Types.func`/`funcAt`/`nullable`/
 `envBase` and `narrowedTypeOf`/`narrowedValueTypeOf`/`inNarrowed`/`staticGuard` are methods; `withContext`/
 `emitTrailingUnreachable`/`emitResumableDispatch` stayed on the TS subclass (async/generator lowering is
 TS-only); `resolveOverload` went to `checker.ts`, where `candidateFits` lives (so it takes a `scope`);
 `nextCall`, four helpers that took `global` only to pass it on, `objectShapes` and `emitAnyTruthy` went to
-the neutral modules. Since then: one `FunctionContext.tempCounter` replaced six module-wide counters AND
-`scratchName`, and assignment expressions run in their own scope so their scratch slots are freed. Sizes:
-towasm 9,760 · type-utils 3,915 · wasm-types 642 · wasm-asm 227.
+the neutral modules. Then: one `FunctionContext.tempCounter` replaced six module-wide counters AND
+`scratchName`, and assignment expressions run in their own scope so their scratch slots are freed; the type
+section took its own struct shapes (`Types.closureBase`/`closure`/`holder`) so `emitDefaultValue`,
+`emitOptionalAccess` and `typeofHeapType` could leave, taking `toValType` as an explicit parameter the way
+`toFuncBody` already does; and `inlineSmallCalls` was deleted. Sizes: towasm 9,601 · type-utils 3,915 ·
+wasm-types 729 · wasm-asm 227.
 
 **The placement rule, for every future candidate** (the user endorsed it): needs `TStoWasm`'s registries
 (`classes`, `types`, `ensureClass`) -> stays a free function taking `ctx` for now, because Step 5's
@@ -51,11 +54,18 @@ written back. Without that, one local per same-typed write site survives until t
 a 40-write probe function 7 -> 45 locals; with the scope, 7, and `lib/node/path.ts` 320 -> 319).
 `assistant/local-count.ts` measures this (`mod.code[].locals`); `local-probe.ts` is its stress input.
 
-**Gates at `02279f5`:** build clean · eslint clean on both touched files · test-towasm green ·
-test-checker green · difftest **2191/2200 · 0 disagree · 9 unsupported**. The corpus is 2200 cases only
-with the nine assignment-order cases added to `assistant/difftest.ts` — that file is GITIGNORED, so a tree
-without them reports 2182/2191. At `bce6f7d`, corpus-ab vs `7b6e3fc` was every bucket **+0** (tested
-13,527 · threw 345 · GAP 346 · WARNING 1,469 · ERROR 864 · false-positive 1,209).
+**Where the type section ends and the language begins.** `Types` owns the shapes (`array`, `box`, `envBase`,
+`closureBase`, `closure(funcTypeIndex)`, `holder(vt)`); rendering a `Type` to a `wasm.ValType` stays the
+language's, and the neutral functions that need it take `toValType` as an EXPLICIT parameter (the
+`toFuncBody(numParams, toValType)` pattern) — no resolver hook on `Types`, nothing to install, and
+`ensureClass` unreachable from the neutral layer. `register` dedupes structurally, so `Types.closure` needs
+no cache; `closureTypes` in towasm is a signature REGISTRY (`an`-dispatch scans it), not a cache.
+
+**Gates at `3793591`:** build clean · eslint clean · test-towasm green · test-checker green · difftest
+**2191/2200 · 0 disagree · 9 unsupported**. The corpus is 2200 cases only with the nine assignment-order
+cases added to `assistant/difftest.ts` — that file is GITIGNORED, so a tree without them reports 2182/2191.
+At `bce6f7d`, corpus-ab vs `7b6e3fc` was every bucket **+0** (tested 13,527 · threw 345 · GAP 346 ·
+WARNING 1,469 · ERROR 864 · false-positive 1,209).
 
 ## The survey is PARKED (user's call, 2026-09-17) — do not wait on it
 
@@ -81,6 +91,9 @@ baseline on a move. Fix the determinism later; never read a survey delta as prog
 - **`towasm-analysis.ts`** (261 lines) is per-language AST queries with one consumer; the user's stated
   expectation is ONE TS module, which folds it into `towasm.ts` — asked, not decided.
 - **`rawElemKind`/`asmDeclaredType` stay TS-side deliberately** (they reason about TS type spellings).
+- **Inlining is a PREPASS, not a towasm pass** (user's call, `3793591`): `inlineSmallCalls` was deleted. Do not
+  re-add a splice-into-instruction-lists pass; do it over the VSDG, where sizes and call sites are visible.
+  `assistant/bench-inline.ts` measures the call overhead that prepass would remove.
 - **Step 3's three generic cores** (independent): `src/examples/layout.ts`, `guard<R>` into `walker.ts`,
   `buildStateMachine` into `src/examples/statemachine.ts`.
 
