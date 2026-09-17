@@ -298,7 +298,7 @@ export class ClassInfo {
 		this.fields.push({ name, wtype, optional });
 	}
 
-	isSubclassOf(cls: ClassInfo | undefined): boolean {
+	isBaseOf(cls: ClassInfo | undefined): boolean {
 		while (cls) {
 			// By identity too: a shared object shape is reachable under more than one key.
 			if (cls.name === this.name || cls === this)

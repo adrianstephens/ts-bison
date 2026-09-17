@@ -2440,7 +2440,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// `WasmType`'s own ref name. Every class named here is already resolved -- a value of a class ref type requires `ensureClass`.
 	function isSubclassOf(subName: string, baseName: string): boolean {
 		const base = classes.get(baseName);
-		return base?.isSubclassOf(classes.get(subName)) ?? false;
+		return base?.isBaseOf(classes.get(subName)) ?? false;
 	}
 
 	function coerceTop(got: WT.Type, ctx: FunctionContext, want: WT.Type): void {
