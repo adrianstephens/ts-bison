@@ -40,22 +40,18 @@ constructor returns a scalar never gets a struct type index).
 disagree · 9 unsupported** (baseline) · corpus-ab vs `7b6e3fc` every bucket **+0** (tested 13,527 · threw
 345 · GAP 346 · WARNING 1,469 · ERROR 864 · false-positive 1,209).
 
-## The survey's delta is NOT trustworthy — new, and the next real row
+## The survey is PARKED (user's call, 2026-09-17) — do not wait on it
 
-The first full survey after `bce6f7d` reads **134/391** compile in isolation, 297 failures / 190 causes, and
-**10 REGRESSED** (`towasm-analysis.ts`'s six `walkerB` users + `wasm-types.ts`'s `notUnsigned`, `elementKind`,
-`wasmTypeKey`, `combineUnionWtypes`), every one failing `Cannot read properties of undefined (reading
-'scope')`. **That is not a regression, it is the instrument.** `selfhost-survey.sh
-tison/src/examples/TS/towasm-analysis.ts` alone compiles all six; a two-file run
-(`wasm-types.ts` + `towasm-analysis.ts`) fails a DIFFERENT set (`storageTypeKey`, `wTypeKey`, `withCatchAt`,
-`withCatch`, `mentionsTypeIndex`) with a DIFFERENT message (`object literal for
-'{ref:HeapType;nullable:boolean}' is missing property 'nullable'`). So per-declaration results are
-order/state-dependent beyond the `935a4e1` import-cycle fix (concurrent import resolution was only one
-source), and a single-run `REGRESSED` line is noise. Re-run 3-5x before reading any delta — the rule the
-handoff already carried, now with an instance.
-**Next row: make the survey deterministic.** Suspects are the shared `parser`/`libScope` (and the per-probe
-re-check) in `assistant/selfhost-survey.ts`; until it is fixed, treat the delta column as a hint, never a
-gate, and never record it as progress or regression.
+The first full survey after `bce6f7d` reads **134/391**, 297 failures / 190 causes, and **10 REGRESSED**
+(`towasm-analysis.ts`'s six `walkerB` users + `wasm-types.ts`'s `notUnsigned`, `elementKind`, `wasmTypeKey`,
+`combineUnionWtypes`), all failing `Cannot read properties of undefined (reading 'scope')`. **That is the
+instrument, not a regression:** `selfhost-survey.sh tison/src/examples/TS/towasm-analysis.ts` alone compiles
+all six, and a two-file run fails a DIFFERENT set with a DIFFERENT message. Per-declaration results are
+order/state-dependent beyond the `935a4e1` import-cycle fix, so a single-run `REGRESSED` line is noise.
+**The user's direction is to keep moving code rather than wait ~10 minutes per survey run**, so: while
+relocating, run only the fast set — `npx tsc -b src/examples`, `test-towasm`, `test-checker`,
+`difftest.sh` (all under ~2 min) and on a move they must be identical to baseline. Fix the determinism
+later; until then never read a survey delta as progress or regression.
 
 ## Next, by value
 
