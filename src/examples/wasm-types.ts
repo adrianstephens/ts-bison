@@ -723,6 +723,24 @@ export class Types extends Array<wasm.SubType> {
 		return this.funcAt(this.funcType(params, results));
 	}
 
+	// Rec groups: one per contiguous run of struct/array types, since wasm-GC equivalence is structural ACROSS
+	// groups (singletons would let two identical shapes canonicalize into types `ref.test` cannot tell apart).
+	// Each host-imported func type gets its own singleton (canonicalizing flat: wasmtime rejected WASI's
+	// `fd_write`); splitting at EVERY func type is invalid, since a struct may forward-reference past one.
+	groupSizes(importedFuncTypes: Set<number>): number[] {
+		const sizes: number[] = [];
+		for (let i = 0, runStart = 0; i <= this.length; i++) {
+			if (i === this.length || importedFuncTypes.has(i)) {
+				if (i > runStart)
+					sizes.push(i - runStart);
+				if (i < this.length)
+					sizes.push(1);
+				runStart = i + 1;
+			}
+		}
+		return sizes;
+	}
+
 	private arrayDesc(kind: ElementI): wasm.SubType {
 		return { final: true, supertypes: [], type: { kind: 'array', field: { type: kind === 'ref' ? { ref: 'any', nullable: true } : kind, mut: true } } };
 	}

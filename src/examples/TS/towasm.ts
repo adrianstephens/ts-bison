@@ -9473,26 +9473,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	for (const info of closureLiterals)
 		place(info);
 
-	// One shared rec group for every STRUCT/ARRAY type, not a singleton group each: wasm-GC equivalence is
-	// structural *across* separate groups, so two identical singleton shapes (sibling classes adding no fields
-	// beyond a shared base) canonicalize into one runtime type that `ref.test` cannot tell apart. `types[]`'s
-	// own registration order already gives a contiguous run, and grouping never merges two already-distinct types.
-	// Each *host-imported* func type is excluded into its own singleton group, so it canonicalizes as its flat,
-	// host-expected shape (wasmtime rejected WASI's `fd_write` otherwise). Splitting at *every* func type is
-	// invalid instead: a struct can forward-reference one registered after an internal func type in between,
-	// and a forward reference across a group boundary is out of bounds.
 	const importedFuncTypeIndices = new Set((mod.imports ?? []).flatMap(imp => imp.desc.kind === 'func' && typeof imp.desc.typeIndex === 'number' ? [imp.desc.typeIndex] : []));
-	const groupSizes: number[] = [];
-	for (let i = 0, runStart = 0; i <= types.length; i++) {
-		if (i === types.length || importedFuncTypeIndices.has(i)) {
-			if (i > runStart)
-				groupSizes.push(i - runStart);
-			if (i < types.length)
-				groupSizes.push(1);
-			runStart = i + 1;
-		}
-	}
-	mod.types			= { types, groupSizes };
+	mod.types			= { types, groupSizes: types.groupSizes(importedFuncTypeIndices) };
 
 	if (WT.touchesMemory(mod.code)) {
 		mod.memories	= [{ min: 1 }];
