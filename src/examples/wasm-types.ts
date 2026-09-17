@@ -555,6 +555,66 @@ export function emitAnyTruthy(got: Type, ctx: FunctionContext, types: Types): vo
 }
 
 
+// `toValType`'s `.ref`, unwrapped from the `wasm.ValType` shape -- what `ref.null` needs.
+function heapTypeOf(vt: wasm.ValType): wasm.HeapType {
+	if (typeof vt === 'string' || !('ref' in vt))
+		throw 'internal: expected a reference type';
+	return vt.ref;
+}
+
+// Pushes `want`'s own zero/default value -- an array-literal hole (`[1, , 3]`) reads back as this, close enough to JS's
+// "hole reads as `undefined`" for a fixed-element-kind array, since there's no way to represent a distinct "empty" slot.
+// A non-nullable ref/array/closure has no such value, the same restriction as an object-typed class field (`ensureCtor`'s
+// `struct.new` vs. `struct.new_default` split).
+export function emitDefaultValue(want: Type, ctx: FunctionContext, types: Types, toValType: (t: Type) => wasm.ValType): void {
+	// The rendered form decides, not the `Type` spelling: `u32`/`u64` share their signed twin's zero.
+	const vt = toValType(want);
+	if (typeof vt === 'string') {
+		switch (vt) {
+			case 'f64': ctx.emit(I.f64.const(0)); return;
+			case 'f32': ctx.emit(I.f32.const(0)); return;
+			case 'i32': ctx.emit(I.i32.const(0)); return;
+			case 'i64': ctx.emit(I.i64.const(0n)); return;
+		}
+	} else if (vt.nullable) {
+		ctx.emit(I.ref.null(heapTypeOf(vt)));
+		return;
+	} else if (vt.ref === 'any') {
+		// A non-nullable `any` slot has no `null` to fall back on, so box a placeholder (already a valid `anyref`). Reached by
+		// a generic type param substituted with `any` for an unrepresentable `void` (see `compileAsyncFunc`'s comment);
+		// nothing reads this placeholder back meaningfully, only that a real value fills the slot.
+		ctx.emit(I.f64.const(0), I.struct.new(types.box('f64')));
+		return;
+	}
+	throw "an array literal hole needs a nullable or scalar element type";
+}
+
+// `obj?.method()`'s shape: evaluate the receiver once into a scratch local, and when it is null yield a null result
+// instead of running the read. Shared so every optional access -- field, call, index -- guards identically.
+export function emitOptionalAccess(ctx: FunctionContext, objWtype: Type, resultWtype: Type, toValType: (t: Type) => wasm.ValType, readCore: (objLocal: number) => void): Type {
+	const objLocal = ctx.temp(`$opt$obj$${ctx.tempCounter++}`, objWtype);
+	ctx.emit(I.local.set(objLocal), I.local.get(objLocal), I.ref.is_null);
+	const _old = ctx.swapOut();
+	ctx.emit(I.ref.null(heapTypeOf(toValType(resultWtype))));
+	const _then = ctx.swapOut();
+	readCore(objLocal);
+	ctx.emit(I.if(toValType(resultWtype), _then, ctx.swapOut(_old)));
+	return resultWtype;
+}
+
+// The heap type one `typeof` tag's runtime test needs: the box a scalar enters an `any` slot as, an array for a
+// string/`bigint`, and the closure base for a callable.
+export function typeofHeapType(tag: string, types: Types): number | undefined {
+	switch (tag) {
+		case 'number':		return types.box('f64');
+		case 'boolean':		return types.box('i32');
+		case 'string':		return types.array('i16');
+		case 'bigint':		return types.array('i32');
+		case 'function':	return types.closureBase();
+	}
+	return undefined;
+}
+
 // The type a short-circuiting operator (`&&`/`||`/`??`) gives both its arms: the caller's, when both it and the
 // self-inferred one are object refs -- only then does building at it rather than converting to it matter (invariance).
 export function wantedShape(want: Type | undefined, self: Type): Type {
@@ -593,6 +653,33 @@ export class Types extends Array<wasm.SubType> {
 	// width-subtyping needs the supertype's fields as a prefix, which is vacuous here).
 	envBase(): number {
 		return this.register({ final: false, supertypes: [], type: { kind: 'struct', fields: [] } });
+	}
+
+	// The shared prefix of every closure struct: the code pointer, the captured env, and the declared arity. Its
+	// first field is `(ref $itsFuncType)` under a covariant immutable field, so `ref.test` against this type is
+	// exactly "is this value a function" -- nominal, and no unrelated struct can match it.
+	closureBase(): number {
+		return this.register({ final: false, supertypes: [], type: { kind: 'struct', fields: [
+			{ type: { ref: 'func', nullable: false }, mut: false },
+			{ type: { ref: this.envBase(), nullable: false }, mut: false },
+			{ type: 'i32', mut: false },
+		] } });
+	}
+
+	// One closure struct per call signature -- `closureBase` plus that signature's own func type, which the
+	// caller renders (a signature's params/results are the language's `Type`s, not the section's).
+	closure(funcTypeIndex: number): number {
+		return this.register({ final: true, supertypes: [this.closureBase()], type: { kind: 'struct', fields: [
+			{ type: { ref: funcTypeIndex, nullable: false }, mut: false },
+			{ type: { ref: this.envBase(), nullable: false }, mut: false },
+			{ type: 'i32', mut: false },
+		] } });
+	}
+
+	// The one-field mutable cell a captured binding turns into, so the closure and the declaring scope write
+	// through to the same storage.
+	holder(vt: wasm.ValType): number {
+		return this.register({ final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: vt, mut: true }] } });
 	}
 
 	// Function indices come off the same per-compile counter as the type section, since a func's type is
