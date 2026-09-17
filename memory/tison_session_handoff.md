@@ -67,9 +67,10 @@ assumed neutral the survey unlocks only 17 of 148 functions (327 of those lines 
 collectors, which are language code), and 125 stay blocked by `typeOf`/`emitAs`/`coerceTop`/`owner*`/
 `ensure*` — the TS layer itself. So the remaining reusable units are: emission primitives on the base
 (`emitIf` landed; an `emitLoop` would serve only 4 sites), the module assembler's neutral core
-(`place`, `mod.datas`/`elements`, and the rec-group rule, which is pure `Types` policy), the data/string
-section (`addData`/`internString`), and misplacements to fix — `memOp` is wasm-op knowledge sitting in
-type-utils, and the assembler's `touchesMemory` wants it.
+(`place`, `mod.datas`/`elements`, and the rec-group rule, which is pure `Types` policy), and the data/string
+section (`addData`/`internString`). Wasm questions that sat in the language module are being moved out as
+they are found -- `memOp`/`touchesMemory` came from type-utils (`543e169`); look for more of those before
+designing anything new.
 
 **Gates at `0dedb5c`:** build clean · eslint clean · test-towasm green · test-checker green · difftest
 **2191/2200 · 0 disagree · 9 unsupported**. The corpus is 2200 cases only with the nine assignment-order
