@@ -13,13 +13,21 @@ nothing else: it is rewritten wholesale, not appended to.
 
 ## As of 2026-09-17 (evening)
 
-**HEAD `bce6f7d` — "pull the neutral half out of towasm.ts, in measured steps".** The extraction is under
-way by a repeatable method rather than by hand, and the neutral half now has real homes:
-`wasm-types.ts` (vocabulary, `TSWError`/`withCatch*`, `Local`/`ClosureEnv`/`FinallyGuard`, the
-`FunctionContext` base, `Types` (the type section), `ClassInfo` (a class), `wantedShape`,
-`mentionsTypeIndex`, `ownerThisType`), `wasm-asm.ts` (the island), `type-utils.ts` (the TS type model — 26
-declarations moved in), and `towasm.ts` = the TypeScript-specific codegen (10,001 lines; wasm-types 532,
-type-utils 3,839).
+**HEAD `0fcf399` — "give each helper its owner and each module its own helpers".** Two strands landed
+together, both instances of the one rule: a method goes on the state it reads, a free function goes in the
+module whose vocabulary it speaks. `ClassInfo.addField`/`fieldDeclaredType`, `Types.func`/`funcAt`/
+`nullable`/`envBase` and `narrowedTypeOf`/`narrowedValueTypeOf`/`inNarrowed`/`staticGuard` are methods now;
+`withContext`/`emitTrailingUnreachable`/`emitResumableDispatch` stayed on the TS subclass (async/generator
+lowering is TS-only); `resolveOverload` went to `checker.ts`, where `candidateFits` lives (so it takes a
+`scope`); `nextCall`, four helpers that took `global` only to pass it on, and `objectShapes` went to
+`type-utils.ts`. Sizes: towasm 9,802 · type-utils 3,915 · wasm-types 605 · wasm-asm 227.
+
+**The placement rule, for every future candidate** (the user endorsed it): needs `TStoWasm`'s registries
+(`classes`, `types`, `ensureClass`) -> stays a free function taking `ctx` for now, because Step 5's
+`TSEmitter` move takes them together; no registries but needs TS state or a JS/TS concept -> subclass
+method; no registries and no language type, generic wasm over the context's own state -> base method. A
+single dependency is a LEAD, not a verdict — signature-local types count (`mergeOverloadSigs` depends only
+on `types` but returns `FullSig`, so it stays free), and "reads only base members" != "belongs on the base".
 
 **The method, which is the thing to reuse:** `assistant/towasm-hoist-survey.ts` resolves every identifier
 with the checker, so "does this need the scope?" is answered by the binding, not by a name. `--module`
@@ -36,9 +44,9 @@ because a plain (or `!`) field definition emits after `super()` and clobbers wha
 assigned (verified; TS2612 names it); `typeIndex: -1` on `ClassInfo` is a real state (a class whose
 constructor returns a scalar never gets a struct type index).
 
-**Gates at `bce6f7d`:** build clean · test-towasm green · test-checker green · difftest **2182/2191 · 0
-disagree · 9 unsupported** (baseline) · corpus-ab vs `7b6e3fc` every bucket **+0** (tested 13,527 · threw
-345 · GAP 346 · WARNING 1,469 · ERROR 864 · false-positive 1,209).
+**Gates at `0fcf399`:** build clean · test-towasm green · test-checker green · difftest **2182/2191 · 0
+disagree · 9 unsupported** (baseline, unchanged by the batch). At `bce6f7d`, corpus-ab vs `7b6e3fc` was
+every bucket **+0** (tested 13,527 · threw 345 · GAP 346 · WARNING 1,469 · ERROR 864 · false-positive 1,209).
 
 ## The survey is PARKED (user's call, 2026-09-17) — do not wait on it
 
@@ -55,10 +63,16 @@ later; until then never read a survey delta as progress or regression.
 
 ## Next, by value
 
-- **Retune functions to the neutral base.** `FunctionContext` is already split, but functions that take the
-  local subclass and only use base members (e.g. `emitRawSlot`, `emitHolderRead`, `emitTrailingUnreachable`,
-  maybe `numericOpInline`/`isNamespaceValue`) can be retyped `ctx: WT.FunctionContext` and move — the same
-  move `ClassInfo`/`ownerThisType` just made. `ClassInfo` is now a class, so neutral methods go ON it.
+- **Retune remaining functions to the neutral base.** Still free functions taking `ctx` whose bodies only
+  touch base members: `emitRawSlot`, `emitHolderRead`, maybe `numericOpInline`/`isNamespaceValue`. Retype
+  them `ctx: WT.FunctionContext` (and move, where the body allows) — the move `emitBreak`/`rawSlot`/
+  `emitTrailingUnreachable` already made. Neutral methods go ON `ClassInfo`, which is a class.
+- **The `--single` leads** (13 functions whose only in-scope dependency is one binding, from
+  `assistant/towasm-hoist-survey.ts --single`): `classes`->`newTypeArgs`, `closureBindings`->`closureWtype`,
+  `moduleBodies`->`moduleFilename`, `functionDeclByName`->`resolveDecl`, `ast`->`needsHolder`, `globals`->
+  `ensureGlobal`, `data`->`addData`, `types`->`mergeOverloadSigs`, `userGenericClassDecls`->
+  `staticTypeArgsFor`, `libGlobal`->`resolveClassAlias`, `openShapes`->`noteTypes`. Fan-in leaders:
+  `toValType` (5), then `ensureClass`/`typeOf`/`ownerOf`/`methodSig`/`ownerFor`/`emitStmt` (2 each).
 - **`towasm-analysis.ts`** (261 lines) is per-language AST queries with one consumer; the user's stated
   expectation is ONE TS module, which folds it into `towasm.ts` — asked, not decided.
 - **`rawElemKind`/`asmDeclaredType` stay TS-side deliberately** (they reason about TS type spellings).
@@ -73,8 +87,8 @@ later; until then never read a survey delta as progress or regression.
 
 ## Tree state
 
-HEAD `bce6f7d`, working tree clean at the time of writing (`42c3cd6` added the VSDG C++ `++`/`--` pins).
-**The user edits and commits concurrently — re-check `git status`; never trust this line.**
+HEAD `0fcf399`, working tree clean at the time of writing. **The user edits and commits concurrently —
+re-check `git status`; never trust this line.**
 
 ## Keeping this current
 
