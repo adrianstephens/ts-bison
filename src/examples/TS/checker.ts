@@ -3049,3 +3049,34 @@ export function inferReturn(fnj: JS.CallSig<any>, body: JS.Stmt<any>[], outer: S
 	checkFunctionBody(sig, body, outer, false);
 	return sig.returnType ?? T.VOID;
 }
+
+// Builds the `Scope` holding every lib declaration `TStoWasm` needs (`String`, `RegExpMatch`, ...). Callers
+// pass the *same* returned `Scope` to both `TStypeCheck`/`TStypeCheckAsync` (as `libScope`, so user code is
+// checked with lib members already in view -- a scope only sees its own ancestors, so a user program's
+// `global` needs the lib scope as an actual ancestor, not a sibling branch) and `TStoWasm` (which needs it
+// directly too, e.g. to compile a lib method's own body in isolation from user-declared names). `libAst` is
+// the language's own flat lib declaration list (`towasm.ts`'s `LIB_AST`), passed in because this is the
+// checker's setup step, not codegen's.
+//
+// Muted, deliberately (its diag sink is a no-op either way) -- but it no longer skips walking a declared-
+// return-type lib method's body outright the way it once did. That used to be an all-or-nothing choice:
+// walking+stamping fixed narrowing-dependent bodies (`String.split`'s `m.groupStart(0)`) but broke every
+// GENERIC lib class method (`Array<T>.reverse`/`.fill`/...), since the stamp left behind was the template's
+// own, with `T` still unresolved, and `??=` first-wins then blocked the real, per-instantiation substituted
+// scope from ever overriding it. Resolved at the source instead (`Scope.isGenericTemplate`, this file):
+// a generic class's own instance scope is flagged, and `checkFunctionBody`/`checkStmt` skip *just* their
+// `fn.scope`/`(stmt as any).scope` stamps under that flag while still performing the walk -- so
+// `applyContextualParams`'s param-typing side effect (needed for e.g. `lib/map.ts`'s `entries()`, whose
+// `.map()` callback params previously never got typed at all) now runs for every lib method, generic or
+// not, while a generic method's body still falls back to `ctx.scope` at codegen time, same as before.
+export function makeLibScope(libAst: Stmt[]): Scope {
+	const libScope = new Scope;
+	// `undefined` is a language built-in, not a lib declaration -- real tsc REFUSES to let a `.d.ts`
+	// declare it ("conflicts with built-in global identifier"), so `lib.d.ts` can't carry it beside
+	// `NaN`/`Infinity`. `T.makeGlobal` binds it for the checker-only path; this is the wasm path's
+	// equivalent. Without it the identifier typed as `any`, so `cond ? x : undefined` came out
+	// `number | any` -- no `undefined` left in the union for anything downstream to be nullable by.
+	libScope.addValue('undefined', T.UNDEFINED);
+	checkBlock(libAst, libScope);
+	return libScope;
+}

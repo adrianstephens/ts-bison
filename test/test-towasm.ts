@@ -5,11 +5,11 @@ import path from 'path';
 import v8 from 'v8';
 import * as TS from '../dist/examples/TS/ts-parser';
 import * as T from '../dist/examples/TS/type-utils';
-import { TStoWasm, makeLibScope } from '../dist/examples/TS/towasm';
+import { TStoWasm, LIB_AST } from '../dist/examples/TS/towasm';
 import { quoteString } from '../dist/examples/TS/printer';
 import { TStypeCheck, TStypeCheckAsync } from '../dist/examples/TS/transform';
 import { ModuleLoader, collectModules } from '../dist/examples/TS/module-loader';
-import { SEVERITY } from '../dist/examples/TS/checker';
+import { SEVERITY, makeLibScope } from '../dist/examples/TS/checker';
 
 // `try`/`catch` compiles to the exnref/try_table exception-handling proposal (Wasm 3.0), which
 // this Node's V8 doesn't enable by default -- must be set before the first `WebAssembly.Module`
@@ -18,7 +18,7 @@ v8.setFlagsFromString('--experimental-wasm-exnref');
 
 const parser = TS.make();
 // Built once, reused across every `compile()` call below -- same lib declarations either way.
-const libScope = makeLibScope();
+const libScope = makeLibScope(LIB_AST);
 
 const b = new Uint8Array(1024);
 const f = new Float32Array(b.buffer);

@@ -1472,7 +1472,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 			case 'array': {
 				// A wasm pseudo-type element (`i8[]`/etc, see `WASM_PSEUDO_TYPES`'s own comment) must survive resolution
 				// intact, same reason `hoistVar`'s own `stopAtPseudoType` guard exists -- towasm.ts's `wasmTypeOf` matches
-				// `TYPED_ARRAY_TAGS` names directly off `t.element`, never through `resolve`'s own alias-unwrapping;
+				// `WASM_PSEUDO_TYPES` names directly off `t.element`, never through `resolve`'s own alias-unwrapping;
 				// resolving `i8` down to its declared `number` alias here would silently pick the wrong physical element
 				// kind for a typed-array-backed field/local (a real, observed regression -- `Uint8Array`'s own literal-
 				// argument constructor picked `f64` storage for what should stay `i8`).

@@ -8,7 +8,7 @@ import * as Common from '../common';
 import { Location, Literal, Binary, Assign, Member, hasMod } from '../common';
 import * as WT from '../wasm-types';
 import { ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, wTypeKey, CLOSURE_FIELDS } from '../wasm-types';
-import { checkBlock, checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, candidateFits } from './checker';
+import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, candidateFits } from './checker';
 import { Walker, walker, walkerB } from './walker';
 import { printer } from './printer';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
@@ -175,12 +175,10 @@ class TSWError {
 // The language-neutral half -- the physical type vocabulary and its pure helpers -- lives in
 // `../wasm-types`, imported as `WT`. What is left here is either about a compiled FUNCTION's shape
 // (`FuncSig` and friends, `Local`/`Global`) or a rule about TypeScript's own type *spellings*
-// (`TYPED_ARRAY_TAGS`, `PRIMITIVE_TAGS`, `READONLY_ALIAS`, `isNullLiteral`, `rawElemKind`); neither belongs
+// (`PRIMITIVE_TAGS`, `READONLY_ALIAS`, `isNullLiteral`, `rawElemKind`); neither belongs
 // in a language-neutral module. `FuncSig` extends `WT.ClosureSig` with the binding data only
 // argument-binding reads (`defaults`/`resolvedParams`/`restElem`), which is what lets `WT.Type` name no
 // language type at all; that binding data is kept BESIDE each closure payload (`closureWtype`), not in it.
-
-const TYPED_ARRAY_TAGS = new Set(['i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'f32', 'f64']);
 
 const PRIMITIVE_TAGS = new Set(['string', 'number', 'boolean', 'bigint']);
 
@@ -204,7 +202,7 @@ function nullLiteralKind(e: Expr): 'null' | 'undefined' | undefined {
 // The element kind of a `RawArray<T>`: a typed-array tag names its own PACKED kind directly, since
 // resolving it as a type would widen `u8` to `u32` and silently give byte storage an i32 element.
 function rawElemKind(a: Type | undefined, resolve: (t: Type) => WT.Type | undefined): WT.ElementI {
-	return a && a.type === 'ref' && !a.typeArgs && TYPED_ARRAY_TAGS.has(a.name)
+	return a && a.type === 'ref' && !a.typeArgs && T.WASM_PSEUDO_TYPES.has(a.name)
 		? WT.notUnsigned(a.name as WT.Element) : WT.elementKind(a && resolve(a));
 }
 
@@ -272,7 +270,7 @@ const LIB_DIR		= path.join(__dirname, 'lib');
 // (see `ModuleLoader.nodeBuiltin`), not part of this always-linked flat scope; the `.ts` filter drops
 // the `node` directory entry along with `tsconfig.json`.
 const LIB_FILES		= ['lib.d.ts', ...fs.readdirSync(LIB_DIR).filter(f => f.endsWith('.ts') && f !== 'lib.d.ts').sort()];
-const LIB_AST		= LIB_FILES.flatMap(f => TS.parse(fs.readFileSync(path.join(LIB_DIR, f), 'utf8')).body);
+export const LIB_AST	= LIB_FILES.flatMap(f => TS.parse(fs.readFileSync(path.join(LIB_DIR, f), 'utf8')).body);
 const LIB_EXPORTS	= LIB_AST.filter(n => n.type === 'export_decl').map(n =>n.declaration);
 const LIB_DECLS		= [
 	...[...LIB_EXPORTS, ...LIB_AST].filter(n => n.type === 'function_decl' || n.type === 'class_decl'),
@@ -820,7 +818,7 @@ function makeAsm(call: JS.Call<Type>, defines?: Record<string, string|number>, t
 			}
 		}
 		if (t.type === 'array') {
-			if (t.element.type === 'ref' && TYPED_ARRAY_TAGS.has(t.element.name))
+			if (t.element.type === 'ref' && T.WASM_PSEUDO_TYPES.has(t.element.name))
 				return ARR_WTYPE[notUnsigned(t.element.name as WT.Element)];
 			const arr = notUnsigned(scalarKind(resolveType(t.element)));
 			if (arr)
@@ -1325,40 +1323,6 @@ function containsDefineProperty(body: Stmt[]): boolean {
 // `Object.defineProperty`'s own target argument anywhere in this function body, together with the
 // literal keys ever defineProperty'd onto each -- `'dynamic'` once any one of them isn't a compile-
 // time-literal string, since a non-enumerable key set can't be given real, individually-named fields
-
-// Builds the `Scope` holding every lib declaration `TStoWasm` needs (`String`, `RegExpMatch`, ...),
-// rooted in a fresh `T.makeGlobal()`, not in any particular user program's own scope -- callers pass
-// the *same* returned `Scope` to both `TStypeCheck`/`TStypeCheckAsync` (as `libScope`, so user code is
-// checked with lib members already in view -- a scope only sees its own ancestors, so a user program's
-// `global` needs the lib scope as an actual ancestor, not a sibling branch) and `TStoWasm` (which needs
-// it directly too, e.g. to compile a lib method's own body in isolation from user-declared names).
-// A throwaway `makeChecker` instance here is fine -- `Scope` is plain data, not tied to whichever
-// checker instance populated it, so this result is equally usable by any later, separate instance.
-// Muted, deliberately (its diag sink is a no-op either way) -- but no longer skips walking a declared-
-// return-type lib method's body outright the way it once did. That used to be an all-or-nothing choice:
-// walking+stamping fixed narrowing-dependent bodies (`String.split`'s `m.groupStart(0)`) but broke every
-// GENERIC lib class method (`Array<T>.reverse`/`.fill`/...), since the stamp left behind was the template's
-// own, with `T` still unresolved, and `??=` first-wins then blocked the real, per-instantiation substituted
-// scope from ever overriding it. Resolved at the source instead (`Scope.isGenericTemplate`, checker.ts):
-// a generic class's own instance scope is flagged, and `checkFunctionBody`/`checkStmt` skip *just* their
-// `fn.scope`/`(stmt as any).scope` stamps under that flag while still performing the walk -- so
-// `applyContextualParams`'s param-typing side effect (needed for e.g. `lib/map.ts`'s `entries()`, whose
-// `.map()` callback params previously never got typed at all) now runs for every lib method, generic or
-// not, while a generic method's body still falls back to `ctx.scope` at codegen time, same as before.
-// `methodOwner`'s special-case in `var_decl` (below) is still worth keeping regardless -- it reads a
-// method's return type directly off the class decl without needing `checkerTypeOf` at all, which remains
-// the cheaper path for that one, common shape.
-export function makeLibScope(): Scope {
-	const libScope = new Scope;
-	// `undefined` is a language built-in, not a lib declaration -- real tsc REFUSES to let a `.d.ts`
-	// declare it ("conflicts with built-in global identifier"), so `lib.d.ts` can't carry it beside
-	// `NaN`/`Infinity`. `T.makeGlobal` binds it for the checker-only path; this is the wasm path's
-	// equivalent. Without it the identifier typed as `any`, so `cond ? x : undefined` came out
-	// `number | any` -- no `undefined` left in the union for anything downstream to be nullable by.
-	libScope.addValue('undefined', T.UNDEFINED);
-	checkBlock(LIB_AST, libScope);
-	return libScope;
-}
 
 // `modules`: every other loaded module (canonical path -> its own top-level statements) reachable from
 // `ast` -- built by the caller (see `module-loader.ts`'s `collectModules`) via the same `ModuleLoader` the
@@ -9367,7 +9331,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A type argument that changes a generic's physical layout: a value stored unboxed, or a typed-array tag. Any other
 	// occupies one ref slot whatever it is, and keying on the finite set of these also bounds `Box<T[]>`-style recursion.
 	function ownsLayout(t: Type, scope: Scope): boolean {
-		if (t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name))
+		if (t.type === 'ref' && !t.typeArgs && T.WASM_PSEUDO_TYPES.has(t.name))
 			return true;
 		const r = T.resolve(scope, t);
 		return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean' || r.name === 'any');
@@ -9375,7 +9339,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	// The tag is read UNRESOLVED on purpose: `T.resolve` collapses every `TypedArray` tag alike to plain `number`.
 	function layoutArgKey(t: Type, scope: Scope): string {
-		return t.type === 'ref' && !t.typeArgs && TYPED_ARRAY_TAGS.has(t.name) ? t.name : T.typeKey(T.resolve(scope, t));
+		return t.type === 'ref' && !t.typeArgs && T.WASM_PSEUDO_TYPES.has(t.name) ? t.name : T.typeKey(T.resolve(scope, t));
 	}
 
 	function ensureObjectShape(name: string, typeArgs?: Type[], declScope?: Scope): ClassInfo | undefined {
@@ -9569,7 +9533,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// A generic instantiation whose type argument survives the collapse below (`Box<number>`) is cached
 		// under a composite key, not the bare class name. Keying off the *unresolved* class name (not
 		// `T.resolve`'s expanded form) keeps two classes with identical field shapes from colliding.
-		// A wasm pseudo-type argument (`TypedArray<u8>`/`<i32>`/etc, see `TYPED_ARRAY_TAGS`) is kept
+		// A wasm pseudo-type argument (`TypedArray<u8>`/`<i32>`/etc, see `T.WASM_PSEUDO_TYPES`) is kept
 		// unresolved too, by its own name -- `T.resolve` collapses every one of them alike down to plain
 		// `number` (they're all just `= number` aliases), which would otherwise key `TypedArray<u8>` and
 		// `TypedArray<i32>` identically and wrongly collide the two into one shared (and wrongly $elem-tagged
@@ -9856,7 +9820,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (decl.typeParams && typeArgs) {
 			decl.typeParams.forEach((p, i) => {
 				const t = typeArgs[i];
-				if (t.type === 'ref' && TYPED_ARRAY_TAGS.has(t.name)) {
+				if (t.type === 'ref' && T.WASM_PSEUDO_TYPES.has(t.name)) {
 					defines[p.name] = t.name;
 				} else {
 					const w = typeOf(typeArgs[i]);

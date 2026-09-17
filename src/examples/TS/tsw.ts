@@ -4,16 +4,16 @@ import path from 'path';
 import * as TS from './ts-parser';
 import * as JSX from './jsx-parser';
 import * as T from './type-utils';
-import { TStoWasm, makeLibScope } from './towasm';
+import { TStoWasm, LIB_AST } from './towasm';
 import { TStypeCheckAsync, OutputOptionsDefault } from './transform';
 import { ModuleLoader, collectModules, OptionsDefault as ModuleOptionsDefault } from './module-loader';
-import { SEVERITY } from './checker';
+import { SEVERITY, makeLibScope } from './checker';
 
 const parser = TS.make();
 // Built once, reused across every input file below -- same lib declarations either way, no reason to
 // re-check them per file. Passed into `TStypeCheckAsync` so user code is checked with lib members already
 // in view -- `TStoWasm` reads the same lib-aware scope back off `ast.scope`, not passed to it directly.
-const libScope = makeLibScope();
+const libScope = makeLibScope(LIB_AST);
 
 type JSX = 'preserve' | 'react-jsx' | 'react-jsxdev'	| 'automatic' | 'react' | 'classic';
 
