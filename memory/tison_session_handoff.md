@@ -13,7 +13,7 @@ nothing else: it is rewritten wholesale, not appended to.
 
 ## As of 2026-09-17 (evening)
 
-**HEAD `3793591` — "drop the inlineSmallCalls pass; inlining belongs in a prepass".** `0fcf399` landed
+**HEAD `0dedb5c` — "FunctionContext.emitIf, so the arms of a conditional stop being hand-swapped".** `0fcf399` landed
 the placement batch: `ClassInfo.addField`/`fieldDeclaredType`/`isBaseOf`, `Types.func`/`funcAt`/`nullable`/
 `envBase` and `narrowedTypeOf`/`narrowedValueTypeOf`/`inNarrowed`/`staticGuard` are methods; `withContext`/
 `emitTrailingUnreachable`/`emitResumableDispatch` stayed on the TS subclass (async/generator lowering is
@@ -23,8 +23,9 @@ the neutral modules. Then: one `FunctionContext.tempCounter` replaced six module
 `scratchName`, and assignment expressions run in their own scope so their scratch slots are freed; the type
 section took its own struct shapes (`Types.closureBase`/`closure`/`holder`) so `emitDefaultValue`,
 `emitOptionalAccess` and `typeofHeapType` could leave, taking `toValType` as an explicit parameter the way
-`toFuncBody` already does; and `inlineSmallCalls` was deleted. Sizes: towasm 9,601 · type-utils 3,915 ·
-wasm-types 729 · wasm-asm 227.
+`toFuncBody` already does; `inlineSmallCalls` was deleted; and `emitIf` replaced the hand-swapped
+conditional protocol at 21 sites (towasm's `swapOut` uses 131 -> 71). Sizes: towasm 9,542 · type-utils 3,915 ·
+wasm-types 737 · wasm-asm 227.
 
 **The placement rule, for every future candidate** (the user endorsed it): needs `TStoWasm`'s registries
 (`classes`, `types`, `ensureClass`) -> stays a free function taking `ctx` for now, because Step 5's
@@ -61,7 +62,16 @@ language's, and the neutral functions that need it take `toValType` as an EXPLIC
 `ensureClass` unreachable from the neutral layer. `register` dedupes structurally, so `Types.closure` needs
 no cache; `closureTypes` in towasm is a signature REGISTRY (`an`-dispatch scans it), not a cache.
 
-**Gates at `3793591`:** build clean · eslint clean · test-towasm green · test-checker green · difftest
+**Reuse is exhausted as whole functions; what is left is helpers and the assembler.** With every registry
+assumed neutral the survey unlocks only 17 of 148 functions (327 of those lines are the two expando
+collectors, which are language code), and 125 stay blocked by `typeOf`/`emitAs`/`coerceTop`/`owner*`/
+`ensure*` — the TS layer itself. So the remaining reusable units are: emission primitives on the base
+(`emitIf` landed; an `emitLoop` would serve only 4 sites), the module assembler's neutral core
+(`place`, `mod.datas`/`elements`, and the rec-group rule, which is pure `Types` policy), the data/string
+section (`addData`/`internString`), and misplacements to fix — `memOp` is wasm-op knowledge sitting in
+type-utils, and the assembler's `touchesMemory` wants it.
+
+**Gates at `0dedb5c`:** build clean · eslint clean · test-towasm green · test-checker green · difftest
 **2191/2200 · 0 disagree · 9 unsupported**. The corpus is 2200 cases only with the nine assignment-order
 cases added to `assistant/difftest.ts` — that file is GITIGNORED, so a tree without them reports 2182/2191.
 At `bce6f7d`, corpus-ab vs `7b6e3fc` was every bucket **+0** (tested 13,527 · threw 345 · GAP 346 ·
@@ -105,7 +115,7 @@ baseline on a move. Fix the determinism later; never read a survey delta as prog
 
 ## Tree state
 
-HEAD `02279f5`, working tree clean at the time of writing. **The user edits and commits concurrently —
+HEAD `0dedb5c`, working tree clean at the time of writing. **The user edits and commits concurrently —
 re-check `git status`; never trust this line.**
 
 ## Keeping this current
