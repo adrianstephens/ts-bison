@@ -4055,6 +4055,30 @@ async function main() {
 	}
 
 	{
+		// Two interfaces laid out alike share ONE struct, so their union is that class physically though no single TS owner
+		// names it (walker.ts's `call | construct`, both a `CallSig`): a computed key reads, writes and deletes through it.
+		// `delete` through a union boxed as `anyref` goes the by-key way too.
+		const { sharedLayoutKey } = await compile(`
+			interface C { type: 'call'; n: number; s?: string }
+			interface K { type: 'construct'; n: number; s?: string }
+			interface D { type: 'd'; m: string; s?: string }
+			function strip<N extends Record<string, any>>(node: N, k: string): N {
+				const r = { ...node };
+				if (node[k as keyof N] !== undefined)
+					delete r[k as keyof N];
+				return r;
+			}
+			function pick(i: number): C | K { return i > 0 ? { type: 'call', n: 1, s: 'x' } : { type: 'construct', n: 2, s: 'y' }; }
+			function pickD(i: number): C | D { return i > 0 ? { type: 'call', n: 1, s: 'x' } : { type: 'd', m: 'q', s: 'y' }; }
+			export function sharedLayoutKey(): number {
+				const a = strip(pick(1), 's'), b = strip(pickD(0), 's');
+				return (a.s === undefined ? 1 : 0) + a.n * 10 + (b.s === undefined ? 100 : 0) + (b.type === 'd' ? 1000 : 0);
+			}
+		`);
+		check('a computed key and delete on a union laid out as one struct, or boxed', sharedLayoutKey(), 1111);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').

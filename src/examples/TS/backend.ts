@@ -3816,7 +3816,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// A computed STRING key on a struct, the write side of `case 'index'`'s own by-name read (walker.ts's `mapObject`'s
 			// `r[k] = ret`): the assignment goes to whichever field the key names, and a key naming none writes nothing, since a
 			// struct has no slot to grow.
-			const byNameOwner = ownerOf(target.object, ctx);
+			const byNameOwner = classOfForIndexing(target.object, ctx);
 			if (byNameOwner && byNameOwner.typeIndex !== -1 && byNameOwner.fields.length && T.isAssignable(ctx.narrowedTypeOf(target.index), T.STRING, ctx.typeScope)) {
 				const n			= ctx.tempCounter++;
 				const objId		= Identifier(`#keyobj$${n}`);
@@ -4790,7 +4790,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 					// A computed STRING key on a struct (`walker.ts`'s `mapObject`, `node[k]` with `k: keyof N`): JS looks the property up by name at run time, which is that comparison
 					// over the class's own field names -- synthesized, so the ordinary member reads and conditional lowering compile it. A key naming no field reads `undefined`, as JS does.
-					const byName = ownerOf(e.object, ctx);
+					const byName = classOfForIndexing(e.object, ctx);
 					if (byName && byName.typeIndex !== -1 && byName.fields.length && T.isAssignable(ctx.narrowedTypeOf(e.index), T.STRING, ctx.typeScope)) {
 						const n			= ctx.tempCounter++;
 						const objId		= Identifier(`#keyobj$${n}`);
@@ -5142,14 +5142,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (e.operator === 'delete') {
 					if (e.operand.type !== 'index' && e.operand.type !== 'member')
 						throw "'delete' is only supported on a property ('delete obj[k]' or 'delete obj.p')";
-					const cls = ownerOf(e.operand.object, ctx);
+					const object	= e.operand.object;
+					const cls		= classOfForIndexing(object, ctx);
 					if (e.operand.type === 'index' && cls?.methodDecls.get('delete')) {
-						emitAs(e.operand.object, ctx, cls.thisWtype!);
+						emitAs(object, ctx, cls.thisWtype!);
 						return emitMethodCall(cls, 'delete', [e.operand.index], ctx);
 					}
 					// A struct cannot lose a slot, and an absent optional field is already one holding `undefined` (an omitted literal
 					// field), so deleting stores that. A required field has no such state: its non-null cast traps, as TS forbids it.
-					if (!cls || cls.typeIndex === -1 || !cls.fields.length)
+					// A union of structs boxed as one `anyref` counts; a value typed `any` may be a dynamic object, where that is no delete.
+					if (!(cls && cls.typeIndex !== -1 && cls.fields.length) && !(physicallyAny(object, ctx) && !T.isAny(ctx.narrowedTypeOf(object))))
 						throw "'delete' is only supported on a struct's field or a dynamic object's key";
 					emitExpr(Assign<Expr, never>(e.operand, Identifier('undefined')), ctx, 'void');
 					ctx.emit(I.i32.const(1));
