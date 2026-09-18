@@ -335,8 +335,9 @@ class FunctionContext extends W.FunctionContext {
 
 	// Where `e`'s physical type is decided. A call has no slot: its value is what the instance built, and a generic
 	// instance is chosen with the NARROWED arguments (`box(v)` inside `if (v === null)` builds `{value: null}`).
+	// Nor does an array literal: its storage is its elements' as narrowed (`p.t ? [p.t] : []` is a `number[]`).
 	physicalScope(e: Expr): Scope {
-		return e.type === 'call' || e.type === 'new' ? this.typeScope : this.scope;
+		return e.type === 'call' || e.type === 'new' || e.type === 'array' ? this.typeScope : this.scope;
 	}
 
 	narrowedValueTypeOf(unwrapped: Expr): Type {

@@ -2211,6 +2211,20 @@ async function main() {
 	}
 
 	{
+		// An array literal has no slot: its storage is its elements' as NARROWED, so `[p.t]` under `p.t ?` is a `number[]`.
+		const { narrowedElements } = await compile(`
+			interface P { t?: number }
+			const g = (p: P): number[] => p.t ? [p.t] : [];
+			const f = (ps: P[]) => ps.flatMap(p => p.t ? [p.t] : []);
+			export function narrowedElements(): number {
+				const a: P = { t: 4 }, b: P = {};
+				return g(a)[0] * 100 + f([a, b, a]).length * 10 + g(b).length;
+			}
+		`);
+		check('array literal: elements typed as narrowed', narrowedElements(), 420);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed
