@@ -37,10 +37,8 @@ has its root cause. The general mechanisms, worth knowing before editing nearby:
 ERROR with the real tsc (`node_modules/.bin/tsc --noEmit --target es2020 <file>`, 6.0.3) before calling it a
 false positive -- seven of this session's were true positives.
 
-**Gates, identical at every commit since `6e29763`** — so all thirteen were behaviour-preserving:
-build clean · eslint 0 errors / 94 warnings (none in backend.ts) · test-towasm · test-checker ·
-test-cpp-backend 17/17 · difftest **2191/2200 · 0 disagree · 9 unsupported** · corpus gate
-**838 / 11,012, baseline 838**.
+**Gates, at every commit through `148f0b4`:** build clean · test-towasm · test-checker · test-cpp-backend ·
+difftest **2191/2200 · 0 disagree · 9 unsupported** · corpus gate (parser) **838 / 11,012, baseline 838**.
 
 **Gate note:** difftest does NOT cover a change to *which* code reaches codegen — it only compares output
 for cases that already compile. `npm run gate` (the 11,012-file corpus) is the one that does. Run both for
