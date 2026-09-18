@@ -4,7 +4,7 @@ import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
 import * as Common from '../common';
-import { Literal, Binary, Assign, Member, hasMod } from '../common';
+import { Literal, Identifier, Binary, Assign, Member, hasMod } from '../common';
 import * as WT from '../wasm-codegen';
 import { TSWError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess, typeofHeapType } from '../wasm-codegen';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
@@ -347,7 +347,7 @@ class FunctionContext extends WT.FunctionContext {
 			} else {
 				const tmpName = `#param$${i}`;
 				this.declareValue(tmpName, p.wtype, p.tsType);
-				const incoming: Expr = { type: 'identifier', name: tmpName };
+				const incoming: Expr = Identifier(tmpName);
 				pending.push(JS.VarDecl('let', JS.Var<Type>(p.key,
 					p.calleeDefault ? { type: 'binary', operator: '??', left: incoming, right: p.calleeDefault.value } as Expr : incoming, p.calleeDefault?.tsType)));
 			}
@@ -1485,7 +1485,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			?? (resolved?.type === 'object' ? ensureAnonObjectShape(resolved)?.thisType : undefined);
 		if (!wt || wt === 'void' || !d.init)
 			return undefined;
-		const g = ensureGlobal(`$lazy$${key}`, types.nullable(wt), { type: 'identifier', name: 'undefined' }, true);
+		const g = ensureGlobal(`$lazy$${key}`, types.nullable(wt), Identifier('undefined'), true);
 		lazyGlobalSlots.set(key, g);
 
 		const { funcIndex, typeIndex } = types.func([], toResults(wt));
@@ -1695,7 +1695,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const shared = distinct.size === 1 ? present[0].params[i] : REF_ANY;
 			if (present.length < sigs.length) {
 				params.push(types.nullable(shared));
-				defaults.push({ type: 'identifier', name: 'undefined' });
+				defaults.push(Identifier('undefined'));
 			} else {
 				params.push(shared);
 				defaults.push(undefined);
@@ -1902,7 +1902,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// Every remaining value of an iterator, into a new array: what JS's `...` does with an iterable, and a rest pattern.
 	function drainIterator(iterator: Expr, it: T.IterationTypes, ctx: FunctionContext): Expr {
 		const arrName = `#iter$${ctx.tempCounter++}`, rName = `#iter$${ctx.tempCounter++}`;
-		const arr: Expr = { type: 'identifier', name: arrName }, r: Expr = { type: 'identifier', name: rName };
+		const arr: Expr = Identifier(arrName), r: Expr = Identifier(rName);
 		emitStmt(JS.VarDecl('const', JS.Var(arrName, { type: 'array', elements: [] } as Expr, TS.ArrayType(it.yield))), ctx);
 		emitStmt(JS.For(
 			JS.VarDecl('let', JS.Var(rName, T.nextCall(iterator, it, ctx.typeScope))),
@@ -1920,7 +1920,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return operand;
 		const itName = `#iter$${ctx.tempCounter++}`;
 		emitStmt(JS.VarDecl('const', JS.Var(itName, JS.Call(JS.Member(operand, '[Symbol.iterator]'), []))), ctx);
-		return drainIterator({ type: 'identifier', name: itName }, it, ctx);
+		return drainIterator(Identifier(itName), it, ctx);
 	}
 
 	// A destructuring pattern bound from `value` one level at a time: each level is materialized into a typed temp first, so
@@ -1930,7 +1930,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			emitStmt(JS.VarDecl(kind, JS.Var(target, value, typeAnnotation)), ctx);
 			return;
 		}
-		const temp = (): Expr => ({ type: 'identifier', name: `#destructure$${ctx.tempCounter++}` });
+		const temp = (): Expr => Identifier(`#destructure$${ctx.tempCounter++}`);
 		const declare = (id: Expr, init: Expr, type?: Type) => emitStmt(JS.VarDecl('const', JS.Var((id as { name: string }).name, init, type)), ctx);
 		const tmp = temp();
 		declare(tmp, value, typeAnnotation);
@@ -1947,7 +1947,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					emitPatternBinding(kind, el.target, el.default
 						? { type: 'conditional', test: Binary<Expr, '<'>('<', Literal(i), JS.Member(tmp, 'length')), alternate: el.default,
 							consequent: readsPastEnd(elem, ctx)
-								? { type: 'conditional', test: Binary<Expr, '==='>('===', elem, { type: 'identifier', name: 'undefined' } as Expr), consequent: el.default, alternate: elem } as Expr
+								? { type: 'conditional', test: Binary<Expr, '==='>('===', elem, Identifier('undefined')), consequent: el.default, alternate: elem } as Expr
 								: elem } as Expr
 						: elem, undefined, ctx);
 				});
@@ -2077,7 +2077,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					build: () => {
 						const name	= `$uvar$${n}$${k}`;
 						ctx.emit(I.local.get(src.index), I.ref.cast(o!.typeIndex), I.local.set(ctx.declareValue(name, o!.thisWtype!, members[k]).index));
-						coerceTop(emitExpr(withProp(i, { type: 'spread', operand: { type: 'identifier', name } as Expr }), ctx), ctx, result);
+						coerceTop(emitExpr(withProp(i, { type: 'spread', operand: Identifier(name) }), ctx), ctx, result);
 					},
 				})));
 			}
@@ -2092,7 +2092,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				emitAs(p.value, ctx, wt);
 				ctx.emit(I.local.set(ctx.declareValue(name, wt, precise).index));
 				return emitArms(values.map(v => ({
-					test: () => { emitAs({ type: 'binary', operator: '===', left: { type: 'identifier', name }, right: v } as Expr, ctx, 'i32'); },
+					test: () => { emitAs({ type: 'binary', operator: '===', left: Identifier(name), right: v } as Expr, ctx, 'i32'); },
 					build: () => coerceTop(emitExpr(withProp(i, { ...p, value: v as unknown as Expr }), ctx), ctx, result),
 				})));
 			}
@@ -2985,7 +2985,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const tags		= named.some(n => n === undefined) ? ALL : ALL.filter(tag => named.includes(tag));
 		const held		= `#typeof$${ctx.tempCounter++}`;
 		emitStmt(JS.VarDecl('const', JS.Var(held, operand, t)), ctx);
-		const id: Expr	= { type: 'identifier', name: held };
+		const id: Expr	= Identifier(held);
 		const str		= typeOf(T.STRING)!;
 		const cascade = (i: number): void => {
 			const tag = tags[i];
@@ -3102,7 +3102,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	function copyElements(value: Expr, got: WT.Type, ctx: FunctionContext, want: WT.Type, typeIndex: number, dst: number): void {
 		const n			= ctx.tempCounter++;
 		const fromName	= `$spread$from$${n}`, atName = `$spread$at$${n}`;
-		const from		= Common.Identifier(fromName);
+		const from		= Identifier(fromName);
 		const slot		= wtypeOf(value, ctx) ?? got;
 		coerceTop(got, ctx, slot);
 		ctx.emit(I.local.set(ctx.declareValue(fromName, slot, ctx.narrowedTypeOf(value)).index));
@@ -3111,7 +3111,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		ctx.emit(I.array.new_default(typeIndex), I.local.set(dst), I.i32.const(0), I.local.set(i));
 		ctx.emitLoop(() => {
 			ctx.emit(I.local.get(i), I.local.get(dst), I.array.len, I.i32.ge_u, I.br_if(1), I.local.get(dst), I.local.get(i));
-			emitAs(JS.Index(from, Common.Identifier(atName)), ctx, want);
+			emitAs(JS.Index(from, Identifier(atName)), ctx, want);
 			ctx.emit(I.array.set(typeIndex), I.local.get(i), I.i32.const(1), I.i32.add, I.local.set(i), I.br(0));
 		});
 	}
@@ -3447,7 +3447,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			emitArrayElements(owner.fields.map((f): Expr => Literal(f.name)), ctx, ARR_WTYPE.i16, 'ref', types.array('ref'));
 			return ARR_WTYPE.ref;
 		}
-		const value = (f: { name: string }): Expr => ({ type: 'member', object: { type: 'identifier', name: objName }, property: f.name });
+		const value = (f: { name: string }): Expr => ({ type: 'member', object: Identifier(objName), property: f.name });
 		emitArrayElements(owner.fields.map((f): Expr => which === 'values' ? value(f) : ({
 			type: 'array',
 			elements: [Literal(f.name), value(f)],
@@ -3704,7 +3704,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}),
 					write: makeWrite(wtype, (val, name) => {
 						ctx.emit(I.local.get(obj));
-						emitMethodCall(cls, T.accessorKey('set', target.property), [{ type: 'identifier', name }], ctx);
+						emitMethodCall(cls, T.accessorKey('set', target.property), [Identifier(name)], ctx);
 					}),
 				};
 			}
@@ -3758,7 +3758,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				emitAs(target.index, ctx, getSig.params[0]);
 				const indexName = `$index$${ctx.tempCounter++}`;
 				ctx.emit(I.local.set(ctx.temp(indexName, getSig.params[0])));
-				const idxExpr: Expr = { type: 'identifier', name: indexName };
+				const idxExpr: Expr = Identifier(indexName);
 				const wtype = getSig.result;
 
 				return {
@@ -3772,7 +3772,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// `storeCore`'s own contract (see `makeWrite`) is to leave nothing on the stack -- true for free for a `void`-returning
 						// `set(i,v)`, but `Map.set()` returns `this` for chaining, so its result needs an explicit drop or the whole
 						// expression-statement's stack balance is wrong.
-						if (emitMethodCall(cls, setter, [idxExpr, { type: 'identifier', name }], ctx) !== 'void')
+						if (emitMethodCall(cls, setter, [idxExpr, Identifier(name)], ctx) !== 'void')
 							ctx.emit(I.drop);
 					}),
 				};
@@ -3784,9 +3784,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const byNameOwner = ownerOf(target.object, ctx);
 			if (byNameOwner && byNameOwner.typeIndex !== -1 && byNameOwner.fields.length && T.isAssignable(ctx.narrowedTypeOf(target.index), T.STRING, ctx.typeScope)) {
 				const n			= ctx.tempCounter++;
-				const objId		= { type: 'identifier', name: `#keyobj$${n}` } as Expr;
-				const keyId		= { type: 'identifier', name: `#key$${n}` } as Expr;
-				const valId		= { type: 'identifier', name: `#keyval$${n}` } as Expr;
+				const objId		= Identifier(`#keyobj$${n}`);
+				const keyId		= Identifier(`#key$${n}`);
+				const valId		= Identifier(`#keyval$${n}`);
 				const keyWtype	= typeOf(T.STRING)!;
 				emitAs(target.object, ctx, byNameOwner.thisWtype!);
 				ctx.emit(I.local.set(ctx.declareValue(`#keyobj$${n}`, byNameOwner.thisWtype!, byNameOwner.thisTsType!).index));
@@ -3797,7 +3797,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					test:		{ type: 'binary', operator: '===', left: keyId, right: Literal(f.name) } as Expr,
 					consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
 					alternate,
-				}) as Expr, { type: 'identifier', name: 'undefined' } as Expr);
+				}) as Expr, Identifier('undefined'));
 				return {
 					wtype:	REF_ANY_NULLABLE,
 					old:	captureOld(REF_ANY_NULLABLE, () => emitAs(readChain, ctx, REF_ANY_NULLABLE)),
@@ -4050,7 +4050,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}) } });
 		}
 
-		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length, defaults: ownParams.map((p, i) => params[i].calleeDefault || (!p.default && hasMod(p, 'optional')) ? { type: 'identifier', name: 'undefined' } as Expr : p.default), resolvedParams: params };
+		const sig: FuncSig = { params: params.map(p => p.wtype), result, hasRest: !!e.rest || !!restBound.length, defaults: ownParams.map((p, i) => params[i].calleeDefault || (!p.default && hasMod(p, 'optional')) ? Identifier('undefined') : p.default), resolvedParams: params };
 		// Captured now: the body compiles later, once this literal's own context (`Rule<CallSig>`'s action) is gone.
 		// The checker's own contextual type wins: it saw the chosen OVERLOAD, where `ctx` only has the implementation's.
 		const contextFn		= (e as { contextualType?: Type }).contextualType ?? ctx.contextualReturn;
@@ -4079,7 +4079,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// Each rest-covered parameter is read back out of that one array as a real `let x = #rest[k]`, so the
 			// ordinary indexing path types and emits it; the declared type must ride along or it reads back as the element type.
 			pending.unshift(...restBound.map((p, k) => JS.VarDecl('let', JS.Var<Type>(p.key,
-				{ type: 'index', object: { type: 'identifier', name: '#rest' }, index: Literal(k) } as Expr, p.typeAnnotation ?? wantSig!.restElem!.tsType))));
+				{ type: 'index', object: Identifier('#rest'), index: Literal(k) } as Expr, p.typeAnnotation ?? wantSig!.restElem!.tsType))));
 			// The cast-down env local (or, with no captures, just the param itself) is declared after the real params, so it's a genuine local, not mistaken for one more wasm param.
 			let envLocal	= envParam;
 			if (fields) {
@@ -4216,7 +4216,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (typeof objWtype === 'object' && 'arr' in objWtype)
 			ctx.emit(I.local.get(obj.index), I.array.len);
 		else
-			emitAs(JS.Member({ type: 'identifier', name: objName }, 'length'), ctx, 'i32');
+			emitAs(JS.Member(Identifier(objName), 'length'), ctx, 'i32');
 		ctx.emit(I.i32.lt_u);
 		ctx.emitIf(toValType(resultWtype), () => read(obj, idx), () => emitDefaultValue(resultWtype, ctx, types, toValType));
 		return resultWtype;
@@ -4383,7 +4383,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							// desugars to an ordinary `new RegExp(source, flags)` against `lib/regexp.ts`'s own self-hosted class
 							return emitExpr({
 								type: 'new',
-								callee: { type: 'identifier', name: 'RegExp' },
+								callee: Identifier('RegExp'),
 								arguments: [Literal(e.value.source), Literal(e.value.flags)],
 							}, ctx, want);
 						}
@@ -4618,7 +4618,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								// way -- matching real JS's never-set-property semantics: `Map.get` already gives that for a missing key on an
 								// allocated map, so only the map itself never allocated needs this branch.
 								ctx.emit(I.local.get(local!.index), I.struct.get(physCls.typeIndex, extIdx), I.ref.is_null);
-								ctx.emitIf(toValType(REF_ANY), () => emitAs({ type: 'identifier', name: 'undefined' }, ctx, REF_ANY), () => {
+								ctx.emitIf(toValType(REF_ANY), () => emitAs(Identifier('undefined'), ctx, REF_ANY), () => {
 									ctx.emit(I.local.get(local!.index), I.struct.get(physCls.typeIndex, extIdx), I.ref.as_non_null);
 									emitMethodCall(mapCls, 'get', [{ type: 'literal', value: e.property }], ctx);
 								});
@@ -4730,7 +4730,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const resultWtype = types.nullable(sig.result);
 						return emitBoundedRead(e, thisW, resultWtype, ctx, (obj, idx) => {
 							ctx.emit(I.local.get(obj.index));
-							coerceTop(emitMethodCall(cls, getter, [{ type: 'identifier', name: idx.name }], ctx), ctx, resultWtype);
+							coerceTop(emitMethodCall(cls, getter, [Identifier(idx.name)], ctx), ctx, resultWtype);
 						});
 					}
 					// `emitAs`, not `emitExpr` -- `e.object` may itself be boxed `anyref` (`a[i][j]`), same reasoning as the field-read cast.
@@ -4758,8 +4758,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					const byName = ownerOf(e.object, ctx);
 					if (byName && byName.typeIndex !== -1 && byName.fields.length && T.isAssignable(ctx.narrowedTypeOf(e.index), T.STRING, ctx.typeScope)) {
 						const n			= ctx.tempCounter++;
-						const objId		= { type: 'identifier', name: `#keyobj$${n}` } as Expr;
-						const keyId		= { type: 'identifier', name: `#key$${n}` } as Expr;
+						const objId		= Identifier(`#keyobj$${n}`);
+						const keyId		= Identifier(`#key$${n}`);
 						const keyWtype	= typeOf(T.STRING)!;
 						emitAs(e.object, ctx, byName.thisWtype!);
 						ctx.emit(I.local.set(ctx.declareValue(`#keyobj$${n}`, byName.thisWtype!, byName.thisTsType!).index));
@@ -4769,7 +4769,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							test:		{ type: 'binary', operator: '===', left: keyId, right: Literal(f.name) } as Expr,
 							consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
 							alternate,
-						}) as Expr, { type: 'identifier', name: 'undefined' } as Expr), ctx, want ?? REF_ANY_NULLABLE);
+						}) as Expr, Identifier('undefined')), ctx, want ?? REF_ANY_NULLABLE);
 					}
 					// A computed key on an ERASED receiver: no single struct to chain over, so every class's own arm is picked by `ref.test` at run time -- `x[k]` as JS reads it
 					// (the checker's own `throughSources`).
@@ -4894,7 +4894,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								ctx.emit(I.local.set(srcLocal.index));
 								for (const key of srcCls.fieldIndex.keys()) {
 									ctx.emit(I.local.get(mapLocal.index));
-									emitMethodCall(owner, 'set', [{ type: 'literal', value: key }, { type: 'member', object: { type: 'identifier', name: srcName }, property: key }] as Expr[], ctx);
+									emitMethodCall(owner, 'set', [{ type: 'literal', value: key }, { type: 'member', object: Identifier(srcName), property: key }] as Expr[], ctx);
 								}
 								continue;
 							}
@@ -4908,12 +4908,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							emitStmt({
 								type: 'for', kind: 'of',
 								init: JS.VarDecl('const', JS.Var(kName)),
-								right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: spreadName }, property: 'keys' }, arguments: [] },
+								right: { type: 'call', callee: { type: 'member', object: Identifier(spreadName), property: 'keys' }, arguments: [] },
 								body: JS.Block({
 									type: 'expression', expression: {
 										type: 'call',
-										callee: { type: 'member', object: { type: 'identifier', name: mapName }, property: 'set' },
-										arguments: [{ type: 'identifier', name: kName }, { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: spreadName }, property: 'get' }, arguments: [{ type: 'identifier', name: kName }] }],
+										callee: { type: 'member', object: Identifier(mapName), property: 'set' },
+										arguments: [Identifier(kName), { type: 'call', callee: { type: 'member', object: Identifier(spreadName), property: 'get' }, arguments: [Identifier(kName)] }],
 									},
 								}),
 							} as Stmt, ctx);
@@ -5146,7 +5146,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 				// `+s` is ToNumber, which for a string is exactly `Number(s)`: the lib wrapper's string constructor parses it (trimmed, '' is 0, trailing junk is NaN).
 				if (e.operator === '+' && T.typeofName(ctx.narrowedTypeOf(e.operand), ctx.scope) === 'string')
-					return emitExpr({ type: 'call', callee: { type: 'identifier', name: 'Number' }, arguments: [e.operand] } as Expr, ctx, want);
+					return emitExpr({ type: 'call', callee: Identifier('Number'), arguments: [e.operand] } as Expr, ctx, want);
 				const t = notUnsigned(scalarKind(info.wtype));
 				if (t) {
 					switch (e.operator) {
@@ -5330,7 +5330,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							// Only the left's falsy (`&&`)/truthy (`||`) part is ever kept, and when that is just null/undefined (an object is never falsy) the result is the result
 							// type's own undefined, not the left's physical value.
 							if (T.isNullish(T.logicalLeftPart(ctx.narrowedTypeOf(left), operator, ctx.scope), ctx.scope)) {
-								emitAs({ type: 'identifier', name: 'undefined' }, ctx, wtype);
+								emitAs(Identifier('undefined'), ctx, wtype);
 								return;
 							}
 							ctx.emit(I.local.get(leftLocal.index));
@@ -5510,7 +5510,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// `Math.pow` (`lib/number.ts`) is the real implementation, so rewriting to it here reuses that rather than adding a second one. A BIGINT operand still
 						// dispatches to `BigInt.pow` above via `leftInfo.owner`, so this is only reached for a genuinely numeric `**`.
 						if (method === 'pow')
-							return emitExpr({ type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Math' }, property: 'pow' }, arguments: [left, right] } as Expr, ctx, want);
+							return emitExpr({ type: 'call', callee: { type: 'member', object: Identifier('Math'), property: 'pow' }, arguments: [left, right] } as Expr, ctx, want);
 
 						if (method === 'add') {
 							const definitelyString = (x: Expr) => {
@@ -6301,8 +6301,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// `done`. `for...of` sends `undefined` to a `next` that takes a value (a generator's). Arrays stay indexed below.
 						const it = iteratesByProtocol(s.right, ctx);
 						if (it) {
-							const itId: Expr	= { type: 'identifier', name: `#for${n}$it` };
-							const rId: Expr		= { type: 'identifier', name: `#for${n}$r` };
+							const itId: Expr	= Identifier(`#for${n}$it`);
+							const rId: Expr		= Identifier(`#for${n}$r`);
 							emitStmt(JS.Block<Stmt>(
 								JS.VarDecl('const', JS.Var(`#for${n}$it`, JS.Call(JS.Member(s.right, '[Symbol.iterator]'), []))),
 								JS.For(
@@ -6314,8 +6314,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							), ctx);
 							return;
 						}
-						const arrId: Expr = { type: 'identifier', name: `#for${n}$arr` };
-						const idxId: Expr = { type: 'identifier', name: `#for${n}$i` };
+						const arrId: Expr = Identifier(`#for${n}$arr`);
+						const idxId: Expr = Identifier(`#for${n}$i`);
 
 						emitStmt(JS.Block<Stmt>(
 							JS.VarDecl('const', JS.Var(arrId.name, s.right)),
@@ -6349,7 +6349,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							emitStmt({
 								type: 'for', kind: 'of',
 								init: s.init,
-								right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Array' }, property: '_indexKeys' }, arguments: [JS.Member(s.right, 'length')] },
+								right: { type: 'call', callee: { type: 'member', object: Identifier('Array'), property: '_indexKeys' }, arguments: [JS.Member(s.right, 'length')] },
 								body: s.body,
 							}, ctx);
 							return;
@@ -6369,7 +6369,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						emitStmt({
 							type: 'for', kind: 'of',
 							init: JS.VarDecl(s.init.kind, { ...v, name: JS.ArrayPattern([{ target: v.name }]) }),
-							right: { type: 'call', callee: { type: 'member', object: { type: 'identifier', name: 'Object' }, property: 'entries' }, arguments: [s.right] },
+							right: { type: 'call', callee: { type: 'member', object: Identifier('Object'), property: 'entries' }, arguments: [s.right] },
 							body: s.body,
 						}, ctx);
 						return;
@@ -6454,7 +6454,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				ctx.inScope(() => {
 					const discName = `#switch$${ctx.tempCounter++}`;
 					emitStmt(JS.VarDecl('const', JS.Var(discName, s.discriminant)), ctx);
-					const discId: Expr = { type: 'identifier', name: discName };
+					const discId: Expr = Identifier(discName);
 
 					const old = ctx.swapOut();
 
@@ -6496,7 +6496,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// A sibling created earlier already captured this name's forward holder (`ensureForwardHolder`): fill that.
 				if (ctx.lookup(s.name)?.holderInner) {
 					ctx.inScope(() => {
-						const target = emitAssignTarget({ type: 'identifier', name: s.name }, ctx, 'none');
+						const target = emitAssignTarget(Identifier(s.name), ctx, 'none');
 						coerceTop(emitClosureLiteral(s, ctx, true), ctx, target.wtype);
 						target.write(false);
 					});
@@ -6659,7 +6659,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emitIf(undefined, build);
 						ctx.exitLabel();
 					};
-					dispatch(1, () => outerOnReturn.emit(ctx, returnValueLocal ? { type: 'identifier', name: '#finally$retval' } : undefined));
+					dispatch(1, () => outerOnReturn.emit(ctx, returnValueLocal ? Identifier('#finally$retval') : undefined));
 					// Skip an arm entirely when no such target was enclosing this construct (those action codes can then never be set), since
 					// 'case break'/'case continue' would otherwise reject the synthesized statement outright.
 					if (guard.breakTargetsLenAtEntry > 0)
@@ -7861,7 +7861,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				key:	'constructor',
 				params,
 				body:	info.superClass
-					? [JS.ExprStmt({ type: 'call', callee: { type: 'super' }, arguments: params.map(p => ({ type: 'identifier', name: p.key as string })) } as Expr)]
+					? [JS.ExprStmt({ type: 'call', callee: { type: 'super' }, arguments: params.map(p => (Identifier(p.key as string))) } as Expr)]
 					: [],
 			} as unknown as MethodMember);
 		}
@@ -7938,7 +7938,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const emitParamPropertyInits = () => {
 			for (const p of params) {
 				if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected'))
-					setField(p.key as string, { type: 'identifier', name: p.key as string });
+					setField(p.key as string, Identifier(p.key as string));
 			}
 		};
 		// A class-level field initializer (`tag: number = 99`) isn't in the constructor's `body`; it is synthesized as `this.field = value`
@@ -8276,8 +8276,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		lateWorklist.push(() => {
 			const dctx	= new FunctionContext(`key_${kind}`, new Scope(libGlobal), plainReturn(result), undefined);
 			const recv	= dctx.declareLocal('$recv', REF_ANY);
-			const keyId: Expr = { type: 'identifier', name: '$key' };
-			const valId: Expr = { type: 'identifier', name: '$value' };
+			const keyId: Expr = Identifier('$key');
+			const valId: Expr = Identifier('$value');
 			dctx.declareValue('$key', keyWtype, T.STRING);
 			if (kind === 'set')
 				dctx.declareValue('$value', REF_ANY_NULLABLE, T.ANY);
@@ -8290,7 +8290,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					continue;
 				seen.add(cls.typeIndex);
 				const objName		= `$obj$${cls.typeIndex}`;
-				const objId: Expr	= { type: 'identifier', name: objName };
+				const objId: Expr	= Identifier(objName);
 				const isKey			= (f: string): Expr => ({ type: 'binary', operator: '===', left: keyId, right: Literal(f) } as Expr);
 				candidates.push({ heap: cls.typeIndex, arm: () => {
 					const obj = dctx.declareValue(objName, cls.thisWtype!, cls.thisTsType!);
@@ -8300,7 +8300,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							test:		isKey(f.name),
 							consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
 							alternate,
-						}) as Expr, { type: 'identifier', name: 'undefined' } as Expr), dctx, REF_ANY_NULLABLE);
+						}) as Expr, Identifier('undefined')), dctx, REF_ANY_NULLABLE);
 					else
 						cls.fields.forEach(f => emitStmt({ type: 'if',
 							test:		isKey(f.name),
@@ -8655,7 +8655,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						dctx.emit(I.local.get(argLocals[j].index));
 						coerceTop(argWtypes[j], dctx, p);
 					} else {
-						emitAs({ type: 'identifier', name: 'undefined' }, dctx, p);
+						emitAs(Identifier('undefined'), dctx, p);
 					}
 				});
 				dctx.emit(I.local.get(held), I.struct.get(c.structTypeIndex, 0), I.call_ref(c.funcTypeIndex));
@@ -8870,7 +8870,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				dctx.emit(I.local.get(recv.index), I.ref.test(m.cls.typeIndex));
 				const _cond = dctx.swapOut();
 				dctx.emit(I.local.get(recv.index), I.ref.cast(m.cls.typeIndex));
-				emitMethodCall(m.cls, '__get', [{ type: 'identifier', name: '$idx' }], dctx);
+				emitMethodCall(m.cls, '__get', [Identifier('$idx')], dctx);
 				coerceUnionArm(m.wtype, dctx, result);
 				return [..._cond, I.if(result === 'void' ? undefined : toValType(result), dctx.swapOut(), buildArm(i + 1))];
 			}
