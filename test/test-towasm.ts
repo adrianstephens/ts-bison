@@ -3988,6 +3988,20 @@ async function main() {
 	}
 
 	{
+		// The lib had no `ReadonlyArray`, so `readonly T[]` was an unknown name: assignable to anything, `undefined` included,
+		// which made `Exclude<readonly T[], undefined>` `never` (walker.ts's `NodeMap<ArrayLit>`, whose `elements` is readonly).
+		check('a readonly array is not assignable to undefined',
+			typeErrors(`declare const xs: readonly number[]; const c: undefined = xs;`).some(x => /not assignable/.test(x)), true);
+		const { readonlyExclude } = await compile(`
+			export function readonlyExclude(): number {
+				const f = (x: Exclude<readonly number[] | undefined, undefined>) => x.length;
+				return f([1, 2, 3]);
+			}
+		`);
+		check('Exclude keeps a readonly array', readonlyExclude(), 3);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').
