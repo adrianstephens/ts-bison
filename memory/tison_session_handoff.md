@@ -13,9 +13,10 @@ nothing else: it is rewritten wholesale, not appended to.
 
 ## As of 2026-09-17 (late)
 
-**HEAD `b9be812`.** Four commits: `307aa89` folded `towasm-analysis.ts` back in, `a69d68a` renamed
+**HEAD `efe46bd`.** Six commits: `307aa89` folded `towasm-analysis.ts` back in, `a69d68a` renamed
 `wasm-types.ts` → `wasm-codegen.ts`, `f09f3d4` put `emitBlock`/`emitLoop` and `TagSection` on the neutral
-side, `b9be812` swept 50 hand-built identifier nodes onto `Identifier()`. The file architecture is settled
+side, `b9be812` swept 50 hand-built identifier nodes onto `Identifier()`, `025cc32` did the other nine node kinds,
+`efe46bd` renamed `TSWError` → `WasmError`. The file architecture is settled
 (see its own section) and the cross-language row is CLOSED, not paused: with `TSEmitter` rejected there is
 no further neutral extraction of consequence. Sizes: towasm **9,722** · type-utils 3,911 · wasm-codegen 829
 · wasm-asm 227. Gates at each commit: build clean · eslint 0 errors / 94 warnings, none in towasm.ts ·
@@ -35,11 +36,19 @@ protocol — load state, `emitResumableDispatch`, wrap in a loop — and **the r
 block ladder is also left alone: it uses the UNMATCHED `swapOut()` form (close off what has accumulated,
 continue in a fresh list), which `emitBlock` does not fit.
 
-**Next, concrete: 60 more hand-built AST nodes in towasm.ts** that common.ts already has constructors for —
-`member` 14, `expression` 9 (`ExprStmt`), `call` 9, `literal` 6, `conditional` 6, `binary` 6, `assign` 4,
-`spread` 2, `return` 2, `index` 2. Same change as `b9be812`, which also showed the real win: 11 `as Expr`
-casts existed only because an object literal doesn't widen to the `Expr` union, and the constructor's
-return type does. Watch the generic ones (`Binary<Expr, '==='>`).
+**The AST-node sweep is DONE** (`b9be812` identifiers, `025cc32` the other nine kinds). Every node in
+towasm.ts is built with common.ts's or js-parser's constructor now; `as Expr`/`as Stmt` went 38 → 16,
+because an object literal doesn't widen to the union on its own and a constructor's return type does.
+Use `JS.Member`/`Call`/`Index`/`Spread` (they carry `optional`), common.ts's for the rest.
+
+**ONE site is deliberately still hand-built** — the union-discriminant arm in `case 'object'` (~line 2097).
+Converting it surfaced a real latent problem: `v` there is a TS literal **type**, not an expression, used
+in an expression position. That is legal only because both are `Common.Literal`, differing in the value
+type parameter (`TemplatePart<Type>[]` vs `TemplatePart<Expr>[]`), and the whole-node `as Expr` hid it.
+**The fix**: exclude template-literal members in the `every` guard (they have no comparable runtime value,
+so an arm for one is already meaningless) and build `Literal(v.value)` — that removes the neighbouring
+`v as unknown as Expr` too. Deferred because it changes WHICH union members compile into arms, so it needs
+its own difftest run. Do not "fix" it by adding a cast; that was tried and reverted.
 
 The previous entry, for the work that built the neutral layer:
 
@@ -170,8 +179,7 @@ either.
 
 ## Open, waiting on the user — do not assume
 
-- `TSWError` is TS-named inside the neutral file (13 refs, 2 files) — `WasmError`/`LowerError`. Offered,
-  not yet answered; the user said yes only to the file rename.
+- (`TSWError` → `WasmError` is DONE, `efe46bd`. The `tsw:` message prefix stays — it is the binary's name.)
 - The **BigInt row** (6 declarations) is a real overload-*resolution* gap in `candidateFits`; unchosen.
 - The **`WT` prefix rename** (~459 refs) was explicitly handed to the user — an editor find/replace. A file
   rename does not force it: `import * as WT from '../wasm-codegen'` is fine.
