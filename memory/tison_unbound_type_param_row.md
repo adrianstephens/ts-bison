@@ -1,72 +1,40 @@
 ---
 name: tison-unbound-type-param-row
-description: OPEN, diagnosed but unfixed — the survey's largest row (~109 declarations) is a signature reaching codegen with its typeParams gone but its params still naming one. Reproducer, what is ruled out, and the single remaining question.
+description: RESOLVED 2026-09-17 — the survey's ~109-declaration "function type parameter 'x': 'T'367' has no representation" row was inferTypeArgs leaking a GENERIC argument's own bound type parameter; fixed with baseSignature. How it was found, and the traps.
 metadata:
   type: project
   modified: 2026-09-17
 ---
 
-The self-hosting survey's biggest cause row. **Diagnosed, deliberately NOT fixed** — the two obvious fixes
-are forbidden workarounds, and the real one is in fragile substitution code that should not be improvised.
+**Resolved.** The row went from ~109 declarations to 3, and those 3 are unrelated signatures
+(`EnumValue<EnumType>`, `Parameters<typeof …>[1]`). The ~96 that moved now stop at the next real wall,
+`param 'fields' needs an explicit type`.
 
-## Reproduce it in ~30s
+## Root cause
 
-```
-npx ts-node -T tison/assistant/probe-one-decl.ts tison/src/examples/TS/type-utils.ts \
-    typeofName tupleReadType primitiveConstraint intersectionConstraint
-```
+`walker.ts`: `const mapTypeA = mapDefined(mapType)`. `mapType` is GENERIC (`<T extends Type>(t?: T) => …`,
+from `makeProcess`), and `mapDefined<T>(map: (x: T) => T | undefined)` infers its `T` from it.
+`inferTypeArgs`'s `function` case (and its `method`-member twin) matched the argument's parameters without
+accounting for the argument's OWN `typeParams`, so `T := T'367`: the bound name escaped its binder, and
+`mapTypeA` came out `(x: T'367) => T'367`. The substitution layer (`avoidCapture` etc.) was innocent;
+the memory's earlier "is it `resolve`?" question was wrong too.
 
-All four fail with the **identical** message — `function type parameter 'x': 'T'367' has no representation,
-in '(x:T'367) => T'367'` — so it is ONE shared signature being hit repeatedly, not a per-declaration fault.
-Run from the workspace root. (`alwaysThrows` in `checker.ts` is NOT a reproducer: it is one of the ~20 that
-compile with a fresh scope. Shared-vs-fresh `libScope` changes only WHICH declaration hits the wall first;
-re-probing all 129 with a fresh scope per run still fails 109.)
+**Fix:** `baseSignature` in `type-utils.ts` — TS's `getBaseSignature`: own type params → their
+constraints (`unknown` when unconstrained), applied to the argument signature before matching. TS would
+go further with higher-order inference (TS 3.4) and give `<T extends Type>(x: T) => T`; tison does not
+implement that — a missing feature, not this bug.
 
-## The mechanism, confirmed
+## How it was found (reusable technique)
 
-Every failure exits through the single throw in `closureSigParts` (`TS/backend.ts`). At that point the
-signature **has no `typeParams`, while a parameter annotation still names one** — so the substitution branch
-just above (`if (func.typeParams?.length)`, which exists precisely for generic signatures) never runs, and
-`typeOf` has nothing to resolve `T'367` to.
+The throw's message names a fresh `T'N`. Instrument `freshTypeParamName` to print a stack when the id is N,
+then instrument `typeKey` to print a stack when it renders the failing string: the second stack reached
+`emitStmt`'s local-declaration `typeOf`, and one temporary log there printed the function and local name.
 
-Proof without instrumenting anything: `printer.ts`'s `case 'function'` renders `typeParams(t.typeParams)`
-before the parameter list, and the message shows `(x:T'367) => T'367` with **no `<…>` binder**.
+## Traps
 
-## Three claims from the first write-up that are WRONG — do not act on them
-
-1. **"`T'N` is a red herring, typeKey renames for display."** No. `typeKey` is `tocode.type(t)` — the
-   printer, no renaming. `T'367` is the actual name in the node.
-2. **"The fresh names are `U'N`/`S'N` from `arrayMethod`."** Not for these. `freshTypeParamName` has exactly
-   four call sites: `avoidCapture` (base = the existing param's own name) and three in `arrayMethod` that
-   mint `U`, `U`, `S`. A `T'`-based name can ONLY come from `avoidCapture`.
-3. **"The parameter named `x` means it is `Object.entries<T>(x: T)` in lib.d.ts."** No. Those return
-   `[string, any][]` / `any[]` / `string[]`; this signature returns `T`. **No `(x: T) => T` exists anywhere
-   in `lib/`** — so the failing signature is synthesized, not read from source.
-
-(Also corrected: the first write-up said `tison/CLAUDE.md` flags the substitution core as fragile. It does
-not — CLAUDE.md says nothing about substitution. The fragility notes that exist cover different areas:
-`Array`'s dual declaration in [[tison-towasm-self-hosting-plan]], `resolveTypes` in
-[[tison-readtype-resolution]].)
-
-## Ruled out — all three PRESERVE typeParams, verified by reading them
-
-- `avoidCapture` (`type-utils.ts`) — renames the bound param and every reference to it consistently, and
-  rebuilds `typeParams` with the new names.
-- `substituteShadowed` — rebuilds `typeParams: own.map(...)`.
-- the walker's `mapSig` — includes `typeParams: mapArrayA(mapTypeParam)`.
-
-So the loss happens **downstream of substitution**, not inside it.
-
-## The single remaining question
-
-`closureSigParts` has exactly ONE caller: `typeOfUncached`'s `case 'function'`, which passes `resolved` —
-the output of `T.resolve`. **So: does `resolve` (or something it calls) rebuild a function type without its
-`typeParams`?** That is where to start, and it is one question rather than a hunt.
-
-## Do not "fix" it either of these ways
-
-Deleting the throw, or returning `REF_ANY` for an unbound parameter, converts 109 honest failures into 109
-silent `any` boxes. The survey count would jump while nothing worked — exactly what CLAUDE.md's
-"instruments must not reward silence" section describes.
+- `test/test-checker.ts` imports from `dist/` — an A/B without `npm run examples` on each side tests nothing.
+- The checker shows the leak too: before the fix the checker printed
+  `(x: any) => any` for the test's `total(id)`, silently `any`-ing it — so the leak was ALSO a checker
+  silent-`any`, not just a codegen throw.
 
 Related: [[tison-session-handoff]], [[tison-checker-inference]], [[tison-towasm-self-hosting-plan]].

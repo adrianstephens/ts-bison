@@ -898,6 +898,24 @@ function substituteShadowed<S extends TS.CallSig>(sig: S, map: Map<string, Type>
 	};
 }
 
+// TS's `getBaseSignature`: `sig`'s own type parameters replaced by their constraints (`unknown` when unconstrained), so none escapes its binder.
+// A constraint may name a sibling in either direction (`<K extends keyof T, T>`); constraints are acyclic, so n-1 passes settle them.
+export function baseSignature<S extends TS.CallSig>(sig: S): S {
+	if (!sig.typeParams?.length)
+		return sig;
+	const map = new Map(sig.typeParams.map(p => [p.name, p.constraint ?? UNKNOWN] as const));
+	for (let i = 1; i < map.size; i++)
+		map.forEach((t, name) => map.set(name, substituteType(t, map)));
+	const sub = (t: Type) => substituteType(t, map);
+	return {
+		...sig,
+		typeParams:	undefined,
+		params:		sig.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: sub(p.typeAnnotation) } : p),
+		rest:		sig.rest?.typeAnnotation ? { ...sig.rest, typeAnnotation: sub(sig.rest.typeAnnotation) } : sig.rest,
+		returnType:	sig.returnType && sub(sig.returnType),
+	};
+}
+
 // TS's rule for a missing type argument: a parameter's DEFAULT may name the parameters before it (`Call<E, A = E>` in common.ts),
 // so each default is instantiated with the arguments already chosen -- otherwise the bare parameter escapes into the member types.
 export function typeArgMap(typeParams: readonly TS.TypeParam[], typeArgs: readonly Type[] | undefined, fallback: Type = ANY): Map<string, Type> {
@@ -2990,8 +3008,9 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 		} else if (paramT.type === 'function' || paramT.type === 'constructor') {
 			// A callable value built via `Object.assign(fn, {...})` (e.g. `rational`) comes out as an intersection, not a bare
 			// `'function'`/`'constructor'` node -- `flattenIntersection` finds the actual callable part, as `narrow()` also does.
-			const fn = flattenIntersection(a, scope).find(p => p.type === paramT.type) as typeof paramT;
-			if (fn) {
+			const callable = flattenIntersection(a, scope).find(p => p.type === paramT.type) as typeof paramT;
+			if (callable) {
+				const fn = baseSignature(callable);
 				flipped(() => paramT.params.forEach((p, i) => {
 					const q = fn.params[i];
 					if (p.typeAnnotation && q?.typeAnnotation)
@@ -3023,8 +3042,9 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 						recurse(m.typeAnnotation, t, depth - 1);
 				} else if (m.type === 'method') {
 					// Same shape as `function`/`constructor` above -- `adapter0<T,D>`-style interfaces often carry `T`/`D` only in a method's own signature.
-					const t = lookupMember(a, key, scope);
-					if (t?.type === 'function') {
+					const member = lookupMember(a, key, scope);
+					if (member?.type === 'function') {
+						const t = baseSignature(member);
 						flipped(() => m.params.forEach((p, i) => {
 							const q = t.params[i];
 							if (p.typeAnnotation && q?.typeAnnotation)

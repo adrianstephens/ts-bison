@@ -172,6 +172,8 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['an assignment nested in a call argument narrows after the branch', 'interface B { v: number } declare const m: Map<string, B>; function f(k: string): B { let b = m.get(k); if (!b) { m.set(k, b = { v: 1 }); } return b; }', []],
 	// TS instantiates a type parameter's default with the arguments already chosen, so one naming an earlier parameter resolves.
 	['a type parameter default naming an earlier one is instantiated with it', 'interface C<E, A = E> { c: E; args: A[] } declare const x: C<number>; const q: boolean = x.args;', ['number[]']],
+	// A generic argument infers through its base signature (TS's `getBaseSignature`), or its own bound `T` escapes into the result.
+	['a generic callback argument infers from its constraints', 'declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
 ];
 
 (async () => {

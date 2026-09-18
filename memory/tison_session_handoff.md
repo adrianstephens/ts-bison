@@ -98,8 +98,6 @@ signature-local types count (`mergeOverloadSigs` needs only `types` but returns 
 - **`emitResumableDispatch` should own its own loop**, retiring the last two hand-written loops in
   `compileGeneratorFunc`/`compileAsyncFunc` (32- and 70-line bodies, so wrapping them at the call site
   makes things worse). It needs a `loadState` callback, the read counterpart of `setFrame`.
-- **The unbound-type-param row** (~109 declarations, the survey's largest) — diagnosed, unfixed, needs a
-  session with the type structure in hand. [[tison-unbound-type-param-row]].
 - **The BigInt row** (6 declarations) is a real overload-*resolution* gap in `candidateFits`; unchosen.
 - **The `WT` prefix rename** (~459 refs) was handed to the user — an editor find/replace.
 - `test-towasm.ts` is now the odd name beside `test-cpp-backend.ts`; not renamed, to avoid churn.
@@ -117,8 +115,9 @@ order/state-dependent, so a single-run `REGRESSED` line is noise — never read 
 the last full run's per-declaration results. Its TARGETS list was repointed at `ed2d662` (it had been
 naming three files that no longer exist).
 
-At 2026-09-17 it reads **135/396 compile in isolation, 302 failures from 198 causes**. The biggest row is
-diagnosed and open — see [[tison-unbound-type-param-row]], and do not "fix" it at the throw.
+At 2026-09-17 (after `baseSignature`) it reads **136/393 compile in isolation, 298 failures from 69 causes**.
+The old biggest row is closed ([[tison-unbound-type-param-row]]); the biggest now is `param 'fields' needs
+an explicit type` (96), then `'t.elements' is indexed but is not an array` (31).
 
 `assistant/towasm-hoist-survey.ts` still answers "does this need the scope?" by the binding rather than the
 name (`--module`, `--single`, `--dump`/`--apply`), but most of what it unlocked was gated on `TSEmitter`
