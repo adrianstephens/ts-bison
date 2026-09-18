@@ -2658,9 +2658,11 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				? src.value === dst.value
 				: !precise && src.type === 'ref' && dst.value !== null && src.name === typeof dst.value;	// widened source: lenient (inventory C1)
 		// A literal is never an array, and a type parameter is opaque; any other name still here could not be expanded, so stays unverifiable.
+		// Against a structural target it boxes as its primitive does: `"def"` satisfies `Object` exactly as `string` does.
 		if (src.type === 'literal')
-			return dst.type === 'ref' && (INTRINSIC_TYPES.has(dst.name) ? dst.name === (src.value === null ? 'null' : typeof src.value)
-				: dst.name !== 'Array' && dst.name !== 'ReadonlyArray' && !dstScope.type(dst.name)?.isTypeParam);
+			return dst.type === 'ref' ? (INTRINSIC_TYPES.has(dst.name) ? dst.name === (src.value === null ? 'null' : typeof src.value)
+				: dst.name !== 'Array' && dst.name !== 'ReadonlyArray' && !dstScope.type(dst.name)?.isTypeParam)
+				: src.value !== null && recurse(TS.RefType(typeof src.value), dst, depth - 1);
 
 		// `dst`/`src` can no longer be `'array'` here -- `normalizeArray` plus `resolve()` above already expanded that into the real
 		// lib.es5 structural body. Only tuple-vs-tuple is left to handle structurally.
@@ -2679,9 +2681,18 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			// TS's arity rule (compareSignaturesRelated): a source needing more arguments than the target ever passes is not one.
 			if (!dst.rest && minArgumentCount(src, scope) > dst.params.filter(p => p.key !== 'this').length)
 				return false;
+			// Parameters are BIVARIANT, TS's method-parameter rule and its weakest: each pair need only relate one way,
+			// but a `(h: Handler) => ...` is no `(value: number) => ...` callback either way.
+			const own = (f: typeof src) => f.params.filter(p => p.key !== 'this');
+			const srcParams = own(src), dstParams = own(dst);
+			if (srcParams.some((p, i) => {
+				const s = p.typeAnnotation, d = dstParams[i]?.typeAnnotation;
+				return s && d && !recurse(s, d, depth - 1) && !recurse(d, s, depth - 1);
+			}))
+				return false;
 			if (!dst.returnType || !src.returnType)
 				return true;	// missing return type (e.g. an unmodeled class method): lenient
-			// parameters deliberately unchecked (bivariance noise); returns covariant, void-dst absorbs anything
+			// returns covariant, void-dst absorbs anything
 			return dst.returnType.type === 'ref' && dst.returnType.name === 'void'
 				|| recurse(src.returnType, dst.returnType, depth - 1);
 		}

@@ -292,7 +292,12 @@ export function candidateFits(c: TS.CallSig, args: Expr[], scope: Scope, typeArg
 // unannotated callback needs that to type its own body (`xs.map(x => [a, b])` against a `[K, V][]`
 // parameter), not just its parameters.
 function applyContextualParams(params: JS.Param<Type>[], expected: Type | undefined, scope: Scope) {
-	const sig = expected && resolveFnMember(expected, scope);
+	// TS's isAritySmaller: a signature with fewer parameters than the callback REQUIRES gives it no context at all -- an overload
+	// trial with `(req1: string) => void` must not type `(req, res) => ...`, which only the two-parameter overload fits.
+	const own		= params.filter(p => p.key !== 'this');
+	const required	= own.findIndex(p => !!p.default || hasMod(p, 'optional'));
+	const found		= expected && resolveFnMember(expected, scope);
+	const sig		= found && (found.rest || found.params.filter(p => p.key !== 'this').length >= (required < 0 ? own.length : required)) ? found : undefined;
 	if (sig) {
 		// Past the declared fixed parameters it is the REST that covers them, so its ELEMENT is the
 		// contextual type -- `(_, a, b) => ...` against `(substring: string, ...args: any[]) => string`,
@@ -837,8 +842,18 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 			// Truthiness-narrows a dotted property path (`if (icon.color)`), keyed by the whole path -- no alias-following, since `scope.alias`
 			// only tracks plain-identifier `const` initializers, not member chains.
 			case 'member': {
-				const key	= T.pathKey(test);
-				return key ? narrowValue(scope, key, truthy, scope.value(key) ?? typeOf(test, scope, false)) : scope;
+				const key		= T.pathKey(test);
+				const narrowed	= key ? narrowValue(scope, key, truthy, scope.value(key) ?? typeOf(test, scope, false)) : scope;
+				// ...and the union holding it, by TS's discriminant rule: a member whose property can never pass the test goes
+				// (`if (c.errors) return;` drops `{errors: E[]}` and keeps `{errors?: never}`).
+				const objKey	= T.pathKey(referenceOf(test.object));
+				const objT		= objKey && (narrowed.value(objKey) ?? typeOf(test.object, narrowed, false));
+				if (!objT || T.resolveOwn(objT, narrowed).type !== 'union')
+					return narrowed;
+				return narrowValue(narrowed, objKey, m => {
+					const p = T.lookupMember(m, test.property, narrowed);
+					return !p || T.unionMembers(T.optional(p, T.memberOptional(m, test.property, narrowed)), narrowed).some(truthy);
+				}, objT);
 			}
 			// `if ((x = e))` narrows x by truthiness
 			case 'assign':
@@ -1381,12 +1396,24 @@ function discriminateContext(t: Type, lit: Expr & { type: 'object' }, scope: Sco
 	const members = T.unionMembers(t, scope);
 	if (members.length < 2)
 		return t;
-	const literals = lit.properties.flatMap(p => p.type === 'field' && typeof p.key === 'string' && p.value?.type === 'literal' && !Array.isArray(p.value.value) ? [[p.key, p.value.value] as const] : []);
-	const kept = members.filter(m => literals.every(([key, value]) => {
+	// TS's discriminateContextualTypeByObjectMembers: a written unit (a literal, or `undefined`), and a discriminant the literal leaves
+	// out, which reads as `undefined` -- so `{cb}` against `{disc: true; ...} | {disc?: false; ...}` is the second member's.
+	const UNDEFINED = Symbol('undefined');
+	const written = new Map<string, unknown>(lit.properties.flatMap((p): [string, unknown][] => p.type !== 'field' || typeof p.key !== 'string' ? []
+		: p.value?.type === 'literal' && !Array.isArray(p.value.value) ? [[p.key, p.value.value]]
+		: p.value?.type === 'identifier' && p.value.name === 'undefined' ? [[p.key, UNDEFINED]] : []));
+	const present = new Set(lit.properties.flatMap(p => p.type !== 'spread' && typeof p.key === 'string' ? [p.key] : []));
+	// A key's unit values in `m`, or undefined when it is no discriminant there (some non-unit type, or absent).
+	const unitsOf = (m: Type, key: string) => {
 		const pt = T.lookupMember(m, key, scope);
 		const units = pt && T.unionMembers(pt, scope).map(u => T.resolveOwn(u, scope));
-		return !units || !units.every(u => u.type === 'literal') || units.some(u => u.type === 'literal' && u.value === value);
-	}));
+		return units && units.every(u => u.type === 'literal' || T.isRef(u, 'undefined'))
+			? [...units.map(u => u.type === 'literal' ? u.value : UNDEFINED), ...T.memberOptional(m, key, scope) ? [UNDEFINED] : []] : undefined;
+	};
+	const omitted = [...new Set(members.flatMap(m => { const r = T.resolveMembers(m, scope); return r.type === 'object' ? r.members : []; })
+		.flatMap(m => m.type === 'property' && typeof m.key === 'string' && hasMod(m, 'optional') && !present.has(m.key) ? [m.key] : []))];
+	const tests = [...written, ...omitted.map(k => [k, UNDEFINED] as const)];
+	const kept = members.filter(m => tests.every(([key, value]) => { const units = unitsOf(m, key); return !units || units.some(u => u === value); }));
 	return kept.length && kept.length < members.length ? T.combineTypes(kept) : t;
 }
 

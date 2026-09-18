@@ -181,6 +181,17 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a guard to any[] keeps the union member that is an array', 'declare const v: number | string[]; if (Array.isArray(v)) { const q: number = v; }', [NOT_ASSIGNABLE('string[]', 'number')]],
 	// ...and the same relation picks inference's common supertype: an `any` candidate makes it `any`, not the other candidate.
 	['an any candidate makes the inferred type any', 'declare function f<T>(a: T, b: T): T; declare const x: any; const q: string = f(x, 1);', []],
+	// Callback parameters are bivariant, TS's weakest rule: a pair unrelated in both directions is still no fit.
+	['callback parameters unrelated both ways do not fit', 'interface A { a: number } interface B { b: number } declare function srt(f: (x: A) => number): void; declare function byB(x: B): number; srt(byB);', ["Argument of type '(x: B) => number'"]],
+	// A literal against a structural target boxes as its primitive does, so a literal-typed value is an `Object` as `string` is.
+	['a literal-typed value satisfies Object', 'declare const s: "def"; const o: Object = s; declare function fo(x: Object): void; const d: (x: "def") => void = fo;', []],
+	// TS's isAritySmaller: an overload whose callback takes fewer parameters than the literal requires gives it no context.
+	['a too-short overload does not type a callback', 'interface O { (h1: (a: string) => void): void; (h2: (a: number, b: number) => void): void; } declare const use: O; use((req, res) => { const q: string = req; });', [NOT_ASSIGNABLE('number', 'string')]],
+	// A written `undefined`, or a discriminant the literal leaves out, discriminates a union context as TS does.
+	['an undefined or omitted discriminant picks the optional member', 'type DT = { disc: true; cb: (x: string) => void }; type DF = { disc?: false; cb: (x: number) => void }; declare function f(o: DT | DF): void; f({ disc: undefined, cb: n => { const q: string = n; } }); f({ cb: n => { const q: string = n; } });', [NOT_ASSIGNABLE('number', 'string'), NOT_ASSIGNABLE('number', 'string')]],
+	// A property's truthiness narrows the union holding it (TS's discriminant rule): past `if (c.errors) return`, only the member
+	// whose `errors` can be falsy is left, so `coerced` is no longer possibly undefined.
+	['a property truthiness test narrows the union holding it', "interface E { e: number } type C = { errors: ReadonlyArray<E>; coerced?: never } | { coerced: { [v: string]: unknown }; errors?: never }; declare const c: C; function g(): { vv: { [v: string]: unknown } } | undefined { if (c.errors) return undefined; const k: number = c.coerced; return { vv: c.coerced }; }", ["unknown\n}' is not assignable to type 'number'"]],
 	// A read off a union is each member's read: one member's optional property makes it possibly undefined.
 	['an optional property read through a union includes undefined', "interface C { n: number; s?: string } interface D { m: string; s?: string } declare const u: C | D; const q: string = u.s;", [NOT_ASSIGNABLE('string | undefined', 'string')]],
 	// A spread of a union distributes, as TS's getSpreadType does: the literal is one shape per member, not an unknowable `any`.
