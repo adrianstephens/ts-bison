@@ -4,7 +4,7 @@ import * as TS from './ts-parser';
 import * as JS from './js-parser';
 import * as T from './type-utils';
 import * as Common from '../common';
-import { Literal, Identifier, Binary, Assign, Member, hasMod } from '../common';
+import { Literal, Identifier, Binary, Assign, Conditional, Member, hasMod } from '../common';
 import * as WT from '../wasm-codegen';
 import { TSWError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess, typeofHeapType } from '../wasm-codegen';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
@@ -349,7 +349,7 @@ class FunctionContext extends WT.FunctionContext {
 				this.declareValue(tmpName, p.wtype, p.tsType);
 				const incoming: Expr = Identifier(tmpName);
 				pending.push(JS.VarDecl('let', JS.Var<Type>(p.key,
-					p.calleeDefault ? { type: 'binary', operator: '??', left: incoming, right: p.calleeDefault.value } as Expr : incoming, p.calleeDefault?.tsType)));
+					p.calleeDefault ? Binary<Expr, '??'>('??', incoming, p.calleeDefault.value) : incoming, p.calleeDefault?.tsType)));
 			}
 		});
 		return pending;
@@ -727,7 +727,7 @@ function arrowOrFunctionToDecl(name: string, e: JS.Arrow<Type> | JS.FunctionExpr
 	return {
 		type: 'function_decl', name,
 		params: e.params, rest: e.rest, typeParams: e.typeParams, returnType: e.returnType,
-		body: Array.isArray(e.body) ? e.body : e.body !== undefined ? [{ type: 'return', argument: e.body }] : [],
+		body: Array.isArray(e.body) ? e.body : e.body !== undefined ? [JS.Return(e.body)] : [],
 	};
 }
 
@@ -1157,7 +1157,7 @@ function expandTupleSpreads(args: Expr[], ctx: FunctionContext): Expr[] {
 		const t = T.resolve(ctx.typeScope, ctx.narrowedTypeOf(a.operand));
 		if (t.type !== 'tuple')
 			return [a];
-		return t.elements.map((_, i): Expr => ({ type: 'index', object: a.operand, index: Literal(i) } as Expr));
+		return t.elements.map((_, i): Expr => JS.Index(a.operand, Literal(i)));
 	});
 }
 
@@ -1907,7 +1907,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		emitStmt(JS.For(
 			JS.VarDecl('let', JS.Var(rName, T.nextCall(iterator, it, ctx.typeScope))),
 			JS.JSUnary('!', JS.Member(r, 'done')),
-			{ type: 'assign', target: r, value: T.nextCall(iterator, it, ctx.typeScope) } as Expr,
+			Assign<Expr, never>(r, T.nextCall(iterator, it, ctx.typeScope)),
 			{ type: 'expression' as const, expression: JS.Call(JS.Member(arr, 'push'), [JS.Member(r, 'value')]) },
 		), ctx);
 		return arr;
@@ -1945,10 +1945,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						return;
 					const elem = JS.Index(tmp, Literal(i));
 					emitPatternBinding(kind, el.target, el.default
-						? { type: 'conditional', test: Binary<Expr, '<'>('<', Literal(i), JS.Member(tmp, 'length')), alternate: el.default,
-							consequent: readsPastEnd(elem, ctx)
-								? { type: 'conditional', test: Binary<Expr, '==='>('===', elem, Identifier('undefined')), consequent: el.default, alternate: elem } as Expr
-								: elem } as Expr
+						? Conditional<Expr>(
+							Binary<Expr, '<'>('<', Literal(i), JS.Member(tmp, 'length')),
+							readsPastEnd(elem, ctx)
+								? Conditional<Expr>(Binary<Expr, '==='>('===', elem, Identifier('undefined')), el.default, elem)
+								: elem,
+							el.default)
 						: elem, undefined, ctx);
 				});
 				if (target.rest)
@@ -1964,7 +1966,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					continue;
 				const got = JS.Member(r, 'value');
 				emitPatternBinding(kind, el.target, el.default
-					? { type: 'conditional', test: JS.Member(r, 'done'), consequent: el.default, alternate: Binary('??', got, el.default) } as Expr
+					? Conditional<Expr>(JS.Member(r, 'done'), el.default, Binary('??', got, el.default))
 					: got, el.default ? undefined : it.yield, ctx);
 			}
 			if (target.rest)
@@ -2077,7 +2079,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					build: () => {
 						const name	= `$uvar$${n}$${k}`;
 						ctx.emit(I.local.get(src.index), I.ref.cast(o!.typeIndex), I.local.set(ctx.declareValue(name, o!.thisWtype!, members[k]).index));
-						coerceTop(emitExpr(withProp(i, { type: 'spread', operand: Identifier(name) }), ctx), ctx, result);
+						coerceTop(emitExpr(withProp(i, JS.Spread(Identifier(name))), ctx), ctx, result);
 					},
 				})));
 			}
@@ -3447,7 +3449,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			emitArrayElements(owner.fields.map((f): Expr => Literal(f.name)), ctx, ARR_WTYPE.i16, 'ref', types.array('ref'));
 			return ARR_WTYPE.ref;
 		}
-		const value = (f: { name: string }): Expr => ({ type: 'member', object: Identifier(objName), property: f.name });
+		const value = (f: { name: string }): Expr => JS.Member(Identifier(objName), f.name);
 		emitArrayElements(owner.fields.map((f): Expr => which === 'values' ? value(f) : ({
 			type: 'array',
 			elements: [Literal(f.name), value(f)],
@@ -3565,7 +3567,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const _allocBranch = ctx.swapOut();
 			ctx.emit(I.if(undefined, _cond, _allocBranch));
 			ctx.emit(I.local.get(scratch.index), I.struct.get(owner.typeIndex, extIdx), I.ref.as_non_null);
-			emitMethodCall(mapCls, 'set', [{ type: 'literal', value: key }, valueExpr], ctx);
+			emitMethodCall(mapCls, 'set', [Literal(key), valueExpr], ctx);
 			ctx.emit(I.drop);
 		}
 		ctx.emit(I.local.get(scratch.index));
@@ -3793,19 +3795,19 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				emitAs(target.index, ctx, keyWtype);
 				ctx.emit(I.local.set(ctx.declareValue(`#key$${n}`, keyWtype, T.STRING).index));
 				const valLocal	= ctx.declareValue(`#keyval$${n}`, REF_ANY_NULLABLE, T.ANY);
-				const readChain	= byNameOwner.fields.reduce<Expr>((alternate, f) => ({ type: 'conditional',
-					test:		{ type: 'binary', operator: '===', left: keyId, right: Literal(f.name) } as Expr,
-					consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
+				const readChain	= byNameOwner.fields.reduce<Expr>((alternate, f) => Conditional<Expr>(
+					Binary<Expr, '==='>('===', keyId, Literal(f.name)),
+					JS.Member(objId, f.name),
 					alternate,
-				}) as Expr, Identifier('undefined'));
+				), Identifier('undefined'));
 				return {
 					wtype:	REF_ANY_NULLABLE,
 					old:	captureOld(REF_ANY_NULLABLE, () => emitAs(readChain, ctx, REF_ANY_NULLABLE)),
 					write:	makeWrite(REF_ANY_NULLABLE, val => {
 						ctx.emit(I.local.get(val), I.local.set(valLocal.index));
 						byNameOwner.fields.forEach(f => emitStmt({ type: 'if',
-							test:		{ type: 'binary', operator: '===', left: keyId, right: Literal(f.name) } as Expr,
-							consequent:	{ type: 'expression', expression: { type: 'assign', target: { type: 'member', object: objId, property: f.name }, value: valId } as Expr } as Stmt,
+							test:		Binary<Expr, '==='>('===', keyId, Literal(f.name)),
+							consequent:	JS.ExprStmt(Assign<Expr, never>(JS.Member(objId, f.name), valId)),
 						} as Stmt, ctx));
 					}),
 				};
@@ -3853,7 +3855,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		} else if (target.type === 'assign' && isPurePath(target.target)) {
 			// `(a.b ??= []).push(x)`: the assignment runs first, and its own target is where the write-back goes (a wasm array's
 			// `push` builds a new one). Only for a target without side effects, which is read again rather than held.
-			emitStmt({ type: 'expression', expression: target }, ctx);
+			emitStmt(JS.ExprStmt(target), ctx);
 			const inner = emitAssignTarget(target.target, ctx, old);
 			// The kept value is the assignment's result, non-null when that is (`??=`), though its slot may be nullable.
 			const result = wtypeOf(target, ctx);
@@ -4079,7 +4081,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// Each rest-covered parameter is read back out of that one array as a real `let x = #rest[k]`, so the
 			// ordinary indexing path types and emits it; the declared type must ride along or it reads back as the element type.
 			pending.unshift(...restBound.map((p, k) => JS.VarDecl('let', JS.Var<Type>(p.key,
-				{ type: 'index', object: Identifier('#rest'), index: Literal(k) } as Expr, p.typeAnnotation ?? wantSig!.restElem!.tsType))));
+				JS.Index(Identifier('#rest'), Literal(k)), p.typeAnnotation ?? wantSig!.restElem!.tsType))));
 			// The cast-down env local (or, with no captures, just the param itself) is declared after the real params, so it's a genuine local, not mistaken for one more wasm param.
 			let envLocal	= envParam;
 			if (fields) {
@@ -4108,7 +4110,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				fnCtx.emitTrailingUnreachable(result);
 			} else {
 				// The checker stamps an expression body with the scope it checked it in, as it stamps a block body's statements.
-				emitStmt(Object.assign({ type: 'return', argument: body } as Stmt, { scope: (body as any).scope }), fnCtx);
+				emitStmt(Object.assign(JS.Return(body) as Stmt, { scope: (body as any).scope }), fnCtx);
 			}
 			info.body = fnCtx.toFuncBody(1 + params.length, toValType);
 		}, e, ctx.homeModule, `${e.name ?? '<closure>'} in ${ctx.name}`));
@@ -4549,7 +4551,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// A real `Map`-typed value is unaffected: its type is a `ref`, for which `indexSignatureValueType` is undefined.
 				if (cls && !isOptionalChainLink(e) && T.indexSignatureValueType(T.resolve(ctx.typeScope, ctx.narrowedTypeOf(e.object))) && methodSig(cls, 'get', ctx)) {
 					emitAs(e.object, ctx, cls.thisWtype!);
-					return emitMethodCall(cls, 'get', [{ type: 'literal', value: e.property }], ctx);
+					return emitMethodCall(cls, 'get', [Literal(e.property)], ctx);
 				}
 
 				// A `get` accessor -- checked before both the `.length` special case and the ordinary
@@ -4620,7 +4622,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								ctx.emit(I.local.get(local!.index), I.struct.get(physCls.typeIndex, extIdx), I.ref.is_null);
 								ctx.emitIf(toValType(REF_ANY), () => emitAs(Identifier('undefined'), ctx, REF_ANY), () => {
 									ctx.emit(I.local.get(local!.index), I.struct.get(physCls.typeIndex, extIdx), I.ref.as_non_null);
-									emitMethodCall(mapCls, 'get', [{ type: 'literal', value: e.property }], ctx);
+									emitMethodCall(mapCls, 'get', [Literal(e.property)], ctx);
 								});
 								return REF_ANY;
 							}
@@ -4765,11 +4767,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						ctx.emit(I.local.set(ctx.declareValue(`#keyobj$${n}`, byName.thisWtype!, byName.thisTsType!).index));
 						emitAs(e.index, ctx, keyWtype);
 						ctx.emit(I.local.set(ctx.declareValue(`#key$${n}`, keyWtype, T.STRING).index));
-						return emitExpr(byName.fields.reduce<Expr>((alternate, f) => ({ type: 'conditional',
-							test:		{ type: 'binary', operator: '===', left: keyId, right: Literal(f.name) } as Expr,
-							consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
+						return emitExpr(byName.fields.reduce<Expr>((alternate, f) => Conditional<Expr>(
+							Binary<Expr, '==='>('===', keyId, Literal(f.name)),
+							JS.Member(objId, f.name),
 							alternate,
-						}) as Expr, Identifier('undefined')), ctx, want ?? REF_ANY_NULLABLE);
+						), Identifier('undefined')), ctx, want ?? REF_ANY_NULLABLE);
 					}
 					// A computed key on an ERASED receiver: no single struct to chain over, so every class's own arm is picked by `ref.test` at run time -- `x[k]` as JS reads it
 					// (the checker's own `throughSources`).
@@ -4870,7 +4872,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						for (const p of e.properties) {
 							if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
 								throw `object literal for '${owner.name}' can only have plain 'key: value' properties (no methods or computed keys)`;
-							emitMethodCall(owner, 'set', [{ type: 'literal', value: p.key }, p.value], ctx);
+							emitMethodCall(owner, 'set', [Literal(p.key), p.value], ctx);
 						}
 						return owner.thisWtype!;
 					}
@@ -4894,7 +4896,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								ctx.emit(I.local.set(srcLocal.index));
 								for (const key of srcCls.fieldIndex.keys()) {
 									ctx.emit(I.local.get(mapLocal.index));
-									emitMethodCall(owner, 'set', [{ type: 'literal', value: key }, { type: 'member', object: Identifier(srcName), property: key }] as Expr[], ctx);
+									emitMethodCall(owner, 'set', [Literal(key), JS.Member(Identifier(srcName), key)] as Expr[], ctx);
 								}
 								continue;
 							}
@@ -4908,12 +4910,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							emitStmt({
 								type: 'for', kind: 'of',
 								init: JS.VarDecl('const', JS.Var(kName)),
-								right: { type: 'call', callee: { type: 'member', object: Identifier(spreadName), property: 'keys' }, arguments: [] },
+								right: JS.Call(JS.Member(Identifier(spreadName), 'keys'), []),
 								body: JS.Block({
 									type: 'expression', expression: {
 										type: 'call',
-										callee: { type: 'member', object: Identifier(mapName), property: 'set' },
-										arguments: [Identifier(kName), { type: 'call', callee: { type: 'member', object: Identifier(spreadName), property: 'get' }, arguments: [Identifier(kName)] }],
+										callee: JS.Member(Identifier(mapName), 'set'),
+										arguments: [Identifier(kName), JS.Call(JS.Member(Identifier(spreadName), 'get'), [Identifier(kName)])],
 									},
 								}),
 							} as Stmt, ctx);
@@ -4922,7 +4924,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
 							throw `object literal for '${owner.name}' can only have plain 'key: value' properties (no methods or computed keys)`;
 						ctx.emit(I.local.get(mapLocal.index));
-						if (emitMethodCall(owner, 'set', [{ type: 'literal', value: p.key }, p.value], ctx) !== 'void')
+						if (emitMethodCall(owner, 'set', [Literal(p.key), p.value], ctx) !== 'void')
 							ctx.emit(I.drop);
 					}
 					ctx.emit(I.local.get(mapLocal.index));
@@ -5146,7 +5148,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 				// `+s` is ToNumber, which for a string is exactly `Number(s)`: the lib wrapper's string constructor parses it (trimmed, '' is 0, trailing junk is NaN).
 				if (e.operator === '+' && T.typeofName(ctx.narrowedTypeOf(e.operand), ctx.scope) === 'string')
-					return emitExpr({ type: 'call', callee: Identifier('Number'), arguments: [e.operand] } as Expr, ctx, want);
+					return emitExpr(JS.Call(Identifier('Number'), [e.operand]), ctx, want);
 				const t = notUnsigned(scalarKind(info.wtype));
 				if (t) {
 					switch (e.operator) {
@@ -5510,7 +5512,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// `Math.pow` (`lib/number.ts`) is the real implementation, so rewriting to it here reuses that rather than adding a second one. A BIGINT operand still
 						// dispatches to `BigInt.pow` above via `leftInfo.owner`, so this is only reached for a genuinely numeric `**`.
 						if (method === 'pow')
-							return emitExpr({ type: 'call', callee: { type: 'member', object: Identifier('Math'), property: 'pow' }, arguments: [left, right] } as Expr, ctx, want);
+							return emitExpr(JS.Call(JS.Member(Identifier('Math'), 'pow'), [left, right]), ctx, want);
 
 						if (method === 'add') {
 							const definitelyString = (x: Expr) => {
@@ -6262,7 +6264,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							// `s.init`'s own declaration (`for (let t = ...; ...)`) is scoped to the loop itself, same as real JS -- opened here rather than relying on
 							// `s.body`'s own block scope, which may not exist at all if the body is a single bare statement.
 							if (s.init)
-								emitStmt(s.init.type === 'var_decl' ? s.init : { type: 'expression', expression: s.init }, ctx);
+								emitStmt(s.init.type === 'var_decl' ? s.init : JS.ExprStmt(s.init), ctx);
 
 							// A `block` wrapping a `loop`, same idiom as `while`, except the body gets its own *inner*
 							// block as the real `continue` target -- a plain `while` can reuse its restart label since it has no separate update step, but this desugared `for` has one (`s.update`) that must still run first.
@@ -6280,7 +6282,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								});
 
 								if (s.update)
-									emitStmt({ type: 'expression', expression: s.update }, ctx);
+									emitStmt(JS.ExprStmt(s.update), ctx);
 								ctx.emit(I.br(0));
 								ctx.exitLabel();
 								ctx.exitBreakTarget();
@@ -6308,7 +6310,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 								JS.For(
 									JS.VarDecl('let', JS.Var(`#for${n}$r`, T.nextCall(itId, it, ctx.typeScope))),
 									JS.JSUnary('!', JS.Member(rId, 'done')),
-									{ type: 'assign', target: rId, value: T.nextCall(itId, it, ctx.typeScope) } as Expr,
+									Assign<Expr, never>(rId, T.nextCall(itId, it, ctx.typeScope)),
 									JS.Block<Stmt>(JS.VarDecl(s.init.kind, JS.Var(v.name, JS.Member(rId, 'value'), v.typeAnnotation ?? it.yield)), s.body),
 								),
 							), ctx);
@@ -6349,7 +6351,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							emitStmt({
 								type: 'for', kind: 'of',
 								init: s.init,
-								right: { type: 'call', callee: { type: 'member', object: Identifier('Array'), property: '_indexKeys' }, arguments: [JS.Member(s.right, 'length')] },
+								right: JS.Call(JS.Member(Identifier('Array'), '_indexKeys'), [JS.Member(s.right, 'length')]),
 								body: s.body,
 							}, ctx);
 							return;
@@ -6359,7 +6361,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							emitStmt({
 								type: 'for', kind: 'of',
 								init: s.init,
-								right: { type: 'call', callee: { type: 'member', object: s.right, property: 'keys' }, arguments: [] },
+								right: JS.Call(JS.Member(s.right, 'keys'), []),
 								body: s.body,
 							}, ctx);
 							return;
@@ -6369,7 +6371,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						emitStmt({
 							type: 'for', kind: 'of',
 							init: JS.VarDecl(s.init.kind, { ...v, name: JS.ArrayPattern([{ target: v.name }]) }),
-							right: { type: 'call', callee: { type: 'member', object: Identifier('Object'), property: 'entries' }, arguments: [s.right] },
+							right: JS.Call(JS.Member(Identifier('Object'), 'entries'), [s.right]),
 							body: s.body,
 						}, ctx);
 						return;
@@ -6384,7 +6386,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const n = s.cases.length;
 				if (n === 0) {
 					// No cases -- the discriminant is still evaluated once for its side effects, same as real JS.
-					emitStmt({ type: 'expression', expression: s.discriminant }, ctx);
+					emitStmt(JS.ExprStmt(s.discriminant), ctx);
 					return;
 				}
 
@@ -7861,7 +7863,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				key:	'constructor',
 				params,
 				body:	info.superClass
-					? [JS.ExprStmt({ type: 'call', callee: { type: 'super' }, arguments: params.map(p => (Identifier(p.key as string))) } as Expr)]
+					? [JS.ExprStmt(JS.Call({ type: 'super' } as Expr, params.map(p => Identifier(p.key as string))))]
 					: [],
 			} as unknown as MethodMember);
 		}
@@ -8291,20 +8293,20 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				seen.add(cls.typeIndex);
 				const objName		= `$obj$${cls.typeIndex}`;
 				const objId: Expr	= Identifier(objName);
-				const isKey			= (f: string): Expr => ({ type: 'binary', operator: '===', left: keyId, right: Literal(f) } as Expr);
+				const isKey			= (f: string): Expr => Binary<Expr, '==='>('===', keyId, Literal(f));
 				candidates.push({ heap: cls.typeIndex, arm: () => {
 					const obj = dctx.declareValue(objName, cls.thisWtype!, cls.thisTsType!);
 					dctx.emit(I.local.get(recv.index), I.ref.cast(cls.typeIndex), I.local.set(obj.index));
 					if (kind === 'get')
-						emitAs(cls.fields.reduce<Expr>((alternate, f) => ({ type: 'conditional',
-							test:		isKey(f.name),
-							consequent:	{ type: 'member', object: objId, property: f.name } as Expr,
+						emitAs(cls.fields.reduce<Expr>((alternate, f) => Conditional<Expr>(
+							isKey(f.name),
+							JS.Member(objId, f.name),
 							alternate,
-						}) as Expr, Identifier('undefined')), dctx, REF_ANY_NULLABLE);
+						), Identifier('undefined')), dctx, REF_ANY_NULLABLE);
 					else
 						cls.fields.forEach(f => emitStmt({ type: 'if',
 							test:		isKey(f.name),
-							consequent:	{ type: 'expression', expression: { type: 'assign', target: { type: 'member', object: objId, property: f.name }, value: valId } as Expr } as Stmt,
+							consequent:	JS.ExprStmt(Assign<Expr, never>(JS.Member(objId, f.name), valId)),
 						} as Stmt, dctx));
 				} });
 			}
