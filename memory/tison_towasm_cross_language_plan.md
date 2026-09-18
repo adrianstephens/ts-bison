@@ -299,7 +299,7 @@ Gates: build clean, test-towasm all green, difftest **2182/2191 · 0 disagree** 
 **`WasmType` + `ClosureSig` + the pure helpers are now self-contained and language-free**, so the neutral
 module §3 wanted is available as a pure move: `src/examples/wasm-codegen.ts` can take `WasmScalarI`…`WasmType`,
 `ClosureSig`, `TYPED_ARRAY_TAGS`, `ARR_WTYPE`/`REF_*`, `CLOSURE_FIELDS` and the 10 helpers, while
-`TS/towasm-codegen.ts` keeps `FuncSig`/`ResolvedParam`/`Global`/`TupleT`/`jsLength` and the semantically
+`TS/towasm-types.ts` keeps `FuncSig`/`ResolvedParam`/`Global`/`TupleT`/`jsLength` and the semantically
 front-end `PRIMITIVE_TAGS`/`READONLY_ALIAS`/`isNullLiteral`/`nullLiteralKind`/`rawElemKind`. Splitting the
 import in `towasm.ts` between the two modules is what makes the boundary visible in the module graph.
 
@@ -308,7 +308,7 @@ signature, so 11 call sites spell out a sig's fields. That is now only duplicati
 
 **Step 1 COMPLETE 2026-09-16 — the neutral module exists.** `src/examples/wasm-codegen.ts` (166 lines) holds
 `WasmScalarI`…`WasmType`, `ClosureSig`, `TYPED_ARRAY_TAGS`, `ARR_WTYPE`/`REF_*`, `CLOSURE_FIELDS` and the 10
-helpers — with **no language types in it**, checked by the compiler. `TS/towasm-codegen.ts` (244 → 99 lines)
+helpers — with **no language types in it**, checked by the compiler. `TS/towasm-types.ts` (244 → 99 lines)
 keeps `FuncSig`/`ResolvedParam`/`Global`/`TupleT`/`jsLength` and the rules about TypeScript's type
 *spellings* (`PRIMITIVE_TAGS`, `READONLY_ALIAS`, `isNullLiteral`, `nullLiteralKind`, `rawElemKind`), and
 imports `WasmType`/`ClosureSig` from the neutral module — one direction only. `TS/towasm.ts` 12,411 →
@@ -343,7 +343,7 @@ and check them", which is what makes PY reachable at all.
 the workspace root, and record the table so the move's delta is readable as *MOVED* only.
 
 **Step 1 — the backend's type vocabulary and state shapes: DONE 2026-09-16, landed TS-side.**
-`TS/towasm-codegen.ts` (244 lines) now holds `WasmScalar`…`wTypeKey` with their helpers, `FuncSig`/
+`TS/towasm-types.ts` (244 lines) now holds `WasmScalar`…`wTypeKey` with their helpers, `FuncSig`/
 `FullSig`/`FuncInfo`/`Inline`/`ClosureTypeInfo`/`TupleT`/`CLOSURE_FIELDS`/`jsLength`, and
 `Local`/`Global`/`ResolvedParam`/`ClosureEnv`/`FinallyGuard`. `towasm.ts` went 12,411 → **12,186**
 lines. It is **not** the neutral module §3 originally proposed — see the blocker above; the type model
@@ -370,7 +370,7 @@ wasm concepts" invited the opposite reading): every function answers a question 
 AST, so each language's backend needs its own. "No wasm concepts" means it does not belong *inside*
 `towasm.ts`, not that it belongs in the examples root.
 
-**`TS/towasm-codegen.ts` was created and then FOLDED BACK the same day — see the rule below.** Its
+**`TS/towasm-types.ts` was created and then FOLDED BACK the same day — see the rule below.** Its
 ~99 declarations (the `FuncSig` family, `Local`/`Global`/`ResolvedParam`/`ClosureEnv`/`FinallyGuard`,
 `TYPED_ARRAY_TAGS`/`PRIMITIVE_TAGS`/`READONLY_ALIAS`/`isNullLiteral`/`nullLiteralKind`/`rawElemKind`) are
 types for ONE consumer, and splitting them from the code that uses them bought nothing.
@@ -527,7 +527,7 @@ enforcement is the imports rule) → 6+ (the seam).
 
 - **TS-specific types and TS-specific code generation stay in the same file.** They are firmly tied
   together; a vocabulary bucket whose only consumer is the file next door is indirection, and was folded
-  back (`towasm-codegen.ts`, created and removed the same day).
+  back (`towasm-types.ts`, created and removed the same day).
 - **`src/examples/wasm-codegen.ts` stays**, because it is not a bucket *for* `towasm.ts` — it is the
   language-neutral vocabulary, expected to serve the common code generation *and* each per-language one,
   and it enforces that nothing in it names a language type (the compiler rejects it).
