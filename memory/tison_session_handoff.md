@@ -11,6 +11,24 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
+## Latest: 2026-09-18 evening -- HEAD `05fe38b`
+
+Four fixes, `0009613`..`05fe38b`, all from checker.ts's `typeOf` chain (the survey's "unresolved identifier 'm'"
+row, 54 decls, was ONE missing feature, not a checker.ts problem):
+- object-literal METHODS compile, as closures in their function-typed fields; one using `this` throws explicitly.
+- `symbol` VALUES: `lib/symbol.ts` class via `builtinTypes`, identity by `ref.eq`; `typeof` knows 'symbol'.
+- `fieldDeclaredType` returns what an optional field ACCEPTS (`T | undefined`).
+- checker: uncontextual `[]` is `never[]` (was `any[]`, which absorbed unions); auto-typed `let x = []` stays `any[]`;
+  destructuring defaults union their own type in.
+
+**Next blocker (checker.ts:2205, `typeOf`)**: `(c ? inf.inferFromLiteral : inf.infer).call(inf, a, b)`.
+`Function.prototype.call` is unimplemented AND unbound method values (`i.add` not called) are unsupported
+("unknown field 'add'"). The only `.call(` in the whole surveyed set. A representation decision -- asked the user.
+Also open: walker.ts's `mapObject` `{...node}` with `N` a union routes a member to `ExprStmt<any>` (probe
+`resolveFnMember`); does not reproduce with a local union -- needs the real types.
+
+**Trap:** `cd src/examples/TS/lib && tsc -p .` EMITS `.js` beside every lib source (no `noEmit`); use `--noEmit`.
+
 ## As of 2026-09-18 -- HEAD `148f0b4`
 
 **The files:** `TS/backend.ts` (~9,750) and `CPP/backend.ts` (379) over the neutral `wasm-codegen.ts`
