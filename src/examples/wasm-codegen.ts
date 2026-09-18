@@ -184,14 +184,14 @@ export {
 	wasmTypeKey, combineUnionWtypes, storageTypeKey, wTypeKey, CLOSURE_FIELDS,
 };
 
-export class TSWError {
+export class WasmError {
 	msg:	string;
 	pos?:	Location;
 	scope:	string[] = [];
 	// The module `pos` is in, set where `pos` is (`inModule`): a position alone can't say which reached file it's in.
 	module?: string;
-	constructor(err: string|TSWError, node?: any, ...scope: string[]) {
-		if (err instanceof TSWError) {
+	constructor(err: string|WasmError, node?: any, ...scope: string[]) {
+		if (err instanceof WasmError) {
 			this.msg	= err.msg;
 			this.pos		= err.pos ?? node?.pos;
 			this.module		= err.module;
@@ -202,7 +202,7 @@ export class TSWError {
 			this.scope		= scope;
 		}
 	}
-	inModule(module: string): TSWError {
+	inModule(module: string): WasmError {
 		if (this.pos && !this.module)
 			this.module = module;
 		return this;
@@ -219,7 +219,7 @@ export function withCatchAt(item: ()=>void, node: unknown, module: string, ...sc
 		try {
 			item();
 		} catch (e) {
-			throw new TSWError(e as any, node, ...scopes).inModule(module);
+			throw new WasmError(e as any, node, ...scopes).inModule(module);
 		}
 	};
 }
@@ -229,7 +229,7 @@ export function withCatch(item: ()=>void, ...scopes: string[]) {
 		try {
 			item();
 		} catch (e) {
-			throw new TSWError(e as any, undefined, ...scopes);
+			throw new WasmError(e as any, undefined, ...scopes);
 		}
 	};
 }

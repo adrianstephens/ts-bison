@@ -6,7 +6,7 @@ import * as T from './type-utils';
 import * as Common from '../common';
 import { Literal, Identifier, Binary, Assign, Conditional, Member, hasMod } from '../common';
 import * as WT from '../wasm-codegen';
-import { TSWError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess, typeofHeapType } from '../wasm-codegen';
+import { WasmError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess, typeofHeapType } from '../wasm-codegen';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
 import { walker, walkerB } from './walker';
 import { AsmDecl, makeAsm as makeAsm0 } from '../wasm-asm';
@@ -1210,7 +1210,7 @@ function numericOpInline(method: string, a: WT.Type | undefined, b: WT.Type | un
 export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
-		throw new TSWError('ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
+		throw new WasmError('ast must be checked (TStypeCheck/TStypeCheckAsync) before TStoWasm');
 
 	// `libGlobal` must be `global` itself, not a lib-only scope: one would sever the ancestor chain and hide
 	// every user declaration from anything built off it (`ctx.scope`) -- confirmed real (`Point`/`Wrapper` broke).
@@ -5937,7 +5937,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			default:
 				throw `unsupported expression '${e.type}'`;
 		} } catch (err) {
-			throw new TSWError(err as any, e).inModule(ctx.homeModule);
+			throw new WasmError(err as any, e).inModule(ctx.homeModule);
 		}
 	}
 
@@ -6882,7 +6882,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		} catch (e) {
 			//console.log(e);
-			throw new TSWError(e as any, undefined, name, homeModule);
+			throw new WasmError(e as any, undefined, name, homeModule);
 		}
 	}
 
@@ -7848,7 +7848,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				}
 			} catch (e) {
 				//console.log(e);
-				throw new TSWError(e as any, m).inModule(info.homeModule ?? '.');
+				throw new WasmError(e as any, m).inModule(info.homeModule ?? '.');
 			}
 		}
 
@@ -7903,7 +7903,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			try {
 				inlineMethods.set(i.key, makeAsm(i.value, { typeOf, typeIndexOf: w => typeof w === 'object' && 'arr' in w ? types.array(w.arr) : undefined }, defines, i.typeParams));
 			} catch (err) {
-				throw new TSWError(err as any, i.value).inModule(info.homeModule ?? '.');
+				throw new WasmError(err as any, i.value).inModule(info.homeModule ?? '.');
 			}
 		}
 
@@ -9553,7 +9553,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				ctx.emit(...ctx.swapOut(before));
 			} catch (e) {
 				ctx.swapOut(before);
-				onTopLevelError(new TSWError(e as any, st, '<module init>').inModule(ctx.homeModule));
+				onTopLevelError(new WasmError(e as any, st, '<module init>').inModule(ctx.homeModule));
 			}
 		};
 		const emitOneTopLevel = (st: Stmt) => {
