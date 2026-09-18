@@ -734,6 +734,14 @@ function avoidCapture(sig: TS.CallSig, map: Map<string, Type>): TS.CallSig {
 	};
 }
 
+// A mapped type's key is a binder too: `Partial<{p: P}>` substitutes a type naming the caller's own `P` under `[P in keyof T]`,
+// which then captured it (`P[]` became `"p"[]`). Also what keeps an outer same-named substitution out of the body.
+function renameMappedKey(m: TS.MappedType): TS.MappedType {
+	const keyName	= freshTypeParamName(m.keyName);
+	const rename	= new Map([[m.keyName, TS.RefType(keyName)]]);
+	return { ...m, keyName, valueType: substituteType(m.valueType, rename), nameType: m.nameType && substituteType(m.nameType, rename) };
+}
+
 // The declared type of the argument sitting at REST position `k`. Usually just the rest's own element,
 // but a TUPLE rest names each position separately -- and a UNION of the two shapes names a callback in
 // only ONE arm (`Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>)`), so every arm that
@@ -952,6 +960,11 @@ export function substituteType(t: Type, map: Map<string, Type>): Type {
 					const shadowed = substituteShadowed(x, map);
 					if (shadowed)
 						return shadowed;
+				}
+				if (x.type === 'mapped') {
+					const key = x.keyName;
+					if (map.has(key) || [...map.values()].some(v => mentionsTypeParam(v, key)))
+						x = renameMappedKey(x);
 				}
 				// A rebuilt union or intersection is reduced as TS reduces an instantiated one: `T & U` at `{}` and `any` is `any`.
 				const r = process(x);

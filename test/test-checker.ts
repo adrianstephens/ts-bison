@@ -177,7 +177,9 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// type arguments -- so an inner generic call can infer from that context (walker.ts's `mapObject(t, { ps: mapArray(p => ...) })`).
 	['an argument is typed against what the earlier arguments inferred', 'declare function mapArray<T>(map: (x: T) => T | undefined): (x: readonly T[]) => T[] | undefined; interface Pn { n: number } interface Q { ps: Pn[] } declare const q: Q; declare function withPlain<N>(node: N, fields: {[K in keyof N]?: (x: N[K]) => N[K] | undefined}): N; const b = withPlain(q, { ps: mapArray(p => p.nope) });', ["Property 'nope' does not exist"]],
 	['an argument is typed against the explicit type arguments', 'declare function mapArray<T>(map: (x: T) => T | undefined): (x: readonly T[]) => T[] | undefined; interface Pn { n: number } interface Q { ps: Pn[] } declare const q: Q; declare function withPlain<N>(node: N, fields: {[K in keyof N]?: (x: N[K]) => N[K] | undefined}): N; const b = withPlain<Q>(q, { ps: mapArray(p => p.nope) });', ["Property 'nope' does not exist"]],
-	['a generic callback argument infers from its constraints','declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
+	// A mapped type's key binds only inside it: `Partial`'s own `[P in keyof T]` must not capture a caller's type named `P`.
+	['a mapped type key does not capture a same-named type substituted into it', 'interface P { n: number } declare const a: Partial<{ ps: P[] }>; const q: string = a.ps;', ['ps: P[]']],
+	['a generic callback argument infers from its constraints', 'declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
 ];
 
 (async () => {
