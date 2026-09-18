@@ -13,11 +13,33 @@ nothing else: it is rewritten wholesale, not appended to.
 
 ## As of 2026-09-17 (late)
 
-**HEAD `307aa89` — "fold towasm-analysis.ts back in".** The file architecture is now settled (see its own
-section below) and the cross-language row is CLOSED, not paused: with `TSEmitter` rejected there is no
-further neutral extraction to do. Sizes: towasm **9,726** · type-utils 3,911 · wasm-codegen 812 · wasm-asm 227.
-Gates at `307aa89`: build clean · eslint 0 errors / 94 warnings, none in towasm.ts · test-towasm green ·
-test-checker green · difftest **2191/2200 · 0 disagree · 9 unsupported** — identical to `6e29763`.
+**HEAD `b9be812`.** Four commits: `307aa89` folded `towasm-analysis.ts` back in, `a69d68a` renamed
+`wasm-types.ts` → `wasm-codegen.ts`, `f09f3d4` put `emitBlock`/`emitLoop` and `TagSection` on the neutral
+side, `b9be812` swept 50 hand-built identifier nodes onto `Identifier()`. The file architecture is settled
+(see its own section) and the cross-language row is CLOSED, not paused: with `TSEmitter` rejected there is
+no further neutral extraction of consequence. Sizes: towasm **9,722** · type-utils 3,911 · wasm-codegen 829
+· wasm-asm 227. Gates at each commit: build clean · eslint 0 errors / 94 warnings, none in towasm.ts ·
+test-towasm green · test-checker green · difftest **2191/2200 · 0 disagree · 9 unsupported** — unchanged
+since `6e29763`, so all four were behaviour-preserving.
+
+**`emitBlock`/`emitLoop` follow `emitIf`**: the body goes into its own list and the wrapper is built AFTER
+it, because the branches inside already carry depths relative to that wrapper. They own only the wrapping,
+NOT the break/continue targets — at `while` the test is emitted before `enterBreakTarget`, so the targets
+don't bracket the body uniformly and folding them in would reorder instructions.
+
+**Two loops stay hand-written on purpose** (`compileGeneratorFunc`, `compileAsyncFunc`): 32- and 70-line
+bodies, so a closure wrapper would push deeply nested code a level deeper to save two lines. Both share one
+protocol — load state, `emitResumableDispatch`, wrap in a loop — and **the right fix is for
+`emitResumableDispatch` to own its own loop** (it already owns the `br_table` ladder; it would need a
+`loadState` callback, the read counterpart of `setFrame`). Not done; a real next step. The try/finally
+block ladder is also left alone: it uses the UNMATCHED `swapOut()` form (close off what has accumulated,
+continue in a fresh list), which `emitBlock` does not fit.
+
+**Next, concrete: 60 more hand-built AST nodes in towasm.ts** that common.ts already has constructors for —
+`member` 14, `expression` 9 (`ExprStmt`), `call` 9, `literal` 6, `conditional` 6, `binary` 6, `assign` 4,
+`spread` 2, `return` 2, `index` 2. Same change as `b9be812`, which also showed the real win: 11 `as Expr`
+casts existed only because an object literal doesn't widen to the `Expr` union, and the constructor's
+return type does. Watch the generic ones (`Binary<Expr, '==='>`).
 
 The previous entry, for the work that built the neutral layer:
 
@@ -135,6 +157,16 @@ file is earned by CROSS-LANGUAGE REUSE and by nothing else — not by being wasm
   closure are all saturated with TS types — class layout 620 lines (48 `Type`, 27 `Scope`, `TS.RefType`),
   any-dispatch 502 (49 `Type`, 8 `Scope`), async/generator 420 (47 `Type`), union/virtual dispatch 235.
   Don't re-survey these hoping for a neutral core.
+
+**wasm-knowledge is NOT the same as language-neutral**, and a grep for TS types will mislead you. The test
+is "would a second front-end want exactly this?" `numericOpInline` is the trap: 30 lines of pure wasm
+opcode selection with no TS type in it, but it encodes JAVASCRIPT semantics — always-float division
+("matching real JS `number` semantics", its own comment) and `shr_u` yielding `u32`. Python or C++ need
+different rules, so it stays. Four more that read neutral and are not: `toValType`/`heapTypeIndexOf`
+(resolving a class NAME is language knowledge — `toValType` stays an explicit parameter), and
+`isSubclassOf`/`storageKindOf`/`builtinTypeOwner`/`namespaceOwner` (all read the `classes`/`builtinTypes`
+registries). `towasm-analysis.ts` failed this same test from the other direction: wasm-FREE is not neutral
+either.
 
 ## Open, waiting on the user — do not assume
 
