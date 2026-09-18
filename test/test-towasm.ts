@@ -2876,6 +2876,12 @@ async function main() {
 		// A program that never calls console.log at all must still instantiate with no imports required.
 		const { noLog } = await compile(`export function noLog(): number { return 5; }`);
 		check('a program that never calls console.log needs no imports', noLog(), 5);
+
+		// Reads memory with NO console.log. The lib's only `memory.size`/`memory.grow` are in console.ts, so every other
+		// memory case reaches one by accident; this pins the memory section to the loads themselves, nested in a loop.
+		const readBack = await compile(`export function readBack(): number { return String.fromCharCodesAt(0, 3).length; }`)
+			.then(e => e.readBack(), (e: Error) => e.message);
+		check('a memory read with no console.log still gets a memory section', readBack, 3);
 	}
 
 	{
