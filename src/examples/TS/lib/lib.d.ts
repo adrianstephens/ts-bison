@@ -111,6 +111,7 @@ declare var BigInt: {
 //-----------------------------------------------------------------------------
 
 interface Symbol {
+	readonly description: string | undefined;
 	toString(): string;
 	valueOf(): symbol;
 }
@@ -118,6 +119,7 @@ interface Symbol {
 // `Symbol` as a VALUE, as far as the lib uses one: the well-known key `[Symbol.iterator]`. A `unique symbol`, so a
 // computed key made from it is a symbol key, never checked against a numeric index signature.
 interface SymbolConstructor {
+	(description?: string | number): symbol;
 	readonly iterator: unique symbol;
 	readonly hasInstance: unique symbol;
 	readonly isConcatSpreadable: unique symbol;

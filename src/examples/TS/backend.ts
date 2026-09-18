@@ -659,6 +659,7 @@ const builtinTypes = new Map<string, { wtype: W.Type; class?: string }>([
 	['string',	{ wtype: W.ARRAY.i16,		class: 'String' }],
 	['String',	{ wtype: W.ARRAY.i16,		class: 'String' }],
 	['bigint',	{ wtype: W.ARRAY.i32,		class: 'BigInt' }],
+	['symbol',	{ wtype: { ref: 'Symbol' },	class: 'Symbol' }],
 	// Pseudo-types from `lib.d.ts` (`declare type i32 = number`, etc) -- real wasm value types, for a field/method whose storage isn't the usual `number`->`f64` mapping (see `lib/typedarray.ts`'s `Uint8Array`).
 	// `class: 'Number'` because that is exactly what each one is an alias OF: without it a value that
 	// happened to get a storage refinement had no method owner at all, so `let i = 0; i.toString()`
@@ -3272,7 +3273,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		// Only a boxed `any` slot can carry a runtime test: two types sharing a physical form (`number` and `boolean` are both
 		// `f64` here) are indistinguishable at runtime, so anything else would be a WRONG answer, not merely an unsupported one.
-		const heap = types.heapType(tag);
+		const heap = types.heapType(tag) ?? builtinTypeOwner(tag)?.typeIndex;
 		const w    = wtypeOf(operand, ctx);
 		if (!(w && typeof w === 'object' && 'ref' in w && w.ref === 'any'))
 			return false;
@@ -3288,7 +3289,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const tmp = ctx.temp(`$typeofobj$${ctx.tempCounter++}`, W.REF_ANY_NULLABLE);
 			emitAs(operand, ctx, W.REF_ANY_NULLABLE);
 			ctx.emit(I.local.set(tmp), I.local.get(tmp), I.ref.is_null);
-			for (const h of [types.box('f64'), types.box('i32'), types.array('i16'), types.closureBase()])
+			for (const h of [types.box('f64'), types.box('i32'), types.array('i16'), types.closureBase(), builtinTypeOwner('symbol')!.typeIndex])
 				ctx.emit(I.local.get(tmp), I.ref.test(h), I.i32.or);
 			ctx.emit(I.i32.eqz);
 			return true;
@@ -3305,7 +3306,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const hasNull	= members.some(m => T.isLiteral(m, 'null') || T.isRef(m, 'null'));
 		if (hasNull && members.some(m => T.isRef(m, 'undefined') || T.isRef(m, 'void')))
 			throw `'typeof' of '${T.typeKey(t)}': null and undefined share one representation here, so a null slot cannot be told apart`;
-		const ALL		= ['undefined', 'number', 'boolean', 'string', 'bigint', 'function', 'object'];
+		const ALL		= ['undefined', 'number', 'boolean', 'string', 'bigint', 'symbol', 'function', 'object'];
 		const named		= members.map(m => T.isNullish(m, ctx.scope) ? (hasNull ? 'object' : 'undefined') : T.typeofName(m, ctx.scope));
 		const tags		= named.some(n => n === undefined) ? ALL : ALL.filter(tag => named.includes(tag));
 		const held		= `#typeof$${ctx.tempCounter++}`;

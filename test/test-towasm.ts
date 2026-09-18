@@ -2107,6 +2107,31 @@ async function main() {
 	}
 
 	{
+		// A symbol is a `lib/symbol.ts` struct compared by identity; `typeof` tests for it, and `'object'` excludes it.
+		const { identity, inAny, typeofs } = await compile(`
+			export function identity(): number {
+				const s = Symbol('x'), t = Symbol('x'), u = s;
+				return (s === t ? 1 : 2) + (s === u ? 10 : 20) + s.toString().length * 100 + (s.description === 'x' ? 1000 : 0);
+			}
+			export function inAny(): number {
+				const U = Symbol('undefined');
+				const m = new Map<string, unknown>([['a', 1], ['b', U]]);
+				return (m.get('b') === U ? 1 : 0) + (m.get('a') === U ? 10 : 0);
+			}
+			const tag	= (x: unknown) => typeof x;
+			const isSym	= (x: unknown) => typeof x === 'symbol' ? 1 : 0;
+			const isObj	= (x: unknown) => typeof x === 'object' ? 1 : 0;
+			export function typeofs(): number {
+				return (tag(Symbol('q')) === 'symbol' ? 1 : 0) + (tag({ a: 1 }) === 'object' ? 10 : 0)
+					+ isSym(Symbol()) * 100 + isSym(5) * 1000 + isObj(Symbol()) * 10000;
+			}
+		`);
+		check('symbol: distinct by identity, with a description', identity(), 1912);
+		check('symbol: held in an unknown slot, compared by identity', inAny(), 1);
+		check("symbol: typeof is 'symbol', never 'object'", typeofs(), 111);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed
