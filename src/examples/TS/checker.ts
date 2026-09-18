@@ -1585,8 +1585,8 @@ export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], ty
 	const map = new Map<string, Type>();
 	if (!sig.typeParams?.length)
 		return map;
-	// A caller-sourced argument names things in the CALLER's scope, but is substituted into the callee's structure and resolved
-	// there (`NodeMap<N>` at `TS.TypeParam`, where `walker.ts` has no `TS`). Defaults and constraints are the callee's own.
+	// An explicit argument names things in the CALLER's scope, as an inferred one does (`T.Inference` stamps those), but is
+	// substituted into the callee's structure and resolved there. Defaults and constraints are the callee's own.
 	if (typeArgs) {
 		sig.typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ? T.stampScope(typeArgs[i], scope) : p.default ?? T.ANY));
 		return map;
@@ -1615,7 +1615,7 @@ export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], ty
 	sig.typeParams.forEach(p => {
 		const t = inferred.get(p.name);
 		if (t && !inference!.wasDefaulted(p.name)) {
-			map.set(p.name, T.stampScope(t, scope));
+			map.set(p.name, t);
 			return;
 		}
 		const assumed = t ?? p.default ?? p.constraint ?? T.ANY;
@@ -2148,25 +2148,28 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// (or a union with one), that position's own element is the only thing that names a callback.
 					const declaredArg = (i: number) => sig!.params[i]?.typeAnnotation
 						?? (sig!.rest?.typeAnnotation && T.restArgType(sig!.rest.typeAnnotation, i - sig!.params.length, scope));
-					const preArgTs = e.arguments.map((a, i) => {
-						if (a.type === 'function' || a.type === 'arrow' || a.type === 'spread')
-							return undefined;
-						// The inner call of `new Map(xs.map(x => [a, b]))` reverse-matches its own `U` from the tuple shape -- see `instantiate`'s
-						// `fromExpected`, which keeps that placeholder binding from escaping as the answer.
-						return arg(a, argContext(a, declaredArg(i), sig!, scope));
-					});
 					// TS's two passes: every non-callback argument feeds the inference first, then each callback in order -- its
 					// context FIXES the type parameters its own parameters read, and its return feeds only the ones still open.
 					// Explicit type arguments leave nothing to infer.
 					const explicit	= typeArgs && sig.typeParams?.length ? new Map(sig.typeParams.map((p, i) => [p.name, typeArgs![i] ?? p.default ?? T.ANY] as const)) : undefined;
 					const inference	= !explicit && sig.typeParams?.length ? new T.Inference(sig.typeParams, scope, declScope) : undefined;
+					// In order, as TS does: each argument's context is its parameter under what the arguments before it inferred
+					// (`mapObject(q, { ps: mapArray(p => ...) })` knows `N` from `q`, so the inner call can infer its `T`).
+					const soFar = (declared: Type | undefined) => declared && (explicit ? T.substituteType(declared, explicit)
+						: inference ? T.substituteType(declared, new Map(sig!.typeParams!.flatMap(p => { const t = inference.inferred(p.name); return t ? [[p.name, t] as const] : []; })))
+						: declared);
+					const preArgTs = e.arguments.map((a, i) => {
+						if (a.type === 'function' || a.type === 'arrow' || a.type === 'spread')
+							return undefined;
+						// The inner call of `new Map(xs.map(x => [a, b]))` reverse-matches its own `U` from the tuple shape -- see `instantiate`'s
+						// `fromExpected`, which keeps that placeholder binding from escaping as the answer.
+						const t = arg(a, argContext(a, soFar(declaredArg(i)), sig!, scope));
+						const p = sig!.params[i];
+						if (inference && t && p?.typeAnnotation)
+							(a.type === 'object' || a.type === 'array' ? inference.inferFromLiteral : inference.infer).call(inference, p.typeAnnotation, t);
+						return t;
+					});
 					if (inference) {
-						preArgTs.forEach((t, i) => {
-							const p = sig!.params[i];
-							const a = e.arguments[i];
-							if (t && p?.typeAnnotation)
-								(a.type === 'object' || a.type === 'array' ? inference.inferFromLiteral : inference.infer).call(inference, p.typeAnnotation, t);
-						});
 						// A param no argument pins down may come from where the call's result is going (`new Promise<T>((resolve) => ...)`).
 						if (expected && sig.returnType)
 							inference.inferReturn(sig.returnType, expected);

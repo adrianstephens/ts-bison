@@ -173,7 +173,11 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// TS instantiates a type parameter's default with the arguments already chosen, so one naming an earlier parameter resolves.
 	['a type parameter default naming an earlier one is instantiated with it', 'interface C<E, A = E> { c: E; args: A[] } declare const x: C<number>; const q: boolean = x.args;', ['number[]']],
 	// A generic argument infers through its base signature (TS's `getBaseSignature`), or its own bound `T` escapes into the result.
-	['a generic callback argument infers from its constraints', 'declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
+	// Arguments are typed in order, each against its parameter under what the arguments before it inferred -- or the explicit
+	// type arguments -- so an inner generic call can infer from that context (walker.ts's `mapObject(t, { ps: mapArray(p => ...) })`).
+	['an argument is typed against what the earlier arguments inferred', 'declare function mapArray<T>(map: (x: T) => T | undefined): (x: readonly T[]) => T[] | undefined; interface Pn { n: number } interface Q { ps: Pn[] } declare const q: Q; declare function withPlain<N>(node: N, fields: {[K in keyof N]?: (x: N[K]) => N[K] | undefined}): N; const b = withPlain(q, { ps: mapArray(p => p.nope) });', ["Property 'nope' does not exist"]],
+	['an argument is typed against the explicit type arguments', 'declare function mapArray<T>(map: (x: T) => T | undefined): (x: readonly T[]) => T[] | undefined; interface Pn { n: number } interface Q { ps: Pn[] } declare const q: Q; declare function withPlain<N>(node: N, fields: {[K in keyof N]?: (x: N[K]) => N[K] | undefined}): N; const b = withPlain<Q>(q, { ps: mapArray(p => p.nope) });', ["Property 'nope' does not exist"]],
+	['a generic callback argument infers from its constraints','declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
 ];
 
 (async () => {

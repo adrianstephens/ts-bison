@@ -2798,7 +2798,10 @@ export class Inference {
 	}
 	// `inferTypeArgs` skips a name this reports: only a fixed one takes no more candidates.
 	has(name: string): boolean	{ return this.fixed.has(name); }
+	// Every candidate comes from the CALLER's side (an argument, the expected result, a callback's annotation) but is substituted into
+	// the callee's own types and resolved there, so it carries the caller's scope (`Fields<S.Pt>`, where the callee has no `S`).
 	add(name: string, t: Type, contra: boolean) {
+		stampScope(t, this.scope);
 		// Only a candidate that is itself an object/array literal's type pools (TS's isObjectOrArrayLiteralType), not a primitive inside one.
 		if (this.feedingLiteral && (t.type === 'object' || t.type === 'array' || t.type === 'tuple'))
 			this.literal.add(t);
@@ -2823,7 +2826,7 @@ export class Inference {
 	inferReturn(returnType: Type, expected: Type) {
 		const m = new Map<string, Type>();
 		inferTypeArgs(returnType, expected, this.names, m, this.scope, this.declScope);
-		m.forEach((t, name) => this.fromReturn.has(name) || this.fromReturn.set(name, t));
+		m.forEach((t, name) => this.fromReturn.has(name) || this.fromReturn.set(name, stampScope(t, this.scope)));
 	}
 	fix(name: string, t: Type)	{ this.fixed.set(name, t); }
 	fromCandidates(name: string): Type | undefined {
