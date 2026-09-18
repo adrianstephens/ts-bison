@@ -2148,6 +2148,40 @@ async function main() {
 	}
 
 	{
+		// A method read as a value is a closure over `envThis`; `.call(t, ...)` rebinds that `this`, and leaves an arrow's alone.
+		const { rebinds, asCallback, arrowKeepsThis, unionCallee } = await compile(`
+			class Inf { n = 1; add(a: number, b: number) { this.n += a * b; } sub(a: number, b: number, c?: boolean) { this.n -= a + b; } get(a: number, b: number) { return this.n + a * b; } }
+			class Sub extends Inf { get(a: number, b: number) { return 100; } }
+			const ap = (g: (a: number, b: number) => number) => g(2, 3);
+			export function rebinds(): number {
+				const i = new Inf(), j = new Inf();
+				i.add.call(i, 2, 3);
+				i.add.call(j, 10, 10);
+				return i.n * 1000 + j.n;
+			}
+			export function asCallback(): number {
+				const s: Inf = new Sub();
+				return ap(new Inf().get) + ap(s.get) * 1000;
+			}
+			export function arrowKeepsThis(): number {
+				const k = 5;
+				const f = (a: number) => a + k;
+				return f.call(undefined, 3);
+			}
+			export function unionCallee(): number {
+				const i = new Inf();
+				for (const k of [true, false])
+					(k ? i.add : i.sub).call(i, 2, 3);
+				return i.n;
+			}
+		`);
+		check('method value: .call rebinds this', rebinds(), 7101);
+		check('method value: passed as a callback, dispatching virtually', asCallback(), 100007);
+		check(".call on an arrow ignores the receiver", arrowKeepsThis(), 8);
+		check('method value: .call through a union of signatures', unionCallee(), 2);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

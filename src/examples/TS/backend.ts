@@ -1633,6 +1633,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A named function used as a *value*, not called directly: one shared zero-capture wrapper per function
 	// name, not per use site -- populated the first time another expression shape needs it (callback, return...).
 	const functionValueWrappers = new Map<string, FuncInfo>();
+	const methodValueWrappers	= new Map<string, FuncInfo>();
 	// A closure *value* whose concrete signature has a narrower/nullable-mismatched result than the slot it is
 	// coerced into (real TS covariant-return assignability, e.g. `(x: number) => number` fitting one returning
 	// `number | undefined`) -- one shared trampoline per (source, wanted) pair. See `ensureClosureCoercionWrapper`.
@@ -4501,6 +4502,112 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return { info, structTypeIndex };
 	}
 
+	// A method's closure env: the `this` it runs on. JS binds a method's `this` at the CALL, so a method value carries it
+	// in this one shape, and `.call(t, ...)` rebuilds the closure with `t` (an arrow's env is its own, and keeps its `this`).
+	function envThis(): number {
+		return types.register({ final: true, supertypes: [types.envBase()], type: { kind: 'struct', fields: [{ type: toValType(W.REF_ANY_NULLABLE), mut: false }] } });
+	}
+
+	// `obj.m` read, not called: a closure over `envThis(obj)`, whose code calls `this.m(...)` as any call site would --
+	// overloads and overrides included. Called with no receiver, the null `this` traps where JS would throw.
+	function emitMethodValue(e: Expr & { type: 'member' }, cls: ClassInfo, ctx: FunctionContext): W.Type {
+		const fnType	= T.resolve(ctx.typeScope, ctx.narrowedTypeOf(e));
+		const w			= typeOf(fnType);
+		if (fnType.type !== 'function' || !w || typeof w === 'string' || !('closure' in w))
+			throw `method '${e.property}' as a value needs a function type, got '${T.typeKey(fnType)}'`;
+		const sig		= closureSigOf(w);
+		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
+		const key		= `${cls.name}.${e.property}:${W.typeKey(w)}`;
+		let info		= methodValueWrappers.get(key);
+		if (!info) {
+			const made: FuncInfo = { ...sig, ...types.funcAt(funcTypeIndex) };
+			info = made;
+			closureLiterals.push(made);
+			methodValueWrappers.set(key, made);
+			worklist.push(() => {
+				const wctx	= new FunctionContext(`<method value>.${cls.name}.${e.property}`, new Scope(libGlobal), plainReturn(sig.result), undefined, ctx.homeModule);
+				const env	= wctx.declareLocal('#envParam', { typeIndex: types.envBase(), nullable: false });
+				const args	= sig.params.map((p, i) => {
+					wctx.declareValue(`$arg$${i}`, p, sig.resolvedParams![i].tsType);
+					return sig.hasRest && i === sig.params.length - 1 ? JS.Spread(Identifier(`$arg$${i}`)) : Identifier(`$arg$${i}`);
+				});
+				const self	= wctx.declareValue('this', cls.thisWtype!, cls.thisTsType);
+				wctx.emit(I.local.get(env.index), I.ref.cast(envThis()), I.struct.get(envThis(), 0), I.ref.cast(cls.typeIndex), I.local.set(self.index));
+				emitStmt(JS.Return(JS.Call(JS.Member({ type: 'this' }, e.property), args)) as Stmt, wctx);
+				wctx.emitTrailingUnreachable(sig.result);
+				made.body = wctx.toFuncBody(1 + sig.params.length, toValType);
+			});
+		}
+		ctx.emit(I.ref.func(info.funcIndex));
+		emitAs(e.object, ctx, W.REF_ANY_NULLABLE);
+		ctx.emit(I.struct.new(envThis()), I.i32.const(jsLength(fnType.params)), I.struct.new(structTypeIndex));
+		return w;
+	}
+
+	const isFunctionTyped = (e: Expr, ctx: FunctionContext) =>
+		T.unionMembers(ctx.narrowedTypeOf(e), ctx.typeScope).every(m => T.resolveOwn(m, ctx.typeScope).type === 'function');
+
+	// `f.call(t, ...args)`: `f` with `t` as its `this` -- a method value's `envThis` refilled -- then called as `f(...args)`.
+	function emitFunctionCallMethod(fn: Expr, [thisArg, ...args]: Expr[], ctx: FunctionContext, want?: W.Type): W.Type {
+		const w			= emitExpr(fn, ctx);
+		const closure	= typeof w !== 'string' && 'closure' in w && !w.nullable;
+		if (!closure && !(typeof w !== 'string' && 'ref' in w && w.ref === 'any'))
+			throw `'.call' needs a function value, got '${W.typeKey(w)}'`;
+		const n			= ctx.tempCounter++;
+		const fnName	= `$callfn$${n}`;
+		const fnLocal	= ctx.declareValue(fnName, w, ctx.narrowedTypeOf(fn));
+		ctx.emit(I.local.set(fnLocal.index));
+		const emitThis	= () => thisArg ? emitAs(thisArg, ctx, W.REF_ANY_NULLABLE) : ctx.emitDefaultValue(W.REF_ANY_NULLABLE, types, toValType);
+		if (closure) {
+			const { structTypeIndex }	= ensureClosureType(closureSigOf(w));
+			const thisLocal				= ctx.declareLocal(`$callthis$${n}`, W.REF_ANY_NULLABLE);
+			emitThis();
+			ctx.emit(I.local.set(thisLocal.index), I.local.get(fnLocal.index), I.struct.get(structTypeIndex, 1), I.ref.test(envThis()));
+			ctx.emitIf(undefined, () => ctx.emit(...rebuildWithThis(structTypeIndex, [I.local.get(fnLocal.index)], [I.local.get(thisLocal.index)]), I.local.set(fnLocal.index)));
+		} else {
+			ctx.emit(I.local.get(fnLocal.index));
+			emitThis();
+			ctx.emit(I.call(ensureAnyRebindThis().funcIndex), I.local.set(fnLocal.index));
+		}
+		return emitExpr(JS.Call(Identifier(fnName), args), ctx, want);
+	}
+
+	// The closure `held` with its env replaced by `envThis(thisVal)`: same code, same `length`.
+	const rebuildWithThis = (structTypeIndex: number, held: wasm.Instr[], thisVal: wasm.Instr[]): wasm.Instr[] => [
+		...held, I.struct.get(structTypeIndex, 0), ...thisVal, I.struct.new(envThis()), ...held, I.struct.get(structTypeIndex, 2), I.struct.new(structTypeIndex),
+	];
+
+	// `.call`'s rebinding for a function held as `any` (a union of signatures): which closure type it is, is known only at run
+	// time, so every closure type the program has is a candidate. Built by `lateWorklist`, once that set is final.
+	function ensureAnyRebindThis(): FuncInfo {
+		const key		= '#rebindThis';
+		const existing	= anyDispatchFuncs.get(key);
+		if (existing)
+			return existing;
+		const { funcIndex, typeIndex } = types.func(toParams2([{ key: 'callee', wtype: W.REF_ANY, tsType: T.ANY }, { key: 'this', wtype: W.REF_ANY_NULLABLE, tsType: T.ANY }]), toResults(W.REF_ANY));
+		const info: FuncInfo = { params: [W.REF_ANY, W.REF_ANY_NULLABLE], result: W.REF_ANY, funcIndex, typeIndex };
+		anyDispatchFuncs.set(key, info);
+		funcs.set(`<any dispatch>.${key}`, info);
+		lateWorklist.push(() => {
+			const dctx		= new FunctionContext(key, new Scope(libGlobal), plainReturn(W.REF_ANY), undefined);
+			const callee	= dctx.declareLocal('$callee', W.REF_ANY);
+			const thisVal	= dctx.declareLocal('$this', W.REF_ANY_NULLABLE);
+			const base		= types.closureBase();
+			const arms		= [...closureTypes.values()].reduceRight<wasm.Instr[]>((rest, c) => [
+				I.local.get(callee.index), I.ref.test(c.structTypeIndex),
+				I.if(toValType(W.REF_ANY), rebuildWithThis(c.structTypeIndex, [I.local.get(callee.index), I.ref.cast(c.structTypeIndex)], [I.local.get(thisVal.index)]), rest),
+			], [I.unreachable]);
+			dctx.emit(I.local.get(callee.index), I.ref.test(base));
+			dctx.emitIf(undefined, () => {
+				dctx.emit(I.local.get(callee.index), I.ref.cast(base), I.struct.get(base, 1), I.ref.test(envThis()));
+				dctx.emitIf(undefined, () => dctx.emit(...arms, I.return));
+			});
+			dctx.emit(I.local.get(callee.index));
+			info.body = dctx.toFuncBody(2, toValType);
+		});
+		return info;
+	}
+
 	// A bare `f` or a namespace-qualified `NS.f` read as a VALUE resolves to a top-level function exactly as a call would.
 	function functionValueDecl(e: Expr, ctx: FunctionContext): { name: string; decl: FunctionDecl; module: string } | undefined {
 		if (e.type === 'identifier') {
@@ -4894,6 +5001,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				}
 
 				const fieldIdx	= cls?.fieldIndex.get(e.property);
+				if (cls && fieldIdx === undefined && cls.methodDecls.has(e.property))
+					return emitMethodValue(e, cls, ctx);
 				if (!cls || fieldIdx === undefined) {
 					// `classOf` couldn't resolve a single owner -- one real reason, besides a genuinely unknown field, is a receiver
 					// whose static type is a union of different object shapes (`unionClassMembers`), boxed as `any` by `typeOf`.
@@ -5975,6 +6084,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 				}
 
+				if (e.callee.type === 'member' && e.callee.property === 'call' && !e.callee.optional && isFunctionTyped(e.callee.object, ctx))
+					return emitFunctionCallMethod(e.callee.object, e.arguments, ctx, want);
+
 				if (e.callee.type === 'identifier') {
 					// A recursive call to the nested `function_decl` currently being compiled, from inside its own body -- resolved to a
 					// direct, statically-known `call` (reusing the same env), not a `call_ref` through a closure struct (see `FuncCtx.selfCall`'s own comment for why).
@@ -6056,7 +6168,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// One-shot: consumed here (for this call's own generic type-param inference, if it applies)
 					// and cleared immediately, so it can't leak into this same call's own arguments below (see
 					// `contextualReturn`'s own comment on why that would be wrong).
-					if (!isModuleValue(e.callee.name, ctx)) {
+					if (!isModuleValue(e.callee.name, ctx) && !ctx.resolvesName(e.callee.name)) {
 						const contextualReturn = ctx.contextualReturn;
 						ctx.contextualReturn = undefined;
 						return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn ?? (() => checkerTypeOf(e, ctx.scope)));
@@ -6247,8 +6359,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 				}
 
-				// A callee typed `any` (core.ts `params[0](() => rules)`): dispatched over the program's closure types.
-				if (T.isAny(ctx.narrowedTypeOf(e.callee)) && !e.arguments.some(a => a.type === 'spread')) {
+				// A callee typed `any` (core.ts `params[0](() => rules)`), or held as one (a union of signatures): dispatched over the program's closure types.
+				if ((T.isAny(ctx.narrowedTypeOf(e.callee)) || physicallyAny(e.callee, ctx)) && !e.arguments.some(a => a.type === 'spread')) {
 					emitAs(e.callee, ctx, W.REF_ANY);
 					const info = ensureAnyCallDispatch(e.arguments.map(a => emitExpr(a, ctx)), want ?? W.REF_ANY);
 					ctx.emit(I.call(info.funcIndex));
@@ -8975,7 +9087,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 				});
 				dctx.emit(I.local.get(held), I.struct.get(c.structTypeIndex, 0), I.call_ref(c.funcTypeIndex));
-				coerceTop(c.sig.result, dctx, want);
+				// A `void` call discards whatever the callee returns, as JS does.
+				if (want === 'void' && c.sig.result !== 'void')
+					dctx.emit(I.drop);
+				else
+					coerceTop(c.sig.result, dctx, want);
 				return [..._cond, I.if(want === 'void' ? undefined : toValType(want), dctx.swapOut(), buildArm(i + 1))];
 			}
 
