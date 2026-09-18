@@ -1,3 +1,25 @@
+## Rename ledger — old names in older memories
+
+Rename freely; **do not rewrite the historical changelogs**, just add a line here. Older entries (and commit
+titles) keep the old name, and this resolves them. `assistant/memory-refs.ts` lists names in `memory/` that
+no longer exist in the tree — run it after a rename and fix what is LIVE; historical mentions stay.
+
+| was | is now | when |
+|---|---|---|
+| `TS/towasm.ts` | `TS/backend.ts` | `ed2d662` |
+| `TS/towasm-analysis.ts` | folded into `TS/backend.ts` | `307aa89` |
+| `TS/towasm-types.ts`, `TS/towasm-asm.ts`, `tocode.ts` | folded away / renamed (`tocode.ts` → `printer.ts`) | earlier |
+| `wasm-types.ts` | `wasm-codegen.ts` | `a69d68a` |
+| `wasm-asm.ts` | folded into `wasm-codegen.ts` | `deb2d18` |
+| `TSWError` → `WasmError` | `W.Error` (the module is imported as `W`) | `efe46bd`, then the user's pass |
+| `WasmScalar`/`WasmType`/`WasmElementI` | `Scalar`/`Type`/`ElementI` | the user's pass |
+| `ARR_WTYPE` | `ARRAY` | the user's pass |
+| `wasmTypeEq`, `wasmTypeKey`, `intWasmType`, `combineUnionWtypes` | `typeEq`, `typeKey`, `intType`, `combineUnion` | the user's pass |
+| `typeofHeapType(tag, types)` | `Types.heapType(tag)` | `b858045` |
+
+The module dropped its `wasm`/`Wasm` prefixes throughout: the file is already named `wasm-codegen.ts` and
+is imported as `W`, so `W.Type` beats `WT.WasmType`.
+
 ## Project rules
 
 - [no name special-casing in backend.ts](feedback_no_name_special_casing.md) — find the structural trigger, never hardcode a method/function name

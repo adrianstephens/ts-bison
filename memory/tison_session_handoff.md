@@ -54,7 +54,7 @@ explicit parameter, the `toFuncBody(numParams, toValType)` idiom), and `isSubcla
 `builtinTypeOwner`/`namespaceOwner` (they read the `classes`/`builtinTypes` registries).
 
 **`CPP/backend.ts` is the neutrality gate.** Scalars, functions, locals, if/while/break/continue/return,
-arithmetic conversions, direct calls, `?:`; anything else throws `WasmError`. It was written against
+arithmetic conversions, direct calls, `?:`; anything else throws `W.Error`. It was written against
 `wasm-codegen.ts` **without adding or changing a line of it** — that is the evidence the split is real.
 `test-cpp-backend.ts` compiles, instantiates and RUNS the output. Keep it green: it is the only thing that
 fails when a "neutral" helper quietly assumes TypeScript. Do not read 379-vs-9,697 as a measure of

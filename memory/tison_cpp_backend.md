@@ -14,7 +14,7 @@ breaks when a "neutral" helper quietly assumes TypeScript.**
 
 Scalar types (`int`/`long`/`short`/`char`/`unsigned*`/`float`/`double`/`bool`/`void`), functions, locals,
 `if`/`while`/`break`/`continue`/`return`, the usual arithmetic conversions, direct calls by name, unary
-`-`/`!`, and `?:`. Anything else throws `WasmError` rather than miscompiling — pointers, references,
+`-`/`!`, and `?:`. Anything else throws `W.Error` rather than miscompiling — pointers, references,
 arrays, classes, templates, overloads and the standard library are all out of scope on purpose.
 
 `test/test-cpp-backend.ts` compiles, instantiates and **runs** the output (gcd, recursive fib, an f64
@@ -26,7 +26,7 @@ wrong, and only execution caught them.
 
 It was written **without adding or changing one line of `wasm-codegen.ts`**. `FunctionContext` (locals and
 slot reuse via `inScope`, `emitIf`, `emitLoop`, `emitBreak`/`emitContinue`, `toFuncBody`,
-`emitTrailingUnreachable`), `Types` and `WasmError` were all consumed as-is. The C++ side is the AST walk
+`emitTrailingUnreachable`), `Types` and `W.Error` were all consumed as-is. The C++ side is the AST walk
 plus `toValType`, passed as a parameter — exactly the seam [[tison-towasm-cross-language-plan]] predicted.
 
 **Do not read 379 vs `TS/backend.ts`'s 9,697 as a measure of anything.** It buys a fraction of the
