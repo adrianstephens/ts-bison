@@ -2178,7 +2178,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// with `ownerFor` on the shape.
 		const flat = resolved.type === 'object' ? resolved : resolved.type === 'intersection' ? T.resolveObjectType(resolved, global) : undefined;
 		if (flat) {
-			const shapeMatch = objectShapeOf(t, resolved, flat);
+			const shapeMatch = objectShapeOf(t, flat);
 			if (shapeMatch)
 				return shapeMatch.thisType;
 		}
@@ -2502,15 +2502,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// *values*; ambiguous or partial cases (computed/non-string key, non-property member) return `undefined`, never a guess.
 	// One answer per type for the whole compile: which classes exist changes as codegen proceeds, and a value built under
 	// one answer is unconvertible to a later one (a local typed before `FunctionType` was built, read after it was).
-	function matchObjectShapeByType(t: TS.ObjectType): ClassInfo | undefined {
+	function matchObjectShapeByType(t: TS.ObjectType, orElse = () => indexSignatureValueType(t) ? undefined : ensureAnonObjectShape(t)): ClassInfo | undefined {
 		const key	= T.typeKey(t);
-		const found	= classes.get(key) ?? findObjectShapeByType(t);
+		const found	= classes.get(key) ?? findObjectShapeByType(t, orElse);
 		if (found)
 			classes.set(key, found);
 		return found;
 	}
 
-	function findObjectShapeByType(t: TS.ObjectType): ClassInfo | undefined {
+	// `orElse` answers when no declared shape has these members; an ambiguous match answers `undefined`.
+	function findObjectShapeByType(t: TS.ObjectType, orElse: () => ClassInfo | undefined): ClassInfo | undefined {
 		const props = new Map<string, Type>();
 		for (const m of t.members) {
 			if (m.type !== 'property' || typeof m.key !== 'string')
@@ -2535,9 +2536,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// not just an expression flowing straight through. Also reached when every name-matching candidate is ruled out
 		// by its own discriminant (`matches.length === 0` below): the same "nothing real represents this shape"
 		// outcome found one step later, e.g. `{type, body}` matching both `static_block` and `FunctionExpr`/`Arrow`.
-		const fallback = () => indexSignatureValueType(t) ? undefined : ensureAnonObjectShape(t);
 		if (candidates.length === 0)
-			return fallback();
+			return orElse();
 
 		const matches = candidates.filter(cls => [...props].every(([key, propType]) => {
 			const wantVals = T.literalValues(propType);
@@ -2546,7 +2546,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const gotVals = T.literalValues(cls.fieldDeclaredType(key, global) ?? T.ANY);
 			return !gotVals || gotVals.some(v => wantVals.includes(v));
 		}));
-		return matches.length === 1 ? matches[0] : matches.length === 0 ? fallback() : undefined;
+		return matches.length === 1 ? matches[0] : matches.length === 0 ? orElse() : undefined;
 	}
 
 	// Index syntax (`a[i]`, `a[i] = v`) calls a class's own INDEX accessor, `__get`/`__set`, never a real API of that name
@@ -2763,7 +2763,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// comment). ...and when nothing declared matches either, synthesize the shape -- the same last resort
 				// `matchObjectShape` applies on the literal side, so a bare anonymous object (an inferred field, a spread
 				// result) has an owner to read fields off.
-				return objectShapeOf(t, w, w);
+				return objectShapeOf(t, w);
 			}
 			// An interface `extends`ing another (`Method<T> extends CallSig<T>`) resolves to an intersection, not an
 			// 'object'; `resolveObjectType` flattens+merges it into the flat object `matchObjectShapeByType` expects.
@@ -2776,7 +2776,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (prim)
 					return ownerFor(prim);
 				const merged = T.resolveObjectType(w, global);
-				return merged && objectShapeOf(t, w, merged);
+				return merged && objectShapeOf(t, merged);
 			}
 		}
 		return undefined;
@@ -8014,11 +8014,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return [...members, ...inherited].sort((a, b) => at(a) - at(b));
 	}
 
-	// The struct for an object type `flat` (`t` resolved, then flattened): over its named part if it intersects one, else a declared
-	// shape it matches, else its own anonymous one. `t` is asked too, since `resolve` merges an intersection of object parts into one.
-	function objectShapeOf(t: Type, resolved: Type, flat: TS.ObjectType): ClassInfo | undefined {
-		const over = t.type === 'intersection' ? t : resolved.type === 'intersection' ? resolved : undefined;
-		return (over && ensureIntersectionShape(over, flat)) ?? matchObjectShapeByType(flat) ?? ensureAnonObjectShape(flat);
+	// The struct for an object type `flat` (`t` resolved, then flattened): a declared shape with these members, else -- where `t` is
+	// written as an intersection over a named shape -- one laid out over it, else its own anonymous one.
+	function objectShapeOf(t: Type, flat: TS.ObjectType): ClassInfo | undefined {
+		const over = () => t.type === 'intersection' ? ensureIntersectionShape(t, flat) : undefined;
+		return matchObjectShapeByType(flat, () => over() ?? ensureAnonObjectShape(flat)) ?? ensureAnonObjectShape(flat);
 	}
 
 	// An intersection over ONE named shape (`{type: 'call'} & CallSig`) is laid out over that shape, as `interface X extends Y` is, so a
