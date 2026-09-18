@@ -19,14 +19,14 @@ import { Location } from './common';
 
 const I				= wasm.I;
 
-type ScalarI	= 'i32' | 'i64' | 'f32' | 'f64'
-type Scalar		= ScalarI | 'u32' | 'u64'
-type ElementI	= ScalarI | 'i8' | 'i16' | 'ref';
-type Element	= ElementI | 'u8' | 'u16' | 'u32' | 'u64';
+export type ScalarI	= 'i32' | 'i64' | 'f32' | 'f64'
+export type Scalar		= ScalarI | 'u32' | 'u64'
+export type ElementI	= ScalarI | 'i8' | 'i16' | 'ref';
+export type Element	= ElementI | 'u8' | 'u16' | 'u32' | 'u64';
 // The PHYSICAL shape of a closure: what wasm needs to call it, and nothing about the language that produced it. `FuncSig` extends this with the binding data only argument-binding reads.
-interface ClosureSig	{ params: Type[]; result: Type; hasRest?: boolean }
+export interface ClosureSig	{ params: Type[]; result: Type; hasRest?: boolean }
 
-type Type		= Scalar
+export type Type		= Scalar
 	| 'void'	// only valid as a function result, never a param/local/field.
 	| { ref:		string; nullable?: boolean }
 	| { arr:		ElementI; nullable?: boolean }
@@ -40,7 +40,7 @@ type Type		= Scalar
 
 
 // Shared singletons -- ctx.local compares Type by object identity
-const ARR_WTYPE: Record<ElementI, Type> = {
+export const ARRAY: Record<ElementI, Type> = {
 	i8: { arr: 'i8' },
 	i16: { arr: 'i16' },
 	i32: { arr: 'i32' },
@@ -49,23 +49,23 @@ const ARR_WTYPE: Record<ElementI, Type> = {
 	f64: { arr: 'f64' },
 	ref: { arr: 'ref' },
 };
-const REF_ANY:			Type = { ref: 'any' };
-const REF_ANY_NULLABLE: Type = { ref: 'any', nullable: true };
-const REF_EXN:			Type = { ref: 'exn', nullable: true };
+export const REF_ANY:			Type = { ref: 'any' };
+export const REF_ANY_NULLABLE: Type = { ref: 'any', nullable: true };
+export const REF_EXN:			Type = { ref: 'exn', nullable: true };
 
 // The plain scalar kind a value acts as for arithmetic/comparison dispatch -- unwraps a boxed
 // nullable primitive the same way `coerceTop` does, or passes a bare scalar through unchanged.
 // `undefined` for anything else (a real class/array/closure).
-function scalarKind(wtype: Type | undefined): Scalar | undefined {
+export function scalarKind(wtype: Type | undefined): Scalar | undefined {
 	return typeof wtype === 'string' ? (wtype !== 'void' ? wtype : undefined) : wtype && unboxedPrimitive(wtype)?.kind;
 }
-function notUnsigned(wtype: Scalar): ScalarI;
-function notUnsigned(wtype: Scalar | undefined): ScalarI  | undefined;
-function notUnsigned(wtype: Element): ElementI;
-function notUnsigned(wtype: string | undefined) {
+export function notUnsigned(wtype: Scalar): ScalarI;
+export function notUnsigned(wtype: Scalar | undefined): ScalarI  | undefined;
+export function notUnsigned(wtype: Element): ElementI;
+export function notUnsigned(wtype: string | undefined) {
 	return wtype && wtype[0] === 'u' ? `i${wtype.slice(1)}` : wtype;
 }
-function elementKind(wtype: Type | undefined): ElementI {
+export function elementKind(wtype: Type | undefined): ElementI {
 	return typeof wtype === 'string' && wtype !== 'void' ? notUnsigned(wtype) : 'ref';
 }
 
@@ -73,14 +73,14 @@ function elementKind(wtype: Type | undefined): ElementI {
 // stands for, so a field/method's storage can be something other than the usual `number`->f64 mapping. The
 // NAMES are wasm's, so they are owned here and a language views them (`T.WASM_PSEUDO_TYPES`) rather than
 // spelling them a second time.
-const PSEUDO_TYPES = ['i8', 'u8', 'i16', 'u16', 'i32', 'i64', 'f32', 'f64', 'u32', 'u64'] as const;
-type PseudoType = typeof PSEUDO_TYPES[number];
-function isPseudoType(name: string): name is PseudoType { return (PSEUDO_TYPES as readonly string[]).includes(name); }
+export const PSEUDO_TYPES = ['i8', 'u8', 'i16', 'u16', 'i32', 'i64', 'f32', 'f64', 'u32', 'u64'] as const;
+export type PseudoType = typeof PSEUDO_TYPES[number];
+export function isPseudoType(name: string): name is PseudoType { return (PSEUDO_TYPES as readonly string[]).includes(name); }
 
 // The VALUE type a pseudo-type occupies in a slot: wasm has no sub-32-bit value types, so the packed 8/16-bit
 // kinds widen (`i8`/`i16` -> i32, `u8`/`u16` -> u32) and every other name is its own value type. Distinct
 // from an element's physical STORAGE kind, which keeps `u8` as `u8` -- see `rawElemKind` on the language side.
-function pseudoValueType(name: PseudoType): Scalar {
+export function pseudoValueType(name: PseudoType): Scalar {
 	return name === 'i8' || name === 'i16' ? 'i32'
 		: name === 'u8' || name === 'u16' ? 'u32'
 		: name;
@@ -92,11 +92,11 @@ function pseudoValueType(name: PseudoType): Scalar {
 // `registerType`'s structural memoization means an unrelated single-scalar-field struct (e.g. a
 // closure's env struct capturing exactly one `f64`) could otherwise coincidentally share a box's
 // type index, which a table keyed by type index alone couldn't tell apart.
-function unboxedPrimitive(wtype: Type): { kind: ScalarI; typeIndex: number } | undefined {
+export function unboxedPrimitive(wtype: Type): { kind: ScalarI; typeIndex: number } | undefined {
 	return typeof wtype !== 'string' && 'primKind' in wtype ? { kind: wtype.primKind, typeIndex: wtype.typeIndex } : undefined;
 }
 
-function wasmTypeEq(a: Type, b: Type): boolean {
+export function typeEq(a: Type, b: Type): boolean {
 	if (typeof a === 'string' || typeof b === 'string')
 		return a === b;
 	if ('ref' in a && 'ref' in b)
@@ -108,14 +108,14 @@ function wasmTypeEq(a: Type, b: Type): boolean {
 	if ('closure' in a && 'closure' in b)
 		return !a.nullable === !b.nullable
 			&& a.closure.params.length === b.closure.params.length
-			&& wasmTypeEq(a.closure.result, b.closure.result)
-			&& a.closure.params.every((p, i) => wasmTypeEq(p, b.closure.params[i]))
+			&& typeEq(a.closure.result, b.closure.result)
+			&& a.closure.params.every((p, i) => typeEq(p, b.closure.params[i]))
 			&& !a.closure.hasRest === !b.closure.hasRest;
 
 	return false;
 }
 // Picks the tightest integer wasm type for a known range: i32, u32, or f64.
-function intWasmType(min: number, max: number): Type {
+export function intType(min: number, max: number): Type {
 	if (min >= -0x80000000 && max <= 0x7fffffff)
 		return 'i32';
 	if (min >= 0 && max <= 0xffffffff)
@@ -124,7 +124,7 @@ function intWasmType(min: number, max: number): Type {
 }
 
 // Stable structural key for memoizing closure-type registration by TS function signature.
-function wasmTypeKey(w: Type): string {
+export function typeKey(w: Type): string {
 	if (typeof w === 'string')
 		return w;
 	if ('ref' in w)
@@ -132,7 +132,7 @@ function wasmTypeKey(w: Type): string {
 	if ('arr' in w)
 		return `arr:${w.arr}:${!!w.nullable}`;
 	if ('closure' in w)
-		return `(${w.closure.params.map(wasmTypeKey).join(',')})=>${wasmTypeKey(w.closure.result)}:${!!w.nullable}`;
+		return `(${w.closure.params.map(typeKey).join(',')})=>${typeKey(w.closure.result)}:${!!w.nullable}`;
 	if ('typeIndex' in w)
 		return `typeIndex:${w.typeIndex}:${!!w.nullable}`;
 	return '?';
@@ -151,18 +151,18 @@ function wasmTypeKey(w: Type): string {
 // `Uint8Array.length: i32` vs `Array<T>.length: number`) widen to the one canonical `f64`. Anything
 // else (class vs. class, scalar vs. struct/array, ...) boxes as `any`, the same physical
 // representation this compiler already gives every other "could be one of several shapes" value.
-function combineUnionWtypes(wtypes: readonly Type[]): Type {
-	if (new Set(wtypes.map(w => wasmTypeKey(w))).size === 1)
+export function combineUnion(wtypes: readonly Type[]): Type {
+	if (new Set(wtypes.map(w => typeKey(w))).size === 1)
 		return wtypes[0];
 	if (wtypes.every(w => scalarKind(w) !== undefined))
 		return 'f64';
 	return REF_ANY;
 }
 
-function storageTypeKey(v: wasm.StorageType): string {
+export function storageTypeKey(v: wasm.StorageType): string {
 	return typeof v === 'string' ? v : `ref:${v.ref}:${v.nullable}`;
 }
-function wTypeKey(type: wasm.SubType): string|undefined {
+export function wTypeKey(type: wasm.SubType): string|undefined {
 	const comp = 'type' in type ? type.type : type;
 	return comp.kind === 'func' ? `func(${comp.params.map(p => storageTypeKey(p.type)).join(',')})=>(${comp.results.map(storageTypeKey).join(',')})`
 		: comp.kind === 'array' ? `array(${storageTypeKey(comp.field.type)}:${comp.field.mut})`
@@ -175,25 +175,15 @@ function wTypeKey(type: wasm.SubType): string|undefined {
 		: undefined;
 }
 
-// A function value's own properties that its closure struct stores, by field index (after `code` and `env`).
-const CLOSURE_FIELDS = new Map([['length', 2]]);
 
-export {
-	ScalarI, Scalar, ElementI, Element, ClosureSig, Type,
-	PSEUDO_TYPES, PseudoType, isPseudoType, pseudoValueType,
-	ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN,
-	scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType,
-	wasmTypeKey, combineUnionWtypes, storageTypeKey, wTypeKey, CLOSURE_FIELDS,
-};
-
-export class WasmError {
+export class Error {
 	msg:	string;
 	pos?:	Location;
 	scope:	string[] = [];
 	// The module `pos` is in, set where `pos` is (`inModule`): a position alone can't say which reached file it's in.
 	module?: string;
-	constructor(err: string|WasmError, node?: any, ...scope: string[]) {
-		if (err instanceof WasmError) {
+	constructor(err: string|Error, node?: any, ...scope: string[]) {
+		if (err instanceof Error) {
 			this.msg	= err.msg;
 			this.pos		= err.pos ?? node?.pos;
 			this.module		= err.module;
@@ -204,7 +194,7 @@ export class WasmError {
 			this.scope		= scope;
 		}
 	}
-	inModule(module: string): WasmError {
+	inModule(module: string): Error {
 		if (this.pos && !this.module)
 			this.module = module;
 		return this;
@@ -221,7 +211,7 @@ export function withCatchAt(item: ()=>void, node: unknown, module: string, ...sc
 		try {
 			item();
 		} catch (e) {
-			throw new WasmError(e as any, node, ...scopes).inModule(module);
+			throw new Error(e as any, node, ...scopes).inModule(module);
 		}
 	};
 }
@@ -231,7 +221,7 @@ export function withCatch(item: ()=>void, ...scopes: string[]) {
 		try {
 			item();
 		} catch (e) {
-			throw new WasmError(e as any, undefined, ...scopes);
+			throw new Error(e as any, undefined, ...scopes);
 		}
 	};
 }
@@ -361,11 +351,11 @@ export class FunctionContext {
 	}
 
 	private allocLocal(wtype: Type): number {
-		const free = this.freeSlots.get(wasmTypeKey(wtype));
+		const free = this.freeSlots.get(typeKey(wtype));
 		return free?.length ? free.pop()! : this.slotTypes.push(wtype) - 1;
 	}
 	private freeLocal(wtype: Type, index: number) {
-		const key	= wasmTypeKey(wtype);
+		const key	= typeKey(wtype);
 		const free	= this.freeSlots.get(key);
 		if (free)
 			free.push(index);
@@ -434,7 +424,7 @@ export class FunctionContext {
 		if (prev) {
 			// Structurally: two equal types need not be one object -- a fresh `Types.nullable(REF_ANY)` and
 			// the `REF_ANY_NULLABLE` constant.
-			if (wasmTypeKey(prev.wtype) !== wasmTypeKey(wtype))
+			if (typeKey(prev.wtype) !== typeKey(wtype))
 				throw `local '${name}' redeclared with different type`;
 			return prev.index;
 		}
@@ -553,56 +543,96 @@ export class FunctionContext {
 		this.depth -= 2;
 		this.emit(I.block(undefined, [I.loop(undefined, this.swapOut(outer))]));
 	}
-	toFuncBody(numParams: number, toValType: (t: Type) => wasm.ValType): wasm.FuncBody & {id: string} {
-		return { id: this.name.replace(/[^a-zA-Z0-9_]/g, '_'), locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
-	}
+
 	// A non-`void` body doesn't necessarily end in a top-level `return` -- `if`/`while`/`switch` compile to a `void`-typed block wrapping their branches, leaving wasm's trailing-fallthrough check unsatisfied.
 	// No full "does every path return" analysis to avoid it -- a trailing `unreachable` is always safe (dead code whenever a real return already covers every path).
 	emitTrailingUnreachable(result: Type): void {
 		if (result !== 'void')
 			this.emit(I.unreachable);
 	}
-	
+
+	// Truthiness of a value whose physical slot is a boxed `any`, decided at RUNTIME -- the checker's type rules nothing out,
+	// so `alwaysTruthy` can never answer. `0n` shares `arr:i32` with `Int32Array` and so reads as truthy: the one wrong answer.
+	emitAnyTruthy(got: Type, types: Types): void {
+		// Always the NULLABLE slot: a non-nullable local is not defaultable, and a null test costs nothing
+		// to skip below when `got` already rules null out.
+		const tmp		= this.temp(`$anytruthy$${this.tempCounter++}`, REF_ANY_NULLABLE);
+		const boxI32	= types.box('i32');
+		const boxF64	= types.box('f64');
+		const str		= types.array('i16');
+		this.emit(I.local.set(tmp));
+
+		const arms: (() => void)[][] = [
+			// A boxed `i32` is a `boolean` or an `i32`-kind number, and `0` is the falsy one for both.
+			[()	=> this.emit(I.local.get(tmp), I.ref.test(boxI32)),
+			()	=> this.emit(I.local.get(tmp), I.ref.cast(boxI32), I.struct.get(boxI32, 0), I.i32.const(0), I.i32.ne)],
+			// `abs(x) > 0`, for the same NaN/`-0` reasons the bare-`f64` case above gives.
+			[()	=> this.emit(I.local.get(tmp), I.ref.test(boxF64)),
+			()	=> this.emit(I.local.get(tmp), I.ref.cast(boxF64), I.struct.get(boxF64, 0), I.f64.abs, I.f64(0), I.f64.gt)],
+			// A string is falsy when EMPTY -- same `arr:i16` test the checker-typed path above makes statically.
+			[()	=> this.emit(I.local.get(tmp), I.ref.test(str)),
+			()	=> this.emit(I.local.get(tmp), I.ref.cast(str), I.array.len, I.i32.const(0), I.i32.ne)],
+		];
+		if (typeof got === 'object' && got.nullable)
+			arms.unshift([() => this.emit(I.local.get(tmp), I.ref.is_null), () => this.emit(I.i32.const(0))]);
+
+		// Nested `if`s, innermost last: everything that matched no box is a real object/array/closure.
+		const chain = (i: number): void => {
+			if (i === arms.length)
+				return this.emit(I.i32.const(1));
+			arms[i][0]();
+			const _old = this.swapOut();
+			arms[i][1]();
+			const _then = this.swapOut();
+			chain(i + 1);
+			this.emit(I.if('i32', _then, this.swapOut(_old)));
+		};
+		chain(0);
+	}
+
+	// Pushes `want`'s own zero/default value -- an array-literal hole (`[1, , 3]`) reads back as this, close enough to JS's
+	// "hole reads as `undefined`" for a fixed-element-kind array, since there's no way to represent a distinct "empty" slot.
+	// A non-nullable ref/array/closure has no such value, the same restriction as an object-typed class field (`ensureCtor`'s
+	// `struct.new` vs. `struct.new_default` split).
+	emitDefaultValue(want: Type, types: Types, toValType: (t: Type) => wasm.ValType): void {
+		// The rendered form decides, not the `Type` spelling: `u32`/`u64` share their signed twin's zero.
+		const vt = toValType(want);
+		if (typeof vt === 'string') {
+			switch (vt) {
+				case 'f64': this.emit(I.f64.const(0)); return;
+				case 'f32': this.emit(I.f32.const(0)); return;
+				case 'i32': this.emit(I.i32.const(0)); return;
+				case 'i64': this.emit(I.i64.const(0n)); return;
+			}
+		} else if (vt.nullable) {
+			this.emit(I.ref.null(heapTypeOf(vt)));
+			return;
+		} else if (vt.ref === 'any') {
+			// A non-nullable `any` slot has no `null` to fall back on, so box a placeholder (already a valid `anyref`). Reached by
+			// a generic type param substituted with `any` for an unrepresentable `void` (see `compileAsyncFunc`'s comment);
+			// nothing reads this placeholder back meaningfully, only that a real value fills the slot.
+			this.emit(I.f64.const(0), I.struct.new(types.box('f64')));
+			return;
+		}
+		throw "an array literal hole needs a nullable or scalar element type";
+	}
+
+	// `obj?.method()`'s shape: evaluate the receiver once into a scratch local, and when it is null yield a null result
+	// instead of running the read. Shared so every optional access -- field, call, index -- guards identically.
+	emitOptionalAccess(objWtype: Type, resultWtype: Type, toValType: (t: Type) => wasm.ValType, readCore: (objLocal: number) => void): Type {
+		const objLocal = this.temp(`$opt$obj$${this.tempCounter++}`, objWtype);
+		const vt = toValType(resultWtype);
+		this.emit(I.local.set(objLocal), I.local.get(objLocal), I.ref.is_null);
+		this.emitIf(vt, () => this.emit(I.ref.null(heapTypeOf(vt))), () => readCore(objLocal));
+		return resultWtype;
+	}
+
+	toFuncBody(numParams: number, toValType: (t: Type) => wasm.ValType): wasm.FuncBody & {id: string} {
+		return { id: this.name.replace(/[^a-zA-Z0-9_]/g, '_'), locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
+	}
+
 }
 
-// Truthiness of a value whose physical slot is a boxed `any`, decided at RUNTIME -- the checker's type rules nothing out,
-// so `alwaysTruthy` can never answer. `0n` shares `arr:i32` with `Int32Array` and so reads as truthy: the one wrong answer.
-export function emitAnyTruthy(got: Type, ctx: FunctionContext, types: Types): void {
-	// Always the NULLABLE slot: a non-nullable local is not defaultable, and a null test costs nothing
-	// to skip below when `got` already rules null out.
-	const tmp		= ctx.temp(`$anytruthy$${ctx.tempCounter++}`, REF_ANY_NULLABLE);
-	const boxI32	= types.box('i32');
-	const boxF64	= types.box('f64');
-	const str		= types.array('i16');
-	ctx.emit(I.local.set(tmp));
-
-	const arms: (() => void)[][] = [
-		// A boxed `i32` is a `boolean` or an `i32`-kind number, and `0` is the falsy one for both.
-		[()	=> ctx.emit(I.local.get(tmp), I.ref.test(boxI32)),
-		()	=> ctx.emit(I.local.get(tmp), I.ref.cast(boxI32), I.struct.get(boxI32, 0), I.i32.const(0), I.i32.ne)],
-		// `abs(x) > 0`, for the same NaN/`-0` reasons the bare-`f64` case above gives.
-		[()	=> ctx.emit(I.local.get(tmp), I.ref.test(boxF64)),
-		()	=> ctx.emit(I.local.get(tmp), I.ref.cast(boxF64), I.struct.get(boxF64, 0), I.f64.abs, I.f64(0), I.f64.gt)],
-		// A string is falsy when EMPTY -- same `arr:i16` test the checker-typed path above makes statically.
-		[()	=> ctx.emit(I.local.get(tmp), I.ref.test(str)),
-		()	=> ctx.emit(I.local.get(tmp), I.ref.cast(str), I.array.len, I.i32.const(0), I.i32.ne)],
-	];
-	if (typeof got === 'object' && got.nullable)
-		arms.unshift([() => ctx.emit(I.local.get(tmp), I.ref.is_null), () => ctx.emit(I.i32.const(0))]);
-
-	// Nested `if`s, innermost last: everything that matched no box is a real object/array/closure.
-	const chain = (i: number): void => {
-		if (i === arms.length)
-			return ctx.emit(I.i32.const(1));
-		arms[i][0]();
-		const _old = ctx.swapOut();
-		arms[i][1]();
-		const _then = ctx.swapOut();
-		chain(i + 1);
-		ctx.emit(I.if('i32', _then, ctx.swapOut(_old)));
-	};
-	chain(0);
-}
 
 
 // `toValType`'s `.ref`, unwrapped from the `wasm.ValType` shape -- what `ref.null` needs.
@@ -612,50 +642,6 @@ function heapTypeOf(vt: wasm.ValType): wasm.HeapType {
 	return vt.ref;
 }
 
-// Pushes `want`'s own zero/default value -- an array-literal hole (`[1, , 3]`) reads back as this, close enough to JS's
-// "hole reads as `undefined`" for a fixed-element-kind array, since there's no way to represent a distinct "empty" slot.
-// A non-nullable ref/array/closure has no such value, the same restriction as an object-typed class field (`ensureCtor`'s
-// `struct.new` vs. `struct.new_default` split).
-export function emitDefaultValue(want: Type, ctx: FunctionContext, types: Types, toValType: (t: Type) => wasm.ValType): void {
-	// The rendered form decides, not the `Type` spelling: `u32`/`u64` share their signed twin's zero.
-	const vt = toValType(want);
-	if (typeof vt === 'string') {
-		switch (vt) {
-			case 'f64': ctx.emit(I.f64.const(0)); return;
-			case 'f32': ctx.emit(I.f32.const(0)); return;
-			case 'i32': ctx.emit(I.i32.const(0)); return;
-			case 'i64': ctx.emit(I.i64.const(0n)); return;
-		}
-	} else if (vt.nullable) {
-		ctx.emit(I.ref.null(heapTypeOf(vt)));
-		return;
-	} else if (vt.ref === 'any') {
-		// A non-nullable `any` slot has no `null` to fall back on, so box a placeholder (already a valid `anyref`). Reached by
-		// a generic type param substituted with `any` for an unrepresentable `void` (see `compileAsyncFunc`'s comment);
-		// nothing reads this placeholder back meaningfully, only that a real value fills the slot.
-		ctx.emit(I.f64.const(0), I.struct.new(types.box('f64')));
-		return;
-	}
-	throw "an array literal hole needs a nullable or scalar element type";
-}
-
-// `obj?.method()`'s shape: evaluate the receiver once into a scratch local, and when it is null yield a null result
-// instead of running the read. Shared so every optional access -- field, call, index -- guards identically.
-export function emitOptionalAccess(ctx: FunctionContext, objWtype: Type, resultWtype: Type, toValType: (t: Type) => wasm.ValType, readCore: (objLocal: number) => void): Type {
-	const objLocal = ctx.temp(`$opt$obj$${ctx.tempCounter++}`, objWtype);
-	const vt = toValType(resultWtype);
-	ctx.emit(I.local.set(objLocal), I.local.get(objLocal), I.ref.is_null);
-	ctx.emitIf(vt, () => ctx.emit(I.ref.null(heapTypeOf(vt))), () => readCore(objLocal));
-	return resultWtype;
-}
-
-
-// The type a short-circuiting operator (`&&`/`||`/`??`) gives both its arms: the caller's, when both it and the
-// self-inferred one are object refs -- only then does building at it rather than converting to it matter (invariance).
-export function wantedShape(want: Type | undefined, self: Type): Type {
-	return typeof want === 'object' && 'ref' in want && typeof self === 'object' && 'ref' in self ? want : self;
-}
-
 export function mentionsTypeIndex(t: wasm.SubType, index: number): boolean {
 	const comp = 'type' in t ? t.type : t;
 	const is = (v: unknown) => typeof v === 'object' && v !== null && 'ref' in v && (v as { ref: unknown }).ref === index;
@@ -663,26 +649,6 @@ export function mentionsTypeIndex(t: wasm.SubType, index: number): boolean {
 		|| (comp.kind === 'struct' ? comp.fields.some(f => is(f.type))
 		: comp.kind === 'array' ? is(comp.field.type)
 		: comp.kind === 'func' && (comp.params.some(p => is(p.type)) || comp.results.some(is)));
-}
-
-// Whether an op reads or writes linear memory -- the module needs a memory section (and an exported `memory`)
-// exactly when the compiled code touches one, whatever emitted it. The `heap` global's NAME is not a proxy: a
-// read that never allocates (`String.fromCharCodesAt`) emitted no such global.
-export const memOp = (op: string) => op.startsWith('memory.') || /^(i32|i64|f32|f64|v128)\.(load|store)/.test(op);
-
-// Whether any instruction in this tree touches memory. Objects are shared between instruction lists, so a
-// value already visited is not re-walked (a cycle too, if one ever appeared).
-export function touchesMemory(instrs: unknown): boolean {
-	const seen = new Set<object>();
-	const walk = (v: unknown): boolean => {
-		if (!v || typeof v !== 'object' || seen.has(v))
-			return false;
-		seen.add(v);
-		if (typeof (v as {op?: unknown}).op === 'string' && memOp((v as {op: string}).op))
-			return true;
-		return (Array.isArray(v) ? v : Object.values(v)).some(walk);
-	};
-	return walk(instrs);
 }
 
 export class Types extends Array<wasm.SubType> {
@@ -886,10 +852,6 @@ function isNumericType(t: Type | undefined): t is NumericType { return NUMERIC_T
 // this plus the argument-binding payload an asm body never reads, so this is its projection, not a copy.
 interface AsmInline extends ClosureSig { inline: wasm.Instr[] }
 
-// The one piece of codegen state an asm body touches: named scratch locals. Deliberately narrower than
-// `FunctionContext`, so the island cannot reach the rest of it.
-interface AsmCtx { temp(name: string, wtype: Type): number }
-
 // The signature ONE asm call settled on -- concrete representations only, so the language's own types stay
 // on its side -- plus the `TYPEINDEX` resolver that belongs to it. The two travel together because a
 // `TYPEINDEX` operand must agree with the very signature its own call settled on (an `array.copy`'s operand
@@ -914,8 +876,8 @@ export interface AsmSource {
 // its signature -- so the two shapes are distinguished here rather than by an optional argument the caller
 // could get wrong.
 type PreparedAsm =
-	| { switched: true;		render(args: (Type | undefined)[], ctx: AsmCtx): AsmInline }
-	| { switched: false;	render(args: (Type | undefined)[], ctx: AsmCtx, decl: AsmDecl): AsmInline };
+	| { switched: true;		render(args: (Type | undefined)[], ctx: FunctionContext): AsmInline }
+	| { switched: false;	render(args: (Type | undefined)[], ctx: FunctionContext, decl: AsmDecl): AsmInline };
 
 // One numeric type's expansion of a `$T`-switch body.
 type TypeSwitchVariants = Partial<Record<NumericType, { locals: WAT.WatLocal[]; body: wasm.Instr[] }>>;
@@ -985,7 +947,7 @@ function expandTypeSwitch(parsed: { locals: WAT.WatLocal[]; body: WAT.WatInstr[]
 }
 
 // Resolves named scratch locals to real local indices via ctx.local
-function resolveAsmLocals(instrs: wasm.Instr[], locals: WAT.WatLocal[], ctx: AsmCtx, asm: string): wasm.Instr[] {
+function resolveAsmLocals(instrs: wasm.Instr[], locals: WAT.WatLocal[], ctx: FunctionContext, asm: string): wasm.Instr[] {
 	const indices = new Map(locals.map(l => {
 		if (!l.id)
 			throw `inline asm '${asm}': an anonymous local can't be referenced by name`;

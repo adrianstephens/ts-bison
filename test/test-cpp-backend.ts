@@ -2,7 +2,7 @@
 // that the physical half comes from `wasm-codegen.ts`, which was written for TypeScript.
 import * as CPP from '../dist/examples/CPP/cpp-parser';
 import { CPPtoWasm } from '../dist/examples/CPP/backend';
-import { WasmError } from '../dist/examples/wasm-codegen';
+import * as W from '../dist/examples/wasm-codegen';
 
 const SOURCE = `
 int gcd(int a, int b) {
@@ -72,7 +72,7 @@ async function checkRejects(label: string, src: string) {
 	try {
 		CPPtoWasm(await CPP.parse(src, { filename: 'reject.cpp' }));
 	} catch (e) {
-		console.log(`ok   - rejects ${label}: ${e instanceof WasmError ? e.msg : e}`);
+		console.log(`ok   - rejects ${label}: ${e instanceof W.Error ? e.msg : e}`);
 		return;
 	}
 	++failures;
