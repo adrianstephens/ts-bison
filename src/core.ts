@@ -349,12 +349,20 @@ export class GrammarBuilder {
 		// -- Precedence -----------------------------------------------
 
 		const prec	= new Map<string, PrecEntry>();
+		// `WithPrec(rule, PREC.relational)` hands over the very object `spec.precedence` was declared with,
+		// which carries an `assoc` but no `level` -- only the entries built here have one. Keyed by identity
+		// as well as by name so the object form resolves to the same levelled entry the string form gets;
+		// without it every such rule compares `undefined > undefined` and ordering silently degrades to
+		// associativity alone.
+		const byEntry = new Map<Assoc | PrecEntry, PrecEntry>();
 		if (spec.precedence) {
 			let i = 0;
 			for (const [name, val] of Object.entries(spec.precedence)) {
 				if (typeof val !== 'string' && val.level)
 					i = val.level;
-				prec.set(name, { level: i++, assoc: typeof val === 'string' ? val : val.assoc });
+				const entry = { level: i++, assoc: typeof val === 'string' ? val : val.assoc };
+				prec.set(name, entry);
+				byEntry.set(val, entry);
 			}
 		}
 
@@ -400,7 +408,7 @@ export class GrammarBuilder {
 					this.addRule(lhs, [internByRules(alt)]);
 				} else {
 					const r = this.addRule(lhs, alt.rhs.map(resolveSym), alt.action);
-					r.prec = alt.prec === undefined ? undefined : typeof alt.prec === 'string' ? prec.get(alt.prec) : alt.prec;
+					r.prec = alt.prec === undefined ? undefined : typeof alt.prec === 'string' ? prec.get(alt.prec) : byEntry.get(alt.prec) ?? alt.prec;
 					r.merge = alt.merge;
 				}
 			}
