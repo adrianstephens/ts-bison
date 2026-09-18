@@ -11,21 +11,33 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## Latest: 2026-09-18 evening -- HEAD `05fe38b`
+## Latest: 2026-09-18 evening -- HEAD `7cbdc6f`
 
-Four fixes, `0009613`..`05fe38b`, all from checker.ts's `typeOf` chain (the survey's "unresolved identifier 'm'"
-row, 54 decls, was ONE missing feature, not a checker.ts problem):
-- object-literal METHODS compile, as closures in their function-typed fields; one using `this` throws explicitly.
-- `symbol` VALUES: `lib/symbol.ts` class via `builtinTypes`, identity by `ref.eq`; `typeof` knows 'symbol'.
-- `fieldDeclaredType` returns what an optional field ACCEPTS (`T | undefined`).
-- checker: uncontextual `[]` is `never[]` (was `any[]`, which absorbed unions); auto-typed `let x = []` stays `any[]`;
-  destructuring defaults union their own type in.
+Eleven fixes, `0009613`..`7cbdc6f`, all from walking checker.ts's `typeOf` chain (`probe-one-decl.ts ... checker.ts typeOf`);
+each commit message has the root cause. Mechanisms worth knowing before editing nearby:
+- object-literal METHODS are closures in their fields; METHOD VALUES (`obj.m` unread) are closures over one `envThis`
+  shape, and `f.call(t, ...)` rebuilds that env (`ensureAnyRebindThis` for a boxed union of signatures). User chose this
+  design (option A). Not done: `.apply`/`.bind`; a `this`-using object-literal method.
+- `symbol` is `lib/symbol.ts` via `builtinTypes`; `typeof` knows it.
+- `fieldDeclaredType` is what a field ACCEPTS (`T | undefined` when optional).
+- checker: uncontextual `[]` is `never[]`; `AUTO_ARRAY` for `let x = []` / `x = []` into an untyped `let`; destructuring
+  defaults union their type in; a destructuring ASSIGNMENT target no longer contextually types the right side.
+- `T.isParamProperty`: one rule (`readonly` alone counts) at all four sites.
+- `objectShapeOf` is the one type-to-struct resolution: a declared shape with those members, else an intersection AS
+  WRITTEN over one named shape (`{type:'call'} & CallSig`) laid out as its wasm SUBTYPE, else anonymous. Asking the
+  RESOLVED type too was a regression (an `extends` expands to an intersection) -- fixed in `9ff40e2`.
+- `physicalScope`: an array literal, like a call, is typed in the narrowed scope (it has no slot).
+- `ReadonlyMap`/`ReadonlySet` declared in lib.d.ts; `ensureClassRef` applies `READONLY_ALIAS`.
+- A callee held physically as `any` takes the any-call dispatch; a LOCAL callee never falls into the global-function lookup.
 
-**Next blocker (checker.ts:2205, `typeOf`)**: `(c ? inf.inferFromLiteral : inf.infer).call(inf, a, b)`.
-`Function.prototype.call` is unimplemented AND unbound method values (`i.add` not called) are unsupported
-("unknown field 'add'"). The only `.call(` in the whole surveyed set. A representation decision -- asked the user.
-Also open: walker.ts's `mapObject` `{...node}` with `N` a union routes a member to `ExprStmt<any>` (probe
-`resolveFnMember`); does not reproduce with a local union -- needs the real types.
+**Next blocker (`typeOf`)**: type-core `addValue` (284:123) -- "no overload of 'BigInt's constructor' matches": the known
+BigInt row. The user is editing `lib/bigint.ts`/lib.d.ts's BigInt concurrently, so left alone.
+Also open: walker.ts `mapObject`'s `{...node}` with `N` a union (probe `resolveFnMember`); `Math.random` fails
+"unknown field 'seed'" in a probe.
+
+**Committing beside the user's WIP**: they edit backend.ts/wasm-codegen.ts/lib.d.ts concurrently. Stage only your hunks
+(`git diff > p; filter hunks; git apply --cached --recount`), or for lib.d.ts `hash-object` a HEAD copy plus your edit and
+`update-index --cacheinfo`. Gates then ran on a tree holding their WIP -- say so in the commit.
 
 **Trap:** `cd src/examples/TS/lib && tsc -p .` EMITS `.js` beside every lib source (no `noEmit`); use `--noEmit`.
 
