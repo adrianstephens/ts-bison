@@ -8662,8 +8662,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				|| (kind(got) === kind(param) && (kind(got) === 'scalar' || kind(got).startsWith('arr')
 					|| (typeof got !== 'string' && typeof param !== 'string' && 'closure' in got && 'closure' in param && closureFits(got.closure, param.closure))
 					|| (typeof got !== 'string' && typeof param !== 'string' && 'ref' in got && 'ref' in param && isSubclassOf(got.ref, param.ref)))));
+			// The result too: a callee whose result cannot become what the call wants is never the one a correct program calls.
 			const candidates = [...closureTypes.values()].filter(c => !c.sig.hasRest && c.sig.params.length >= argWtypes.length
-				&& argWtypes.every((w, i) => fits(w, c.sig.params[i]))
+				&& argWtypes.every((w, i) => fits(w, c.sig.params[i])) && (want === 'void' || fits(c.sig.result, want))
 				&& c.sig.params.slice(argWtypes.length).every(p => typeof p !== 'string' && (!!p.nullable || isAnyRef(p))));
 			if (!candidates.length)
 				throw `no closure type in the program takes ${argWtypes.length} such argument(s) -- a call through 'any' needs at least one real candidate`;

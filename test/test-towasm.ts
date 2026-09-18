@@ -4112,6 +4112,20 @@ async function main() {
 	}
 
 	{
+		// A call through an `any` callee dispatches over every closure type whose ARGUMENTS fit; one whose result cannot become what
+		// the call wants (a string where an array is used) is never the callee either, and converting it failed the whole dispatch.
+		const { anyCallResult } = await compile(`
+			export function anyCallResult(): number {
+				const fs: any[] = [(x: number) => [x, x + 1], (x: number) => 'str' + x];
+				const r: number[] = fs[0](1);
+				const s: string = fs[1](2);
+				return r[1] * 10 + s.length;
+			}
+		`);
+		check('a call through any skips callees whose result cannot be used', anyCallResult(), 24);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').
