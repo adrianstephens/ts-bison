@@ -4079,6 +4079,23 @@ async function main() {
 	}
 
 	{
+		// `ownerFor` widened a nullable union before stripping its nullish part, which widened the object member's tag too:
+		// `{type: 'keyof'} | undefined` became `{type: string}`, which matched the unrelated interface `R` (type-utils's `find(...)?.argument`).
+		const { nullableTagOwner } = await compile(`
+			interface R { type: 'return'; argument?: number }
+			type U = { type: 'keyof'; argument: number } | { type: 'x'; n: number };
+			function mk(i: number): U { return i > 0 ? { type: 'keyof', argument: 7 } : { type: 'x', n: 1 }; }
+			export function nullableTagOwner(): number {
+				const r: R = { type: 'return', argument: 5 };
+				const us: U[] = [mk(0), mk(1)];
+				const k = us.find(m => m.type === 'keyof');
+				return (k?.argument ?? 0) + (r.argument ?? 0) * 10;
+			}
+		`);
+		check('a nullable union keeps its object member\'s tag when finding its owner', nullableTagOwner(), 57);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').

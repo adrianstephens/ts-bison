@@ -2425,15 +2425,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// member's declared type too, including a discriminant field (`{type:'static_block';...}`'s `type`) down to plain
 		// `string`, corrupting the literal precision `matchObjectShapeByType`'s discriminant tiebreak needs to tell union members apart.
 		const resolvedForOwner = T.resolve(global, t);
-		const w = resolvedForOwner.type === 'object' ? resolvedForOwner : T.widenLiterals(resolvedForOwner, false, true);
 		// `obj?.method(...)`'s receiver is nullable by construction -- strip `null`/`undefined` before
 		// dispatching; there's no "owner of `null`", only "owner of the non-nullish part `?.` already guarded".
+		// Before widening: widened, `{type: 'keyof'} | undefined`'s tag became `string` and matched another struct.
+		const nonNullish = resolvedForOwner.type === 'union' ? T.nonNullable(resolvedForOwner, global) : resolvedForOwner;
+		if (nonNullish !== resolvedForOwner)
+			return ownerFor(nonNullish);
+		const w = resolvedForOwner.type === 'object' ? resolvedForOwner : T.widenLiterals(resolvedForOwner, false, true);
 
 		switch (w.type) {
 			case 'union': {
-				const nonNullish = T.nonNullable(w, global);
-				if (nonNullish !== w)
-					return ownerFor(nonNullish);
 				// A union of tuples (js-parser.ts `CallSigParams<T>`, a rest's type) is one `arr:ref` whichever member it is.
 				const members = T.unionMembers(w, global).map(m => T.resolve(global, m));
 				return members.every(m => m.type === 'tuple') ? tupleArrayOwner(members as TupleT[]) : undefined;
