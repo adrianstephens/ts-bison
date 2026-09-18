@@ -499,9 +499,8 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type; 
 					// An overloaded constructor's implementation still declares its parameter properties, but not a signature.
 					if (!(m.body && overloaded.has('constructor')))
 						ctorMembers.push(m);
-					// A parameter-property modifier is anything but the unrelated `'optional'` tag.
 					for (const p of m.params)
-						if (p.modifiers?.some(x => x !== 'optional') && typeof p.key === 'string')
+						if (T.isParamProperty(p) && typeof p.key === 'string')
 							// The PARAMETER's own modifiers, not the constructor's -- `public b?: P` declares an
 							// optional property; a default makes it always-assigned, so not optional then.
 							members.push(TS.TypeProperty(p.key, p.typeAnnotation ?? T.literalTypeOf(p.default) ?? T.ANY, p.default ? p.modifiers.filter(x => x !== 'optional') : p.modifiers));

@@ -274,6 +274,9 @@ export function FixSig(params: JS.CallSig<any>, defaultRet?: Type, declaredRetur
 // form for codegen to test for at runtime.
 // `scope`: resolve first, and resolve each union member. Omit it to answer from the type exactly as
 // given, which is what the checker's own narrowing wants (it applies this per already-split member).
+// A constructor parameter with an accessibility or `readonly` modifier also declares the property of that name.
+export const isParamProperty = <P extends { modifiers?: string[] }>(p: P): p is P & { modifiers: string[] } => !!p.modifiers?.some(m => m !== 'optional');
+
 export function typeofName(t: Type, scope?: Scope): string | undefined {
 	const r = scope ? resolve(scope, t) : t;
 	switch (r.type) {

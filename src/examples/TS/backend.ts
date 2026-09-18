@@ -8246,7 +8246,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 					if (m.key === 'constructor') {
 						for (const p of m.params) {
-							if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected')) {
+							if (T.isParamProperty(p)) {
 								if (typeof p.key !== 'string')
 									throw `computed field names in '${name}' are not supported`;
 								addField(info, p.key, p.typeAnnotation ?? (p.default ? checkerTypeOf(p.default, libGlobal) : undefined), !p.default && hasMod(p, 'optional'));
@@ -8363,7 +8363,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// itself (`ensureCtor`'s own `setField` loop over `params`).
 		const emitParamPropertyInits = () => {
 			for (const p of params) {
-				if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected'))
+				if (T.isParamProperty(p))
 					setField(p.key as string, Identifier(p.key as string));
 			}
 		};

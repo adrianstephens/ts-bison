@@ -2182,6 +2182,15 @@ async function main() {
 	}
 
 	{
+		// `readonly` alone makes a parameter property, as an accessibility modifier does.
+		const { readonlyParam } = await compile(`
+			class A { readonly names: number; constructor(k: number, readonly scope: number, private readonly d: number) { this.names = k; } get() { return this.scope * 10 + this.d + this.names * 100; } }
+			export function readonlyParam(): number { return new A(3, 4, 5).get(); }
+		`);
+		check('a readonly constructor parameter is a property', readonlyParam(), 345);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

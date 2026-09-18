@@ -1176,7 +1176,7 @@ export function TStoDecl(program: Module<Stmt>, opts?: Partial<typeof OutputOpti
 						const extra:	TS.ClassMember[] = [];
 						if (m.key === 'constructor') {
 							for (const p of m.params) {
-								if (hasMod(p, 'public') || hasMod(p, 'private') || hasMod(p, 'protected') || hasMod(p, 'readonly'))
+								if (T.isParamProperty(p))
 									extra.push(JS.Field(typeof p.key === 'string' ? p.key : '?', undefined, p.typeAnnotation, p.modifiers));
 							}
 							extra.push(JS.Method('method', m.key, {params: m.params.map(stripParam), rest: m.rest, typeParams: m.typeParams}));
