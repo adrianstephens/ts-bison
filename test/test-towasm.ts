@@ -4036,6 +4036,25 @@ async function main() {
 	}
 
 	{
+		// A computed key on a union of differing structs (walker.ts's `mapObject` at `call | construct`): the value is boxed as one
+		// `anyref`, so it takes the erased-receiver path that picks each class's arm at run time, reading and writing alike.
+		const { unionKey } = await compile(`
+			interface A { type: 'a'; x: number; s?: string }
+			interface B { type: 'b'; y: string; s?: string }
+			function get<N extends Record<string, any>>(node: N, k: string): any { return node[k as keyof N]; }
+			function put<N extends Record<string, any>>(node: N, k: string, v: any): N { const r = { ...node }; r[k as keyof N] = v; return r; }
+			function pick(i: number): A | B { return i > 0 ? { type: 'a', x: 3, s: 'q' } : { type: 'b', y: 'hello' }; }
+			export function unionKey(): number {
+				const a = pick(1), b = pick(0);
+				const a2 = put(a, 's', 'zz');
+				return (get(a, 'x') as number) + (get(b, 'y') as string).length * 10 + (get(b, 's') === undefined ? 100 : 0)
+					+ (a2.s === 'zz' ? 1000 : 0) + (a.s === 'q' ? 10000 : 0);
+			}
+		`);
+		check('a computed key on a union of structs reads and writes by name', unionKey(), 11153);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').

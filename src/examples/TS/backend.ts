@@ -3847,7 +3847,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 
 			// The WRITE half of `ensureAnyKey`, reached the same way its read half is.
-			if (T.isAny(ctx.narrowedTypeOf(target.object)) && T.isAssignable(ctx.narrowedTypeOf(target.index), T.STRING, ctx.typeScope)) {
+			if ((T.isAny(ctx.narrowedTypeOf(target.object)) || physicallyAny(target.object, ctx)) && T.isAssignable(ctx.narrowedTypeOf(target.index), T.STRING, ctx.typeScope)) {
 				const n			= ctx.tempCounter++;
 				const keyWtype	= typeOf(T.STRING)!;
 				const objLocal	= ctx.declareValue(`#anykeyobj$${n}`, W.REF_ANY, T.ANY);
@@ -4806,9 +4806,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							alternate,
 						), Identifier('undefined')), ctx, want ?? W.REF_ANY_NULLABLE);
 					}
-					// A computed key on an ERASED receiver: no single struct to chain over, so every class's own arm is picked by `ref.test` at run time -- `x[k]` as JS reads it
-					// (the checker's own `throughSources`).
-					if (T.isAny(ctx.narrowedTypeOf(e.object)) && T.isAssignable(ctx.narrowedTypeOf(e.index), T.STRING, ctx.typeScope)) {
+					// A computed key on an ERASED receiver -- typed `any`, or a union of differing structs boxed as one -- has no single struct to chain
+					// over, so every class's own arm is picked by `ref.test` at run time: `x[k]` as JS reads it (the checker's own `throughSources`).
+					if ((T.isAny(ctx.narrowedTypeOf(e.object)) || physicallyAny(e.object, ctx)) && T.isAssignable(ctx.narrowedTypeOf(e.index), T.STRING, ctx.typeScope)) {
 						emitAs(e.object, ctx, W.REF_ANY);
 						emitAs(e.index, ctx, typeOf(T.STRING)!);
 						ctx.emit(I.call(ensureAnyKey('get').funcIndex));
