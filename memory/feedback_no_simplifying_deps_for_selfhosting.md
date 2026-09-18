@@ -8,10 +8,10 @@ metadata:
   modified: 2026-08-19T23:40:43.363Z
 ---
 
-When a construct in code being self-hosted (or otherwise fed through towasm.ts as a stress test)
+When a construct in code being self-hosted (or otherwise fed through backend.ts as a stress test)
 is hard to compile because it's genuine metaprogramming or an otherwise-advanced pattern, the fix
 is a real new compiler feature -- not rewriting that source to a simpler shape the compiler already
-handles. This applies to the *target's own* source (towasm.ts itself) and equally to any
+handles. This applies to the *target's own* source (backend.ts itself) and equally to any
 dependency pulled into scope (e.g. `binary-libs/src/wasm.ts`'s `bin.Class(spec)` factory pattern
 and its `TableBuilder`/`TreeBuilder` metaprogramming).
 

@@ -46,7 +46,7 @@ engine `src/tison.ts`; PEG back end `src/peg.ts` (see [[tison-peg-backend]]). Gr
   "Test" config runs a `test/test.ts` that does not exist -- vestigial, nobody uses it.
 - **`dist/examples/TS/lib` is a COPY** (`copylib`, via `postexamples` and `build:emit`), and it arms two traps
   that hid it for weeks: `cp -r src/.../lib dist/.../lib` nests `lib/lib` when the target exists, and npm
-  SKIPS `postexamples` entirely when `tsc -b` exits nonzero. Both fixed 2026-09-15 -- `towasm.ts` reads that
+  SKIPS `postexamples` entirely when `tsc -b` exits nonzero. Both fixed 2026-09-15 -- `backend.ts` reads that
   lib at runtime, so a stale copy silently shifts checker/towasm results (it moved test-ts-parser's counts).
 - `src/examples` needs its own tsconfig invocation: **`cd src/examples && tsc -p .`**. See
   [[feedback-tison-examples-needs-own-tsconfig]] — this has bitten more than once.

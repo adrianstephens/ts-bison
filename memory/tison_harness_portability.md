@@ -42,7 +42,7 @@ script that delegates does not contain):
 - `npm run examples` MUST precede `test-towasm.ts` — the suite reads `dist/`, so a stale build silently
   tests old code.
 - `selfhost-survey.sh` takes ~10 minutes: run it in the background as one job, and never with an A/B toggle
-  left in a surveyed file (`towasm.ts` is itself a target). It prints its own warning when the tree is dirty.
+  left in a surveyed file (`backend.ts` is itself a target). It prints its own warning when the tree is dirty.
 - The survey was NONDETERMINISTIC before `935a4e1` (import-cycle race) — re-run a probe 3-5x before trusting
   a delta, and read the MOVED/REGRESSED lines rather than the flat total.
 - `test-towasm.ts` runs under `ts-node -T` (transpile-only), so it does NOT type-check: it will pass while

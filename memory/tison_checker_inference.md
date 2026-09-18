@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-Five connected checker mechanisms, all landed 2026-09-08 while clearing towasm.ts:193's
+Five connected checker mechanisms, all landed 2026-09-08 while clearing backend.ts:193's
 `new Map(LIB_AST.filter(...).map(n => [n.name, n]))`. Read together: they are how a type argument
 gets inferred through a nested generic call.
 

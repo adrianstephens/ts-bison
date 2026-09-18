@@ -10,7 +10,7 @@ metadata:
 
 Adopted 2026-09-07, after the user reframed the goal: **self-hosting was only ever pressure; the real
 goal is "compiler"** — semantic correctness against TypeScript. Every bug found before this was
-*created* under self-hosting pressure, because constructs were implemented only as deep as towasm.ts's
+*created* under self-hosting pressure, because constructs were implemented only as deep as backend.ts's
 own source exercised them. So **semantic conformance is the gate now**, not the survey.
 
 **The method**: pick one lib area, write a `conform/<area>` difftest group covering every method and
@@ -46,7 +46,7 @@ that half is not delegable.
 
 - **No microtask queue** (11 `conform/async` cases, one cause). `.then` on a settled promise runs its
   callback SYNCHRONOUSLY, and `await` on an already-resolved promise resumes synchronously in the
-  same call. Real JS always defers. Documented as intentional in towasm.ts's header; it is a real
+  same call. Real JS always defers. Documented as intentional in backend.ts's header; it is a real
   feature, not a bug fix. `lib/promise.ts` also has no static `Promise.resolve`, no rejection/`.catch`,
   and `.then` returns `void` (no chaining).
 - **`ToInt32` is implemented for the bitwise operators and, through them, typed-array stores.** The
@@ -114,7 +114,7 @@ undefined`, which alone was 8 corpus false positives).
 - `npx ts-node -T test/test-towasm.ts` — **must exit 0**; it holds behaviour difftest does not.
 - `npm run gate`, `npm run libdecls`.
 - **`cd src/examples && npx tsc -p .`** — tison's ROOT `tsconfig.json` **excludes `src/examples`**, so
-  `tsc -p .` from `tison/` never type-checks towasm.ts, checker.ts, type-utils.ts, transform.ts or
+  `tsc -p .` from `tison/` never type-checks backend.ts, checker.ts, type-utils.ts, transform.ts or
   walker.ts AT ALL. Reporting "tsc clean" from the root is meaningless for every compiler source.
   Separately, `cd src/examples/TS/lib && npx tsc -p .` is the only thing that checks `lib/*.ts`.
 - **`npx eslint src/examples/TS --ext .ts`** — 124 pre-existing warnings, so read the ERROR count.

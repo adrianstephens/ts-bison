@@ -44,7 +44,7 @@ fastest way to see the state of this. `parser.tables.conflicts` lists every reso
 
 ## How it was found
 
-Writing `assistant/cpp-towasm.ts`, a throwaway C++→wasm backend over the neutral layer, and getting
+Writing `assistant/cpp-backend.ts`, a throwaway C++→wasm backend over the neutral layer, and getting
 wrong answers from `?:`. Worth remembering as a method: a second front-end exercises the grammar
 differently from the test suite, which had no case pinning cross-operator precedence.
 

@@ -120,7 +120,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   methods missing from a class's members (6), mixin members (6), `this` in a static member (4), construct signatures on a
   constructor-typed `T` / merged `new()` (3), polymorphic `this` returns (2), guard narrowing to a supertype keeps the
   subtype (1), `this` in a nested `function` (1), `partiallyAnnotatedFunctionInferenceWithTypeParameter` (1, undiagnosed).
-  Our own sources gain only towasm.ts's `Uint8Array.set` (lib.d.ts lacks it); towasm's lib also needs `[Symbol.iterator]`
+  Our own sources gain only backend.ts's `Uint8Array.set` (lib.d.ts lacks it); towasm's lib also needs `[Symbol.iterator]`
   declared on `TypedArray` (test-towasm's for-of over a `Uint8Array` fails without it). Classify with real tsc per LINE, not
   baseline presence: `assistant/corpus-ab.sh` now keeps `corpus-ab/base-false-positives.txt` for the diff.
 - **TS's own `MapConstructor` loses a mapped call's types** (2026-09-13, missed inference): `new Map([1, 2].map(x => [String(x),
@@ -288,7 +288,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
         trap section A already names (Params<number> vs Params<any>): erase to ONE layout per generic shape.
     (b) NARROWED vs DECLARED (19): `{type:"keyof"; argument:Type}` vs `{type:string; argument:Type}` -- an inferred
         type predicate narrows a discriminant to its literal, and the narrowed view keys differently even though the
-        value IS an instance of the declared struct. Constraint to respect: towasm.ts:3140 documents that object
+        value IS an instance of the declared struct. Constraint to respect: backend.ts:3140 documents that object
         shapes must NOT simply be widened, because `matchObjectShapeByType`'s discriminant tiebreak needs the literal
         precision to tell union members apart. TRIED AND INSUFFICIENT: reusing an already-built widened struct in
         `ensureAnonObjectShape` -- the failing pair is not created through that path, so first find where each struct
@@ -342,7 +342,7 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
   A NARROWED object shape (literal discriminant, from an inferred type predicate) and the declared shape it was
   narrowed from become TWO structs, because struct identity is `T.typeKey` and that keeps the literal. At runtime the
   value IS an instance of the declared struct, so the conversion can never succeed. The tension to respect:
-  towasm.ts:3140 documents that an object shape must NOT simply be widened, because `matchObjectShapeByType`'s
+  backend.ts:3140 documents that an object shape must NOT simply be widened, because `matchObjectShapeByType`'s
   discriminant tiebreak needs the literal precision to tell union members apart. TRIED AND INSUFFICIENT: having
   `ensureAnonObjectShape` reuse an already-built widened struct on a hit -- the failing pair is not created through
   that path, so find where each struct IS built first (log inside `buildObjectShape`, BEFORE its `const info`

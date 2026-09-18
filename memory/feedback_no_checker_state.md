@@ -16,7 +16,7 @@ not, even when it looks locally justified.
 
 **Why**: user's own words, "I don't want any persistent state on checker... [I'd like this] for
 consistency with everywhere else" — flagged directly when I added a `WeakMap<Statement, Scope>` inside
-`makeChecker` to solve a real problem (towasm.ts needing narrowing-aware per-statement scope info the
+`makeChecker` to solve a real problem (backend.ts needing narrowing-aware per-statement scope info the
 checker computes but doesn't expose). The instance-state approach was ALSO functionally broken in a way
 I hadn't caught: consumers other than the one call that ran the check (e.g. `TStoWasm`, which creates
 its own fresh `makeChecker()` instance) see an empty cache and get no benefit, silently falling back to

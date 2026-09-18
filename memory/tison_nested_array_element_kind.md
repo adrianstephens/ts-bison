@@ -1,6 +1,6 @@
 ---
 name: tison-nested-array-element-kind
-description: "towasm.ts: a nested array's inner arrays keep their DECLARED element kind, not 'ref' — and `Array<any>` methods still lose it (open bug)"
+description: "backend.ts: a nested array's inner arrays keep their DECLARED element kind, not 'ref' — and `Array<any>` methods still lose it (open bug)"
 metadata:
   node_type: memory
   type: project

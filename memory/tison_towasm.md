@@ -1,6 +1,6 @@
 ---
 name: tison-towasm
-description: "towasm.ts (TS-AST-to-wasm backend, tison/src/examples/TS/) — what it is, where the authoritative gap list lives, and the design invariants worth not rediscovering."
+description: "backend.ts (TS-AST-to-wasm backend, tison/src/examples/TS/) — what it is, where the authoritative gap list lives, and the design invariants worth not rediscovering."
 metadata: 
   node_type: memory
   type: project
@@ -8,11 +8,11 @@ metadata:
   modified: 2026-09-04T18:23:12.324Z
 ---
 
-`src/examples/TS/towasm.ts` (~7.8k lines) compiles a static TS subset straight to a
+`src/examples/TS/backend.ts` (~7.8k lines) compiles a static TS subset straight to a
 `wasm.WasmModule` (no WAT stage), via [[binary-wasm-module]]. It assumes the AST already passed
 `TStypeCheck`/`TStypeCheckAsync`. Every gap throws a clear error rather than silently miscompiling.
 
-**The authoritative gap list is towasm.ts's own top-of-file header comment. Read it there, not from
+**The authoritative gap list is backend.ts's own top-of-file header comment. Read it there, not from
 memory.** It is maintained per-fix and is the only copy that stays current. An item listed under a
 category is either a whole missing construct or the one unsupported edge of an otherwise-working
 one — never a description of what does work.

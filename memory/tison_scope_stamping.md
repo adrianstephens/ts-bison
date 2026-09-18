@@ -29,7 +29,7 @@ so gating on it costs ~75% of the stamps (measured 98 vs 429 consumption hits ov
 
 ## Do NOT "fix" narrowedTypeOf
 
-`narrowedTypeOf` (towasm.ts) looks like a workaround for missing block-level scope. It is not. Its
+`narrowedTypeOf` (backend.ts) looks like a workaround for missing block-level scope. It is not. Its
 comment explicitly rejects using `ctx.typeScope` outright: a narrowed scope resolves a clean nominal
 `Map<K,V>` into its full structural shape, which `ownerFor` then builds an anonymous struct for instead
 of finding the class. `backToDeclaredMembers` maps a refined type back to physical struct members.

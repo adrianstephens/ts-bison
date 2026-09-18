@@ -49,7 +49,7 @@ now all take 0, 1, or several `(result t)` clauses. Design:
   changed from `Instr[]` to `WatInstr[]` -- they were never actually fully-resolved `Instr[]` (index
   names still unresolved until `toWasm`'s `resolveInstrs` runs on them), that was always a slightly-too-
   narrow type, just never surfaced until `try_table`'s blockType widening made the mismatch load-bearing.
-- `towasm.ts`'s `assertFlatInstrs` (rejects control-flow ops in flat inline `__asm` bodies) updated to
+- `backend.ts`'s `assertFlatInstrs` (rejects control-flow ops in flat inline `__asm` bodies) updated to
   also reject `try_table`, matching its existing block/loop/if rejection -- a real gap `tsc` caught
   immediately once `WatInstr` gained the new op.
 

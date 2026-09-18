@@ -13,7 +13,7 @@ them is "the closure literal cannot type its own parameter".
 
 ## What the message actually means
 
-`emitClosureLiteral` (towasm.ts ~4590) throws it when a parameter has no `typeAnnotation`. The
+`emitClosureLiteral` (backend.ts ~4590) throws it when a parameter has no `typeAnnotation`. The
 checker's `applyContextualParams` normally back-fills one, so the throw only means **the checker could
 not contextually type this callback** — the interesting question is always *why*, never the throw.
 
@@ -83,7 +83,7 @@ CONTAINING A TUPLE (`Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Ru
 union machinery `e97b848` added is for a union PARAMETER whose member is a function; this needs
 the tuple ARM of a union REST, indexed per argument. Next target.
 
-Two new rows appeared where those declarations landed: `14 | towasm.ts | 'typeAnnotation' needs
+Two new rows appeared where those declarations landed: `14 | backend.ts | 'typeAnnotation' needs
 an explicit number/boolean/object type` and `4 | js-parser.ts | 'any' (ref:TextPos) cannot be
 used as a boolean condition`.
 

@@ -1,6 +1,6 @@
 ---
 name: tison-towasm-self-hosting-plan
-description: "towasm.ts self-hosting (compile+run its own implementation, WITHOUT adapting the source) — current measured state, the instruments and their traps (the survey was nondeterministic until `935a4e1`), and the causes that gate everything; 56/274 at `935a4e1`."
+description: "backend.ts self-hosting (compile+run its own implementation, WITHOUT adapting the source) — current measured state, the instruments and their traps (the survey was nondeterministic until `935a4e1`), and the causes that gate everything; 56/274 at `935a4e1`."
 metadata: 
   node_type: memory
   type: project
@@ -8,7 +8,7 @@ metadata:
   modified: 2026-09-08T16:50:01.196Z
 ---
 
-**Goal (set 2026-08-19)**: make `towasm.ts` compile its own implementation and have the compiled-to-
+**Goal (set 2026-08-19)**: make `backend.ts` compile its own implementation and have the compiled-to-
 wasm result *actually run* as a working compiler. Not "passes the checker without hitting a gap" —
 it must take real input and produce correct executable output.
 
@@ -22,7 +22,7 @@ output is discarded into its own emit buffer, the error is reported, the rest co
 module whose initialisation silently didn't run.
 
 **Read the pre-`25d2cc0` "moved N declarations" figures with this in mind.** The 40/43/43/45 that the
-towasm.ts chain produced were partly measuring THAT COUPLING, not per-declaration progress: each fix
+backend.ts chain produced were partly measuring THAT COUPLING, not per-declaration progress: each fix
 unblocked one module-level statement, and the ~35 declarations behind it all moved together to whatever
 the next module-level statement was. The fixes were real; the multiplier was an artifact. Numbers after
 `25d2cc0` attribute a declaration to its own blocker -- expect them to be smaller and more honest.
@@ -44,7 +44,7 @@ the next module-level statement was. The fixes were real; the multiplier was an 
 - **`assistant/corpus-ab.sh [base-rev]`** -- the checker A/B (see below).
 - **`tison/assistant/probe-decl.ts`** -- one declaration, seconds instead of ~10 min.
 - **`tison/assistant/parse-one.ts`** -- does tison's OWN parser read this file? Run it after every edit to a
-  surveyed file, towasm.ts included. Nothing else catches a parser gap: tsc accepts the file, and the suite,
+  surveyed file, backend.ts included. Nothing else catches a parser gap: tsc accepts the file, and the suite,
   difftest and corpus gate never parse it with tison's parser -- the survey does, and reports "does not parse",
   dropping that file's whole declaration set (48 of them, 2026-09-14, 066d9b2). The construct that bit: a lone
   spread in a parenthesized object literal, `l => ({ ...l })` -- a KNOWN js-parser gap documented above
@@ -147,7 +147,7 @@ kept part is purely nullish; the checker's per-member logic is `T.logicalLeftPar
   keeps the slot's type when the narrowing is nullish-only (`a = undefined`). **The null-comparison
   row (26) is gone**, moved to `uncached` (1 -> 19) and `parseInt` (0 -> 8); zero blast radius in
   test-towasm and difftest (measured behind an in-place toggle before flipping the default).
-- **TRAP, hit here**: that toggle read `process.env` INSIDE towasm.ts -- which is itself a SURVEYED
+- **TRAP, hit here**: that toggle read `process.env` INSIDE backend.ts -- which is itself a SURVEYED
   file. The toggle-on survey compiled the toggle too: a fake 29-block `unresolved identifier 'process'`
   row, which masked the `Parser<any>` row and made it look cleared, and a bogus "54 moved". Remove every
   toggle from a surveyed file before surveying, and diff the cause TABLES against the last clean run.
@@ -231,7 +231,7 @@ What actually closed it (all general):
 ## IMPORTED MODULES WERE NEVER CHECKED -- only hoisted (`exportScope`)
 
 So their bodies had no per-statement scope stamps (narrowing) and local annotations no `declScope`. The
-survey HID this: it compiles each file as the ENTRY. Real self-hosting (towasm.ts as entry) compiles every
+survey HID this: it compiles each file as the ENTRY. Real self-hosting (backend.ts as entry) compiles every
 other module as an import. `TStoWasm` now runs `checkHoisted` (muted, stamping, no re-hoist) once per
 module record. **And a latent checker bug under it**: `checkStmt1` stamps a `function_decl`'s `.scope` as a
 STATEMENT before `checkFunctionBody` runs, and that is the same property as `fn.scope`, so every muted pass
@@ -270,7 +270,7 @@ globals already are:
    Then `Rule(...)` inside `push(...)` sees `Rule<CallSig>`, and `inferTypeArgMap`'s `expected` binds `T`
    before the deferred callback-return inference can bind it to the literal's own type.
 2. A closure literal whose context is a function type should give its `return`s / concise body that
-   type's `returnType` as context (`emitClosureLiteral`, towasm.ts ~4644; `case 'return'` ~6965).
+   type's `returnType` as context (`emitClosureLiteral`, backend.ts ~4644; `case 'return'` ~6965).
 DONE 2026-09-11 (both hops, `withContext`: `emitCallArgs` per argument; `plainReturn(result, context)` for
 closures -- captured at the literal, the body compiles later -- plain functions and methods). Line 599 now
 compiles; line 600 does not, and the reason is OVERLOADS: `Rule` has two generic overload signatures and a
@@ -293,7 +293,7 @@ spread of a UNION needs a runtime `ref.test` cascade building each member's stru
 
 ## The `Parser<any> -> Parser<{...}>` row (22 decls) -- one root, partly characterised
 
-21 of the 22 are tiny towasm.ts helpers: towasm.ts imports ts-parser.ts, whose module-level
+21 of the 22 are tiny backend.ts helpers: backend.ts imports ts-parser.ts, whose module-level
 `const parser = make()` fails, and an IMPORTED module's init is not recoverable the way the entry's is.
 A real blocker, not an artifact -- compiled towasm needs that parser. The error carries no position.
 - Plain nested inference is NOT it: `outer<T>(spec: Spec<T>): P<T> { return inner(spec); }` compiles.
@@ -307,9 +307,9 @@ A real blocker, not an artifact -- compiled towasm needs that parser. The error 
 
 | blocks | files | cause |
 |---|---|---|
-| 29 | towasm.ts, lalr.ts | `class 'Map' needs 2 explicit type argument(s)` -- the towasm.ts domino, now at line 194 |
+| 29 | backend.ts, lalr.ts | `class 'Map' needs 2 explicit type argument(s)` -- the backend.ts domino, now at line 194 |
 | 24 | checker.ts | `internal: cannot convert i64 to ref:any` (checker.ts:48) -- ALL of checker.ts, one cause |
-| 16 | towasm.ts, type-utils.ts, peg.ts | comparing to null/undefined needs a nullable object-typed value |
+| 16 | backend.ts, type-utils.ts, peg.ts | comparing to null/undefined needs a nullable object-typed value |
 | 16 | ts-parser.ts | `WithTextPos<ValuesOf<...>>` has no representation |
 | 8 | js-parser.ts | closure parameter needs an explicit type |
 | 7 | type-utils.ts | `'a?.length' on a getter is not supported` |
@@ -317,10 +317,10 @@ A real blocker, not an artifact -- compiled towasm needs that parser. The error 
 **59 declarations moved** since `b360b91`. The spread row (31) is gone entirely. `tocode.ts` remains the
 one file that essentially works: 17/18 declarations and 21 functions as a WHOLE FILE.
 
-## MEASURED STATE 2026-09-09 (`5e148b7`) -- 56/270, towasm.ts:193 CLEAR, tocode.ts COMPLETE
+## MEASURED STATE 2026-09-09 (`5e148b7`) -- 56/270, backend.ts:193 CLEAR, tocode.ts COMPLETE
 
-**towasm.ts:193 is done.** `const LIB_AMBIENT_MODULES = new Map(LIB_AST.filter(...).map(n => [n.name,
-n]))` blocked 30 of towasm.ts's 41 declarations for most of two sessions. Clearing it took SEVEN
+**backend.ts:193 is done.** `const LIB_AMBIENT_MODULES = new Map(LIB_AST.filter(...).map(n => [n.name,
+n]))` blocked 30 of backend.ts's 41 declarations for most of two sessions. Clearing it took SEVEN
 general fixes, none specific to that statement -- it was an unusually good probe:
 tuple inference in `inferTypeArgs`; contextual array literals; `Extract` distribution; dotted-name
 abstractness; the missing `undefined` binding; `??` + empty-literal context; and a
@@ -331,12 +331,12 @@ Current causes (every row of the previous table is closed):
 | blocks | files | cause |
 |---|---|---|
 | 17 | ts-parser.ts | `closure parameter 'self' needs an explicit number/boolean/object type` |
-| 16 | towasm.ts, ts-parser.ts | `unknown field 'recover'` |
-| 16 | towasm.ts, type-utils.ts | comparing to null/undefined needs a nullable object-typed value |
+| 16 | backend.ts, ts-parser.ts | `unknown field 'recover'` |
+| 16 | backend.ts, type-utils.ts | comparing to null/undefined needs a nullable object-typed value |
 | 11 | checker.ts, type-utils.ts | `'a?.length' on a getter is not supported` |
-| 10 | towasm.ts, transform.ts, type-utils.ts | `unresolved identifier 'isJsStatement'` |
+| 10 | backend.ts, transform.ts, type-utils.ts | `unresolved identifier 'isJsStatement'` |
 
-Flatter than it has been: no single wall left, and towasm.ts's declarations are now spread across
+Flatter than it has been: no single wall left, and backend.ts's declarations are now spread across
 several causes rather than piled behind one.
 
 ## DO NOT TIGHTEN ASSIGNABILITY YET -- measured 2026-09-09, and reverted
@@ -362,18 +362,18 @@ first (constraint-instead-of-argument substitution is the recurring culprit), th
 ## MEASURED STATE 2026-09-08 (`132771a`) -- 55/270, and tocode.ts is COMPLETE
 
 **`tocode.ts` compiles 18/18 -- the first target file to compile completely.** Per-file: type-utils
-22/94, tison.ts 7/12, lalr.ts 6/16, peg.ts 2/7, and checker.ts / towasm.ts / transform.ts /
+22/94, tison.ts 7/12, lalr.ts 6/16, peg.ts 2/7, and checker.ts / backend.ts / transform.ts /
 ts-parser.ts / js-parser.ts / walker.ts / binary-libs wasm.ts all still 0.
 
 Top causes now (every row from the old table is closed):
 
 | blocks | files | cause |
 |---|---|---|
-| 21 | towasm.ts, ts-parser.ts | `internal: 'parse' has a non-literal default with no resolved parameter info` |
-| 16 | towasm.ts, type-utils.ts | comparing to null/undefined needs a nullable object-typed value |
+| 21 | backend.ts, ts-parser.ts | `internal: 'parse' has a non-literal default with no resolved parameter info` |
+| 16 | backend.ts, type-utils.ts | comparing to null/undefined needs a nullable object-typed value |
 | 16 | ts-parser.ts | `WithTextPos<ValuesOf<readonly GrammarSym<any>[]>>` has no representation |
 | 11 | checker.ts, type-utils.ts | `'a?.length' on a getter is not supported` |
-| 10 | towasm.ts, transform.ts, type-utils.ts | `unresolved identifier 'isJsStatement'` |
+| 10 | backend.ts, transform.ts, type-utils.ts | `unresolved identifier 'isJsStatement'` |
 | 9 | checker.ts | `unknown field 'scope'` |
 
 The `internal:` prefix on the top row means an internal invariant, not a missing feature -- likely a
@@ -385,7 +385,7 @@ bug, and worth probing before assuming it needs a new capability.
   checker.ts's own `checkStmt(s, scope, typeOf, checkStmt)` is exactly that shape. `T.resolve`'s cycle
   guard cannot see it: the loop is BETWEEN `typeOf` calls. Fixed with an identity in-progress set in
   `typeOf` returning `REF_ANY` (`3a93dc4`).
-- towasm.ts's 30 declarations all shared line 193's `new Map(LIB_AST.filter(...).map(n => [n.name, n]))`.
+- backend.ts's 30 declarations all shared line 193's `new Map(LIB_AST.filter(...).map(n => [n.name, n]))`.
   It took FOUR fixes to clear: tuple inference, contextual array literals, `Extract` distribution, and
   a dotted-name abstractness bug. See [[tison_checker_inference]].
 
@@ -428,7 +428,7 @@ that, `303f7fd` + `bfd0aeb`:
   instead of the scope. Root cause and general fix: [[tison_nominal_class_refs]].
 - **Two `promise.ts` workarounds turned out to have different roots**: the `(() => void)[]`-instead-of-
   `Array<() => void>` one is obsolete and is deleted; the `shift()` annotation stays -- it reproduces
-  with the `T[]` spelling too, so it is the genuine `Array<T>` ELEMENT collapse (towasm.ts:7604),
+  with the `T[]` spelling too, so it is the genuine `Array<T>` ELEMENT collapse (backend.ts:7604),
   still open and still the root of the callback cluster.
 
 **difftest is FULLY GREEN again -- 2090/2100, 0 disagreements** (`d95533f`, `baeba85`). The three
@@ -461,16 +461,16 @@ Left in the working tree, UNCOMMITTED (doesn't clear the auto-commit bar -- [[fe
 (`array.ts`, `promise.ts`, `map.ts`, ... -- the always-available `LIB_AST` bundle, distinct from the
 entry module and from `lib/node/*`'s ON-DEMAND, `collectModules`-loaded files) is unreachable from any
 function or method declared in that SAME file. Traced with temporary instrumentation in
-`lazyGlobalFor`/`ensureClass` (added, verified, removed -- `towasm.ts` itself has no diff):
-- `ensureClass`'s `homeModule` for a lib class comes from `stmtHomeModule.get(decl)` (towasm.ts:8144).
-- `stmtHomeModule` is populated by exactly one loop, over `moduleBodies` (towasm.ts:9275) --
+`lazyGlobalFor`/`ensureClass` (added, verified, removed -- `backend.ts` itself has no diff):
+- `ensureClass`'s `homeModule` for a lib class comes from `stmtHomeModule.get(decl)` (backend.ts:8144).
+- `stmtHomeModule` is populated by exactly one loop, over `moduleBodies` (backend.ts:9275) --
   `['.', entry]` plus `modules` (files reached via `collectModules`, how `lib/node/*` gets in). **Static
   `LIB_AST` files are never added to `moduleBodies` at all.**
 - So `stmtHomeModule.get(decl)` is `undefined` for `Promise`'s class decl, and since
   `FunctionContext`'s `homeModule` param defaults to `'.'` on `undefined`, every `Promise` method
   silently compiles as if it belonged to the ENTRY module.
 - `resolve()`/`then()` then read `microtasks` via `lazyGlobalFor`, which -- believing it's in `'.'` --
-  looks in `topLevelVars`, ALSO only populated from `moduleBodies` (towasm.ts:9318) -- so
+  looks in `topLevelVars`, ALSO only populated from `moduleBodies` (backend.ts:9318) -- so
   `microtasks` (declared in `lib/promise.ts`, never scanned by that loop either) isn't there. Throws
   `unresolved identifier 'microtasks'`.
 
@@ -479,7 +479,7 @@ function or method declared in that SAME file. Traced with temporary instrumenta
   written, indexed, `.length`, `.push`, all correct (verified by actually running the wasm, not just
   compiling it: `let n=5; export function check(){ n=n+100; return n; } ` -> real `105`).
 - A SCALAR top-level const in a static lib file also works -- it goes through a separate, simpler path
-  (towasm.ts:4950-4959, straight off `LIB_DECL_MAP`) that never needs `stmtHomeModule` at all. This is
+  (backend.ts:4950-4959, straight off `LIB_DECL_MAP`) that never needs `stmtHomeModule` at all. This is
   exactly why the gap was never noticed before: every existing static lib file either has no shared
   top-level state, or only a scalar one.
 - Only a NON-scalar (array/object/class-typed) top-level binding in a static lib file, read from a
@@ -586,7 +586,7 @@ Shape that fits this codebase:
   it handles multiple `return`s for free where an epilogue could not.
 - **Gated on the machinery actually being reached** -- e.g. the `microtasks` lazy-global slot existing
   after the worklist drains. A program that never touches promises emits nothing.
-- Ordering note: the export loop (towasm.ts:9561) runs BEFORE the worklist, so the Promise class may
+- Ordering note: the export loop (backend.ts:9561) runs BEFORE the worklist, so the Promise class may
   not be instantiated yet. Build the wrappers after the worklist and patch `mod.exports`' indices.
 
 This is faithful to JS: a host call to a wasm export IS the job, and JS runs microtasks at the end of
@@ -631,7 +631,7 @@ wrapper handles that, and an annotated callback works at any arity. Two distinct
 
 The two interact: `[0, ...b.filter(x => x > 0)]` works for `number[]` and fails for `string[]`.
 
-### THE `Array<T>` COLLAPSE (towasm.ts:7604) -- the root of the callback cluster, measured 2026-09-07
+### THE `Array<T>` COLLAPSE (backend.ts:7604) -- the root of the callback cluster, measured 2026-09-07
 
 ```ts
 if (name === 'Array') {
@@ -821,7 +821,7 @@ four, which is honest; the real lowering needs actual conversions (`bigFromNumbe
 `parseFloat`, truthiness). **Write the difftest cases against real JS first.**
 
 **Also corrected: towasm's explicit-return-constructor convention SKIPS `as` nodes** (`unwrapAs` at
-towasm.ts:7811), so a cast target is NOT "declared intent" -- it is there for tsc's benefit only.
+backend.ts:7811), so a cast target is NOT "declared intent" -- it is there for tsc's benefit only.
 
 ### `7852172`: a parameter default may be a CLOSURE, and is typed by its annotation
 
@@ -834,7 +834,7 @@ Two fixes, both needed before `Array.sort()` worked without an explicit comparat
   `compareFn: (a: T, b: T) => number` gave its params `any`. Real TS checks a default AGAINST the
   parameter's declared type; pass `anno` as `expected` (checker.ts ~1860).
 
-**towasm.ts:170 is now fully unblocked** -- the domino moves to line 194, `class 'Map' needs 2 explicit
+**backend.ts:170 is now fully unblocked** -- the domino moves to line 194, `class 'Map' needs 2 explicit
 type argument(s)`.
 
 ### OPEN: `Array.sort` diverges from JS twice (reproduced, not fixed)
@@ -857,9 +857,9 @@ produced an "illegal cast" (3). Also learned: `Array._copy` with the DESTINATION
 explicit `<T>` -- with T open the two `TYPEINDEX("T[]")` operands resolve from the arguments, which
 differ. Budget a real session for this, not a tail-end patch.
 
-### `b2c1bcc`: `fs.readdirSync` -- and towasm.ts:170's domino moved again
+### `b2c1bcc`: `fs.readdirSync` -- and backend.ts:170's domino moved again
 
-The spread cause's towasm.ts sites were ALL one module-level statement (the `LIB_FILES` glob) blocked
+The spread cause's backend.ts sites were ALL one module-level statement (the `LIB_FILES` glob) blocked
 on `readdirSync` not existing -- debt from `bf316eb`, where I added the glob without the lib support.
 Implemented over WASI `fd_readdir`: 24-byte dirent header (d_next u64, d_ino u64, d_namlen u32,
 d_type u8) then the name bytes, packed. **LOOP on the cookie** -- one buffer does not hold a directory,
@@ -874,7 +874,7 @@ JS gives NaN** -- worth knowing.
 tests the set of names without depending on an order neither WASI nor node promises (and without
 needing `sort`, which has its own gap).
 
-**towasm.ts:170 now fails on `sort`'s ARROW-FUNCTION DEFAULT PARAMETER** ("a param's default value must
+**backend.ts:170 now fails on `sort`'s ARROW-FUNCTION DEFAULT PARAMETER** ("a param's default value must
 be a literal ... or a read of an earlier parameter"). That is the next domino, and it bites twice --
 the lib's own `Array.sort` is unusable for the same reason.
 
@@ -898,7 +898,7 @@ receiver **narrowed out of `T | undefined`**, then a field off it spread.
 
 Simple spreads all WORK: `['a', ...b]`, `[...b, 'a']`, `[...a, ...b]`, for both `string[]` and
 `number[]`, and spreading a `slice()` result. The failing sites involve ref-element arrays
-(`checker.ts:2003` is `[...a.rights, ...b.rights]`) and generic-method results. towasm.ts's own site
+(`checker.ts:2003` is `[...a.rights, ...b.rights]`) and generic-method results. backend.ts's own site
 (`['lib.d.ts', ...readdirSync(...).filter(...).sort()]`) also drags in `@types/node`. An attempt to
 repro with an `interface`-typed element hit a DIFFERENT gap first: **`interface_decl` is unsupported as
 a top-level statement in the entry module**. Isolate before building anything.
@@ -1102,14 +1102,14 @@ beyond lib.d.ts-first. `lib/node/*` stays out (on-demand modules, resolved throu
 
 ### `429bb6c`: a closure need not CAPTURE a module-level const -- it is a global
 
-The survey's largest single cause (24 declarations, `unresolved identifier 'LIB_DIR'`, towasm.ts:162)
+The survey's largest single cause (24 declarations, `unresolved identifier 'LIB_DIR'`, backend.ts:162)
 was a one-clause gap in `resolvesGlobally`, the function deciding what a closure must capture. A
 top-level `const`/`let` becomes a real global or an `ensureLazyGlobal` wrapper, so it never needs a
 capture slot -- but `hoist` deliberately does not hoist a plain top-level `var_decl` into a scope, so
 `resolveDecl` could not see one (`topLevelVars` is where the entry module's live). Exact same shape as
 the namespace-import clause directly above it. Repro is 5 lines; 9 `capture/global` difftest cases.
 
-**towasm.ts:162 now fails on the SHORT-ARITY ARRAY CALLBACK gap instead** -- `flatMap(f => ...)` where
+**backend.ts:162 now fails on the SHORT-ARITY ARRAY CALLBACK gap instead** -- `flatMap(f => ...)` where
 the signature is `(value, index, array)`. `coerceTop` already has a fewer-params closure coercion; it
 does not fire here because the PARAM TYPE differs too (`arr:i16` vs `ref:any`), i.e. the array
 literal's element type resolved to `any` rather than `string`. difftest already tracks this family
@@ -1167,7 +1167,7 @@ never serializes. Two independent bugs:
   "call to unknown function '__asm'". Use the same asm as an inline call inside a real function body.
 - Never `import` a static lib file from `lib/node/*` (second `heap` over one memory). Ambient-declare.
 
-### towasm.ts:161-162 is a DOMINO CHAIN -- one identifier at a time, 22ish declarations each
+### backend.ts:161-162 is a DOMINO CHAIN -- one identifier at a time, 22ish declarations each
 
 The same two lines have now been the survey's #1 cause four times running, each fix advancing it exactly
 one identifier and the block count barely moving:
@@ -1231,7 +1231,7 @@ pre-existing cases (identical 1266/1281 before and after the swap).
 - `path.join` and `path.resolve` **do not compile at all** cross-module -- and the SURVEY CANNOT SEE THIS,
   because `LIB_DIR`'s own declaration dies on `__dirname` before it ever reaches `join`'s body.
 - `extname` needs `String.lastIndexOf`; `resolve` needs `Array.join`. **Both missing from the lib** --
-  `Array.join` is also 2 blocks of the survey's own table (towasm.ts, peg.ts), so it pays twice.
+  `Array.join` is also 2 blocks of the survey's own table (backend.ts, peg.ts), so it pays twice.
 - `dirname` was WRONG on every repeated separator (fixed, `6a114ca`).
 
 **Root cause of the `join` failure, isolated to a 2-line repro** -- in an IMPORTED module:
@@ -1239,7 +1239,7 @@ pre-existing cases (identical 1266/1281 before and after the swap).
 function mk(s: string): string[] { return [s]; }
 export function viaHelper(s: string): number { const a = mk(s); return a[0].length; }
 ```
-"indexing is only supported on number[]/boolean[]/..." (towasm.ts:4740). Binding the `string[]` RESULT OF A
+"indexing is only supported on number[]/boolean[]/..." (backend.ts:4740). Binding the `string[]` RESULT OF A
 CALL into a local, then indexing it, degrades to a ref-kind (`arr:ref`) array, which index reads don't
 support. A locally-built `string[]`, a rest param, and `for...of` over the same value all work; only the
 returned-array binding fails, and only cross-module. **Same family as the recorded `map` limitation**
@@ -1342,7 +1342,7 @@ and each reference kind. It is the reason this landed with 0 disagreements rathe
 
 **25 of 257 compile in isolation.** 318 failures from **154** distinct causes. The cause count jumped
 because `25d2cc0` stopped a module-level statement blocking its whole file (see the correction above):
-towasm.ts now reports **16** distinct causes over its 38 declarations instead of 1, ts-parser.ts 6
+backend.ts now reports **16** distinct causes over its 38 declarations instead of 1, ts-parser.ts 6
 instead of 1. `type-utils.ts` went **7 -> 14 compiling**, peg.ts 0 -> 1.
 
 | blocks | causes | shape |
@@ -1361,11 +1361,11 @@ appearing in several files) or by difftest agreement, not by row size.
 and `guard()` needs truthiness + `typeof` + `in` + field read on a boxed `any`); the array-callback
 cluster (short-arity arrow vs `(value, index, array)` -- 5 difftest cases); missing lib statics.
 
-### INSTRUMENT TRAP found 2026-09-04, and fixed: towasm.ts was surveyed against `wasm: any`
+### INSTRUMENT TRAP found 2026-09-04, and fixed: backend.ts was surveyed against `wasm: any`
 
 `ModuleLoader` cannot resolve `@isopodlabs/binary_libs/wasm` -- the package's `exports` map points at a
 built `dist/*.js` and the loader never reads `exports`. So `import * as wasm` bound a *value* with no
-namespace, `wasm.I` was a member read on `any`, and every towasm.ts measurement before this was partly
+namespace, `wasm.I` was a member read on `any`, and every backend.ts measurement before this was partly
 an artifact. `selfhost-survey.ts` and `assistant/probe-decl.ts` now pass a `paths` option mapping
 `@isopodlabs/binary_libs/` and `@isopodlabs/binary/` to the sibling **`src/`** trees (a `.d.ts` has no
 bodies to compile, and `binary-libs/src/wasm.ts` is itself a target). Making the loader read `exports`
@@ -1379,8 +1379,8 @@ module-level const whose value has no physical representation failed the WHOLE m
 statement blocked 32-42 declarations at a time. Four separate top-row causes this session were all that
 same shape:
 
-- `const Scope = T.Scope` (towasm.ts) -- a class alias. 42 blocks.
-- `const I = wasm.I` (towasm.ts) -- a cross-module binding alias. 32 blocks.
+- `const Scope = T.Scope` (backend.ts) -- a class alias. 42 blocks.
+- `const I = wasm.I` (backend.ts) -- a cross-module binding alias. 32 blocks.
 - `const JSBinary = Binary<Expr, binaryOps>` (js-parser.ts) -- a generic declaration named with explicit
   type arguments.
 - `export type { Location } from '../common';` (js-parser.ts) -- a bare `export` statement, which binds
@@ -1396,7 +1396,7 @@ function is evaluating something nothing reads.**
   its MEMBERS alone -- the FOURTH thing that broke on today, after the `in` test, the union dispatches
   and `never`. A constraint like `WasmScalarI | 'i8' | 'ref'` kept one member as an unresolved alias, the
   flat "every key is a literal" test failed, and the mapped type stayed opaque. `literalKeys` resolves as
-  it descends. towasm.ts's `ARR_WTYPE: Record<WasmElementI, WasmType>` is exactly this. **45 moved.**
+  it descends. backend.ts's `ARR_WTYPE: Record<WasmElementI, WasmType>` is exactly this. **45 moved.**
   Corpus: **GAP 601 -> 599**, everything else unchanged.
 
 **RECURRING TRAP (4x in one session), now with a shared fix: `T.resolve` does NOT resolve union
@@ -1432,7 +1432,7 @@ reference, which are the already-tracked dynamic-`any` row -- so there is no hid
 
 - **`Array.flatMap` was never declared** (`693a926`): not in `lib/array.ts` nor `lib.d.ts`, so every
   `xs.flatMap(...)` typed as `any`, and ONE `any` in a spread poisons the whole array literal.
-  towasm.ts's `LIB_DECLS = [...filter(...), ...filter(...).flatMap(...)]` therefore gave `d: any` in its
+  backend.ts's `LIB_DECLS = [...filter(...), ...filter(...).flatMap(...)]` therefore gave `d: any` in its
   `for...of`, which was all 35 of that file's `unknown field 'name'`. **40 declarations moved.**
   Pre-existing limits it does NOT fix, shared with `map`: binding a generic method's `U[]` result to a
   concrete-typed local (`const r = a.map(...)`) still fails -- method-level generics are not
@@ -1525,8 +1525,8 @@ reference, which are the already-tracked dynamic-`any` row -- so there is no hid
 - **a module-level const through its namespace** (`64ef598`): `NS.someConst` had no read path at all --
   `ensureLazyGlobal`'s wrapper was only ever reached from a bare identifier. `lazyGlobalFor` now takes
   the scope to resolve in.
-- **the towasm.ts chain merged into the `opts` cluster**: with `wasm` really resolved, towasm.ts's next
-  blocker is `new Output({newline:'', ...})` at towasm.ts:138 -- the same tocode.ts `Output` shape
+- **the backend.ts chain merged into the `opts` cluster**: with `wasm` really resolved, backend.ts's next
+  blocker is `new Output({newline:'', ...})` at backend.ts:138 -- the same tocode.ts `Output` shape
   transform.ts already sat on. Fixing `Output` now unblocks 34.
 
 ### tocode.ts's 16-block row is `guard()`, and it is NOT a quick win
@@ -1592,8 +1592,8 @@ it apart in minutes.
 - **a module-level const through its namespace** (`64ef598`): `NS.someConst` had no read path at all --
   `ensureLazyGlobal`'s wrapper was only ever reached from a bare identifier. `lazyGlobalFor` now takes
   the scope to resolve in.
-- **the towasm.ts chain merged into the `opts` cluster**: with `wasm` really resolved, towasm.ts's next
-  blocker is `new Output({newline:'', ...})` at towasm.ts:138 -- the same tocode.ts `Output` shape
+- **the backend.ts chain merged into the `opts` cluster**: with `wasm` really resolved, backend.ts's next
+  blocker is `new Output({newline:'', ...})` at backend.ts:138 -- the same tocode.ts `Output` shape
   transform.ts already sat on. Fixing `Output` now unblocks 34.
 
 ### tocode.ts's 16-block row is `guard()`, and it is NOT a quick win
@@ -1843,7 +1843,7 @@ its `const info` literal". That was right, and one step short: logging the KEY s
 being built, but only logging each built struct's FIELD WASM TYPES showed why -- two of the four were
 already byte-identical (`Rest<any>` and `Rest<unknown>`), which is what proved the key, not the layout,
 was the bug. **Log the layout, not just the key.** `SHAPELOG`-style `process.env` logging inside
-towasm.ts is fine for probing but MUST be removed before surveying (this file's own toggle trap).
+backend.ts is fine for probing but MUST be removed before surveying (this file's own toggle trap).
 
 **The one regression (`patternBindings`) is RESOLVED** by removing the marker that caused it -- it was
 behaviour-identical (see [[tison-scope-stamping]]). The towasm gap it exposed -- now COVERED by the receiver analysis below --
@@ -1935,7 +1935,7 @@ Batch-probed 2026-09-13, it holds several causes: (a) an expression-bodied arrow
 `ctx.stmtScope` stayed unset. FIXED: the checker stamps an expression body with its `inner` scope, gated on
 `narrowing` like branch stamps, and the synthesized return carries it. (b) a computed key on `any`
 (checker.ts:580 `out[k]`, wasm.ts:418 `(OP as any)[v.op]`) needs a runtime-keyed dynamic read. (c) a
-`Record` indexed by a literal-union key (`ARR_WTYPE[we]`, towasm.ts:324). (d) `t.typeArgs?.[i]`
+`Record` indexed by a literal-union key (`ARR_WTYPE[we]`, backend.ts:324). (d) `t.typeArgs?.[i]`
 (type-utils.ts:2984) turned out to be (a) too: an arrow capturing a narrowed `t`. (e) about 12 declarations threw with no position at all.
 **Trap**: a probe's `at L:C` names no file, and the position can be in ANY module the probe reaches
 (`parse`'s 33:131 was tableCache.ts). Two repros "failed to reproduce" because I had the wrong file.
@@ -1967,7 +1967,7 @@ not just the survey's "Since" summary.
 TS's discriminated union, so `T.iterationTypes` can't split `value` by `done` for a user iterator class that
 returns it -- its yield comes out `Y | R`. Faithful fix: make it TS's union and have `compileGeneratorFunc`
 build the shape. (2) a generator returning `undefined` (`Generator<T, undefined, N>`) throws "unsupported
-return type" (towasm.ts `compileGeneratorFunc`); `void` works. (3) `for...of` over a TUPLE value
+return type" (backend.ts `compileGeneratorFunc`); `void` works. (3) `for...of` over a TUPLE value
 (`[[a, b], [b, a]] as const`, checker.ts `narrow`) fails "unknown field 'length'" -- a tuple is neither
 array-kind nor iterable to towasm.
 
@@ -2109,7 +2109,7 @@ before it was excluded); a NAMED IMPORT of another module's const reading that m
 closure parameter whose written-back annotation does not resolve where the closure is written falling back to the wanted
 signature's slot (e3aad3c -- printer.ts's `m` over `stmt.body` is annotated `ClassMember<Type>`, js-parser's name; the
 deeper fix is for the checker to stamp what it writes back with its own declaring scope).
-**towasm.ts `scalarKind` now compiles through printer.ts** and stops only in tableCache.ts (`JSON`), which is out of scope.
+**backend.ts `scalarKind` now compiles through printer.ts** and stops only in tableCache.ts (`JSON`), which is out of scope.
 **Next on the checker path**: checker.ts `throughSources`'s `const out: any = {...e}` then `out[k]` -- a computed-key read
 AND write on an `any` (also wasm.ts's `(OP as any)[v.op]`). Needs a real design: the receiver's class is only known at run
 time, so either a generated "property by name" dispatch (per class, comparing the key against each field name) or a
@@ -2159,7 +2159,7 @@ literal gets no context through `&&` and builds an anon shape (`assistant/repro-
 the user chose over a run-time `instanceof`/`Array.isArray` split: towasm picks a body with the CHECKER's own per-candidate test
 (`candidateFits`, b41dee7), passing the call's explicit type arguments (a34ece2); the checker's trial now types each argument in the
 context its final pass will (`argContext`, 05c9d55); `new Map(otherMap)` (d6c9357) and typed-array `set(array, offset)` (44145be)
-are plain second bodies. Survey: 99 compiled, unchanged; peg.ts's Map ERR gone; towasm.ts's `addData` `set` calls compile.
+are plain second bodies. Survey: 99 compiled, unchanged; peg.ts's Map ERR gone; backend.ts's `addData` `set` calls compile.
 **Invariant**: a callback nested in an argument keeps the FIRST context it is typed in -- any pass that types arguments before
 the final one (an overload trial, or towasm re-asking after the check) must use the final pass's context, or it silently fixes
 the wrong one. It hid behind single signatures: `Map`'s second constructor turned it into 73 survey blocks in one step.
@@ -2214,7 +2214,7 @@ rejects at the same position; two of those files say so in their own comments. S
 
 ## Scope
 
-In: towasm.ts, checker.ts, type-utils.ts, walker.ts, transform.ts, tison.ts, ts-parser.ts,
+In: backend.ts, checker.ts, type-utils.ts, walker.ts, transform.ts, tison.ts, ts-parser.ts,
 js-parser.ts, `binary-libs/src/wasm.ts`. True bootstrap — the image parses raw TS source text itself,
 including the parser engine and grammars (explicit user correction: don't treat tison as a native
 pre-pass). Out: `tableCache.ts` (fs/crypto/zlib convenience wrapper), `module-loader.ts`.

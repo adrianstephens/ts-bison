@@ -1,6 +1,6 @@
 ---
 name: feedback-no-name-special-casing
-description: "In towasm.ts, dispatching on a hardcoded method/function name (e.g. \"if methodName is one of push/pop/shift/unshift\") is unacceptable even as a working first cut -- always find the structural/shape-based trigger instead"
+description: "In backend.ts, dispatching on a hardcoded method/function name (e.g. \"if methodName is one of push/pop/shift/unshift\") is unacceptable even as a working first cut -- always find the structural/shape-based trigger instead"
 metadata: 
   node_type: memory
   type: feedback
@@ -19,13 +19,13 @@ as-is, works for any class/method automatically).
 
 **Why:** this matches the file's own established convention throughout (`scanInlineMethods`'s asm-body
 recognition, `methodSig`'s get/set-by-probe dispatch, `namespaceOwner`) — every existing "special" behavior in
-towasm.ts is triggered by recognizing a *shape* in the declared TS source, never by a hardcoded name/owner
+backend.ts is triggered by recognizing a *shape* in the declared TS source, never by a hardcoded name/owner
 list. A name-based special case is a smell specifically *in this file* even when it works, because the whole
-multi-session project arc here is "remove special-casing from towasm.ts" (see memory index) — new
+multi-session project arc here is "remove special-casing from backend.ts" (see memory index) — new
 special-casing is directly counter to the standing goal, not a neutral tradeoff.
 
 **How to apply:** before writing `if (name === 'foo' || name === 'bar' || ...)` (or `owner.name === 'X'`) in
-towasm.ts, stop and ask: what *shape* in the source (an assignment to `this`, a body that's just one
+backend.ts, stop and ask: what *shape* in the source (an assignment to `this`, a body that's just one
 `__asm(...)` call, an empty-args-callable `get`/`set` pair) actually distinguishes the cases that need special
 handling from the ones that don't? Build the detector around that shape so it generalizes to classes/methods
 that don't exist yet, even if that means more up-front machinery (e.g. real multi-value wasm functions) than

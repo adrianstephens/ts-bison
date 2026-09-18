@@ -1,12 +1,12 @@
 ---
 name: tison-comment-pass-tooling
-description: "how to rewrite towasm.ts comments safely (edit lists anchored to original lines + a printer-based code-identity gate), and the bare-createScanner template trap"
+description: "how to rewrite backend.ts comments safely (edit lists anchored to original lines + a printer-based code-identity gate), and the bare-createScanner template trap"
 metadata:
   node_type: memory
   type: project
 ---
 
-A wholesale comment pass over `towasm.ts` must never let an editor reproduce code. Working shape, in
+A wholesale comment pass over `backend.ts` must never let an editor reproduce code. Working shape, in
 `assistant/towasm-comment-pass.js` (`plan` / `apply` / `verify` / `report` / `reindent`):
 
 - editors return `{start, end, lines}` edits anchored to ORIGINAL line numbers; `apply` validates each
