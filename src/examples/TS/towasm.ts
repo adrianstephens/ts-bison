@@ -9,7 +9,7 @@ import * as WT from '../wasm-codegen';
 import { WasmError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess } from '../wasm-codegen';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
 import { walker, walkerB } from './walker';
-import { AsmDecl, makeAsm as makeAsm0 } from '../wasm-asm';
+import { AsmDecl, makeAsm as makeAsm0 } from '../wasm-codegen';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
 import * as WAT from '../wat-parser';
@@ -502,7 +502,7 @@ class FunctionContext extends WT.FunctionContext {
 // ===================================================================
 // Inline `__asm` -- the TypeScript spelling
 // ===================================================================
-// The island itself is in `../wasm-asm` and is language-free. What is here is only what TypeScript alone can
+// The island itself is in `../wasm-codegen` and is language-free. What is here is only what TypeScript alone can
 // answer: the SPELLING (recognising the call, and reading the WAT text and the declared types off it) and
 // the types -- what a declared type lowers to, and what a `TYPEINDEX` operand names against the signature
 // its own call settled on.
@@ -542,7 +542,7 @@ function asmDeclaredType(t: Type, resolve?: (t: Type) => WT.Type | undefined): W
 
 
 // A `const f = __asm<[...], R>('...')` declaration or a bare `__asm<...>('...')(args)` call -- the two
-// spellings `isAsm`/`isAsmMethod` recognise. Everything about the BODY is `../wasm-asm`'s; read here is the
+// spellings `isAsm`/`isAsmMethod` recognise. Everything about the BODY is `../wasm-codegen`'s; read here is the
 // island's TypeScript spelling, and answered here are its types.
 function makeAsm(call: JS.Call<Type>, codegen: AsmCodegen, defines?: Record<string, string|number>, typeParams?: string[]): Builtin<Inline> {
 	let		asm		= (call.arguments[0] as Literal<string | JS.TemplatePart<Expr>[]>).value;
@@ -574,7 +574,7 @@ function makeAsm(call: JS.Call<Type>, codegen: AsmCodegen, defines?: Record<stri
 	const resolveType = (t: Type): WT.Type | undefined => isOpenParam(t) ? REF_ANY_NULLABLE : asmDeclaredType(t, codegen.typeOf);
 	const generic = !!typeParams?.length || asm.includes(WAT.TYPEINDEX_MACRO);
 
-	// The signature ONE call settled on, in concrete representations -- all `../wasm-asm` needs of TypeScript's
+	// The signature ONE call settled on, in concrete representations -- all `../wasm-codegen` needs of TypeScript's
 	// types. Declared types are substituted with the call site's type arguments first, so `__asm<[i32], T[]>`
 	// resolves `T[]` to a real element kind instead of the `arr:ref` an unsubstituted `T` falls back to.
 	const declFor = (typeArgs: readonly Type[] | undefined, argWtypes: readonly (WT.Type | undefined)[]): AsmDecl => {
