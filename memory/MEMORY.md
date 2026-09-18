@@ -67,3 +67,4 @@ derivable from git), compressed to current-state summaries above on 2026-09-04.*
 
 *Migrated out of the global auto-memory store (`~/.claude/projects/-Volumes-DevSSD-dev-packages/memory/`)
 on 2026-09-09 so tison's memories travel with the tison repo.*
+- [precedence resolution](tison_precedence_resolution.md) — rule-vs-rule prec, the object-vs-named bug fixed at `87a809b`, and the **OneOf default-shift defect still open** (don't fix it with termOneOf)
