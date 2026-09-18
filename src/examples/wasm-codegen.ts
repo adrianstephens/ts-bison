@@ -623,18 +623,6 @@ export function emitOptionalAccess(ctx: FunctionContext, objWtype: Type, resultW
 	return resultWtype;
 }
 
-// The heap type one `typeof` tag's runtime test needs: the box a scalar enters an `any` slot as, an array for a
-// string/`bigint`, and the closure base for a callable.
-export function typeofHeapType(tag: string, types: Types): number | undefined {
-	switch (tag) {
-		case 'number':		return types.box('f64');
-		case 'boolean':		return types.box('i32');
-		case 'string':		return types.array('i16');
-		case 'bigint':		return types.array('i32');
-		case 'function':	return types.closureBase();
-	}
-	return undefined;
-}
 
 // The type a short-circuiting operator (`&&`/`||`/`??`) gives both its arms: the caller's, when both it and the
 // self-inferred one are object refs -- only then does building at it rather than converting to it matter (invariance).
@@ -759,6 +747,20 @@ export class Types extends Array<wasm.SubType> {
 	}
 	private boxDesc(kind: ScalarI): wasm.SubType {
 		return { final: true, supertypes: [], type: { kind: 'struct', fields: [{ type: kind, mut: false }] } };
+	}
+
+
+	// The heap type one `typeof` tag's runtime test needs: the box a scalar enters an `any` slot as, an array for a
+	// string/`bigint`, and the closure base for a callable.
+	heapType(tag: string): number | undefined {
+		switch (tag) {
+			case 'number':		return this.box('f64');
+			case 'boolean':		return this.box('i32');
+			case 'string':		return this.array('i16');
+			case 'bigint':		return this.array('i32');
+			case 'function':	return this.closureBase();
+		}
+		return undefined;
 	}
 
 	get(i: number) { return this[i]; }

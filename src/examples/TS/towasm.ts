@@ -6,7 +6,7 @@ import * as T from './type-utils';
 import * as Common from '../common';
 import { Literal, Identifier, Binary, Assign, Conditional, Member, hasMod } from '../common';
 import * as WT from '../wasm-codegen';
-import { WasmError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess, typeofHeapType } from '../wasm-codegen';
+import { WasmError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess } from '../wasm-codegen';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
 import { walker, walkerB } from './walker';
 import { AsmDecl, makeAsm as makeAsm0 } from '../wasm-asm';
@@ -2953,7 +2953,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		// Only a boxed `any` slot can carry a runtime test: two types sharing a physical form (`number` and `boolean` are both
 		// `f64` here) are indistinguishable at runtime, so anything else would be a WRONG answer, not merely an unsupported one.
-		const heap = typeofHeapType(tag, types);
+		const heap = types.heapType(tag);
 		const w    = wtypeOf(operand, ctx);
 		if (!(w && typeof w === 'object' && 'ref' in w && w.ref === 'any'))
 			return false;
