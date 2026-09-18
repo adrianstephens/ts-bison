@@ -4,19 +4,31 @@ description: LIVE cold-start state for the wasm-backend work — where things st
 metadata:
   node_type: memory
   type: project
-  modified: 2026-09-17
+  modified: 2026-09-18
 ---
 
 **Read this first, and usually instead of [[tison-towasm-self-hosting-plan]]** (2233 lines — open it only
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## As of 2026-09-17 (late) — HEAD `ed2d662`
+## As of 2026-09-18 -- HEAD `529f2d7`
 
-**The files:** `TS/backend.ts` (9,697) and `CPP/backend.ts` (379) over the neutral `wasm-codegen.ts`
-(1,083); `TS/type-utils.ts` 3,911. `wasm-asm.ts`, `TS/towasm-analysis.ts` and `TS/towasm-types.ts` are all
-folded in and gone. `TS/towasm.ts` was renamed to `TS/backend.ts` at `ed2d662`; `wasm-types.ts` to
-`wasm-codegen.ts` at `a69d68a`. Older memories and commit titles use the old names for the same files.
+**The files:** `TS/backend.ts` (~9,750) and `CPP/backend.ts` (379) over the neutral `wasm-codegen.ts`
+(~1,046); `TS/type-utils.ts` ~3,950. The module is imported as `W` since the user's `b3a0b01` rename.
+
+**2026-09-18 session:** 15 fixes from the self-hosting survey, `5a0a944`..`529f2d7`; each commit message
+has its root cause. The general mechanisms, worth knowing before editing nearby:
+- **A caller's type carries the caller's scope.** `T.Inference.add`/`inferReturn` stamp every candidate, and
+  `inferTypeArgMap` stamps explicit type arguments. A caller type substituted into a callee alias and resolved in
+  the callee's module scope went opaque, and `resolve`'s per-scope cache then kept the stale answer.
+- **Call arguments are typed in order** against what the earlier arguments inferred (TS's non-fixing mapper).
+- **Generic instances use NARROWED argument types** (`ctx.narrowedTypeOf`), as the checker infers. Since a call
+  result then need not match the un-narrowed view, `FunctionContext.physicalScope` types a call/`new` in the
+  narrowed scope; variables keep their slot's type.
+- **One struct per object type per compile**: `matchObjectShapeByType` memoizes under the typeKey, and a shape
+  built by `ensureAnonObjectShape` is `anonymous`, never a match candidate for another type.
+- `precise` in `isAssignable` is TS's subtype relation: `any` is below nothing but itself.
+- The lib declares `ReadonlyArray`. A mapped type's key is a binder in `substituteType` (`renameMappedKey`).
 
 **Gates, identical at every commit since `6e29763`** — so all thirteen were behaviour-preserving:
 build clean · eslint 0 errors / 94 warnings (none in backend.ts) · test-towasm · test-checker ·
@@ -115,9 +127,17 @@ order/state-dependent, so a single-run `REGRESSED` line is noise — never read 
 the last full run's per-declaration results. Its TARGETS list was repointed at `ed2d662` (it had been
 naming three files that no longer exist).
 
-At 2026-09-17 (after `baseSignature`) it reads **136/393 compile in isolation, 298 failures from 69 causes**.
-The old biggest row is closed ([[tison-unbound-type-param-row]]); the biggest now is `param 'fields' needs
-an explicit type` (96), then `'t.elements' is indexed but is not an array` (31).
+At 2026-09-18 (`96a0667`) the fields row (96) was closed and no declaration regressed; the next top row,
+`cannot convert ... to Return<any>` (107), was fixed after that run (`a1e95c4`) and is NOT yet re-surveyed.
+Rows left, biggest first: object literal needs a known target type (24, ts-parser/peg), `Map<string,{...}>`
+constructor overload (23, backend.ts), unresolved identifier `m` (15, checker.ts), comparing to null (12),
+`Array.from` on the constructor type (11), `Handler` closure conversion (4, now `typeofName`'s blocker).
+`walker.ts`'s `walker` compiles. `probe-one-decl.ts` takes `FULL=1` to print the error's position.
+
+**Open, found this session:** a spread of a generic `N` types as `{[key: string]: any}` where TS keeps `N`;
+`xs.nope` on a `readonly T[]` is not reported; the checker writes no contextual annotation for a callback in an
+annotated const inside an IMPORTED module's function (codegen now copes); backend's `resolveOverload` still picks
+an overload with the un-narrowed scope.
 
 `assistant/towasm-hoist-survey.ts` still answers "does this need the scope?" by the binding rather than the
 name (`--module`, `--single`, `--dump`/`--apply`), but most of what it unlocked was gated on `TSEmitter`
@@ -129,7 +149,7 @@ While relocating code, run only the fast set: `npx tsc -b src/examples`, `test-t
 ## Tree state
 
 **Never trust this line — the user edits and commits concurrently; re-check `git status`.** At the time of
-writing: HEAD `ed2d662`, instruments in `assistant/` updated for the rename (gitignored, so not committed).
+writing: HEAD `529f2d7`; the user's own uncommitted edit to `wasm-codegen.ts` (alignment) is in the tree.
 
 ## Keeping this current
 
