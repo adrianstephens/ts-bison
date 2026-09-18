@@ -2511,8 +2511,8 @@ function splitDiscriminants(src: TS.ObjectType | Extract<Type, { type: 'tuple' }
 
 // `dstScope` resolves names in `dst`'s own structure (distinct from `scope`, which resolves `src`'s) -- same scope almost
 // always, but differs for a `dst` from another module's signature. Every recursive call passes each value's own origin scope.
-// `precise`: none of the C1 leniency (a widened source accepted into a literal target) -- for inference's common supertype,
-// which TS chooses with its real relation: `string` is not a supertype candidate below `"def"`.
+// `precise`: TS's subtype relation, for inference's common supertype and a guard's narrowing: none of the C1 leniency (a widened
+// source into a literal target, so `string` is not below `"def"`), and `any` is below nothing but itself (`any[]` is not below `string[]`).
 export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope = scope, strict = false, depth = 10, precise = false): boolean {
 	const recurse = (src: Type, dst: Type, depth: number): boolean => {
 		if (depth < 0) {
@@ -2570,7 +2570,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 		if (src.type === 'array' || dst.type === 'array')
 			return recurse(src, dst, depth - 1);
 
-		if (src === dst || isAny(src) || isAny(dst))
+		if (src === dst || isAny(dst) || (isAny(src) && !precise))
 			return true;
 		if (isNullOrUndefined(src) && !scope.strictNullChecks())
 			return true;

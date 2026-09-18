@@ -177,6 +177,10 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// type arguments -- so an inner generic call can infer from that context (walker.ts's `mapObject(t, { ps: mapArray(p => ...) })`).
 	['an argument is typed against what the earlier arguments inferred', 'declare function mapArray<T>(map: (x: T) => T | undefined): (x: readonly T[]) => T[] | undefined; interface Pn { n: number } interface Q { ps: Pn[] } declare const q: Q; declare function withPlain<N>(node: N, fields: {[K in keyof N]?: (x: N[K]) => N[K] | undefined}): N; const b = withPlain(q, { ps: mapArray(p => p.nope) });', ["Property 'nope' does not exist"]],
 	['an argument is typed against the explicit type arguments', 'declare function mapArray<T>(map: (x: T) => T | undefined): (x: readonly T[]) => T[] | undefined; interface Pn { n: number } interface Q { ps: Pn[] } declare const q: Q; declare function withPlain<N>(node: N, fields: {[K in keyof N]?: (x: N[K]) => N[K] | undefined}): N; const b = withPlain<Q>(q, { ps: mapArray(p => p.nope) });', ["Property 'nope' does not exist"]],
+	// A guard narrows a union by TS's subtype relation, where `any` is below nothing but itself: `x is any[]` keeps `string[]`.
+	['a guard to any[] keeps the union member that is an array', 'declare const v: number | string[]; if (Array.isArray(v)) { const q: number = v; }', [NOT_ASSIGNABLE('string[]', 'number')]],
+	// ...and the same relation picks inference's common supertype: an `any` candidate makes it `any`, not the other candidate.
+	['an any candidate makes the inferred type any', 'declare function f<T>(a: T, b: T): T; declare const x: any; const q: string = f(x, 1);', []],
 	// A read off a union is each member's read: one member's optional property makes it possibly undefined.
 	['an optional property read through a union includes undefined', "interface C { n: number; s?: string } interface D { m: string; s?: string } declare const u: C | D; const q: string = u.s;", [NOT_ASSIGNABLE('string | undefined', 'string')]],
 	// A spread of a union distributes, as TS's getSpreadType does: the literal is one shape per member, not an unknowable `any`.
