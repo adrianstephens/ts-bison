@@ -1782,34 +1782,37 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 			case 'object': {
 				// A union context is first narrowed by this literal's own discriminant values, as TS does (`type: 'inter'` picks Inter).
 				const context = expected && discriminateContext(expected, e, scope);
-				const members: TS.TypeMember[] = [];
 				// A later property overrides an earlier one with the same key -- real JS object-literal semantics,
 				// and what lets a spread's own members participate (`{...X, key: override}` or `{key, ...X}`).
-				const byKey	= new Map<string, number>();
-				const push	= (m: TS.TypeMember) => {
-					const key = 'key' in m ? T.memberKey(m.key) : undefined;
-					if (key !== undefined) {
-						const i = byKey.get(key);
-						if (i !== undefined) {
-							// A later OPTIONAL property does NOT erase an earlier one: at runtime an absent
-							// property leaves the earlier value in place, which is exactly what the
-							// `{...defaults, ...opts}` idiom relies on. So the result is either type, and is
-							// optional only if both were. An explicit `key: value` is never optional and
-							// still overrides outright, as does a required spread member.
-							const prev = members[i];
-							// Resolved before combining: a mapped type's own member (`Partial<typeof D>['k']`) is an
-							// unresolved indexed access, which would union with the earlier `string` instead of
-							// collapsing into it. Its `| undefined` is dropped too -- optionality is the
-							// modifier, and the absent case is precisely what the earlier member covers.
-							members[i] = m.type === 'property' && prev.type === 'property' && hasMod(m, 'optional')
-								? TS.TypeProperty(key, T.combineTypes([prev.typeAnnotation, T.nonNullable(T.resolveOwn(m.typeAnnotation, scope), scope)]), hasMod(prev, 'optional') ? ['optional'] : undefined)
-								: m;
-							return;
+				// One shape per ALTERNATIVE: a spread of a union distributes, as TS's `getSpreadType` does.
+				const shape = (members: TS.TypeMember[] = [], byKey = new Map<string, number>()) => ({ members, byKey,
+					push(m: TS.TypeMember) {
+						const key = 'key' in m ? T.memberKey(m.key) : undefined;
+						if (key !== undefined) {
+							const i = byKey.get(key);
+							if (i !== undefined) {
+								// A later OPTIONAL property does NOT erase an earlier one: at runtime an absent
+								// property leaves the earlier value in place, which is exactly what the
+								// `{...defaults, ...opts}` idiom relies on. So the result is either type, and is
+								// optional only if both were. An explicit `key: value` is never optional and
+								// still overrides outright, as does a required spread member.
+								const prev = members[i];
+								// Resolved before combining: a mapped type's own member (`Partial<typeof D>['k']`) is an
+								// unresolved indexed access, which would union with the earlier `string` instead of
+								// collapsing into it. Its `| undefined` is dropped too -- optionality is the
+								// modifier, and the absent case is precisely what the earlier member covers.
+								members[i] = m.type === 'property' && prev.type === 'property' && hasMod(m, 'optional')
+									? TS.TypeProperty(key, T.combineTypes([prev.typeAnnotation, T.nonNullable(T.resolveOwn(m.typeAnnotation, scope), scope)]), hasMod(prev, 'optional') ? ['optional'] : undefined)
+									: m;
+								return;
+							}
+							byKey.set(key, members.length);
 						}
-						byKey.set(key, members.length);
-					}
-					members.push(m);
-				};
+						members.push(m);
+					},
+				});
+				let shapes	= [shape()];
+				const push	= (m: TS.TypeMember) => shapes.forEach(s => s.push(m));
 				// An interface that EXTENDS another resolves to an INTERSECTION, never a plain object (ts-parser's
 				// `CallSig`, spread by `checkCall`'s own `settle`): each part contributes its members, a later
 				// part winning as spreading each in turn would. `undefined` where they aren't determinable.
@@ -1824,11 +1827,18 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				};
 				for (const p of e.properties) {
 					if (p.type === 'spread') {
-						const t		 = T.resolveOwn(recurse(p.operand), scope);
-						const members = t.type === 'object' ? t.members : t.type === 'intersection' ? intersectionMembers(t) : undefined;
-						if (!members)
+						const spreadMembers = (x: Type) => {
+							const t = T.resolveOwn(x, scope);
+							return t.type === 'object' ? t.members : t.type === 'intersection' ? intersectionMembers(t) : undefined;
+						};
+						const parts = T.unionMembers(recurse(p.operand), scope).map(spreadMembers);
+						if (!parts.length || !parts.every((m): m is TS.TypeMember[] => !!m))
 							return T.ANY;	// not a determinable object shape -- shape unknowable here, as before
-						members.forEach(push);
+						shapes = shapes.flatMap(s => parts.map(members => {
+							const next = shape([...s.members], new Map(s.byKey));
+							members.forEach(m => next.push(m));
+							return next;
+						}));
 					} else {
 						// A `satisfies`/annotated-`var_decl` `expected` type propagates member-by-member: an unannotated arrow/method
 						// value (`{read: (pe, data) => ...}`) otherwise types its own params as `any`, same gap `applyContextualParams`
@@ -1862,7 +1872,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						}
 					}
 				}
-				return TS.ObjectType(members);
+				return T.combineTypes(shapes.map(s => TS.ObjectType(s.members)));
 			}
 
 			case 'function': {
