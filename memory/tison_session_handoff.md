@@ -13,15 +13,16 @@ nothing else: it is rewritten wholesale, not appended to.
 
 ## As of 2026-09-17 (late)
 
-**HEAD `efe46bd`.** Six commits: `307aa89` folded `towasm-analysis.ts` back in, `a69d68a` renamed
+**HEAD `b858045`.** Eight commits: `307aa89` folded `towasm-analysis.ts` back in, `a69d68a` renamed
 `wasm-types.ts` → `wasm-codegen.ts`, `f09f3d4` put `emitBlock`/`emitLoop` and `TagSection` on the neutral
 side, `b9be812` swept 50 hand-built identifier nodes onto `Identifier()`, `025cc32` did the other nine node kinds,
-`efe46bd` renamed `TSWError` → `WasmError`. The file architecture is settled
+`efe46bd` renamed `TSWError` → `WasmError`, `bf26ba7` fixed the literal-type-as-expression site, and
+`b858045` (the user's own) made `typeofHeapType` into `Types.heapType`. The file architecture is settled
 (see its own section) and the cross-language row is CLOSED, not paused: with `TSEmitter` rejected there is
-no further neutral extraction of consequence. Sizes: towasm **9,722** · type-utils 3,911 · wasm-codegen 829
+no further neutral extraction of consequence. Sizes: towasm **9,727** · type-utils 3,911 · wasm-codegen 837
 · wasm-asm 227. Gates at each commit: build clean · eslint 0 errors / 94 warnings, none in towasm.ts ·
-test-towasm green · test-checker green · difftest **2191/2200 · 0 disagree · 9 unsupported** — unchanged
-since `6e29763`, so all four were behaviour-preserving.
+test-towasm green · test-checker green · difftest **2191/2200 · 0 disagree · 9 unsupported** · corpus gate
+**838/11,012, baseline 838** — unchanged since `6e29763`, so all eight were behaviour-preserving.
 
 **`emitBlock`/`emitLoop` follow `emitIf`**: the body goes into its own list and the wrapper is built AFTER
 it, because the branches inside already carry depths relative to that wrapper. They own only the wrapping,
@@ -37,18 +38,24 @@ block ladder is also left alone: it uses the UNMATCHED `swapOut()` form (close o
 continue in a fresh list), which `emitBlock` does not fit.
 
 **The AST-node sweep is DONE** (`b9be812` identifiers, `025cc32` the other nine kinds). Every node in
-towasm.ts is built with common.ts's or js-parser's constructor now; `as Expr`/`as Stmt` went 38 → 16,
+towasm.ts is built with common.ts's or js-parser's constructor now; `as Expr`/`as Stmt` went 38 → 14,
 because an object literal doesn't widen to the union on its own and a constructor's return type does.
 Use `JS.Member`/`Call`/`Index`/`Spread` (they carry `optional`), common.ts's for the rest.
 
-**ONE site is deliberately still hand-built** — the union-discriminant arm in `case 'object'` (~line 2097).
-Converting it surfaced a real latent problem: `v` there is a TS literal **type**, not an expression, used
-in an expression position. That is legal only because both are `Common.Literal`, differing in the value
-type parameter (`TemplatePart<Type>[]` vs `TemplatePart<Expr>[]`), and the whole-node `as Expr` hid it.
-**The fix**: exclude template-literal members in the `every` guard (they have no comparable runtime value,
-so an arm for one is already meaningless) and build `Literal(v.value)` — that removes the neighbouring
-`v as unknown as Expr` too. Deferred because it changes WHICH union members compile into arms, so it needs
-its own difftest run. Do not "fix" it by adding a cast; that was tried and reverted.
+**The last hand-built site is CLOSED too** (`bf26ba7`, the union-discriminant arm in `case 'object'`).
+It had been reusing the union member's literal **TYPE** node in two expression positions — legal only
+because a literal type and a literal expression are both `Common.Literal` — which the whole-node `as Expr`
+and a neighbouring `as unknown as Expr` hid. Two real bugs under the casts: a literal type carries
+`fresh`/`frozen`, which only type-utils' widening reads and which mean nothing in an expression slot; and
+a template literal type's `value` is template PARTS over types, with no runtime value to compare, yet
+`every(v => v.type === 'literal')` admitted one as an arm. Now the member's `value` is pulled out,
+template literals are excluded by the same guard, and both positions build `Literal(lit)`.
+**towasm.ts now has no `as unknown as` and no hand-built AST node anywhere.** Corpus gate was 838/838
+across the change, so excluding template-literal members altered nothing that compiles today.
+
+**Gate note:** difftest alone does NOT cover a change to which members reach codegen — it compares output
+for cases that compile. `npm run gate` (the 11,012-file corpus, baseline 838 failures) is the one that
+does. Run both for any guard/eligibility change.
 
 The previous entry, for the work that built the neutral layer:
 
