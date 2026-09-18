@@ -4,14 +4,14 @@ description: LIVE cold-start state for the wasm-backend work — where things st
 metadata:
   node_type: memory
   type: project
-  modified: 2026-09-18
+  modified: 2026-09-17
 ---
 
 **Read this first, and usually instead of [[tison-towasm-self-hosting-plan]]** (2233 lines — open it only
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## As of 2026-09-18 — HEAD `ed2d662`
+## As of 2026-09-17 (late) — HEAD `ed2d662`
 
 **The files:** `TS/backend.ts` (9,697) and `CPP/backend.ts` (379) over the neutral `wasm-codegen.ts`
 (1,083); `TS/type-utils.ts` 3,911. `wasm-asm.ts`, `TS/towasm-analysis.ts` and `TS/towasm-types.ts` are all

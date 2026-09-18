@@ -3,7 +3,7 @@ name: tison-cpp-backend
 description: CPP/backend.ts — the partial C++ wasm back end that exists to keep wasm-codegen.ts honest. What it covers, why it is deliberately small, and the trap it found.
 metadata:
   type: project
-  modified: 2026-09-18
+  modified: 2026-09-17
 ---
 
 `src/examples/CPP/backend.ts` (379 lines, `607896b`) compiles a small C++ subset to wasm over the neutral
