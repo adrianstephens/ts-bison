@@ -216,6 +216,9 @@ function wasmTypeOf(t: Type, global: Scope): W.Type | undefined {
 	// rangeToType collapses a single-value range to a Literal -- needs the same bounds check or it widens to f64.
 	if (t.type === 'literal' && typeof t.value === 'number')
 		return Number.isInteger(t.value) ? W.intType(t.value, t.value) : 'f64';
+	// A type with no inhabitant but null/undefined (`Literal<null>` from a narrowed `e.value === null`) holds only `ref.null`.
+	if (T.isNullish(t, global) && !T.isRef(T.resolveOwn(t, global), 'void'))
+		return W.REF_ANY_NULLABLE;
 
 	// Resolve each union member first so alias duplicates collapse before arrayElemKind.
 	const w = T.widenLiterals(t.type === 'union' ? T.combineTypes(t.types.map(m => T.resolve(global, m))) : T.resolve(global, t), false, true);

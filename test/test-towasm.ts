@@ -3956,6 +3956,21 @@ async function main() {
 	}
 
 	{
+		// Narrowed to `null`, the argument instantiates `box<null>` as TS does: a type whose only value is null is a nullable ref.
+		const { nullBox } = await compile(`
+			function box<T>(value: T): { value: T } { return { value }; }
+			function pick(i: number): string | null { return i > 0 ? 'abc' : null; }
+			function size(v: string | null): number {
+				if (v === null)
+					return box(v).value === null ? 100 : -1;
+				return box(v).value.length;
+			}
+			export function nullBox(): number { return size(pick(1)) + size(pick(0)); }
+		`);
+		check('a generic instantiated at a narrowed null argument', nullBox(), 103);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').
