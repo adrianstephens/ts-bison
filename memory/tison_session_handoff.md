@@ -167,8 +167,12 @@ file is earned by CROSS-LANGUAGE REUSE and by nothing else — not by being wasm
 
 - **Do not propose splitting `towasm.ts` for navigability.** `TS/asm.ts` (the ~140-line TS asm spelling) and
   `TS/lib-decls.ts` (the lib ingestion) were proposed on those grounds and are DECLINED by this rule.
-- **`TSEmitter` is rejected** (Step 5, and see the plan memory). 8,517 of towasm's lines are inside
-  `TStoWasm`'s closure and will stay there; `emitExpr` (1,630) and `emitStmt` (654) do not get split.
+- **`TSEmitter` is rejected, because the subclass would be ~90% of towasm.ts** — an unhelpful split (the
+  user's reason, 2026-09-17). Step 5's own estimate agreed (1,500–2,500 neutral vs 10,000+ TS) but called
+  the lopsidedness "the point"; it is not. And the ~1,064 neutral lines exist today WITHOUT the class
+  conversion, so it was never what produced them. 8,517 of towasm's lines are inside `TStoWasm`'s closure
+  and stay there; `emitExpr` (1,630) and `emitStmt` (654) do not get split. This rejects the SPLIT, not
+  methods — moving a genuinely neutral function onto `FunctionContext`/`Types`/`ClassInfo` stays right.
 - **Neutral extraction is exhausted, confirmed by measurement.** The four biggest clusters inside the
   closure are all saturated with TS types — class layout 620 lines (48 `Type`, 27 `Scope`, `TS.RefType`),
   any-dispatch 502 (49 `Type`, 8 `Scope`), async/generator 420 (47 `Type`), union/virtual dispatch 235.

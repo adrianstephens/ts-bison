@@ -486,7 +486,23 @@ Do this **before** moving any function body: it is what converts the sieve of §
 conversion is not going to happen, so every "blocked until Step 5" note elsewhere means "not happening",
 not "later" — including the ~128 functions the hoist survey leaves blocked on `typeOf`/`emitAs`/`coerceTop`/
 `owner*`/`ensure*`, and splitting `emitExpr` (1,630 lines) or `emitStmt` (654). They stay inside the closure.
-The neutral layer is what it is now. Original text follows for the reasoning only.
+The neutral layer is what it is now.
+
+**The user's reason, and it refutes the paragraph below directly:** the `TSEmitter` subclass would have been
+~90% of towasm.ts, so the split buys nothing. Step 5's own estimate agrees — **1,500–2,500 neutral against
+10,000+ TS** — it just read that as "the lopsidedness is the point". It is not: a 90/10 cut leaves you two
+files, the big one still unnavigable and the small one no more reusable than a module would have been.
+
+**And the outcome was reached WITHOUT the class conversion.** `wasm-codegen.ts` (837) + `wasm-asm.ts` (227)
+is ~1,064 neutral lines today, harvested as plain functions and as methods on `FunctionContext`/`Types`/
+`ClassInfo`/`DataSection`/`TagSection` — already most of the 1,500–2,500 the base class was supposed to
+yield. So the class conversion was never what produced the neutral layer; it would only have relabelled the
+TS residue. Do not revive it on the argument that it "unlocks" the neutral half.
+
+Note this rejects the SPLIT, not methods: moving an individual function onto `FunctionContext`, `Types` or
+`ClassInfo` when it is genuinely neutral is exactly what has been happening and stays right.
+
+Original text follows for the reasoning only.
 
 ~~Step 5 — the real 2-way split.~~ Convert `TStoWasm`'s body to a class — base = module-level state + the
 emission algorithm, subclass = TS dispatch and type lowering — which is exactly the `Emitter`/`TSEmitter`
