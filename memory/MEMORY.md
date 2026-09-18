@@ -50,6 +50,7 @@
 - [checker perf debugging](tison_checker_perf_debugging.md) — `--prof` misled twice; macOS `sample <pid>` was right both times
 - [interface inheritance](tison_interface_inheritance.md) — `extends` IS an intersection; last part = most concrete, and all four consumers must read it backwards
 - [closure-param causes](tison_closure_param_causes.md) — the survey's `closure parameter 'X'` rows are THREE unrelated blockers, not one; read before working that row
+- [unbound type param row](tison_unbound_type_param_row.md) — **OPEN, diagnosed not fixed**: the survey's biggest row (~109 decls) is a substitution-layer bug dropping a signature's own `typeParams` before codegen. Fix `avoidCapture`/`substituteShadowed`, never the throw in `closureSigParts`
 - [checker inference](tison_checker_inference.md) — distributive conditionals, contextual callback returns, const contexts, template literal expansion, and probe traps (literal leniency, silent `any` members)
 - [nominal class refs](tison_nominal_class_refs.md) — **`resolve` keeps class refs nominal; `resolveMembers` is the opt-out** (4 sites); replaced 8 per-site guards
 - [scope stamping](tison_scope_stamping.md) — how checker scopes reach towasm (statement/branch stamps); **don't "fix" `narrowedTypeOf`**; why block-node scopes were measured and declined

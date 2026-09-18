@@ -98,6 +98,8 @@ signature-local types count (`mergeOverloadSigs` needs only `types` but returns 
 - **`emitResumableDispatch` should own its own loop**, retiring the last two hand-written loops in
   `compileGeneratorFunc`/`compileAsyncFunc` (32- and 70-line bodies, so wrapping them at the call site
   makes things worse). It needs a `loadState` callback, the read counterpart of `setFrame`.
+- **The unbound-type-param row** (~109 declarations, the survey's largest) — diagnosed, unfixed, needs a
+  session with the type structure in hand. [[tison-unbound-type-param-row]].
 - **The BigInt row** (6 declarations) is a real overload-*resolution* gap in `candidateFits`; unchosen.
 - **The `WT` prefix rename** (~459 refs) was handed to the user — an editor find/replace.
 - `test-towasm.ts` is now the odd name beside `test-cpp-backend.ts`; not renamed, to avoid churn.
@@ -106,13 +108,21 @@ signature-local types count (`mergeOverloadSigs` needs only `types` but returns 
 - **Step 3's three generic cores** (independent): `src/examples/layout.ts`, `guard<R>` into `walker.ts`,
   `buildStateMachine` into `src/examples/statemachine.ts`.
 
-## The self-hosting survey is PARKED (user's call) — do not wait on it
+## The self-hosting survey — run it OCCASIONALLY, never as a gate (user's call)
 
-Its per-declaration results are order/state-dependent, so a single-run `REGRESSED` line is noise; never
-read a survey delta as progress. Its TARGETS list was repointed at `ed2d662` (it had been naming three
-files that no longer exist). `assistant/towasm-hoist-survey.ts` still answers "does this need the scope?"
-by the binding rather than the name (`--module`, `--single`, `--dump`/`--apply`), but most of what it
-unlocked was gated on `TSEmitter` and is therefore moot.
+**It is slow and causes friction, so run it deliberately, not routinely.** The gates are difftest, the
+corpus gates and the test suites; the survey is a probe to be read. Its per-declaration results are
+order/state-dependent, so a single-run `REGRESSED` line is noise — never read a delta as progress.
+`--whole` is the ~15s mode, but it OVERWRITES the stored per-file JSON with whole-only data, discarding
+the last full run's per-declaration results. Its TARGETS list was repointed at `ed2d662` (it had been
+naming three files that no longer exist).
+
+At 2026-09-17 it reads **135/396 compile in isolation, 302 failures from 198 causes**. The biggest row is
+diagnosed and open — see [[tison-unbound-type-param-row]], and do not "fix" it at the throw.
+
+`assistant/towasm-hoist-survey.ts` still answers "does this need the scope?" by the binding rather than the
+name (`--module`, `--single`, `--dump`/`--apply`), but most of what it unlocked was gated on `TSEmitter`
+and is therefore moot.
 
 While relocating code, run only the fast set: `npx tsc -b src/examples`, `test-towasm`, `test-checker`,
 `difftest.sh` (~2 min).
