@@ -27,9 +27,14 @@ else JS-specific (truthiness, typeof, iteration, globals) is called only by the 
 out with no hook at all. Do not grow `Semantics` for a question only a front end asks. That code belongs
 in the language's own layer.
 
-**Not built:** Python semantics. The seam is unverified until a Python front end uses it. Its known gaps
-are keyword arguments (`TS.CallSig` has no pass-by-name), Python truthiness, `isinstance`, and MRO/dunder
-member lookup.
+**Python stub: `PY/type-utils.ts`.** It holds `builtinType` (Python annotation to shared type: `int`
+→ `bigint`, `None` → `undefined`, `list[T]` → `Array<T>`, `dict` → `Map`, `Optional`, `Union`,
+`Awaitable` → `Promise`), plus `PY_SEMANTICS` and a `makeGlobal` with `None`. There is no Python lib or
+checker yet. Found while writing it: Python's `object` class must be spelled `Object`, because `object` is
+an intrinsic type name in the vocabulary and a class of that name is never looked up. Both languages'
+`apparentMember` is now the core's `objectMember` (`Function` then `Object`). Still missing, listed at
+the file's end: keyword arguments (`TS.CallSig` has no pass-by-name), Python truthiness, `isinstance`
+narrowing, literal typing, and `__iter__` iteration.
 
 **C++ (discussed, not planned):** the common core for C++ is smaller: type terms, scopes/namespaces,
 substitution, `typeArgMap` defaults, deduction (`inferTypeArgs`/`matchInfer`). Unions, literal types,

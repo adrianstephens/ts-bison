@@ -1778,6 +1778,18 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 	}
 }
 
+// A member of the global type `name` as the lib declares it.
+function globalTypeMember(name: string, prop: string, scope: Scope): Type | undefined {
+	const root = scope.root();
+	return root.type(name) ? lookupMember(TS.RefType(name), prop, root, 4, true) : undefined;
+}
+
+// The shared vocabulary's apparent members, for a language's `apparentMember`: every value's are the global `Object`'s,
+// and anything callable has `Function`'s (`apply`/`call`/`bind`, or Python's `__call__`) first.
+export function objectMember(prop: string, callable: boolean, scope: Scope): Type | undefined {
+	return (callable ? globalTypeMember('Function', prop, scope) : undefined) ?? globalTypeMember('Object', prop, scope);
+}
+
 export function memberOptional(t: Type, prop: string, scope: Scope, depth = 6): boolean {
 	return memberOptionalState(t, prop, scope, depth) === 'optional';
 }

@@ -5,7 +5,7 @@ import { Expr } from './js-parser';
 import { Type } from './ts-parser';
 import {
 	ANY, BIGINT, BOOLEAN, INTRINSIC_TYPES, NEVER, NUMBER, REGEXP, SIMPLE_TYPES, STRING, Scope, Semantics, UNDEFINED, UNKNOWN, WASM_PSEUDO_TYPES,
-	arrayLikeElement, awaitType, combineTypes, elementTypes, findFunctionType, freshTypeParamName, isAny, isBoolean, isLiteral, isNullish,
+	arrayLikeElement, awaitType, combineTypes, elementTypes, findFunctionType, freshTypeParamName, objectMember, isAny, isBoolean, isLiteral, isNullish,
 	isRef, isString, lookupMember, ownScope, paramTypeAt, rangeIncludesZero, resolve, resolveMembers, resolveOwn, substituteThisType,
 	typeArgMap, unionMembers, widenLiterals,
 } from './type-core';
@@ -167,17 +167,9 @@ function refinedMember(t: Type, prop: string, scope: Scope, depth: number): Type
 		?? TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(ANY)) }, ret)));
 }
 
-// A member a type gets from a global interface (`Object`, or `Function` for anything callable), as the lib declares it: the
-// apparent type TS reads members off when the type itself doesn't declare them.
-function globalInterfaceMember(name: 'Object' | 'Function', prop: string, scope: Scope): Type | undefined {
-	const root = scope.root();
-	return root.type(name) ? lookupMember(TS.RefType(name), prop, root, 4, true) : undefined;
-}
-
 export const TS_SEMANTICS: Semantics = {
 	boxed:			name => BOXED_PRIMITIVE.get(name),
-	// Anything with call or construct signatures has `Function`'s members (`apply`/`call`/`bind`), then `Object`'s.
-	apparentMember:	(prop, callable, scope) => (callable ? globalInterfaceMember('Function', prop, scope) : undefined) ?? globalInterfaceMember('Object', prop, scope),
+	apparentMember:	objectMember,
 	refinedMember,
 };
 
