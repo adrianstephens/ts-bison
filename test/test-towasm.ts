@@ -2132,6 +2132,22 @@ async function main() {
 	}
 
 	{
+		// An optional field accepts `undefined`: a literal whose `min` is `number | undefined` is an `R`, not an anonymous shape.
+		const { optionalField } = await compile(`
+			interface R { base: 'a' | 'b'; min?: number; integer: boolean }
+			function f(a: R, d: number): R {
+				const base = a.base;
+				const shift = (k: number) => ({ base, integer: a.integer, min: a.min !== undefined ? a.min + k : undefined });
+				return shift(d);
+			}
+			export function optionalField(): number {
+				return (f({ base: 'a', integer: true, min: 3 }, 4).min ?? -1) + (f({ base: 'b', integer: true }, 4).min ?? -100);
+			}
+		`);
+		check('object literal: an explicit undefined-able value fills an optional field', optionalField(), -93);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

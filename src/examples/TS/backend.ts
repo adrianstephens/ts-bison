@@ -231,17 +231,17 @@ class ClassInfo extends W.ClassInfo {
 		super(name, typeIndex);
 	}
 
-	// The declared type of `key`: `decl` first, then the resolved shape. A composite cache key (`Field<Type>`)
-	// is never a resolvable name, so `thisTsType` is what named and anonymous shapes both carry.
+	// The type `key` accepts, `| undefined` when optional: `decl` first, then the resolved shape. A composite cache key
+	// (`Field<Type>`) is never a resolvable name, so `thisTsType` is what named and anonymous shapes both carry.
 	fieldDeclaredType(key: string, scope: Scope): Type | undefined {
 		const m = this.decl.body.find((m): m is JS.Field<Type> => m.type === 'field' && m.key === key);
 		if (m)
-			return m.typeAnnotation;
+			return m.typeAnnotation && T.optional(m.typeAnnotation, hasMod(m, 'optional'));
 		const resolved = T.resolveObjectType(this.thisTsType, scope);
 		if (resolved) {
 			const p = resolved.members.find(p => p.type === 'property' && p.key === key);
 			if (p?.type === 'property')
-				return p.typeAnnotation;
+				return T.optional(p.typeAnnotation, hasMod(p, 'optional'));
 		}
 		return undefined;
 	}
