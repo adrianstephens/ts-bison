@@ -2,7 +2,7 @@
 //  Inline assembly
 // ===================================================================
 // The inline-`__asm` island: from the island's WAT body and the signature its call settled on, to the
-// instructions a wasm function carries. Everything here manipulates WAT instructions and `wasm-types`
+// instructions a wasm function carries. Everything here manipulates WAT instructions and `wasm-codegen`
 // representations -- the language's own types never appear, and `AsmDecl` is the concrete, already-lowered
 // signature it hands over (the plan's idiom: a base interface the language fills in, never a type parameter
 // over its type -- a seam that needs one is a seam in the wrong place).
@@ -15,7 +15,7 @@
 
 import * as wasm from '@isopodlabs/binary_libs/wasm';
 import * as WAT from './wat-parser';
-import * as WT from './wasm-types';
+import * as WT from './wasm-codegen';
 
 const I = wasm.I;
 

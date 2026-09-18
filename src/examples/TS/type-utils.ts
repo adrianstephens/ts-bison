@@ -6,7 +6,7 @@ import { Expr, BindingTarget } from './js-parser';
 import { Type } from './ts-parser';
 import { Walker, walker, walkerB, WalkerB } from './walker';
 import { printer } from './printer';
-import * as WT from '../wasm-types';
+import * as WT from '../wasm-codegen';
 
 // ===================================================================
 //  Type utilities

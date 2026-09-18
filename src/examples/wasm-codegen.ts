@@ -1,6 +1,6 @@
-// The language-neutral half of the wasm backend's vocabulary: what a value physically IS once lowered,
-// plus the pure helpers that read those representations. Nothing here names a language's AST, its type
-// model, or its checker.
+// The language-neutral half of the wasm backend: what a value physically IS once lowered (`Type` and its
+// pure helpers), the state code generation carries (`FunctionContext`, `ClassInfo`) and the module sections
+// it fills (`Types`, `DataSection`). Nothing here names a language's AST, its type model, or its checker.
 //
 // `ClosureSig` is the seam that makes that possible: `Type`'s `closure` variant names only the
 // PHYSICAL shape, while the binding data that only argument-binding reads (`defaults`/`resolvedParams`/

@@ -15,7 +15,7 @@ nothing else: it is rewritten wholesale, not appended to.
 
 **HEAD `307aa89` — "fold towasm-analysis.ts back in".** The file architecture is now settled (see its own
 section below) and the cross-language row is CLOSED, not paused: with `TSEmitter` rejected there is no
-further neutral extraction to do. Sizes: towasm **9,726** · type-utils 3,911 · wasm-types 812 · wasm-asm 227.
+further neutral extraction to do. Sizes: towasm **9,726** · type-utils 3,911 · wasm-codegen 812 · wasm-asm 227.
 Gates at `307aa89`: build clean · eslint 0 errors / 94 warnings, none in towasm.ts · test-towasm green ·
 test-checker green · difftest **2191/2200 · 0 disagree · 9 unsupported** — identical to `6e29763`.
 
@@ -34,7 +34,7 @@ section took its own struct shapes (`Types.closureBase`/`closure`/`holder`) so `
 `toFuncBody` already does; `inlineSmallCalls` was deleted; and `emitIf` replaced the hand-swapped
 conditional protocol at 21 sites (towasm's `swapOut` uses 131 -> 71); then `memOp`/`touchesMemory`,
 `Types.groupSizes` and `DataSection` left the language side. Sizes: towasm 9,481 · type-utils 3,911 ·
-wasm-types 812 · wasm-asm 227.
+wasm-codegen 812 · wasm-asm 227.
 
 **The placement rule, for every future candidate** (the user endorsed it): needs `TStoWasm`'s registries
 (`classes`, `types`, `ensureClass`) -> stays a free function taking `ctx` for now, because Step 5's
@@ -51,7 +51,7 @@ pass found 0 more), `--single` lists functions with exactly one in-scope depende
 `assistant/towasm-comment-pass.js` is the comment tool (449 blocks >2 lines -> 274).
 
 **Structural, not stylistic:** `declScope?: Scope` can never be neutral (`Scope` is type-utils', and
-type-utils imports wasm-types); a subtype must RE-NARROW a base's recursive member (`declare superClass?:
+type-utils imports wasm-codegen); a subtype must RE-NARROW a base's recursive member (`declare superClass?:
 ClassInfo`) or every chain walk degrades to the base — `declare`, never `!`, because a field initializer
 emits after `super()` and clobbers what the constructor assigned (verified; TS2612); `typeIndex: -1` on
 `ClassInfo` is a real state (a scalar-returning constructor never gets a struct type index).
@@ -120,7 +120,10 @@ baseline on a move. Fix the determinism later; never read a survey delta as prog
 
 ## The file architecture is SETTLED (user, 2026-09-17) — two components, two files
 
-**`TS/towasm.ts` IS the TS-specific component; `wasm-types.ts` (+`wasm-asm.ts`) is the generic one.** A
+**`TS/towasm.ts` IS the TS-specific component; `wasm-codegen.ts` (+`wasm-asm.ts`) is the generic one.**
+(`wasm-codegen.ts` was named `wasm-types.ts` until 2026-09-17 — commits and plan text before then say
+`wasm-types`, and it is the same file. The name went wrong once it grew `FunctionContext`/`Types`/
+`DataSection`: only ~180 of its 812 lines are the type vocabulary.) A
 file is earned by CROSS-LANGUAGE REUSE and by nothing else — not by being wasm-free (that is what
 `towasm-analysis.ts` was drawn on, and why it was folded back in at `307aa89`), and not by size. So:
 
@@ -135,12 +138,8 @@ file is earned by CROSS-LANGUAGE REUSE and by nothing else — not by being wasm
 
 ## Open, waiting on the user — do not assume
 
-- **Renaming `wasm-types.ts`** — the user says the name is now wrong, and it is: the file is ~180 lines of
-  vocabulary plus ~470 of mutable codegen state (`FunctionContext`, `ClassInfo`) and module sections
-  (`Types`, `DataSection`), and "types" already names two other things here. Candidates offered:
-  `wasm-codegen.ts`, `wasm-backend.ts`, `wasm-lower.ts`. Not chosen. A three-way split was proposed and is
-  ruled out by the one-component-one-file rule above.
-- `TSWError` is TS-named inside the neutral file (13 refs, 2 files) — `WasmError`/`LowerError`. Not raised yet.
+- `TSWError` is TS-named inside the neutral file (13 refs, 2 files) — `WasmError`/`LowerError`. Offered,
+  not yet answered; the user said yes only to the file rename.
 - The **BigInt row** (6 declarations) is a real overload-*resolution* gap in `candidateFits`; unchosen.
 - The **`WT` prefix rename** (~459 refs) was explicitly handed to the user — an editor find/replace. A file
   rename does not force it: `import * as WT from '../wasm-codegen'` is fine.

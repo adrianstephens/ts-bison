@@ -5,8 +5,8 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import * as Common from '../common';
 import { Literal, Binary, Assign, Member, hasMod } from '../common';
-import * as WT from '../wasm-types';
-import { TSWError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess, typeofHeapType } from '../wasm-types';
+import * as WT from '../wasm-codegen';
+import { TSWError, ClosureSig, ARR_WTYPE, REF_ANY, REF_ANY_NULLABLE, REF_EXN, scalarKind, notUnsigned, elementKind, unboxedPrimitive, wasmTypeEq, intWasmType, wasmTypeKey, combineUnionWtypes, CLOSURE_FIELDS, emitAnyTruthy, emitDefaultValue, emitOptionalAccess, typeofHeapType } from '../wasm-codegen';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
 import { walker, walkerB } from './walker';
 import { AsmDecl, makeAsm as makeAsm0 } from '../wasm-asm';
@@ -140,7 +140,7 @@ const I				= wasm.I;
 // ===================================================================
 //  The TypeScript-side vocabulary
 // ===================================================================
-// The language-neutral half -- the physical type vocabulary and its pure helpers -- lives in `../wasm-types`, imported as `WT`.
+// The language-neutral half -- the physical type vocabulary, the codegen context and the module sections -- lives in `../wasm-codegen`, imported as `WT`.
 // What is left here is either about a compiled FUNCTION's shape (`FuncSig` and friends, `Local`/`Global`), or a rule about TypeScript's own type *spellings*
 // (`rawElemKind`); neither belongs in a language-neutral module. `T.isNullLiteral`/`T.READONLY_ALIAS`/`T.PRIMITIVE_TAGS` are those spelling rules, in type-utils.
 // `FuncSig` extends `WT.ClosureSig` with the binding data only argument-binding reads (`defaults`/`resolvedParams`/`restElem`), which is what lets `WT.Type` name no language type at all.

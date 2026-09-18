@@ -274,7 +274,7 @@ context triple) is too small to justify a framework — leave it.
 
 ## The blocker — RESOLVED 2026-09-16, and the neutral module is now unblocked
 
-Extraction #1 was first attempted as planned — `wasm-types.ts` with a thin neutral `ClosureSig` that
+Extraction #1 was first attempted as planned — `wasm-codegen.ts` with a thin neutral `ClosureSig` that
 `FuncSig` would extend — and **failed**: `WasmType` and `FuncSig` are mutually recursive and `FuncSig`
 carried TS types, so a thin payload produced 12 errors across 2 producer sites and 6 readers, two of them
 *object literals* constructing the payload.
@@ -297,18 +297,18 @@ names only this.
 
 Gates: build clean, test-towasm all green, difftest **2182/2191 · 0 disagree** — identical to baseline.
 **`WasmType` + `ClosureSig` + the pure helpers are now self-contained and language-free**, so the neutral
-module §3 wanted is available as a pure move: `src/examples/wasm-types.ts` can take `WasmScalarI`…`WasmType`,
+module §3 wanted is available as a pure move: `src/examples/wasm-codegen.ts` can take `WasmScalarI`…`WasmType`,
 `ClosureSig`, `TYPED_ARRAY_TAGS`, `ARR_WTYPE`/`REF_*`, `CLOSURE_FIELDS` and the 10 helpers, while
-`TS/towasm-types.ts` keeps `FuncSig`/`ResolvedParam`/`Global`/`TupleT`/`jsLength` and the semantically
+`TS/towasm-codegen.ts` keeps `FuncSig`/`ResolvedParam`/`Global`/`TupleT`/`jsLength` and the semantically
 front-end `PRIMITIVE_TAGS`/`READONLY_ALIAS`/`isNullLiteral`/`nullLiteralKind`/`rawElemKind`. Splitting the
 import in `towasm.ts` between the two modules is what makes the boundary visible in the module graph.
 
 **Still a prerequisite, still not done:** `emitCallArgs` takes a signature's four parts rather than the
 signature, so 11 call sites spell out a sig's fields. That is now only duplication, not a blocker.
 
-**Step 1 COMPLETE 2026-09-16 — the neutral module exists.** `src/examples/wasm-types.ts` (166 lines) holds
+**Step 1 COMPLETE 2026-09-16 — the neutral module exists.** `src/examples/wasm-codegen.ts` (166 lines) holds
 `WasmScalarI`…`WasmType`, `ClosureSig`, `TYPED_ARRAY_TAGS`, `ARR_WTYPE`/`REF_*`, `CLOSURE_FIELDS` and the 10
-helpers — with **no language types in it**, checked by the compiler. `TS/towasm-types.ts` (244 → 99 lines)
+helpers — with **no language types in it**, checked by the compiler. `TS/towasm-codegen.ts` (244 → 99 lines)
 keeps `FuncSig`/`ResolvedParam`/`Global`/`TupleT`/`jsLength` and the rules about TypeScript's type
 *spellings* (`PRIMITIVE_TAGS`, `READONLY_ALIAS`, `isNullLiteral`, `nullLiteralKind`, `rawElemKind`), and
 imports `WasmType`/`ClosureSig` from the neutral module — one direction only. `TS/towasm.ts` 12,411 →
@@ -343,7 +343,7 @@ and check them", which is what makes PY reachable at all.
 the workspace root, and record the table so the move's delta is readable as *MOVED* only.
 
 **Step 1 — the backend's type vocabulary and state shapes: DONE 2026-09-16, landed TS-side.**
-`TS/towasm-types.ts` (244 lines) now holds `WasmScalar`…`wTypeKey` with their helpers, `FuncSig`/
+`TS/towasm-codegen.ts` (244 lines) now holds `WasmScalar`…`wTypeKey` with their helpers, `FuncSig`/
 `FullSig`/`FuncInfo`/`Inline`/`ClosureTypeInfo`/`TupleT`/`CLOSURE_FIELDS`/`jsLength`, and
 `Local`/`Global`/`ResolvedParam`/`ClosureEnv`/`FinallyGuard`. `towasm.ts` went 12,411 → **12,186**
 lines. It is **not** the neutral module §3 originally proposed — see the blocker above; the type model
@@ -355,7 +355,7 @@ Gates: build clean, test-towasm all green, difftest **2182/2191 · 0 disagree** 
 **Step 1b — REVERSED 2026-09-17 (`307aa89`), the user's call.** `towasm-analysis.ts` is folded back into
 `towasm.ts`. The split was drawn on "knows nothing about wasm", but the axis that earns a file is
 CROSS-LANGUAGE REUSE, and wasm-free is not the same thing: those 12 functions query the TypeScript AST, so
-they belong to the TS component. **TS/towasm.ts IS the TS component and is ONE file; `wasm-types.ts`
+they belong to the TS component. **TS/towasm.ts IS the TS component and is ONE file; `wasm-codegen.ts`
 (+`wasm-asm.ts`) is the generic one.** Do not re-propose splitting `towasm.ts` for navigability — size is
 not an axis. Historical record of the original move follows.
 
@@ -370,7 +370,7 @@ wasm concepts" invited the opposite reading): every function answers a question 
 AST, so each language's backend needs its own. "No wasm concepts" means it does not belong *inside*
 `towasm.ts`, not that it belongs in the examples root.
 
-**`TS/towasm-types.ts` was created and then FOLDED BACK the same day — see the rule below.** Its
+**`TS/towasm-codegen.ts` was created and then FOLDED BACK the same day — see the rule below.** Its
 ~99 declarations (the `FuncSig` family, `Local`/`Global`/`ResolvedParam`/`ClosureEnv`/`FinallyGuard`,
 `TYPED_ARRAY_TAGS`/`PRIMITIVE_TAGS`/`READONLY_ALIAS`/`isNullLiteral`/`nullLiteralKind`/`rawElemKind`) are
 types for ONE consumer, and splitting them from the code that uses them bought nothing.
@@ -395,7 +395,7 @@ answers are about the TS/JS-parser AST — see Step 1b above).
 **LANDED 2026-09-17 — the asm machinery is neutral, in the examples root.** `src/examples/wasm-asm.ts` (162
 code lines) holds the island: `assertFlatInstrs`, `expandTypeSwitch`, `resolveAsmLocals`,
 `resolveTypeExprs`, the three-shape dispatch, and nothing that reasons about a type. It imports only `wasm`,
-`wat-parser` and `wasm-types`, and nothing from the language half at all — not even types: `Inline` in
+`wat-parser` and `wasm-codegen`, and nothing from the language half at all — not even types: `Inline` in
 `towasm.ts` is structurally the `AsmInline` it returns. `WAT.TYPEINDEX_MACRO` is exported so the
 "is this a generic asm" test names the macro structurally rather than copying its spelling.
 
@@ -414,7 +414,7 @@ rule: one consumer and no enforcement earns no module — the first cut's `TS/to
 open-parameter argument override, the `TYPEINDEX` map — all of it about TypeScript's generics), plus the
 dispatch (~8). There is no edge back into `towasm.ts` at all.
 
-**The packed-kind rule and the pseudo-type NAMES moved to the neutral vocabulary.** `wasm-types.ts` now owns
+**The packed-kind rule and the pseudo-type NAMES moved to the neutral vocabulary.** `wasm-codegen.ts` now owns
 `PSEUDO_TYPES`/`isPseudoType`/`pseudoValueType` (`i8`/`i16` -> i32, `u8`/`u16` -> u32 — wasm has no
 sub-32-bit value types), and `type-utils.ts`'s `WASM_PSEUDO_TYPES` is derived from it, so the plan's
 "declared three times" pseudo-type names have one owner. That deleted a hand-written name switch from the TS
@@ -430,7 +430,7 @@ unresolved, so `typeOf(RefType('i8'))` is `undefined` while an asm signature dec
 neutral helper above answers that part now). Deleting the rest means teaching the GENERAL mapper the
 pseudo-type spellings — a general codegen change, difftest-gated, not part of this axis.
 
-Remaining: the survey's TARGETS now include `wasm-types.ts`/`wasm-asm.ts`/`towasm-analysis.ts` (they were
+Remaining: the survey's TARGETS now include `wasm-codegen.ts`/`wasm-asm.ts`/`towasm-analysis.ts` (they were
 invisible to the work queue, so a declaration moved out of a surveyed file read as progress when it was a
 scope change). The remaining downcast's proper fix is a keyed accessor exported beside `I` in `wasm.ts`.
 
@@ -460,7 +460,7 @@ and the diagnostics apparatus alone — each has exactly one possible user today
 not a core.
 
 **The boundary is enforced by imports, not by a lint rule** (true of every step here; stated once). No custom
-eslint rule is needed: a neutral module imports only `common.ts`/`wasm-types.ts`/`wasm`/`wat-parser` and its
+eslint rule is needed: a neutral module imports only `common.ts`/`wasm-codegen.ts`/`wasm`/`wat-parser` and its
 own submodules, and the language module imports *it*, never the reverse. That makes the separation a property
 of the module graph, checked by the compiler, with no judgement to drift. The one rule to write down (in the
 neutral module's header) is the §3 divider: **ask about types freely; answering with a representation is
@@ -511,8 +511,8 @@ enforcement is the imports rule) → 6+ (the seam).
 
 - **TS-specific types and TS-specific code generation stay in the same file.** They are firmly tied
   together; a vocabulary bucket whose only consumer is the file next door is indirection, and was folded
-  back (`towasm-types.ts`, created and removed the same day).
-- **`src/examples/wasm-types.ts` stays**, because it is not a bucket *for* `towasm.ts` — it is the
+  back (`towasm-codegen.ts`, created and removed the same day).
+- **`src/examples/wasm-codegen.ts` stays**, because it is not a bucket *for* `towasm.ts` — it is the
   language-neutral vocabulary, expected to serve the common code generation *and* each per-language one,
   and it enforces that nothing in it names a language type (the compiler rejects it).
 - **Builtins stay in the language's code generation** (anticipated to be language-specific).
