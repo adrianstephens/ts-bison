@@ -4014,6 +4014,28 @@ async function main() {
 	}
 
 	{
+		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
+		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
+		const { structDelete } = await compile(`
+			interface N { a: number; b?: string; c?: number[] }
+			function strip<M extends Record<string, any>>(node: M, keys: string[]): M {
+				const r = { ...node };
+				for (const k of keys)
+					delete r[k as keyof M];
+				return r;
+			}
+			export function structDelete(): number {
+				const n: N = { a: 1, b: 'xy', c: [1, 2, 3] };
+				const s = strip(n, ['b', 'zz']);
+				const t: N = { a: 2, c: [4] };
+				delete t.c;
+				return (s.b === undefined ? 1 : 0) + (s.c ? s.c.length * 10 : 0) + (n.b === 'xy' ? 100 : 0) + (t.c === undefined ? 1000 : 0);
+			}
+		`);
+		check('delete on a struct field leaves it undefined', structDelete(), 1131);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').

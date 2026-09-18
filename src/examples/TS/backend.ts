@@ -5140,13 +5140,20 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// `delete obj[k]`, like `++`/`--`, needs the target's own object+key rather than its evaluated value, so it gets its own branch before the generic
 				// operand dispatch below. Only a dynamic object has a real `delete` to dispatch to.
 				if (e.operator === 'delete') {
-					if (e.operand.type !== 'index')
-						throw "'delete' is only supported on a dynamic object's own bracket-indexed property ('delete obj[k]')";
+					if (e.operand.type !== 'index' && e.operand.type !== 'member')
+						throw "'delete' is only supported on a property ('delete obj[k]' or 'delete obj.p')";
 					const cls = ownerOf(e.operand.object, ctx);
-					if (!cls?.methodDecls.get('delete'))
-						throw "'delete' is only supported over a dynamic object (a structural '{[k: string]: V}'-typed value)";
-					emitAs(e.operand.object, ctx, cls.thisWtype!);
-					return emitMethodCall(cls, 'delete', [e.operand.index], ctx);
+					if (e.operand.type === 'index' && cls?.methodDecls.get('delete')) {
+						emitAs(e.operand.object, ctx, cls.thisWtype!);
+						return emitMethodCall(cls, 'delete', [e.operand.index], ctx);
+					}
+					// A struct cannot lose a slot, and an absent optional field is already one holding `undefined` (an omitted literal
+					// field), so deleting stores that. A required field has no such state: its non-null cast traps, as TS forbids it.
+					if (!cls || cls.typeIndex === -1 || !cls.fields.length)
+						throw "'delete' is only supported on a struct's field or a dynamic object's key";
+					emitExpr(Assign<Expr, never>(e.operand, Identifier('undefined')), ctx, 'void');
+					ctx.emit(I.i32.const(1));
+					return 'i32';
 				}
 
 				const info = operandInfo(e.operand, ctx);
