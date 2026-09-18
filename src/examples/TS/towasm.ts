@@ -499,9 +499,6 @@ class FunctionContext extends WT.FunctionContext {
 }
 
 
-
-
-
 // ===================================================================
 // Inline `__asm` -- the TypeScript spelling
 // ===================================================================
@@ -518,10 +515,6 @@ interface AsmCodegen {
 	// caller with the type section in hand can answer.
 	typeIndexOf?: (w: WT.Type) => number | undefined;
 }
-
-
-
-
 
 // What a declared type in an asm signature STORES -- not `typeOf`, since a signature may name a packed element
 // kind (`i8`/`u8`) that `T.resolve` leaves unresolved and `builtinTypes` doesn't carry, so it comes from the
@@ -6202,35 +6195,25 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					return;
 				}
 				emitTruthy(s.test, ctx);
-				ctx.enterLabel();
 				const alternate = s.alternate;
 				ctx.emitIf(undefined, () => emitStmt(s.consequent, ctx), alternate ? () => emitStmt(alternate, ctx) : undefined);
-				ctx.exitLabel();
 				return;
 			}
 
 			case 'while': {
 				ctx.emitLoop(() => {
 					emitTruthy(s.test, ctx);
-					ctx.enterBreakTarget();
-					ctx.enterContinueTarget();
 					ctx.emit(I.i32.eqz, I.br_if(1));
 					emitStmt(s.body, ctx);
 					ctx.emit(I.br(0));
-					ctx.exitContinueTarget();
-					ctx.exitBreakTarget();
 				});
 				return;
 			}
 			case 'do_while': {
 				ctx.emitLoop(() => {
-					ctx.enterBreakTarget();
-					ctx.enterContinueTarget();
 					emitStmt(s.body, ctx);
 					emitTruthy(s.test, ctx);
 					ctx.emit(I.br_if(0));
-					ctx.exitContinueTarget();
-					ctx.exitBreakTarget();
 				});
 				return;
 			}
@@ -6274,22 +6257,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							// block as the real `continue` target -- a plain `while` can reuse its restart label since it has no separate update step, but this desugared `for` has one (`s.update`) that must still run first.
 							ctx.emitLoop(() => {
 								emitTruthy(s.test ?? Literal(true), ctx);
-								ctx.emit(I.i32.eqz);
-								ctx.enterBreakTarget();
-								ctx.enterLabel();	// the bare "loop" level, between the break-block and the continue-block
-								ctx.emit(I.br_if(1));
-
-								ctx.emitBlock(() => {
-									ctx.enterContinueTarget();
-									emitStmt(s.body, ctx);
-									ctx.exitContinueTarget();
-								});
-
+								ctx.emit(I.i32.eqz, I.br_if(1));
+								ctx.emitContinueBlock(() => emitStmt(s.body, ctx));
 								if (s.update)
 									emitStmt(JS.ExprStmt(s.update), ctx);
 								ctx.emit(I.br(0));
-								ctx.exitLabel();
-								ctx.exitBreakTarget();
 							});
 						});
 						return;
@@ -6661,9 +6633,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// Exactly one action code is ever set, and each arm is gated by its own 'if' so the validator only checks one small branch at a time.
 					const dispatch = (code: number, build: () => void) => {
 						ctx.emit(I.local.get(actionLocal.index), I.i32.const(code), I.i32.eq);
-						ctx.enterLabel();			// this 'if''s own implicit level -- a depth-relative 'br' built by `build()` (e.g. a nested try/finally's own redispatch) needs it counted
 						ctx.emitIf(undefined, build);
-						ctx.exitLabel();
 					};
 					dispatch(1, () => outerOnReturn.emit(ctx, returnValueLocal ? Identifier('#finally$retval') : undefined));
 					// Skip an arm entirely when no such target was enclosing this construct (those action codes can then never be set), since

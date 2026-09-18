@@ -503,28 +503,52 @@ export class FunctionContext {
 		this.out.push(...instr.flat());
 	}
 
+	// Each of the four below owns the wasm levels it opens: `depth` counts them while the body runs, so a
+	// depth-relative `br` built inside one lands where its author meant. Getting that wrong is invisible --
+	// a `break` inside an `if` silently targeted the loop's restart instead of its exit -- so it is not left
+	// to the caller. The wrapper is built AFTER the body, since the body's branches are relative to it.
+
 	// Emits exactly one of two arms and leaves its value on the stack. Each arm goes into its own instruction
 	// list, so neither can run before the condition's own code has; an omitted (or empty) else stays a 2-arg `if`.
 	emitIf(vt: wasm.ValType | undefined, then: () => void, els?: () => void): void {
 		const outer		= this.swapOut();
+		this.enterLabel();
 		then();
 		const thenArm	= this.swapOut();
 		els?.();
+		this.exitLabel();
 		const elseArm	= this.swapOut(outer);
 		this.emit(elseArm.length ? I.if(vt, thenArm, elseArm) : I.if(vt, thenArm));
 	}
 
-	// `body` goes into its own instruction list and the wrapper is built around it AFTERWARDS, because the
-	// branches inside it already carry depths relative to that wrapper (`br 0` repeats, `br 1` exits).
 	emitBlock(body: () => void): void {
 		const outer = this.swapOut();
+		this.enterLabel();
 		body();
+		this.exitLabel();
 		this.emit(I.block(undefined, this.swapOut(outer)));
 	}
-	// The ordinary breakable loop: `br 1` leaves it, `br 0` starts the next iteration.
+
+	// A block wrapping `body` that `continue` branches to instead of the enclosing loop's restart -- for a
+	// `for`, whose update step still has to run. Shadows the loop's own target, and only for this body.
+	emitContinueBlock(body: () => void): void {
+		this.emitBlock(() => {
+			this.continueTargets.push(this.depth);
+			body();
+			this.continueTargets.pop();
+		});
+	}
+
+	// The ordinary breakable loop, `block` around `loop`: `break` leaves by the block, `continue` restarts at
+	// the loop, and both are registered here so a body needs no bookkeeping of its own.
 	emitLoop(body: () => void): void {
 		const outer = this.swapOut();
+		this.breakTargets.push(++this.depth);
+		this.continueTargets.push(++this.depth);
 		body();
+		this.continueTargets.pop();
+		this.breakTargets.pop();
+		this.depth -= 2;
 		this.emit(I.block(undefined, [I.loop(undefined, this.swapOut(outer))]));
 	}
 	toFuncBody(numParams: number, toValType: (t: Type) => wasm.ValType): wasm.FuncBody & {id: string} {

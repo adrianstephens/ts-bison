@@ -319,27 +319,19 @@ export function CPPtoWasm(module: { body: CPP.Definition[] }): wasm.WasmModule {
 
 			case 'if':
 				truthy(s.test, ctx);
-				// The `if` is itself a block, so it shifts every enclosing branch depth: without this a
-				// `break` inside one targets the loop's restart instead of its exit, and spins forever.
-				ctx.enterLabel();
 				ctx.emitIf(undefined,
 					() => emitStmt(s.consequent, ctx, result),
 					s.alternate ? () => emitStmt(s.alternate!, ctx, result) : undefined);
-				ctx.exitLabel();
 				return;
 
 			case 'while':
-				// The neutral `emitLoop` owns the block+loop wrapping; the break/continue targets stay here,
-				// because the test is emitted before they open.
+				// `emitLoop` owns the block+loop and registers both branch targets, so the body needs no
+				// depth bookkeeping: `br_if(1)` leaves the loop, `br(0)` restarts it.
 				ctx.emitLoop(() => {
 					truthy(s.test, ctx);
-					ctx.enterBreakTarget();
-					ctx.enterContinueTarget();
 					ctx.emit(I.i32.eqz, I.br_if(1));
 					emitStmt(s.body, ctx, result);
 					ctx.emit(I.br(0));
-					ctx.exitContinueTarget();
-					ctx.exitBreakTarget();
 				});
 				return;
 
