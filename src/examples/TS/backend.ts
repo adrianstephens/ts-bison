@@ -817,7 +817,8 @@ function ownBoundNames(names: string[], body: Stmt[] | Expr, selfName?: string):
 			}
 			return process(s);
 		},
-		(e, process) => (e.type === 'arrow' || e.type === 'function') ? false : process(e)
+		// An object literal reaches statements only through its methods' bodies, each a closure boundary.
+		(e, process) => (e.type === 'arrow' || e.type === 'function' || e.type === 'object') ? false : process(e)
 	).body(body);
 	return bound;
 }
@@ -851,10 +852,25 @@ function collectFreeVars(bound: Set<string>, body: Stmt[] | Expr, free: Set<stri
 				collectClosureFreeVars(bound, e, e.type === 'function' ? e.name : undefined, free);
 				return false;
 			}
+			if (e.type === 'object') {
+				for (const p of e.properties) {
+					if (p.type !== 'spread' && typeof p.key !== 'string')
+						collectFreeVars(bound, p.key.computed, free);
+					if (p.type === 'spread')
+						collectFreeVars(bound, p.operand, free);
+					else if (p.type !== 'field')
+						collectClosureFreeVars(bound, p, undefined, free);
+					else if (p.value)
+						collectFreeVars(bound, p.value, free);
+				}
+				return false;
+			}
 			return process(e);
 		}
 	).body(body);
 }
+
+const usesThis = (fn: { body?: Stmt[] }) => walkerB(undefined, (x, process) => x.type === 'this' || process(x)).statements(fn.body ?? []);
 
 // Whether a nested function's body names it other than as the callee of a direct self-call: a value use, or any mention
 // inside a closure within it (a capture). Such a body needs its own name bound (`emitClosureLiteral`).
@@ -3788,9 +3804,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			throw "'Object.defineProperty': a descriptor's `value` must be a plain property";
 		if (!valueExpr && !getProp && !setProp)
 			throw "'Object.defineProperty': the descriptor needs a `value`, a `get` or a `set`";
-		for (const p of [getProp, setProp])
-			if (p?.type === 'method' && walkerB(undefined, (x, process) => x.type === 'this' || process(x)).statements(p.body ?? []))
-				throw "'Object.defineProperty': an accessor method that uses `this` is not supported -- its `this` is the target, which a closure cannot bind";
+		if ([getProp, setProp].some(p => p?.type === 'method' && usesThis(p)))
+			throw "'Object.defineProperty': an accessor method that uses `this` is not supported -- its `this` is the target, which a closure cannot bind";
 		const emitHalf = (p: NonNullable<typeof getProp>, want: W.Type) => {
 			if (p.type === 'method')
 				coerceTop(emitClosureLiteral(p, ctx, false, want), ctx, want);
@@ -5236,7 +5251,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// right here (real JS's one-evaluation-per-spread semantics, matching the Map-backed case above) rather than re-emitting `p.operand` once per field it
 				// supplies. A later source for the same field name overwrites an earlier one, and only a field this class actually declares is ever read back off a spread
 				// operand -- any of the operand's own extra fields are simply not part of this shape, as a real JS spread's excess properties would never be looked at.
-				interface FieldSource { expr?: Expr; spreadLocal?: W.Local; spreadCls?: ClassInfo; unionCls?: ClassInfo[]; nullable?: boolean }
+				interface FieldSource { expr?: Expr; method?: JS.Method<Type>; spreadLocal?: W.Local; spreadCls?: ClassInfo; unionCls?: ClassInfo[]; nullable?: boolean }
 				// Every source for a field, in written order -- not just the last one. `{...D, ...opts}` is the reason: an OPTIONAL property of a later operand is only
 				// "last wins" when it is actually present at runtime, so an absent one has to fall back to whatever came before it.
 				const sources = new Map<string, FieldSource[]>();
@@ -5269,15 +5284,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							addSource(f.name, { spreadLocal, spreadCls });
 						continue;
 					}
-					if (p.type !== 'field' || typeof p.key !== 'string' || !p.value)
-						throw `object literal for '${owner.name}' can only have plain 'key: value' properties or a spread (no methods or computed keys)`;
+					const src: FieldSource | undefined = p.type === 'field' ? p.value && { expr: p.value } : p.type === 'method' ? { method: p } : undefined;
+					if (typeof p.key !== 'string' || !src)
+						throw `object literal for '${owner.name}' can only have plain 'key: value' properties, methods or a spread (no accessors or computed keys)`;
 					if (!owner.fieldIndex.has(p.key))
 						throw `object literal for '${owner.name}' has unknown property '${p.key}'`;
-					addSource(p.key, { expr: p.value });
+					if (src.method && usesThis(src.method))
+						throw `object literal for '${owner.name}': a method that uses \`this\` is not supported -- its \`this\` is the receiver, which a closure cannot bind`;
+					addSource(p.key, src);
 				}
 				// "Certain" means the source always yields a value: an explicit `k: v`, a spread of a field that isn't optional, or -- for a union spread -- a field every
 				// member declares and none optionally, with a never-nullish operand.
-				const certain	= (src: FieldSource, name: string) => !!src.expr || (src.unionCls
+				const certain	= (src: FieldSource, name: string) => !!src.expr || !!src.method || (src.unionCls
 					? !src.nullable && src.unionCls.every(m => { const i = m.fieldIndex.get(name); return i !== undefined && !m.fields[i].optional; })
 					: !src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].optional);
 				const rawWtype	= (src: FieldSource, name: string) => src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].wtype;
@@ -5314,9 +5332,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// read (`emitFieldRead`) already called it, and the copy's slot stays empty.
 				const copiesGetter = (f: { name: string }) => f.name.startsWith('#get:') || f.name.startsWith('#set:');
 				const emitOne	= (src: FieldSource, f: { name: string; wtype: W.Type }) => {
-					if (!src.expr && copiesGetter(f))
+					if (!src.expr && !src.method && copiesGetter(f))
 						return void ctx.emitDefaultValue(f.wtype, types, toValType);
-					if (src.expr) {
+					if (src.method) {
+						coerceTop(emitClosureLiteral(src.method, ctx, false, f.wtype), ctx, f.wtype);
+					} else if (src.expr) {
 						// The field's declared type is the value's context: a nested literal picks its union member from it.
 						ctx.withContext(owner.fieldDeclaredType(f.name, global), () => emitAs(src.expr!, ctx, f.wtype));
 					} else {

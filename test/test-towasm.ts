@@ -2074,6 +2074,39 @@ async function main() {
 	}
 
 	{
+		// An object literal's method is a closure stored in its function-typed field. Its parameters were read as the
+		// enclosing function's free variables ("unresolved identifier"), and its locals as the enclosing closure's own.
+		const { captures, declaredTarget, shadowing } = await compile(`
+			export function captures(): number {
+				const shape = (members: number[] = [], byKey = new Map<string, number>()) => ({ members, byKey,
+					push(m: number) {
+						byKey.set('a' + m, members.length);
+						members.push(m);
+					},
+				});
+				const s = shape();
+				s.push(3);
+				s.push(4);
+				return s.members.length * 10 + s.members[1] + (s.byKey.get('a4') ?? 99) * 100;
+			}
+			interface Adder { base: number; add(m: number): number }
+			export function declaredTarget(): number {
+				let calls = 0;
+				const o: Adder = { base: 1, add(m: number) { calls++; return m * 2; } };
+				return o.add(20) + o.add(1) + calls * 1000;
+			}
+			export function shadowing(): number {
+				const x = 5;
+				const f = () => { const o = { g(m: number) { const x = 100; return x + m; } }; return o.g(1) + x; };
+				return f();
+			}
+		`);
+		check('object literal method: captures the enclosing locals', captures(), 124);
+		check('object literal method: a declared target, writing a captured local', declaredTarget(), 2042);
+		check("object literal method: its locals don't bind the enclosing closure's names", shadowing(), 106);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed
