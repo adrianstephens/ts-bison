@@ -11,7 +11,15 @@ metadata:
 only when you need the accumulated history of a specific row). This file is the live state and
 nothing else: it is rewritten wholesale, not appended to.
 
-## As of 2026-09-17 (evening)
+## As of 2026-09-17 (late)
+
+**HEAD `307aa89` — "fold towasm-analysis.ts back in".** The file architecture is now settled (see its own
+section below) and the cross-language row is CLOSED, not paused: with `TSEmitter` rejected there is no
+further neutral extraction to do. Sizes: towasm **9,726** · type-utils 3,911 · wasm-types 812 · wasm-asm 227.
+Gates at `307aa89`: build clean · eslint 0 errors / 94 warnings, none in towasm.ts · test-towasm green ·
+test-checker green · difftest **2191/2200 · 0 disagree · 9 unsupported** — identical to `6e29763`.
+
+The previous entry, for the work that built the neutral layer:
 
 **HEAD `6e29763` — "DataSection owns the data segment and its string table".** `0fcf399` landed
 the placement batch: `ClassInfo.addField`/`fieldDeclaredType`/`isBaseOf`, `Types.func`/`funcAt`/`nullable`/
@@ -102,8 +110,7 @@ baseline on a move. Fix the determinism later; never read a survey delta as prog
   `ensureGlobal`, `data`->`addData`, `types`->`mergeOverloadSigs`, `userGenericClassDecls`->
   `staticTypeArgsFor`, `libGlobal`->`resolveClassAlias`, `openShapes`->`noteTypes`. Fan-in leaders:
   `toValType` (5), then `ensureClass`/`typeOf`/`ownerOf`/`methodSig`/`ownerFor`/`emitStmt` (2 each).
-- **`towasm-analysis.ts`** (261 lines) is per-language AST queries with one consumer; the user's stated
-  expectation is ONE TS module, which folds it into `towasm.ts` — asked, not decided.
+- **`towasm-analysis.ts` is GONE** (folded into `towasm.ts`, `307aa89`) — see the architecture note below.
 - **`rawElemKind`/`asmDeclaredType` stay TS-side deliberately** (they reason about TS type spellings).
 - **Inlining is a PREPASS, not a towasm pass** (user's call, `3793591`): `inlineSmallCalls` was deleted. Do not
   re-add a splice-into-instruction-lists pass; do it over the VSDG, where sizes and call sites are visible.
@@ -111,11 +118,32 @@ baseline on a move. Fix the determinism later; never read a survey delta as prog
 - **Step 3's three generic cores** (independent): `src/examples/layout.ts`, `guard<R>` into `walker.ts`,
   `buildStateMachine` into `src/examples/statemachine.ts`.
 
+## The file architecture is SETTLED (user, 2026-09-17) — two components, two files
+
+**`TS/towasm.ts` IS the TS-specific component; `wasm-types.ts` (+`wasm-asm.ts`) is the generic one.** A
+file is earned by CROSS-LANGUAGE REUSE and by nothing else — not by being wasm-free (that is what
+`towasm-analysis.ts` was drawn on, and why it was folded back in at `307aa89`), and not by size. So:
+
+- **Do not propose splitting `towasm.ts` for navigability.** `TS/asm.ts` (the ~140-line TS asm spelling) and
+  `TS/lib-decls.ts` (the lib ingestion) were proposed on those grounds and are DECLINED by this rule.
+- **`TSEmitter` is rejected** (Step 5, and see the plan memory). 8,517 of towasm's lines are inside
+  `TStoWasm`'s closure and will stay there; `emitExpr` (1,630) and `emitStmt` (654) do not get split.
+- **Neutral extraction is exhausted, confirmed by measurement.** The four biggest clusters inside the
+  closure are all saturated with TS types — class layout 620 lines (48 `Type`, 27 `Scope`, `TS.RefType`),
+  any-dispatch 502 (49 `Type`, 8 `Scope`), async/generator 420 (47 `Type`), union/virtual dispatch 235.
+  Don't re-survey these hoping for a neutral core.
+
 ## Open, waiting on the user — do not assume
 
+- **Renaming `wasm-types.ts`** — the user says the name is now wrong, and it is: the file is ~180 lines of
+  vocabulary plus ~470 of mutable codegen state (`FunctionContext`, `ClassInfo`) and module sections
+  (`Types`, `DataSection`), and "types" already names two other things here. Candidates offered:
+  `wasm-codegen.ts`, `wasm-backend.ts`, `wasm-lower.ts`. Not chosen. A three-way split was proposed and is
+  ruled out by the one-component-one-file rule above.
+- `TSWError` is TS-named inside the neutral file (13 refs, 2 files) — `WasmError`/`LowerError`. Not raised yet.
 - The **BigInt row** (6 declarations) is a real overload-*resolution* gap in `candidateFits`; unchosen.
-- Whether to fold `towasm-analysis.ts` (above).
-- The **`WT` prefix rename** (~459 refs) was explicitly handed to the user — an editor find/replace.
+- The **`WT` prefix rename** (~459 refs) was explicitly handed to the user — an editor find/replace. A file
+  rename does not force it: `import * as WT from '../wasm-codegen'` is fine.
 
 ## Tree state
 

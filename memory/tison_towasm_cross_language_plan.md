@@ -352,7 +352,14 @@ is pinned to the TS half by the closure payload. Stayed behind deliberately: `wa
 (they need `ClassInfo` or `FunctionContext`, a later chunk with the same one-directional-import shape).
 Gates: build clean, test-towasm all green, difftest **2182/2191 · 0 disagree** — identical to baseline.
 
-**Step 1b — the analysis cluster DONE 2026-09-16.** `TS/towasm-analysis.ts` (260 lines) took the 12
+**Step 1b — REVERSED 2026-09-17 (`307aa89`), the user's call.** `towasm-analysis.ts` is folded back into
+`towasm.ts`. The split was drawn on "knows nothing about wasm", but the axis that earns a file is
+CROSS-LANGUAGE REUSE, and wasm-free is not the same thing: those 12 functions query the TypeScript AST, so
+they belong to the TS component. **TS/towasm.ts IS the TS component and is ONE file; `wasm-types.ts`
+(+`wasm-asm.ts`) is the generic one.** Do not re-propose splitting `towasm.ts` for navigability — size is
+not an axis. Historical record of the original move follows.
+
+~~Step 1b — the analysis cluster DONE 2026-09-16.~~ `TS/towasm-analysis.ts` (260 lines) took the 12
 name/free-variable functions (`unwrapAs`, `isPurePath`, `exprMentionsName`, `assignsToThis`,
 `describeBinding`, `paramNames`, `ownBoundNames`, `collectFreeVars`, `namesSelfAsValue`,
 `collectClosureFreeVars`, `collectCapturedMutables`, `noteAssignExpr`) — pure AST queries, no wasm concepts.
@@ -475,7 +482,13 @@ that reaches for a TS field stops compiling.
 
 Do this **before** moving any function body: it is what converts the sieve of §3 into a line.
 
-**Step 5 — the real 2-way split.** Convert `TStoWasm`'s body to a class — base = module-level state + the
+**Step 5 — REJECTED 2026-09-17 by the user: "I also don't want TSEmitter".** The `TStoWasm`-body-to-class
+conversion is not going to happen, so every "blocked until Step 5" note elsewhere means "not happening",
+not "later" — including the ~128 functions the hoist survey leaves blocked on `typeOf`/`emitAs`/`coerceTop`/
+`owner*`/`ensure*`, and splitting `emitExpr` (1,630 lines) or `emitStmt` (654). They stay inside the closure.
+The neutral layer is what it is now. Original text follows for the reasoning only.
+
+~~Step 5 — the real 2-way split.~~ Convert `TStoWasm`'s body to a class — base = module-level state + the
 emission algorithm, subclass = TS dispatch and type lowering — which is exactly the `Emitter`/`TSEmitter`
 shape the VSDG already proved, with §3.4's 16-member context as the base's state. Expect roughly
 **1,500–2,500 neutral / 10,000+ TS**: honest two files, and deliberately *not* two equal halves — the axis is
