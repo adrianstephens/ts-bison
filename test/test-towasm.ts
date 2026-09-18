@@ -3971,6 +3971,23 @@ async function main() {
 	}
 
 	{
+		// An anonymous shape was a match CANDIDATE for any other type whose fields were assignable to it: `(t: any) => string`
+		// is assignable to `(t: P) => string`, so `withAny` took `withP`'s struct and `withAny.ret(1)` converted `1` to a `P`,
+		// or trapped as an illegal cast. Walker.ts's `mapSig`/`mapSigU` pair. An anonymous shape answers only for its own type.
+		const { anonShapesKeepTheirTypes } = await compile(`
+			interface P { name: string }
+			const withP		= { params: (x: P[]) => x, ret: (t: P) => t.name };
+			const withAny	= { params: (x: any[]) => x, ret: (t: any) => 'u' };
+			export function anonShapesKeepTheirTypes(): number {
+				const o = { ...withAny, key: 3 };
+				const p = { ...withP, key: 4 };
+				return o.key + p.key + o.ret(1).length * 10 + p.ret({ name: 'ab' }).length * 100 + withAny.ret(2).length * 1000;
+			}
+		`);
+		check('anonymous shapes are not matched to other types by assignability', anonShapesKeepTheirTypes(), 1217);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').

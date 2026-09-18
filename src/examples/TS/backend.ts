@@ -256,6 +256,8 @@ class ClassInfo extends W.ClassInfo {
 	// Where this class was DECLARED: its own module's scope and canonical path, so a method body compiled from
 	// another module can resolve the names its own file declares. Absent for a lib class or a synthesized shape.
 	declScope?:		Scope;
+	// Built for an unnamed object type, so reached only through that type (`ensureAnonObjectShape`), never matched for another.
+	anonymous		= false;
 	// Narrows the base's own recursive member, or every walk of the chain would lose the fields above.
 	declare superClass?:	ClassInfo;
 
@@ -365,8 +367,14 @@ class FunctionContext extends W.FunctionContext {
 		return unwrapped !== e && !T.unionMembers(t, this.scope).length ? checkerTypeOf(e, this.typeScope) : t;
 	}
 
+	// Where `e`'s physical type is decided. A call has no slot: its value is what the instance built, and a generic
+	// instance is chosen with the NARROWED arguments (`box(v)` inside `if (v === null)` builds `{value: null}`).
+	physicalScope(e: Expr): Scope {
+		return e.type === 'call' || e.type === 'new' ? this.typeScope : this.scope;
+	}
+
 	narrowedValueTypeOf(unwrapped: Expr): Type {
-		const base = checkerTypeOf(unwrapped, this.scope);
+		const base = checkerTypeOf(unwrapped, this.physicalScope(unwrapped));
 		// `any` counts as well as a real union: a field read off a NARROWED union receiver (`w.body` inside `if (w.kind === 'w')`)
 		// has no baseline, since `ctx.scope` still sees the whole union, on which `body` doesn't exist. Every divergence the
 		// union-only guard protected against needs `ctx.scope` to have a real answer, so an `any` baseline can't reach one.
@@ -1894,7 +1902,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// `Point`, so the comparison was rejected as having no nullable operand, even though the slot it lives in is still
 		// nullable. `narrowedTypeOf` only fills in where `ctx.scope` has no answer at all: a read off a receiver narrowed out
 		// of `T | undefined` (`if (!r) return; r.min`) comes back `any` there.
-		const base = checkerTypeOf(unwrapAs(e), ctx.scope);
+		const unwrapped	= unwrapAs(e);
+		const base		= checkerTypeOf(unwrapped, ctx.physicalScope(unwrapped));
 		if (!T.isAny(base))
 			return typeOf(base);
 		// A narrowing to just null/undefined (`a = undefined`) says nothing about the slot, which is still `any`; `void` is not
@@ -2164,7 +2173,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return !declared || !value || T.isAssignable(checkerTypeOf(unwrapAs(value), ctx.scope), declared, ctx.typeScope);
 		});
 		const candidates = [...new Set(classes.values())].filter(cls =>
-			cls.typeIndex !== -1 && [...explicit].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional) && fits(cls)
+			cls.typeIndex !== -1 && !cls.anonymous && [...explicit].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional) && fits(cls)
 		);
 		if (candidates.length === 1)
 			return candidates[0];
@@ -2199,7 +2208,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// `walker.ts`'s `mapObject` hit exactly this (`local 'r' has an unsupported type`). Same exact-field-set-then-
 	// literal-discriminant matching as the literal version above, but against declared field *types* not expression
 	// *values*; ambiguous or partial cases (computed/non-string key, non-property member) return `undefined`, never a guess.
+	// One answer per type for the whole compile: which classes exist changes as codegen proceeds, and a value built under
+	// one answer is unconvertible to a later one (a local typed before `FunctionType` was built, read after it was).
 	function matchObjectShapeByType(t: TS.ObjectType): ClassInfo | undefined {
+		const key	= T.typeKey(t);
+		const found	= classes.get(key) ?? findObjectShapeByType(t);
+		if (found)
+			classes.set(key, found);
+		return found;
+	}
+
+	function findObjectShapeByType(t: TS.ObjectType): ClassInfo | undefined {
 		const props = new Map<string, Type>();
 		for (const m of t.members) {
 			if (m.type !== 'property' || typeof m.key !== 'string')
@@ -2213,7 +2232,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// re-enters (ts-parser.ts's `CallSig` -> `Param[]` -> the recursive `Type` union did not terminate). A field
 		// whose declared type is unknown to `fieldDeclaredType` is not judged.
 		const candidates = [...new Set(classes.values())].filter(cls =>
-			cls.typeIndex !== -1 && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
+			cls.typeIndex !== -1 && !cls.anonymous && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
 			&& [...props].every(([k, pt]) => { const declared = cls.fieldDeclaredType(k, global); return !declared || T.isAssignable(pt, declared, global); })
 		);
 		if (candidates.length === 1)
@@ -7606,6 +7625,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const merged = T.typeKey(twin.thisTsType) === T.typeKey(info.thisTsType) ? twin.thisTsType : T.unionShapes(twin.thisTsType, info.thisTsType, global);
 		if (!merged)
 			return info;
+		twin.anonymous &&= info.anonymous;
 		for (const k of aliases)
 			classes.set(k, twin);
 		if (merged !== twin.thisTsType) {
@@ -7637,7 +7657,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		} finally {
 			anonShapeVetting.delete(key);
 		}
-		return layoutTwin(buildObjectShape(key, obj.members, obj, key, true), key);
+		const info = buildObjectShape(key, obj.members, obj, key, true);
+		info.anonymous = true;
+		return layoutTwin(info, key);
 	}
 
 	// Resolves fields and the struct type eagerly, but only collects method/ctor decls -- building each is
