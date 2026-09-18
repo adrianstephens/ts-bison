@@ -6,7 +6,7 @@ import * as T from './type-utils';
 import * as W from '../wasm-codegen';
 import { Literal, Identifier, Binary, Assign, Conditional, Member, hasMod, Module as CModule } from '../common';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
-import { walker, walkerB } from './walker';
+import { Walker, walker, walkerB } from './walker';
 import { AsmDecl, makeAsm as makeAsm0 } from '../wasm-codegen';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
@@ -140,7 +140,7 @@ const I				= wasm.I;
 // ===================================================================
 // The language-neutral half -- the physical type vocabulary, the codegen context and the module sections -- lives in `../wasm-codegen`, imported as `WT`.
 // What is left here is either about a compiled FUNCTION's shape (`FuncSig` and friends, `Local`/`Global`), or a rule about TypeScript's own type *spellings*
-// (`rawElemKind`); neither belongs in a language-neutral module. `T.isNullLiteral`/`T.READONLY_ALIAS`/`T.PRIMITIVE_TAGS` are those spelling rules, in type-utils.
+// (`rawElemKind`); neither belongs in a language-neutral module. `T.isNullLiteral`/`T.LITERAL_PRIMITIVES`/`READONLY_ALIAS` are those spelling rules.
 // `FuncSig` extends `WT.ClosureSig` with the binding data only argument-binding reads (`defaults`/`resolvedParams`/`restElem`), which is what lets `WT.Type` name no language type at all.
 // That binding data is kept BESIDE each closure payload (`closureWtype`), not in it.
 
@@ -206,40 +206,6 @@ function hostImportsIn(body: TS.Stmt[]): HostImport[] {
 }
 
 const LIB_HOST_IMPORTS: HostImport[] = hostImportsIn(LIB_AST);
-
-// Checks builtinTypes before T.resolve to avoid expanding a hoisted class name and losing it.
-function wasmTypeOf(t: Type, global: Scope): W.Type | undefined {
-	if (t.type === 'ref' && !t.typeArgs && builtinTypes.has(t.name))
-		return builtinTypes.get(t.name)!.wtype;
-	if (t.type === 'range' && t.base === 'number')
-		return t.integer && t.min !== undefined && t.max !== undefined ? W.intType(t.min as number, t.max as number) : 'f64';
-	// rangeToType collapses a single-value range to a Literal -- needs the same bounds check or it widens to f64.
-	if (t.type === 'literal' && typeof t.value === 'number')
-		return Number.isInteger(t.value) ? W.intType(t.value, t.value) : 'f64';
-	// A type with no inhabitant but null/undefined (`Literal<null>` from a narrowed `e.value === null`) holds only `ref.null`.
-	if (T.isNullish(t, global) && !T.isRef(T.resolveOwn(t, global), 'void'))
-		return W.REF_ANY_NULLABLE;
-
-	// Resolve each union member first so alias duplicates collapse before arrayElemKind.
-	const w = T.widenLiterals(t.type === 'union' ? T.combineTypes(t.types.map(m => T.resolve(global, m))) : T.resolve(global, t), false, true);
-	if (w.type === 'array' || (w.type === 'ref' && (w.name === 'Array' || w.name === 'ReadonlyArray'))) {
-		const elemType = w.type === 'array' ? w.element : w.typeArgs![0];
-		const we = elemType.type === 'ref' && !elemType.typeArgs && (elemType.name === 'i8' || elemType.name === 'u8') ? 'i8'
-			: W.elementKind(wasmTypeOf(elemType, global));
-		return we ? W.ARRAY[we] : undefined;
-	}
-
-	// A tuple's own elements can be heterogeneous, so there's no single per-element wasm kind to pick the way a real array's element type gives one.
-	// Physically it's just the same boxed-`anyref` "everything else" storage a mixed/`any`-typed array already uses (`ARR_WTYPE.ref`).
-	// The checker already fully tracks each element's own precise type (`type-utils.ts`'s own extensive 'tuple' handling); codegen needed only this one physical-representation mapping, nothing else.
-	if (w.type === 'tuple')
-		return W.ARRAY.ref;
-
-	if (w.type === 'ref')
-		return builtinTypes.get(w.name)?.wtype;
-
-	return undefined;
-}
 
 interface MethodDelegate 			{ owner: ClassInfo; method: string }
 // Per-operand info for builtin dispatch -- wtype for kind-polymorphic dispatch, owner for identity dispatch.
@@ -381,7 +347,7 @@ class FunctionContext extends W.FunctionContext {
 		if (!this.stmtScope || !(T.isAny(base) || T.resolve(this.scope, base).type === 'union'))
 			return base;
 		const narrowed = checkerTypeOf(unwrapped, this.stmtScope);
-		return T.isAny(narrowed) ? base : T.backToDeclaredMembers(narrowed, base, this.scope);
+		return T.isAny(narrowed) ? base : backToDeclaredMembers(narrowed, base, this.scope);
 	}
 
 	// Emit `fn` with `ctx.stmtScope` refined by `test` holding (or failing), for a ternary's or logical operator's own branch.
@@ -518,6 +484,31 @@ class FunctionContext extends W.FunctionContext {
 // the types -- what a declared type lowers to, and what a `TYPEINDEX` operand names against the signature
 // its own call settled on.
 
+function isAsm(e?: Expr): e is JS.Call<Type> {
+	return e?.type === 'call' && e.callee.type === 'identifier' && e.callee.name === '__asm';
+}
+
+function isAsmMethod(m: JS.Method<Type>): JS.Call<Type> | undefined {
+	if (m.body?.[0]?.type === 'return') {
+		const outer = m.body[0].argument;
+		if (outer?.type === 'call' && isAsm(outer.callee)) {
+			const paramNames = m.params.map(p => typeof p.key === 'string' ? p.key : undefined);
+			const argNames = outer.arguments.map(a => a.type === 'identifier' ? a.name : undefined);
+			if (paramNames.length === argNames.length && paramNames.every((p, i) => p !== undefined && p === argNames[i]))
+				return outer.callee;
+		}
+	}
+}
+
+// A structural `{[k: string]: V}` type has no nominal class, so it gets no owner; routed to `Map<string, V>`, whose `get`/`set` (`case 'index'`) plus `delete`/`has`/`keys` already cover it.
+// Purely a shared-implementation choice, invisible to the source: real `{}`/bracket/`delete`/`in`/`for...in` stays genuine syntax.
+export function indexSignatureValueType(w: Type): Type | undefined {
+	if (w.type !== 'object' || w.members.length !== 1)
+		return undefined;
+	const m = w.members[0];
+	return m.type === 'index' && m.paramType.type === 'ref' && m.paramType.name === 'string' ? m.typeAnnotation : undefined;
+}
+
 interface AsmCodegen {
 	// The general declared-type mapper, for a declared type `asmDeclaredType` has no case for (an alias, a
 	// class). Absent at the module-level builtin registry, which is built before any compile scope exists.
@@ -538,12 +529,14 @@ function asmDeclaredType(t: Type, resolve?: (t: Type) => W.Type | undefined): W.
 			const builtin = builtinTypes.get(t.name)?.wtype;
 			if (builtin)
 				return builtin;
-			if (W.isPseudoType(t.name))
-				return W.pseudoValueType(t.name);
+			if (T.WASM_PSEUDO_TYPES.has(t.name))
+				return	t.name === 'i8' || t.name === 'i16' ? 'i32'
+					:	t.name === 'u8' || t.name === 'u16' ? 'u32'
+					:	t.name;
 		}
 	}
 	if (t.type === 'array') {
-		if (t.element.type === 'ref' && W.isPseudoType(t.element.name))
+		if (t.element.type === 'ref' && T.WASM_PSEUDO_TYPES.has(t.element.name))
 			return W.ARRAY[W.notUnsigned(t.element.name)];
 		const arr = W.notUnsigned(W.scalarKind(asmDeclaredType(t.element, resolve)));
 		return arr ? { arr } : W.ARRAY.ref;
@@ -711,7 +704,7 @@ const BINARY_OP_NAMES = {
 const builtins = new Map<string, Builtin>([
 	...LIB_DECLS.filter(d => d.type === 'function_decl').filter(d => d.body).map(d => [d.name, () => d] as const),
 	...LIB_DECLS.filter(d => d.type === 'var_decl').flatMap(d => {
-		if (T.isAsm(d.init)) {
+		if (isAsm(d.init)) {
 			const builtin = makeAsm(d.init, {}, {});
 			return builtin ? [[d.name as string, builtin] as const] : [];
 		}
@@ -1142,6 +1135,255 @@ function containsDefineProperty(body: Stmt[]): boolean {
 const checkedModules = new WeakSet<Module>();
 
 
+// JS `fn.length`: the parameters before the first defaulted one; a rest parameter and a TS `this` parameter never count.
+function jsLength(params: { key: unknown; default?: unknown }[]): number {
+	const own = params.filter(p => p.key !== 'this');
+	const i = own.findIndex(p => p.default !== undefined);
+	return i < 0 ? own.length : i;
+}
+
+// A `get`/`set` accessor's `methodDecls`/`inlineMethods`/`funcs` key, mangled apart from a plain same-named
+// method so a getter and a setter for one property can coexist as two entries instead of overwriting each other.
+function accessorKey(kind: 'get' | 'set', name: string): string {
+	return `${kind}:${name}`;
+}
+
+// A structural shape's expando identity: its member names. A named shape and its anonymous twin share it, so they get
+// the same expando fields and `layoutTwin` can still merge them.
+function shapeKey(members: readonly TS.TypeMember[]): string {
+	return `#shape#${members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string' ? [m.key] : []).sort().join(',')}`;
+}
+function structuralKey(name: string, params: JS.Param<Type>[]): string {
+	return `${name}#struct<${params.map(p => p.typeAnnotation ? T.typeKey(p.typeAnnotation) : '_').join(',')}>`;
+}
+
+
+function genericKey(name: string, typeParams: readonly TS.TypeParam[], map: Map<string, Type>, scope: Scope) {
+	return `${name}<${typeParams.map(p => T.typeKey(T.resolve(scope, map.get(p.name)!))).join(',')}>`;
+}
+
+function homeKey(homeModule: string, name: string) {
+	return homeModule === '.' ? name : homeModule + '\0' + name;
+}
+
+
+// What iterating `t` yields, and returns once done (TS's iteration types): read off its `[Symbol.iterator]()` iterator's
+// `next()` result (`for await` tries `[Symbol.asyncIterator]` first). Without the protocol (an ES5 lib) only arrays and strings iterate.
+// `iterator.next()`: JS sends `undefined` to a `next` that takes a value (a generator's).
+function nextCall(iterator: Expr, it: T.IterationTypes, typeScope: Scope): Expr {
+	return JS.Call(JS.Member(iterator, 'next'), T.isNullish(it.next, typeScope) ? [] : [{ type: 'identifier', name: 'undefined' }]);
+}
+
+// Substitutes a generic class's type parameters throughout its decl.
+function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<string, Type>): JS.ClassDecl<Type> {
+	const out = walker(undefined, undefined, (t, process) =>
+		t.type === 'ref' && map.has(t.name) ? map.get(t.name) : process(t)
+	).statement(decl)!;
+	// A STATIC member is restored verbatim: real TS forbids one referencing its class's type parameters, so
+	// substituting into one can only corrupt a static's OWN same-named type parameter -- `Array<any>`'s
+	// `_alloc<T>(n): T[]` became `any[]`, allocating `arr:ref` whatever it was called with, so `$ret` never had a chance to resolve it.
+	// Order is structural, so `out.body[i]` is `decl.body[i]` throughout.
+	out.body = out.body.map((m, i) => hasMod(decl.body[i] as { modifiers?: string[] }, 'static') ? decl.body[i] : m);
+	return out;
+}
+
+// Applies a whole set of type-param substitutions in one `walk` pass; the caller resolves `map` for both the
+// explicit-type-args and inferred-from-arguments cases (see `ensureGenericFunc`).
+function substituteTypeParams(map: ReadonlyMap<string, Type>): Walker {
+	return walker(
+		// The checker's stamps are the TEMPLATE's scopes, where `T` is opaque: stale for an instance, which `instantiateDecl`
+		// re-checks so its own narrowing (on the concrete types) is stamped afresh.
+		(s, process) => { const built = process(s); delete (built as any).scope; return built; },
+		(e, process) => { const built = process(e); delete (built as any).scope; return built; },
+		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
+	);
+}
+
+// A guard can refine a union member past anything physical (`Lit<string>` out of `Lit<string | number>`),
+// but a value's struct is fixed when it is built: each refined part maps back to the one member it came from.
+function backToDeclaredMembers(narrowed: Type, base: Type, scope: Scope): Type {
+	const r = T.resolve(scope, base);
+	if (r.type !== 'union')
+		return narrowed;
+	const members	= T.unionMembers(r, scope);
+	const declared	= new Set(members.map(m => T.typeKey(m)));
+	const refined	= T.unionMembers(T.resolve(scope, narrowed), scope);
+	const parts		= refined.map(p => {
+		if (declared.has(T.typeKey(p)))
+			return p;
+		const from = members.filter(m => !T.isAny(m) && T.isAssignable(p, m, scope));
+		return from.length === 1 ? from[0] : p;
+	});
+	return parts.some((p, i) => p !== refined[i]) ? T.combineTypes(parts) : narrowed;
+}
+
+// A default reading an earlier parameter (`b.length`) has its references rewritten to the scratch local `emitCallArgs`
+// binds into, matching the grammar `isReemittableDefault` accepts.
+function substituteEarlierParamRefs(e: Expr, rename: ReadonlyMap<string, string>): Expr {
+	const sub = (x: Expr) => substituteEarlierParamRefs(x, rename);
+	// A node actually REBUILT here loses its branch stamp (`stampBranch`, checker.ts), same as `substituteTypeParams`: the
+	// stamp was taken where the original parameter names were bound and cannot resolve the scratch locals they become at the
+	// call site. A node returned untouched was not rewritten, so its stamp still means what it said.
+	const out = rebuild();
+	if (out !== e)
+		delete (out as any).scope;
+	return out;
+
+	function rebuild(): Expr {
+		switch (e.type) {
+			case 'identifier': {
+				const to = rename.get(e.name);
+				return to ? { ...e, name: to } : e;
+			}
+			case 'member':		return { ...e, object: sub(e.object) };
+			// The operator shapes `isReemittableDefault` accepts must be descended into as well, or the
+			// `a` in `b = a * 2` stayed pointing at a name the call site has never heard of.
+			case 'binary':		return { ...e, left: sub(e.left), right: sub(e.right) };
+			case 'unary':		return { ...e, operand: sub(e.operand) };
+			case 'conditional':	return { ...e, test: sub(e.test), consequent: sub(e.consequent), alternate: sub(e.alternate) };
+			case 'array':		return { ...e, elements: e.elements.map(el => el && el.type !== 'spread' ? sub(el) : el) };
+			default:			return e;
+		}
+	}
+}
+
+// A CLOSURE default (`sort(compareFn = (a, b) => ...)`) is judged by what it CAPTURES: only its own params and the earlier
+// params the call site already passes -- anything else is an enclosing local re-emitted out of scope.
+function closureDefaultIsSelfContained(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
+	if (e.type !== 'arrow' && e.type !== 'function')
+		return false;
+	const bound = new Set<string>(earlierNames);
+	for (const p of e.params)
+		if (typeof p.key === 'string')
+			bound.add(p.key);
+	let ok = true;
+	walker(undefined, (x, process) => {
+		if (x.type === 'identifier' && !bound.has(x.name))
+			ok = false;
+		return process(x);
+	}).body(e.body);
+	return ok;
+}
+
+// A default is re-emitted verbatim at each omitted call site (`emitCallArgs`), so it may reference only literals or an *earlier*
+// parameter (`len = b.length`); anything else would resolve against the call site's scope, so it is applied in the callee instead.
+function isReemittableDefault(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
+	return e.type === 'literal'
+		// `undefined` is a language CONSTANT, not a name to resolve: self-contained and side-effect-free, which is the property this predicate actually tests.
+		// The AST has a `null` literal but no `undefined` one, so it arrives as an identifier -- and `defaultsWithImplicitUndefined` synthesizes exactly this node.
+		|| (e.type === 'identifier' && e.name === 'undefined')
+		|| closureDefaultIsSelfContained(e, earlierNames)
+		|| (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el, earlierNames)))
+		// Same reasoning as the array case, and `{}` -- an all-defaults options bag -- is the common one.
+		|| (e.type === 'object' && e.properties.every(pr => pr.type === 'field' && typeof pr.key === 'string' && !!pr.value && isReemittableDefault(pr.value, earlierNames)))
+		|| (e.type === 'identifier' && !!earlierNames?.has(e.name))
+		|| (e.type === 'member' && !e.optional && isReemittableDefault(e.object, earlierNames))
+		// An OPERATOR over things already re-emittable (`b = a * 2`, `n = -1`, `x = a ? 1 : 2`) adds no new name to resolve at the call site,
+		// so it carries none of the cross-module hazard a default that *called* something would.
+		|| (e.type === 'binary' && isReemittableDefault(e.left, earlierNames) && isReemittableDefault(e.right, earlierNames))
+		|| (e.type === 'unary' && isReemittableDefault(e.operand, earlierNames))
+		|| (e.type === 'conditional' && isReemittableDefault(e.test, earlierNames) && isReemittableDefault(e.consequent, earlierNames) && isReemittableDefault(e.alternate, earlierNames));
+}
+
+// A bare `p?: T` gets a synthesized `undefined` default, so an optional-but-defaultless trailing param can be omitted at a call site.
+// A default only the callee can evaluate (`calleeDefault`) is applied there, so callers pass `undefined` for it too.
+function defaultsWithImplicitUndefined(params: readonly { key: BindingTarget; default?: Expr; modifiers?: string[] }[]): (Expr | undefined)[] {
+	return params.map((p, i) => p.default && isReemittableDefault(p.default, new Set(params.slice(0, i).flatMap(q => typeof q.key === 'string' ? [q.key] : []))) ? p.default
+		: p.default || hasMod(p, 'optional') ? { type: 'identifier', name: 'undefined' } : undefined);
+}
+
+// An accessor's halves as `Object.defineProperty` stores them: one canonical `() => any` getter and `(v: any) => void`
+// setter, so every accessor slot of a kind shares one type whatever the descriptor's own closures declared.
+function getterSig(): TS.FunctionType { return { type: 'function', params: [], returnType: T.ANY }; }
+
+function setterSig(): TS.FunctionType { return { type: 'function', params: [{ key: 'v', typeAnnotation: T.ANY }], returnType: T.VOID }; }
+
+// The TS type of a HIDDEN field (`#ext`, an accessor's `#get:`/`#set:` companion) -- named in one place, so a derived shape
+// repeating its base's hidden fields repeats them exactly and stays that base's wasm subtype. Plain expandos are `any`.
+function hiddenFieldType(name: string): Type {
+	return name === '#ext' ? TS.RefType('Map', [T.STRING, T.ANY])
+		: name.startsWith('#get:') ? getterSig()
+		: name.startsWith('#set:') ? setterSig()
+		: T.ANY;
+}
+
+// A type argument that changes a generic's physical layout: a value stored unboxed, or a typed-array tag. Any other
+// occupies one ref slot whatever it is, and keying on the finite set of these also bounds `Box<T[]>`-style recursion.
+function ownsLayout(t: Type, scope: Scope): boolean {
+	if (t.type === 'ref' && !t.typeArgs && T.WASM_PSEUDO_TYPES.has(t.name))
+		return true;
+	const r = T.resolve(scope, t);
+	return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean' || r.name === 'any');
+}
+
+// The tag is read UNRESOLVED on purpose: `T.resolve` collapses every `TypedArray` tag alike to plain `number`.
+function layoutArgKey(t: Type, scope: Scope): string {
+	return t.type === 'ref' && !t.typeArgs && T.WASM_PSEUDO_TYPES.has(t.name) ? t.name : T.typeKey(T.resolve(scope, t));
+}
+
+// Would these two types occupy the same wasm slot? Answered WITHOUT building a shape -- this runs before codegen -- by the same collapse `ensureClass`
+// applies: a reference type argument erases, so `TemplatePart<unknown>` and `TemplatePart<Type>` are one layout (widening one would leave it unbuilt, with nothing for a dynamic read to find).
+function layoutSketch(t: Type | undefined, scope: Scope, depth = 3): string {
+	if (!t || depth < 0)
+		return 'any';
+	// A GENERIC's reference is sketched unresolved: `ensureClass` collapses reference type arguments, so
+	// `TemplatePart<unknown>` and `TemplatePart<Type>` are one instantiation, which substituting them apart would hide.
+	if (t.type === 'ref' && t.typeArgs?.length && !scope.type(t.name)?.isTypeParam)
+		return `${t.name}<${t.typeArgs.map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
+	const r = T.resolve(scope, t);
+	const members = T.unionMembers(r, scope).filter(m => !T.isNullish(m, scope));
+	// A union of references is one `anyref`, and so is `any`/`unknown`/`object` -- `TemplatePart<unknown>`'s `exp?` and
+	// `TemplatePart<Type>`'s (a union) are the same slot, while `Sig` and `Meth` are two distinct struct references.
+	if (members.length > 1)
+		return members.every(m => !!typeOfScalar(m, scope)) ? 'num' : 'any';
+	if (r.type === 'ref') {
+		if (T.isAny(r) || r.name === 'unknown' || r.name === 'object')
+			return 'any';
+		const scalar = typeOfScalar(r, scope);
+		return scalar ?? `${r.name}<${(r.typeArgs ?? []).map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
+	}
+	if (r.type === 'array' || r.type === 'tuple') {
+		// A tuple is an `Array` of its combined element type, which is a reference whenever the positions differ.
+		const el = r.type === 'array' ? r.element : T.ANY;
+		return `arr:${ownsLayout(el, scope) ? layoutSketch(el, scope, depth - 1) : 'ref'}`;
+	}
+	if (r.type === 'object')
+		return `{${r.members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string'
+			? [`${m.key}:${layoutSketch(T.lookupMember(r, m.key, scope), scope, depth - 1)}`] : []).sort().join(',')}}`;
+	return 'ref';
+}
+
+// `number`/`boolean` are the only types stored unboxed; everything else is one reference slot.
+function typeOfScalar(t: Type, scope: Scope): string | undefined {
+	const r = T.resolve(scope, t);
+	return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean') ? r.name
+		: r.type === 'literal' ? (typeof r.value === 'number' ? 'number' : typeof r.value === 'boolean' ? 'boolean' : undefined)
+		: undefined;
+}
+
+// A readonly view is a checker-only distinction over the very same physical container.
+const READONLY_ALIAS = new Map([['ReadonlyArray', 'Array'], ['ReadonlyMap', 'Map'], ['ReadonlySet', 'Set']]);
+
+// The array-backed part of an intersection with one physical shape (an ARRAY carrying extra properties, e.g.
+// `TemplateStringsArray`): the value IS the array. Flattened over the RAW parts, never `flattenIntersection`.
+function arrayPartOf(t: Type, scope: Scope): { part: Type; element: Type } | undefined {
+	// Matched on the part's own written shape, never through `resolve` -- that expands `Array<string>` into the
+	// class's own object shape and loses the very thing being looked for. A TUPLE part is physically the same
+	// `arr:ref`, its element the union of every position.
+	const elementOf = (x: Type) => x.type === 'tuple' ? T.combineTypes(T.elementTypes(x, scope)) : T.arrayLikeElement(x);
+	const arrays = T.flatParts([t], 'intersection').flatMap(part => {
+		// A part whose array-ness is one resolution step away -- an alias, or a mapped type over an array.
+		const element = elementOf(part) ?? elementOf(T.resolve(scope, part));
+		return element ? [{ part, element }] : [];
+	});
+	return arrays.length && new Set(arrays.map(a => T.typeKey(a.element))).size === 1 ? arrays[0] : undefined;
+}
+
+// The primitive member of an intersection, by its own `typeofName`.
+function primitivePart(t: TS.IntersectionType, scope: Scope): Type | undefined {
+	return t.types.find(p => T.LITERAL_PRIMITIVES.has(T.typeofName(p, scope) ?? ''));
+}
+
 
 // A value with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable; one without (an array: the lib declares it none) is read by position.
 function iteratesByProtocol(e: Expr, ctx: FunctionContext): T.IterationTypes | undefined {
@@ -1225,6 +1467,40 @@ function touchesMemory(instrs: readonly wasm.LooseInstr[]): boolean {
 		|| ('then' in i && (touchesMemory(i.then) || !!i.else && touchesMemory(i.else))));
 }
 
+// Checks builtinTypes before T.resolve to avoid expanding a hoisted class name and losing it.
+function wasmTypeOf(t: Type, global: Scope): W.Type | undefined {
+	if (t.type === 'ref' && !t.typeArgs && builtinTypes.has(t.name))
+		return builtinTypes.get(t.name)!.wtype;
+	if (t.type === 'range' && t.base === 'number')
+		return t.integer && t.min !== undefined && t.max !== undefined ? W.intType(t.min as number, t.max as number) : 'f64';
+	// rangeToType collapses a single-value range to a Literal -- needs the same bounds check or it widens to f64.
+	if (t.type === 'literal' && typeof t.value === 'number')
+		return Number.isInteger(t.value) ? W.intType(t.value, t.value) : 'f64';
+	// A type with no inhabitant but null/undefined (`Literal<null>` from a narrowed `e.value === null`) holds only `ref.null`.
+	if (T.isNullish(t, global) && !T.isRef(T.resolveOwn(t, global), 'void'))
+		return W.REF_ANY_NULLABLE;
+
+	// Resolve each union member first so alias duplicates collapse before arrayElemKind.
+	const w = T.widenLiterals(t.type === 'union' ? T.combineTypes(t.types.map(m => T.resolve(global, m))) : T.resolve(global, t), false, true);
+	if (w.type === 'array' || (w.type === 'ref' && (w.name === 'Array' || w.name === 'ReadonlyArray'))) {
+		const elemType = w.type === 'array' ? w.element : w.typeArgs![0];
+		const we = elemType.type === 'ref' && !elemType.typeArgs && (elemType.name === 'i8' || elemType.name === 'u8') ? 'i8'
+			: W.elementKind(wasmTypeOf(elemType, global));
+		return we ? W.ARRAY[we] : undefined;
+	}
+
+	// A tuple's own elements can be heterogeneous, so there's no single per-element wasm kind to pick the way a real array's element type gives one.
+	// Physically it's just the same boxed-`anyref` "everything else" storage a mixed/`any`-typed array already uses (`ARR_WTYPE.ref`).
+	// The checker already fully tracks each element's own precise type (`type-utils.ts`'s own extensive 'tuple' handling); codegen needed only this one physical-representation mapping, nothing else.
+	if (w.type === 'tuple')
+		return W.ARRAY.ref;
+
+	if (w.type === 'ref')
+		return builtinTypes.get(w.name)?.wtype;
+
+	return undefined;
+}
+
 export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImports?: Map<string, Map<string, { module: string; name: string }>>, onTopLevelError?: (e: unknown) => void): wasm.WasmModule {
 	const global = ast.scope as Scope;
 	if (!global)
@@ -1291,15 +1567,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (s.type !== 'var_decl')
 				continue;
 			for (const d of s.declarations) {
-				if (typeof d.name === 'string' && T.isAsm(d.init))
-					moduleAsmBuiltins.set(T.homeKey(moduleId, d.name), makeAsm(d.init, {}, {}));
+				if (typeof d.name === 'string' && isAsm(d.init))
+					moduleAsmBuiltins.set(homeKey(moduleId, d.name), makeAsm(d.init, {}, {}));
 			}
 		}
 	}
 	// The one place an unqualified (or namespace-resolved) name turns into a `FunctionDecl` -- a lib
 	// declaration is always homeModule-independent, checked only after the calling module's own.
 	function resolveDecl(homeModule: string, name: string) {
-		return functionDeclByName.get(T.homeKey(homeModule, name)) ?? LIB_DECL_MAP.get(name);
+		return functionDeclByName.get(homeKey(homeModule, name)) ?? LIB_DECL_MAP.get(name);
 	}
 	// True for a name that resolves without ever needing a closure capture slot: reachable from anywhere via
 	// the ordinary `case 'identifier'` fallback chain, regardless of lexical nesting.
@@ -1313,11 +1589,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// tell the two apart, so without this ANY closure or nested function mentioning a module-level class threw.
 			|| moduleScopeOf(homeModule)?.decl(name)?.type === 'class_decl'
 			// An ENUM name, for the same reason: every read of it folds to a constant at its own site.
-			|| enumNames.has(T.homeKey(homeModule, name))
+			|| enumNames.has(homeKey(homeModule, name))
 			// The same for the entry module's own top-level `const`/`let`: `hoist` deliberately doesn't hoist a
 			// plain `var_decl` into a scope, so `resolveDecl` cannot see one -- `topLevelVars` is where they live,
 			// and without this a closure referencing one read as a free variable ("unresolved identifier 'LIB_DIR'").
-			|| topLevelVars.has(T.homeKey(homeModule, name));
+			|| topLevelVars.has(homeKey(homeModule, name));
 	}
 
 	const worklist:			(()=>void)[] = [];
@@ -1485,9 +1761,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// `const f = __asm<[...], R>('...')` DECLARES a builtin and holds no value, so returning `undefined` lets the
 		// reference fall through to `moduleAsmBuiltins`. Guarded here rather than in `lazyGlobalFor` because
 		// `case 'call'`'s closure-valued-const path reaches this function directly.
-		if (d.init && T.isAsm(d.init))
+		if (d.init && isAsm(d.init))
 			return undefined;
-		const key = T.homeKey(homeModule, name);
+		const key = homeKey(homeModule, name);
 		const existing = lazyGlobals.get(key);
 		if (existing)
 			return existing;
@@ -1552,7 +1828,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return undefined;
 		seen.add(name);
 		const varStmt	= scope.decl(name);
-		const d			= varStmt?.type === 'var_decl' ? varStmt.declarations.find(v => v.name === name) : topLevelVars.get(T.homeKey(homeModule, name))?.d;
+		const d			= varStmt?.type === 'var_decl' ? varStmt.declarations.find(v => v.name === name) : topLevelVars.get(homeKey(homeModule, name))?.d;
 		return d?.init ? classRefTarget(d.init, scope, seen) : undefined;
 	}
 
@@ -1562,24 +1838,24 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const varStmt	= scope.decl(name);
 		const own		= varStmt?.type === 'var_decl'
 			? { stmt: varStmt as TS.Stmt, d: varStmt.declarations.find(d => d.name === name) }
-			: scope === ctx.scope ? topLevelVars.get(T.homeKey(ctx.homeModule, name)) : undefined;
+			: scope === ctx.scope ? topLevelVars.get(homeKey(ctx.homeModule, name)) : undefined;
 		if (!own?.d) {
 			// A named import of another module's const (`import { isJsStatement } from './walker'` in printer.ts): the same lazy
 			// global under its DECLARING module's identity, since the reading module's own scope never declares it.
 			const imported	= scope === ctx.scope ? namedImportsByModule.get(ctx.homeModule)?.get(name) : undefined;
-			const target	= imported && topLevelVars.get(T.homeKey(imported.module, imported.name));
+			const target	= imported && topLevelVars.get(homeKey(imported.module, imported.name));
 			if (imported && target?.d) {
 				const wrapper	= ensureLazyGlobal(imported.name, imported.module, target.d, moduleScopeOf(imported.module) ?? scope);
-				const slot		= lazyGlobalSlots.get(T.homeKey(imported.module, imported.name));
+				const slot		= lazyGlobalSlots.get(homeKey(imported.module, imported.name));
 				return wrapper && slot ? { wrapper, slot } : undefined;
 			}
 			// A module-level binding in a STATIC lib file (`LIB_AST`): those files are never in `moduleBodies`, so they are
 			// absent from `topLevelVars`, but share one flat `libGlobal` -- so the identity must be a FIXED one, since falling
 			// back to `ctx.homeModule` would give each referencing module its own copy of the same shared state.
 			const lib = LIB_DECL_MAP.get(name);
-			if (lib?.type === 'var_decl' && lib.init && !T.isAsm(lib.init)) {
+			if (lib?.type === 'var_decl' && lib.init && !isAsm(lib.init)) {
 				const wrapper	= ensureLazyGlobal(name, LIB_MODULE, lib as unknown as JS.Var<Type>, libGlobal);
-				const slot		= lazyGlobalSlots.get(T.homeKey(LIB_MODULE, name));
+				const slot		= lazyGlobalSlots.get(homeKey(LIB_MODULE, name));
 				return wrapper && slot ? { wrapper, slot } : undefined;
 			}
 			return undefined;
@@ -1588,7 +1864,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// `scope` is only where `name` was FOUND: an `NS.name` read finds it in the module's export scope, which lacks
 		// that module's own imports. The initializer compiles in its home module's own scope, as its functions do.
 		const wrapper		= ensureLazyGlobal(name, homeModule, own.d, moduleScopeOf(homeModule) ?? scope);
-		const slot			= lazyGlobalSlots.get(T.homeKey(homeModule, name));
+		const slot			= lazyGlobalSlots.get(homeKey(homeModule, name));
 		return wrapper && slot ? { wrapper, slot } : undefined;
 	}
 
@@ -1601,7 +1877,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return isAliasInit(e.expression, scope);
 		// `const f = __asm<[...], R>('...')` DECLARES a builtin (`moduleAsmBuiltins`); there is no value to
 		// evaluate, and the start function trying to call `__asm` is exactly the "unknown function" it got.
-		return T.isAsm(e)
+		return isAsm(e)
 			|| !!classRefTarget(e, scope)
 			|| (e.type === 'identifier' && scope.decl(e.name)?.type === 'function_decl')
 			|| (e.type === 'member' && e.object.type === 'identifier' && !!scope.namespace(e.object.name));
@@ -1640,21 +1916,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const wt = typeOf(t);
 		if (storageKindOf(wt) !== undefined)
 			return wt;
-		const elems = T.restElementTypes(t, global);
+		const elems = T.elementTypes(t, global);
 		return elems.length ? typeOf(TS.ArrayType(T.combineTypes(elems))) : wt;
 	}
 
 	function closureSigParts(sig: TS.CallSig): FullSig | undefined {
 		// The type-annotation-side twin of `emitClosureLiteral`'s own comment: same bound substitution, same free-when-bounded reasoning.
-		let func = sig;
-		if (func.typeParams?.length) {
-			const map = new Map(func.typeParams.map(p => [p.name, p.constraint ?? T.ANY]));
-			func = { ...func, typeParams: undefined, params: func.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p), returnType: func.returnType && T.substituteType(func.returnType, map) };
-		}
+		const func = T.baseSignature(sig, T.ANY);
 		// Naming the whole signature, not just the parameter: one of these reaches a caller from some
 		// enclosing declaration's own type, and the parameter name alone rarely says which.
 		const sigText = () => T.typeKey({ type: 'function', ...sig } as Type);
-		const defaults = T.defaultsWithImplicitUndefined(func.params);
+		const defaults = defaultsWithImplicitUndefined(func.params);
 		const omittable = (i: number) => !!defaults[i] && T.nullLiteralKind(defaults[i]!) === 'undefined';
 		const params = func.params.map((p, i) => {
 			// `void` is valid TS in a param position but has no wasm value, so box it as `any` like any other "no meaningful value" position rather than rejecting valid source.
@@ -1681,7 +1953,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			params.push(wt);
 			resolvedParams.push({ key: func.rest.key, wtype: wt, tsType: func.rest.typeAnnotation });
 			hasRest = true;
-			const element = T.arrayPartOf(func.rest.typeAnnotation, global)?.element;
+			const element = arrayPartOf(func.rest.typeAnnotation, global)?.element;
 			const ewt = element && typeOf(element);
 			if (element && ewt)
 				restElem = { key: func.rest.key, wtype: ewt === 'void' ? W.REF_ANY : ewt, tsType: element };
@@ -1691,7 +1963,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// Scoped to exactly this spot, not a general `typeOf` fallback -- that collides with a NAMED type whose `ref` wrapper `T.combineTypes` flattened away.
 		if (!result && func.returnType) {
 			const returnResolved = T.resolve(global, func.returnType);
-			if (returnResolved.type === 'object' && !T.indexSignatureValueType(returnResolved)) {
+			if (returnResolved.type === 'object' && !indexSignatureValueType(returnResolved)) {
 				const cls = ensureAnonObjectShape(returnResolved);
 				result = cls?.thisType;
 			}
@@ -1773,7 +2045,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 
 		if (t.type === 'ref' && t.typeArgs?.length) {
-			const name = T.READONLY_ALIAS.get(t.name) ?? t.name;
+			const name = READONLY_ALIAS.get(t.name) ?? t.name;
 			const decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
 			if (decl?.type === 'class_decl' && decl.typeParams?.length) {
 				const cls = ensureClass(name, t.typeArgs);
@@ -1801,7 +2073,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			case 'object': {
 				if (openShapes.has(T.typeKey(resolved)))
 					return W.REF_ANY;
-				const vt	= T.indexSignatureValueType(resolved);
+				const vt	= indexSignatureValueType(resolved);
 				const cls	= vt && ensureClass('Map', [TS.RefType('string'), vt]);
 				if (cls)
 					return cls.thisType;
@@ -1824,10 +2096,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// array-backed; falls through to the flatten-and-merge path below when no part is array-backed at all (an interface extending another
 			// interface), or when two parts disagree on the element kind.
 			case 'intersection': {
-				const arr = T.arrayPartOf(resolved, global);
+				const arr = arrayPartOf(resolved, global);
 				if (arr)
 					return typeOf(TS.ArrayType(arr.element));
-				const prim = T.primitivePart(resolved, global);
+				const prim = primitivePart(resolved, global);
 				if (prim)
 					return typeOf(prim);
 				break;
@@ -1926,9 +2198,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const arr: Expr = Identifier(arrName), r: Expr = Identifier(rName);
 		emitStmt(JS.VarDecl('const', JS.Var(arrName, { type: 'array', elements: [] } as Expr, TS.ArrayType(it.yield))), ctx);
 		emitStmt(JS.For(
-			JS.VarDecl('let', JS.Var(rName, T.nextCall(iterator, it, ctx.typeScope))),
+			JS.VarDecl('let', JS.Var(rName, nextCall(iterator, it, ctx.typeScope))),
 			JS.JSUnary('!', JS.Member(r, 'done')),
-			Assign<Expr, never>(r, T.nextCall(iterator, it, ctx.typeScope)),
+			Assign<Expr, never>(r, nextCall(iterator, it, ctx.typeScope)),
 			{ type: 'expression' as const, expression: JS.Call(JS.Member(arr, 'push'), [JS.Member(r, 'value')]) },
 		), ctx);
 		return arr;
@@ -1982,7 +2254,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			declare(iterator, JS.Call(JS.Member(tmp, '[Symbol.iterator]'), []));
 			for (const el of target.elements) {
 				const r = temp();
-				declare(r, T.nextCall(iterator, it, ctx.typeScope));	// a hole still advances
+				declare(r, nextCall(iterator, it, ctx.typeScope));	// a hole still advances
 				if (!el)
 					continue;
 				const got = JS.Member(r, 'value');
@@ -2056,7 +2328,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (cls)
 			return cls.fields.map(f => f.name);
 		const t = T.resolve(ctx.scope, ctx.narrowedTypeOf(operand));
-		return t.type === 'object' && !T.indexSignatureValueType(t)
+		return t.type === 'object' && !indexSignatureValueType(t)
 			? t.members.flatMap(m => m.type === 'property' && typeof m.key === 'string' ? [m.key] : [])
 			: undefined;
 	}
@@ -2189,7 +2461,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (!anon)
 				return undefined;
 			const resolved = T.resolve(ctx.scope, checkerTypeOf(e, ctx.scope));
-			return resolved.type === 'object' && !T.indexSignatureValueType(resolved) ? ensureAnonObjectShape(resolved) : undefined;
+			return resolved.type === 'object' && !indexSignatureValueType(resolved) ? ensureAnonObjectShape(resolved) : undefined;
 		};
 		if (candidates.length === 0)
 			return fallback();
@@ -2245,7 +2517,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// not just an expression flowing straight through. Also reached when every name-matching candidate is ruled out
 		// by its own discriminant (`matches.length === 0` below): the same "nothing real represents this shape"
 		// outcome found one step later, e.g. `{type, body}` matching both `static_block` and `FunctionExpr`/`Arrow`.
-		const fallback = () => T.indexSignatureValueType(t) ? undefined : ensureAnonObjectShape(t);
+		const fallback = () => indexSignatureValueType(t) ? undefined : ensureAnonObjectShape(t);
 		if (candidates.length === 0)
 			return fallback();
 
@@ -2264,7 +2536,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	function indexAccessor(cls: ClassInfo, receiver: Expr, kind: 'get' | 'set', ctx: FunctionContext): string | undefined {
 		if (methodSig(cls, `__${kind}`, ctx))
 			return `__${kind}`;
-		return T.indexSignatureValueType(T.resolve(ctx.typeScope, ctx.narrowedTypeOf(receiver))) && methodSig(cls, kind, ctx) ? kind : undefined;
+		return indexSignatureValueType(T.resolve(ctx.typeScope, ctx.narrowedTypeOf(receiver))) && methodSig(cls, kind, ctx) ? kind : undefined;
 	}
 
 	// A class read by POSITION, as JS's array-likes are: an index getter keyed by a number, and a real `length` (a field or
@@ -2273,7 +2545,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const sig = methodSig(cls, '__get', ctx);
 		const key = sig?.params[sig.params.length - 1];
 		return key !== undefined && W.scalarKind(key) !== undefined
-			&& (cls.fields.some(f => f.name === 'length') || !!methodSig(cls, T.accessorKey('get', 'length'), ctx));
+			&& (cls.fields.some(f => f.name === 'length') || !!methodSig(cls, accessorKey('get', 'length'), ctx));
 	}
 
 	// `cls.name`'s own method signature -- whether inline-asm or a plain declared method.
@@ -2347,8 +2619,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A value STORED as `any` has no statically bound members, whatever its checker type names -- an open shape
 	// (`openShapes`), or a genuinely dynamic value; its members are reached by the runtime dispatchers instead.
 	function physicallyAny(e: Expr, ctx: FunctionContext): boolean {
-		const w = wtypeOf(e, ctx);
-		return typeof w === 'object' && !!w && 'ref' in w && w.ref === 'any';
+		return W.isAny(wtypeOf(e, ctx));
 	}
 
 	function classOfForIndexing(e: Expr, ctx: FunctionContext): ClassInfo | undefined {
@@ -2394,7 +2665,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A tuple is an `Array` over REF storage whatever its elements: its element is the union of every position when that is
 	// ref-kind, else `any` (`[number, number]` would otherwise name `f64` storage). Asked of the element -- no class built to ask.
 	function tupleArrayOwner(tuples: TupleT[]): ClassInfo | undefined {
-		const el = T.combineTypes(tuples.flatMap(tu => tu.elements.map(x => T.tupleElementType(x) ?? T.ANY)));
+		const el = T.combineTypes(tuples.flatMap(tu => T.elementTypes(tu, global)));
 		return ensureClass('Array', [rawElemKind(el, typeOf) === 'ref' ? el : T.ANY]);
 	}
 
@@ -2449,7 +2720,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				return tupleArrayOwner([w]);
 
 			case 'ref': {
-				const mutable = T.READONLY_ALIAS.get(w.name);
+				const mutable = READONLY_ALIAS.get(w.name);
 				if (mutable)
 					return ensureClass(mutable, w.typeArgs);
 				if (w.name === 'Array')
@@ -2464,7 +2735,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 
 			case 'object': {
-				const vt = T.indexSignatureValueType(w);
+				const vt = indexSignatureValueType(w);
 				if (vt)
 					return ensureClass('Map', [TS.RefType('string'), vt]);
 				// Genuinely last resort, same guard as `typeOf`'s own -- only reached once `t.type === 'ref'` had its shot
@@ -2480,10 +2751,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// 'object'; `resolveObjectType` flattens+merges it into the flat object `matchObjectShapeByType` expects.
 			case 'intersection': {
 				// See `arrayPartOf` -- an array carrying extra properties dispatches against `Array` itself.
-				const arr = T.arrayPartOf(w, global);
+				const arr = arrayPartOf(w, global);
 				if (arr)
 					return ensureClass('Array', [arr.element]);
-				const prim = T.primitivePart(w, global);
+				const prim = primitivePart(w, global);
 				if (prim)
 					return ownerFor(prim);
 				const merged = T.resolveObjectType(w, global);
@@ -2685,7 +2956,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// `narrowByDiscriminant(m: Type, depth = 6)` as a `(m: Type) => ...`, ordinary TS since a default makes its JS arity 1.
 			if ((gotSig.params.length <= wantSig.params.length || gotSig.params.slice(wantSig.params.length).every((p, i) => {
 				const d = gotSig.defaults?.[wantSig.params.length + i];
-				return (!!d && T.isReemittableDefault(d)) || (typeof p !== 'string' && !!p.nullable);
+				return (!!d && isReemittableDefault(d)) || (typeof p !== 'string' && !!p.nullable);
 			})) && !!gotSig.hasRest === !!wantSig.hasRest
 				&& gotSig.params.slice(0, wantSig.params.length).every(paramFits)) {
 				const orig = ctx.temp(`$origClosure$${ctx.tempCounter++}`, got);
@@ -3277,13 +3548,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// A non-literal default must be reading an earlier parameter (the only other shape `isReemittableDefault` accepts), so bind
 				// every argument into its own scratch local first, in declaration order: each default sees its earlier siblings' real
 				// values once, matching JS's left-to-right evaluation rather than re-emitting an expression that could have a side effect.
-				if (missing.some(d => !T.isReemittableDefault(d!))) {
+				if (missing.some(d => !isReemittableDefault(d!))) {
 					if (!resolvedParams)
 						throw `internal: '${label}' has a non-literal default with no resolved parameter info`;
 					const rename = new Map<string, string>();
 					ctx.openScope();
 					const locals = resolvedParams.map((p, i) => {
-						const a = i < args.length ? args[i] : T.substituteEarlierParamRefs(missing[i - args.length]!, rename);
+						const a = i < args.length ? args[i] : substituteEarlierParamRefs(missing[i - args.length]!, rename);
 						emitAs(a, ctx, params[i]);
 						const name = `$default$${ctx.tempCounter++}`;
 						const local = ctx.declareLocal(name, params[i]);
@@ -3330,8 +3601,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const params = decl.body && structuralParams(decl.params, args, ctx);
 		if (!params)
 			return undefined;
-		const key = T.structuralKey(name, params);
-		return funcs.get(T.homeKey(homeModule, key)) ?? compileFunc(key, { ...decl, params }, homeModule, name);
+		const key = structuralKey(name, params);
+		return funcs.get(homeKey(homeModule, key)) ?? compileFunc(key, { ...decl, params }, homeModule, name);
 	}
 
 	// `declared` with each parameter whose argument is a different struct retyped as that argument; `undefined` when none is.
@@ -3342,7 +3613,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// A literal is built AS the parameter's type (its context), and an index-signature parameter is a dynamic object read
 			// by key: neither is a struct to specialize for.
 			if (!arg || arg.type === 'spread' || arg.type === 'object' || arg.type === 'array' || !p.typeAnnotation
-				|| T.indexSignatureValueType(T.resolve(global, p.typeAnnotation)))
+				|| indexSignatureValueType(T.resolve(global, p.typeAnnotation)))
 				return p;
 			const want = typeOf(p.typeAnnotation), got = wtypeOf(arg, ctx);
 			if (!want || !got || typeof want === 'string' || typeof got === 'string' || !('ref' in want) || !('ref' in got)
@@ -3360,7 +3631,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// names the module whose `functionDeclByName` bucket an unqualified `name` resolves against (a `NS.foo(...)` call site passes the target).
 	function emitCall(name: string, args: Expr[], ctx: FunctionContext, typeArgs?: Type[], expected?: Expected, homeModule: string = ctx.homeModule): W.Type {
 		let decl;
-		const builtin = builtins.get(name) ?? moduleAsmBuiltins.get(T.homeKey(homeModule, name));
+		const builtin = builtins.get(name) ?? moduleAsmBuiltins.get(homeKey(homeModule, name));
 		if (builtin) {
 			const result = builtin(args.map(a => operandInfo(a, ctx)), ctx);
 			if ('inline' in result)
@@ -3372,14 +3643,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 			decl = result;
 		} else {
-			decl = functionDeclByName.get(T.homeKey(homeModule, name));
+			decl = functionDeclByName.get(homeKey(homeModule, name));
 			// A pre-seeded host import (`LIB_HOST_IMPORTS`) has no `FunctionDecl` to compile a body from -- a missing `decl` is only a real error when `funcs` doesn't already know the name either.
 			if (!decl && !funcs.has(name)) {
 				// `name` may be a plain (non-namespace) `import { foo }` binding local to `homeModule`: resolve it to the declaring
 				// module and retry there -- the same redirect a namespace-qualified call site's own `nsTarget` makes (`case 'call'`'s
 				// member-callee branch), just reached via a bare identifier instead of `NS.foo(...)`.
 				const imported = namedImportsByModule.get(homeModule)?.get(name);
-				if (imported && functionDeclByName.has(T.homeKey(imported.module, imported.name)))
+				if (imported && functionDeclByName.has(homeKey(imported.module, imported.name)))
 					return emitCall(imported.name, args, ctx, typeArgs, expected, imported.module);
 				// `C(...)` where `C` names a CLASS: the primitive wrappers are called without `new`, and their constructors are
 				// the conversion (`String`'s is `return s.toString()`). Structural, not a name list -- a constructor that IGNORES
@@ -3722,7 +3993,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// A `set` accessor -- checked before the ordinary struct-field write, mirroring the read side's getter-probe in `case 'member'`.
 			if (base?.setterNames?.has(target.property)) {
 				const cls = base;
-				const setSig = methodSig(cls, T.accessorKey('set', target.property), ctx);
+				const setSig = methodSig(cls, accessorKey('set', target.property), ctx);
 				if (!setSig)
 					throw `internal: setter '${target.property}' has no signature`;
 				const wtype = setSig.params[0];
@@ -3738,11 +4009,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (!cls.getterNames?.has(target.property))
 							throw `'${target.property}' has no getter -- its old value can't be read for a compound assignment/'++'/'--'`;
 						ctx.emit(I.local.get(obj));
-						emitMethodCall(cls, T.accessorKey('get', target.property), [], ctx);
+						emitMethodCall(cls, accessorKey('get', target.property), [], ctx);
 					}),
 					write: makeWrite(wtype, (val, name) => {
 						ctx.emit(I.local.get(obj));
-						emitMethodCall(cls, T.accessorKey('set', target.property), [Identifier(name)], ctx);
+						emitMethodCall(cls, accessorKey('set', target.property), [Identifier(name)], ctx);
 					}),
 				};
 			}
@@ -3962,14 +4233,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// that has to work across every instantiation. Substituting each type param with its own upper bound (defaulting to `any` when
 		// unconstrained) throughout params/return/body is enough, because a bounded value is already physically valid as its bound.
 		if (e.typeParams?.length) {
-			const map = new Map(e.typeParams.map(p => [p.name, p.constraint ?? T.ANY]));
-			e = {
-				...e,
-				typeParams: undefined,
-				params: e.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p),
-				returnType: e.returnType && T.substituteType(e.returnType, map),
-				body: T.substituteTypeParams(map).body(e.body),
-			};
+			const map = T.constraintMap(e.typeParams, T.ANY);
+			e = { ...T.instantiateSig(e, map), body: substituteTypeParams(map).body(e.body) };
 		}
 
 		const body	= e.body ?? [];
@@ -4128,7 +4393,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (allowSelfCall && e.name)
 				fnCtx.selfCall = info;
 			if (selfType) {
-				fnCtx.emit(I.ref.func(funcIndex), I.local.get(envParam.index), I.i32.const(T.jsLength(e.params)), I.struct.new(structTypeIndex));
+				fnCtx.emit(I.ref.func(funcIndex), I.local.get(envParam.index), I.i32.const(jsLength(e.params)), I.struct.new(structTypeIndex));
 				fnCtx.emit(I.local.set(fnCtx.declareValue(e.name!, closureWtype(sig), selfType).index));
 			}
 			for (const name of capturedNames) {
@@ -4163,7 +4428,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				ctx.rawSlot(name);
 		}
 		ctx.emit(fields ? I.struct.new(envTypeIndex) : I.struct.new_default(envBase));
-		ctx.emit(I.i32.const(T.jsLength(e.params)), I.struct.new(structTypeIndex));
+		ctx.emit(I.i32.const(jsLength(e.params)), I.struct.new(structTypeIndex));
 		return closureWtype(sig);
 	}
 
@@ -4173,7 +4438,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// zero-capture trampoline per function name instead -- same shape `emitClosureLiteral`'s own zero-capture case builds (`env`
 	// ignored, `envBase` reused directly, no distinct env type) -- forwarding to the real, already- or newly-compiled function.
 	function ensureFunctionValueWrapper(name: string, decl: FunctionDecl, homeModule = '.', want?: W.Type, typeArgs?: Type[]): { info: FuncInfo; structTypeIndex: number } {
-		const key = typeArgs ? `${T.homeKey(homeModule, name)}<${typeArgs.map(T.typeKey).join(',')}>` : T.homeKey(homeModule, name);
+		const key = typeArgs ? `${homeKey(homeModule, name)}<${typeArgs.map(T.typeKey).join(',')}>` : homeKey(homeModule, name);
 		const existing = functionValueWrappers.get(key);
 		if (existing) {
 			const { structTypeIndex } = ensureClosureType({ params: existing.params, result: existing.result, hasRest: existing.hasRest });
@@ -4186,7 +4451,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const erased	= decl.typeParams?.length
 			? new Map(decl.typeParams.map((p, i) => [p.name, (typeArgs?.[i] ?? (typeArgs && p.default) ?? p.constraint ?? T.ANY) as Type]))
 			: undefined;
-		const instance	= erased && T.genericKey(name, decl.typeParams!, erased, global);
+		const instance	= erased && genericKey(name, decl.typeParams!, erased, global);
 		const target	= funcs.get(instance || key) ?? (instance
 			? compileFunc(instance, instantiateDecl(decl, erased!, homeModule), homeModule, name)
 			: compileFunc(name, decl, homeModule));
@@ -4227,13 +4492,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (own)
 				return own.type === 'function_decl' && own.body ? { name: e.name, decl: own, module: ctx.homeModule } : undefined;
 			const imported = namedImportsByModule.get(ctx.homeModule)?.get(e.name);
-			const decl = imported && functionDeclByName.get(T.homeKey(imported.module, imported.name));
+			const decl = imported && functionDeclByName.get(homeKey(imported.module, imported.name));
 			return decl?.type === 'function_decl' && decl.body ? { name: imported!.name, decl, module: imported!.module } : undefined;
 		}
 		if (e.type === 'member' && e.object.type === 'identifier' && !ctx.lookup(e.object.name)) {
 			const nsDecl	= ctx.scope.namespace(e.object.name)?.decl(e.property);
 			const module	= nsDecl && stmtHomeModule.get(nsDecl);
-			const decl		= module !== undefined ? functionDeclByName.get(T.homeKey(module, e.property)) : undefined;
+			const decl		= module !== undefined ? functionDeclByName.get(homeKey(module, e.property)) : undefined;
 			return decl?.type === 'function_decl' && decl.body ? { name: e.property, decl, module: module! } : undefined;
 		}
 		return undefined;
@@ -4263,19 +4528,19 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// A bare name bound to a module-level VALUE, not a function (`walker.ts`'s `export const isJsStatement = guard<TS.Stmt>(...)`,
 	// called by name in `printer.ts`): the call calls the value it holds, as a namespace member's does.
 	function isModuleValue(name: string, ctx: FunctionContext): boolean {
-		if (ctx.resolvesName(name) || resolveDecl(ctx.homeModule, name) || funcs.has(T.homeKey(ctx.homeModule, name)))
+		if (ctx.resolvesName(name) || resolveDecl(ctx.homeModule, name) || funcs.has(homeKey(ctx.homeModule, name)))
 			return false;
 		const imported	= namedImportsByModule.get(ctx.homeModule)?.get(name);
 		const decl		= imported ? moduleScopeOf(imported.module)?.decl(imported.name) : moduleScopeOf(ctx.homeModule)?.decl(name);
 		// Not an inline-asm intrinsic (`const loadI32 = __asm<[i32], i32>('i32.load')`): that IS the instruction, not a value.
 		const init		= decl?.type === 'var_decl' ? decl.declarations.find(d => d.name === (imported?.name ?? name))?.init : undefined;
-		return !!init && !(init.type === 'call' && T.isAsm(init));
+		return !!init && !(init.type === 'call' && isAsm(init));
 	}
 
 
 	function emitFunctionValue(fn: { name: string; decl: FunctionDecl; module: string }, want: W.Type | undefined, ctx: FunctionContext, typeArgs?: Type[]): W.Type {
 		const { info, structTypeIndex } = ensureFunctionValueWrapper(fn.name, fn.decl, fn.module, want, typeArgs);
-		ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(types.envBase()), I.i32.const(T.jsLength(fn.decl.params)), I.struct.new(structTypeIndex));
+		ctx.emit(I.ref.func(info.funcIndex), I.struct.new_default(types.envBase()), I.i32.const(jsLength(fn.decl.params)), I.struct.new(structTypeIndex));
 		return closureWtype({ params: info.params, result: info.result, hasRest: info.hasRest, defaults: info.defaults });
 	}
 
@@ -4549,7 +4814,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// An `enum` MEMBER folds to its constant: an enum has no runtime object here (see
 				// `enumMembers`), so this is the only way a read of one resolves at all.
 				if (e.object.type === 'identifier') {
-					const v = enumMembers.get(T.homeKey(ctx.homeModule, `${e.object.name}.${e.property}`));
+					const v = enumMembers.get(homeKey(ctx.homeModule, `${e.object.name}.${e.property}`));
 					if (v !== undefined)
 						return emitExpr(Literal(v), ctx, want);
 				}
@@ -4585,7 +4850,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// are the same access in TS, so a dot read must route to `get` too. Before the getter and field checks below, since the
 				// receiver's TS type exposes no `Map` member at all -- `env.size` must read the `'size'` KEY, not the map's own count.
 				// A real `Map`-typed value is unaffected: its type is a `ref`, for which `indexSignatureValueType` is undefined.
-				if (cls && !isOptionalChainLink(e) && T.indexSignatureValueType(T.resolve(ctx.typeScope, ctx.narrowedTypeOf(e.object))) && methodSig(cls, 'get', ctx)) {
+				if (cls && !isOptionalChainLink(e) && indexSignatureValueType(T.resolve(ctx.typeScope, ctx.narrowedTypeOf(e.object))) && methodSig(cls, 'get', ctx)) {
 					emitAs(e.object, ctx, cls.thisWtype!);
 					return emitMethodCall(cls, 'get', [Literal(e.property)], ctx);
 				}
@@ -4596,7 +4861,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// `isOptionalChainLink`, not a bare `e.optional`: `a?.b.getter` continues `a?.b`'s own chain though *this* access writes
 					// no `?.` of its own (see the checker's own `isOptionalChainLink` comment, shared verbatim). `methodSig` gives the
 					// getter's result type without emitting, which `emitOptionalAccess` needs to type its own result before the call is built.
-					const getter = T.accessorKey('get', e.property);
+					const getter = accessorKey('get', e.property);
 					const sig = isOptionalChainLink(e) ? methodSig(cls, getter, ctx) : undefined;
 					if (sig) {
 						const objWtype = types.nullable(cls.thisWtype!);
@@ -5677,7 +5942,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// A bare `__asm<[Params],Result>('...')(args...)` call anywhere an expression is allowed, not just a class member's
 				// sole body statement (`scanInlineMethods`): `$this`/element-kind resolve from `ctx.owner` live here rather than
 				// pre-computed, so this works in a top-level function body too.
-				if (e.callee.type === 'call' && T.isAsm(e.callee)) {
+				if (e.callee.type === 'call' && isAsm(e.callee)) {
 					if (e.arguments.some(a => a.type === 'spread'))
 						throw 'inline asm does not support spread call arguments';
 					const owner = ctx.owner;
@@ -5873,7 +6138,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// *target module itself* declares, never spuriously fall back to an unrelated same-named `LIB_DECL_MAP` global.
 						const nsDecl	= ctx.scope.namespace(obj.name)?.decl(e.callee.property);
 						const nsTarget	= nsDecl && stmtHomeModule.get(nsDecl);
-						if (nsTarget !== undefined && functionDeclByName.has(T.homeKey(nsTarget, e.callee.property)))
+						if (nsTarget !== undefined && functionDeclByName.has(homeKey(nsTarget, e.callee.property)))
 							return emitCall(e.callee.property, e.arguments, ctx, typeArgs, undefined, nsTarget);
 						const owner = namespaceOwner(obj.name, ctx);
 						if (owner)
@@ -6332,9 +6597,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							emitStmt(JS.Block<Stmt>(
 								JS.VarDecl('const', JS.Var(`#for${n}$it`, JS.Call(JS.Member(s.right, '[Symbol.iterator]'), []))),
 								JS.For(
-									JS.VarDecl('let', JS.Var(`#for${n}$r`, T.nextCall(itId, it, ctx.typeScope))),
+									JS.VarDecl('let', JS.Var(`#for${n}$r`, nextCall(itId, it, ctx.typeScope))),
 									JS.JSUnary('!', JS.Member(rId, 'done')),
-									Assign<Expr, never>(rId, T.nextCall(itId, it, ctx.typeScope)),
+									Assign<Expr, never>(rId, nextCall(itId, it, ctx.typeScope)),
 									JS.Block<Stmt>(JS.VarDecl(s.init.kind, JS.Var(v.name, JS.Member(rId, 'value'), v.typeAnnotation ?? it.yield)), s.body),
 								),
 							), ctx);
@@ -6751,7 +7016,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// (`isReemittableDefault`) and to infer that default's type against a scope that actually has those earlier parameters declared (`libGlobal` can't see them).
 	function resolveParam(p: JS.Param<Type>, earlierNames?: ReadonlySet<string>, scope: Scope = libGlobal, calleeOnly = false): ResolvedParam {
 		let tsType = p.typeAnnotation;
-		const calleeSide = !!p.default && (calleeOnly || !T.isReemittableDefault(p.default, earlierNames));
+		const calleeSide = !!p.default && (calleeOnly || !isReemittableDefault(p.default, earlierNames));
 		if (p.default)
 			tsType ??= checkerTypeOf(p.default, scope);
 		if (!tsType)
@@ -6803,8 +7068,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const restElementTs: Type[] = [];
 		args.forEach((a, i) => {
 			const t = a.type === 'spread' ? T.resolveOwn(checkerTypeOf(a.operand, scope), scope) : i >= params.length ? argTs[i] : undefined;
-			const el = a.type === 'spread' && t ? t.type === 'array' ? t.element
-				: t.type === 'tuple' ? T.combineTypes(t.elements.map(e => T.tupleElementType(e)).filter(x => !!x)) : undefined
+			const el = a.type === 'spread' && t ? T.arrayLikeElement(t) ?? (t.type === 'tuple' ? T.combineTypes(T.elementTypes(t, scope)) : undefined)
 				: t;
 			if (el)
 				restElementTs.push(el);
@@ -6813,14 +7077,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	function ensureFunc(name: string, decl: FunctionDecl, homeModule = '.'): FuncInfo {
-		return funcs.get(T.homeKey(homeModule, name)) ?? compileFunc(name, decl, homeModule)!;
+		return funcs.get(homeKey(homeModule, name)) ?? compileFunc(name, decl, homeModule)!;
 	}
 
 	// Resolves a generic top-level function call to its monomorphized `FuncInfo`, cached under the same composite-key shape `ensureClass` uses for `Box<number>` (`identity<number>`).
 	// Unlike a class reference, a function's type arguments are usually inferred from the arguments (`inferCallTypeArgs`); explicit call-site type args are honored too.
 	// The instance is checked as a declaration of its own: its narrowing depends on the type arguments (`typeof x === 'string'` on `T | string` after `Array.isArray`), which the template can't see.
 	function instantiateDecl(decl: FunctionDecl, map: Map<string, Type>, homeModule: string): FunctionDecl {
-		const inst = { ...T.substituteTypeParams(map).statement(decl)!, typeParams: undefined } as FunctionDecl;
+		const inst = { ...substituteTypeParams(map).statement(decl)!, typeParams: undefined } as FunctionDecl;
 		checkHoisted([inst], new Scope(moduleScopeOf(homeModule) ?? libGlobal));
 		return inst;
 	}
@@ -6833,8 +7097,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const structural	= decl.body && structuralParams(substituted, args, ctx);
 		// Bare (unmangled) composite key -- `compileFunc` applies `homeKey` itself when it caches, so this
 		// must match without a second wrapping here.
-		const key			= structural ? T.structuralKey(T.genericKey(name, typeParams, map, global), structural) : T.genericKey(name, typeParams, map, global);
-		const existing		= funcs.get(T.homeKey(homeModule, key));
+		const key			= structural ? structuralKey(genericKey(name, typeParams, map, global), structural) : genericKey(name, typeParams, map, global);
+		const existing		= funcs.get(homeKey(homeModule, key));
 		if (existing)
 			return existing;
 		// `ensureClassExtension`'s ordering requirement: if this function's body ever calls `Object.defineProperty`, any of this specific instantiation's own
@@ -6891,8 +7155,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				params.push({key: decl.rest.key, wtype: restParamWtype(decl.rest.typeAnnotation)!, tsType: decl.rest.typeAnnotation});
 
 			const {funcIndex, typeIndex} = types.func(toParams2(params), toResults(result));
-			const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: T.defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation};
-			funcs.set(T.homeKey(homeModule, name), info);
+			const info: FuncInfo = {params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation};
+			funcs.set(homeKey(homeModule, name), info);
 			worklist.push(W.withCatchAt(() => {
 				const ctx	= new FunctionContext(name, new Scope(homeScope ?? libGlobal), plainReturn(result, decl.returnType as Type | undefined), undefined, homeModule);
 				ctx.widenedTypes = collectRangeWidenings(decl.body!, ctx.scope);
@@ -7369,8 +7633,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 	}
 
-	function getterWtype(): W.Type { return types.nullable(typeOf(T.getterSig())!); }
-	function setterWtype(): W.Type { return types.nullable(typeOf(T.setterSig())!); }
+	function getterWtype(): W.Type { return types.nullable(typeOf(getterSig())!); }
+	function setterWtype(): W.Type { return types.nullable(typeOf(setterSig())!); }
 
 	// A field write; `obj`/`val` are locals holding the receiver and the value (typed `valWtype`). A key some `defineProperty`
 	// gave a setter (`accessorKeys`) has a `#set:k` companion: while that holds a setter the write CALLS it; otherwise the field.
@@ -7481,7 +7745,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		(subtypesOf.get(info) ?? []).forEach(sub => relayoutOverBase(sub, info));
 	}
 
-	function buildObjectShape(key: string, members: TS.TypeMember[], thisTsType: Type, declName: string, everFinal: boolean, shape = T.shapeKey(members)): ClassInfo {
+	function buildObjectShape(key: string, members: TS.TypeMember[], thisTsType: Type, declName: string, everFinal: boolean, shape = shapeKey(members)): ClassInfo {
 		const info = new ClassInfo(key, types.add({kind: 'struct', fields: []}), { name: declName, body: [] }, thisTsType);
 		info.thisWtype = { ref: key };
 		classes.set(key, info);
@@ -7538,10 +7802,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			entry.typeParams.forEach((p, i) => {
 				const arg = typeArgs?.[i] ?? (p.default ? T.substituteType(p.default, chosen) : p.constraint ?? T.ANY);
 				chosen.set(p.name, arg);
-				args.push(T.ownsLayout(arg, scope) ? arg : p.constraint ?? T.ANY);
+				args.push(ownsLayout(arg, scope) ? arg : p.constraint ?? T.ANY);
 			});
 		}
-		let key		= args.length ? `${name}<${args.map(a => T.layoutArgKey(a, scope)).join(',')}>` : name;
+		let key		= args.length ? `${name}<${args.map(a => layoutArgKey(a, scope)).join(',')}>` : name;
 		// Which MODULE declares the name is part of the key: two modules can declare the same one (`Common.Member` and js-parser's own `Member`),
 		// and a shape keyed by name alone handed the second one the first's struct. The entry module and the lib keep bare keys.
 		const tag = moduleTagOf(name, entry);
@@ -7606,8 +7870,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// gains one would otherwise silently stop being this shape's wasm supertype.
 		const declared	= new Set(resolved.members.flatMap(m => 'key' in m && typeof m.key === 'string' ? [m.key] : []));
 		const inherited	= (base?.fields ?? []).filter(f => !declared.has(f.name))
-			.map(f => TS.TypeProperty(f.name, T.hiddenFieldType(f.name), ['optional']));
-		const info		= buildObjectShape(key, base ? [...resolved.members, ...inherited].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name), T.shapeKey(resolved.members));
+			.map(f => TS.TypeProperty(f.name, hiddenFieldType(f.name), ['optional']));
+		const info		= buildObjectShape(key, base ? [...resolved.members, ...inherited].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name), shapeKey(resolved.members));
 		classes.set(structural, info);
 		shapeEntries.set(info, entry);
 		// Deferred: a shape merged into a twin could not take the supertype afterwards.
@@ -7694,8 +7958,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// The trigger is structural, never a class name.
 		const classDecl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name) ?? declScope?.decl(name);
 		if (name === 'Array' || (classDecl?.type === 'class_decl' && !classDecl.body.some(m => m.type === 'method')))
-			typeArgs = typeArgs?.map(t => T.ownsLayout(t, global) ? t : T.ANY);
-		const key = typeArgs?.length ? `${name}<${typeArgs.map(t => T.layoutArgKey(t, global)).join(',')}>` : name;
+			typeArgs = typeArgs?.map(t => ownsLayout(t, global) ? t : T.ANY);
+		const key = typeArgs?.length ? `${name}<${typeArgs.map(t => layoutArgKey(t, global)).join(',')}>` : name;
 		// A non-generic top-level class is seeded into `classes` *eagerly* (`TStoWasm`'s seeding pass), so `typeIndex === -1` means "reserved but not yet processed"
 		// -- unlike `ensureObjectShape`, which nothing pre-seeds. A generic class is never pre-seeded: only its template lives in `userGenericClassDecls`, and each
 		// instantiation is cached lazily here on first reference.
@@ -7735,7 +7999,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (!decl.typeParams[i].default)
 							throw `class '${name}' needs ${decl.typeParams.length} explicit type argument(s)`;
 				}
-				decl = T.substituteClassTypeParam(decl, new Map(decl.typeParams.map((p, i) => [p.name, i < got ? typeArgs![i] : p.default!])));
+				decl = substituteClassTypeParam(decl, new Map(decl.typeParams.map((p, i) => [p.name, i < got ? typeArgs![i] : p.default!])));
 			}
 			// `thisTsType` must be a real reference to this class -- the ref itself carries the real name and type arguments, not the mangled composite cache key,
 			// or `this.length`/`this[i]` can't resolve (`T.lookupMember` silently falls back to `any`).
@@ -7827,7 +8091,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (m.type === 'field'/* && !hasMod(m, 'static')*/) {
 					if (typeof m.key !== 'string')
 						throw `computed field names in '${name}' are not supported`;
-					if (T.isAsm(m.value))
+					if (isAsm(m.value))
 						inlineDecls.push({ key: m.key, value: m.value! });
 					else if (!m.modifiers?.includes('static'))
 						// Neither an annotation nor an initializer (`opts;`): the type lives only in the constructor's `this.opts = ...`,
@@ -7839,7 +8103,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// the iteration protocol calls it by that name. A truly dynamic one has no name to call it by.
 					const key = T.memberKey(m.key);
 					if (key !== undefined) {
-						const value = T.isAsmMethod(m);
+						const value = isAsmMethod(m);
 						if (value) {
 							inlineDecls.push({ key, value, typeParams: m.typeParams?.map(tp => tp.name) });
 						} else {
@@ -7859,8 +8123,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 				} else if (m.type === 'get' || m.type === 'set') {
 					if (typeof m.key === 'string') {
-						const key = T.accessorKey(m.type, m.key);
-						const value = T.isAsmMethod(m);
+						const key = accessorKey(m.type, m.key);
+						const value = isAsmMethod(m);
 						if (value) {
 							inlineDecls.push({ key, value});
 						} else {
@@ -8051,7 +8315,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const thisWtype		= cls.thisWtype!;
 
 		const {funcIndex, typeIndex} = types.func(toParams2(params), toResults(thisWtype));
-		const info: FuncInfo = { params: params.map(r => r.wtype), result: thisWtype, funcIndex, typeIndex, defaults: T.defaultsWithImplicitUndefined(ctor.params), resolvedParams: params, hasRest: !!ctor.rest?.typeAnnotation };
+		const info: FuncInfo = { params: params.map(r => r.wtype), result: thisWtype, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(ctor.params), resolvedParams: params, hasRest: !!ctor.rest?.typeAnnotation };
 		funcs.set(key, info);
 
 		// A constructor's own `return;` never carries a value (real TS syntax already enforces that at the checker level) -- it just means
@@ -8185,14 +8449,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// (as checker.ts's `instantiate` does) and the body through `substituteTypeParams` (a plain `Statement[]`, which `walk` does accept directly).
 		if (decl.typeParams?.length) {
 			const map = inferCallTypeArgs(decl.typeParams, decl.params, args, typeArgs, callerCtx, undefined, undefined, decl.rest);
-			key		= T.genericKey(key, decl.typeParams, map, global);
+			key		= genericKey(key, decl.typeParams, map, global);
 			decl	= {
 				...decl,
 				typeParams: undefined,
 				params:		decl.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p),
 				rest:		decl.rest?.typeAnnotation ? { ...decl.rest, typeAnnotation: T.substituteType(decl.rest.typeAnnotation, map) } : decl.rest,
 				returnType: decl.returnType ? T.substituteType(decl.returnType, map) : decl.returnType,
-				body:		decl.body ? T.substituteTypeParams(map).statements(decl.body) : decl.body,
+				body:		decl.body ? substituteTypeParams(map).statements(decl.body) : decl.body,
 			};
 		}
 
@@ -8226,7 +8490,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			reassignsThis	? [...toResults(result), toValType(thisWtype)] : toResults(result)
 		);
 
-		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: T.defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
+		const info: FuncInfo = { params: params.map(r => r.wtype), result, funcIndex, typeIndex, defaults: defaultsWithImplicitUndefined(decl.params), resolvedParams: params, hasRest: !!decl.rest?.typeAnnotation, reassignsThis };
 		funcs.set(key, info);
 		worklist.push(W.withCatch(() => {
 			// See `ensureCtor`'s own note -- a method body resolves against its class's declaring module too.
@@ -8393,7 +8657,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						coerceTop(cls.fields[idx].wtype, dctx, W.REF_ANY_NULLABLE);
 					} });
 				} else if (cls.getterNames?.has(name)) {
-					const sig = methodSig(cls, T.accessorKey('get', name), dctx);
+					const sig = methodSig(cls, accessorKey('get', name), dctx);
 					if (sig) {
 						// Boxed by the member's DECLARED type, not the physical width the getter's body produces: `String.length` is `get length(): number` over an `array.len`,
 						// so it yields `u32`; boxed as-is that is an i32 box, while every consumer reads a `number` back by casting to the f64 box, and that cast traps --
@@ -8404,7 +8668,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const want		= canonical === 'void' ? sig.result : canonical;
 						seen.add(heap);
 						candidates.push({ heap, read: () => {
-							emitMethodCall(cls, T.accessorKey('get', name), [], dctx);
+							emitMethodCall(cls, accessorKey('get', name), [], dctx);
 							coerceTop(sig.result, dctx, want);
 							coerceTop(want, dctx, W.REF_ANY_NULLABLE);
 						} });
@@ -8803,7 +9067,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (idx !== undefined)
 				return { cls: m, kind: 'field' as const, fieldIdx: idx, wtype: m.fields[idx].wtype };
 			if (m.getterNames?.has(name)) {
-				const sig = methodSig(m, T.accessorKey('get', name), dctx);
+				const sig = methodSig(m, accessorKey('get', name), dctx);
 				if (sig)
 					return { cls: m, kind: 'getter' as const, wtype: sig.result };
 			}
@@ -8843,7 +9107,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				const _cond = dctx.swapOut();
 				dctx.emit(I.local.get(recv.index), I.ref.cast(f.cls.typeIndex));
 				if (f.kind === 'getter')
-					emitMethodCall(f.cls, T.accessorKey('get', name), [], dctx);
+					emitMethodCall(f.cls, accessorKey('get', name), [], dctx);
 				else
 					emitFieldRead(f.cls, f.fieldIdx, dctx);
 				coerceUnionArm(f.wtype, dctx, result);
@@ -9041,7 +9305,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (T.isAny(v) || (v.type === 'ref' && v.name === 'unknown'))
 			return;
 		// Only a value of a genuinely different LAYOUT widens: two types that share one are already interchangeable.
-		if (T.layoutSketch(s, scope) !== T.layoutSketch(v, scope) && T.isAssignable(v, s, scope))
+		if (layoutSketch(s, scope) !== layoutSketch(v, scope) && T.isAssignable(v, s, scope))
 			openShapes.add(T.typeKey(s));
 	}
 	function collectOpenShapes() {
@@ -9106,7 +9370,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					continue;
 				const isClass	= part.type === 'ref' && (T.isClassRef(part, scope) || LIB_DECL_MAP.get(part.name)?.type === 'class_decl');
 				const shape		= part.type === 'object' ? part : part.type === 'ref' && !isClass ? T.resolveObjectType(part, scope) : undefined;
-				const name		= shape ? T.shapeKey(shape.members) : part.type === 'ref' ? part.name : undefined;
+				const name		= shape ? shapeKey(shape.members) : part.type === 'ref' ? part.name : undefined;
 				if (!name)
 					continue;
 				if (accessor && key !== undefined)
@@ -9434,12 +9698,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				s = s.declaration;
 			stmtHomeModule.set(s, moduleId);
 			if (s.type === 'function_decl' && s.body) {
-				functionDeclByName.set(T.homeKey(moduleId, s.name), s);
+				functionDeclByName.set(homeKey(moduleId, s.name), s);
 			} else if (s.type === 'enum_decl') {
 				// Same numbering rule the checker's own `hoist` uses: an implicit member continues from
 				// the previous explicit one, a string member has no successor to continue from.
 				let next = 0;
-				enumNames.add(T.homeKey(moduleId, s.name));
+				enumNames.add(homeKey(moduleId, s.name));
 				for (const m of s.members) {
 					const init = m.init;
 					const value = !init ? next++
@@ -9447,7 +9711,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						: init.type === 'literal' && typeof init.value === 'string' ? init.value
 						: undefined;
 					if (value !== undefined)
-						enumMembers.set(T.homeKey(moduleId, `${s.name}.${m.name}`), value);
+						enumMembers.set(homeKey(moduleId, `${s.name}.${m.name}`), value);
 				}
 			} else if (moduleId === '.' && s.type === 'class_decl') {
 				if (s.typeParams?.length) {
@@ -9461,9 +9725,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						continue;
 					// Only `exportScope` stamps `Scope.addDecl` for a var_decl, and only for an EXPORTED one, so a
 					// non-exported module-level `const` (js-parser.ts's `import_attributes`) resolved nowhere; keyed per module.
-					topLevelVars.set(T.homeKey(moduleId, d.name), { stmt: s, d });
+					topLevelVars.set(homeKey(moduleId, d.name), { stmt: s, d });
 					if (s.kind === 'const' && (d.init.type === 'arrow' || d.init.type === 'function')) {
-						functionDeclByName.set(T.homeKey(moduleId, d.name), arrowOrFunctionToDecl(d.name, d.init));
+						functionDeclByName.set(homeKey(moduleId, d.name), arrowOrFunctionToDecl(d.name, d.init));
 						if (moduleId === '.')
 							promotedConsts.add(d.name);
 					} else if (moduleId === '.') {
@@ -9652,7 +9916,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// microtask queue drains on export return, never mid-call. "Outermost" is STRUCTURAL, needing no depth
 	// counter: the wrapper is reachable only via the export TABLE, never by an internal or export-to-export call.
 	// Emitted solely where the lib references `microtasks` (never a hardwired policy), after the worklist.
-	if (lazyGlobalSlots.has(T.homeKey(LIB_MODULE, 'microtasks'))) {
+	if (lazyGlobalSlots.has(homeKey(LIB_MODULE, 'microtasks'))) {
 		const hook = (n: string) => {
 			const decl = LIB_DECL_MAP.get(n);
 			return decl?.type === 'function_decl' ? ensureFunc(n, decl) : undefined;

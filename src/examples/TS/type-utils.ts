@@ -4,12 +4,11 @@ import * as JS from './js-parser';
 import { Literal, hasMod } from '../common';
 import { Expr, BindingTarget } from './js-parser';
 import { Type } from './ts-parser';
-import { Walker, walker, walkerB, WalkerB } from './walker';
+import { walker, walkerB, WalkerB } from './walker';
 import { printer } from './printer';
-import * as WT from '../wasm-codegen';
 
 // ===================================================================
-//  Type utilities
+//  Type names and well-known types
 // ===================================================================
 
 const _PRIMITIVES		= ['number', 'string', 'symbol', 'boolean', 'bigint', 'undefined', 'object', 'never', 'void', 'null'] as const;
@@ -29,19 +28,15 @@ class TypeSet<T extends string> {
 }
 
 const KEY_TYPES			= new TypeSet(['number', 'string', 'symbol']);
+export const LITERAL_PRIMITIVES	= new TypeSet(['string', 'number', 'boolean', 'bigint']);
 const SIMPLE_TYPES		= new TypeSet(['number', 'string', 'symbol', 'boolean', 'bigint', 'undefined']);
+const PRIMITIVE_DOMAINS	= SIMPLE_TYPES.or(new TypeSet(['null']));
 const PRIMITIVES		= new TypeSet(_PRIMITIVES);
 const TOP_TYPES			= new TypeSet(['any', 'unknown']);
 const INTRINSIC_TYPES	= PRIMITIVES.or(TOP_TYPES);
 
-// `declare type i32 = number` etc (lib.d.ts) -- wasm-level pseudo-types, deliberately never resolved past
-// their own `ref` form (see that file's own comment: "not used for arithmetic, never resolved by the
-// general checker either"). Every real consumer (backend.ts's `builtinTypes`) matches these *by name*,
-// ahead of `resolve`'s own alias-unwrapping. Exported for `hoistVar`'s own narrow use (see there) -- NOT
-// folded into `resolve`'s general unwrapping or into `ALL_PRIMITIVES` itself: doing either globally breaks
-// every *other* place a resolved `number` was relied on to unify structurally with an `i32` (e.g. a
-// ternary's two branches, one `i32` one `number`, need to combine into one type same as before).
-export const WASM_PSEUDO_TYPES	= new Set<string>(WT.PSEUDO_TYPES);
+export const WASM_PSEUDO_TYPES	= new TypeSet(['i8', 'u8', 'i16', 'u16', 'i32', 'i64', 'f32', 'f64', 'u32', 'u64']);
+
 const OPAQUE		= new Set(['keyof', 'indexed_access', 'conditional', 'infer', 'mapped', 'this', 'predicate']);
 
 // The subset of `OPAQUE` that's a genuinely unevaluated computation, as opposed to `this`/`predicate` (opaque by design, not a gap).
@@ -50,10 +45,6 @@ const OPAQUE_GAP	= new Set(['keyof', 'indexed_access', 'conditional', 'infer', '
 
 // A Map, not an object: it is indexed by names from source, and `constructor`/`toString` must not find `Object.prototype`'s.
 const BOXED_PRIMITIVE = new Map([['string', 'String'], ['number', 'Number'], ['boolean', 'Boolean'], ['bigint', 'BigInt'], ['symbol', 'Symbol']]);
-
-export const tocode = printer({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
-export function typeKey(t: Type) { return tocode.type(t); }
-export function exprKey(e: Expr) { return tocode.expression(e); }
 
 export const NUMBER		= TS.RefType('number');
 export const STRING		= TS.RefType('string');
@@ -67,6 +58,71 @@ export const NEVER		= TS.RefType('never');
 export const UNKNOWN	= TS.RefType('unknown');
 export const NUMERIC	= TS.UnionType([NUMBER, BIGINT]);
 
+// ===================================================================
+//  Keys: printed types, expression paths, member and binding names
+// ===================================================================
+
+export const tocode = printer({newline:'', indent:'', spaceAfterColon: false, spaceAfterComma: false, spaceAroundOps: false});
+export function typeKey(t: Type) { return tocode.type(t); }
+export function exprKey(e: Expr) { return tocode.expression(e); }
+
+// A stable key for narrowing simple property chains (`a.b.c`), sharing the Scope narrowings map with plain identifiers (dotted keys can never collide with real bindings)
+export function pathKey(e: Expr): string | undefined {
+	switch (e.type) {
+		case 'identifier':	return e.name;
+		case 'this':		return 'this';
+		case 'member': {
+			const k = pathKey(e.object);
+			return k && k + '.' + e.property;
+		}
+		// A LITERAL index names one fixed element, so `a[0].k` is as stable a path as `a.b.k` and narrows
+		// the same way (real TS narrows element access on a literal index too). A COMPUTED one must not:
+		// the index expression can evaluate differently between the guard and the read.
+		case 'index': {
+			const k = pathKey(e.object);
+			if (k === undefined || e.index.type !== 'literal')
+				return undefined;
+			const v = e.index.value;
+			return typeof v === 'number' ? `${k}[${v}]` : typeof v === 'string' ? `${k}["${v}"]` : undefined;
+		}
+		default:			return undefined;
+	}
+}
+
+// A member key's static name: a string key as written, a literal computed key as its value, and one naming an entity
+// (`[Symbol.iterator]`) by that path, spelled as TS prints it. Any other computed key has no static name.
+export function memberKey(key: JS.Key<Type>): string | undefined {
+	if (typeof key === 'string')
+		return key;
+	const e = key.computed;
+	if (e.type === 'literal' && (typeof e.value === 'string' || typeof e.value === 'number'))
+		return String(e.value);
+	const path = e.type === 'identifier' || e.type === 'member' ? pathKey(e) : undefined;
+	return path && `[${path}]`;
+}
+
+export function bindingNames(t: BindingTarget): string[] {
+	return typeof t === 'string' ? [t]
+		: t.type === 'object_pattern' ? [...t.properties.flatMap(p => bindingNames(p.value)), ...(t.rest ? [t.rest] : [])]
+		: [...t.elements.flatMap(e => e ? bindingNames(e.target) : []), ...(t.rest ? bindingNames(t.rest) : [])];
+}
+
+export function isNullLiteral(e: Expr): boolean {
+	return nullLiteralKind(e) !== undefined;
+}
+
+// Which of the two nullish literals `e` is, if either. They share one physical form here (`ref.null`),
+// so only a STRICT comparison ever has to tell them apart, and only statically -- see `case '==='`.
+export function nullLiteralKind(e: Expr): 'null' | 'undefined' | undefined {
+	return	e.type === 'literal' && e.value === null			? 'null'
+		:	e.type === 'identifier' && e.name === 'undefined'	? 'undefined'
+		:	undefined;
+}
+
+// ===================================================================
+//  Shallow tests (no resolution)
+// ===================================================================
+
 export function isRef<T extends string>(t: Type, name: T): t is TS.RefType<T>							{ return t.type === 'ref' && t.name === name; }
 export function isRefOf<T extends string>(t: Type, set: { has: (n: T)=> boolean }): t is TS.RefType<T>	{ return t.type === 'ref' && set.has(t.name as any); }
 
@@ -75,6 +131,14 @@ export function isKeyable(t: Type)	{ return t.type === 'ref' && KEY_TYPES.has(t.
 export function isAny(t: Type)		{ return t.type === 'ref' && TOP_TYPES.has(t.name); }
 export function isBoolean(t: Type)	{ return isRef(t, 'boolean'); }
 export function isString(t: Type)	{ return isRef(t, 'string'); }
+
+function isNullOrUndefined(t: Type): boolean {
+	return t.type === 'literal' ? t.value === null : t.type === 'ref' && (t.name === 'null' || t.name === 'undefined');
+}
+
+// ===================================================================
+//  Literals and widening
+// ===================================================================
 
 interface TypeOfMap {
 	string: string;	number: number;	boolean: boolean;
@@ -128,54 +192,61 @@ export function literalString(t: Type|Expr): string | undefined {
 	return text;
 }
 
-// What `typeof` would report for a value of this type, or undefined when it can't be known statically --
-// which is also the only way to answer `'object'`/`'function'`, neither of which has a single physical
-// form for codegen to test for at runtime.
-// `scope`: resolve first, and resolve each union member. Omit it to answer from the type exactly as
-// given, which is what the checker's own narrowing wants (it applies this per already-split member).
-export function typeofName(t: Type, scope?: Scope): string | undefined {
-	const r = scope ? resolve(scope, t) : t;
-	switch (r.type) {
-		case 'literal':				return Array.isArray(r.value) ? 'string' : typeof r.value;
-		case 'range':				return r.base;
-		case 'function':
-		case 'constructor':			return 'function';
-		case 'array':
-		case 'tuple':
-		case 'object':				return 'object';
-		case 'intersection': {
-			// A part that makes the value a PRIMITIVE wins over the object-ish ones -- a branded
-			// `string & {brand}` is a string, and `typeof` reports it as one.
-			const parts = r.types.map(p => typeofName(p, scope));
-			return parts.find(n => n && SIMPLE_TYPES.has(n))
-				?? (parts.includes('function') ? 'function' : 'object');
-		}
-		case 'union': {
-			// Every inhabitant must agree. `unionMembers` resolves and flattens, and drops `never` -- see
-			// its own comment. Only with a `scope`; without one this stays a shallow, as-given answer.
-			const members	= scope ? unionMembers(r, scope) : r.types.filter(m => !isRef(m, 'never'));
-			const names		= new Set(members.map(m => typeofName(m, scope)));
-			return names.size === 1 && !names.has(undefined) ? [...names][0] : undefined;
-		}
-		case 'ref': {
-			if (SIMPLE_TYPES.has(r.name))
-				return r.name;
-			if (r.name === 'void' || r.name === 'null')
-				return r.name === 'void' ? 'undefined' : 'object';
-			// Whatever `resolve` left as a ref names a real class -- `typeof` is a question about the
-			// STRUCTURE, so ask for it. Guarded on actually getting one back, or a ref with no entry to
-			// expand would recurse on itself.
-			const m = scope && resolveMembers(r, scope);
-			return m && m.type !== 'ref' ? typeofName(m, scope) : undefined;
-		}
-		default:					return undefined;
-	}
+// The possible values of a pure literal or union of literals (a real discriminant, e.g. `type: 'method'|'get'|'set'`);
+// `undefined` for anything wider, meaning "no signal".
+export function literalValues(t: Type): unknown[] | undefined {
+	return t.type === 'literal' ? [t.value]
+		: t.type === 'union' && t.types.every((m): m is Literal<string | number | boolean | null | JS.TemplatePart<Type>[]> => m.type === 'literal') ? t.types.map(m => m.value)
+		: undefined;
 }
 
+// Deep: also widens literal element/property types nested inside array/object structure (matching real TS, which widens a freshly-
+// inferred array/object literal's members too, not just a bare literal expression) -- not just this type's own top-level shape.
+// `frozen` leaves (see `common.ts`'s `Literal.frozen`) are left exactly as they are, at any nesting depth -- an `as const`
+// value's own literal identity survives being embedded in a container that's itself later widened (`[1, x as const]`).
+// `ignoreFrozen`: an `as const` literal's `frozen` flag exists so the *checker* keeps its precise literal
+// type (real TS semantics) -- callers computing a *physical* runtime representation instead (e.g.
+// backend.ts picking a value's wasm storage kind) have no such use for it: a frozen and non-frozen `'foo'`
+// still need the exact same physical representation, so those callers pass `true` to widen through it.
+// `shallow`: only the value's own literal (or union of them) widens, not literals nested in an array or object it holds.
+// Memoized per type object (and flags): a DAG rewritten once per node, not once per path.
+const widenCache = new Map<number, WeakMap<Type, Type>>();
+export function widenLiterals(t: Type, keepBoolean = false, ignoreFrozen = false, shallow = false): Type {
+	const flags = (keepBoolean ? 1 : 0) | (ignoreFrozen ? 2 : 0) | (shallow ? 4 : 0);
+	let cache = widenCache.get(flags);
+	if (!cache)
+		widenCache.set(flags, cache = new WeakMap());
+	let r = cache.get(t);
+	if (!r)
+		cache.set(t, r = widen(t, keepBoolean, ignoreFrozen, shallow));
+	return r;
+}
+function widen(t: Type, keepBoolean: boolean, ignoreFrozen: boolean, shallow: boolean): Type {
+	return	(t.type === 'literal' || t.type === 'range') && t.frozen && !ignoreFrozen ? t
+		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean')
+			&& (t.fresh || ignoreFrozen || typeof t.value === 'number' || typeof t.value === 'bigint') ? TS.RefType(literalType(t))
+		:	t.type === 'range' ? TS.RefType(t.base)
+		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean, ignoreFrozen, shallow)))
+		:	shallow ? t
+		:	t.type === 'array' ? TS.ArrayType(widenLiterals(t.element, keepBoolean, ignoreFrozen), t.readonly)
+		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, widenLiterals(m.typeAnnotation, keepBoolean, ignoreFrozen), m.modifiers) : m))
+		:	t;
+}
+
+// The inverse of `widenLiterals`'s own recursion shape: marks every literal/range leaf within `t` as `frozen`, matching
+// an `as const` assertion's real TS semantics -- used once, where `typeOf`'s `'as'` case computes the asserted value.
+export function freeze(t: Type): Type {
+	return	t.type === 'literal' || t.type === 'range' ? { ...t, frozen: true }
+		:	t.type === 'union' ? TS.UnionType(t.types.map(freeze))
+		:	t.type === 'array' ? TS.ArrayType(freeze(t.element), t.readonly)
+		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, freeze(m.typeAnnotation), m.modifiers) : m))
+		:	t;
+}
 
 // ===================================================================
-//  numeric/bigint range narrowing
+//  Numeric ranges
 // ===================================================================
+
 // A canonical, base-uniform view of "how much do we know about a number/bigint value" -- consumed/produced by
 // `narrow()`'s relational/equality handling in checker.ts. `min`/`max` undefined means unbounded on that side;
 // `integer` is always true for `bigint` (every bigint value already is one).
@@ -248,33 +319,14 @@ function divValue(a: number | bigint, b: number | bigint): number | bigint { ret
 function minOfValues(vs: (number | bigint)[]): number | bigint { return vs.reduce((a, b) => a < b ? a : b); }
 function maxOfValues(vs: (number | bigint)[]): number | bigint { return vs.reduce((a, b) => a > b ? a : b); }
 
-// Interval arithmetic for `+`/`-`/unary `-`/`*`/`/` over possibly-unbounded ranges -- consumed by `typeOf`'s
-// `'binary'`/`'unary'` cases so e.g. `x + 1` for a bounded `x` stays bounded, instead of always collapsing to
-// the base `number`/`bigint`. `undefined` on either side of a range means "unbounded there", so any operation
-// touching it produces an unbounded result on that side too (a conservative, always-safe over-approximation).
+// The range of `Math.max`/`Math.min` over values in each of `a`: each bound picked across all of them, unbounded if any is.
+function rangeExtreme(a: NumRange[], pick: (vs: (number | bigint)[]) => number | bigint): NumRange | undefined {
+	const bound = (vs: (number | bigint | undefined)[]) => vs.every(v => v !== undefined) ? pick(vs) : undefined;
+	return a.length ? { base: a[0].base, min: bound(a.map(r => r.min)), max: bound(a.map(r => r.max)), integer: a.every(r => r.integer) } : undefined;
+}
+export function rangeMax(a: NumRange[]) { return rangeExtreme(a, maxOfValues); }
+export function rangeMin(a: NumRange[]) { return rangeExtreme(a, minOfValues); }
 
-export function rangeMax(a: NumRange[]): NumRange | undefined {
-	if (a.length > 0) {
-		const mins = a.map(i => i.min);
-		const maxs = a.map(i => i.max);
-		return { base: a[0].base,
-			min: mins.every(v => v !== undefined) ? maxOfValues(mins) : undefined,
-			max: maxs.every(v => v !== undefined) ? maxOfValues(maxs) : undefined,
-			integer: a.every(r => r.integer)
-		};
-	}
-}
-export function rangeMin(a: NumRange[]): NumRange | undefined {
-	if (a.length > 0) {
-		const mins = a.map(i => i.min);
-		const maxs = a.map(i => i.max);
-		return { base: a[0].base,
-			min: mins.every(v => v !== undefined) ? minOfValues(mins) : undefined,
-			max: maxs.every(v => v !== undefined) ? minOfValues(maxs) : undefined,
-			integer: a.every(r => r.integer)
-		};
-	}
-}
 // Whether `r`'s span provably includes the value `0` -- used to decide truthy/falsy/nullish-adjacent questions for
 // a narrowed numeric type the same way a plain `number`/`bigint` ref is decided (both are always presumed to include 0).
 function rangeIncludesZero(r: { min?: number | bigint; max?: number | bigint }): boolean {
@@ -297,8 +349,14 @@ export function rangeClamp(a: NumRange, bound: number|bigint, isUpper: boolean, 
 	}
 }
 
+// Interval arithmetic over possibly-unbounded ranges, so `x + 1` for a bounded `x` stays bounded. An unbounded side
+// of an operand leaves the result unbounded on that side too: a conservative over-approximation.
 export function rangeUnOp(op: JS.unaryOps, a: NumRange): NumRange | undefined {
-	const base = a.base;
+	const base	= a.base;
+	const shift	= (d: number) => ({ base, integer: a.integer,
+		min: a.min !== undefined ? addValue(a.min, d) : undefined,
+		max: a.max !== undefined ? addValue(a.max, d) : undefined
+	});
 	switch (op) {
 		case '+':	return a;
 		case '-':	return {
@@ -307,16 +365,8 @@ export function rangeUnOp(op: JS.unaryOps, a: NumRange): NumRange | undefined {
 			max: a.min !== undefined ? negValue(a.min) : undefined
 		};
 		case '~':	return { base, integer: a.integer};
-		case '++':	return {
-			base, integer: a.integer,
-			min: a.min !== undefined ? addValue(a.min, 1) : undefined,
-			max: a.max !== undefined ? addValue(a.max, 1) : undefined
-		};
-		case '--':	return {
-			base, integer: a.integer,
-			min: a.min !== undefined ? subValue(a.min, 1) : undefined,
-			max: a.max !== undefined ? subValue(a.max, 1) : undefined
-		};
+		case '++':	return shift(1);
+		case '--':	return shift(-1);
 	}
 }
 
@@ -364,65 +414,41 @@ export function rangeBinOp(op: JS.binaryOps, a: NumRange, b: NumRange): NumRange
 }
 
 // ===================================================================
-//  
+//  Building unions and intersections
 // ===================================================================
 
-// A spread (`...T`) contributes no single element value; an optional element (`T?`)'s contributed value type is just `T`, consistent with this
-// file not modeling "possibly absent" via `| undefined` for optional members elsewhere either.
-// `te` is undefined when a literal has more elements than the tuple type it's contextually checked
-// against (e.g. `[1, 2, 3]` against an expected `[number, number]`) -- those extra positions just get
-// no contextual type, same as an untyped array literal's elements would.
-export function tupleElementType(te: TS.TupleElement | undefined): Type | undefined {
-	return !te || te.type === 'spread' ? undefined : te.type === 'optional' || te.type === 'labeled' ? te.element : te;
+// `types` with every nested union (or intersection) spread into its members, as written -- nothing is resolved.
+export function flatParts(types: readonly Type[], kind: 'union' | 'intersection'): Type[] {
+	return types.flatMap(t => (t.type === 'union' || t.type === 'intersection') && t.type === kind ? flatParts(t.types, kind) : [t]);
 }
 
-// A READ of position `i` (TS's getIndexedAccessType): an optional element may be absent, so it reads `T | undefined`; a position a
-// rest spread covers reads the spread's element or any fixed one after it; no type at all past a fixed-length tuple's end.
-export function tupleReadType(t: Extract<Type, { type: 'tuple' }>, i: number, scope: Scope): Type | undefined {
-	const spreadAt = t.elements.findIndex(e => e.type === 'spread');
-	if (spreadAt >= 0 && i >= spreadAt) {
-		const rest = resolveOwn((t.elements[spreadAt] as { argument: Type }).argument, scope);
-		return combineTypes([rest.type === 'array' ? rest.element : rest.type === 'ref' && rest.name === 'Array' && rest.typeArgs?.length === 1 ? rest.typeArgs[0] : ANY,
-			...t.elements.slice(spreadAt + 1).map(e => tupleElementType(e) ?? ANY)]);
-	}
-	const el = t.elements[i];
-	if (!el)
-		return undefined;
-	const v = tupleElementType(el)!;
-	return el.type === 'optional' || (el.type === 'labeled' && el.optional) ? combineTypes([v, UNDEFINED]) : v;
-}
-
-export function bindingNames(t: BindingTarget): string[] {
-	return typeof t === 'string' ? [t]
-		: t.type === 'object_pattern' ? [...t.properties.flatMap(p => bindingNames(p.value)), ...(t.rest ? [t.rest] : [])]
-		: [...t.elements.flatMap(e => e ? bindingNames(e.target) : []), ...(t.rest ? bindingNames(t.rest) : [])];
+// The first of `types` with each `key`.
+function dedupe(types: Type[], key: (t: Type) => unknown): Type[] {
+	const seen = new Set<unknown>();
+	return types.filter(t => {
+		const k = key(t);
+		return !seen.has(k) && !!seen.add(k);
+	});
 }
 
 // De-dupes structurally-identical types and folds what's left into a `union`
 export function combineTypes(types: Type[]): Type {
 	const seen = new Map<string, number>();
 	const unique: Type[] = [];
-	const add = (t: Type) => {
-		if (t.type === 'union') {
-			t.types.forEach(add);
-		} else if (!isRef(t, 'never')) {
-			// `never` is a union's identity element -- nothing inhabits it, so it can never be the runtime
-			// value. Left in, it makes the whole union unanswerable to every consumer that asks "one owner
-			// or many" (`ownerFor` returned nothing at all for a `Stream | never` a branch merge produced).
-			// Same rule `unionMembers` already applies when it flattens.
-			const key = typeKey(t);
-			const at = seen.get(key);
-			if (at === undefined) {
-				seen.set(key, unique.length);
-				unique.push(t);
-			} else if (t.type === 'literal' && t.fresh) {
-				unique[at] = t;	// a fresh twin is kept: it widens, as TS keeps the fresh one
-			}
+	// `never` is a union's identity element: nothing inhabits it, and left in it makes the union unanswerable to every
+	// consumer asking "one owner or many". Same rule `unionMembers` applies when it flattens.
+	for (const t of flatParts(types, 'union').filter(t => !isRef(t, 'never'))) {
+		const key = typeKey(t);
+		const at = seen.get(key);
+		if (at === undefined) {
+			seen.set(key, unique.length);
+			unique.push(t);
+		} else if (t.type === 'literal' && t.fresh) {
+			unique[at] = t;	// a fresh twin is kept: it widens, as TS keeps the fresh one
 		}
-	};
-	types.forEach(add);
+	}
 	// TS's removeRedundantLiteralTypes: a literal (or one of this checker's ranges) whose primitive is a member adds nothing.
-	const primitives = new Set(unique.flatMap(t => t.type === 'ref' && !t.typeArgs && ['string', 'number', 'boolean', 'bigint'].includes(t.name) ? [t.name] : []));
+	const primitives = new Set<string>(unique.flatMap(t => t.type === 'ref' && !t.typeArgs && LITERAL_PRIMITIVES.has(t.name) ? [t.name] : []));
 	if (primitives.size) {
 		const redundant = (t: Type) => t.type === 'literal' ? t.value !== null && primitives.has(literalType(t)) : t.type === 'range' && primitives.has(t.base);
 		for (let i = unique.length; i--; )
@@ -439,7 +465,7 @@ export function combineTypes(types: Type[]): Type {
 // `any` absorbing either, `unknown` a union and leaving an intersection -- without `combineTypes`'s structural dedupe, whose
 // `typeKey` per member costs as much as the types are large.
 function reduceInstantiated(t: TS.UnionType | TS.IntersectionType): Type {
-	const flat = t.types.flatMap(m => m.type === t.type ? (m as TS.UnionType | TS.IntersectionType).types : [m]);
+	const flat = flatParts(t.types, t.type);
 	if (flat.some(m => isRef(m, 'any')))
 		return ANY;
 	// Nothing inhabits `never`, so an intersection holding one IS `never` -- as TS reduces it at construction, which is what makes
@@ -461,25 +487,9 @@ export function optional(type:Type, optional?: boolean) {
 export function intersectTypes(types: Type[]): Type {
 	if (types.length === 1)
 		return types[0];
-
-	const seen = new Set<string>();
-	const unique: Type[] = [];
-	const add = (t: Type) => {
-		if (t.type === 'intersection') {
-			t.types.forEach(add);
-		} else {
-			const key = typeKey(t);
-			if (!seen.has(key)) {
-				seen.add(key);
-				unique.push(t);
-			}
-		}
-	};
-	types.forEach(add);
+	const unique = dedupe(flatParts(types, 'intersection'), typeKey);
 	// TS's intersection reduction: `any` absorbs every member.
-	if (unique.some(t => isRef(t, 'any')))
-		return ANY;
-	return unique.length === 1 ? unique[0] : TS.IntersectionType(unique);
+	return unique.some(t => isRef(t, 'any')) ? ANY : unique.length === 1 ? unique[0] : TS.IntersectionType(unique);
 }
 
 // Declaration merging's own intersect: parts flattened and deduped by IDENTITY only. `intersectTypes`' structural
@@ -487,15 +497,480 @@ export function intersectTypes(types: Type[]): Type {
 // rest of the block is bound, so `charCodeAt = __asm<[i32], i32>(...)` memoized `any`. Real TS merges declarations
 // without resolving their members at all.
 export function joinTypes(types: Type[]): Type {
-	const parts: Type[] = [];
-	const add = (t: Type) => {
-		if (t.type === 'intersection')
-			t.types.forEach(add);
-		else if (!parts.includes(t))
-			parts.push(t);
-	};
-	types.forEach(add);
+	const parts = dedupe(flatParts(types, 'intersection'), t => t);
 	return parts.length === 1 ? parts[0] : TS.IntersectionType(parts);
+}
+
+// Merges the `object` parts of an intersection into one flat `object`, keeping any non-object parts alongside it rather than folding them in.
+// A key declared by more than one object part becomes the intersection of its own per-part types
+// `optional` survives only if every part declaring the key marks it optional, `readonly` if any part does
+export function mergeIntersection(t: Type): Type {
+	if (t.type !== 'intersection')
+		return t;
+
+	const nonObject:	Type[] = [];
+	const otherMembers: TS.TypeMember[] = [];
+	const byKey = new Map<string, { types: Type[]; optional: boolean; readonly: boolean }>();
+
+	for (const part of flatParts([t], 'intersection')) {
+		if (part.type === 'object') {
+			for (const m of part.members) {
+				if (m.type === 'property' && typeof m.key === 'string') {
+					const entry = byKey.get(m.key) ?? { types: [], optional: true, readonly: false };
+					entry.types.push(m.typeAnnotation);
+					entry.optional &&= hasMod(m, 'optional');
+					entry.readonly ||= hasMod(m, 'readonly');
+					byKey.set(m.key, entry);
+				} else {
+					otherMembers.push(m);
+				}
+			}
+		} else {
+			nonObject.push(part);
+		}
+	}
+
+	return intersectTypes([TS.ObjectType([
+		...[...byKey].map(([key, { types, optional, readonly }]): TS.TypeMember => {
+			const modifiers = [...(optional ? ['optional'] : []), ...(readonly ? ['readonly'] : [])];
+			return TS.TypeProperty(key, intersectTypes(types), modifiers.length ? modifiers : undefined);
+		}),
+		...otherMembers,
+	]), ...nonObject]);
+}
+
+// ===================================================================
+//  Declaring scopes of types
+// ===================================================================
+
+export function withScope<T extends {declScope?: any}>(t: T, scope: Scope): T {
+	t.declScope = scope;
+	return t;
+}
+export function declScopeOf<T extends {declScope?: any}>(t: T, scope: Scope) {
+	return (t.declScope as Scope) ?? scope;
+}
+export function ownScope(t: Type, scope: Scope) {
+	return t.type === 'ref' ? declScopeOf(t, scope) : scope;
+}
+
+// Tags every `ref`/signature reachable from `t` with `scope`, mutating in place (`mapObjectVoid`, freshly-built nodes only).
+// Skips one that already carries a scope, so re-stamping an already-tagged structure is a no-op. Delegates traversal to `walk`.
+// `exclude`: names that must NOT be stamped even though otherwise eligible -- see `stampSig`'s own use, where a nested
+// function's own type-parameter names are bound (not free) and must stay resolvable in whatever scope later actually
+// registers them, not permanently baked to the hoisting pass's outer scope.
+export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<string>): T {
+	walkerB(undefined, undefined,
+		searchOnce((x: Type, process: (x: Type) => boolean) => {
+			// Primitives resolve the same everywhere -- stamping them would only add dead weight and dedup-key noise for no gain.
+			if (x.type === 'ref') {
+				if (!x.declScope && !INTRINSIC_TYPES.has(x.name) && !exclude?.has(x.name))
+					x.declScope = scope;
+			} else if (x.type === 'typeof') {
+				// A `typeof X` query names a VALUE, so it needs its declaring scope for exactly the reason a
+				// `ref` does -- `type Options = Partial<typeof DefaultOptions>` exported from one module
+				// resolves its members in the importer's scope, where `DefaultOptions` (a plain
+				// non-exported const) is not a name at all.
+				x.declScope ??= scope;
+			} else if (x.type === 'function' || x.type === 'constructor') {
+				x.declScope ??= scope;
+			}
+			return process(x);
+		}),
+		searchOnce((m: TS.TypeMember | TS.ClassMember, process: (x: TS.TypeMember | TS.ClassMember) => boolean) => {
+			if (m.type === 'method' || m.type === 'call' || m.type === 'construct')
+				m.declScope ??= scope;
+			return process(m);
+		})
+	).type(t);
+	return t;
+}
+
+// Stamps a `CallSig`-shaped object's own params/rest/return type -- for callers stamping a freshly-built signature directly
+// (a bare `TS.CallSig`, e.g. a hoisted free function's, isn't itself a `Type` node, so `stampScope`/`walk` alone can't take it).
+export function stampSig<T extends TS.CallSig>(sig: T, scope: Scope): T {
+	// Also tags the signature itself (see `withScope`) -- a bare interface/type-literal method has no other declScope
+	// source (unlike a hoisted free function/class method, which already gets one before `stampSig` ever sees it).
+	sig.declScope ??= scope;
+	// This signature's own type parameters are excluded from stamping below -- they're bound within the signature, not
+	// free names resolved against the hoisting pass's outer scope. A hoisted *nested* function (one whose own body-check
+	// scope, which registers these names via `addTypeParam`, doesn't exist yet at hoist time) would otherwise have every
+	// reference to its own `T` permanently stamped with the *enclosing* function's scope -- `declScope`'s "first stamp
+	// wins, skip if already tagged" semantics then shadow the nested function's own registration forever, so its own `T`
+	// silently resolves as the *outer* function's `T` throughout its whole body. A real, previously-latent scope-leakage
+	// bug, invisible before type parameters were ever registered at all (either name was equally unresolvable, so which
+	// scope you asked never mattered) -- exposed once `checkFunctionBody` started registering them for real.
+	const ownTypeParams = sig.typeParams?.length ? new Set(sig.typeParams.map(p => p.name)) : undefined;
+	sig.params.forEach(p => p.typeAnnotation && stampScope(p.typeAnnotation as Type, scope, ownTypeParams));
+	if (sig.rest?.typeAnnotation)
+		stampScope(sig.rest.typeAnnotation as Type, scope, ownTypeParams);
+	if (sig.returnType)
+		stampScope(sig.returnType, scope, ownTypeParams);
+	// A type param's own `constraint`/`default` need it too -- otherwise `inferTypeArgs`'s `isLiteralOnly(tp.constraint, ...)`
+	// check (does this constraint restrict to a union of literals?) can't resolve a constraint declared in this module but
+	// invisible from the caller's own scope, and silently widens a literal argument that should have stayed narrow.
+	// Still excludes `ownTypeParams`: an F-bounded constraint (`T extends hasop<'x', T>`) refers to its own bound `T`.
+	sig.typeParams?.forEach(p => {
+		if (p.constraint)
+			stampScope(p.constraint as Type, scope, ownTypeParams);
+		if (p.default)
+			stampScope(p.default as Type, scope, ownTypeParams);
+	});
+	return sig;
+}
+
+// ===================================================================
+//  Substitution and type-parameter hygiene
+// ===================================================================
+
+// A type is a DAG -- one subtree reached through many parents -- so a walk over it visits each node once, or its cost
+// is the number of paths, exponential in how deeply generic instantiations nest. For a search, a node seen before is no hit.
+function searchOnce<X extends object, P, R>(on: (x: X, process: P, recurse: R) => boolean) {
+	const seen = new Set<X>();
+	return (x: X, process: P, recurse: R) => {
+		if (seen.has(x))
+			return false;
+		seen.add(x);
+		return on(x, process, recurse);
+	};
+}
+// For a rewrite, a node seen before maps to what it mapped to, which also keeps the shared subtree shared in the result.
+function rewriteOnce<X extends object, P, R>(on: (x: X, process: P, recurse: R) => X | undefined) {
+	const done = new Map<X, X | undefined>();
+	return (x: X, process: P, recurse: R) => {
+		if (!done.has(x))
+			done.set(x, on(x, process, recurse));
+		return done.get(x);
+	};
+}
+
+// A synthetic type-parameter name: the apostrophe can never appear in a real identifier, so it collides with nothing in scope.
+let freshTypeParamId = 0;
+function freshTypeParamName(base: string) { return `${base}'${freshTypeParamId++}`; }
+
+// `sig` with every type in it -- parameters, rest, return, its own type parameters' bounds -- mapped through `f`.
+function mapSigTypes<S extends TS.CallSig>(sig: S, f: (t: Type) => Type): S {
+	return {
+		...sig,
+		params:		sig.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: f(p.typeAnnotation) } : p),
+		rest:		sig.rest?.typeAnnotation ? { ...sig.rest, typeAnnotation: f(sig.rest.typeAnnotation) } : sig.rest,
+		returnType:	sig.returnType && f(sig.returnType),
+		typeParams:	sig.typeParams?.map(p => ({ ...p, constraint: p.constraint && f(p.constraint), default: p.default && f(p.default) })),
+	};
+}
+
+// A nested signature's own type parameter (`Array<T>.map<U>`'s `U`) would capture a same-named one in a value substituted into it
+// (`T := U[]` from a caller's own `U`). Alpha-renames each such bound parameter first, so the outer substitution is capture-free.
+function avoidCapture<S extends TS.CallSig>(sig: S, map: Map<string, Type>): S {
+	if (!sig.typeParams?.length)
+		return sig;
+	const values = [...map.values()];
+	const rename = new Map(sig.typeParams.filter(p => values.some(v => mentionsTypeParam(v, p.name))).map(p => [p.name, freshTypeParamName(p.name)] as const));
+	if (!rename.size)
+		return sig;
+	const renameRefs	= new Map([...rename].map(([from, to]) => [from, TS.RefType(to)] as const));
+	const renamed		= mapSigTypes(sig, t => substituteType(t, renameRefs));
+	return { ...renamed, typeParams: renamed.typeParams?.map(p => ({ ...p, name: rename.get(p.name) ?? p.name })) };
+}
+
+// A mapped type's key is a binder too: `Partial<{p: P}>` substitutes a type naming the caller's own `P` under `[P in keyof T]`,
+// which then captured it (`P[]` became `"p"[]`). Also what keeps an outer same-named substitution out of the body.
+function renameMappedKey(m: TS.MappedType): TS.MappedType {
+	const keyName	= freshTypeParamName(m.keyName);
+	const rename	= new Map([[m.keyName, TS.RefType(keyName)]]);
+	return { ...m, keyName, valueType: substituteType(m.valueType, rename), nameType: m.nameType && substituteType(m.nameType, rename) };
+}
+
+// Chained generic method calls (a builder returning `TableBuilder<T & X>`, called repeatedly) each
+// substitute the *previous* call's own already-substituted return type back in as `T` -- without sharing,
+// every step embeds a full fresh copy of everything before it, so the resulting type's own node count
+// (not just how often it gets walked) doubles per chained call: confirmed empirically, a 20-call chain
+// produced 2^19 distinct 'ref' nodes for the same class, all genuinely different objects (a `WeakSet`
+// scan found zero repeats), so no amount of memoizing *readers* of the type (`resolve`, `lookupMember`)
+// can fix this -- the type itself has to stop duplicating. Reference-keyed per binding, not structural:
+// map values here are typically other structurally-shared types by the time this cache has been warm for
+// a while, so identity is enough, and it avoids the stringification cost a `typeKey`-based key would add
+// on every call (tried first; it relocated the exponential cost into printing instead of removing it).
+const substituteTypeCache = new WeakMap<Type, Map<string, WeakMap<Type, Type>>>();
+
+// A signature's own type parameters SHADOW the same outer names (`class G<T> { foo<T>(t: X<T>) }`: G's T never reaches foo's).
+// Undefined when nothing is shadowed; otherwise `sig` with only the outer names it doesn't redeclare substituted.
+function substituteShadowed<S extends TS.CallSig>(sig: S, map: Map<string, Type>): S | undefined {
+	const own = sig.typeParams;
+	if (!own?.some(p => map.has(p.name)))
+		return undefined;
+	const outer = new Map([...map].filter(([name]) => !own.some(p => p.name === name)));
+	return outer.size ? mapSigTypes(sig, t => substituteType(t, outer)) : sig;
+}
+
+// TS's rule for a missing type argument: a parameter's DEFAULT may name the parameters before it (`Call<E, A = E>` in common.ts),
+// so each default is instantiated with the arguments already chosen -- otherwise the bare parameter escapes into the member types.
+export function typeArgMap(typeParams: readonly TS.TypeParam[], typeArgs: readonly Type[] | undefined, fallback: Type = ANY): Map<string, Type> {
+	const map = new Map<string, Type>();
+	typeParams.forEach((p, i) => map.set(p.name, typeArgs?.[i] ?? (p.default ? substituteType(p.default, map) : fallback)));
+	return map;
+}
+
+// Replaces type-parameter references with their instantiating arguments (`Foo<string>` -> Foo's body with T := string).
+export function substituteType(t: Type, map: Map<string, Type>): Type {
+	if (map.size === 1) {
+		const [[name, arg]] = map;
+		let byName = substituteTypeCache.get(t);
+		if (!byName)
+			substituteTypeCache.set(t, byName = new Map());
+		let byArg = byName.get(name);
+		if (!byArg)
+			byName.set(name, byArg = new WeakMap());
+		const cached = byArg.get(arg);
+		if (cached)
+			return cached;
+		const result = uncached();
+		byArg.set(arg, result);
+		return result;
+	}
+	return uncached();
+
+	function uncached(): Type {
+		return walker(undefined, undefined,
+			rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) => {
+				if (x.type === 'ref' && !x.typeArgs && map.has(x.name))
+					return map.get(x.name);
+				if (x.type === 'function' || x.type === 'constructor') {
+					x = { ...x, ...avoidCapture(x, map) };
+					const shadowed = substituteShadowed(x, map);
+					if (shadowed)
+						return shadowed;
+				}
+				if (x.type === 'mapped') {
+					const key = x.keyName;
+					if (map.has(key) || [...map.values()].some(v => mentionsTypeParam(v, key)))
+						x = renameMappedKey(x);
+				}
+				// A rebuilt union or intersection is reduced as TS reduces an instantiated one: `T & U` at `{}` and `any` is `any`.
+				const r = process(x);
+				return r.type === 'union' || r.type === 'intersection' ? reduceInstantiated(r) : r;
+			}),
+			// An interface/class method's own generic signature (`Array<T>.map<U>`) is a `TypeMember` node
+			// (`method`/`call`/`construct`), not a `Type` one -- `avoidCapture` needs the same treatment here,
+			// or a method's own type parameter only gets capture-avoidance when it's reachable through a bare
+			// `function`/`constructor` type, missing every interface/class member signature (the common case).
+			rewriteOnce((m: TS.TypeMember, process: <T extends TS.TypeMember>(x: T) => T) => {
+				if (m.type === 'method' || m.type === 'call' || m.type === 'construct') {
+					m = { ...m, ...avoidCapture(m, map) };
+					const shadowed = substituteShadowed(m, map);
+					if (shadowed)
+						return shadowed;
+				}
+				return process(m);
+			})
+		).type(t) ?? t;
+	}
+}
+
+// Each type parameter at its constraint (`unconstrained` when it has none). A constraint may name a sibling in either
+// direction (`<K extends keyof T, T>`); constraints are acyclic, so n-1 passes settle them.
+export function constraintMap(typeParams: readonly TS.TypeParam[], unconstrained: Type = UNKNOWN): Map<string, Type> {
+	const map = new Map(typeParams.map(p => [p.name, p.constraint ?? unconstrained] as const));
+	for (let i = 1; i < map.size; i++)
+		map.forEach((t, name) => map.set(name, substituteType(t, map)));
+	return map;
+}
+
+// `sig` with its own type parameters replaced per `map`, no longer generic.
+export function instantiateSig<S extends TS.CallSig>(sig: S, map: Map<string, Type>): S {
+	return { ...mapSigTypes(sig, t => substituteType(t, map)), typeParams: undefined };
+}
+
+// TS's `getBaseSignature`: `sig`'s own type parameters replaced by their constraints, so none escapes its binder.
+export function baseSignature<S extends TS.CallSig>(sig: S, unconstrained: Type = UNKNOWN): S {
+	return sig.typeParams?.length ? instantiateSig(sig, constraintMap(sig.typeParams, unconstrained)) : sig;
+}
+
+// Whether a node of `kind` occurs anywhere in `t`.
+function containsKind(t: Type, kind: Type['type']): boolean {
+	return walkerB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === kind || process(x))).type(t);
+}
+
+// Replaces a `this` type node with `thisType`, the concrete class ref codegen needs up front. A walk rebuilds every node, so a type
+// with no `this` is returned as the same object, keeping every identity-keyed cache downstream (`resolve`, `lookupMember`) warm.
+export function substituteThisType(t: Type, thisType: Type): Type {
+	return containsKind(t, 'this') ? walker(undefined, undefined, rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) =>
+		x.type === 'this' ? thisType : process(x)
+	)).type(t) ?? t : t;
+}
+
+// Whether `name` occurs somewhere `inferTypeArgs` would actually descend into -- tells "no argument could ever determine
+// this" apart from "an argument should have but didn't" (a real gap). Mirrors `inferTypeArgs`'s recursion shape, not a blanket walk.
+const mentionsCache = new WeakMap<Type, Map<string, boolean>>();
+export function mentionsTypeParam(t: Type, name: string): boolean {
+	let byName = mentionsCache.get(t);
+	if (!byName)
+		mentionsCache.set(t, byName = new Map());
+	let r = byName.get(name);
+	if (r === undefined)
+		byName.set(name, r = mentions(t, name));
+	return r;
+}
+function mentions(t: Type, name: string): boolean {
+	return walkerB(undefined, undefined, searchOnce((t: Type, process: (x: Type) => boolean, recurse: WalkerB) => {
+		switch (t.type) {
+			case 'ref':				return t.typeArgs ? process(t) : t.name === name;
+			case 'function':
+			case 'constructor':		return t.params.some(p => recurse.type(p.typeAnnotation)) || recurse.type(t.returnType);
+			case 'object':			return t.members.some(m =>
+				m.type === 'property' ? recurse.type(m.typeAnnotation)
+				: m.type === 'method' ? recurse.type(m.returnType)
+				: false
+			);
+			case 'conditional':		return recurse.type(t.trueType) || recurse.type(t.falseType);
+			case 'array': case 'tuple': case 'intersection': case 'union': case 'predicate':
+				return process(t);
+			// `keyof`/`indexed_access`/`mapped`/`typeof`/`this`/`template_literal`/`infer`: not positions `inferTypeArgs` inverts.
+			default:				return false;
+		}
+	})).type(t);
+}
+
+// A declared type's body with `typeArgs` substituted for its parameters (their defaults where missing).
+function instantiateEntry(entry: TypeEntry, typeArgs: readonly Type[] | undefined): Type {
+	return entry.typeParams?.length ? substituteType(entry.type, typeArgMap(entry.typeParams, typeArgs)) : entry.type;
+}
+
+// Expands a `ref` one level into its declared body (substituting type args), without recursing further:
+// named refs nested inside it stay names rather than getting eagerly flattened too.
+export function expandRefOnce(scope: Scope, t: Type): Type {
+	if (t.type !== 'ref')
+		return t;
+	const entry = ownScope(t, scope).lookupType(t.name);
+	return entry ? instantiateEntry(entry, t.typeArgs) : t;
+}
+
+// ===================================================================
+//  Resolution
+// ===================================================================
+
+// Does this ref name a real `class`? `resolve` keeps such a ref nominal (see its own `case 'ref'`), so
+// every consumer that used to be handed a class's expanded structural shape now meets the ref instead.
+export function isClassRef(t: Type, scope: Scope): boolean {
+	if (t.type !== 'ref' || INTRINSIC_TYPES.has(t.name))
+		return false;
+	const [ns, name] = declScopeOf(t, scope).qualified(t.name);
+	return ns?.decl(name)?.type === 'class_decl';
+}
+
+// Whether `t` derives from a genuinely uninstantiated type parameter (never registered in `scope`) rather than just being
+// structurally complex. `indexed_access` passes the question through to its inner position.
+function isAbstract(t: Type, scope: Scope): boolean {
+	switch (t.type) {
+		// A CLASS ref is the opposite of abstract -- it is a fully concrete named type. It only reaches
+		// here at all because `resolve` stopped expanding it; calling it abstract made a conditional
+		// (`T extends number | rational ? ...`) refuse to pick a branch and union both instead.
+		// A DOTTED name is never a type parameter -- those are always bare. `scope.type` doesn't split on
+		// '.', so a namespace-qualified type (`TS.Stmt`) looked unbound and every conditional over one
+		// stayed deferred: `Extract<TS.Stmt, {type:'module_decl'}>` resolved to `never` despite `TS.Stmt`
+		// resolving perfectly well to its 33 members.
+		// Looked up where `resolve` looks it up, in the ref's own `declScope`: a stamped member of an imported union
+		// (`EnumDecl` in `Stmt & {type:'switch'}`) is unknown to the ambient scope, and treating it as unbound kept it unreduced.
+		case 'ref': {
+			const home = declScopeOf(t, scope);
+			return !t.typeArgs && !t.name.includes('.') && !INTRINSIC_TYPES.has(t.name) && !isClassRef(t, home) && (!home.type(t.name) || !!home.type(t.name)?.isTypeParam);
+		}
+		case 'indexed_access':	return isAbstract(t.object, scope) || isAbstract(t.index, scope);
+		default:				return false;
+	}
+}
+
+// Does `t` mention an unbound type parameter anywhere reachable? `isAbstract` only answers for a bare
+// ref; a conditional's decidability also depends on one buried in an object member or a type argument
+// (`{type: T}`, `Node<T>`). Exported for `instantiate`, which uses it to tell a real inference result
+// from one that is still carrying an OUTER call's unsolved parameters.
+export function mentionsAbstract(t: Type, scope: Scope, depth = 4): boolean {
+	if (depth < 0)
+		return false;
+	if (isAbstract(t, scope))
+		return true;
+	switch (t.type) {
+		case 'union': case 'intersection':	return t.types.some(m => mentionsAbstract(m, scope, depth - 1));
+		case 'array':						return mentionsAbstract(t.element, scope, depth - 1);
+		case 'tuple':						return t.elements.some(e => { const el = tupleElementType(e); return !!el && mentionsAbstract(el, scope, depth - 1); });
+		case 'ref':							return (t.typeArgs ?? []).some(a => mentionsAbstract(a, scope, depth - 1));
+		case 'object':						return t.members.some(m => (m.type === 'property' || m.type === 'index') && mentionsAbstract(m.typeAnnotation, scope, depth - 1));
+		default:							return false;
+	}
+}
+
+// `X[i]`, reduced ONE step to the element it names when `X` is a tuple or array -- the element itself left exactly
+// as written, so a named ref inside stays a ref. Anything else is returned untouched.
+function oneStepIndexed(t: Type, scope: Scope): Type {
+	if (t.type !== 'indexed_access')
+		return t;
+	const obj = resolveOwn(t.object, scope);
+	const idx = resolveOwn(t.index, scope);
+	if (obj.type === 'tuple' && idx.type === 'literal' && typeof idx.value === 'number')
+		return (obj.elements[idx.value] && tupleElementType(obj.elements[idx.value])) || t;
+	if (obj.type === 'array' && isNumberLike(idx, scope))
+		return obj.element;
+	return t;
+}
+
+// A homomorphic mapped type's own `readonly`/`-readonly`/`optional`/`-optional` tags override the source member's matching
+// tag; anything the mapped type doesn't mention passes the source's own state through unchanged.
+function mapMemberModifiers(sourceMods: string[] | undefined, mapMods: string[] | undefined): string[] | undefined {
+	const result = new Set(sourceMods);
+	for (const tag of ['readonly', 'optional']) {
+		if (mapMods?.includes(tag))
+			result.add(tag);
+		else if (mapMods?.includes('-' + tag))
+			result.delete(tag);
+	}
+	return result.size ? [...result] : undefined;
+}
+
+// The text each member of a template interpolation contributes, or undefined when some member isn't a finite literal.
+function templateTexts(t: Type, scope: Scope): string[] | undefined {
+	const out: string[] = [];
+	for (const m of unionMembers(t, scope).map(m => resolve(scope, m))) {
+		if (m.type === 'literal' && !Array.isArray(m.value))
+			out.push(String(m.value));
+		else if (m.type === 'range' && m.min !== undefined && m.min === m.max)
+			out.push(String(m.min));
+		else if (isRef(m, 'boolean'))
+			out.push('false', 'true');
+		else if (isRef(m, 'null') || isRef(m, 'undefined'))
+			out.push(isRef(m, 'null') ? 'null' : 'undefined');
+		else
+			return undefined;
+	}
+	return out;
+}
+
+// A template literal type whose interpolations are all finite is the union of its cross product -- what gives a mapped
+// type over `${E}${E}` real keys. tsc refuses past 100,000 members; this leaves such a type unexpanded instead.
+function expandTemplate(parts: JS.TemplatePart<Type>[], scope: Scope): Type | undefined {
+	let acc = [''];
+	for (const p of parts) {
+		const texts = p.exp ? templateTexts(p.exp, scope) : [''];
+		if (!texts || acc.length * texts.length > 100000)
+			return undefined;
+		acc = acc.flatMap(a => texts.map(x => a + p.str + x));
+	}
+	return combineTypes(acc.map(x => Literal(x)));
+}
+
+// A regex matching every string an unexpanded template literal type denotes; an interpolation it can't pin down matches anything.
+function templatePattern(parts: JS.TemplatePart<Type>[], scope: Scope): string {
+	const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	const part = (t: Type): string => {
+		const texts = templateTexts(t, scope);
+		if (texts)
+			return `(?:${texts.map(esc).join('|')})`;
+		const r = resolve(scope, t);
+		return isRef(r, 'number') ? '(?:[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:e[-+]?\\d+)?|NaN|-?Infinity)'
+			: isRef(r, 'bigint') ? '-?\\d+'
+			: r.type === 'literal' && Array.isArray(r.value) ? `(?:${templatePattern(r.value, scope)})`
+			: '[\\s\\S]*';
+	};
+	return parts.map(p => esc(p.str) + (p.exp ? part(p.exp) : '')).join('');
 }
 
 // The disjoint domain of a resolved intersection member (TS's DisjointDomains, `void` counted as `undefined`), 'structural'
@@ -512,25 +987,9 @@ function domainOf(r: Type, scope: Scope): Domain {
 	}
 }
 
-// TS's hasPrimitiveConstraint: a type parameter bounded by a primitive (`T extends string`, a literal union) infers the
-// literal itself, unwidened -- `f<T extends string>(x: T): T` called with 'a' is 'a'.
-const PRIMITIVE_DOMAINS = new Set(['string', 'number', 'bigint', 'boolean', 'symbol', 'undefined', 'null']);
-function primitiveConstraint(c: Type | undefined, scope: Scope): boolean {
-	return !!c && unionMembers(c, scope).some(m => PRIMITIVE_DOMAINS.has(domainOf(resolveOwn(m, scope), scope) ?? ''));
-}
-
 type Unit = string | number | bigint | boolean;
 const unitOf = (r: Type): Unit | undefined => r.type === 'literal' && !Array.isArray(r.value) && r.value !== null ? r.value
 	: r.type === 'range' && r.min !== undefined && r.min === r.max ? r.min : undefined;
-
-// An intersection of type parameters, at their constraints and normalized. Undefined when no part is abstract (nothing to gain)
-// or the bound came back unchanged, which would make `isAssignable` ask the same question again.
-function intersectionConstraint(t: TS.IntersectionType, scope: Scope): Type | undefined {
-	if (!t.types.some(p => isAbstract(p, scope)))
-		return undefined;
-	const bound = resolve(scope, TS.IntersectionType(t.types.map(p => isAbstract(p, scope) ? resolve(scope, p) : p)));
-	return bound.type === 'intersection' && bound.types.length === t.types.length && bound.types.every((b, i) => b === t.types[i]) ? undefined : bound;
-}
 
 // TS's intersection normalization (getIntersectionType): it distributes over a union member (`NonNullable<A | B>` is `A | B`);
 // `unknown`, a `{}` beside an object type and a primitive beside its own unit literal drop out; disjoint domains, a nullish member
@@ -618,847 +1077,6 @@ function reduceIntersection(t: TS.IntersectionType, scope: Scope, depth: number)
 	const kept			= raw.filter((_, i) => !(isRef(raw[i], 'unknown') || (hasObject && isEmpty(res[i])) || (unitDomain && units[i] === undefined && res[i].type === 'ref' && doms[i] === unitDomain)));
 
 	return kept.length === raw.length ? undefined : !kept.length ? UNKNOWN : kept.length === 1 ? kept[0] : TS.IntersectionType(kept);
-}
-
-
-export function makeNullish(type: Type) {
-	if (type.type === 'ref') {
-		switch (type.name) {
-			case 'bigint':
-			case 'number':	return Literal(0);
-			case 'boolean':	return Literal(false);
-			case 'string':	return Literal('');
-		}
-	}
-	if (type.type === 'range') {
-		// A range provably excluding 0 can never take its "one falsy value" -- that branch is unreachable for it.
-		if (!rangeIncludesZero(type))
-			return NEVER;
-		return type.base === 'number' ? Literal(0) : TS.RangeType('bigint', 0n, 0n);
-	}
-	return type;
-}
-
-export function withScope<T extends {declScope?: any}>(t: T, scope: Scope): T {
-	t.declScope = scope;
-	return t;
-}
-export function declScopeOf<T extends {declScope?: any}>(t: T, scope: Scope) {
-	return (t.declScope as Scope) ?? scope;
-}
-export function ownScope(t: Type, scope: Scope) {
-	return t.type === 'ref' ? declScopeOf(t, scope) : scope;
-}
-
-
-// Deep: also widens literal element/property types nested inside array/object structure (matching real TS, which widens a freshly-
-// inferred array/object literal's members too, not just a bare literal expression) -- not just this type's own top-level shape.
-// `frozen` leaves (see `common.ts`'s `Literal.frozen`) are left exactly as they are, at any nesting depth -- an `as const`
-// value's own literal identity survives being embedded in a container that's itself later widened (`[1, x as const]`).
-// `ignoreFrozen`: an `as const` literal's `frozen` flag exists so the *checker* keeps its precise literal
-// type (real TS semantics) -- callers computing a *physical* runtime representation instead (e.g.
-// backend.ts picking a value's wasm storage kind) have no such use for it: a frozen and non-frozen `'foo'`
-// still need the exact same physical representation, so those callers pass `true` to widen through it.
-// `shallow`: only the value's own literal (or union of them) widens, not literals nested in an array or object it holds.
-// Memoized per type object (and flags): a DAG rewritten once per node, not once per path.
-const widenCache = new Map<number, WeakMap<Type, Type>>();
-export function widenLiterals(t: Type, keepBoolean = false, ignoreFrozen = false, shallow = false): Type {
-	const flags = (keepBoolean ? 1 : 0) | (ignoreFrozen ? 2 : 0) | (shallow ? 4 : 0);
-	let cache = widenCache.get(flags);
-	if (!cache)
-		widenCache.set(flags, cache = new WeakMap());
-	let r = cache.get(t);
-	if (!r)
-		cache.set(t, r = widen(t, keepBoolean, ignoreFrozen, shallow));
-	return r;
-}
-function widen(t: Type, keepBoolean: boolean, ignoreFrozen: boolean, shallow: boolean): Type {
-	return	(t.type === 'literal' || t.type === 'range') && t.frozen && !ignoreFrozen ? t
-		:	t.type === 'literal' && t.value !== null && (!keepBoolean || typeof t.value !== 'boolean')
-			&& (t.fresh || ignoreFrozen || typeof t.value === 'number' || typeof t.value === 'bigint') ? TS.RefType(literalType(t))
-		:	t.type === 'range' ? TS.RefType(t.base)
-		:	t.type === 'union' ? combineTypes(t.types.map(m => widenLiterals(m, keepBoolean, ignoreFrozen, shallow)))
-		:	shallow ? t
-		:	t.type === 'array' ? TS.ArrayType(widenLiterals(t.element, keepBoolean, ignoreFrozen), t.readonly)
-		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, widenLiterals(m.typeAnnotation, keepBoolean, ignoreFrozen), m.modifiers) : m))
-		:	t;
-}
-
-// The inverse of `widenLiterals`'s own recursion shape: marks every literal/range leaf within `t` as `frozen`, matching
-// an `as const` assertion's real TS semantics -- used once, where `typeOf`'s `'as'` case computes the asserted value.
-export function freeze(t: Type): Type {
-	return	t.type === 'literal' || t.type === 'range' ? { ...t, frozen: true }
-		:	t.type === 'union' ? TS.UnionType(t.types.map(freeze))
-		:	t.type === 'array' ? TS.ArrayType(freeze(t.element), t.readonly)
-		:	t.type === 'object' ? TS.ObjectType(t.members.map(m => m.type === 'property' ? TS.TypeProperty(m.key, freeze(m.typeAnnotation), m.modifiers) : m))
-		:	t;
-}
-
-// Replaces type-parameter references with their instantiating arguments (`Foo<string>` -> Foo's body with T := string)
-// Monotonically-increasing suffix for a synthetic type-parameter name -- an apostrophe keeps it guaranteed-distinct
-// from any real user identifier (never valid in one), so a fresh/renamed name can never collide with a real type
-// actually in scope. Shared by `avoidCapture` (renaming a colliding *existing* type param) and `arrayMethod` (naming
-// a hand-built signature's own type param fresh from the start, rather than colliding in the first place).
-let freshTypeParamId = 0;
-function freshTypeParamName(base: string) { return `${base}'${freshTypeParamId++}`; }
-
-// A nested signature's own type parameter (`Array<T>.map<U>`'s own `U`) is bound within it, shadowing whatever
-// `substituteType` is replacing elsewhere -- but if one of `map`'s *values* being substituted in also happens to
-// mention that same bound name (e.g. substituting `T := U[]`, where `U` is the *caller's* own, unrelated ambient
-// type parameter, into `map`'s declared `(value: T, ...) => U`), the substituted-in value's `U` gets silently
-// captured by `map`'s own bound `U` -- both are the same literal name afterward, and `inferTypeArgs`'s purely
-// name-based matching can no longer tell "map's own, still-to-infer U" apart from "the caller's already-resolved
-// U[] that got substituted in". Alpha-renames the colliding bound parameter (and every occurrence of it within
-// just this one nested signature, including its own constraint/default) to a fresh, guaranteed-unique name first,
-// so the outer substitution proceeds capture-free. A real, general hygiene gap in generic substitution -- exposed
-// once type parameters started resolving to their real constraints instead of staying permanently opaque.
-function avoidCapture(sig: TS.CallSig, map: Map<string, Type>): TS.CallSig {
-	if (!sig.typeParams?.length)
-		return sig;
-	const values = [...map.values()];
-	const rename = new Map(sig.typeParams.filter(p => values.some(v => mentionsTypeParam(v, p.name))).map(p => [p.name, freshTypeParamName(p.name)] as const));
-	if (!rename.size)
-		return sig;
-	const renameRefs = new Map([...rename].map(([from, to]) => [from, TS.RefType(to)] as const));
-	return {
-		...sig,
-		params: sig.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: substituteType(p.typeAnnotation, renameRefs) } : p),
-		rest: sig.rest?.typeAnnotation ? { ...sig.rest, typeAnnotation: substituteType(sig.rest.typeAnnotation, renameRefs) } : sig.rest,
-		returnType: sig.returnType && substituteType(sig.returnType, renameRefs),
-		typeParams: sig.typeParams.map(p => ({
-			...p,
-			name: rename.get(p.name) ?? p.name,
-			constraint: p.constraint && substituteType(p.constraint, renameRefs),
-			default: p.default && substituteType(p.default, renameRefs),
-		})),
-	};
-}
-
-// A mapped type's key is a binder too: `Partial<{p: P}>` substitutes a type naming the caller's own `P` under `[P in keyof T]`,
-// which then captured it (`P[]` became `"p"[]`). Also what keeps an outer same-named substitution out of the body.
-function renameMappedKey(m: TS.MappedType): TS.MappedType {
-	const keyName	= freshTypeParamName(m.keyName);
-	const rename	= new Map([[m.keyName, TS.RefType(keyName)]]);
-	return { ...m, keyName, valueType: substituteType(m.valueType, rename), nameType: m.nameType && substituteType(m.nameType, rename) };
-}
-
-// The declared type of the argument sitting at REST position `k`. Usually just the rest's own element,
-// but a TUPLE rest names each position separately -- and a UNION of the two shapes names a callback in
-// only ONE arm (`Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>)`), so every arm that
-// can answer contributes and `resolveFnMember` picks the function out of the combined result.
-export function restArgType(rest: Type, k: number, scope: Scope, depth = 4): Type | undefined {
-	const r = resolveOwn(rest, scope);
-	if (r.type === 'array')
-		return r.element;
-	if (r.type === 'ref' && r.name === 'Array' && r.typeArgs?.length === 1)
-		return r.typeArgs[0];
-	if (r.type === 'tuple') {
-		const el = r.elements[k];
-		return !el ? undefined
-			: el.type === 'labeled' || el.type === 'optional' ? el.element
-			: el.type === 'spread' ? restArgType(el.argument, 0, scope, depth - 1)
-			: el;
-	}
-	if (r.type === 'union' && depth > 0) {
-		const parts = r.types.map(t => restArgType(t, k, scope, depth - 1)).filter((t): t is Type => !!t);
-		return parts.length ? combineTypes(parts) : undefined;
-	}
-	return undefined;
-}
-
-// A union of signatures identical up to their own type-parameter names is ONE signature (real TS's
-// `getUnionSignatures`). `(readonly T[] | T[]).map` is that shape: each part minted its own fresh `U`.
-export function mergeIdenticalSignatures(t: Type): Type {
-	if (t.type !== 'union')
-		return t;
-	const [first, ...rest] = t.types;
-	if (first.type !== 'function')
-		return t;
-	const names	= first.typeParams?.map(p => p.name) ?? [];
-	const key	= typeKey(first);
-	const same	= (f: Type) => {
-		if (f.type !== 'function' || (f.typeParams?.length ?? 0) !== names.length)
-			return false;
-		const renamed = names.length ? substituteType(f, new Map(f.typeParams!.map((p, i) => [p.name, TS.RefType(names[i])] as const))) as TS.FunctionType : f;
-		return typeKey({ ...renamed, typeParams: renamed.typeParams?.map((p, i) => ({ ...p, name: names[i] })) }) === key;
-	};
-	return rest.every(same) ? first : t;
-}
-
-// The signatures of `kind` a value of type `t` is invoked through: a function/constructor type, or an object's (and an
-// intersection's) call/construct members.
-export function signaturesOf(t: Type, kind: 'call' | 'construct', scope: Scope): TS.CallSig[] {
-	const r			= resolveOwn(t, scope);
-	const fnKind	= kind === 'call' ? 'function' : 'constructor';
-	const parts		= r.type === 'intersection' ? r.types.map(p => resolveOwn(p, scope)) : [r];
-	return [
-		...parts.flatMap(p => p.type === fnKind ? [p as TS.CallSig] : []),
-		...collectMembers(r, scope).flatMap(m => m.type === kind ? [m] : []),
-	];
-}
-
-// TS's resolveUnionSignature: invoking a union invokes whichever member the value is, so an argument must suit every
-// member and the result is any of their returns. For members with one signature each, none generic; TS stops at about
-// the same. The parameters combine pairwise as TS's combineUnionParameters does.
-export function unionSignature(t: Type, kind: 'call' | 'construct', scope: Scope): TS.CallSig | undefined {
-	const r = resolveOwn(t, scope);
-	if (r.type !== 'union')
-		return undefined;
-	const sigs = r.types.map(m => signaturesOf(m, kind, scope));
-	if (sigs.some(s => s.length !== 1 || s[0].typeParams?.length))
-		return undefined;
-	const each = sigs.map(s => s[0]);
-	const combined = each.slice(1).reduce((a, b) => combineUnionParameters(a, b, scope), each[0]);
-	return { params: combined.params, rest: combined.rest, returnType: combineTypes(each.map(s => s.returnType ?? ANY)) };
-}
-
-// Each position takes the intersection of both signatures' types there (a missing one constrains nothing), and is optional
-// only where both allow no argument. The longer one's rest stays a rest; a rest only the shorter has becomes an extra one.
-function combineUnionParameters(left: TS.CallSig, right: TS.CallSig, scope: Scope): TS.CallSig {
-	const count		= (s: TS.CallSig) => s.params.length + (s.rest ? 1 : 0);
-	const required	= (s: TS.CallSig) => s.params.reduce((n, p, i) => hasMod(p, 'optional') ? n : i + 1, 0);
-	const typeAt	= (s: TS.CallSig, i: number) => i < s.params.length ? s.params[i].typeAnnotation
-		: s.rest?.typeAnnotation && restArgType(s.rest.typeAnnotation, i - s.params.length, scope);
-	const both		= (a: Type | undefined, b: Type | undefined) => !a ? b ?? ANY : !b ? a : intersectTypes([a, b]);
-	const [longest, shorter] = count(left) >= count(right) ? [left, right] : [right, left];
-	const n			= count(longest);
-	const params: TS.Param[] = [];
-	let rest: TS.CallSig['rest'];
-	for (let i = 0; i < n; i++) {
-		const type = both(typeAt(longest, i), typeAt(shorter, i));
-		if (longest.rest && i === n - 1)
-			rest = JS.Rest(longest.rest.key, TS.ArrayType(type));
-		else
-			params.push(JS.Param((longest.params[i] ?? shorter.params[i]).key, type, i >= required(longest) && i >= required(shorter) ? ['optional'] : []));
-	}
-	if (!longest.rest && !!shorter.rest)
-		rest = JS.Rest(shorter.rest!.key, TS.ArrayType(typeAt(shorter, n) ?? ANY));
-	return { params, rest };
-}
-
-// A union of arrays/tuples as ONE array of the combined element type -- what real TS (5.2+) calls a
-// method on when the union's own signatures don't merge (`(Ty[] | Lit[]).map`).
-export function arrayUnionAsArray(t: Type, scope: Scope): TS.ArrayType | undefined {
-	const r = resolve(scope, t);
-	if (r.type !== 'union')
-		return undefined;
-	const elements: Type[] = [];
-	let readonly = false;
-	for (const m of r.types.map(m => resolve(scope, m))) {
-		if (m.type === 'array')
-			elements.push(m.element);
-		else if (m.type === 'tuple')
-			elements.push(...m.elements.flatMap(el => tupleElementType(el) ?? []));
-		else
-			return undefined;
-		readonly ||= !!m.readonly;
-	}
-	return TS.ArrayType(combineTypes(elements), readonly);
-}
-
-// A type is a DAG -- one subtree reached through many parents -- so a walk over it visits each node once, or its cost
-// is the number of paths, exponential in how deeply generic instantiations nest. For a search, a node seen before is no hit.
-function searchOnce<X extends object, P, R>(on: (x: X, process: P, recurse: R) => boolean) {
-	const seen = new Set<X>();
-	return (x: X, process: P, recurse: R) => {
-		if (seen.has(x))
-			return false;
-		seen.add(x);
-		return on(x, process, recurse);
-	};
-}
-// For a rewrite, a node seen before maps to what it mapped to, which also keeps the shared subtree shared in the result.
-function rewriteOnce<X extends object, P, R>(on: (x: X, process: P, recurse: R) => X | undefined) {
-	const done = new Map<X, X | undefined>();
-	return (x: X, process: P, recurse: R) => {
-		if (!done.has(x))
-			done.set(x, on(x, process, recurse));
-		return done.get(x);
-	};
-}
-
-// Chained generic method calls (a builder returning `TableBuilder<T & X>`, called repeatedly) each
-// substitute the *previous* call's own already-substituted return type back in as `T` -- without sharing,
-// every step embeds a full fresh copy of everything before it, so the resulting type's own node count
-// (not just how often it gets walked) doubles per chained call: confirmed empirically, a 20-call chain
-// produced 2^19 distinct 'ref' nodes for the same class, all genuinely different objects (a `WeakSet`
-// scan found zero repeats), so no amount of memoizing *readers* of the type (`resolve`, `lookupMember`)
-// can fix this -- the type itself has to stop duplicating. Reference-keyed per binding, not structural:
-// map values here are typically other structurally-shared types by the time this cache has been warm for
-// a while, so identity is enough, and it avoids the stringification cost a `typeKey`-based key would add
-// on every call (tried first; it relocated the exponential cost into printing instead of removing it).
-const substituteTypeCache = new WeakMap<Type, Map<string, WeakMap<Type, Type>>>();
-
-// A signature's own type parameters SHADOW the same outer names (`class G<T> { foo<T>(t: X<T>) }`: G's T never reaches foo's).
-// Undefined when nothing is shadowed; otherwise `sig` with only the outer names it doesn't redeclare substituted.
-function substituteShadowed<S extends TS.CallSig>(sig: S, map: Map<string, Type>): S | undefined {
-	const own = sig.typeParams;
-	if (!own?.some(p => map.has(p.name)))
-		return undefined;
-	const outer = new Map([...map].filter(([name]) => !own.some(p => p.name === name)));
-	const sub = <U extends Type | undefined>(t: U): U => (t && outer.size ? substituteType(t, outer) : t) as U;
-	return {
-		...sig,
-		params:		sig.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: sub(p.typeAnnotation) } : p),
-		rest:		sig.rest?.typeAnnotation ? { ...sig.rest, typeAnnotation: sub(sig.rest.typeAnnotation) } : sig.rest,
-		returnType:	sub(sig.returnType),
-		typeParams:	own.map(p => ({ ...p, constraint: sub(p.constraint), default: sub(p.default) })),
-	};
-}
-
-// TS's `getBaseSignature`: `sig`'s own type parameters replaced by their constraints (`unknown` when unconstrained), so none escapes its binder.
-// A constraint may name a sibling in either direction (`<K extends keyof T, T>`); constraints are acyclic, so n-1 passes settle them.
-export function baseSignature<S extends TS.CallSig>(sig: S): S {
-	if (!sig.typeParams?.length)
-		return sig;
-	const map = new Map(sig.typeParams.map(p => [p.name, p.constraint ?? UNKNOWN] as const));
-	for (let i = 1; i < map.size; i++)
-		map.forEach((t, name) => map.set(name, substituteType(t, map)));
-	const sub = (t: Type) => substituteType(t, map);
-	return {
-		...sig,
-		typeParams:	undefined,
-		params:		sig.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: sub(p.typeAnnotation) } : p),
-		rest:		sig.rest?.typeAnnotation ? { ...sig.rest, typeAnnotation: sub(sig.rest.typeAnnotation) } : sig.rest,
-		returnType:	sig.returnType && sub(sig.returnType),
-	};
-}
-
-// TS's rule for a missing type argument: a parameter's DEFAULT may name the parameters before it (`Call<E, A = E>` in common.ts),
-// so each default is instantiated with the arguments already chosen -- otherwise the bare parameter escapes into the member types.
-export function typeArgMap(typeParams: readonly TS.TypeParam[], typeArgs: readonly Type[] | undefined, fallback: Type = ANY): Map<string, Type> {
-	const map = new Map<string, Type>();
-	typeParams.forEach((p, i) => map.set(p.name, typeArgs?.[i] ?? (p.default ? substituteType(p.default, map) : fallback)));
-	return map;
-}
-
-export function substituteType(t: Type, map: Map<string, Type>): Type {
-	if (map.size === 1) {
-		const [[name, arg]] = map;
-		let byName = substituteTypeCache.get(t);
-		if (!byName)
-			substituteTypeCache.set(t, byName = new Map());
-		let byArg = byName.get(name);
-		if (!byArg)
-			byName.set(name, byArg = new WeakMap());
-		const cached = byArg.get(arg);
-		if (cached)
-			return cached;
-		const result = uncached();
-		byArg.set(arg, result);
-		return result;
-	}
-	return uncached();
-
-	function uncached(): Type {
-		return walker(undefined, undefined,
-			rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) => {
-				if (x.type === 'ref' && !x.typeArgs && map.has(x.name))
-					return map.get(x.name);
-				if (x.type === 'function' || x.type === 'constructor') {
-					x = { ...x, ...avoidCapture(x, map) };
-					const shadowed = substituteShadowed(x, map);
-					if (shadowed)
-						return shadowed;
-				}
-				if (x.type === 'mapped') {
-					const key = x.keyName;
-					if (map.has(key) || [...map.values()].some(v => mentionsTypeParam(v, key)))
-						x = renameMappedKey(x);
-				}
-				// A rebuilt union or intersection is reduced as TS reduces an instantiated one: `T & U` at `{}` and `any` is `any`.
-				const r = process(x);
-				return r.type === 'union' || r.type === 'intersection' ? reduceInstantiated(r) : r;
-			}),
-			// An interface/class method's own generic signature (`Array<T>.map<U>`) is a `TypeMember` node
-			// (`method`/`call`/`construct`), not a `Type` one -- `avoidCapture` needs the same treatment here,
-			// or a method's own type parameter only gets capture-avoidance when it's reachable through a bare
-			// `function`/`constructor` type, missing every interface/class member signature (the common case).
-			rewriteOnce((m: TS.TypeMember, process: <T extends TS.TypeMember>(x: T) => T) => {
-				if (m.type === 'method' || m.type === 'call' || m.type === 'construct') {
-					m = { ...m, ...avoidCapture(m, map) };
-					const shadowed = substituteShadowed(m, map);
-					if (shadowed)
-						return shadowed;
-				}
-				return process(m);
-			})
-		).type(t) ?? t;
-	}
-}
-
-// Replaces a `this` type node with `thisType` (the concrete class ref for whichever class is
-// currently being compiled/checked) -- the checker itself never needs this (`this` as a type is
-// resolved lazily, contextually, at each individual assignability check against `scope.value('this')`
-// -- see `OPAQUE`'s own inclusion of `'this'`), but a consumer needing one concrete, materialized
-// type up front (codegen) does.
-// `walk`'s own `mapObject` primitive always rebuilds a fresh shallow copy of every node it visits,
-// even one it leaves otherwise untouched (it has no "nothing changed here" fast path) -- so walking
-// a whole type tree just to end up substituting nothing anywhere still returns an all-new object
-// graph, structurally identical but never `===` the original. Real, general cost: a caller like
-// `ensureMethod` doing this unconditionally for every param on every method call, or a scope's own
-// `resolve()`/`lookupMember()` caching (both keyed by the exact type object, `WeakMap`s) never
-// getting a hit for a value it already resolved once under the original object's identity. Checking
-// first means a type with no 'this' anywhere -- the overwhelming majority -- comes back as the exact
-// same object, no rebuild, and every object-identity-keyed cache downstream keeps working normally.
-function containsThis(t: Type): boolean {
-	return walkerB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'this' || process(x))).type(t);
-}
-
-export function substituteThisType(t: Type, thisType: Type): Type {
-	return containsThis(t) ? walker(undefined, undefined, rewriteOnce((x: Type, process: <T extends Type>(x: T) => T) =>
-		x.type === 'this' ? thisType : process(x)
-	)).type(t) ?? t : t;
-}
-
-// Whether `name` occurs somewhere `inferTypeArgs` would actually descend into -- tells "no argument could ever determine
-// this" apart from "an argument should have but didn't" (a real gap). Mirrors `inferTypeArgs`'s recursion shape, not a blanket walk.
-const mentionsCache = new WeakMap<Type, Map<string, boolean>>();
-export function mentionsTypeParam(t: Type, name: string): boolean {
-	let byName = mentionsCache.get(t);
-	if (!byName)
-		mentionsCache.set(t, byName = new Map());
-	let r = byName.get(name);
-	if (r === undefined)
-		byName.set(name, r = mentions(t, name));
-	return r;
-}
-function mentions(t: Type, name: string): boolean {
-	return walkerB(undefined, undefined, searchOnce((t: Type, process: (x: Type) => boolean, recurse: WalkerB) => {
-		switch (t.type) {
-			case 'ref':				return t.typeArgs ? process(t) : t.name === name;
-			case 'function':
-			case 'constructor':		return t.params.some(p => recurse.type(p.typeAnnotation)) || recurse.type(t.returnType);
-			case 'object':			return t.members.some(m =>
-				m.type === 'property' ? recurse.type(m.typeAnnotation)
-				: m.type === 'method' ? recurse.type(m.returnType)
-				: false
-			);
-			case 'conditional':		return recurse.type(t.trueType) || recurse.type(t.falseType);
-			case 'array': case 'tuple': case 'intersection': case 'union': case 'predicate':
-				return process(t);
-			// `keyof`/`indexed_access`/`mapped`/`typeof`/`this`/`template_literal`/`infer`: not positions `inferTypeArgs` inverts.
-			default:				return false;
-		}
-	})).type(t);
-}
-
-function containsInfer(t: Type): boolean {
-	return walkerB(undefined, undefined, searchOnce((x: Type, process: (x: Type) => boolean) => x.type === 'infer' || process(x))).type(t);
-}
-
-// An un-annotated parameter's type, inferred from its default. Widened, matching both real TS
-// (`function f(scale = 10)` declares `scale: number`, not `10`) and towasm's own declaration-side
-// `resolveParam`, which infers the same parameter through `checkerTypeOf` -- the two have to agree, or
-// a function TYPE built from a declaration lowers to a different physical signature than the
-// declaration itself does.
-function widenedDefaultType(d: JS.Expr<any> | undefined): Type | undefined {
-	const t = d && literalTypeOf(d);
-	if (!t)
-		return undefined;
-	// `literalTypeOf` types an integer literal as the wasm pseudo-type `i32` (`declare type i32 = number`),
-	// a storage refinement `widenLiterals` has no reason to touch. In a signature the declared type is
-	// plainly `number`, which is also what the declaration side infers -- same collapse `combineTypes`
-	// already does when deduplicating union members.
-	const w = widenLiterals(t);
-	return w.type === 'ref' && !w.typeArgs && WASM_PSEUDO_TYPES.has(w.name) ? NUMBER : w;
-}
-
-// TS's getMinArgumentCount: through the last parameter a call must pass -- not optional (or defaulted), and not accepting `void`.
-export function minArgumentCount(sig: TS.Params, scope: Scope): number {
-	const own = sig.params.filter(p => p.key !== 'this');
-	let n = own.length;
-	while (n > 0 && (hasMod(own[n - 1], 'optional') || (own[n - 1].typeAnnotation && unionMembers(resolveOwn(own[n - 1].typeAnnotation!, scope), scope).some(m => m.type === 'ref' && m.name === 'void'))))
-		n--;
-	return n;
-}
-
-// JS.ParamList to TS.ParamList; a defaulted parameter counts as optional
-export function FixParams(params: JS.Params<any>): TS.Params {
-	return {
-		params: params.params.filter(p => p.key !== 'this').map((p): TS.Param => ({
-			key:			typeof p.key === 'string' ? p.key : '_',
-			modifiers:		hasMod(p, 'optional') || !!p.default ? ['optional'] : [],
-			typeAnnotation: p.typeAnnotation as Type ?? widenedDefaultType(p.default),
-			default:		p.default
-		})),
-		rest: params.rest as JS.Rest<Type>
-	};
-}
-// `declaredReturnType`: the function/arrow's own explicit annotation, captured *before* `checkFunctionBody` runs and overwrites
-// `params.returnType` with a body-inferred type for its own internal checking -- wrong for this value's type as seen externally.
-export function FixSig(params: JS.CallSig<any>, defaultRet?: Type, declaredReturnType?: Type): TS.CallSig {
-	return { ...FixParams(params),
-		returnType: declaredReturnType ?? params.returnType as Type ?? defaultRet,
-		typeParams: params.typeParams as TS.TypeParam[]
-	};
-}
-
-// Just enough built-in array members that element types survive `pop()!` etc.
-function arrayMethod(elem: Type, prop: string): Type | undefined {
-	// `map`'s result depends on the callback's own return type, not a fixed formula of `elem` -- needs a real generic signature, or it silently
-	// falls back to `ANY`, which can then poison a *constrained* generic elsewhere with a confusing error nowhere near the real cause.
-	// The type param's own name is freshly generated per call (not the literal `'U'`) -- `elem` may itself already mention an ambient `U`
-	// (e.g. calling `.map()` on `U[][]` inside a method whose own type parameter happens to be named `U` too), and a hand-built signature
-	// like this one is constructed directly rather than through `substituteType`, so `avoidCapture`'s own collision handling never sees it;
-	// a hardcoded name here would let that unrelated ambient `U` silently capture this signature's own, genuinely different `U`, corrupting
-	// per-call generic inference (`inferTypeArgs`'s purely name-based matching can't tell them apart once both are spelled the same).
-	if (prop === 'map') {
-		const U = TS.RefType(freshTypeParamName('U'));
-		return TS.FunctionType([
-				JS.Param('callback', TS.FunctionType([
-					JS.Param('v', elem),
-					JS.Param('i', NUMBER),
-					JS.Param('arr', TS.ArrayType(elem))
-				], U)),
-				JS.Param('thisArg', ANY, ['optional']),
-			],
-			TS.ArrayType(U),
-			[{ name: U.name }]
-		);
-	}
-
-	// Real `.flat()` is a recursive conditional type keyed off an explicit depth argument; only the common argument-less (depth-1) case is
-	// modeled -- unwrap one level of nesting when `elem` is itself an array. An unmodeled explicit depth falls back to the methods below.
-	if (prop === 'flat' && elem.type === 'array')
-		return { type: 'function', params: [], rest: { key: 'args', typeAnnotation: { type: 'array', element: NUMBER } }, returnType: { type: 'array', element: elem.element } };
-
-	// TS's own three overloads, exactly: no seed (the accumulator is the element type), a seed of the element type, a seed of U.
-	// Freshly-named per call, same reasoning as `map`'s own `U` above.
-	if (prop === 'reduce' || prop === 'reduceRight') {
-		const U		= TS.RefType(freshTypeParamName('U'));
-		const cb	= (acc: Type) => JS.Param('callback', TS.FunctionType([JS.Param('acc', acc), JS.Param('v', elem), JS.Param('i', NUMBER), JS.Param('arr', TS.ArrayType(elem))], acc));
-		return TS.ObjectType([
-			TS.TypeCall(TS.CallSig({ params: [cb(elem)] }, elem)),
-			TS.TypeCall(TS.CallSig({ params: [cb(elem), JS.Param('initialValue', elem)] }, elem)),
-			TS.TypeCall(TS.CallSig({ params: [cb(U), JS.Param('initialValue', U)] }, U, [{ name: U.name }])),
-		]);
-	}
-
-	// Collapsed into one rest-based signature: this checker's overload picker always fails whenever any argument is a spread
-	// (`arr.splice(i, n, ...items)`), so a real 2-overload `splice` would otherwise never match a spread call at all.
-	if (prop === 'splice')
-		return TS.FunctionType(
-			{ params: [JS.Param('start', NUMBER), JS.Param('deleteCount', NUMBER, ['optional'])], rest: JS.Rest('items', TS.ArrayType(elem)) },
-			TS.ArrayType(elem)
-		);
-
-	// Freshly-named per call, same reasoning as `map`'s own `U` above.
-	if (prop === 'every' || prop === 'filter' || prop === 'find' || prop === 'findLast') {
-		const S = TS.RefType(freshTypeParamName('S'));
-		return TS.FunctionType(
-			[
-				JS.Param('predicate', TS.FunctionType(
-					[JS.Param('v', elem), JS.Param('i', NUMBER), JS.Param('arr', TS.ArrayType(elem))],
-					TS.Predicate('v', S)
-				)),
-				JS.Param('thisArg', ANY, ['optional']),
-			],
-			prop === 'every' ? TS.Predicate('this', TS.ArrayType(S)) : prop === 'filter' ? TS.ArrayType(S) : combineTypes([S, UNDEFINED]),
-			[{ name: S.name, constraint: elem, default: elem }],
-		);
-	}
-	return undefined;
-}
-
-// Everything else `interface Array<T>` declares for real; only the RETURN type is refined here, over that
-// declaration's own parameters. This used to synthesise a whole `(...args: any[]) => ret` signature, which
-// threw away every parameter type -- so an unannotated callback (`a.some(x => x > 0)`, `a.findIndex(...)`)
-// got no contextual typing at all and only died much later, in codegen, as "closure parameter needs an
-// explicit type".
-function arrayMethodReturn(elem: Type, prop: string): Type | undefined {
-	return	prop === 'pop' || prop === 'shift' ? combineTypes([elem, UNDEFINED])
-			// Bounded (not bare `number`) so a loop comparing against these stays in `i32` instead of
-			// promoting to `f64` -- see `backend.ts`'s `numericPairWtype`, which requires both operands
-			// already `i32`. `0x7fffffff`, not `0xffffffff`, so `intWasmType` picks `i32` not `u32`.
-			:	prop === 'push' || prop === 'unshift' ? TS.RangeType('number', 0, 0x7fffffff, true)
-			:	prop === 'indexOf' || prop === 'lastIndexOf' || prop === 'findIndex' ? TS.RangeType('number', -1, 0x7fffffff, true)
-			:	prop === 'includes' || prop === 'some' ? BOOLEAN
-			:	prop === 'join' ? STRING
-			:	prop === 'slice' || prop === 'concat' || prop === 'reverse' || prop === 'flat' ? { type: 'array', element: elem } as Type
-			:	undefined;
-}
-
-// Applies `arrayMethodReturn`'s refinement to whatever shape the declaration came back as -- a lone
-// `function`, or the multi-signature `object` an overload set groups into.
-function withReturnType(t: Type | undefined, ret: Type): Type | undefined {
-	if (t?.type === 'function')
-		return { ...t, returnType: ret };
-	if (t?.type === 'object' && t.members.every(m => m.type === 'call'))
-		return TS.ObjectType(t.members.map(m => ({ ...m, returnType: ret })));
-	return undefined;
-}
-
-// The built-in members of an array/tuple value: this checker's own more precise model where it has one,
-// otherwise `interface Array<T>`'s real declaration, return-refined.
-function arrayMember(elem: Type, prop: string, scope: Scope, depth: number): Type | undefined {
-	const own = arrayMethod(elem, prop);
-	if (own)
-		return own;
-	const declared	= lookupMember(TS.RefType('Array', [elem]), prop, scope, depth - 1);
-	const ret		= arrayMethodReturn(elem, prop);
-	// The synthetic fallback survives only for a member `lib.d.ts` doesn't declare at all -- keeping the
-	// old behaviour rather than losing the member, but every such name is a gap in `interface Array<T>`.
-	return !ret ? declared
-		: withReturnType(declared, ret) ?? TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(ANY)) }, ret);
-}
-
-// A member a type gets from a global interface (`Object`, or `Function` for anything callable), as the lib declares it: the
-// apparent type TS reads members off when the type itself doesn't declare them.
-function globalInterfaceMember(name: 'Object' | 'Function', prop: string, scope: Scope): Type | undefined {
-	let root = scope;
-	while (root.parent)
-		root = root.parent;
-	return root.type(name) ? lookupMember(TS.RefType(name), prop, root, 4, true) : undefined;
-}
-const objectPrototypeMember = (prop: string, scope: Scope) => globalInterfaceMember('Object', prop, scope);
-// Anything with call or construct signatures has `Function`'s members (`apply`/`call`/`bind`), then `Object`'s.
-const callablePrototypeMember = (prop: string, scope: Scope) => globalInterfaceMember('Function', prop, scope) ?? objectPrototypeMember(prop, scope);
-
-// `T[]` really is `Array<T>` (a `readonly: true` one `ReadonlyArray<T>`) -- turns the structural `'array'` node into the real named
-// ref wherever it's compared, instead of bridging two representations at every call site.
-function normalizeArray(t: Type): Type {
-	return t.type === 'array' ? TS.RefType(t.readonly ? 'ReadonlyArray' : 'Array', [t.element]) : t;
-}
-// The element type of an `Array<T>`/`ReadonlyArray<T>` ref (after `normalizeArray`, a real array value's type always arrives this way).
-function arrayLikeElement(t: Type): Type | undefined {
-	return t.type === 'ref' && (t.name === 'Array' || t.name === 'ReadonlyArray') && t.typeArgs?.length ? t.typeArgs[0] : undefined;
-}
-
-export function wrapType(t: Type, names: Set<string>, name: string) {
-	return t.type === 'ref' && names.has(t.name) ? t : TS.RefType(name, [t]);
-}
-
-// A member key's static name: a string key as written, a literal computed key as its value, and one naming an entity
-// (`[Symbol.iterator]`) by that path, spelled as TS prints it. Any other computed key has no static name.
-export function memberKey(key: JS.Key<Type>): string | undefined {
-	if (typeof key === 'string')
-		return key;
-	const e = key.computed;
-	if (e.type === 'literal' && (typeof e.value === 'string' || typeof e.value === 'number'))
-		return String(e.value);
-	const path = e.type === 'identifier' || e.type === 'member' ? pathKey(e) : undefined;
-	return path && `[${path}]`;
-}
-
-// The `property`/`method` member (the only kinds carrying `modifiers`) named `key` in `members`, if any.
-function findTypeMember(members: TS.TypeMember[], key: string): TS.TypeMember & { modifiers?: string[] } | undefined {
-	return members.find(m => (m.type === 'property' || m.type === 'method') && memberKey(m.key) === key);
-}
-
-// Tags every `ref`/signature reachable from `t` with `scope`, mutating in place (`mapObjectVoid`, freshly-built nodes only).
-// Skips one that already carries a scope, so re-stamping an already-tagged structure is a no-op. Delegates traversal to `walk`.
-// `exclude`: names that must NOT be stamped even though otherwise eligible -- see `stampSig`'s own use, where a nested
-// function's own type-parameter names are bound (not free) and must stay resolvable in whatever scope later actually
-// registers them, not permanently baked to the hoisting pass's outer scope.
-export function stampScope<T extends Type>(t: T, scope: Scope, exclude?: Set<string>): T {
-	walkerB(undefined, undefined,
-		searchOnce((x: Type, process: (x: Type) => boolean) => {
-			// Primitives resolve the same everywhere -- stamping them would only add dead weight and dedup-key noise for no gain.
-			if (x.type === 'ref') {
-				if (!x.declScope && !INTRINSIC_TYPES.has(x.name) && !exclude?.has(x.name))
-					x.declScope = scope;
-			} else if (x.type === 'typeof') {
-				// A `typeof X` query names a VALUE, so it needs its declaring scope for exactly the reason a
-				// `ref` does -- `type Options = Partial<typeof DefaultOptions>` exported from one module
-				// resolves its members in the importer's scope, where `DefaultOptions` (a plain
-				// non-exported const) is not a name at all.
-				x.declScope ??= scope;
-			} else if (x.type === 'function' || x.type === 'constructor') {
-				x.declScope ??= scope;
-			}
-			return process(x);
-		}),
-		searchOnce((m: TS.TypeMember | TS.ClassMember, process: (x: TS.TypeMember | TS.ClassMember) => boolean) => {
-			if (m.type === 'method' || m.type === 'call' || m.type === 'construct')
-				m.declScope ??= scope;
-			return process(m);
-		})
-	).type(t);
-	return t;
-}
-
-// Stamps a `CallSig`-shaped object's own params/rest/return type -- for callers stamping a freshly-built signature directly
-// (a bare `TS.CallSig`, e.g. a hoisted free function's, isn't itself a `Type` node, so `stampScope`/`walk` alone can't take it).
-export function stampSig<T extends TS.CallSig>(sig: T, scope: Scope): T {
-	// Also tags the signature itself (see `withScope`) -- a bare interface/type-literal method has no other declScope
-	// source (unlike a hoisted free function/class method, which already gets one before `stampSig` ever sees it).
-	sig.declScope ??= scope;
-	// This signature's own type parameters are excluded from stamping below -- they're bound within the signature, not
-	// free names resolved against the hoisting pass's outer scope. A hoisted *nested* function (one whose own body-check
-	// scope, which registers these names via `addTypeParam`, doesn't exist yet at hoist time) would otherwise have every
-	// reference to its own `T` permanently stamped with the *enclosing* function's scope -- `declScope`'s "first stamp
-	// wins, skip if already tagged" semantics then shadow the nested function's own registration forever, so its own `T`
-	// silently resolves as the *outer* function's `T` throughout its whole body. A real, previously-latent scope-leakage
-	// bug, invisible before type parameters were ever registered at all (either name was equally unresolvable, so which
-	// scope you asked never mattered) -- exposed once `checkFunctionBody` started registering them for real.
-	const ownTypeParams = sig.typeParams?.length ? new Set(sig.typeParams.map(p => p.name)) : undefined;
-	sig.params.forEach(p => p.typeAnnotation && stampScope(p.typeAnnotation as Type, scope, ownTypeParams));
-	if (sig.rest?.typeAnnotation)
-		stampScope(sig.rest.typeAnnotation as Type, scope, ownTypeParams);
-	if (sig.returnType)
-		stampScope(sig.returnType, scope, ownTypeParams);
-	// A type param's own `constraint`/`default` need it too -- otherwise `inferTypeArgs`'s `isLiteralOnly(tp.constraint, ...)`
-	// check (does this constraint restrict to a union of literals?) can't resolve a constraint declared in this module but
-	// invisible from the caller's own scope, and silently widens a literal argument that should have stayed narrow.
-	// Still excludes `ownTypeParams`: an F-bounded constraint (`T extends hasop<'x', T>`) refers to its own bound `T`.
-	sig.typeParams?.forEach(p => {
-		if (p.constraint)
-			stampScope(p.constraint as Type, scope, ownTypeParams);
-		if (p.default)
-			stampScope(p.default as Type, scope, ownTypeParams);
-	});
-	return sig;
-}
-
-// Whether `t` derives from a genuinely uninstantiated type parameter (never registered in `scope`) rather than just being
-// structurally complex. `indexed_access` passes the question through to its inner position.
-// Does this ref name a real `class`? `resolve` keeps such a ref nominal (see its own `case 'ref'`), so
-// every consumer that used to be handed a class's expanded structural shape now meets the ref instead.
-export function isClassRef(t: Type, scope: Scope): boolean {
-	if (t.type !== 'ref' || INTRINSIC_TYPES.has(t.name))
-		return false;
-	const parts	= t.name.split('.');
-	const name	= parts.pop()!;
-	return ((t.declScope as Scope ?? scope).lookupScope(parts)?.decl(name))?.type === 'class_decl';
-}
-
-// `X[i]`, reduced ONE step to the element it names when `X` is a tuple or array -- the element itself left exactly
-// as written, so a named ref inside stays a ref. Anything else is returned untouched.
-function oneStepIndexed(t: Type, scope: Scope): Type {
-	if (t.type !== 'indexed_access')
-		return t;
-	const obj = resolveOwn(t.object, scope);
-	const idx = resolveOwn(t.index, scope);
-	if (obj.type === 'tuple' && idx.type === 'literal' && typeof idx.value === 'number')
-		return (obj.elements[idx.value] && tupleElementType(obj.elements[idx.value])) || t;
-	if (obj.type === 'array' && isNumberLike(idx, scope))
-		return obj.element;
-	return t;
-}
-
-// Does `t` mention an unbound type parameter anywhere reachable? `isAbstract` only answers for a bare
-// ref; a conditional's decidability also depends on one buried in an object member or a type argument
-// (`{type: T}`, `Node<T>`). Exported for `instantiate`, which uses it to tell a real inference result
-// from one that is still carrying an OUTER call's unsolved parameters.
-export function mentionsAbstract(t: Type, scope: Scope, depth = 4): boolean {
-	if (depth < 0)
-		return false;
-	if (isAbstract(t, scope))
-		return true;
-	switch (t.type) {
-		case 'union': case 'intersection':	return t.types.some(m => mentionsAbstract(m, scope, depth - 1));
-		case 'array':						return mentionsAbstract(t.element, scope, depth - 1);
-		case 'tuple':						return t.elements.some(e => { const el = tupleElementType(e); return !!el && mentionsAbstract(el, scope, depth - 1); });
-		case 'ref':							return (t.typeArgs ?? []).some(a => mentionsAbstract(a, scope, depth - 1));
-		case 'object':						return t.members.some(m => (m.type === 'property' || m.type === 'index') && mentionsAbstract(m.typeAnnotation, scope, depth - 1));
-		default:							return false;
-	}
-}
-
-function isAbstract(t: Type, scope: Scope): boolean {
-	switch (t.type) {
-		// A CLASS ref is the opposite of abstract -- it is a fully concrete named type. It only reaches
-		// here at all because `resolve` stopped expanding it; calling it abstract made a conditional
-		// (`T extends number | rational ? ...`) refuse to pick a branch and union both instead.
-		// A DOTTED name is never a type parameter -- those are always bare. `scope.type` doesn't split on
-		// '.', so a namespace-qualified type (`TS.Stmt`) looked unbound and every conditional over one
-		// stayed deferred: `Extract<TS.Stmt, {type:'module_decl'}>` resolved to `never` despite `TS.Stmt`
-		// resolving perfectly well to its 33 members.
-		// Looked up where `resolve` looks it up, in the ref's own `declScope`: a stamped member of an imported union
-		// (`EnumDecl` in `Stmt & {type:'switch'}`) is unknown to the ambient scope, and treating it as unbound kept it unreduced.
-		case 'ref': {
-			const home = t.declScope as Scope ?? scope;
-			return !t.typeArgs && !t.name.includes('.') && !INTRINSIC_TYPES.has(t.name) && !isClassRef(t, home) && (!home.type(t.name) || !!home.type(t.name)?.isTypeParam);
-		}
-		case 'indexed_access':	return isAbstract(t.object, scope) || isAbstract(t.index, scope);
-		default:				return false;
-	}
-}
-
-// A homomorphic mapped type's own `readonly`/`-readonly`/`optional`/`-optional` tags override the source member's matching
-// tag; anything the mapped type doesn't mention passes the source's own state through unchanged.
-function mapMemberModifiers(sourceMods: string[] | undefined, mapMods: string[] | undefined): string[] | undefined {
-	const result = new Set(sourceMods);
-	for (const tag of ['readonly', 'optional']) {
-		if (mapMods?.includes(tag))
-			result.add(tag);
-		else if (mapMods?.includes('-' + tag))
-			result.delete(tag);
-	}
-	return result.size ? [...result] : undefined;
-}
-
-
-export function resolveOwn(t: Type, scope: Scope): Type {
-	return resolve(ownScope(t, scope), t);
-}
-
-// The one direction `resolve` deliberately will not go: expanding a named class into its structural
-// member list. Every other consumer dispatches on a class by NAME and needs the ref kept intact, so
-// this is opt-in -- ask for it only where the MEMBERS are what you actually want (`lookupMember`).
-// Expands exactly one level: the members it yields keep their own nominal refs.
-export function resolveMembers(t: Type, scope: Scope, depth = 10): Type {
-	const r = resolveOwn(t, scope);
-	if (r.type !== 'ref' || INTRINSIC_TYPES.has(r.name))
-		return r;
-	const refScope	= r.declScope as Scope ?? scope;
-	const parts		= r.name.split('.');
-	const name		= parts.pop()!;
-	const ns		= refScope.lookupScope(parts);
-	const entry		= ns?.type(name);
-	if (!ns || !entry)
-		return r;
-	return resolve(ns, entry.typeParams?.length
-		? substituteType(entry.type, typeArgMap(entry.typeParams, r.typeArgs))
-		: entry.type, depth - 1);
-}
-
-// The text each member of a template interpolation contributes, or undefined when some member isn't a finite literal.
-function templateTexts(t: Type, scope: Scope): string[] | undefined {
-	const out: string[] = [];
-	for (const m of unionMembers(t, scope).map(m => resolve(scope, m))) {
-		if (m.type === 'literal' && !Array.isArray(m.value))
-			out.push(String(m.value));
-		else if (m.type === 'range' && m.min !== undefined && m.min === m.max)
-			out.push(String(m.min));
-		else if (isRef(m, 'boolean'))
-			out.push('false', 'true');
-		else if (isRef(m, 'null') || isRef(m, 'undefined'))
-			out.push(isRef(m, 'null') ? 'null' : 'undefined');
-		else
-			return undefined;
-	}
-	return out;
-}
-
-// A template literal type whose interpolations are all finite is the union of its cross product -- what gives a mapped
-// type over `${E}${E}` real keys. tsc refuses past 100,000 members; this leaves such a type unexpanded instead.
-function expandTemplate(parts: JS.TemplatePart<Type>[], scope: Scope): Type | undefined {
-	let acc = [''];
-	for (const p of parts) {
-		const texts = p.exp ? templateTexts(p.exp, scope) : [''];
-		if (!texts || acc.length * texts.length > 100000)
-			return undefined;
-		acc = acc.flatMap(a => texts.map(x => a + p.str + x));
-	}
-	return combineTypes(acc.map(x => Literal(x)));
-}
-
-// A regex matching every string an unexpanded template literal type denotes; an interpolation it can't pin down matches anything.
-function templatePattern(parts: JS.TemplatePart<Type>[], scope: Scope): string {
-	const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	const part = (t: Type): string => {
-		const texts = templateTexts(t, scope);
-		if (texts)
-			return `(?:${texts.map(esc).join('|')})`;
-		const r = resolve(scope, t);
-		return isRef(r, 'number') ? '(?:[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:e[-+]?\\d+)?|NaN|-?Infinity)'
-			: isRef(r, 'bigint') ? '-?\\d+'
-			: r.type === 'literal' && Array.isArray(r.value) ? `(?:${templatePattern(r.value, scope)})`
-			: '[\\s\\S]*';
-	};
-	return parts.map(p => esc(p.str) + (p.exp ? part(p.exp) : '')).join('');
 }
 
 export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): Type {
@@ -1606,25 +1224,16 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				// each corresponding member -- or when it is the `number` TYPE, the standard "element type of
 				// this array" idiom (`typeof LIB_DECLS[number]`), which means every position at once.
 				const index = resolve(scope, t.index);
-				// A numeric literal index into a *tuple* (the `FlatArray` idiom) picks a fixed element positionally -- distinct from the
-				// string-keyed lookups below and from `lookupMember`, which has no notion of a numeric tuple position.
-				// `T[number]` -- indexed by the `number` TYPE rather than a literal -- is the standard "element
-				// type of this array" idiom (`typeof LIB_DECLS[number]`), and means every position at once:
-				// an array's element type, or a tuple's own elements unioned.
-				if (index.type === 'ref' && index.name === 'number') {
-					const object = resolve(scope, t.object);
-					if (object.type === 'array')
-						return resolve(scope, object.element, undefined, stopAtRef);
-					if (object.type === 'tuple')
-						return resolve(scope, combineTypes(object.elements.map(e => tupleElementType(e) ?? ANY)), undefined, stopAtRef);
-				} else if (isLiteral(index, 'number')) {
-					const object = resolve(scope, t.object);
-					if (object.type === 'tuple') {
-						const el = object.elements[index.value];
-						return el ? resolve(scope, tupleElementType(el) ?? ANY, undefined, stopAtRef) : ANY;
-					}
-					if (object.type === 'array')
-						return resolve(scope, object.element, undefined, stopAtRef);
+				// `T[number]` means every position at once: an array's element, or a tuple's elements unioned. A numeric literal
+				// into a tuple (the `FlatArray` idiom) reads one position, which the string-keyed lookups below have no notion of.
+				if (isRef(index, 'number') || isLiteral(index, 'number')) {
+					const object	= resolve(scope, t.object);
+					const read		= object.type === 'array' ? object.element
+						: object.type !== 'tuple' ? undefined
+						: isLiteral(index, 'number') ? tupleReadType(object, index.value, scope) ?? ANY
+						: combineTypes(elementTypes(object, scope));
+					if (read)
+						return resolve(scope, read, undefined, stopAtRef);
 				}
 				// A mapped type's own value, for *any* index expression (not just a resolvable literal) --
 				// `{[K in C]: V}[X]` is just `V` with `K := X` substituted throughout, by construction,
@@ -1664,7 +1273,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				// property name) -- real TS gives the index signature's own value type here, same as a literal
 				// key lookup would if a matching property actually existed.
 				if (object.type === 'object') {
-					const idx = object.members.find((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index' && isAssignable(index, m.paramType, scope));
+					const idx = indexMembers(object.members).find(m => isAssignable(index, m.paramType, scope));
 					if (idx)
 						return resolve(scope, idx.typeAnnotation, depth - 1, stopAtRef);
 				}
@@ -1712,7 +1321,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				// tuple instantiates `ElemValue<[Box<number>, ':'][0]>`, which must see `Box<number>`.
 				const checkType = oneStepIndexed(t.checkType, scope);
 				if (!isAny(check) && !isAbstract(check, scope)) {
-					if (containsInfer(t.extendsType)) {
+					if (containsKind(t.extendsType, 'infer')) {
 						const bindings = new Map<string, Type>();
 						// Not the already-resolved `check` -- resolving would eagerly expand a named type, losing the identity
 						// `matchInfer`'s `ref`-typeArgs case needs to match `Promise<infer R>`. Gets its own fresh budget, not `resolve`'s `depth`.
@@ -1724,12 +1333,12 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 						// `undefined` propagates `isLiteralOnly`'s "can't safely decide" -- caller must stay opaque, not guess.
 						const extendsType = resolve(scope, t.extendsType, depth - 1);
 						const lit = isPrimitive(check) ? isLiteralOnly(extendsType, scope) : false;
-						// `t.checkType`, not the already-resolved `check` -- same reasoning as `containsInfer` above: eagerly resolving loses
+						// `t.checkType`, not the already-resolved `check` -- same reasoning as the `infer` branch above: eagerly resolving loses
 						// the ref identity `isAssignable`'s same-name fast path needs to confirm "does this class extend itself" cheaply.
 						if (lit !== undefined)
 							return resolve(scope, lit || !isAssignable(checkType, extendsType, scope) ? t.falseType : t.trueType, depth - 1, stopAtRef);
 					}
-				} else if (!containsInfer(t.extendsType)) {
+				} else if (!containsKind(t.extendsType, 'infer')) {
 					// `checkType` is a genuinely abstract, unbound type param -- any real instantiation picks exactly one branch, never a
 					// blend, so unioning both is a safe over-approximation (skipped when `extendsType` has `infer`, which needs real bindings).
 					return resolve(scope, combineTypes([t.trueType, t.falseType]), depth - 1, stopAtRef);
@@ -1739,7 +1348,7 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 			case 'typeof': {
 				// The query's own `declScope` wins over the ambient one, exactly as `case 'ref'` below does
 				// and for the same reason -- the name it queries is a VALUE in its own declaring module.
-				const qScope = t.declScope as Scope ?? scope;
+				const qScope = declScopeOf(t, scope);
 				const parts = t.name.split('.');
 				let v		= qScope.value(parts[0]);
 				for (let i = 1; v && i < parts.length; i++)
@@ -1757,10 +1366,8 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 				if (!INTRINSIC_TYPES.has(t.name)) {
 					// A ref's own `declScope` wins over the ambient `scope` for lookup -- kept local, not
 					// reassigned onto `scope` (which `uncached`'s closure shares with `resolve`'s own resolving-set bookkeeping below; reassigning it here used to leak that set onto the wrong scope).
-					const refScope = t.declScope as Scope ?? scope;
-					const parts	= t.name.split('.');
-					const name	= parts.pop()!;
-					const ns	= refScope.lookupScope(parts);
+					const refScope		= declScopeOf(t, scope);
+					const [ns, name]	= refScope.qualified(t.name);
 					if (!ns)
 						return t;
 
@@ -1811,6 +1418,24 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 		return t;
 	}
 }
+
+export function resolveOwn(t: Type, scope: Scope): Type {
+	return resolve(ownScope(t, scope), t);
+}
+
+// The one direction `resolve` deliberately will not go: expanding a named class into its structural
+// member list. Every other consumer dispatches on a class by NAME and needs the ref kept intact, so
+// this is opt-in -- ask for it only where the MEMBERS are what you actually want (`lookupMember`).
+// Expands exactly one level: the members it yields keep their own nominal refs.
+export function resolveMembers(t: Type, scope: Scope, depth = 10): Type {
+	const r = resolveOwn(t, scope);
+	if (r.type !== 'ref' || INTRINSIC_TYPES.has(r.name))
+		return r;
+	const [ns, name]	= declScopeOf(r, scope).qualified(r.name);
+	const entry			= ns?.type(name);
+	return ns && entry ? resolve(ns, instantiateEntry(entry, r.typeArgs), depth - 1) : r;
+}
+
 // Every member a union could actually BE, resolved and flattened. `resolve` reduces the union itself but
 // leaves its MEMBERS alone, and a member can resolve to a further nested union (`type AB = A | B;` used
 // in `AB | C`), so a bare `resolved.types` walk silently misses aliases. `never` members are dropped:
@@ -1838,46 +1463,38 @@ export function flattenIntersection(t: Type, scope: Scope): Type[] {
 	return r.type === 'intersection' ? r.types.flatMap(t => flattenIntersection(t, scope)) : [r];
 }
 
-// Merges the `object` parts of an intersection into one flat `object`, keeping any non-object parts alongside it rather than folding them in.
-// A key declared by more than one object part becomes the intersection of its own per-part types
-// `optional` survives only if every part declaring the key marks it optional, `readonly` if any part does
-export function mergeIntersection(t: Type): Type {
-	if (t.type !== 'intersection')
-		return t;
-
-	const nonObject:	Type[] = [];
-	const otherMembers: TS.TypeMember[] = [];
-	const byKey = new Map<string, { types: Type[]; optional: boolean; readonly: boolean }>();
-
-	function flattenIntersection(t: Type): Type[] {
-		return t.type === 'intersection' ? t.types.flatMap(t => flattenIntersection(t)) : [t];
+// Resolves any `Type` down to a real flat `ObjectType`, if possible: an intersection's parts (possibly unresolved refs,
+// `CallSig<T>`) are flattened and merged into one, so every caller agrees on one flat shape for a given declared type.
+export function resolveObjectType(t: Type, scope: Scope): TS.ObjectType | undefined {
+	const w = resolve(scope, t);
+	if (w.type === 'object')
+		return w;
+	if (w.type === 'intersection') {
+		const merged = mergeIntersection(TS.IntersectionType(flattenIntersection(w, scope)));
+		return merged.type === 'object' ? merged : undefined;
 	}
+	return undefined;
+}
 
-	for (const part of flattenIntersection(t)) {
-		if (part.type === 'object') {
-			for (const m of part.members) {
-				if (m.type === 'property' && typeof m.key === 'string') {
-					const entry = byKey.get(m.key) ?? { types: [], optional: true, readonly: false };
-					entry.types.push(m.typeAnnotation);
-					entry.optional &&= hasMod(m, 'optional');
-					entry.readonly ||= hasMod(m, 'readonly');
-					byKey.set(m.key, entry);
-				} else {
-					otherMembers.push(m);
-				}
-			}
-		} else {
-			nonObject.push(part);
-		}
-	}
+// Every object shape a type expands to as a union member, each beside its own RAW member type. A consumer matching on
+// nominal identity must be handed the raw member -- `raw` still names a real interface, which an owner lookup resolves
+// by NAME to the one class the dispatch side builds too, where the name-stripped shape alone would build a structural twin.
+export function objectShapes(t: Type, scope: Scope): { raw: Type; objT: TS.ObjectType }[] {
+	return unionMembers(t, scope).flatMap(raw => {
+		const objT = resolveObjectType(raw, scope);
+		return objT ? [{ raw, objT }] : [];
+	});
+}
 
-	return intersectTypes([TS.ObjectType([
-		...[...byKey].map(([key, { types, optional, readonly }]): TS.TypeMember => {
-			const modifiers = [...(optional ? ['optional'] : []), ...(readonly ? ['readonly'] : [])];
-			return TS.TypeProperty(key, intersectTypes(types), modifiers.length ? modifiers : undefined);
-		}),
-		...otherMembers,
-	]), ...nonObject]);
+// The object shape two types share field-wise, each field widened to their union.
+export function unionShapes(a: Type, b: Type, scope: Scope): TS.ObjectType | undefined {
+	const ra = resolveObjectType(a, scope), rb = resolveObjectType(b, scope);
+	if (!ra || !rb)
+		return undefined;
+	const other = new Map(rb.members.flatMap(m => m.type === 'property' && typeof m.key === 'string' ? [[m.key, m.typeAnnotation] as const] : []));
+	return TS.ObjectType(ra.members.map(m => m.type === 'property' && typeof m.key === 'string' && other.has(m.key)
+		? { ...m, typeAnnotation: combineTypes([m.typeAnnotation, other.get(m.key)!]) }
+		: m));
 }
 
 // LEVEL-ORDER (real TS orders inherited call signatures by inheritance depth, and resolution here is
@@ -1902,368 +1519,228 @@ export function collectMembers(t: Type, scope: Scope): TS.TypeMember[] {
 	return out;
 }
 
-// A callee's construct signatures as TS resolves them on an intersection (resolveIntersectionTypeMembers): a MIXIN part -- one
-// construct signature taking only `...args: any[]` -- adds none of its own, and its instance type joins every other part's result.
-export function constructSignatures(t: Type, scope: Scope): TS.CallSig[] {
-	const parts: TS.CallSig[][] = [];
-	const collect = (x: Type, depth: number): void => {
-		const r = resolveOwn(x, scope);
-		if (r.type === 'intersection' && depth > 0)
-			r.types.forEach(p => collect(p, depth - 1));
-		else if (r.type === 'constructor')
-			parts.push([r]);
-		else if (r.type === 'object' && r.members.some(m => m.type === 'construct'))
-			parts.push(r.members.filter((m): m is TS.TypeMember & TS.CallSig => m.type === 'construct'));
-	};
-	collect(t, 8);
-	const isMixin = (sigs: TS.CallSig[]) => {
-		const rest = sigs.length === 1 && !sigs[0].params.length && sigs[0].rest?.typeAnnotation;
-		const r = rest && resolveOwn(rest, scope);
-		return !!r && r.type === 'array' && isAny(r.element);
-	};
-	const mixin = parts.map(isMixin);
-	if (mixin.length && mixin.every(m => m))
-		mixin[0] = false;
-	const mixed = parts.flatMap((sigs, i) => mixin[i] ? [sigs[0].returnType ?? ANY] : []);
-	return parts.flatMap((sigs, i) => mixin[i] ? [] : mixed.length ? sigs.map(s => ({ ...s, returnType: TS.IntersectionType([s.returnType ?? ANY, ...mixed]) })) : sigs);
+// ===================================================================
+//  Arrays, tuples and rest parameters
+// ===================================================================
+
+// `T[]` really is `Array<T>` (a `readonly: true` one `ReadonlyArray<T>`) -- turns the structural `'array'` node into the real named
+// ref wherever it's compared, instead of bridging two representations at every call site.
+function normalizeArray(t: Type): Type {
+	return t.type === 'array' ? TS.RefType(t.readonly ? 'ReadonlyArray' : 'Array', [t.element]) : t;
+}
+// The element type of an array: a `T[]` node, or an `Array<T>`/`ReadonlyArray<T>` ref (what `normalizeArray` makes of one).
+export function arrayLikeElement(t: Type): Type | undefined {
+	return t.type === 'array' ? t.element
+		: t.type === 'ref' && (t.name === 'Array' || t.name === 'ReadonlyArray') && t.typeArgs?.length ? t.typeArgs[0]
+		: undefined;
 }
 
-export function isNullish(t: Type, scope: Scope): boolean {
-	const r = resolveOwn(t, scope);
-	return	r.type === 'literal'	? r.value === null
-		:	r.type === 'ref'		? r.name === 'undefined' || r.name === 'null' || r.name === 'void'
-		:	r.type === 'union'		? r.types.every(t => isNullish(t, scope))
-		:	false;
-}
-export function isOther(op: string) {
-	return op === '?' ? isNullish : op === '|' ? isFalsy : isTruthy;
+// A spread (`...T`) contributes no single element value; an optional element (`T?`)'s contributed value type is just `T`, consistent with this
+// file not modeling "possibly absent" via `| undefined` for optional members elsewhere either.
+// `te` is undefined when a literal has more elements than the tuple type it's contextually checked
+// against (e.g. `[1, 2, 3]` against an expected `[number, number]`) -- those extra positions just get
+// no contextual type, same as an untyped array literal's elements would.
+export function tupleElementType(te: TS.TupleElement | undefined): Type | undefined {
+	return !te || te.type === 'spread' ? undefined : te.type === 'optional' || te.type === 'labeled' ? te.element : te;
 }
 
-// What `a && b` / `a || b` / `a ?? b` yields from `a` when it short-circuits: a boolean survives `||` only as true and
-// `&&` only as false, and `&&` narrows a string/number to its one falsy literal (`||`'s truthy side has no single value).
-export function logicalLeftPart(t: Type, op: string, scope: Scope): Type {
-	const other	= isOther(op[0]);
-	return combineTypes(unionMembers(t, scope).flatMap(m => {
-		const p = resolveOwn(m, scope);
-		if (other(p, scope))
-			return [];
-		if (op !== '??' && isBoolean(p))
-			return [Literal(op === '||')];
-		return [op === '&&' ? makeNullish(p) : m];
-	}));
-}
-
-// The non-nullish remainder of `t` -- `t` itself, unchanged, unless it resolves to a union with at least
-// one (but not every) nullish member, in which case those members are dropped. Shared by anything
-// implementing optional-chaining semantics (`?.`/`??`), which only ever cares about the non-nullish part
-// of a value's type -- e.g. `lookupMember`'s own union case requires *every* member to have the property
-// looked up, which a bare `null`/`undefined` member never does, so a `?.` member lookup needs this run on
-// the object type first (see `checker.ts`'s own `'member'` case) or it always misses, falling back to `any`.
-// `nonNullable = false` keeps `t` whole -- unless `strictNullChecks` is off, where no value is ever treated as possibly nullish.
-export function nonNullable(t: Type, scope: Scope, nonNullable = true): Type {
-	if (!nonNullable && scope.strictNullChecks())
-		return t;
-	const r = resolveOwn(t, scope);
-	if (r.type !== 'union')
-		return t;
-	// Flattened: `Maybe<X> | undefined` hides `Maybe`'s own `null | undefined` one alias down.
-	const members	= unionMembers(r, scope);
-	const kept		= members.filter(m => !isNullish(m, scope));
-	return kept.length === 0 || kept.length === members.length ? t : combineTypes(kept);
-}
-
-function isNullOrUndefined(t: Type): boolean {
-	return t.type === 'literal' ? t.value === null : t.type === 'ref' && (t.name === 'null' || t.name === 'undefined');
-}
-
-// An inferred declaration or return type, as TS widens one without `strictNullChecks`: `null`/`undefined` leave a union and
-// alone become `any`. Identity when strict.
-export function widenNullish(t: Type, scope: Scope): Type {
-	if (scope.strictNullChecks())
-		return t;
-	const members	= unionMembers(t, scope);
-	const kept		= members.filter(m => !isNullOrUndefined(resolveOwn(m, scope)));
-	return !kept.length ? ANY : kept.length === members.length ? t : combineTypes(kept);
-}
-
-export function isFalsy(t: Type, scope: Scope): boolean {
-	const r = resolveOwn(t, scope);
-	return	r.type === 'literal'	? !r.value
-		:	r.type === 'ref'		? r.name === 'undefined' || r.name === 'null' || r.name === 'void'
-		:	r.type === 'range'		? r.min !== undefined && r.min === r.max && rangeIncludesZero(r)	// the single point 0
-		:	r.type === 'union'		? r.types.every(t => isFalsy(t, scope))
-		:	false;
-}
-
-export function isTruthy(t: Type, scope: Scope): boolean {
-	const r = resolveOwn(t, scope);
-	return	r.type === 'literal'		? !!r.value
-		:	r.type === 'range'			? !rangeIncludesZero(r)
-		:	r.type === 'union'			? r.types.every(m => isTruthy(m, scope))
-		:	r.type === 'intersection'	? r.types.some(m => isTruthy(m, scope))
-		:	r.type === 'ref'			? isObjectRef(r, scope)
-		:	['object', 'array', 'tuple', 'function', 'constructor'].includes(r.type);
-}
-
-
-
-// True when a value of this type is truthy whenever it is non-null -- an object, an array, a tuple, a
-// function. Never a `string` (`''` is falsy), a `number` (`0`, `NaN`), a `boolean`, a literal, or a
-// genuinely dynamic `any`/type parameter, for all of which truthiness is a property of the VALUE.
-// Answered from the CHECKER's type, which is the only thing that still knows a boxed `any` slot holds
-// `Stmt | undefined` rather than something that could be `0`.
-export function alwaysTruthy(t: Type, scope: Scope): boolean {
-	const r = resolve(scope, t);
-	switch (r.type) {
-		case 'object': case 'array': case 'tuple':	case 'function': case 'constructor':
-			return true;
-		case 'union':
-			// An all-nullish union lands here as `true`, which is still correct: the null test below
-			// answers `false` for it, which is what it always is. `T.unionMembers` drops `never` and
-			// flattens nested aliases -- see its own comment.
-			return unionMembers(r, scope).every(m => isNullish(m, scope) || alwaysTruthy(m, scope));
-		case 'intersection':
-			// A value satisfying an intersection satisfies every part, so one object-ish part is enough
-			// to make it an object -- unless another part makes it a PRIMITIVE (a branded
-			// `string & {brand}`), where truthiness is still the primitive's own. An interface that
-			// `extends` another resolves to exactly this (`FunctionType` = `{type:'function'} & CallSig`).
-			return r.types.some(m => alwaysTruthy(m, scope))
-				&& !r.types.some(m => ['ref', 'literal'].includes(resolve(scope, m).type));
-		case 'ref':
-			// `never` is uninhabited, so no value can BE the falsy one -- vacuously true, and a union
-			// member `JS.Stmt<any>` really has (a generic parameter substituted away). Every other `ref`
-			// surviving `resolve` is a primitive or an unresolved name, neither decidable here.
-			return r.name === 'never';
-		default:
-			// A literal, `keyof`, a conditional, a type parameter: not decidable here either.
-			return false;
-	}
-}
-export function isNullLiteral(e: Expr): boolean {
-	return nullLiteralKind(e) !== undefined;
-}
-
-// Which of the two nullish literals `e` is, if either. They share one physical form here (`ref.null`),
-// so only a STRICT comparison ever has to tell them apart, and only statically -- see `case '==='`.
-export function nullLiteralKind(e: Expr): 'null' | 'undefined' | undefined {
-	return	e.type === 'literal' && e.value === null			? 'null'
-		:	e.type === 'identifier' && e.name === 'undefined'	? 'undefined'
-		:	undefined;
-}
-
-// A class or interface instance is an object, never falsy -- TS's object type facts. Not an empty shape (`{}`, `Object`),
-// which a primitive satisfies, nor anything unresolved.
-function isObjectRef(r: TS.RefType, scope: Scope): boolean {
-	if (INTRINSIC_TYPES.has(r.name))
-		return false;
-	const m = resolveMembers(r, scope);
-	return m.type === 'object' ? m.members.length > 0 : m.type === 'intersection' && m.types.some(p => p.type === 'object' && p.members.length > 0);
-}
-
-export function isBigint(t: Type, scope: Scope): boolean {
-	const r = resolveOwn(t, scope);
-	return r.type === 'ref'		? r.name === 'bigint'
-		: r.type === 'literal'	? typeof r.value === 'bigint'
-		: r.type === 'range'	? r.base === 'bigint'
-		: r.type === 'union'	? r.types.every(m => isBigint(m, scope))
-		: false;
-};
-
-// Inferred unions over-approximate, so only complain when no member could be numeric
-export function isNumberLike(t: Type, scope: Scope): boolean {
-	const r = resolveOwn(t, scope);
-	return r.type === 'union' ? r.types.some(m => isAssignable(m, NUMERIC, scope)) : isAssignable(r, NUMERIC, scope);
-}
-
-export function isStringLike(t: Type, scope: Scope): boolean {
-	const r = resolveOwn(t, scope);
-	return isString(r)
-		|| isLiteral(r, 'string')
-		|| (r.type === 'union' && r.types.some(t => isStringLike(t, scope)));
-}
-
-// Three-valued: `undefined` is "couldn't fully resolve this" (e.g. an alias not reachable through this `scope`'s import chain) and must not be
-// treated as a confirmed `false`, or `conditionalExtends` below would wrongly fall through to the leniency it exists to guard against.
-function isLiteralOnly(t: Type, scope: Scope, depth = 6): boolean | undefined {
-	switch (t.type) {
-		case 'literal':	return true;
-		// A CLASS is definitively not a literal union -- `undefined` here means "could not look the name
-		// up", which stopped being true for classes once `resolve` began keeping them nominal, and left
-		// `string extends RegExp` undecidable in `case 'conditional'`.
-		case 'ref':		return INTRINSIC_TYPES.has(t.name) || isClassRef(t, scope) ? false : undefined;
-		case 'union':
-			if (depth >= 0) {
-				const parts = t.types.map(m => isLiteralOnly(resolveOwn(m, scope), scope, depth - 1));
-				return parts.some(p => p === false) ? false : parts.every(p => p === true) ? true : undefined;
-			}
-			scope.hitDepthLimit('isLiteralOnly');
-			return undefined;
-		default:
-			return false;
-	}
-}
-
-
-// Structurally matches `pattern` (an `extendsType` containing `infer` nodes) against `actual`, binding each `infer X` into `out`.
-// Three-valued like `conditionalExtends`: `false` only on outright conflict, `undefined` when unresolvable -- never guessed.
-function matchInfer(pattern: Type, actual: Type, scope: Scope, out: Map<string, Type>, depth = 6): boolean | undefined {
-	if (depth < 0) {
-		scope.hitDepthLimit('matchInfer');
+// A READ of position `i` (TS's getIndexedAccessType): an optional element may be absent, so it reads `T | undefined`; a position a
+// rest spread covers reads the spread's element or any fixed one after it; no type at all past a fixed-length tuple's end.
+export function tupleReadType(t: Extract<Type, { type: 'tuple' }>, i: number, scope: Scope): Type | undefined {
+	const spreadAt = t.elements.findIndex(e => e.type === 'spread');
+	if (spreadAt >= 0 && i >= spreadAt)
+		return combineTypes(elementTypes({ ...t, elements: t.elements.slice(spreadAt) }, scope));
+	const el = t.elements[i];
+	if (!el)
 		return undefined;
-	}
-	if (pattern.type === 'infer') {
-		if (!out.has(pattern.name))
-			out.set(pattern.name, actual);
-		return !pattern.constraint || isAssignable(actual, pattern.constraint, scope);
-	}
-	if (!containsInfer(pattern))
-		return isAssignable(actual, pattern, scope);
+	const v = tupleElementType(el)!;
+	return el.type === 'optional' || (el.type === 'labeled' && el.optional) ? combineTypes([v, UNDEFINED]) : v;
+}
 
-	const a = normalizeArray(resolve(scope, actual, depth - 1));
-	if (pattern.type === 'ref' && pattern.typeArgs) {
-		if (pattern.name === 'ReadonlyArray') {
-			const patternEl = pattern.typeArgs[0];
-			if (a.type === 'ref' && a.name === 'Array' && a.typeArgs?.length)
-				return matchInfer(patternEl, a.typeArgs[0], scope, out, depth - 1);
-			if (a.type === 'tuple')
-				return a.elements.every(e => { const t = tupleElementType(e); return !t || matchInfer(patternEl, t, scope, out, depth - 1) !== false; }) || undefined;
-		} else if (pattern.name === 'Array' && a.type === 'tuple' && pattern.typeArgs.length === 1) {
-			const patternEl = pattern.typeArgs[0];
-			return a.elements.every(e => { const t = tupleElementType(e); return !t || matchInfer(patternEl, t, scope, out, depth - 1) !== false; }) || undefined;
-		}
-		// Checks the *unresolved* `actual` for a same-named ref first -- `scope.resolve` would eagerly expand it, losing the
-		// "named `Promise<number>`" identity this needs; only falls back to the resolved form for an alias needing one unwrap.
-		const named = actual.type === 'ref' && actual.typeArgs && actual.name === pattern.name ? actual
-			: a.type === 'ref' && a.typeArgs && a.name === pattern.name ? a
-			: undefined;
-		if (!named) {
-			// The pattern's own name may still describe a shape the actual can match: an interface or alias expands
-			// (`Term<infer U>` -> `{t: infer U}`), and the structural cases below then decide it properly. A class ref stays
-			// nominal through `resolve`, so this cannot loop. Without it a chain like `T extends Term<infer U> ? U : T extends
-			// (() => infer U) ? U : never` gave up at the FIRST branch (undecidable) instead of falling to the second.
-			const expanded = resolve(scope, pattern, depth - 1);
-			if (expanded.type !== 'ref' || expanded.name !== pattern.name)
-				return matchInfer(expanded, actual, scope, out, depth - 1);
-			// A resolved primitive (`string`, `number`, &c) can never structurally match a generic ref pattern
-			// like `PromiseLike<infer R>` -- no type arguments, no generic shape -- so this is a confident `false`,
-			// not the usual "differently-named, could still be an unresolved match" `undefined`. A function type is the
-			// same answer for the same reason: it has no keyed members, and a class ref (kept nominal by `resolve`, so it
-			// never expanded above) is not something a function value is an instance of.
-			return isPrimitive(a) || a.type === 'function' || a.type === 'constructor' ? false : undefined;
-		}
-		return pattern.typeArgs.length === named.typeArgs!.length
-			&& pattern.typeArgs.every((p, i) => matchInfer(p, named.typeArgs![i], scope, out, depth - 1) !== false)
-			|| undefined;
+// The declared type of the argument sitting at REST position `k`. Usually just the rest's own element,
+// but a TUPLE rest names each position separately -- and a UNION of the two shapes names a callback in
+// only ONE arm (`Rules<T>(...alts: [(self: () => Rules<T>) => Rules<T>] | Rules<T>)`), so every arm that
+// can answer contributes and `resolveFnMember` picks the function out of the combined result.
+export function restArgType(rest: Type, k: number, scope: Scope, depth = 4): Type | undefined {
+	const r = resolveOwn(rest, scope);
+	const element = arrayLikeElement(r);
+	if (element)
+		return element;
+	if (r.type === 'tuple') {
+		const el = r.elements[k];
+		return !el ? undefined
+			: el.type === 'labeled' || el.type === 'optional' ? el.element
+			: el.type === 'spread' ? restArgType(el.argument, 0, scope, depth - 1)
+			: el;
 	}
-	if (pattern.type === 'array') {
-		// `a` was normalized to `Array<T>`/`ReadonlyArray<T>` above -- no longer `'array'` itself -- so this reads its element
-		// back out through `arrayLikeElement` instead of `a.element` directly.
-		const ael = arrayLikeElement(a);
-		return ael !== undefined ? matchInfer(pattern.element, ael, scope, out, depth - 1)
-			: a.type === 'tuple' ? a.elements.every(e => {
-				const t = tupleElementType(e);
-				return t && matchInfer(pattern.element, t, scope, out, depth - 1) !== false;
-			}) || undefined
-			: false;
-	}
-	if (pattern.type === 'tuple') {
-		if (a.type !== 'tuple')
-			return undefined;
-		// A trailing `...infer Rest` (or `...unknown[]`) only has to line up against whatever's left after the fixed leading elements match --
-		// unlike the fixed-length case below, `a` may have *more* elements than `pattern`'s leading portion.
-		const last = pattern.elements.at(-1);
-		if (last?.type === 'spread') {
-			const lead = pattern.elements.slice(0, -1);
-			if (a.elements.length < lead.length)
-				return false;
-			// `a` itself may contain a spread anywhere in the range being matched here (e.g. `[...T[]]`, the
-			// common encoding for "array of unknown length" reaching this branch as a genuine `tuple` rather
-			// than tison's own `array` kind, which `normalizeArray` above would already have converted to
-			// `Array<T>` and failed the `a.type !== 'tuple'` check before this point) -- unlike `tupleElementType`
-			// (which deliberately returns `undefined` for a spread elsewhere, since a spread has no *single*
-			// element value), a pattern position lining up against one still needs *some* type to bind its
-			// `infer` against, and the spread's own argument is exactly that (matches real TS's inference for
-			// `[infer First, ...infer Rest]` against a plain array type).
-			const elementTypeAt = (te: TS.TupleElement) => te.type === 'spread' ? te.argument : tupleElementType(te);
-			if (!lead.every((p, i) => {
-				const at = elementTypeAt(a.elements[i]), pt = tupleElementType(p);
-				return !at || !pt || matchInfer(pt, at, scope, out, depth - 1) !== false;
-			}))
-				return false;
-			if (!containsInfer(last.argument))
-				return true;
-			const rest = a.elements.slice(lead.length).map(elementTypeAt);
-			return rest.every(t => !!t) && matchInfer(last.argument, TS.ArrayType(combineTypes(rest)), scope, out, depth - 1) !== false || undefined;
-		}
-		return a.elements.length === pattern.elements.length
-			&& a.elements.every((e, i) => {
-				const at = tupleElementType(e), pt = tupleElementType(pattern.elements[i]);
-				return !at || !pt || matchInfer(pt, at, scope, out, depth - 1) !== false;
-			})
-			|| undefined;
-	}
-	if (pattern.type === 'function' || pattern.type === 'constructor') {
-		// An overloaded value (`((s: sync._stream) => T) & ((s: async._stream) => Promise<T>)`) is a genuine
-		// `intersection` of signatures, not a single one -- matches if *any* overload does, same as a real call
-		// picking whichever signature fits.
-		if (a.type === 'intersection')
-			return a.types.some(m => matchInfer(pattern, m, scope, out, depth - 1) === true) || undefined;
-		return a.type !== pattern.type ? false
-			: pattern.returnType && a.returnType ? matchInfer(pattern.returnType, a.returnType, scope, out, depth - 1)
-			: undefined;
-	}
-
-	if (pattern.type === 'union') {
-		// non-distributive: `infer` inside a pattern-side union is rare and real TS's handling here is itself subtle -- best-effort only.
-		for (const p of pattern.types) {
-			if (matchInfer(p, actual, scope, out, depth - 1))
-				return true;
-		}
-		return undefined;
-	}
-	if (pattern.type === 'object') {
-		// `a` may be a plain object/intersection with call/construct signature *members* (`{new(...): infer R}`
-		// matched structurally), or itself a bare `constructor`/`function` value (e.g. a class reference used as
-		// a spec entry) -- semantically the same thing for matching purposes, so both are checked below.
-		const aMembers = a.type === 'object' ? a.members : a.type === 'intersection' ? a.types.flatMap(x => x.type === 'object' ? x.members : []) : undefined;
-		for (const m of pattern.members) {
-			// `new(...): infer R` / `(...): infer R` -- a call/construct signature, not a keyed property: matched
-			// against `a`'s own signature of the same kind, if it has one (a plain data-spec object never does,
-			// which correctly fails this branch rather than silently binding nothing, as an unhandled member
-			// kind falling through the loop below used to).
-			if (m.type === 'call' || m.type === 'construct') {
-				if (!m.returnType || !containsInfer(m.returnType))
-					continue;
-				const aReturnType = m.type === 'construct' && a.type === 'constructor' ? a.returnType
-					: m.type === 'call' && a.type === 'function' ? a.returnType
-					: (aMembers?.find(x => x.type === m.type) as TS.CallSig)?.returnType;
-				if (!aReturnType)
-					return false;
-				if (matchInfer(m.returnType, aReturnType, scope, out, depth - 1) === false)
-					return false;
-				continue;
-			}
-			if (m.type !== 'property' || typeof m.key !== 'string' || !containsInfer(m.typeAnnotation))
-				continue;
-			// A function/constructor type HAS no keyed members, so a required property is a confident miss -- same answer the
-			// absent-property case below gives. Anything else isn't a shape this can look a property up in at all.
-			if (!aMembers)
-				return a.type === 'function' || a.type === 'constructor' ? (hasMod(m, 'optional') ? undefined : false) : undefined;
-			// `lookupMember` gets its own fresh budget, not `matchInfer`'s remaining `depth` -- unrelated recursions, same
-			// reasoning as `lookupMember`'s own `resolve()` call and `isAssignable`'s per-member `lookupMember` call.
-			const t = lookupMember(a, m.key, scope);
-			if (!t)
-				return hasMod(m, 'optional') ? undefined : false;
-			if (matchInfer(m.typeAnnotation, t, scope, out, depth - 1) === false)
-				return false;
-		}
-		return true;
+	if (r.type === 'union' && depth > 0) {
+		const parts = r.types.map(t => restArgType(t, k, scope, depth - 1)).filter((t): t is Type => !!t);
+		return parts.length ? combineTypes(parts) : undefined;
 	}
 	return undefined;
 }
 
-// `skipObjectFallback`: an intersection part must not resolve `Object.prototype` members on its own, or the "first match wins" search would
-// stop before reaching a later part's real declaration (e.g. a superclass). Only set by `case 'intersection'`'s own recursive per-part search.
+// Every value an array, a tuple (a spread contributing what it spreads) or a union of them can hold.
+// A rest parameter is physically always one array, whose element these combine into.
+export function elementTypes(t: Type, scope: Scope, depth = 4): Type[] {
+	const r			= resolveOwn(t, scope);
+	const element	= arrayLikeElement(r);
+	return element ? [element]
+		: r.type === 'tuple' ? r.elements.flatMap(e => e.type === 'spread' ? elementTypes(e.argument, scope, depth - 1) : tupleElementType(e) ?? [])
+		: r.type === 'union' && depth > 0 ? r.types.flatMap(m => elementTypes(m, scope, depth - 1))
+		: [];
+}
+
+// A union of arrays/tuples as ONE array of the combined element type -- what real TS (5.2+) calls a
+// method on when the union's own signatures don't merge (`(Ty[] | Lit[]).map`).
+export function arrayUnionAsArray(t: Type, scope: Scope): TS.ArrayType | undefined {
+	const r = resolve(scope, t);
+	if (r.type !== 'union')
+		return undefined;
+	const members = r.types.map(m => resolve(scope, m));
+	return members.every(m => m.type === 'array' || m.type === 'tuple')
+		? TS.ArrayType(combineTypes(members.flatMap(m => elementTypes(m, scope))), members.some(m => !!m.readonly))
+		: undefined;
+}
+
+// ===================================================================
+//  Member lookup
+// ===================================================================
+
+// The `property`/`method` member (the only kinds carrying `modifiers`) named `key` in `members`, if any.
+function findTypeMember(members: TS.TypeMember[], key: string): TS.TypeMember & { modifiers?: string[] } | undefined {
+	return members.find(m => (m.type === 'property' || m.type === 'method') && memberKey(m.key) === key);
+}
+
+// Just enough built-in array members that element types survive `pop()!` etc.
+function arrayMethod(elem: Type, prop: string): Type | undefined {
+	// `map`'s result depends on the callback's own return type, not a fixed formula of `elem` -- needs a real generic signature, or it silently
+	// falls back to `ANY`, which can then poison a *constrained* generic elsewhere with a confusing error nowhere near the real cause.
+	// The type param's own name is freshly generated per call (not the literal `'U'`) -- `elem` may itself already mention an ambient `U`
+	// (e.g. calling `.map()` on `U[][]` inside a method whose own type parameter happens to be named `U` too), and a hand-built signature
+	// like this one is constructed directly rather than through `substituteType`, so `avoidCapture`'s own collision handling never sees it;
+	// a hardcoded name here would let that unrelated ambient `U` silently capture this signature's own, genuinely different `U`, corrupting
+	// per-call generic inference (`inferTypeArgs`'s purely name-based matching can't tell them apart once both are spelled the same).
+	if (prop === 'map') {
+		const U = TS.RefType(freshTypeParamName('U'));
+		return TS.FunctionType([
+				JS.Param('callback', TS.FunctionType([
+					JS.Param('v', elem),
+					JS.Param('i', NUMBER),
+					JS.Param('arr', TS.ArrayType(elem))
+				], U)),
+				JS.Param('thisArg', ANY, ['optional']),
+			],
+			TS.ArrayType(U),
+			[{ name: U.name }]
+		);
+	}
+
+	// Real `.flat()` is a recursive conditional type keyed off an explicit depth argument; only the common argument-less (depth-1) case is
+	// modeled -- unwrap one level of nesting when `elem` is itself an array. An unmodeled explicit depth falls back to the methods below.
+	if (prop === 'flat' && elem.type === 'array')
+		return { type: 'function', params: [], rest: { key: 'args', typeAnnotation: { type: 'array', element: NUMBER } }, returnType: { type: 'array', element: elem.element } };
+
+	// TS's own three overloads, exactly: no seed (the accumulator is the element type), a seed of the element type, a seed of U.
+	// Freshly-named per call, same reasoning as `map`'s own `U` above.
+	if (prop === 'reduce' || prop === 'reduceRight') {
+		const U		= TS.RefType(freshTypeParamName('U'));
+		const cb	= (acc: Type) => JS.Param('callback', TS.FunctionType([JS.Param('acc', acc), JS.Param('v', elem), JS.Param('i', NUMBER), JS.Param('arr', TS.ArrayType(elem))], acc));
+		return TS.ObjectType([
+			TS.TypeCall(TS.CallSig({ params: [cb(elem)] }, elem)),
+			TS.TypeCall(TS.CallSig({ params: [cb(elem), JS.Param('initialValue', elem)] }, elem)),
+			TS.TypeCall(TS.CallSig({ params: [cb(U), JS.Param('initialValue', U)] }, U, [{ name: U.name }])),
+		]);
+	}
+
+	// Collapsed into one rest-based signature: this checker's overload picker always fails whenever any argument is a spread
+	// (`arr.splice(i, n, ...items)`), so a real 2-overload `splice` would otherwise never match a spread call at all.
+	if (prop === 'splice')
+		return TS.FunctionType(
+			{ params: [JS.Param('start', NUMBER), JS.Param('deleteCount', NUMBER, ['optional'])], rest: JS.Rest('items', TS.ArrayType(elem)) },
+			TS.ArrayType(elem)
+		);
+
+	// Freshly-named per call, same reasoning as `map`'s own `U` above.
+	if (prop === 'every' || prop === 'filter' || prop === 'find' || prop === 'findLast') {
+		const S = TS.RefType(freshTypeParamName('S'));
+		return TS.FunctionType(
+			[
+				JS.Param('predicate', TS.FunctionType(
+					[JS.Param('v', elem), JS.Param('i', NUMBER), JS.Param('arr', TS.ArrayType(elem))],
+					TS.Predicate('v', S)
+				)),
+				JS.Param('thisArg', ANY, ['optional']),
+			],
+			prop === 'every' ? TS.Predicate('this', TS.ArrayType(S)) : prop === 'filter' ? TS.ArrayType(S) : combineTypes([S, UNDEFINED]),
+			[{ name: S.name, constraint: elem, default: elem }],
+		);
+	}
+	return undefined;
+}
+
+// Everything else `interface Array<T>` declares for real; only the RETURN type is refined here, over that
+// declaration's own parameters. This used to synthesise a whole `(...args: any[]) => ret` signature, which
+// threw away every parameter type -- so an unannotated callback (`a.some(x => x > 0)`, `a.findIndex(...)`)
+// got no contextual typing at all and only died much later, in codegen, as "closure parameter needs an
+// explicit type".
+function arrayMethodReturn(elem: Type, prop: string): Type | undefined {
+	return	prop === 'pop' || prop === 'shift' ? combineTypes([elem, UNDEFINED])
+			// Bounded (not bare `number`) so a loop comparing against these stays in `i32` instead of
+			// promoting to `f64` -- see `backend.ts`'s `numericPairWtype`, which requires both operands
+			// already `i32`. `0x7fffffff`, not `0xffffffff`, so `intWasmType` picks `i32` not `u32`.
+			:	prop === 'push' || prop === 'unshift' ? TS.RangeType('number', 0, 0x7fffffff, true)
+			:	prop === 'indexOf' || prop === 'lastIndexOf' || prop === 'findIndex' ? TS.RangeType('number', -1, 0x7fffffff, true)
+			:	prop === 'includes' || prop === 'some' ? BOOLEAN
+			:	prop === 'join' ? STRING
+			:	prop === 'slice' || prop === 'concat' || prop === 'reverse' || prop === 'flat' ? { type: 'array', element: elem } as Type
+			:	undefined;
+}
+
+// Applies `arrayMethodReturn`'s refinement to whatever shape the declaration came back as -- a lone
+// `function`, or the multi-signature `object` an overload set groups into.
+function withReturnType(t: Type | undefined, ret: Type): Type | undefined {
+	if (t?.type === 'function')
+		return { ...t, returnType: ret };
+	if (t?.type === 'object' && t.members.every(m => m.type === 'call'))
+		return TS.ObjectType(t.members.map(m => ({ ...m, returnType: ret })));
+	return undefined;
+}
+
+// The built-in members of an array/tuple value: this checker's own more precise model where it has one,
+// otherwise `interface Array<T>`'s real declaration, return-refined.
+function arrayMember(elem: Type, prop: string, scope: Scope, depth: number): Type | undefined {
+	const own = arrayMethod(elem, prop);
+	if (own)
+		return own;
+	const declared	= lookupMember(TS.RefType('Array', [elem]), prop, scope, depth - 1);
+	const ret		= arrayMethodReturn(elem, prop);
+	// The synthetic fallback survives only for a member `lib.d.ts` doesn't declare at all -- keeping the
+	// old behaviour rather than losing the member, but every such name is a gap in `interface Array<T>`.
+	return !ret ? declared
+		: withReturnType(declared, ret) ?? TS.FunctionType({ params: [], rest: JS.Rest('args', TS.ArrayType(ANY)) }, ret);
+}
+
+// A member a type gets from a global interface (`Object`, or `Function` for anything callable), as the lib declares it: the
+// apparent type TS reads members off when the type itself doesn't declare them.
+function globalInterfaceMember(name: 'Object' | 'Function', prop: string, scope: Scope): Type | undefined {
+	const root = scope.root();
+	return root.type(name) ? lookupMember(TS.RefType(name), prop, root, 4, true) : undefined;
+}
+const objectPrototypeMember = (prop: string, scope: Scope) => globalInterfaceMember('Object', prop, scope);
+// Anything with call or construct signatures has `Function`'s members (`apply`/`call`/`bind`), then `Object`'s.
+const callablePrototypeMember = (prop: string, scope: Scope) => globalInterfaceMember('Function', prop, scope) ?? objectPrototypeMember(prop, scope);
+
+type IndexMember = Extract<TS.TypeMember, { type: 'index' }>;
+function indexMembers(members: TS.TypeMember[]): IndexMember[] {
+	return members.filter((m): m is IndexMember => m.type === 'index');
+}
+
+// A property name that is an array index (`'0'`, `'12'`), as a numeric index signature or a tuple position covers.
+function isIndexKey(prop: string): boolean {
+	return /^(0|[1-9]\d*)$/.test(prop);
+}
+
 // The declared value type of a numeric index signature (`[i: number]: T`) reachable from `t` -- searches
 // every part of an intersection (declaration merging's usual shape, e.g. an ambient interface merged with
 // a real implementing class, see `lib/typedarray.ts`'s own header comment), not just a bare object, since
@@ -2275,7 +1752,7 @@ export function indexSignatureOf(t: Type, scope: Scope, depth = 6): Type | undef
 		return undefined;
 	const r = resolveOwn(t, scope);
 	if (r.type === 'object')
-		return r.members.find((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index' && isNumberLike(m.paramType, scope))?.typeAnnotation;
+		return indexMembers(r.members).find(m => isNumberLike(m.paramType, scope))?.typeAnnotation;
 	if (r.type === 'intersection') {
 		// Last part first, as every producer of an intersection here puts the more concrete declaration
 		// last: `NodeListOf<T>`'s `[index: number]: T` must beat the `Node` it inherits from `NodeList`.
@@ -2288,22 +1765,19 @@ export function indexSignatureOf(t: Type, scope: Scope, depth = 6): Type | undef
 	return undefined;
 }
 
-// Every real call site starts at the default `depth` (only `lookupMember`'s own internal recursive
-// calls decrement it), and depth otherwise only gates the `depth < 0` truncation escape hatch below --
-// so caching keyed on (t, scope, prop) alone, ignoring depth, is safe: a cache hit can only ever
-// substitute for redoing the exact same structural walk. Types/scopes are immutable value objects here
-// (never mutated in place), so a `WeakMap` keyed on either never goes stale.
-
 // The index signature among `members` that covers key `prop`: a numeric one only a numeric-looking key (it is the more
 // specific, as TS requires), a string one every key. A numeric signature must not answer `'push'` for `String`'s `[i: number]`.
 function indexSignatureFor(members: TS.TypeMember[], prop: string, scope: Scope): Type | undefined {
-	const indexes = members.filter((m): m is Extract<TS.TypeMember, { type: 'index' }> => m.type === 'index');
+	const indexes = indexMembers(members);
 	// A well-known symbol key (`memberKey`'s `[Symbol.iterator]`) is covered only by a `symbol` index signature, never a string one.
 	if (prop.startsWith('[Symbol.'))
 		return indexes.find(m => unionMembers(m.paramType, scope).some(p => isRef(resolveOwn(p, scope), 'symbol')))?.typeAnnotation;
-	return ((/^(0|[1-9]\d*)$/.test(prop) && indexes.find(m => isNumberLike(m.paramType, scope))) || indexes.find(m => !isNumberLike(m.paramType, scope)))?.typeAnnotation;
+	return ((isIndexKey(prop) && indexes.find(m => isNumberLike(m.paramType, scope))) || indexes.find(m => !isNumberLike(m.paramType, scope)))?.typeAnnotation;
 }
 
+// Cached on (t, prop) alone, ignoring `depth`: every real call starts at the default, and depth only gates the truncation bail.
+// `skipObjectFallback`: an intersection part must not resolve `Object.prototype` members on its own, or the "first match wins"
+// search would stop before reaching a later part's real declaration (e.g. a superclass). Only `case 'intersection'` sets it.
 export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, skipObjectFallback = false): Type | undefined {
 	const key	= skipObjectFallback ? prop + '\0skip' : prop;
 	let keyMap	= scope.lookupMemberCache?.get(t);
@@ -2322,8 +1796,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 			scope.hitDepthLimit('lookupMember');
 			return ANY;
 		}
-		// A bare `ref` stamped with its own `declScope` resolves there instead of in `scope` -- the caller's chain may shadow it
-		// (e.g. DOM's `Element`). `resolve()` itself stays unaware of `declScope`; this is the one bounded place that consults it.
+		// A bare `ref` stamped with its own `declScope` resolves there instead of in `scope` -- the caller's chain may shadow it (e.g. DOM's `Element`).
 		t = resolveMembers(t, scope, depth);
 		// A LITERAL type has the members of the primitive it is a literal of. Without this, a method call
 		// on a literal receiver -- `'a,b'.split(/,/)`, `(255).toString(16)` -- typed as `any`, and towasm
@@ -2351,11 +1824,8 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 
 			case 'tuple': {
 				// A tuple's positions are real properties (`'0'`, `'1'`, ...), which is what lets a union of tuples be indexed and discriminated.
-				const at = /^(0|[1-9]\d*)$/.test(prop) && !t.elements.slice(0, +prop).some(el => el.type === 'spread') ? tupleElementType(t.elements[+prop]) : undefined;
-				if (at)
-					return at;
-				const elem = combineTypes(t.elements.map(tupleElementType).filter(x => !!x));
-				return arrayMember(elem, prop, scope, depth);
+				const at = isIndexKey(prop) && !t.elements.slice(0, +prop).some(el => el.type === 'spread') ? tupleElementType(t.elements[+prop]) : undefined;
+				return at ?? arrayMember(combineTypes(elementTypes(t, scope)), prop, scope, depth);
 			}
 
 			case 'object': {
@@ -2467,6 +1937,41 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 	}
 }
 
+export function memberOptional(t: Type, prop: string, scope: Scope, depth = 6): boolean {
+	return memberOptionalState(t, prop, scope, depth) === 'optional';
+}
+
+// `undefined` = `prop` isn't declared by this part at all -- only meaningful within an intersection, where a part
+// that doesn't mention `prop` imposes no constraint on it and must neither force it required nor count as optional.
+function memberOptionalState(t: Type, prop: string, scope: Scope, depth: number): 'optional' | 'required' | undefined {
+	t = resolveMembers(t, scope, depth);
+	if (t.type === 'object') {
+		const m = findTypeMember(t.members, prop);
+		return m ? (hasMod(m, 'optional') ? 'optional' : 'required') : undefined;
+	}
+	if (t.type !== 'intersection' && t.type !== 'union')
+		return undefined;
+	if (depth <= 0) {
+		scope.hitDepthLimit('memberOptional');
+		return undefined;
+	}
+	// A union's read is each member's read, so one member marking `prop` optional makes the whole read possibly undefined.
+	if (t.type === 'union') {
+		const states = t.types.map(p => memberOptionalState(p, prop, scope, depth - 1));
+		return states.includes('optional') ? 'optional' : states.every(s => s === 'required') ? 'required' : undefined;
+	}
+	// `prop` is optional in `A & B` only if every part that declares it marks it optional -- one part requiring it
+	// makes the combined type require it too, matching `lookupMember`'s own intersection case.
+	let anyOptional = false;
+	for (const p of t.types) {
+		const s = memberOptionalState(p, prop, scope, depth - 1);
+		if (s === 'required')
+			return 'required';
+		anyOptional ||= s === 'optional';
+	}
+	return anyOptional ? 'optional' : undefined;
+}
+
 // A shape is "sealed" when a missing member is genuinely an error (an object type we fully know),
 // as opposed to a ref/primitive/array whose built-in members this checker doesn't model.
 export function sealed(t: Type, scope: Scope, depth = 6): boolean {
@@ -2476,6 +1981,427 @@ export function sealed(t: Type, scope: Scope, depth = 6): boolean {
 	}
 	t = resolveMembers(t, scope);
 	return t.type === 'object' || (t.type === 'intersection' && t.types.every(p => sealed(p, scope, depth - 1)));
+}
+
+// ===================================================================
+//  Signatures
+// ===================================================================
+
+// An un-annotated parameter's type, inferred from its default. Widened, matching both real TS
+// (`function f(scale = 10)` declares `scale: number`, not `10`) and towasm's own declaration-side
+// `resolveParam`, which infers the same parameter through `checkerTypeOf` -- the two have to agree, or
+// a function TYPE built from a declaration lowers to a different physical signature than the
+// declaration itself does.
+function widenedDefaultType(d: JS.Expr<any> | undefined): Type | undefined {
+	const t = d && literalTypeOf(d);
+	if (!t)
+		return undefined;
+	// `literalTypeOf` types an integer literal as the wasm pseudo-type `i32` (`declare type i32 = number`),
+	// a storage refinement `widenLiterals` has no reason to touch. In a signature the declared type is
+	// plainly `number`, which is also what the declaration side infers -- same collapse `combineTypes`
+	// already does when deduplicating union members.
+	const w = widenLiterals(t);
+	return w.type === 'ref' && !w.typeArgs && WASM_PSEUDO_TYPES.has(w.name) ? NUMBER : w;
+}
+
+// JS.ParamList to TS.ParamList; a defaulted parameter counts as optional
+export function FixParams(params: JS.Params<any>): TS.Params {
+	return {
+		params: params.params.filter(p => p.key !== 'this').map((p): TS.Param => ({
+			key:			typeof p.key === 'string' ? p.key : '_',
+			modifiers:		hasMod(p, 'optional') || !!p.default ? ['optional'] : [],
+			typeAnnotation: p.typeAnnotation as Type ?? widenedDefaultType(p.default),
+			default:		p.default
+		})),
+		rest: params.rest as JS.Rest<Type>
+	};
+}
+// `declaredReturnType`: the function/arrow's own explicit annotation, captured *before* `checkFunctionBody` runs and overwrites
+// `params.returnType` with a body-inferred type for its own internal checking -- wrong for this value's type as seen externally.
+export function FixSig(params: JS.CallSig<any>, defaultRet?: Type, declaredReturnType?: Type): TS.CallSig {
+	return { ...FixParams(params),
+		returnType: declaredReturnType ?? params.returnType as Type ?? defaultRet,
+		typeParams: params.typeParams as TS.TypeParam[]
+	};
+}
+
+// TS's getMinArgumentCount: through the last parameter a call must pass -- not optional (or defaulted), and not accepting `void`.
+export function minArgumentCount(sig: TS.Params, scope: Scope): number {
+	const own = sig.params.filter(p => p.key !== 'this');
+	let n = own.length;
+	while (n > 0 && (hasMod(own[n - 1], 'optional') || (own[n - 1].typeAnnotation && unionMembers(resolveOwn(own[n - 1].typeAnnotation!, scope), scope).some(m => m.type === 'ref' && m.name === 'void'))))
+		n--;
+	return n;
+}
+
+// The declared type of argument `i`: its own parameter's, or past them the rest parameter's at that position.
+export function paramTypeAt(sig: TS.Params, i: number, scope: Scope): Type | undefined {
+	return i < sig.params.length ? sig.params[i].typeAnnotation
+		: sig.rest?.typeAnnotation && restArgType(sig.rest.typeAnnotation, i - sig.params.length, scope);
+}
+
+// Does `argTs` fit `sig` (arity, then every provided argument assignable)? `hasSpread`: a spread argument's real element
+// count is unknowable statically, so an upper-bound arity mismatch is waived the same way a `rest` param waives it.
+export function argsFit(sig: TS.CallSig, argTs: (Type | undefined)[], scope: Scope, hasSpread = false): boolean {
+	if (argTs.length < sig.params.filter(p => !hasMod(p, 'optional')).length || (!sig.rest && !hasSpread && argTs.length > sig.params.length))
+		return false;
+	// `sig.declScope`: each param's own declared type resolves names in its *declaring* module's scope, not the caller's (see `isAssignable`'s `dstScope`).
+	const dstScope = declScopeOf(sig, scope);
+	return argTs.every((t, i) => {
+		const p = sig.params[i];
+		return !t || !p?.typeAnnotation || isAssignable(t, hasMod(p, 'optional') ? TS.UnionType([p.typeAnnotation, UNDEFINED]) : p.typeAnnotation, scope, dstScope);
+	});
+}
+
+// The signatures of `kind` a value of type `t` is invoked through: a function/constructor type, or an object's (and an
+// intersection's) call/construct members.
+export function signaturesOf(t: Type, kind: 'call' | 'construct', scope: Scope): TS.CallSig[] {
+	const r			= resolveOwn(t, scope);
+	const fnKind	= kind === 'call' ? 'function' : 'constructor';
+	const parts		= r.type === 'intersection' ? r.types.map(p => resolveOwn(p, scope)) : [r];
+	return [
+		...parts.flatMap(p => p.type === fnKind ? [p as TS.CallSig] : []),
+		...collectMembers(r, scope).flatMap(m => m.type === kind ? [m] : []),
+	];
+}
+
+// A callee's construct signatures as TS resolves them on an intersection (resolveIntersectionTypeMembers): a MIXIN part -- one
+// construct signature taking only `...args: any[]` -- adds none of its own, and its instance type joins every other part's result.
+export function constructSignatures(t: Type, scope: Scope): TS.CallSig[] {
+	const parts: TS.CallSig[][] = [];
+	const collect = (x: Type, depth: number): void => {
+		const r = resolveOwn(x, scope);
+		if (r.type === 'intersection' && depth > 0)
+			r.types.forEach(p => collect(p, depth - 1));
+		else if (r.type === 'constructor')
+			parts.push([r]);
+		else if (r.type === 'object' && r.members.some(m => m.type === 'construct'))
+			parts.push(r.members.filter((m): m is TS.TypeMember & TS.CallSig => m.type === 'construct'));
+	};
+	collect(t, 8);
+	const isMixin = (sigs: TS.CallSig[]) => {
+		const rest = sigs.length === 1 && !sigs[0].params.length && sigs[0].rest?.typeAnnotation;
+		const r = rest && resolveOwn(rest, scope);
+		return !!r && r.type === 'array' && isAny(r.element);
+	};
+	const mixin = parts.map(isMixin);
+	if (mixin.length && mixin.every(m => m))
+		mixin[0] = false;
+	const mixed = parts.flatMap((sigs, i) => mixin[i] ? [sigs[0].returnType ?? ANY] : []);
+	return parts.flatMap((sigs, i) => mixin[i] ? [] : mixed.length ? sigs.map(s => ({ ...s, returnType: TS.IntersectionType([s.returnType ?? ANY, ...mixed]) })) : sigs);
+}
+
+// TS's resolveUnionSignature: invoking a union invokes whichever member the value is, so an argument must suit every
+// member and the result is any of their returns. For members with one signature each, none generic; TS stops at about
+// the same. The parameters combine pairwise as TS's combineUnionParameters does.
+export function unionSignature(t: Type, kind: 'call' | 'construct', scope: Scope): TS.CallSig | undefined {
+	const r = resolveOwn(t, scope);
+	if (r.type !== 'union')
+		return undefined;
+	const sigs = r.types.map(m => signaturesOf(m, kind, scope));
+	if (sigs.some(s => s.length !== 1 || s[0].typeParams?.length))
+		return undefined;
+	const each = sigs.map(s => s[0]);
+	const combined = each.slice(1).reduce((a, b) => combineUnionParameters(a, b, scope), each[0]);
+	return { params: combined.params, rest: combined.rest, returnType: combineTypes(each.map(s => s.returnType ?? ANY)) };
+}
+
+// Each position takes the intersection of both signatures' types there (a missing one constrains nothing), and is optional
+// only where both allow no argument. The longer one's rest stays a rest; a rest only the shorter has becomes an extra one.
+function combineUnionParameters(left: TS.CallSig, right: TS.CallSig, scope: Scope): TS.CallSig {
+	const count		= (s: TS.CallSig) => s.params.length + (s.rest ? 1 : 0);
+	const required	= (s: TS.CallSig) => s.params.reduce((n, p, i) => hasMod(p, 'optional') ? n : i + 1, 0);
+	const typeAt	= (s: TS.CallSig, i: number) => paramTypeAt(s, i, scope);
+	const both		= (a: Type | undefined, b: Type | undefined) => !a ? b ?? ANY : !b ? a : intersectTypes([a, b]);
+	const [longest, shorter] = count(left) >= count(right) ? [left, right] : [right, left];
+	const n			= count(longest);
+	const params: TS.Param[] = [];
+	let rest: TS.CallSig['rest'];
+	for (let i = 0; i < n; i++) {
+		const type = both(typeAt(longest, i), typeAt(shorter, i));
+		if (longest.rest && i === n - 1)
+			rest = JS.Rest(longest.rest.key, TS.ArrayType(type));
+		else
+			params.push(JS.Param((longest.params[i] ?? shorter.params[i]).key, type, i >= required(longest) && i >= required(shorter) ? ['optional'] : []));
+	}
+	if (!longest.rest && !!shorter.rest)
+		rest = JS.Rest(shorter.rest!.key, TS.ArrayType(typeAt(shorter, n) ?? ANY));
+	return { params, rest };
+}
+
+// A union of signatures identical up to their own type-parameter names is ONE signature (real TS's
+// `getUnionSignatures`). `(readonly T[] | T[]).map` is that shape: each part minted its own fresh `U`.
+export function mergeIdenticalSignatures(t: Type): Type {
+	if (t.type !== 'union')
+		return t;
+	const [first, ...rest] = t.types;
+	if (first.type !== 'function')
+		return t;
+	const names	= first.typeParams?.map(p => p.name) ?? [];
+	const key	= typeKey(first);
+	const same	= (f: Type) => {
+		if (f.type !== 'function' || (f.typeParams?.length ?? 0) !== names.length)
+			return false;
+		const renamed = names.length ? substituteType(f, new Map(f.typeParams!.map((p, i) => [p.name, TS.RefType(names[i])] as const))) as TS.FunctionType : f;
+		return typeKey({ ...renamed, typeParams: renamed.typeParams?.map((p, i) => ({ ...p, name: names[i] })) }) === key;
+	};
+	return rest.every(same) ? first : t;
+}
+
+// A callable candidate reachable through any nesting of unions/intersections/overload-objects -- used below to dig
+// out `.then`'s own signature regardless of how many lib files' worth of `Promise<T>` declaration merging it took.
+export function findFunctionType(t: Type, scope: Scope): TS.CallSig | undefined {
+	const r = resolveOwn(t, scope);
+	if (r.type === 'function')
+		return r;
+	if (r.type === 'object')
+		return r.members.find(m => m.type === 'call');
+	if (r.type === 'union' || r.type === 'intersection') {
+		for (const m of r.types) {
+			const f = findFunctionType(m, scope);
+			if (f)
+				return f;
+		}
+	}
+	return undefined;
+}
+
+// ===================================================================
+//  Type facts: typeof, nullishness, truthiness
+// ===================================================================
+
+// What `typeof` would report for a value of this type, or undefined when it can't be known statically --
+// which is also the only way to answer `'object'`/`'function'`, neither of which has a single physical
+// form for codegen to test for at runtime.
+// `scope`: resolve first, and resolve each union member. Omit it to answer from the type exactly as
+// given, which is what the checker's own narrowing wants (it applies this per already-split member).
+export function typeofName(t: Type, scope?: Scope): string | undefined {
+	const r = scope ? resolve(scope, t) : t;
+	switch (r.type) {
+		case 'literal':				return Array.isArray(r.value) ? 'string' : typeof r.value;
+		case 'range':				return r.base;
+		case 'function':
+		case 'constructor':			return 'function';
+		case 'array':
+		case 'tuple':
+		case 'object':				return 'object';
+		case 'intersection': {
+			// A part that makes the value a PRIMITIVE wins over the object-ish ones -- a branded
+			// `string & {brand}` is a string, and `typeof` reports it as one.
+			const parts = r.types.map(p => typeofName(p, scope));
+			return parts.find(n => n && SIMPLE_TYPES.has(n))
+				?? (parts.includes('function') ? 'function' : 'object');
+		}
+		case 'union': {
+			// Every inhabitant must agree. `unionMembers` resolves and flattens, and drops `never` -- see
+			// its own comment. Only with a `scope`; without one this stays a shallow, as-given answer.
+			const members	= scope ? unionMembers(r, scope) : r.types.filter(m => !isRef(m, 'never'));
+			const names		= new Set(members.map(m => typeofName(m, scope)));
+			return names.size === 1 && !names.has(undefined) ? [...names][0] : undefined;
+		}
+		case 'ref': {
+			if (SIMPLE_TYPES.has(r.name))
+				return r.name;
+			if (r.name === 'void' || r.name === 'null')
+				return r.name === 'void' ? 'undefined' : 'object';
+			// Whatever `resolve` left as a ref names a real class -- `typeof` is a question about the
+			// STRUCTURE, so ask for it. Guarded on actually getting one back, or a ref with no entry to
+			// expand would recurse on itself.
+			const m = scope && resolveMembers(r, scope);
+			return m && m.type !== 'ref' ? typeofName(m, scope) : undefined;
+		}
+		default:					return undefined;
+	}
+}
+
+export function isNullish(t: Type, scope: Scope): boolean {
+	const r = resolveOwn(t, scope);
+	return	r.type === 'literal'	? r.value === null
+		:	r.type === 'ref'		? r.name === 'undefined' || r.name === 'null' || r.name === 'void'
+		:	r.type === 'union'		? r.types.every(t => isNullish(t, scope))
+		:	false;
+}
+
+// The non-nullish remainder of `t` -- `t` itself, unchanged, unless it resolves to a union with at least
+// one (but not every) nullish member, in which case those members are dropped. Shared by anything
+// implementing optional-chaining semantics (`?.`/`??`), which only ever cares about the non-nullish part
+// of a value's type -- e.g. `lookupMember`'s own union case requires *every* member to have the property
+// looked up, which a bare `null`/`undefined` member never does, so a `?.` member lookup needs this run on
+// the object type first (see `checker.ts`'s own `'member'` case) or it always misses, falling back to `any`.
+// `nonNullable = false` keeps `t` whole -- unless `strictNullChecks` is off, where no value is ever treated as possibly nullish.
+export function nonNullable(t: Type, scope: Scope, nonNullable = true): Type {
+	if (!nonNullable && scope.strictNullChecks())
+		return t;
+	const r = resolveOwn(t, scope);
+	if (r.type !== 'union')
+		return t;
+	// Flattened: `Maybe<X> | undefined` hides `Maybe`'s own `null | undefined` one alias down.
+	const members	= unionMembers(r, scope);
+	const kept		= members.filter(m => !isNullish(m, scope));
+	return kept.length === 0 || kept.length === members.length ? t : combineTypes(kept);
+}
+
+// An inferred declaration or return type, as TS widens one without `strictNullChecks`: `null`/`undefined` leave a union and
+// alone become `any`. Identity when strict.
+export function widenNullish(t: Type, scope: Scope): Type {
+	if (scope.strictNullChecks())
+		return t;
+	const members	= unionMembers(t, scope);
+	const kept		= members.filter(m => !isNullOrUndefined(resolveOwn(m, scope)));
+	return !kept.length ? ANY : kept.length === members.length ? t : combineTypes(kept);
+}
+
+export function isFalsy(t: Type, scope: Scope): boolean {
+	const r = resolveOwn(t, scope);
+	return	r.type === 'literal'	? !r.value
+		:	r.type === 'ref'		? r.name === 'undefined' || r.name === 'null' || r.name === 'void'
+		:	r.type === 'range'		? r.min !== undefined && r.min === r.max && rangeIncludesZero(r)	// the single point 0
+		:	r.type === 'union'		? r.types.every(t => isFalsy(t, scope))
+		:	false;
+}
+
+export function isTruthy(t: Type, scope: Scope): boolean {
+	const r = resolveOwn(t, scope);
+	return	r.type === 'literal'		? !!r.value
+		:	r.type === 'range'			? !rangeIncludesZero(r)
+		:	r.type === 'union'			? r.types.every(m => isTruthy(m, scope))
+		:	r.type === 'intersection'	? r.types.some(m => isTruthy(m, scope))
+		:	r.type === 'ref'			? isObjectRef(r, scope)
+		:	['object', 'array', 'tuple', 'function', 'constructor'].includes(r.type);
+}
+
+// True when a value of this type is truthy whenever it is non-null -- an object, an array, a tuple, a
+// function. Never a `string` (`''` is falsy), a `number` (`0`, `NaN`), a `boolean`, a literal, or a
+// genuinely dynamic `any`/type parameter, for all of which truthiness is a property of the VALUE.
+// Answered from the CHECKER's type, which is the only thing that still knows a boxed `any` slot holds
+// `Stmt | undefined` rather than something that could be `0`.
+export function alwaysTruthy(t: Type, scope: Scope): boolean {
+	const r = resolve(scope, t);
+	switch (r.type) {
+		case 'object': case 'array': case 'tuple':	case 'function': case 'constructor':
+			return true;
+		case 'union':
+			// An all-nullish union lands here as `true`, which is still correct: the null test below
+			// answers `false` for it, which is what it always is. `T.unionMembers` drops `never` and
+			// flattens nested aliases -- see its own comment.
+			return unionMembers(r, scope).every(m => isNullish(m, scope) || alwaysTruthy(m, scope));
+		case 'intersection':
+			// A value satisfying an intersection satisfies every part, so one object-ish part is enough
+			// to make it an object -- unless another part makes it a PRIMITIVE (a branded
+			// `string & {brand}`), where truthiness is still the primitive's own. An interface that
+			// `extends` another resolves to exactly this (`FunctionType` = `{type:'function'} & CallSig`).
+			return r.types.some(m => alwaysTruthy(m, scope))
+				&& !r.types.some(m => ['ref', 'literal'].includes(resolve(scope, m).type));
+		case 'ref':
+			// `never` is uninhabited, so no value can BE the falsy one -- vacuously true, and a union
+			// member `JS.Stmt<any>` really has (a generic parameter substituted away). Every other `ref`
+			// surviving `resolve` is a primitive or an unresolved name, neither decidable here.
+			return r.name === 'never';
+		default:
+			// A literal, `keyof`, a conditional, a type parameter: not decidable here either.
+			return false;
+	}
+}
+
+// A class or interface instance is an object, never falsy -- TS's object type facts. Not an empty shape (`{}`, `Object`),
+// which a primitive satisfies, nor anything unresolved.
+function isObjectRef(r: TS.RefType, scope: Scope): boolean {
+	if (INTRINSIC_TYPES.has(r.name))
+		return false;
+	const m = resolveMembers(r, scope);
+	return m.type === 'object' ? m.members.length > 0 : m.type === 'intersection' && m.types.some(p => p.type === 'object' && p.members.length > 0);
+}
+
+export function makeNullish(type: Type) {
+	if (type.type === 'ref') {
+		switch (type.name) {
+			case 'bigint':
+			case 'number':	return Literal(0);
+			case 'boolean':	return Literal(false);
+			case 'string':	return Literal('');
+		}
+	}
+	if (type.type === 'range') {
+		// A range provably excluding 0 can never take its "one falsy value" -- that branch is unreachable for it.
+		if (!rangeIncludesZero(type))
+			return NEVER;
+		return type.base === 'number' ? Literal(0) : TS.RangeType('bigint', 0n, 0n);
+	}
+	return type;
+}
+
+export function isOther(op: string) {
+	return op === '?' ? isNullish : op === '|' ? isFalsy : isTruthy;
+}
+
+// What `a && b` / `a || b` / `a ?? b` yields from `a` when it short-circuits: a boolean survives `||` only as true and
+// `&&` only as false, and `&&` narrows a string/number to its one falsy literal (`||`'s truthy side has no single value).
+export function logicalLeftPart(t: Type, op: string, scope: Scope): Type {
+	const other	= isOther(op[0]);
+	return combineTypes(unionMembers(t, scope).flatMap(m => {
+		const p = resolveOwn(m, scope);
+		if (other(p, scope))
+			return [];
+		if (op !== '??' && isBoolean(p))
+			return [Literal(op === '||')];
+		return [op === '&&' ? makeNullish(p) : m];
+	}));
+}
+
+export function isBigint(t: Type, scope: Scope): boolean {
+	const r = resolveOwn(t, scope);
+	return r.type === 'ref'		? r.name === 'bigint'
+		: r.type === 'literal'	? typeof r.value === 'bigint'
+		: r.type === 'range'	? r.base === 'bigint'
+		: r.type === 'union'	? r.types.every(m => isBigint(m, scope))
+		: false;
+}
+
+// Inferred unions over-approximate, so only complain when no member could be numeric
+export function isNumberLike(t: Type, scope: Scope): boolean {
+	const r = resolveOwn(t, scope);
+	return r.type === 'union' ? r.types.some(m => isAssignable(m, NUMERIC, scope)) : isAssignable(r, NUMERIC, scope);
+}
+
+export function isStringLike(t: Type, scope: Scope): boolean {
+	const r = resolveOwn(t, scope);
+	return isString(r)
+		|| isLiteral(r, 'string')
+		|| (r.type === 'union' && r.types.some(t => isStringLike(t, scope)));
+}
+
+// Three-valued: `undefined` is "couldn't fully resolve this" (e.g. an alias not reachable through this `scope`'s import chain) and must not be
+// treated as a confirmed `false`, or `conditionalExtends` below would wrongly fall through to the leniency it exists to guard against.
+function isLiteralOnly(t: Type, scope: Scope, depth = 6): boolean | undefined {
+	switch (t.type) {
+		case 'literal':	return true;
+		// A CLASS is definitively not a literal union -- `undefined` here means "could not look the name
+		// up", which stopped being true for classes once `resolve` began keeping them nominal, and left
+		// `string extends RegExp` undecidable in `case 'conditional'`.
+		case 'ref':		return INTRINSIC_TYPES.has(t.name) || isClassRef(t, scope) ? false : undefined;
+		case 'union':
+			if (depth >= 0) {
+				const parts = t.types.map(m => isLiteralOnly(resolveOwn(m, scope), scope, depth - 1));
+				return parts.some(p => p === false) ? false : parts.every(p => p === true) ? true : undefined;
+			}
+			scope.hitDepthLimit('isLiteralOnly');
+			return undefined;
+		default:
+			return false;
+	}
+}
+
+// ===================================================================
+//  Assignability
+// ===================================================================
+
+// An intersection of type parameters, at their constraints and normalized. Undefined when no part is abstract (nothing to gain)
+// or the bound came back unchanged, which would make `isAssignable` ask the same question again.
+function intersectionConstraint(t: TS.IntersectionType, scope: Scope): Type | undefined {
+	if (!t.types.some(p => isAbstract(p, scope)))
+		return undefined;
+	const bound = resolve(scope, TS.IntersectionType(t.types.map(p => isAbstract(p, scope) ? resolve(scope, p) : p)));
+	return bound.type === 'intersection' && bound.types.length === t.types.length && bound.types.every((b, i) => b === t.types[i]) ? undefined : bound;
 }
 
 // `t`'s union constituents, resolved, with `boolean` as `true | false`.
@@ -2772,6 +2698,173 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 	return recurse(src, dst, depth);
 }
 
+// ===================================================================
+//  Inference
+// ===================================================================
+
+// TS's hasPrimitiveConstraint: a type parameter bounded by a primitive (`T extends string`, a literal union) infers the
+// literal itself, unwidened -- `f<T extends string>(x: T): T` called with 'a' is 'a'.
+function primitiveConstraint(c: Type | undefined, scope: Scope): boolean {
+	return !!c && unionMembers(c, scope).some(m => PRIMITIVE_DOMAINS.has(domainOf(resolveOwn(m, scope), scope) ?? ''));
+}
+
+// Structurally matches `pattern` (an `extendsType` containing `infer` nodes) against `actual`, binding each `infer X` into `out`.
+// Three-valued like `conditionalExtends`: `false` only on outright conflict, `undefined` when unresolvable -- never guessed.
+function matchInfer(pattern: Type, actual: Type, scope: Scope, out: Map<string, Type>, depth = 6): boolean | undefined {
+	if (depth < 0) {
+		scope.hitDepthLimit('matchInfer');
+		return undefined;
+	}
+	if (pattern.type === 'infer') {
+		if (!out.has(pattern.name))
+			out.set(pattern.name, actual);
+		return !pattern.constraint || isAssignable(actual, pattern.constraint, scope);
+	}
+	if (!containsKind(pattern, 'infer'))
+		return isAssignable(actual, pattern, scope);
+
+	const a = normalizeArray(resolve(scope, actual, depth - 1));
+	if (pattern.type === 'ref' && pattern.typeArgs) {
+		if (pattern.name === 'ReadonlyArray') {
+			const patternEl = pattern.typeArgs[0];
+			if (a.type === 'ref' && a.name === 'Array' && a.typeArgs?.length)
+				return matchInfer(patternEl, a.typeArgs[0], scope, out, depth - 1);
+			if (a.type === 'tuple')
+				return a.elements.every(e => { const t = tupleElementType(e); return !t || matchInfer(patternEl, t, scope, out, depth - 1) !== false; }) || undefined;
+		} else if (pattern.name === 'Array' && a.type === 'tuple' && pattern.typeArgs.length === 1) {
+			const patternEl = pattern.typeArgs[0];
+			return a.elements.every(e => { const t = tupleElementType(e); return !t || matchInfer(patternEl, t, scope, out, depth - 1) !== false; }) || undefined;
+		}
+		// Checks the *unresolved* `actual` for a same-named ref first -- `scope.resolve` would eagerly expand it, losing the
+		// "named `Promise<number>`" identity this needs; only falls back to the resolved form for an alias needing one unwrap.
+		const named = actual.type === 'ref' && actual.typeArgs && actual.name === pattern.name ? actual
+			: a.type === 'ref' && a.typeArgs && a.name === pattern.name ? a
+			: undefined;
+		if (!named) {
+			// The pattern's own name may still describe a shape the actual can match: an interface or alias expands
+			// (`Term<infer U>` -> `{t: infer U}`), and the structural cases below then decide it properly. A class ref stays
+			// nominal through `resolve`, so this cannot loop. Without it a chain like `T extends Term<infer U> ? U : T extends
+			// (() => infer U) ? U : never` gave up at the FIRST branch (undecidable) instead of falling to the second.
+			const expanded = resolve(scope, pattern, depth - 1);
+			if (expanded.type !== 'ref' || expanded.name !== pattern.name)
+				return matchInfer(expanded, actual, scope, out, depth - 1);
+			// A resolved primitive (`string`, `number`, &c) can never structurally match a generic ref pattern
+			// like `PromiseLike<infer R>` -- no type arguments, no generic shape -- so this is a confident `false`,
+			// not the usual "differently-named, could still be an unresolved match" `undefined`. A function type is the
+			// same answer for the same reason: it has no keyed members, and a class ref (kept nominal by `resolve`, so it
+			// never expanded above) is not something a function value is an instance of.
+			return isPrimitive(a) || a.type === 'function' || a.type === 'constructor' ? false : undefined;
+		}
+		return pattern.typeArgs.length === named.typeArgs!.length
+			&& pattern.typeArgs.every((p, i) => matchInfer(p, named.typeArgs![i], scope, out, depth - 1) !== false)
+			|| undefined;
+	}
+	if (pattern.type === 'array') {
+		// `a` was normalized to `Array<T>`/`ReadonlyArray<T>` above -- no longer `'array'` itself -- so this reads its element
+		// back out through `arrayLikeElement` instead of `a.element` directly.
+		const ael = arrayLikeElement(a);
+		return ael !== undefined ? matchInfer(pattern.element, ael, scope, out, depth - 1)
+			: a.type === 'tuple' ? a.elements.every(e => {
+				const t = tupleElementType(e);
+				return t && matchInfer(pattern.element, t, scope, out, depth - 1) !== false;
+			}) || undefined
+			: false;
+	}
+	if (pattern.type === 'tuple') {
+		if (a.type !== 'tuple')
+			return undefined;
+		// A trailing `...infer Rest` (or `...unknown[]`) only has to line up against whatever's left after the fixed leading elements match --
+		// unlike the fixed-length case below, `a` may have *more* elements than `pattern`'s leading portion.
+		const last = pattern.elements.at(-1);
+		if (last?.type === 'spread') {
+			const lead = pattern.elements.slice(0, -1);
+			if (a.elements.length < lead.length)
+				return false;
+			// `a` itself may contain a spread anywhere in the range being matched here (e.g. `[...T[]]`, the
+			// common encoding for "array of unknown length" reaching this branch as a genuine `tuple` rather
+			// than tison's own `array` kind, which `normalizeArray` above would already have converted to
+			// `Array<T>` and failed the `a.type !== 'tuple'` check before this point) -- unlike `tupleElementType`
+			// (which deliberately returns `undefined` for a spread elsewhere, since a spread has no *single*
+			// element value), a pattern position lining up against one still needs *some* type to bind its
+			// `infer` against, and the spread's own argument is exactly that (matches real TS's inference for
+			// `[infer First, ...infer Rest]` against a plain array type).
+			const elementTypeAt = (te: TS.TupleElement) => te.type === 'spread' ? te.argument : tupleElementType(te);
+			if (!lead.every((p, i) => {
+				const at = elementTypeAt(a.elements[i]), pt = tupleElementType(p);
+				return !at || !pt || matchInfer(pt, at, scope, out, depth - 1) !== false;
+			}))
+				return false;
+			if (!containsKind(last.argument, 'infer'))
+				return true;
+			const rest = a.elements.slice(lead.length).map(elementTypeAt);
+			return rest.every(t => !!t) && matchInfer(last.argument, TS.ArrayType(combineTypes(rest)), scope, out, depth - 1) !== false || undefined;
+		}
+		return a.elements.length === pattern.elements.length
+			&& a.elements.every((e, i) => {
+				const at = tupleElementType(e), pt = tupleElementType(pattern.elements[i]);
+				return !at || !pt || matchInfer(pt, at, scope, out, depth - 1) !== false;
+			})
+			|| undefined;
+	}
+	if (pattern.type === 'function' || pattern.type === 'constructor') {
+		// An overloaded value (`((s: sync._stream) => T) & ((s: async._stream) => Promise<T>)`) is a genuine
+		// `intersection` of signatures, not a single one -- matches if *any* overload does, same as a real call
+		// picking whichever signature fits.
+		if (a.type === 'intersection')
+			return a.types.some(m => matchInfer(pattern, m, scope, out, depth - 1) === true) || undefined;
+		return a.type !== pattern.type ? false
+			: pattern.returnType && a.returnType ? matchInfer(pattern.returnType, a.returnType, scope, out, depth - 1)
+			: undefined;
+	}
+
+	if (pattern.type === 'union') {
+		// non-distributive: `infer` inside a pattern-side union is rare and real TS's handling here is itself subtle -- best-effort only.
+		for (const p of pattern.types) {
+			if (matchInfer(p, actual, scope, out, depth - 1))
+				return true;
+		}
+		return undefined;
+	}
+	if (pattern.type === 'object') {
+		// `a` may be a plain object/intersection with call/construct signature *members* (`{new(...): infer R}`
+		// matched structurally), or itself a bare `constructor`/`function` value (e.g. a class reference used as
+		// a spec entry) -- semantically the same thing for matching purposes, so both are checked below.
+		const aMembers = a.type === 'object' ? a.members : a.type === 'intersection' ? a.types.flatMap(x => x.type === 'object' ? x.members : []) : undefined;
+		for (const m of pattern.members) {
+			// `new(...): infer R` / `(...): infer R` -- a call/construct signature, not a keyed property: matched
+			// against `a`'s own signature of the same kind, if it has one (a plain data-spec object never does,
+			// which correctly fails this branch rather than silently binding nothing, as an unhandled member
+			// kind falling through the loop below used to).
+			if (m.type === 'call' || m.type === 'construct') {
+				if (!m.returnType || !containsKind(m.returnType, 'infer'))
+					continue;
+				const aReturnType = m.type === 'construct' && a.type === 'constructor' ? a.returnType
+					: m.type === 'call' && a.type === 'function' ? a.returnType
+					: (aMembers?.find(x => x.type === m.type) as TS.CallSig)?.returnType;
+				if (!aReturnType)
+					return false;
+				if (matchInfer(m.returnType, aReturnType, scope, out, depth - 1) === false)
+					return false;
+				continue;
+			}
+			if (m.type !== 'property' || typeof m.key !== 'string' || !containsKind(m.typeAnnotation, 'infer'))
+				continue;
+			// A function/constructor type HAS no keyed members, so a required property is a confident miss -- same answer the
+			// absent-property case below gives. Anything else isn't a shape this can look a property up in at all.
+			if (!aMembers)
+				return a.type === 'function' || a.type === 'constructor' ? (hasMod(m, 'optional') ? undefined : false) : undefined;
+			// `lookupMember` gets its own fresh budget, not `matchInfer`'s remaining `depth` -- unrelated recursions, same
+			// reasoning as `lookupMember`'s own `resolve()` call and `isAssignable`'s per-member `lookupMember` call.
+			const t = lookupMember(a, m.key, scope);
+			if (!t)
+				return hasMod(m, 'optional') ? undefined : false;
+			if (matchInfer(m.typeAnnotation, t, scope, out, depth - 1) === false)
+				return false;
+		}
+		return true;
+	}
+	return undefined;
+}
 
 // TS's choice among a type parameter's candidates: covariant ones if any -- the object/array-literal ones first pooled into one
 // union (`unionObjectAndArrayLiteralCandidates`), then literals of one primitive UNION, otherwise the leftmost candidate every
@@ -2885,19 +2978,6 @@ export class Inference {
 	}
 }
 
-// Does `argTs` fit `sig` (arity, then every provided argument assignable)? `hasSpread`: a spread argument's real element
-// count is unknowable statically, so an upper-bound arity mismatch is waived the same way a `rest` param waives it.
-export function argsFit(sig: TS.CallSig, argTs: (Type | undefined)[], scope: Scope, hasSpread = false): boolean {
-	if (argTs.length < sig.params.filter(p => !hasMod(p, 'optional')).length || (!sig.rest && !hasSpread && argTs.length > sig.params.length))
-		return false;
-	// `sig.declScope`: each param's own declared type resolves names in its *declaring* module's scope, not the caller's (see `isAssignable`'s `dstScope`).
-	const dstScope = declScopeOf(sig, scope);
-	return argTs.every((t, i) => {
-		const p = sig.params[i];
-		return !t || !p?.typeAnnotation || isAssignable(t, hasMod(p, 'optional') ? TS.UnionType([p.typeAnnotation, UNDEFINED]) : p.typeAnnotation, scope, dstScope);
-	});
-}
-
 // Infers a generic call's type args by structurally matching each param's declared type against the argument's (first binding wins).
 // `declScope` resolves `paramT`'s own names (the signature's declaring module); `scope` resolves `argT`'s (the call site's).
 // `deferred`: when given, a callback-shaped param's own *return*-position inference (the one case that
@@ -2972,7 +3052,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 		} else if (paramT.type === 'ref' && paramT.typeArgs) {
 			// A generic alias unfolded one level (`paramT.name` is declared in `declScope`, not `scope`).
 			const entry		= declScope.type(paramT.name);
-			const unfold	= () => substituteType(entry!.type, typeArgMap(entry!.typeParams!, paramT.typeArgs));
+			const unfold	= () => instantiateEntry(entry!, paramT.typeArgs);
 			const sameName	= argT.type === 'ref' && argT.name === paramT.name;
 			if (paramT.name === 'Array' && paramT.typeArgs.length === 1 && a.type === 'array') {
 				recurse(paramT.typeArgs[0], a.element, depth - 1);
@@ -3120,23 +3200,9 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 	}
 }
 
-// A callable candidate reachable through any nesting of unions/intersections/overload-objects -- used below to dig
-// out `.then`'s own signature regardless of how many lib files' worth of `Promise<T>` declaration merging it took.
-export function findFunctionType(t: Type, scope: Scope): TS.CallSig | undefined {
-	const r = resolveOwn(t, scope);
-	if (r.type === 'function')
-		return r;
-	if (r.type === 'object')
-		return r.members.find(m => m.type === 'call');
-	if (r.type === 'union' || r.type === 'intersection') {
-		for (const m of r.types) {
-			const f = findFunctionType(m, scope);
-			if (f)
-				return f;
-		}
-	}
-	return undefined;
-}
+// ===================================================================
+//  Promises and iteration
+// ===================================================================
 
 // Peels through plain ref aliases one substitution at a time, looking for a literal `Promise<X>` ref -- unlike
 // `scope.resolve`, which would expand straight into Promise's structural body and lose the "this was a Promise" identity.
@@ -3149,15 +3215,8 @@ export function asPromiseRef(t: Type, scope: Scope, depth = 6): TS.RefType | und
 		return undefined;
 	if (t.name === 'Promise')
 		return t.typeArgs?.length ? t : undefined;
-	const entry = ownScope(t, scope).type(t.name);
-	return entry && asPromiseRef(entry.typeParams?.length
-		? substituteType(entry.type, typeArgMap(entry.typeParams, t.typeArgs))
-		: entry.type, scope, depth - 1
-	);
-}
-
-export function wrapReturnIfAsync(t: Type, scope: Scope, async: boolean|undefined): Type {
-	return !async || asPromiseRef(t, scope) ? t : TS.RefType('Promise', [t]);
+	const body = expandRefOnce(scope, t);
+	return body !== t ? asPromiseRef(body, scope, depth - 1) : undefined;
 }
 
 // `Awaited<T>` distributes over a union (e.g. `string | Promise<string>`) -- each member is awaited on its own, since
@@ -3182,6 +3241,18 @@ export function awaitType(t: Type, scope: Scope): Type {
 	return r;
 }
 
+export function wrapReturnIfAsync(t: Type, scope: Scope, async: boolean|undefined): Type {
+	return !async || asPromiseRef(t, scope) ? t : TS.RefType('Promise', [t]);
+}
+
+export function unwrapIfAsync(t: Type, scope: Scope, async: boolean|undefined): Type {
+	return async ? awaitType(t, scope) : t;
+}
+
+export function wrapType(t: Type, names: Set<string>, name: string) {
+	return t.type === 'ref' && names.has(t.name) ? t : TS.RefType(name, [t]);
+}
+
 export interface IterationTypes { yield: Type; return: Type; next: Type }
 
 // The GLOBAL iteration types whose type arguments ARE their iteration types (TS's getIterationTypesOfIterableFast): its own lib
@@ -3192,22 +3263,11 @@ const ASYNC_ITERABLES	= new Set(['AsyncIterable', 'AsyncIterableIterator', 'Asyn
 function globalIterationTypes(t: Type, scope: Scope, async: boolean, generatorReturn: boolean): IterationTypes | undefined {
 	if (t.type !== 'ref' || !((async ? ASYNC_ITERABLES : ITERABLES).has(t.name) || (generatorReturn && t.name === (async ? 'AsyncIterator' : 'Iterator'))))
 		return undefined;
-	let root = scope;
-	while (root.parent)
-		root = root.parent;
 	const entry = ownScope(t, scope).lookupType(t.name);
-	if (!entry?.typeParams || entry !== root.type(t.name))
+	if (!entry?.typeParams || entry !== scope.root().type(t.name))
 		return undefined;
 	const [y, r, n] = [...typeArgMap(entry.typeParams, t.typeArgs, UNKNOWN).values()];
 	return { yield: y ?? UNKNOWN, return: r ?? ANY, next: n ?? ANY };
-}
-
-
-// What iterating `t` yields, and returns once done (TS's iteration types): read off its `[Symbol.iterator]()` iterator's
-// `next()` result (`for await` tries `[Symbol.asyncIterator]` first). Without the protocol (an ES5 lib) only arrays and strings iterate.
-// `iterator.next()`: JS sends `undefined` to a `next` that takes a value (a generator's).
-export function nextCall(iterator: Expr, it: IterationTypes, typeScope: Scope): Expr {
-	return JS.Call(JS.Member(iterator, 'next'), isNullish(it.next, typeScope) ? [] : [{ type: 'identifier', name: 'undefined' }]);
 }
 
 export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6, generatorReturn = false): IterationTypes | undefined {
@@ -3253,7 +3313,7 @@ export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6, 
 		}
 		// `next`: what `next(v)` accepts, which a generator's `yield` evaluates to -- `next(...[value]: [] | [TNext])` spells it as a rest.
 		return { yield: combineTypes(yields), return: combineTypes(returns),
-			next: nextSig.params[0]?.typeAnnotation ?? (nextSig.rest?.typeAnnotation && restArgType(nextSig.rest.typeAnnotation, 0, scope)) ?? UNDEFINED };
+			next: paramTypeAt(nextSig, 0, scope) ?? UNDEFINED };
 	};
 	if (async) {
 		const own = protocol('[Symbol.asyncIterator]');
@@ -3265,88 +3325,13 @@ export function iterationTypes(t: Type, scope: Scope, async = false, depth = 6, 
 	const found = protocol('[Symbol.iterator]');
 	if (found)
 		return found;
-	const direct = r.type === 'array' ? r.element
-		: arrayLikeElement(r) ?? (r.type === 'tuple' ? combineTypes(r.elements.map(tupleElementType).filter(x => !!x)) : isString(r) ? STRING : undefined);
+	const direct = arrayLikeElement(r) ?? (r.type === 'tuple' ? combineTypes(elementTypes(r, scope)) : isString(r) ? STRING : undefined);
 	return direct && { yield: direct, return: UNDEFINED, next: UNDEFINED };
 }
 
-export function unwrapIfAsync(t: Type, scope: Scope, async: boolean|undefined): Type {
-	return async ? awaitType(t, scope) : t;
-}
-
-
-export function memberOptional(t: Type, prop: string, scope: Scope, depth = 6): boolean {
-	return memberOptionalState(t, prop, scope, depth) === 'optional';
-}
-
-// `undefined` = `prop` isn't declared by this part at all -- only meaningful within an intersection, where a part
-// that doesn't mention `prop` imposes no constraint on it and must neither force it required nor count as optional.
-function memberOptionalState(t: Type, prop: string, scope: Scope, depth: number): 'optional' | 'required' | undefined {
-	t = resolveMembers(t, scope, depth);
-	if (t.type === 'object') {
-		const m = findTypeMember(t.members, prop);
-		return m ? (hasMod(m, 'optional') ? 'optional' : 'required') : undefined;
-	}
-	if (t.type !== 'intersection' && t.type !== 'union')
-		return undefined;
-	if (depth <= 0) {
-		scope.hitDepthLimit('memberOptional');
-		return undefined;
-	}
-	// A union's read is each member's read, so one member marking `prop` optional makes the whole read possibly undefined.
-	if (t.type === 'union') {
-		const states = t.types.map(p => memberOptionalState(p, prop, scope, depth - 1));
-		return states.includes('optional') ? 'optional' : states.every(s => s === 'required') ? 'required' : undefined;
-	}
-	// `prop` is optional in `A & B` only if every part that declares it marks it optional -- one part requiring it
-	// makes the combined type require it too, matching `lookupMember`'s own intersection case.
-	let anyOptional = false;
-	for (const p of t.types) {
-		const s = memberOptionalState(p, prop, scope, depth - 1);
-		if (s === 'required')
-			return 'required';
-		anyOptional ||= s === 'optional';
-	}
-	return anyOptional ? 'optional' : undefined;
-}
-
-// Expands a `ref` one level into its declared body (substituting type args), without recursing further --
-// used only on an overload's own return type below, so the printing walk (`resolveTypes`) still resolves
-// whatever `conditional`/`indexed_access`/&c machinery the body exposes, while named refs nested inside it
-// (e.g. a helper return type) print as names rather than getting eagerly flattened too.
-export function expandRefOnce(scope: Scope, t: Type): Type {
-	if (t.type !== 'ref')
-		return t;
-	const entry = ownScope(t, scope).lookupType(t.name);
-	if (!entry)
-		return t;
-	return entry.typeParams?.length
-		? substituteType(entry.type, typeArgMap(entry.typeParams, t.typeArgs))
-		: entry.type;
-}
-
-// A stable key for narrowing simple property chains (`a.b.c`), sharing the Scope narrowings map with plain identifiers (dotted keys can never collide with real bindings)
-export function pathKey(e: Expr): string | undefined {
-	switch (e.type) {
-		case 'identifier':	return e.name;
-		case 'this':		return 'this';
-		case 'member': {
-			const k = pathKey(e.object);
-			return k && k + '.' + e.property;
-		}
-		// A LITERAL index names one fixed element, so `a[0].k` is as stable a path as `a.b.k` and narrows
-		// the same way (real TS narrows element access on a literal index too). A COMPUTED one must not:
-		// the index expression can evaluate differently between the guard and the read.
-		case 'index': {
-			const k = pathKey(e.object);
-			if (k === undefined || e.index.type !== 'literal')
-				return undefined;
-			const v = e.index.value;
-			return typeof v === 'number' ? `${k}[${v}]` : typeof v === 'string' ? `${k}["${v}"]` : undefined;
-		}
-		default:			return undefined;
-	}
-}
+// ===================================================================
+//  Scopes
+// ===================================================================
 
 // `isTypeParam`: registered via `Scope.addTypeParam`, not a real, resolvable type alias -- `isAbstract`'s
 // own `'ref'` case treats a flagged entry as still abstract despite having a real `scope.type()` entry
@@ -3501,18 +3486,25 @@ export class Scope {
 		return ns;
 	}
 
-	lookupType(name: string): TypeEntry | undefined {
+	// A dotted name's namespace scope, beside its last part.
+	qualified(name: string): [Scope | undefined, string] {
 		const parts	= name.split('.');
 		const last	= parts.pop()!;
-		const ns	= this.lookupScope(parts);
+		return [this.lookupScope(parts), last];
+	}
+
+	lookupType(name: string): TypeEntry | undefined {
+		const [ns, last] = this.qualified(name);
 		return ns?.type(last);
 	}
 
 	lookupValue(name: string): TS.Type | undefined {
-		const parts	= name.split('.');
-		const last	= parts.pop()!;
-		const ns	= this.lookupScope(parts);
+		const [ns, last] = this.qualified(name);
 		return ns?.value(last);
+	}
+
+	root(): Scope {
+		return this.parent?.root() ?? this;
 	}
 	
 
@@ -3602,362 +3594,4 @@ export function makeGlobal() {
 	]));
 */
 	return global;
-}
-
-// JS `fn.length`: the parameters before the first defaulted one; a rest parameter and a TS `this` parameter never count.
-export function jsLength(params: { key: unknown; default?: unknown }[]): number {
-	const own = params.filter(p => p.key !== 'this');
-	const i = own.findIndex(p => p.default !== undefined);
-	return i < 0 ? own.length : i;
-}
-
-// A `get`/`set` accessor's `methodDecls`/`inlineMethods`/`funcs` key, mangled apart from a plain same-named
-// method so a getter and a setter for one property can coexist as two entries instead of overwriting each other.
-export function accessorKey(kind: 'get' | 'set', name: string): string {
-	return `${kind}:${name}`;
-}
-
-// A structural shape's expando identity: its member names. A named shape and its anonymous twin share it, so they get
-// the same expando fields and `layoutTwin` can still merge them.
-export function shapeKey(members: readonly TS.TypeMember[]): string {
-	return `#shape#${members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string' ? [m.key] : []).sort().join(',')}`;
-}
-
-// Substitutes a generic class's own single type parameter (`PARAM`) for `subs` throughout its decl -- shared
-// by `builtinOwner` and `ensureClass`. `thisTsType`, when given, also substitutes a `T[]`-shaped member type for the whole instantiation itself -- specific to `Array<T>`'s own shape, ordinary callers omit it.
-export function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<string, Type>): JS.ClassDecl<Type> {
-	const out = walker(undefined, undefined, (t, process) =>
-		t.type === 'ref' && map.has(t.name) ? map.get(t.name) : process(t)
-	).statement(decl)!;
-	// A STATIC member is restored verbatim: real TS forbids one referencing its class's type parameters, so
-	// substituting into one can only corrupt a static's OWN same-named type parameter -- `Array<any>`'s
-	// `_alloc<T>(n): T[]` became `any[]`, allocating `arr:ref` whatever it was called with, so `$ret` never had a chance to resolve it.
-	// Order is structural, so `out.body[i]` is `decl.body[i]` throughout.
-	out.body = out.body.map((m, i) => hasMod(decl.body[i] as { modifiers?: string[] }, 'static') ? decl.body[i] : m);
-	return out;
-}
-
-// Applies a whole set of type-param substitutions in one `walk` pass; unlike `substituteClassTypeParam` (one name,
-// re-invoked once per class type param), the caller resolves `map` for both the explicit-type-args and
-// inferred-from-arguments cases (see `ensureGenericFunc`).
-export function substituteTypeParams(map: ReadonlyMap<string, Type>): Walker {
-	return walker(
-		// The checker's stamps are the TEMPLATE's scopes, where `T` is opaque: stale for an instance, which `instantiateDecl`
-		// re-checks so its own narrowing (on the concrete types) is stamped afresh.
-		(s, process) => { const built = process(s); delete (built as any).scope; return built; },
-		(e, process) => { const built = process(e); delete (built as any).scope; return built; },
-		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
-	);
-}
-
-export function isAsm(e?: Expr): e is JS.Call<Type> {
-	return e?.type === 'call' && e.callee.type === 'identifier' && e.callee.name === '__asm';
-}
-
-export function isAsmMethod(m: JS.Method<Type>): JS.Call<Type> | undefined {
-	if (m.body?.[0]?.type === 'return') {
-		const outer = m.body[0].argument;
-		if (outer?.type === 'call' && isAsm(outer.callee)) {
-			const paramNames = m.params.map(p => typeof p.key === 'string' ? p.key : undefined);
-			const argNames = outer.arguments.map(a => a.type === 'identifier' ? a.name : undefined);
-			if (paramNames.length === argNames.length && paramNames.every((p, i) => p !== undefined && p === argNames[i]))
-				return outer.callee;
-		}
-	}
-}
-
-export function genericKey(name: string, typeParams: readonly TS.TypeParam[], map: Map<string, Type>, scope: Scope) {
-	return `${name}<${typeParams.map(p => typeKey(resolve(scope, map.get(p.name)!))).join(',')}>`;
-}
-
-export function homeKey(homeModule: string, name: string) {
-	return homeModule === '.' ? name : homeModule + '\0' + name;
-}
-
-// A structural `{[k: string]: V}` type has no nominal class, so it gets no owner; routed to `Map<string, V>`, whose `get`/`set` (`case 'index'`) plus `delete`/`has`/`keys` already cover it.
-// Purely a shared-implementation choice, invisible to the source: real `{}`/bracket/`delete`/`in`/`for...in` stays genuine syntax.
-export function indexSignatureValueType(w: Type): Type | undefined {
-	if (w.type !== 'object' || w.members.length !== 1)
-		return undefined;
-	const m = w.members[0];
-	return m.type === 'index' && m.paramType.type === 'ref' && m.paramType.name === 'string' ? m.typeAnnotation : undefined;
-}
-
-// A guard can refine a union member past anything physical (`Lit<string>` out of `Lit<string | number>`),
-// but a value's struct is fixed when it is built: each refined part maps back to the one member it came from.
-export function backToDeclaredMembers(narrowed: Type, base: Type, scope: Scope): Type {
-	const r = resolve(scope, base);
-	if (r.type !== 'union')
-		return narrowed;
-	const members	= unionMembers(r, scope);
-	const declared	= new Set(members.map(m => typeKey(m)));
-	const refined	= unionMembers(resolve(scope, narrowed), scope);
-	const parts		= refined.map(p => {
-		if (declared.has(typeKey(p)))
-			return p;
-		const from = members.filter(m => !isAny(m) && isAssignable(p, m, scope));
-		return from.length === 1 ? from[0] : p;
-	});
-	return parts.some((p, i) => p !== refined[i]) ? combineTypes(parts) : narrowed;
-}
-
-// The possible values for a field whose declared type is a pure literal or union of literals (a real discriminant, e.g. a
-// class member's `type: 'method'|'get'|'set'`); `undefined` for anything else (an ordinary wider field that merely happens
-// to hold a constant-looking value at one call site), meaning "no signal, doesn't rule a candidate in or out". Shared by every
-// discriminant tiebreak in this file (`matchObjectShape`/`matchObjectShapeByType`/`matchContextualUnionMember`); checking
-// only `declType.type === 'literal'` independently misses a union of literal tags (any real discriminated union with >2 arms
-// sharing one field), silently treating a candidate that can never hold the value as an unconstrained match rather than a definite mismatch.
-export function literalValues(t: Type): unknown[] | undefined {
-	return t.type === 'literal' ? [t.value]
-		: t.type === 'union' && t.types.every((m): m is Literal<string | number | boolean | null | JS.TemplatePart<Type>[]> => m.type === 'literal') ? t.types.map(m => m.value)
-		: undefined;
-}
-
-// Resolves any `Type` down to a real flat `ObjectType`, if possible: a plain `'object'` already is one; an `extends`
-// intersection's own parts can still be unresolved refs (`CallSig<T>`) -- `T.flattenIntersection`'s `resolveOwn`
-// handles that, and `T.mergeIntersection` folds the flattened parts into one flat object. Shared by `ownerFor`'s
-// `'intersection'` case and `matchContextualUnionMember` below, so both agree on the exact same flat shape (and the
-// same `T.typeKey`/struct) for a given declared type; duplicating the merge risks subtly different shapes for one interface.
-export function resolveObjectType(t: Type, scope: Scope): TS.ObjectType | undefined {
-	const w = resolve(scope, t);
-	if (w.type === 'object')
-		return w;
-	if (w.type === 'intersection') {
-		const merged = mergeIntersection(TS.IntersectionType(flattenIntersection(w, scope)));
-		return merged.type === 'object' ? merged : undefined;
-	}
-	return undefined;
-}
-
-// Emits a call's arguments, shared by every call site (`emitCall`/`emitMethodCall`/`new`/a closure value's own call): a rest
-// param's trailing arguments (a compile-time-known count in this subset) bundle into one array via `emitArrayElements`, the
-// same machinery an array *literal*'s own `[...a, b]` uses, so a spread there Just Works. A spread crossing into the *fixed*
-// portion (`f(...a, b)`) is unsupported -- its runtime length can't tell how many fixed params it fills. A default reading an
-// earlier parameter (`b.length`) has its references rewritten to the scratch local `emitCallArgs` binds into, matching the
-// grammar `isReemittableDefault` accepts.
-export function substituteEarlierParamRefs(e: Expr, rename: ReadonlyMap<string, string>): Expr {
-	const sub = (x: Expr) => substituteEarlierParamRefs(x, rename);
-	// A node actually REBUILT here loses its branch stamp (`stampBranch`, checker.ts), same as `substituteTypeParams`: the
-	// stamp was taken where the original parameter names were bound and cannot resolve the scratch locals they become at the
-	// call site. A node returned untouched was not rewritten, so its stamp still means what it said.
-	const out = rebuild();
-	if (out !== e)
-		delete (out as any).scope;
-	return out;
-
-	function rebuild(): Expr {
-		switch (e.type) {
-			case 'identifier': {
-				const to = rename.get(e.name);
-				return to ? { ...e, name: to } : e;
-			}
-			case 'member':		return { ...e, object: sub(e.object) };
-			// The operator shapes `isReemittableDefault` accepts must be descended into as well, or the
-			// `a` in `b = a * 2` stayed pointing at a name the call site has never heard of.
-			case 'binary':		return { ...e, left: sub(e.left), right: sub(e.right) };
-			case 'unary':		return { ...e, operand: sub(e.operand) };
-			case 'conditional':	return { ...e, test: sub(e.test), consequent: sub(e.consequent), alternate: sub(e.alternate) };
-			case 'array':		return { ...e, elements: e.elements.map(el => el && el.type !== 'spread' ? sub(el) : el) };
-			default:			return e;
-		}
-	}
-}
-
-export function structuralKey(name: string, params: JS.Param<Type>[]): string {
-	return `${name}#struct<${params.map(p => p.typeAnnotation ? typeKey(p.typeAnnotation) : '_').join(',')}>`;
-}
-
-// Returns both the resolved `Type` and its `WasmType` -- a caller declaring this param as a real local (`declareParams`) needs the former too, and re-deriving it
-// would need a `checker` instance FuncCtx doesn't have. A default is re-emitted verbatim at each omitted call site (`emitCallArgs`), so it may reference only
-// its own literal value or an *earlier* parameter (`earlierNames`, e.g. `updateBuffer(b: Uint8Array, off = 0, len = b.length)`); anything else would resolve
-// against the *call site's* scope, not the declaring function's, so it is applied in the callee instead. Literals, recursively-safe array literals, and a
-// plain (possibly chained) non-optional property read off an earlier parameter are all safe the same way -- no call, no side effect. `emitCallArgs` is what
-// makes an earlier-parameter reference resolve correctly (see its own comment); this only decides whether the *shape* is safe to attempt. A CLOSURE default
-// (`sort(compareFn = (a, b) => ...)`) is judged instead by what it CAPTURES: only its own params and the earlier params those call sites already pass --
-// anything else is an enclosing local re-emitted out of scope. `Array.sort`'s own `(a, b) => a < b ? -1 : ...` default captures nothing.
-export function closureDefaultIsSelfContained(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
-	if (e.type !== 'arrow' && e.type !== 'function')
-		return false;
-	const bound = new Set<string>(earlierNames);
-	for (const p of e.params)
-		if (typeof p.key === 'string')
-			bound.add(p.key);
-	let ok = true;
-	walker(undefined, (x, process) => {
-		if (x.type === 'identifier' && !bound.has(x.name))
-			ok = false;
-		return process(x);
-	}).body(e.body);
-	return ok;
-}
-
-export function isReemittableDefault(e: Expr, earlierNames?: ReadonlySet<string>): boolean {
-	return e.type === 'literal'
-		// `undefined` is a language CONSTANT, not a name to resolve: self-contained and side-effect-free, which is the property this predicate actually tests.
-		// The AST has a `null` literal but no `undefined` one, so it arrives as an identifier -- and `defaultsWithImplicitUndefined` synthesizes exactly this node.
-		|| (e.type === 'identifier' && e.name === 'undefined')
-		|| closureDefaultIsSelfContained(e, earlierNames)
-		|| (e.type === 'array' && e.elements.every(el => el !== undefined && el.type !== 'spread' && isReemittableDefault(el, earlierNames)))
-		// Same reasoning as the array case, and `{}` -- an all-defaults options bag -- is the common one.
-		|| (e.type === 'object' && e.properties.every(pr => pr.type === 'field' && typeof pr.key === 'string' && !!pr.value && isReemittableDefault(pr.value, earlierNames)))
-		|| (e.type === 'identifier' && !!earlierNames?.has(e.name))
-		|| (e.type === 'member' && !e.optional && isReemittableDefault(e.object, earlierNames))
-		// An OPERATOR over things already re-emittable (`b = a * 2`, `n = -1`, `x = a ? 1 : 2`) adds no new name to resolve at the call site,
-		// so it carries none of the cross-module hazard a default that *called* something would.
-		|| (e.type === 'binary' && isReemittableDefault(e.left, earlierNames) && isReemittableDefault(e.right, earlierNames))
-		|| (e.type === 'unary' && isReemittableDefault(e.operand, earlierNames))
-		|| (e.type === 'conditional' && isReemittableDefault(e.test, earlierNames) && isReemittableDefault(e.consequent, earlierNames) && isReemittableDefault(e.alternate, earlierNames));
-}
-
-// A bare `p?: T` (optional, no `= value`) is valid TS distinct from `p: T = value`, and `emitCallArgs` only ever consulted a real default expression,
-// so an optional-but-defaultless trailing param could never be omitted at a call site -- found via `lib/map.ts`'s `entries()` calling `.map()` with `thisArg` omitted.
-// Synthesizes a real `undefined` identifier as its default; `emitAs`'s own `isNullLiteral` handling already accepts a bare `undefined` wherever a nullable (or plain `any`) target is expected,
-// so this needs no further codegen support. A default only the callee can evaluate (`calleeDefault`) is applied there, so callers pass `undefined` for it too.
-export function defaultsWithImplicitUndefined(params: readonly { key: BindingTarget; default?: Expr; modifiers?: string[] }[]): (Expr | undefined)[] {
-	return params.map((p, i) => p.default && isReemittableDefault(p.default, new Set(params.slice(0, i).flatMap(q => typeof q.key === 'string' ? [q.key] : []))) ? p.default
-		: p.default || hasMod(p, 'optional') ? { type: 'identifier', name: 'undefined' } : undefined);
-}
-
-// An accessor's halves as `Object.defineProperty` stores them: one canonical `() => any` getter and `(v: any) => void`
-// setter, so every accessor slot of a kind shares one type whatever the descriptor's own closures declared.
-export function getterSig(): TS.FunctionType { return { type: 'function', params: [], returnType: ANY }; }
-
-export function setterSig(): TS.FunctionType { return { type: 'function', params: [{ key: 'v', typeAnnotation: ANY }], returnType: VOID }; }
-
-// The TS type of a HIDDEN field (`#ext`, an accessor's `#get:`/`#set:` companion) -- named in one place, so a derived shape
-// repeating its base's hidden fields repeats them exactly and stays that base's wasm subtype. Plain expandos are `any`.
-export function hiddenFieldType(name: string): Type {
-	return name === '#ext' ? TS.RefType('Map', [STRING, ANY])
-		: name.startsWith('#get:') ? getterSig()
-		: name.startsWith('#set:') ? setterSig()
-		: ANY;
-}
-
-// `declScope`: a cross-module reference (`t.declScope` on the original `RefType`, see checker.ts's/type-utils.ts's `withScope`/`declScopeOf`)
-// resolves `name` where it was declared, not where referenced -- `global` never sees a type reached only transitively (e.g. inferred off an
-// imported function's own return type) without itself being imported by name. Defaults to `global`, as every same-module caller expects.
-// A type argument that changes a generic's physical layout: a value stored unboxed, or a typed-array tag. Any other
-// occupies one ref slot whatever it is, and keying on the finite set of these also bounds `Box<T[]>`-style recursion.
-export function ownsLayout(t: Type, scope: Scope): boolean {
-	if (t.type === 'ref' && !t.typeArgs && WASM_PSEUDO_TYPES.has(t.name))
-		return true;
-	const r = resolve(scope, t);
-	return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean' || r.name === 'any');
-}
-
-// The tag is read UNRESOLVED on purpose: `T.resolve` collapses every `TypedArray` tag alike to plain `number`.
-export function layoutArgKey(t: Type, scope: Scope): string {
-	return t.type === 'ref' && !t.typeArgs && WASM_PSEUDO_TYPES.has(t.name) ? t.name : typeKey(resolve(scope, t));
-}
-
-// Would these two types occupy the same wasm slot? Answered WITHOUT building a shape -- this runs before codegen -- by the same collapse `ensureClass`
-// applies: a reference type argument erases, so `TemplatePart<unknown>` and `TemplatePart<Type>` are one layout (widening one would leave it unbuilt, with nothing for a dynamic read to find).
-export function layoutSketch(t: Type | undefined, scope: Scope, depth = 3): string {
-	if (!t || depth < 0)
-		return 'any';
-	// A GENERIC's reference is sketched unresolved: `ensureClass` collapses reference type arguments, so
-	// `TemplatePart<unknown>` and `TemplatePart<Type>` are one instantiation, which substituting them apart would hide.
-	if (t.type === 'ref' && t.typeArgs?.length && !scope.type(t.name)?.isTypeParam)
-		return `${t.name}<${t.typeArgs.map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
-	const r = resolve(scope, t);
-	const members = unionMembers(r, scope).filter(m => !isNullish(m, scope));
-	// A union of references is one `anyref`, and so is `any`/`unknown`/`object` -- `TemplatePart<unknown>`'s `exp?` and
-	// `TemplatePart<Type>`'s (a union) are the same slot, while `Sig` and `Meth` are two distinct struct references.
-	if (members.length > 1)
-		return members.every(m => !!typeOfScalar(m, scope)) ? 'num' : 'any';
-	if (r.type === 'ref') {
-		if (isAny(r) || r.name === 'unknown' || r.name === 'object')
-			return 'any';
-		const scalar = typeOfScalar(r, scope);
-		return scalar ?? `${r.name}<${(r.typeArgs ?? []).map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
-	}
-	if (r.type === 'array' || r.type === 'tuple') {
-		// A tuple is an `Array` of its combined element type, which is a reference whenever the positions differ.
-		const el = r.type === 'array' ? r.element : ANY;
-		return `arr:${ownsLayout(el, scope) ? layoutSketch(el, scope, depth - 1) : 'ref'}`;
-	}
-	if (r.type === 'object')
-		return `{${r.members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string'
-			? [`${m.key}:${layoutSketch(lookupMember(r, m.key, scope), scope, depth - 1)}`] : []).sort().join(',')}}`;
-	return 'ref';
-}
-
-// `number`/`boolean` are the only types stored unboxed; everything else is one reference slot.
-export function typeOfScalar(t: Type, scope: Scope): string | undefined {
-	const r = resolve(scope, t);
-	return r.type === 'ref' && (r.name === 'number' || r.name === 'boolean') ? r.name
-		: r.type === 'literal' ? (typeof r.value === 'number' ? 'number' : typeof r.value === 'boolean' ? 'boolean' : undefined)
-		: undefined;
-}
-
-// A readonly view is a checker-only distinction over the very same physical container; a primitive tag names a
-// scalar that is stored unboxed, which `typeOfScalar` and `primitivePart` are the two readers of.
-export const READONLY_ALIAS = new Map([['ReadonlyArray', 'Array'], ['ReadonlyMap', 'Map'], ['ReadonlySet', 'Set']]);
-export const PRIMITIVE_TAGS = new Set(['string', 'number', 'boolean', 'bigint']);
-
-// The element types a REST parameter can hold, across every shape its annotation may take: a rest is physically
-// ALWAYS one array, but a tuple or tuple/array union has no array type of its own.
-export function restElementTypes(t: Type, scope: Scope, out: Type[] = [], depth = 4): Type[] {
-	const r = resolveOwn(t, scope);
-	if (r.type === 'array')
-		out.push(r.element);
-	else if (r.type === 'ref' && r.name === 'Array' && r.typeArgs?.length === 1)
-		out.push(r.typeArgs[0]);
-	else if (r.type === 'tuple')
-		out.push(...r.elements.map(el => el.type === 'labeled' || el.type === 'optional' ? el.element : el.type === 'spread' ? el.argument : el));
-	else if (r.type === 'union' && depth > 0)
-		r.types.forEach(m => restElementTypes(m, scope, out, depth - 1));
-	return out;
-}
-
-// The array-backed part of an intersection with one physical shape (an ARRAY carrying extra properties, e.g.
-// `TemplateStringsArray`): the value IS the array. Flattened over the RAW parts, never `flattenIntersection`.
-export function arrayPartOf(t: Type, scope: Scope): { part: Type; element: Type } | undefined {
-	const parts: Type[] = [];
-	const flatten = (x: Type): void => {
-		if (x.type === 'intersection')
-			x.types.forEach(flatten);
-		else
-			parts.push(x);
-	};
-	flatten(t);
-	// Matched on the part's own written shape, never through `resolve` -- that expands `Array<string>` into the
-	// class's own object shape and loses the very thing being looked for. A TUPLE part is physically the same
-	// `arr:ref`, its element the union of every position.
-	const elementOf = (x: Type) => x.type === 'array' ? x.element
-		: x.type === 'tuple' ? combineTypes(x.elements.map(el => tupleElementType(el) ?? ANY))
-		: x.type === 'ref' && x.typeArgs?.length === 1 && (READONLY_ALIAS.get(x.name) ?? x.name) === 'Array' ? x.typeArgs[0]
-		: undefined;
-	const arrays = parts.flatMap(part => {
-		// A part whose array-ness is one resolution step away -- an alias, or a mapped type over an array.
-		const element = elementOf(part) ?? elementOf(resolve(scope, part));
-		return element ? [{ part, element }] : [];
-	});
-	return arrays.length && new Set(arrays.map(a => typeKey(a.element))).size === 1 ? arrays[0] : undefined;
-}
-
-// The primitive member of an intersection, by its own `typeofName`.
-export function primitivePart(t: TS.IntersectionType, scope: Scope): Type | undefined {
-	return t.types.find(p => PRIMITIVE_TAGS.has(typeofName(p, scope) ?? ''));
-}
-
-// Every object shape a type expands to as a union member, each beside its own RAW member type. A consumer matching on
-// nominal identity must be handed the raw member -- `raw` still names a real interface, which an owner lookup resolves
-// by NAME to the one class the dispatch side builds too, where the name-stripped shape alone would build a structural twin.
-export function objectShapes(t: Type, scope: Scope): { raw: Type; objT: TS.ObjectType }[] {
-	return unionMembers(t, scope).flatMap(raw => {
-		const objT = resolveObjectType(raw, scope);
-		return objT ? [{ raw, objT }] : [];
-	});
-}
-
-// The object shape two types share field-wise, each field widened to their union.
-export function unionShapes(a: Type, b: Type, scope: Scope): TS.ObjectType | undefined {
-	const ra = resolveObjectType(a, scope), rb = resolveObjectType(b, scope);
-	if (!ra || !rb)
-		return undefined;
-	const other = new Map(rb.members.flatMap(m => m.type === 'property' && typeof m.key === 'string' ? [[m.key, m.typeAnnotation] as const] : []));
-	return TS.ObjectType(ra.members.map(m => m.type === 'property' && typeof m.key === 'string' && other.has(m.key)
-		? { ...m, typeAnnotation: combineTypes([m.typeAnnotation, other.get(m.key)!]) }
-		: m));
 }

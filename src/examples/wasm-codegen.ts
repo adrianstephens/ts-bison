@@ -19,10 +19,10 @@ import { Location } from './common';
 
 const I				= wasm.I;
 
-export type ScalarI	= 'i32' | 'i64' | 'f32' | 'f64'
+export type ScalarI		= 'i32' | 'i64' | 'f32' | 'f64'
 export type Scalar		= ScalarI | 'u32' | 'u64'
 export type ElementI	= ScalarI | 'i8' | 'i16' | 'ref';
-export type Element	= ElementI | 'u8' | 'u16' | 'u32' | 'u64';
+export type Element		= ElementI | 'u8' | 'u16' | 'u32' | 'u64';
 // The PHYSICAL shape of a closure: what wasm needs to call it, and nothing about the language that produced it. `FuncSig` extends this with the binding data only argument-binding reads.
 export interface ClosureSig	{ params: Type[]; result: Type; hasRest?: boolean }
 
@@ -41,16 +41,16 @@ export type Type		= Scalar
 
 // Shared singletons -- ctx.local compares Type by object identity
 export const ARRAY: Record<ElementI, Type> = {
-	i8: { arr: 'i8' },
-	i16: { arr: 'i16' },
-	i32: { arr: 'i32' },
-	i64: { arr: 'i64' },
-	f32: { arr: 'f32' },
-	f64: { arr: 'f64' },
-	ref: { arr: 'ref' },
+	i8:		{ arr: 'i8' },
+	i16:	{ arr: 'i16' },
+	i32:	{ arr: 'i32' },
+	i64:	{ arr: 'i64' },
+	f32:	{ arr: 'f32' },
+	f64:	{ arr: 'f64' },
+	ref:	{ arr: 'ref' },
 };
 export const REF_ANY:			Type = { ref: 'any' };
-export const REF_ANY_NULLABLE: Type = { ref: 'any', nullable: true };
+export const REF_ANY_NULLABLE:	Type = { ref: 'any', nullable: true };
 export const REF_EXN:			Type = { ref: 'exn', nullable: true };
 
 // The plain scalar kind a value acts as for arithmetic/comparison dispatch -- unwraps a boxed
@@ -69,21 +69,8 @@ export function elementKind(wtype: Type | undefined): ElementI {
 	return typeof wtype === 'string' && wtype !== 'void' ? notUnsigned(wtype) : 'ref';
 }
 
-// Wasm's own pseudo-type vocabulary: the value types a language's `declare type i32 = number`-style alias
-// stands for, so a field/method's storage can be something other than the usual `number`->f64 mapping. The
-// NAMES are wasm's, so they are owned here and a language views them (`T.WASM_PSEUDO_TYPES`) rather than
-// spelling them a second time.
-export const PSEUDO_TYPES = ['i8', 'u8', 'i16', 'u16', 'i32', 'i64', 'f32', 'f64', 'u32', 'u64'] as const;
-export type PseudoType = typeof PSEUDO_TYPES[number];
-export function isPseudoType(name: string): name is PseudoType { return (PSEUDO_TYPES as readonly string[]).includes(name); }
-
-// The VALUE type a pseudo-type occupies in a slot: wasm has no sub-32-bit value types, so the packed 8/16-bit
-// kinds widen (`i8`/`i16` -> i32, `u8`/`u16` -> u32) and every other name is its own value type. Distinct
-// from an element's physical STORAGE kind, which keeps `u8` as `u8` -- see `rawElemKind` on the language side.
-export function pseudoValueType(name: PseudoType): Scalar {
-	return name === 'i8' || name === 'i16' ? 'i32'
-		: name === 'u8' || name === 'u16' ? 'u32'
-		: name;
+export function isAny(w?: Type): boolean {
+	return typeof w === 'object' && !!w && 'ref' in w && w.ref === 'any';
 }
 
 // If `wtype` is a boxed nullable primitive (see `Types.nullable`/`Types.box`), its underlying

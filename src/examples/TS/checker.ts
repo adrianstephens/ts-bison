@@ -273,7 +273,7 @@ export function resolveOverload(label: string, decls: JS.Method<Type>[], args: E
 // Whether `args` fit candidate `c` as TS's overload resolution asks (checkExpressionWithContextualType): each argument typed
 // against the candidate's OWN parameter, since a literal's type depends on it (`new Map([['', true]])` fits only as tuples).
 export function candidateFits(c: TS.CallSig, args: Expr[], scope: Scope, typeArgs?: Type[], typedIn = args.map(() => new Map<Type | undefined, Type>()), yieldCollector?: Type[], pos: Location = { line: 0, col: 0 }): boolean {
-	const paramAt = (i: number) => c.params[i]?.typeAnnotation ?? (c.rest?.typeAnnotation && T.restArgType(c.rest.typeAnnotation, i - c.params.length, scope));
+	const paramAt = (i: number) => T.paramTypeAt(c, i, scope);
 	// A callback fits as any function (the chosen candidate fixes its parameters later); every other argument gets the final pass's
 	// own context (`argContext`). Muted and unwidened, typed once per distinct context (`typedIn`).
 	const ts = args.map((a, i) => {
@@ -2183,8 +2183,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					// it isn't available yet, and threading a still-generic shape as `expected` risks a wrong contextual guess.
 					// Past the fixed parameters the REST names the argument -- and where the rest is a tuple
 					// (or a union with one), that position's own element is the only thing that names a callback.
-					const declaredArg = (i: number) => sig!.params[i]?.typeAnnotation
-						?? (sig!.rest?.typeAnnotation && T.restArgType(sig!.rest.typeAnnotation, i - sig!.params.length, scope));
+					const declaredArg = (i: number) => T.paramTypeAt(sig!, i, scope);
 					// TS's two passes: every non-callback argument feeds the inference first, then each callback in order -- its
 					// context FIXES the type parameters its own parameters read, and its return feeds only the ones still open.
 					// Explicit type arguments leave nothing to infer.
@@ -2222,8 +2221,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						const declaredSig	= inference && declared && T.findFunctionType(declared, scope);
 						if (declaredSig)
 							a.params.forEach((p, k) => {
-								const target = declaredSig.params[k]?.typeAnnotation
-									?? (declaredSig.rest?.typeAnnotation && T.restArgType(declaredSig.rest.typeAnnotation, k - declaredSig.params.length, scope));
+								const target = T.paramTypeAt(declaredSig, k, scope);
 								if (p.typeAnnotation && target)
 									inference!.infer(target, p.typeAnnotation);
 							});

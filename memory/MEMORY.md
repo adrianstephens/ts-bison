@@ -16,6 +16,10 @@ no longer exist in the tree — run it after a rename and fix what is LIVE; hist
 | `ARR_WTYPE` | `ARRAY` | the user's pass |
 | `wasmTypeEq`, `wasmTypeKey`, `intWasmType`, `combineUnionWtypes` | `typeEq`, `typeKey`, `intType`, `combineUnion` | the user's pass |
 | `typeofHeapType(tag, types)` | `Types.heapType(tag)` | `b858045` |
+| `PRIMITIVE_TAGS` | `T.LITERAL_PRIMITIVES` | type-utils regroup, 2026-09-18 |
+| `T.restElementTypes` | `T.elementTypes` (spreads now contribute their element) | type-utils regroup, 2026-09-18 |
+| `containsInfer`/`containsThis` | `containsKind(t, kind)` | type-utils regroup, 2026-09-18 |
+| backend-only helpers in type-utils (`substituteClassTypeParam` … `arrayPartOf`) | unexported functions in `backend.ts` | type-utils regroup, 2026-09-18 |
 
 The module dropped its `wasm`/`Wasm` prefixes throughout: the file is already named `wasm-codegen.ts` and
 is imported as `W`, so `W.Type` beats `WT.WasmType`.
