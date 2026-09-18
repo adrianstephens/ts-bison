@@ -1455,8 +1455,6 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 		return slot[idx];
 
 	if (scope.resolving?.has(t)) {
-		if (process.env.DBG_RES)
-			console.log('DBG circular', typeKey(t).slice(0, 200));
 		scope.hitDepthLimit('Scope.resolve(circular)');
 		// Stays opaque rather than returning `ANY` like the `depth` bail below: `ANY` would silently *pass* every
 		// assignability check involving a circular type instead of reporting the honest "couldn't verify" gap.
@@ -1464,8 +1462,6 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 	}
 
 	if (depth < 0) {
-		if (process.env.DBG_RES)
-			console.log('DBG depth', typeKey(t).slice(0, 200));
 		scope.hitDepthLimit('Scope.resolve');
 		return ANY;
 	}

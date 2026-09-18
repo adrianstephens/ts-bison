@@ -3927,6 +3927,35 @@ async function main() {
 	}
 
 	{
+		// An inferred type argument names things in the CALLER's scope but is substituted into the callee's alias and resolved in
+		// the callee's, where `S` means nothing: `Fields<S.Pt>` stayed an opaque mapped type (walker.ts's `NodeMap<TS.TypeParam>`).
+		// `run`'s argument is a NARROWED union, so its instance is `S.Pt`, not `S.Pt | string`, whose keys are those of `string`.
+		const { scaledKeys } = await compileMulti({
+			shapes: `
+				export interface Pt { name: string; tag?: string }
+			`,
+			lib: `
+				export type Fields<N> = Partial<{[K in keyof N]: (x: Exclude<N[K], undefined>) => Exclude<N[K], undefined> | undefined}>;
+				export function keep<N>(node: N, fields: Fields<N>): N { return node; }
+			`,
+			main: `
+				import * as S from './shapes';
+				import { keep } from './lib';
+				function run(p: S.Pt | string): number {
+					if (typeof p === 'string')
+						return -1;
+					return keep(p, { tag: t => t }).name.length * 10;
+				}
+				export function scaledKeys(): number {
+					const plain = (p: S.Pt) => keep(p, { tag: t => t }).name.length;
+					return run({ name: 'abcd' }) + plain({ name: 'abc' });
+				}
+			`,
+		}, 'main');
+		check('a generic instantiated at a caller-qualified, narrowed type argument resolves its mapped parameter', scaledKeys(), 43);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').

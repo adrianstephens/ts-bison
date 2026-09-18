@@ -6724,7 +6724,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			throw `'param '${describeBinding(p.key)}' needs an explicit type`;
 		const rawWtype = typeOf(tsType);
 		if (!rawWtype)
-			throw `'param '${describeBinding(p.key)}' needs an explicit type` + ' DBG ' + T.typeKey(tsType) + ' => ' + T.typeKey(T.resolve(scope, tsType)) + ' TP=' + ((r: Type) => r.type === 'mapped' ? T.typeKey(T.resolve(scope, r.constraint)) + ' /// ' + (r.constraint.type === 'keyof' ? T.typeKey(T.resolve(scope, r.constraint.argument)) : '') : r.type)(T.resolve(scope, tsType));
+			throw `'param '${describeBinding(p.key)}' needs an explicit type`;
 		// See `closureFuncSigType`'s own comment -- box a real but wasm-unrepresentable `void` as `any`
 		// rather than reject otherwise-valid source.
 		const boxed = rawWtype === 'void' ? W.REF_ANY : rawWtype;
@@ -6794,8 +6794,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	function ensureGenericFunc(name: string, decl: FunctionDecl, args: Expr[], typeArgs: Type[] | undefined, ctx: FunctionContext, expected?: Expected, homeModule = '.'): FuncInfo {
 		const typeParams	= decl.typeParams!;
 		const map			= inferCallTypeArgs(typeParams, decl.params, args, typeArgs, ctx, expected, decl.returnType as Type | undefined, decl.rest);
-		if (process.env.DBG_GEN)
-			console.log('DBG', name, [...map].map(([k, v]) => k + '=' + T.typeKey(v) + (v.type === 'ref' ? '@' + !!v.declScope : '')).join(' '), args.map(a => T.typeKey(checkerTypeOf(a, ctx.scope))).join(' | ').slice(0, 300));
 		// A class instance filling a structural parameter specializes the instantiation further, as it does a plain function.
 		const substituted	= decl.params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p);
 		const structural	= decl.body && structuralParams(substituted, args, ctx);

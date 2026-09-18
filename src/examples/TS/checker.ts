@@ -1582,8 +1582,10 @@ export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], ty
 	const map = new Map<string, Type>();
 	if (!sig.typeParams?.length)
 		return map;
+	// A caller-sourced argument names things in the CALLER's scope, but is substituted into the callee's structure and resolved
+	// there (`NodeMap<N>` at `TS.TypeParam`, where `walker.ts` has no `TS`). Defaults and constraints are the callee's own.
 	if (typeArgs) {
-		sig.typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ?? p.default ?? T.ANY));
+		sig.typeParams.forEach((p, i) => map.set(p.name, typeArgs[i] ? T.stampScope(typeArgs[i], scope) : p.default ?? T.ANY));
 		return map;
 	}
 	// A callback's own return, when the callback wasn't typed in order by the call site: heard only after the destination.
@@ -1610,7 +1612,7 @@ export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], ty
 	sig.typeParams.forEach(p => {
 		const t = inferred.get(p.name);
 		if (t && !inference!.wasDefaulted(p.name)) {
-			map.set(p.name, t);
+			map.set(p.name, T.stampScope(t, scope));
 			return;
 		}
 		const assumed = t ?? p.default ?? p.constraint ?? T.ANY;
