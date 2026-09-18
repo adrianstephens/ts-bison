@@ -408,6 +408,27 @@ interface ReadonlyArray<T> {
 	reduceRight<U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number, array: readonly T[]) => U, initialValue: U): U;
 }
 
+// Likewise the non-mutating part of `Map`/`Set` (lib/map.ts): physically each IS one (`READONLY_ALIAS`).
+interface ReadonlyMap<K, V> {
+	readonly size: number;
+	get(key: K): V | undefined;
+	has(key: K): boolean;
+	keys(): K[];
+	values(): V[];
+	entries(): [K, V][];
+	[Symbol.iterator](): Generator<[K, V], void, unknown>;
+	forEach(callbackfn: (value: V, key: K, map: ReadonlyMap<K, V>) => void, thisArg?: any): void;
+}
+interface ReadonlySet<T> {
+	readonly size: number;
+	has(value: T): boolean;
+	keys(): T[];
+	values(): T[];
+	entries(): [T, T][];
+	[Symbol.iterator](): Generator<T, void, unknown>;
+	forEach(callbackfn: (value: T, value2: T, set: ReadonlySet<T>) => void, thisArg?: any): void;
+}
+
 
 //-----------------------------------------------------------------------------
 //	TypedArray

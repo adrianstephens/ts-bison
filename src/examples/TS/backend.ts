@@ -2029,7 +2029,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (ns && (ns.decl(leaf)?.type === 'class_decl' || ns.type(leaf)))
 				return ensureClass(leaf, t.typeArgs, ns);
 		}
-		return ensureClass(t.name, t.typeArgs, t.declScope as Scope | undefined);
+		// A readonly view IS its mutable class physically, though the lib declares it an interface of its own.
+		return ensureClass(READONLY_ALIAS.get(t.name) ?? t.name, t.typeArgs, t.declScope as Scope | undefined);
 	}
 
 	// A SELF-REFERENTIAL type has no single physical shape, so re-entering `typeOf` on one already being computed boxes as `any` (as the union case does for an unrepresentable member).

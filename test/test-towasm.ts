@@ -2225,6 +2225,26 @@ async function main() {
 	}
 
 	{
+		// `ReadonlyMap`/`ReadonlySet` are declared (so they iterate by the protocol) and are physically `Map`/`Set`.
+		const { readonlyViews } = await compile(`
+			class C {
+				constructor(readonly names: ReadonlyMap<string, number>, readonly s: ReadonlySet<number>) {}
+				sum() {
+					let t = 0;
+					for (const [k, v] of this.names)
+						t += v * k.length;
+					for (const x of this.s)
+						t += x * 1000;
+					this.names.forEach(() => { t += 100; });
+					return t + this.names.size * 10000;
+				}
+			}
+			export function readonlyViews(): number { return new C(new Map([['ab', 3], ['c', 4]]), new Set([5])).sum(); }
+		`);
+		check('ReadonlyMap/ReadonlySet: iterate, forEach, size', readonlyViews(), 25210);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed
