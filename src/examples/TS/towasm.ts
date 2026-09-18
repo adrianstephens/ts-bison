@@ -2087,15 +2087,19 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// Unwidened: the question is which LITERALS it can hold (`narrowedTypeOf` widens, for physical representation).
 				const precise	= checkerTypeOf(unwrapAs(p.value), ctx.stmtScope ?? ctx.scope, false);
 				const values	= T.unionMembers(T.resolve(ctx.typeScope, precise), ctx.typeScope).map(m => T.resolveOwn(m, ctx.typeScope));
-				if (values.length < 2 || !values.every(v => v.type === 'literal'))
+				// Each arm's discriminant as a real literal EXPRESSION. A literal type and a literal expression are
+				// both `Common.Literal`, but a type carries `fresh`/`frozen` that only widening reads, and a template
+				// literal's parts are TYPES -- which has no runtime value to compare, so it can't be an arm at all.
+				const literals	= values.flatMap(v => v.type === 'literal' && !Array.isArray(v.value) ? [v.value] : []);
+				if (values.length < 2 || literals.length !== values.length)
 					continue;
 				const name	= `$udisc$${ctx.tempCounter++}`;
 				const wt	= wtypeOf(p.value, ctx) ?? REF_ANY;
 				emitAs(p.value, ctx, wt);
 				ctx.emit(I.local.set(ctx.declareValue(name, wt, precise).index));
-				return emitArms(values.map(v => ({
-					test: () => { emitAs({ type: 'binary', operator: '===', left: Identifier(name), right: v } as Expr, ctx, 'i32'); },
-					build: () => coerceTop(emitExpr(withProp(i, { ...p, value: v as unknown as Expr }), ctx), ctx, result),
+				return emitArms(literals.map(lit => ({
+					test: () => { emitAs(Binary<Expr, '==='>('===', Identifier(name), Literal(lit)), ctx, 'i32'); },
+					build: () => coerceTop(emitExpr(withProp(i, { ...p, value: Literal(lit) }), ctx), ctx, result),
 				})));
 			}
 		}
