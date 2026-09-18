@@ -2178,7 +2178,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// with `ownerFor` on the shape.
 		const flat = resolved.type === 'object' ? resolved : resolved.type === 'intersection' ? T.resolveObjectType(resolved, global) : undefined;
 		if (flat) {
-			const shapeMatch = matchObjectShapeByType(flat) ?? ensureAnonObjectShape(flat);
+			const shapeMatch = objectShapeOf(t, resolved, flat);
 			if (shapeMatch)
 				return shapeMatch.thisType;
 		}
@@ -2763,7 +2763,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// comment). ...and when nothing declared matches either, synthesize the shape -- the same last resort
 				// `matchObjectShape` applies on the literal side, so a bare anonymous object (an inferred field, a spread
 				// result) has an owner to read fields off.
-				return matchObjectShapeByType(w) ?? ensureAnonObjectShape(w);
+				return objectShapeOf(t, w, w);
 			}
 			// An interface `extends`ing another (`Method<T> extends CallSig<T>`) resolves to an intersection, not an
 			// 'object'; `resolveObjectType` flattens+merges it into the flat object `matchObjectShapeByType` expects.
@@ -2776,9 +2776,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (prim)
 					return ownerFor(prim);
 				const merged = T.resolveObjectType(w, global);
-				// Same last resort the 'object' case above uses -- synthesize the flattened shape when
-				// nothing declared matches it, or a value of such a type has no owner to read fields off.
-				return merged && (matchObjectShapeByType(merged) ?? ensureAnonObjectShape(merged));
+				return merged && objectShapeOf(t, w, merged);
 			}
 		}
 		return undefined;
@@ -7997,20 +7995,49 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const reached	= classes.get(key);
 		if (reached)
 			return reached;
-		const basePos	= new Map(base?.fields.map((f, i) => [f.name, i]));
-		const at		= (m: TS.TypeMember) => ('key' in m && typeof m.key === 'string' ? basePos.get(m.key) : undefined) ?? Infinity;
-		// The base's expando fields (and `#ext`) are part of its layout, so they are repeated in place: a base that
-		// gains one would otherwise silently stop being this shape's wasm supertype.
-		const declared	= new Set(resolved.members.flatMap(m => 'key' in m && typeof m.key === 'string' ? [m.key] : []));
-		const inherited	= (base?.fields ?? []).filter(f => !declared.has(f.name))
-			.map(f => TS.TypeProperty(f.name, hiddenFieldType(f.name), ['optional']));
-		const info		= buildObjectShape(key, base ? [...resolved.members, ...inherited].sort((a, b) => at(a) - at(b)) : resolved.members, ref, name, !everExtended.has(name), shapeKey(resolved.members));
+		const info		= buildObjectShape(key, base ? membersOverBase(resolved.members, base) : resolved.members, ref, name, !everExtended.has(name), shapeKey(resolved.members));
 		classes.set(structural, info);
 		shapeEntries.set(info, entry);
 		// Deferred: a shape merged into a twin could not take the supertype afterwards.
 		if (base && linkSupertype(info, base))
 			return info;
 		return layoutTwin(info, key, structural);
+	}
+
+	// `members` ordered with `base`'s fields first, in its order, so the struct can be a wasm subtype of the base's. The base's
+	// expando fields (and `#ext`) are part of its layout, so they are repeated in place, or a base gaining one stops being the supertype.
+	function membersOverBase(members: TS.TypeMember[], base: ClassInfo): TS.TypeMember[] {
+		const basePos	= new Map(base.fields.map((f, i) => [f.name, i]));
+		const at		= (m: TS.TypeMember) => ('key' in m && typeof m.key === 'string' ? basePos.get(m.key) : undefined) ?? Infinity;
+		const declared	= new Set(members.flatMap(m => 'key' in m && typeof m.key === 'string' ? [m.key] : []));
+		const inherited	= base.fields.filter(f => !declared.has(f.name)).map(f => TS.TypeProperty(f.name, hiddenFieldType(f.name), ['optional']));
+		return [...members, ...inherited].sort((a, b) => at(a) - at(b));
+	}
+
+	// The struct for an object type `flat` (`t` resolved, then flattened): over its named part if it intersects one, else a declared
+	// shape it matches, else its own anonymous one. `t` is asked too, since `resolve` merges an intersection of object parts into one.
+	function objectShapeOf(t: Type, resolved: Type, flat: TS.ObjectType): ClassInfo | undefined {
+		const over = t.type === 'intersection' ? t : resolved.type === 'intersection' ? resolved : undefined;
+		return (over && ensureIntersectionShape(over, flat)) ?? matchObjectShapeByType(flat) ?? ensureAnonObjectShape(flat);
+	}
+
+	// An intersection over ONE named shape (`{type: 'call'} & CallSig`) is laid out over that shape, as `interface X extends Y` is, so a
+	// value of it IS one: a wasm subtype, converting for free where an anonymous struct could not convert at all.
+	function ensureIntersectionShape(t: TS.IntersectionType, flat: TS.ObjectType): ClassInfo | undefined {
+		const bases = t.types.flatMap(p => {
+			const cls = p.type === 'ref' ? ensureClassRef({ ...p, declScope: p.declScope ?? global }) : undefined;
+			return cls && shapeEntries.has(cls) ? [cls] : [];
+		});
+		if (bases.length !== 1 || flat.members.some(m => m.type !== 'property' && m.type !== 'method'))
+			return undefined;
+		const key		= T.typeKey(t);
+		const existing	= classes.get(key);
+		if (existing)
+			return existing;
+		const info = buildObjectShape(key, membersOverBase(flat.members, bases[0]), t, key, true);
+		info.anonymous = true;
+		linkSupertype(info, bases[0]);
+		return info;
 	}
 
 	// A STRUCTURAL shape's identity is its physical layout -- fields sorted, each by its stored wasm type -- since
@@ -9959,9 +9986,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		else if (s.type === 'namespace_decl' || s.type === 'module_decl')
 			markExtendedInterfaces(s.body as TS.Stmt[]);
 	});
-	markExtendedInterfaces(LIB_AST);
-	for (const m of moduleBodies.values())
-		markExtendedInterfaces(m.body);
+	// So must a named shape written as a part of an intersection (`{type: 'call'} & CallSig`): see `ensureIntersectionShape`.
+	const markIntersected = walkerB(undefined, undefined, (t, process) => {
+		if (t.type === 'intersection')
+			t.types.forEach(p => p.type === 'ref' && everExtended.add(p.name.slice(p.name.lastIndexOf('.') + 1)));
+		return process(t);
+	});
+	for (const body of [LIB_AST, ...[...moduleBodies.values()].map(m => m.body)]) {
+		markExtendedInterfaces(body);
+		markIntersected.statements(body);
+	}
 
 	//top level
 	const {funcIndex, typeIndex} = types.func([], []);

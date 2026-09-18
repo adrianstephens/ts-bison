@@ -2191,6 +2191,26 @@ async function main() {
 	}
 
 	{
+		// An intersection over a named shape (`{type: 'call'} & Sig`) is laid out over it, a wasm subtype: its value IS a `Sig`.
+		const { annotated, viaUnion } = await compile(`
+			interface Sig { params: number[]; ret?: number }
+			type Mem = { type: 'prop'; key: string } | ({ type: 'call' } & Sig) | ({ type: 'construct' } & Sig);
+			const arity = (s: Sig) => s.params.length * 10 + (s.ret ?? 0);
+			const f = (m: Mem) => m.type === 'prop' ? 0 : arity(m);
+			export function annotated(): number {
+				const m: { type: 'call' } & Sig = { type: 'call', params: [1, 2], ret: 3 };
+				return arity(m);
+			}
+			export function viaUnion(): number {
+				const ms: Mem[] = [{ type: 'prop', key: 'a' }, { type: 'call', params: [1, 2], ret: 3 }, { type: 'construct', params: [1] }];
+				return ms.map(f).reduce((a, b) => a + b, 0) + f({ type: 'construct', params: [] }) * 1000;
+			}
+		`);
+		check('intersection over a named shape: converts to it', annotated(), 23);
+		check('intersection over a named shape: through a union', viaUnion(), 33);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed
