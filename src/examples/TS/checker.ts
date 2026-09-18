@@ -1344,6 +1344,10 @@ function hoist(stmts: Stmt[], scope: Scope) {
 	}
 }
 
+// TS's auto-typed array: `let x = []` (or `x = []` into an untyped `let x`) evolves by its writes, which `any[]` approximates.
+const AUTO_ARRAY			= TS.ArrayType(T.ANY);
+const isEmptyArrayLiteral	= (e?: Expr) => e?.type === 'array' && !e.elements.length;
+
 function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation = d.typeAnnotation, err?: Err) {
 	if (typeof d.name === 'string') {
 		// A wasm-level pseudo-type annotation (`i32`/etc, see `T.WASM_PSEUDO_TYPES`) must survive
@@ -1359,6 +1363,7 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 		scope.addValue(d.name, typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs && typeAnnotation.declScope
 			? T.resolve(typeAnnotation.declScope as Scope, typeAnnotation, undefined, stopAtPseudoType)
 			: typeAnnotation ? T.resolve(scope, typeAnnotation, undefined, stopAtPseudoType)
+			: isEmptyArrayLiteral(d.init) ? AUTO_ARRAY
 			: d.init ? T.widenNullish(typeOf(d.init, scope, widen, undefined, undefined, err), scope) : T.ANY);
 		// TS 4.4 aliased conditions: a `const`'s initializer stays true for its whole lifetime, so narrowing the const
 		// also narrows through what its initializer itself would narrow (`narrow()`'s `case 'identifier'` reads this).
@@ -1455,6 +1460,8 @@ function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: E
 	const r			= T.resolve(scope, t);
 	const narrowed	= (e: Expr | undefined) => { const k = e && T.pathKey(e); return k ? scope.value(k) : undefined; };
 	const correlate	= constant && r.type === 'union' && !!source && T.pathKey(source) !== undefined;
+	// A default replaces only `undefined`, so the binding is the source's non-nullable part or the default's own type.
+	const withDefault = (t: Type, def?: Expr) => def ? T.combineTypes([T.nonNullable(t, scope), typeOf(def, scope, !constant, T.nonNullable(t, scope))]) : t;
 	if (target.type === 'array_pattern') {
 		// Each member answers for itself, as TS destructures a union: a tuple's own position, anything else its iterated element.
 		// Iterated once per member, so a non-iterable one is reported once, not once per position.
@@ -1466,7 +1473,7 @@ function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: E
 			const sub	= el && source ? { type: 'index', object: source, index: { type: 'literal', value: i } } as Expr : undefined;
 			const et	= el && (narrowed(sub) ?? at(i));
 			if (el)
-				bindPattern(scope, el.target, el.default ? T.nonNullable(et!, scope) : et!, sub, constant, err);
+				bindPattern(scope, el.target, withDefault(et!, el.default), sub, constant, err);
 		});
 		if (target.rest)
 			bindPattern(scope, target.rest, TS.ArrayType(T.combineTypes(members.map(restOf))), undefined, false, err);
@@ -1475,7 +1482,7 @@ function bindPattern(scope: Scope, target: JS.BindingTarget, t: Type, source?: E
 			const sub	= typeof p.key === 'string' && source ? { type: 'member', object: source, property: p.key } as Expr : undefined;
 			const m		= narrowed(sub)
 				?? (typeof p.key === 'string' ? T.optional(T.lookupMember(r, p.key, scope) ?? T.ANY, T.memberOptional(r, p.key, scope)) : T.ANY);
-			bindPattern(scope, p.value, p.default ? T.nonNullable(m, scope) : m, sub, constant, err);
+			bindPattern(scope, p.value, withDefault(m, p.default), sub, constant, err);
 			if (correlate && sub && typeof p.value === 'string' && !p.default)
 				scope.addSource(p.value, sub);
 		}
@@ -1787,12 +1794,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				}
 				if (wantTuple)
 					return { type: 'tuple', elements: elems };
-				// An EMPTY literal has no elements to infer from, so context is the only information there
-				// is: `const a: Spec[] = []` and `specs ?? []` both want `Spec[]`, not `any[]` -- and an
-				// `any[]` in a union (`Spec[] | any[]`) leaves member lookup with nothing to offer, which
-				// is how a `.map` callback's parameter ended up with no type at all.
+				// An EMPTY literal is its context, else TS's `never[]`, which a union (`c ? xs : []`) drops. An `any[]` there
+				// absorbed the union, leaving member lookup nothing to offer and a `.map` callback's parameter no type.
 				if (!elems.length)
-					return resolvedExpected?.type === 'array' ? resolvedExpected : TS.ArrayType(elemExpected ?? T.ANY);
+					return resolvedExpected?.type === 'array' ? resolvedExpected : TS.ArrayType(elemExpected ?? T.NEVER);
 				// LITERAL WIDENING, as real TS does it: `[1, 2, 3]` is `number[]`, not `(1|2|3)[]` -- an
 				// array literal is MUTABLE, so keeping the initialiser's literal types made `a[0] = 5` a
 				// type error ("Type '5' is not assignable to type '1 | 2 | 3'"). It also leaked into
@@ -2401,7 +2406,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// stripped because they defeat inference against a `C<...>`-shaped return without adding
 				// anything: an `undefined` right side doesn't need a contextual type, and the assignability
 				// check below still judges against the full declared `lt`.
-				const rt = recurse(e.value, T.nonNullable(lt, scope));
+				const rt = recurse(e.value, e.target.type === 'array' || e.target.type === 'object' ? undefined : T.nonNullable(lt, scope));
 				// Assignments are judged against the declaration-site type, not any active narrowing -- a dotted target goes through
 				// `lookupMember` on the object's own type, not `typeOf` (which would consult the narrowings map instead).
 				// A destructuring target (`e.target.type` 'object'/'array', reusing the literal AST shape) has no dedicated pattern
@@ -2448,7 +2453,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 								// Always widens for the narrowed-forward type, regardless of this call's own `widen` (a side effect
 								// on `scope`, not part of the return value) -- matches plain JS assignment semantics: `x = 5` narrows
 								// `x` to `number` from here on, not literal `5`, whether or not *this* expression's own answer is widened.
-								scope.addNarrowing(key, T.widenLiterals(rt));
+								scope.addNarrowing(key, T.isAny(lt) && isEmptyArrayLiteral(e.value) ? AUTO_ARRAY : T.widenLiterals(rt));
 						}
 					} else if (e.operator === '??' || e.operator === '||' || e.operator === '&&') {
 						const key = T.pathKey(e.target);

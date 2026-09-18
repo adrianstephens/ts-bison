@@ -198,7 +198,11 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a spread of a union is the union of each spread', "interface A { type: 'a'; x: number } interface B { type: 'b'; y: string } declare const u: A | B; const r = { ...u, z: 1 }; const s: number = r;", ['z: number\n} | {']],
 	// A mapped type's key binds only inside it: `Partial`'s own `[P in keyof T]` must not capture a caller's type named `P`.
 	['a mapped type key does not capture a same-named type substituted into it', 'interface P { n: number } declare const a: Partial<{ ps: P[] }>; const q: string = a.ps;', ['ps: P[]']],
-	['a generic callback argument infers from its constraints', 'declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
+	// An uncontextual `[]` is `never[]`, which a union drops; an auto-typed declaration or assignment still evolves (`any[]`).
+	['an empty array arm of a conditional takes the other arm', 'declare const c: boolean; declare const xs: { n: number }[]; const r = c ? xs : []; const q: string = r.map(x => x.n);', [NOT_ASSIGNABLE('number[]', 'string')]],
+	['an empty array declaration or assignment evolves', 'let a = []; a.push(1); let b; (b = [], b).push(5);', []],
+	['a destructuring default adds its own type', "let [x = 'a' in {}] = []; x = !x; const { y = 1 } = {} as { y?: string }; const q: boolean = y;", [NOT_ASSIGNABLE('string | number', 'boolean')]],
+	['a generic callback argument infers from its constraints','declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
 ];
 
 (async () => {
