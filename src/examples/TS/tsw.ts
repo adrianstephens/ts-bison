@@ -4,7 +4,7 @@ import path from 'path';
 import * as TS from './ts-parser';
 import * as JSX from './jsx-parser';
 import * as T from './type-utils';
-import { TStoWasm, LIB_AST } from './towasm';
+import { TStoWasm, LIB_AST } from './backend';
 import { TStypeCheckAsync, OutputOptionsDefault } from './transform';
 import { ModuleLoader, collectModules, OptionsDefault as ModuleOptionsDefault } from './module-loader';
 import { SEVERITY, makeLibScope } from './checker';

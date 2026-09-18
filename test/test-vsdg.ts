@@ -1443,7 +1443,7 @@ export async function main() {
 	// exactly once (it may be effectful, and an array/object pattern reads its own value multiple
 	// times -- once per element/property), then desugared into flat var_decls reading off that
 	// temp, each recursed through the ordinary var_decl dispatch. A skipped element (elision), a
-	// default (`??`-based, same simplification towasm.ts's own patternBindings already accepts),
+	// default (`??`-based, same simplification backend.ts's own patternBindings already accepts),
 	// and a rest element all exercise real, separate code paths.
 	check('destructuring: array pattern with elision, default, and rest all desugar off one temp', `
 		function f(arr) {

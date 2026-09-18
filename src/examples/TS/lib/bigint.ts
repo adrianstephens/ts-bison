@@ -10,7 +10,7 @@
 // Limbs are backed by a real `RawArray<u32>` (wasm-GC array, reclaimed by the host's GC when unreachable --
 // unlike the old `Uint32Array`/linear-memory backing, which never freed). Every indexed read below is
 // still bound to an explicit `number` local before use in further arithmetic, rather than mixed directly
-// with a `number` local in one expression -- `arithInline` in towasm.ts dispatches purely on the *left*
+// with a `number` local in one expression -- `arithInline` in backend.ts dispatches purely on the *left*
 // operand's physical kind, so e.g. `someArr[i] * someLargeNumberLocal` would silently truncate the right
 // side toward `i32`/`u32` (lossy/saturating) if the left side stays a raw indexed read. Bitwise results
 // need their own care in the other direction: real JS (and this compiler) gives `&`/`|`/`^`/`<<`/`>>` a
@@ -113,7 +113,7 @@ export function bigTrim(a: RawArray<u32>): RawArray<u32> {
 }
 // `x`'s only call site (`toU32(b[i] ^ bx)`) already passes a genuine `i32` (`^`'s declared result type),
 // so this takes/returns the real pseudo-types directly rather than `number` -- `i32`->`u32` is a free tag
-// reinterpretation in towasm.ts's `coerceTop` (wasm has no separate unsigned storage), so the body compiles
+// reinterpretation in backend.ts's `coerceTop` (wasm has no separate unsigned storage), so the body compiles
 // to nothing but a return, and the caller's `number` context does one unsigned widen (`f64.convert_i32_u`)
 // at the very end instead of a signed widen in and a truncate back out around a branch.
 function toU32(x: i32): u32 {
@@ -176,7 +176,7 @@ function bigApplySign(a: RawArray<u32>, neg: boolean): RawArray<u32> {
 // Unsigned magnitude multiply (`mul`'s sign is handled by its caller). Schoolbook/operand-scanning, one
 // exact 32x32->64 product per limb pair via `__towasm_mulWide` (real `i64.mul`, not `number` arithmetic
 // -- a raw 32x32 product needs up to 64 bits, past what `number` can hold exactly at 2^53) -- read back
-// as a 2-limb `bigint` (see towasm.ts's own comment on the intrinsic), low limb at index 0.
+// as a 2-limb `bigint` (see backend.ts's own comment on the intrinsic), low limb at index 0.
 function bigMulMag(a: RawArray<u32>, b: RawArray<u32>): RawArray<u32> {
 	const na = a.length;
 	const nb = b.length;
@@ -455,7 +455,7 @@ export class BigInt {
 		return bigCompare(this as unknown as RawArray<u32>, b as unknown as RawArray<u32>);
 	}
 
-	// `<`/`>`/`<=`/`>=`/`==`/`!=` on two `bigint`s all lower to one of these (see towasm.ts's
+	// `<`/`>`/`<=`/`>=`/`==`/`!=` on two `bigint`s all lower to one of these (see backend.ts's
 	// `BIGINT_OPS`) -- each just wraps `compare` rather than re-walking the limbs, so the actual
 	// comparison logic exists exactly once.
 	lt(b: bigint): boolean { return this.compare(b) < 0; }

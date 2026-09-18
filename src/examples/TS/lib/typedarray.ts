@@ -18,7 +18,7 @@
 // `length`'s real physical `i32` field type survives the merge instead of collapsing into `number & i32`.
 //
 // `Uint8Array`/`Int32Array`/etc (`lib.d.ts`) are ordinary `declare type X = TypedArray<u8>`-style aliases --
-// `T` is a real generic type argument here, not a name-substitution target: `towasm.ts`'s `ensureClass`
+// `T` is a real generic type argument here, not a name-substitution target: `backend.ts`'s `ensureClass`
 // resolves a bare alias name to its real generic target the first time it's referenced (general -- works
 // for any `declare type X = SomeGenericClass<...>` alias, not special-cased per typed-array name), then
 // instantiates `TypedArray<T>` the same ordinary way a direct `Box<number>` reference already would.
@@ -29,7 +29,7 @@
 // to resolve it against, the way a name-substituted copy would have needed.
 //
 // `(n)`/`(buffer)`/`(buffer, byteOffset)`/`(buffer, byteOffset, length)`/`(elements)` are real,
-// separately-compiled constructor overloads below -- towasm.ts resolves which one a given call site needs
+// separately-compiled constructor overloads below -- backend.ts resolves which one a given call site needs
 // the same way the checker itself does (argument shape), including the array-literal form
 // (`new Uint8Array([1, 2, 3])`, see the last overload's own comment for the one optimization opportunity
 // still on the table there).
@@ -57,7 +57,7 @@ export class TypedArray<T> {
 
 	// Real byte width per element, resolved the same `$elem`-switch way `get`/`set` below already are --
 	// lets the constructors below convert between element count and byte count without needing to know
-	// which of Uint8Array/Int32Array/Uint32Array they actually are (towasm.ts substitutes the class's own
+	// which of Uint8Array/Int32Array/Uint32Array they actually are (backend.ts substitutes the class's own
 	// name into this call site too, same as everywhere else in this file -- see its header comment).
 	// A GETTER rather than a stored field: this is a per-instantiation constant that `elemSize`'s own
 	// `$T` switch already resolves to 1/2/4/8, so a field would put a redundant word in every instance
@@ -80,10 +80,10 @@ export class TypedArray<T> {
 			(($f32 $f64)								i32.const 1)
 		)`)(); }
 
-	// Real, separately-compiled constructors -- towasm.ts now supports genuine overloading (each of these
+	// Real, separately-compiled constructors -- backend.ts now supports genuine overloading (each of these
 	// gets its own wasm function, resolved per call site by argument shape, the same way the checker itself
 	// already resolves which one a given call typechecks against), so this no longer needs to be a single
-	// permissive stub with the real construction logic hand-built in towasm.ts's `case 'new'`.
+	// permissive stub with the real construction logic hand-built in backend.ts's `case 'new'`.
 	//
 	// Every field write here must stay a plain `this.field = <expr>` statement with no `this.field` *read*
 	// anywhere in this constructor (a struct with an object-typed field, `buffer`, is built by collecting

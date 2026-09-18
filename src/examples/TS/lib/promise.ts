@@ -12,7 +12,7 @@
 // 'resolve' is a real public method instead of an executor-only callback, which is all
 // `async`/`await` codegen itself needs (it always resolves its own result Promise directly, never
 // through a captured closure). The standard 'new Promise((resolve, reject) => ...)' executor form
-// isn't modeled -- a real, separate gap (see towasm.ts's own top-of-file comment). The constructor's
+// isn't modeled -- a real, separate gap (see backend.ts's own top-of-file comment). The constructor's
 // own `initial` param exists only because every field needs a real assignment somewhere in the
 // constructor and there's no generic "default T" expressible in source for an unconstrained type
 // param -- `value` is overwritten for real the moment `resolve()` runs (guarded by `settled`
@@ -38,7 +38,7 @@ export function __towasm_exitCall(): void {
 
 export function drainMicrotasks(): void {
 	while (microtasks.length > 0) {
-		// Annotated: `Array<T>` collapses to `Array<any>` for any non-scalar `T` (towasm.ts's own
+		// Annotated: `Array<T>` collapses to `Array<any>` for any non-scalar `T` (backend.ts's own
 		// `Array` special case), so `shift()`'s inferred type is `any`, not a closure -- and a call on
 		// it then resolves as a function NAME ("call to unknown function 'task'").
 		const task: (() => void) | undefined = microtasks.shift();
@@ -65,7 +65,7 @@ export class Promise<T> {
 		this.value = value;
 		// 'for...of' desugars to the same index-read-into-a-local shape as the array case below, so 'cb'
 		// is already a plain local by the time it's captured -- calling a closure read straight off an
-		// array element in one expression ('cbs[i](value)') isn't supported (see towasm.ts's own gap
+		// array element in one expression ('cbs[i](value)') isn't supported (see backend.ts's own gap
 		// comment), a real local of closure type already is.
 		for (const cb of this.callbacks) {
 			// Annotated for the same reason as `drainMicrotasks`' `shift()`: `Array<T>` collapses to

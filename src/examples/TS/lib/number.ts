@@ -113,7 +113,7 @@ function getSign(p: StringParser): number {
 	return 1;
 }
 function getUnsigned(p: StringParser, radix = 10, value = 0): number {
-	// `break` isn't supported (see towasm.ts's own statement dispatch) -- the stop condition folds
+	// `break` isn't supported (see backend.ts's own statement dispatch) -- the stop condition folds
 	// into the loop condition itself instead of exiting from the middle of the body.
 	let stop = false;
 	while (!stop && p.pos < p.n) {

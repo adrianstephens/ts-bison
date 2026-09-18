@@ -5,7 +5,7 @@ import path from 'path';
 import v8 from 'v8';
 import * as TS from '../dist/examples/TS/ts-parser';
 import * as T from '../dist/examples/TS/type-utils';
-import { TStoWasm, LIB_AST } from '../dist/examples/TS/towasm';
+import { TStoWasm, LIB_AST } from '../dist/examples/TS/backend';
 import { quoteString } from '../dist/examples/TS/printer';
 import { TStypeCheck, TStypeCheckAsync } from '../dist/examples/TS/transform';
 import { ModuleLoader, collectModules } from '../dist/examples/TS/module-loader';
@@ -36,7 +36,7 @@ for (let i = 0; i < f.length; i++) {
 // (wabt's published build has GC compiled out entirely; binaryen works but is ~200x this project's
 // own size for what's fundamentally a fixed, self-controlled instruction set -- see the write-up).
 // Type-checks `src` in isolation (no codegen) -- for tests that only care whether the checker
-// accepts/rejects a program, independent of whatever towasm.ts backend gaps its shape might otherwise hit.
+// accepts/rejects a program, independent of whatever backend.ts backend gaps its shape might otherwise hit.
 function typeErrors(src: string): string[] {
 	const program		= parser.parse(src);
 	const diagnostics	= TStypeCheck(program, new T.Scope(libScope));
@@ -134,7 +134,7 @@ async function main() {
 		}
 	};
 	// Asserts `src` type-checks with zero errors -- for narrowing/inference regressions where the bug is
-	// entirely in the checker's own verdict, independent of whether towasm.ts's backend can also compile the shape.
+	// entirely in the checker's own verdict, independent of whether backend.ts's backend can also compile the shape.
 	const checkTypeChecks = (name: string, src: string) => {
 		const errors = typeErrors(src);
 		if (errors.length === 0) {
@@ -307,7 +307,7 @@ async function main() {
 	}
 
 	{
-		// `++`/`--`, prefix and postfix -- identifiers only (see towasm.ts's `emitIncDec`). Postfix must
+		// `++`/`--`, prefix and postfix -- identifiers only (see backend.ts's `emitIncDec`). Postfix must
 		// yield the *old* value, prefix the *new* one; a bare `x++;`/`++x;` statement and a `for` loop's
 		// update clause both exercise the same lowering as an ordinary sub-expression.
 		const { postInc, preInc, postDec, loopSum, bareStmt } = await compile(`
@@ -411,7 +411,7 @@ async function main() {
 	{
 		// An object-typed (class/array) field: `struct.new_default` has no zero value for a non-null ref,
 		// so a class with such a field is built via the collect-then-`struct.new` path instead (see
-		// `emitFieldCollectingCtorBody` in towasm.ts) -- real field values pushed straight into `struct.new`,
+		// `emitFieldCollectingCtorBody` in backend.ts) -- real field values pushed straight into `struct.new`,
 		// no zero-init step at all. Covers a class-typed field (cross-class dependency, forcing `Point`'s
 		// own `struct` type to resolve before `Wrapper`'s), a plain local declared before any field is
 		// assigned, and fields assigned out of declaration order.
@@ -486,7 +486,7 @@ async function main() {
 	{
 		// Array-literal spread (`[...a, b]`): can't use `array.new_fixed` (a spread source's length is
 		// only known at runtime), so this goes through `array.new_default` + `array.copy`/`array.set`
-		// instead (see `emitArrayElementsWithSpread` in towasm.ts). Covers a spread at each position, two
+		// instead (see `emitArrayElementsWithSpread` in backend.ts). Covers a spread at each position, two
 		// spreads in one literal, and that every element (plain or spread source) is evaluated exactly
 		// once, in source order, even when it has a side effect.
 		const { sumSpreadEnd, sumSpreadMiddle, sumTwoSpreads, lenSpreadEnd, order } = await compile(`
@@ -710,7 +710,7 @@ async function main() {
 
 	{
 		// Array pattern rest (`.slice()` under the hood, so a genuinely new array, not a view) and default
-		// values (`??` under the hood -- see towasm.ts's own comment on `patternBindings`). A default on an
+		// values (`??` under the hood -- see backend.ts's own comment on `patternBindings`). A default on an
 		// ordinary (non-nullable) array element is provably dead code -- covered here as "doesn't wrongly
 		// throw", with the real nullable-triggers case covered separately below via a nullable object field.
 		const { arrayRest, arrayRestEmpty, arrayDefaultUnused, paramArrayRestCaller } = await compile(`
@@ -1009,7 +1009,7 @@ async function main() {
 	{
 		// Same `obj?.method()` shape as `callNull`/`callNonNull` above, but bound to an *unannotated*
 		// `const` and read back later -- exercises a real root-caused bug distinct from `typeOf`'s own
-		// `?.` handling (that part was already correct): towasm.ts's `var_decl` codegen has its own fast
+		// `?.` handling (that part was already correct): backend.ts's `var_decl` codegen has its own fast
 		// path that, whenever it can resolve the callee's owner class, reads the called method's *raw*
 		// declared return type straight off the class decl instead of calling `checker.typeOf` on the
 		// whole call expression -- silently dropping the `| undefined` an optional call short-circuits
@@ -1078,7 +1078,7 @@ async function main() {
 		// held, and (as a consequence of the same union-combining logic) silently dropping a union member
 		// along the way. Type-check only (not `compile`/wasm execution) -- the bug is entirely in the
 		// checker's own verdict, and this receiver shape (an optional union-of-interfaces parameter) hits
-		// unrelated, pre-existing towasm.ts backend gaps that have nothing to do with the narrowing itself.
+		// unrelated, pre-existing backend.ts backend gaps that have nothing to do with the narrowing itself.
 		checkTypeChecks('optional-chain discriminant conjunction: negation keeps every union member and excludes undefined', `
 			interface RefType { kind: 'ref'; typeArgs?: unknown[]; declScope?: object }
 			interface OtherType { kind: 'other' }
@@ -1260,7 +1260,7 @@ async function main() {
 	{
 		// Uint8Array: both constructor forms, index read/write, .length, for...of. The length-only form
 		// (`new Uint8Array(n)`) goes through `Array<T>`'s own real `constructor` (see towasm-lib.ts),
-		// substituted for `i8` like its other methods -- not a hand-built allocation in towasm.ts (see
+		// substituted for `i8` like its other methods -- not a hand-built allocation in backend.ts (see
 		// `ensureBuiltinCtor`); the array-literal form stays a small special case in `emitExpr`'s `'new'`
 		// case, since a single-signature ctor can't express "length or array literal" without overloading.
 		const { bytesSum, zeroFilledLength, zeroFilledContent } = await compile(`
@@ -1819,7 +1819,7 @@ async function main() {
 	}
 
 	{
-		// towasm.ts's own generic-function-call codegen (`ensureGenericFunc`/`inferTypeArgMap`) is a
+		// backend.ts's own generic-function-call codegen (`ensureGenericFunc`/`inferTypeArgMap`) is a
 		// separate, parallel mechanism from checker.ts's own `instantiate` -- it reuses the same shared
 		// `T.inferTypeArgs`, but previously had no contextual/expected-type step at all (documented gap,
 		// `inferTypeArgMap`'s own old comment). A generic callback argument with no other source for its
@@ -2261,7 +2261,7 @@ async function main() {
 	}
 
 	{
-		// TS's `set(array, offset)` copy form (towasm.ts's own `addData`), two bodies picked statically: from a typed array, from a
+		// TS's `set(array, offset)` copy form (backend.ts's own `addData`), two bodies picked statically: from a typed array, from a
 		// `number[]`, and from an overlapping view of the same buffer, which JS copies as if through a temporary (a forward loop gives 1111).
 		const { u8SetTyped, u8SetArray, u8SetOverlap } = await compile(`
 			export function u8SetTyped(): number {
@@ -2599,7 +2599,7 @@ async function main() {
 
 	{
 		// Int32Array + real i32 arithmetic (arithInline/equalityInline dispatch on the *operand's* kind,
-		// not just declared `number`/`boolean` -- see towasm.ts's `operandKind`).
+		// not just declared `number`/`boolean` -- see backend.ts's `operandKind`).
 		const { i32RoundTrip, i32Compare } = await compile(`
 			export function i32RoundTrip(): number {
 				const a: Int32Array = new Int32Array(3);
@@ -2643,7 +2643,7 @@ async function main() {
 	{
 		// Partial BigInt -- unsigned, base-65536-limb `bigint` (real primitive, backed by `BigInt`'s
 		// methods -- see towasm-lib.ts's header comment for the documented scope). `+`/`<`/`<=`/`>`/`>=`/
-		// `==`/`!=` all lower through `BIGINT_OPS` onto `BigInt`'s own methods (see towasm.ts's `emitExpr`
+		// `==`/`!=` all lower through `BIGINT_OPS` onto `BigInt`'s own methods (see backend.ts's `emitExpr`
 		// `'binary'` case) -- real TS itself allows these operators on two `bigint`s, so this is exercising
 		// genuine operator syntax, not a hand-written method call. Operands are bound to explicit
 		// `bigint`-annotated locals first, not chained straight through a call -- `bigFromNumber` itself is
@@ -2798,7 +2798,7 @@ async function main() {
 
 	{
 		// Template literals -- `\`a${b}c\`` desugars to the same left-to-right '+' chain real JS builds it
-		// from (see towasm.ts's `emitTemplateLiteral`). Every interpolated value's type decides how it
+		// from (see backend.ts's `emitTemplateLiteral`). Every interpolated value's type decides how it
 		// stringifies: `string` passes through, `number` calls `.toString()`, `boolean` is a ternary (no
 		// `Boolean` class in this lib to call a real `.toString()` on).
 		const { tplNum, tplNumFrac, tplStr, tplBoolTrue, tplBoolFalse, tplMulti, tplAdjacent, tplNoInterp, tplClass } = await compile(`
@@ -2841,7 +2841,7 @@ async function main() {
 	}
 
 	{
-		// console.log(x) -- real WASI `fd_write` output now (see towasm.ts's `usesConsoleLog` and
+		// console.log(x) -- real WASI `fd_write` output now (see backend.ts's `usesConsoleLog` and
 		// `lib/console.ts`'s `__towasm_console_log`), not a spied JS `console.log`. `compile()`'s own
 		// `fd_write` stub decodes each call's bytes and records them on `__consoleOutput`, one entry per
 		// call, each including `__towasm_writeString`'s own trailing `'\n'`.
@@ -2880,7 +2880,7 @@ async function main() {
 
 	{
 		// Closures -- a captured arrow/function-expression literal compiles to a `{code, env}` wasm-GC
-		// struct pair (see towasm.ts's `ensureClosureType`), called via `call_ref` against one wasm function
+		// struct pair (see backend.ts's `ensureClosureType`), called via `call_ref` against one wasm function
 		// type shared per TS signature. Captures are by value/reference *for the lifetime of one closure
 		// instance* (repeat calls to the same instance see each other's mutations -- the counter case below)
 		// but not shared back with the enclosing function's own copy once created.
@@ -3120,7 +3120,7 @@ async function main() {
 		// literal/`.`/character classes (incl. negation), \d\s, greedy/lazy quantifiers (* + ? {n,m}),
 		// capturing groups + backreferences, alternation, ^$ anchors, i/g flags, exec()'s lastIndex
 		// stepping. Every `new RegExp(...)` is bound to a local before calling a method on it --
-		// `new RegExp(...).test(...)` chained directly is a real (separate, reported) towasm.ts bug:
+		// `new RegExp(...).test(...)` chained directly is a real (separate, reported) backend.ts bug:
 		// method-call dispatch resolves the receiver's class via an already-registered lookup that a
 		// directly-chained `new` expression hasn't triggered yet.
 		const {
@@ -3196,7 +3196,7 @@ async function main() {
 				return (re.test("a cat sat") ? 1 : 0) * 10 + (re.test("category") ? 1 : 0);
 			}
 			// '.flags'/sticky ('y') support -- added for tison.ts's own lexer (nextToken sets 'lastIndex'
-			// and expects an exact-position match, never a forward scan), part of the towasm.ts
+			// and expects an exact-position match, never a forward scan), part of the backend.ts
 			// self-hosting groundwork.
 			export function flagsContent(): number {
 				const re = new RegExp("a", "yim");
@@ -3273,8 +3273,8 @@ async function main() {
 	}
 
 	{
-		// Map<K,V> -- linear-scan implementation (lib/map.ts), part of the towasm.ts self-hosting
-		// groundwork (checker.ts/type-utils.ts/walker.ts/transform.ts/towasm.ts/tison.ts itself all use
+		// Map<K,V> -- linear-scan implementation (lib/map.ts), part of the backend.ts self-hosting
+		// groundwork (checker.ts/type-utils.ts/walker.ts/transform.ts/backend.ts/tison.ts itself all use
 		// Map pervasively). `set`/`get`/`has`/`delete`/`size`/`clear`/`keys` over string keys, plus
 		// reference-identity semantics for class-typed keys (a structurally-identical-but-distinct
 		// instance must NOT collide).
@@ -5855,7 +5855,7 @@ async function main() {
 		// Async/await -- reuses the exact same resumable-function machinery a generator does (frame,
 		// `flattenStateMachine`, the loop+block dispatch), but driven very differently: an async function
 		// runs immediately up to its first real suspend, and a suspended `await` resumes via
-		// `Promise.then()`, not an external caller (see towasm.ts's own `compileAsyncFunc` header
+		// `Promise.then()`, not an external caller (see backend.ts's own `compileAsyncFunc` header
 		// comment). A top-level mutable global is used to observe results below, not a captured closure
 		// variable -- capturing a *mutation* back out to the enclosing scope is a separate, pre-existing
 		// limitation (captures snapshot by value at creation time), not something these tests are about.
@@ -6578,7 +6578,7 @@ async function main() {
 	}
 
 	{
-		// `const Cls = M.Cls` -- towasm.ts's own `const Scope = T.Scope` shape. A class has no runtime
+		// `const Cls = M.Cls` -- backend.ts's own `const Scope = T.Scope` shape. A class has no runtime
 		// value here (classes are nominal), so the const is a compile-time alias: the start function must
 		// emit nothing for it, and both names must land on the SAME physical class.
 		const { main } = await compileMulti({
@@ -7051,7 +7051,7 @@ async function main() {
 		check('new Map([[k, v]]) built at the Map type it is headed for', r10.mapArg() * 100 + r10.mapDecl(), 1213);
 		check('a generic type guard narrows a wider member; its instantiations share one struct', r10.guards(), 350);
 
-		// towasm.ts's `hostImportsIn`: `body.find(...)` then `decl?.type === 'function_decl'`. Each of these trapped,
+		// backend.ts's `hostImportsIn`: `body.find(...)` then `decl?.type === 'function_decl'`. Each of these trapped,
 		// failed to validate, or dispatched to structs the literals were never built as.
 		const r11 = await compile(`
 			interface FD { type: 'function_decl'; name: string; params: number[] }
@@ -7275,7 +7275,7 @@ async function main() {
 
 	{
 		// `flatMap` wasn't declared at all -- not in `lib/array.ts`, not in `lib.d.ts` -- so every
-		// `xs.flatMap(...)` typed as `any`. towasm.ts's own `LIB_DECLS` is `[...filter(...),
+		// `xs.flatMap(...)` typed as `any`. backend.ts's own `LIB_DECLS` is `[...filter(...),
 		// ...filter(...).flatMap(...)]`, and one `any` in a spread poisons the array: `for (const d of
 		// LIB_DECLS)` gave `d: any`, which is where all 35 of that file's `unknown field 'name'` came from.
 		// Full-arity callbacks here because a shorter one is a separate, still-open gap (a 1-parameter
@@ -7378,7 +7378,7 @@ async function main() {
 		// A mapped type's key constraint that is a NESTED union of aliases (`type Keys = Small | 'c'`).
 		// `resolve` reduces the union itself but leaves its members alone, so one member arriving as an
 		// unresolved alias made the flat "every key is a literal" test fail and the whole mapped type
-		// stayed opaque. towasm.ts's own `ARR_WTYPE: Record<WasmElementI, WasmType>` is exactly this, and
+		// stayed opaque. backend.ts's own `ARR_WTYPE: Record<WasmElementI, WasmType>` is exactly this, and
 		// it blocked that file at module level.
 		const { sum, deeper } = await compile(`
 			type Small = 'a' | 'b';
@@ -7669,7 +7669,7 @@ async function main() {
 	}
 
 	{
-		// An expression-bodied arrow sees a captured name narrowed where the arrow is created (towasm.ts's own `wasmTypeEq`).
+		// An expression-bodied arrow sees a captured name narrowed where the arrow is created (backend.ts's own `wasmTypeEq`).
 		const { arrowNarrowed } = await compile(`
 			type W = 'i32' | 'f64' | { ref: string } | { closure: { params: W[] } };
 			function eq(a: W, b: W): boolean {

@@ -96,7 +96,7 @@ export class Array<T> extends ArrayBase {
 	// `push`/`pop`/`shift`/`unshift`: real bodies -- growing/shrinking means allocating a fresh physical array
 	// (a wasm-GC array's length is fixed at `array.new_default` time), and assigning it to `this` is how this
 	// compiler's subset spells "replace my own receiver's physical value" (real TS never allows assigning to
-	// `this`, so `towasm.ts`'s `ensureMethod` treats a body that does it as this method's own explicit,
+	// `this`, so `backend.ts`'s `ensureMethod` treats a body that does it as this method's own explicit,
 	// general signal to compile it that way -- not a hardcoded list of method names -- and rewrites every
 	// call site to write the result back to the receiver's real lvalue; see `assignsToThis`/`reassignsThis`).
 	pop(): T | undefined {
@@ -180,7 +180,7 @@ export class Array<T> extends ArrayBase {
 		return false;
 	}
 	// `end`'s "omitted" default can't be `this.length` (towasm's call-site defaults must be plain
-	// literals -- see towasm.ts's `paramWasmType`), and a nullable `number` isn't supported either (no
+	// literals -- see backend.ts's `paramWasmType`), and a nullable `number` isn't supported either (no
 	// boxing) -- so a large literal sentinel stands in for "omitted", clamped down to `len` below,
 	// same as real JS already clamps an over-long `end` to the array's length.
 	slice(start: i32 = 0, end: i32 = 0x7fffffff): T[] {

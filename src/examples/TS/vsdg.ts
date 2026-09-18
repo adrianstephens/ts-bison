@@ -921,7 +921,7 @@ export class TSBuilder extends VSDGBuilder<Expr, Stmt, Type> implements SwitchSy
 
 // Desugars a destructuring BindingTarget into flat var_decls reading off valueExpr -- which MUST
 // already be a stable, side-effect-free reference, never the raw initializer (a pattern reads its
-// value multiple times). Reuses transform.ts's own version (shared with towasm.ts) rather than a
+// value multiple times). Reuses transform.ts's own version (shared with backend.ts) rather than a
 // second copy; wrapped in try/catch since it hard-throws on two gaps (object rest, computed key)
 // this file otherwise degrades gracefully on -- accepted since both are already rare.
 function patternBindings(kind: JS.DeclarationKind, target: JS.BindingTarget, valueExpr: Expr): Stmt[] {

@@ -5,7 +5,7 @@
 //
 // `ClosureSig` is the seam that makes that possible: `Type`'s `closure` variant names only the
 // PHYSICAL shape, while the binding data that only argument-binding reads (`defaults`/`resolvedParams`/
-// `restElem` -- language exprs and types) lives in `FuncSig` in `towasm.ts`, which extends it.
+// `restElem` -- language exprs and types) lives in `FuncSig` in `backend.ts`, which extends it.
 // See `memory/tison_towasm_cross_language_plan.md`.
 //
 // Deliberately NOT here, though they have no language types in them: `PRIMITIVE_TAGS`, `READONLY_ALIAS`,

@@ -25,7 +25,7 @@ import path from 'path';
 import * as TS from '../dist/examples/TS/ts-parser';
 
 const LIB_DIR	= path.join(__dirname, '../dist/examples/TS/lib');
-// Same glob and the same order towasm.ts itself uses, so this reads exactly the set that gets linked.
+// Same glob and the same order backend.ts itself uses, so this reads exactly the set that gets linked.
 const LIB_FILES	= ['lib.d.ts', ...fs.readdirSync(LIB_DIR).filter(f => f.endsWith('.ts') && f !== 'lib.d.ts').sort()];
 
 type Members = { instance: Set<string>; static: Set<string> };

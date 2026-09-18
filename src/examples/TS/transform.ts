@@ -143,10 +143,10 @@ export function foldConstants<T extends Expr>(e: T) {
 //-----------------------------------------------------------------------------
 
 // Every plain-identifier local a generator/async function's own body declares via `var_decl` (its
-// enclosing statement kept alongside, for its own checker-stamped scope -- see towasm.ts's own
+// enclosing statement kept alongside, for its own checker-stamped scope -- see backend.ts's own
 // `compileGeneratorFunc`, which needs it to resolve each local's type the same way `case 'var_decl'`
 // does) -- stops at a nested closure boundary, whose locals belong to *that* function, not this one.
-// towasm.ts hoists every one of these into the resumable step function's frame (no precise liveness
+// backend.ts hoists every one of these into the resumable step function's frame (no precise liveness
 // analysis -- conservative, but simple and correct: a local that never actually crosses a suspend
 // point just costs an unused frame field). A destructured declarator ('const {a,b} = x') is skipped
 // here -- real, but narrower and deferred; only a plain 'let x = ...'/'const x = ...' is hoisted.
@@ -173,13 +173,13 @@ export function collectHoistedLocals(body: Stmt[]): Map<string, { stmt: Stmt; de
 export interface SuspendBoundary {
 	kind: 'yield' | 'await';
 	operand?:	Expr;
-	delegate?:	boolean;	// 'yield*' -- recognized here so it isn't caught by the generic "nested" rejection below; towasm.ts's own consumer currently still rejects delegation itself (a separate, later gap).
+	delegate?:	boolean;	// 'yield*' -- recognized here so it isn't caught by the generic "nested" rejection below; backend.ts's own consumer currently still rejects delegation itself (a separate, later gap).
 	resultVar?:	string;		// set when the source binds the resumed/settled value directly: 'const v = yield x;' / 'const v = await p;'
 }
 
 // Every transition out of a segment is one of these -- 'goto'/'branch' are the state-machine
 // equivalent of an unconditional/conditional jump (real control flow, not structured wasm nesting,
-// since a *resumed* call has none of the original call's block/loop context left -- see towasm.ts's
+// since a *resumed* call has none of the original call's block/loop context left -- see backend.ts's
 // own 'emitGeneratorDispatch'). 'complete' is the single shared "done" landing point: reached once,
 // by whatever naturally falls off the function's own end, and again by every subsequent call.
 export type SegmentNext =
@@ -201,7 +201,7 @@ export interface StateMachine {
 }
 
 // Splits a generator/async function's body into a flat, id-addressable graph of segments --
-// towasm.ts's 'emitGeneratorDispatch' turns this into one resumable step function (a dispatch + one
+// backend.ts's 'emitGeneratorDispatch' turns this into one resumable step function (a dispatch + one
 // nested block per segment, the same shape 'case switch' already lowers a real switch statement to,
 // wrapped in one more outer 'loop' so a 'goto'/'branch' transition can redispatch instead of relying
 // on structured block nesting, which a *resumed* call has none of). Pure AST-in/out, no wasm
@@ -256,7 +256,7 @@ export function BuildStateMachine(stmts: Stmt[]) {
 		).statement(stmt);
 	}
 
-	// A bare (unlabeled -- labeled break/continue is unsupported everywhere else in towasm.ts too) break
+	// A bare (unlabeled -- labeled break/continue is unsupported everywhere else in backend.ts too) break
 	// or continue that would target the loop/switch containing `body` directly, not a nested one (which
 	// establishes its own break/continue scope, same reasoning `case 'switch'`'s own scoping needs).
 	function containsOwnBreakOrContinue(body: Stmt): boolean {
@@ -379,7 +379,7 @@ export function BuildStateMachine(stmts: Stmt[]) {
 
 // Debug/visualization only: renders a `StateMachine` back into a plain, printable JS AST -- a
 // `while (true) { switch (state) { ... } }` dispatch loop -- so `Output.toCode` can show exactly
-// which segment runs, what it does, and where it goes next. Not real codegen (towasm.ts's own
+// which segment runs, what it does, and where it goes next. Not real codegen (backend.ts's own
 // 'emitGeneratorDispatch' lowers the same graph straight to wasm instead); a suspend is rendered
 // as `state = resumeId; return yield/await x;` since that's the clearest way to show "control
 // leaves here and re-enters at resumeId" as source text.

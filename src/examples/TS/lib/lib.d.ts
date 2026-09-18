@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-empty-object-type */
 /* eslint-disable no-shadow-restricted-names */
 /* eslint-disable no-var */
-// Ambient declarations shared by every `lib/*.ts` file -- read and parsed alongside them (see towasm.ts's
+// Ambient declarations shared by every `lib/*.ts` file -- read and parsed alongside them (see backend.ts's
 // own `LIB_AST`), never `import`ed as a normal module, so none of this needs an `export`.
 
 
@@ -27,7 +27,7 @@ declare module 'wasi:io/resource-error' {
 	export function drop(resourceHandle: i32): void;
 }
 
-// `__asm(asmText)` is how a lib file embeds real wasm assembly -- towasm.ts's own `isAsm`/`makeAsmBuiltin`
+// `__asm(asmText)` is how a lib file embeds real wasm assembly -- backend.ts's own `isAsm`/`makeAsmBuiltin`
 // recognize a call to this exact name and compile `asmText` as real instructions (see `WAT.parseAsmBody`),
 // so `Math.floor = __asm<[number], number>('(switch $T (($f32 $f64) $T.floor))')` really does emit an
 // `f64.floor`/`f32.floor` at every call site, per whichever type the switch's own arm declares. This
@@ -57,9 +57,9 @@ declare function pure(target: any, propertyKey: string, descriptor: PropertyDesc
 // Pseudo-types for `__asm`'s own `P`/`R` generic args, purely so an asm-backed method can declare its
 // *real* wasm-level param/result type when it isn't `number`'s usual `f64` -- e.g. `String.charCodeAt`'s
 // index param is a genuine wasm `i32` (an array index), not a general-purpose `number`; declaring it
-// `i32` here is what tells `towasm.ts` to actually emit that param as i32, not silently widen/narrow it.
+// `i32` here is what tells `backend.ts` to actually emit that param as i32, not silently widen/narrow it.
 // Not used for arithmetic (never resolved by the general checker either) -- matched directly in
-// `towasm.ts`'s `builtinTypes`, ahead of `T.resolve`'s alias-unwrapping, same as any other builtin name --
+// `backend.ts`'s `builtinTypes`, ahead of `T.resolve`'s alias-unwrapping, same as any other builtin name --
 // so a *plain* class field/method can use one too, not just an `__asm<P,R>` type argument (see
 // `lib/typedarray.ts`'s own fields/`get`/`set`). `u32` is wasm's usual `i32` storage, just tagged so a
 // caller/comparison knows to treat it as unsigned (see `Uint32Array.get`).
@@ -169,7 +169,7 @@ interface PropertyDescriptorMap {
 // subclassed) struct-backed class/object-shape; an extended class isn't supported yet (would need the
 // receiver's real runtime type, not just its static one). `defineProperty` only supports a plain value
 // descriptor (`{value: ...}`, real `enumerable`/`configurable`/`writable` flags accepted but with no
-// observable effect) and a literal string `key` -- see `emitObjectDefineProperty` in towasm.ts.
+// observable effect) and a literal string `key` -- see `emitObjectDefineProperty` in backend.ts.
 interface Object {
 	constructor: Function;
 	toString(): string;

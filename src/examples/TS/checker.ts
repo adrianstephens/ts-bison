@@ -316,7 +316,7 @@ function applyContextualParams(params: JS.Param<Type>[], expected: Type | undefi
 // receiver position only (`member`/`index`'s `object`, `call`'s `callee`) -- a chain can't restart once
 // broken by anything else (a binary op, a parenthesized sub-expression losing its own `optional` marker,
 // etc), matching real TS's own "optional chaining is contiguous" rule.
-// Exported: `towasm.ts`'s own codegen needs the exact same "is this link part of a live chain" test (its
+// Exported: `backend.ts`'s own codegen needs the exact same "is this link part of a live chain" test (its
 // own equivalent of the checker's `T.nonNullable`-before-lookup use here) -- one shared implementation,
 // not two that could silently drift apart on what counts as "still the same chain".
 export function isOptionalChainLink(e: Expr): boolean {
@@ -1329,7 +1329,7 @@ function hoist(stmts: Stmt[], scope: Scope) {
 function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation = d.typeAnnotation, err?: Err) {
 	if (typeof d.name === 'string') {
 		// A wasm-level pseudo-type annotation (`i32`/etc, see `T.WASM_PSEUDO_TYPES`) must survive
-		// resolution intact -- every real consumer (towasm.ts's `builtinTypes`) matches it *by name*,
+		// resolution intact -- every real consumer (backend.ts's `builtinTypes`) matches it *by name*,
 		// ahead of ordinary alias-unwrapping; resolving it here (to `number`, its real declared alias
 		// target) would bake that into `scope` permanently, losing the name for every later read of this
 		// variable (found via a top-level `let heap: i32 = 0;` being silently treated as `f64`
@@ -1492,7 +1492,7 @@ export function exportScope(body: Stmt[], parent: Scope, filename?: string, into
 			const varStmt = stmt;
 			stmt.declarations.forEach(d => {
 				hoistVar(inner, d, varStmt.kind !== 'const');
-				// Lets a consumer that needs the real initializer (not just its derived type) -- e.g. towasm.ts
+				// Lets a consumer that needs the real initializer (not just its derived type) -- e.g. backend.ts
 				// lazily initializing a cross-module `const X = someFactory(...)` on first use -- reach it via
 				// the same `declScope`/`Scope.decl` mechanism a function/class declaration already does.
 				if (typeof d.name === 'string')
@@ -1574,7 +1574,7 @@ function settleFromReturn(inference: T.Inference, scope: Scope) {
 // The type-argument map a generic call instantiates with: the explicit args outright, else TS's own
 // inference (`T.Inference`) over the argument types, with the contextual result type settling what the
 // arguments left open and the deferred callback-return candidates replayed last. Exported because
-// `towasm.ts`'s monomorphization needs the same answer -- it used to re-implement exactly this policy.
+// `backend.ts`'s monomorphization needs the same answer -- it used to re-implement exactly this policy.
 // `restElementTs`: a spread argument's element type(s), since `argTs` leaves a spread position `undefined`.
 // `inference`: the call site's own, already fed its arguments and callbacks in TS's order (see `case 'call'`);
 // a bare trial (an overload fit, an instantiation expression) infers from `argTs` here.
@@ -1883,7 +1883,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// header comment) shape: `T.resolve` doesn't flatten an intersection, so a resolved check here
 				// would never match at all, same reason `i32`/`u8`/etc are checked by name before resolving.
 				if (T.isRefOf(objT, TYPED_ARRAY_RANGES) && !objT.typeArgs) {
-					// Bounded, not bare `number` -- a loop comparing against these should stay `i32` in towasm.ts rather than promoting to `f64`
+					// Bounded, not bare `number` -- a loop comparing against these should stay `i32` in backend.ts rather than promoting to `f64`
 					if (e.property === 'length' || e.property === 'byteOffset' || e.property === 'byteLength')
 						return TS.RangeType('number', 0, 0x7fffffff, true);
 					if (e.property === 'buffer')
@@ -2592,10 +2592,10 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 	// The reason this specific case must NOT stamp: this method body is a shared template, reused across
 	// every concrete instantiation via structural substitution rather than re-checked per instantiation --
 	// a stamp here would freeze the template's own unresolved type param forever (`??=` first-wins),
-	// permanently blocking a later, per-instantiation-correct scope (`ctx.scope` in towasm.ts) from ever
+	// permanently blocking a later, per-instantiation-correct scope (`ctx.scope` in backend.ts) from ever
 	// being used instead. Leaving it unstamped is safe: every consumer of `fn.scope`/`(stmt as any).scope`
 	// already falls back to something instantiation-correct when unset (see `makeLibScope`'s own comment
-	// in towasm.ts). The walk itself still has to run either way, muted or not -- `applyContextualParams`'s
+	// in backend.ts). The walk itself still has to run either way, muted or not -- `applyContextualParams`'s
 	// side effect on an unannotated callback param below doesn't depend on the scope stamp at all.
 	// Only where there is nothing declared to check against -- a declared return type is always the
 	// better answer, and `expected` alone must keep driving the diagnostics below.
@@ -2795,7 +2795,7 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 // post-if type can merge the branches.
 function assignRights(st: Stmt, scope: Scope, name?: string): { name: string; rights: { expr: Expr; scope: Scope }[] } | undefined {
 	if (st.type === 'expression') {
-		// The assignment may sit anywhere in the expression (towasm.ts `bindingIn`'s `c.names.set(name, b = {...})`), which TS's own
+		// The assignment may sit anywhere in the expression (backend.ts `bindingIn`'s `c.names.set(name, b = {...})`), which TS's own
 		// flow analysis narrows at just the same. Never inside a closure there: that runs later, if at all.
 		let found: { name: string; value: Expr } | undefined;
 		walkerB(undefined, (e, process) => {
@@ -2898,7 +2898,7 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 			// regardless of `muted` -- only the assignability diagnostics below are real "reporting" and
 			// should be skipped. These used to share one `if (!muted)` guard, so a plain top-level
 			// `const`/`let` (not `stmt.ambient`, so `hoist`'s own pre-pass skips it -- see that function's
-			// comment) checked under a muted pass (`checkBlock`'s own `muted` param, e.g. towasm.ts's
+			// comment) checked under a muted pass (`checkBlock`'s own `muted` param, e.g. backend.ts's
 			// bundled-lib check) never got registered at all: any later reference to it resolved to `any`
 			// as a plain "unknown identifier" fallback, not a real error -- found via `lib/number.ts`'s
 			// `export const ieeeFrom = __asm<...>(...)`, whose call result silently became `any` deep
@@ -3081,7 +3081,7 @@ export function inferReturn(fnj: JS.CallSig<any>, body: JS.Stmt<any>[], outer: S
 // checked with lib members already in view -- a scope only sees its own ancestors, so a user program's
 // `global` needs the lib scope as an actual ancestor, not a sibling branch) and `TStoWasm` (which needs it
 // directly too, e.g. to compile a lib method's own body in isolation from user-declared names). `libAst` is
-// the language's own flat lib declaration list (`towasm.ts`'s `LIB_AST`), passed in because this is the
+// the language's own flat lib declaration list (`backend.ts`'s `LIB_AST`), passed in because this is the
 // checker's setup step, not codegen's.
 //
 // Muted, deliberately (its diag sink is a no-op either way) -- but it no longer skips walking a declared-

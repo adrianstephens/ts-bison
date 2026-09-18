@@ -288,7 +288,7 @@ export class ModuleLoader {
 
 	// A node builtin (`import * as path from 'path'`) served from this compiler's own runtime library.
 	// Loaded ON DEMAND, unlike `lib/*.ts` proper -- those are concatenated into one always-present global
-	// declaration list (towasm.ts's `LIB_AST`), so everything in them is linked into every module whether
+	// declaration list (backend.ts's `LIB_AST`), so everything in them is linked into every module whether
 	// it is used or not. These are ordinary modules instead: nothing resolves here unless a program really
 	// imports the specifier, and adding a new builtin is a new file, not a compiler change. Its own
 	// directory, not `lib/` itself, so a bare specifier can never collide with a static lib file
@@ -347,7 +347,7 @@ export class ModuleLoader {
 // every other module's own body (keyed by its `LoadedModule.canonical`, entry excluded -- callers
 // conventionally treat `'.'` as the entry itself) plus, per module, its plain `import { foo } from '...'`
 // bindings mapped to where they really come from (foo, or its local alias, -> {module: target canonical,
-// name: the *exported* name, which may differ from the local one}). `TStoWasm` (towasm.ts) needs the
+// name: the *exported* name, which may differ from the local one}). `TStoWasm` (backend.ts) needs the
 // bodies to compile a real cross-file call, and `namedImports` because a named import's local binding
 // carries no module of its own. An `import * as X` needs nothing here: the checker's `Scope` already
 // binds `X` to the target module's own scope, declarations included. `export ... from` is

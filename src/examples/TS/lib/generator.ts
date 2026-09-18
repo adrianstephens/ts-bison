@@ -17,7 +17,7 @@ export class IteratorResult<Y, R> {
 }
 
 // A generator instance is just a named wrapper around its own resumable "step" closure --
-// towasm.ts's 'compileGeneratorFunc' builds that closure (code + a per-instance frame holding the
+// backend.ts's 'compileGeneratorFunc' builds that closure (code + a per-instance frame holding the
 // resume state, and every local/param live across a yield) exactly the way an ordinary
 // arrow/function-expression closure is built, then constructs 'new Generator(step)' the same way
 // any other class gets constructed. 'next()' calling the closure-typed 'step' field is what taught

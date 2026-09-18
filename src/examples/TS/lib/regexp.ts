@@ -13,7 +13,7 @@
 //	regex bytecode: CHAR/ANY/CLASS/SAVE/JMP/SPLIT/BACKREF/BOL/EOL/WORDB/NWORDB/SPACE/
 //	NSPACE/MATCH/FAIL) and executed by an iterative backtracking VM with an explicit,
 //	growable backtrack stack -- no native recursion, no closures, no exceptions, matching
-//	this TS subset's hard restrictions (see towasm.ts's own header comment).
+//	this TS subset's hard restrictions (see backend.ts's own header comment).
 //
 //	A zero-width-repeatable subpattern (e.g. `(a?)*`) can loop forever -- same known
 //	limitation many minimal backtracking engines accept; not guarded against here.
@@ -41,14 +41,14 @@ function hasFlag(flags: string, code: number): boolean {
 //-----------------------------------------------------------------------------
 //	Compiler -- pattern string -> bytecode. A separate class (not methods on RegExp
 //	itself): RegExp has object-typed fields, so its own constructor can't call instance
-//	methods on its not-yet-fully-built `this` (see towasm.ts's field-collecting-ctor
+//	methods on its not-yet-fully-built `this` (see backend.ts's field-collecting-ctor
 //	comment) -- compiling happens on this already-fully-constructed helper instead,
 //	invoked from the top-level `compilePattern`, then RegExp's ctor just copies the
 //	finished fields over.
 //-----------------------------------------------------------------------------
 
 // Opcodes: duplicated as `static readonly` fields on *both* RegExpCompiler and RegExp, not
-// shared top-level consts. Top-level consts in a lib file resolve via towasm.ts's
+// shared top-level consts. Top-level consts in a lib file resolve via backend.ts's
 // `ensureGlobal`, which registers a wasm global with the right type but never bakes in the
 // initializer value -- every reference silently read back `0` at runtime (confirmed the hard
 // way: every opcode misread as OP_MATCH=0). `static readonly` is a real, documented
@@ -885,7 +885,7 @@ export class RegExp {
 }
 
 // `values: Array<string>` was the first design here -- reverted: a field/return-type typed
-// `Array<string>` loses its type argument somewhere in towasm.ts's inference when read back
+// `Array<string>` loses its type argument somewhere in backend.ts's inference when read back
 // through a local (`local 'x' has an unsupported type`, traced to `typeOf`'s bare-name
 // `classes.get(t.name)` fallback missing the composite `'Array<string>'` cache key), separate
 // from the two other real bugs found building this file. `group(i)` slices on demand off

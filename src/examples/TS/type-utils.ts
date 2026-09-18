@@ -36,7 +36,7 @@ const INTRINSIC_TYPES	= PRIMITIVES.or(TOP_TYPES);
 
 // `declare type i32 = number` etc (lib.d.ts) -- wasm-level pseudo-types, deliberately never resolved past
 // their own `ref` form (see that file's own comment: "not used for arithmetic, never resolved by the
-// general checker either"). Every real consumer (towasm.ts's `builtinTypes`) matches these *by name*,
+// general checker either"). Every real consumer (backend.ts's `builtinTypes`) matches these *by name*,
 // ahead of `resolve`'s own alias-unwrapping. Exported for `hoistVar`'s own narrow use (see there) -- NOT
 // folded into `resolve`'s general unwrapping or into `ALL_PRIMITIVES` itself: doing either globally breaks
 // every *other* place a resolved `number` was relied on to unify structurally with an `i32` (e.g. a
@@ -657,7 +657,7 @@ export function ownScope(t: Type, scope: Scope) {
 // value's own literal identity survives being embedded in a container that's itself later widened (`[1, x as const]`).
 // `ignoreFrozen`: an `as const` literal's `frozen` flag exists so the *checker* keeps its precise literal
 // type (real TS semantics) -- callers computing a *physical* runtime representation instead (e.g.
-// towasm.ts picking a value's wasm storage kind) have no such use for it: a frozen and non-frozen `'foo'`
+// backend.ts picking a value's wasm storage kind) have no such use for it: a frozen and non-frozen `'foo'`
 // still need the exact same physical representation, so those callers pass `true` to widen through it.
 // `shallow`: only the value's own literal (or union of them) widens, not literals nested in an array or object it holds.
 // Memoized per type object (and flags): a DAG rewritten once per node, not once per path.
@@ -1138,7 +1138,7 @@ function arrayMethod(elem: Type, prop: string): Type | undefined {
 function arrayMethodReturn(elem: Type, prop: string): Type | undefined {
 	return	prop === 'pop' || prop === 'shift' ? combineTypes([elem, UNDEFINED])
 			// Bounded (not bare `number`) so a loop comparing against these stays in `i32` instead of
-			// promoting to `f64` -- see `towasm.ts`'s `numericPairWtype`, which requires both operands
+			// promoting to `f64` -- see `backend.ts`'s `numericPairWtype`, which requires both operands
 			// already `i32`. `0x7fffffff`, not `0xffffffff`, so `intWasmType` picks `i32` not `u32`.
 			:	prop === 'push' || prop === 'unshift' ? TS.RangeType('number', 0, 0x7fffffff, true)
 			:	prop === 'indexOf' || prop === 'lastIndexOf' || prop === 'findIndex' ? TS.RangeType('number', -1, 0x7fffffff, true)
@@ -1469,12 +1469,12 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 			// An array's own element never got resolved recursively at all before this case existed -- e.g. `Record<string,
 			// number>['string']`-shaped indexed access (a mapped type's homomorphic value collapsing down to a plain
 			// index-signature's own value type, per `case 'indexed_access'` above) stayed opaque forever once tucked
-			// inside a `V[]` field, even though resolving it *directly* already worked -- towasm.ts's own generic-array-
+			// inside a `V[]` field, even though resolving it *directly* already worked -- backend.ts's own generic-array-
 			// element-kind lookup (`ownerFor`'s `w.type === 'array'` case) never got a chance to see the real, concrete
 			// element type as a result, silently defaulting a scalar array field to boxed/`any` storage instead.
 			case 'array': {
 				// A wasm pseudo-type element (`i8[]`/etc, see `WASM_PSEUDO_TYPES`'s own comment) must survive resolution
-				// intact, same reason `hoistVar`'s own `stopAtPseudoType` guard exists -- towasm.ts's `wasmTypeOf` matches
+				// intact, same reason `hoistVar`'s own `stopAtPseudoType` guard exists -- backend.ts's `wasmTypeOf` matches
 				// `WASM_PSEUDO_TYPES` names directly off `t.element`, never through `resolve`'s own alias-unwrapping;
 				// resolving `i8` down to its declared `number` alias here would silently pick the wrong physical element
 				// kind for a typed-array-backed field/local (a real, observed regression -- `Uint8Array`'s own literal-
@@ -2390,7 +2390,7 @@ export function lookupMember(t: Type, prop: string, scope: Scope, depth = 10, sk
 				// interface merged with a towasm-internal class implementing it (e.g. `TypedArray`/`lib/typedarray.ts`) commonly
 				// redeclares the same member once each way (`number` vs `i32`), which are the *same* declared type, not a genuine
 				// conflict; `hoist`'s own pre-pass always processes interfaces before classes, so `matches`' later (class) entry -
-				// the physically-precise one towasm.ts itself needs - is what survives this `Map`'s last-write-wins dedup.
+				// the physically-precise one backend.ts itself needs - is what survives this `Map`'s last-write-wins dedup.
 				const dedupKey = (m: Type) => typeKey(m.type === 'ref' && !m.typeArgs && WASM_PSEUDO_TYPES.has(m.name) ? NUMBER : m);
 				const distinct = [...new Map(matches.map(m => [dedupKey(m), m])).values()];
 				if (distinct.length === 1)
@@ -3317,7 +3317,7 @@ export class Scope {
 	// reference to it) has no other way to get from "this name, in this scope" back to real source: `value`/
 	// `type` only ever carry a *derived* `Type`, never a pointer to what produced it. Lets a cross-module
 	// consumer resolve via the same scope-chain/`declScope` mechanism already used for types, instead of a
-	// separate name-mangling scheme (e.g. towasm.ts's own `homeModule`/`homeKey`) reinventing module-scoped
+	// separate name-mangling scheme (e.g. backend.ts's own `homeModule`/`homeKey`) reinventing module-scoped
 	// lookup on the side.
 	private decls?:			Map<string, TS.Stmt>;
 

@@ -825,7 +825,7 @@ export function parseWat(src: string, defines?: Record<string, string|number>): 
 // that need a real `Instr[]` are on the hook for known-flat snippets themselves (no `block`/`loop`/`if`,
 // the only instr shapes `WatInstr` and `Instr` differ on -- `collectAsmItems` above already hoists
 // every `(local ...)` out of `.body` into `.locals`, so `__local` markers never survive into it), and
-// for resolving `WatLocal.id` to a real index themselves (see towasm.ts's `resolveAsmLocals`).
+// for resolving `WatLocal.id` to a real index themselves (see backend.ts's `resolveAsmLocals`).
 
 export interface ParsedAsmBody { locals: WatLocal[]; body: WatInstr[] }
 
