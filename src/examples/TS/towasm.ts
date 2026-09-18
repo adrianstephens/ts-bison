@@ -1363,14 +1363,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 	const types	= new WT.Types;
 
-	// One project-wide exception tag, `(anyref) -> ()` -- JS/TS `catch(e)` is untyped and catches any thrown value regardless of its real TS type, so there's no reason for more than one tag
-	const tags: wasm.TagType[] = [];
-	let exceptionTagIndex: number | undefined;
-	function ensureExceptionTag(): number {
-		if (exceptionTagIndex === undefined)
-			exceptionTagIndex = tags.push({ attribute: 0, typeIndex: types.funcType(toParams([REF_ANY]), []) }) - 1;
-		return exceptionTagIndex;
-	}
+	// One tag for the whole module -- JS/TS `catch(e)` is untyped and catches any thrown value regardless of its real TS type, so there's no reason for more than one
+	const tags				= new WT.TagSection;
+	const ensureExceptionTag = () => tags.exception(types);
 
 	// A closure referencing a SIBLING const/let declared later in the same block (mutually recursive local
 	// closures, e.g. walker.ts's `mapStatementC` capturing `mapStatement`) has no local to capture: the
@@ -3114,11 +3109,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const i = ctx.declareValue(atName, 'i32', T.NUMBER).index;
 		emitAs(JS.Member(from, 'length'), ctx, 'i32');
 		ctx.emit(I.array.new_default(typeIndex), I.local.set(dst), I.i32.const(0), I.local.set(i));
-		const _old = ctx.swapOut();
-		ctx.emit(I.local.get(i), I.local.get(dst), I.array.len, I.i32.ge_u, I.br_if(1), I.local.get(dst), I.local.get(i));
-		emitAs(JS.Index(from, Common.Identifier(atName)), ctx, want);
-		ctx.emit(I.array.set(typeIndex), I.local.get(i), I.i32.const(1), I.i32.add, I.local.set(i), I.br(0));
-		ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(_old))]));
+		ctx.emitLoop(() => {
+			ctx.emit(I.local.get(i), I.local.get(dst), I.array.len, I.i32.ge_u, I.br_if(1), I.local.get(dst), I.local.get(i));
+			emitAs(JS.Index(from, Common.Identifier(atName)), ctx, want);
+			ctx.emit(I.array.set(typeIndex), I.local.get(i), I.i32.const(1), I.i32.add, I.local.set(i), I.br(0));
+		});
 	}
 
 	// `elementTsType` may name each position separately -- a TUPLE rest parameter's arguments.
@@ -6209,28 +6204,28 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			}
 
 			case 'while': {
-				const _old = ctx.swapOut();
-				emitTruthy(s.test, ctx);
-				ctx.enterBreakTarget();
-				ctx.enterContinueTarget();
-				ctx.emit(I.i32.eqz, I.br_if(1));
-				emitStmt(s.body, ctx);
-				ctx.emit(I.br(0));
-				ctx.exitContinueTarget();
-				ctx.exitBreakTarget();
-				ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(_old))]));
+				ctx.emitLoop(() => {
+					emitTruthy(s.test, ctx);
+					ctx.enterBreakTarget();
+					ctx.enterContinueTarget();
+					ctx.emit(I.i32.eqz, I.br_if(1));
+					emitStmt(s.body, ctx);
+					ctx.emit(I.br(0));
+					ctx.exitContinueTarget();
+					ctx.exitBreakTarget();
+				});
 				return;
 			}
 			case 'do_while': {
-				const _old = ctx.swapOut();
-				ctx.enterBreakTarget();
-				ctx.enterContinueTarget();
-				emitStmt(s.body, ctx);
-				emitTruthy(s.test, ctx);
-				ctx.emit(I.br_if(0));
-				ctx.exitContinueTarget();
-				ctx.exitBreakTarget();
-				ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(_old))]));
+				ctx.emitLoop(() => {
+					ctx.enterBreakTarget();
+					ctx.enterContinueTarget();
+					emitStmt(s.body, ctx);
+					emitTruthy(s.test, ctx);
+					ctx.emit(I.br_if(0));
+					ctx.exitContinueTarget();
+					ctx.exitBreakTarget();
+				});
 				return;
 			}
 			case 'continue': {
@@ -6271,25 +6266,25 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 							// A `block` wrapping a `loop`, same idiom as `while`, except the body gets its own *inner*
 							// block as the real `continue` target -- a plain `while` can reuse its restart label since it has no separate update step, but this desugared `for` has one (`s.update`) that must still run first.
-							const old = ctx.swapOut();
-							emitTruthy(s.test ?? Literal(true), ctx);
-							ctx.emit(I.i32.eqz);
-							ctx.enterBreakTarget();
-							ctx.enterLabel();	// the bare "loop" level, between the break-block and the continue-block
-							ctx.emit(I.br_if(1));
+							ctx.emitLoop(() => {
+								emitTruthy(s.test ?? Literal(true), ctx);
+								ctx.emit(I.i32.eqz);
+								ctx.enterBreakTarget();
+								ctx.enterLabel();	// the bare "loop" level, between the break-block and the continue-block
+								ctx.emit(I.br_if(1));
 
-							const bodyOld = ctx.swapOut();
-							ctx.enterContinueTarget();
-							emitStmt(s.body, ctx);
-							ctx.exitContinueTarget();
-							ctx.emit(I.block(undefined, ctx.swapOut(bodyOld)));
+								ctx.emitBlock(() => {
+									ctx.enterContinueTarget();
+									emitStmt(s.body, ctx);
+									ctx.exitContinueTarget();
+								});
 
-							if (s.update)
-								emitStmt({ type: 'expression', expression: s.update }, ctx);
-							ctx.emit(I.br(0));
-							ctx.exitLabel();
-							ctx.exitBreakTarget();
-							ctx.emit(I.block(undefined, [I.loop(undefined, ctx.swapOut(old))]));
+								if (s.update)
+									emitStmt({ type: 'expression', expression: s.update }, ctx);
+								ctx.emit(I.br(0));
+								ctx.exitLabel();
+								ctx.exitBreakTarget();
+							});
 						});
 						return;
 

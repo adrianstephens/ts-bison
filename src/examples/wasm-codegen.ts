@@ -514,6 +514,19 @@ export class FunctionContext {
 		this.emit(elseArm.length ? I.if(vt, thenArm, elseArm) : I.if(vt, thenArm));
 	}
 
+	// `body` goes into its own instruction list and the wrapper is built around it AFTERWARDS, because the
+	// branches inside it already carry depths relative to that wrapper (`br 0` repeats, `br 1` exits).
+	emitBlock(body: () => void): void {
+		const outer = this.swapOut();
+		body();
+		this.emit(I.block(undefined, this.swapOut(outer)));
+	}
+	// The ordinary breakable loop: `br 1` leaves it, `br 0` starts the next iteration.
+	emitLoop(body: () => void): void {
+		const outer = this.swapOut();
+		body();
+		this.emit(I.block(undefined, [I.loop(undefined, this.swapOut(outer))]));
+	}
 	toFuncBody(numParams: number, toValType: (t: Type) => wasm.ValType): wasm.FuncBody & {id: string} {
 		return { id: this.name.replace(/[^a-zA-Z0-9_]/g, '_'), locals: this.slotTypes.slice(numParams).map(t => ({ count: 1, type: toValType(t) })), body: this.out };
 	}
@@ -810,4 +823,14 @@ export class DataSection {
 	}
 
 	get bytes(): Uint8Array { return this.buffer; }
+}
+
+// The module's tag section. One tag is enough for a whole language: a throw carries a single boxed `any`,
+// so the tag's type is `(anyref) -> ()` and every `throw`/`try_table` in the module shares it.
+export class TagSection extends Array<wasm.TagType> {
+	private exceptionIndex?: number;
+
+	exception(types: Types): number {
+		return this.exceptionIndex ??= this.push({ attribute: 0, typeIndex: types.funcType([{ type: { ref: 'any', nullable: false } }], []) }) - 1;
+	}
 }
