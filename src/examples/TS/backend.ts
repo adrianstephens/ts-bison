@@ -8318,7 +8318,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (cls.typeIndex === -1 || !cls.fields.length || !cls.thisTsType || seen.has(cls.typeIndex))
 					continue;
 				seen.add(cls.typeIndex);
-				const objName		= `$obj$${cls.typeIndex}`;
+				// Its own prefix: the arms' assignments name temps `$obj$<counter>` in this same context.
+				const objName		= `$keyobj$${cls.typeIndex}`;
 				const objId: Expr	= Identifier(objName);
 				const isKey			= (f: string): Expr => Binary<Expr, '==='>('===', keyId, Literal(f));
 				candidates.push({ heap: cls.typeIndex, arm: () => {
