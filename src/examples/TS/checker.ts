@@ -1535,12 +1535,12 @@ export function exportScope(body: Stmt[], parent: Scope, filename?: string, into
 	if (assign) {
 		return {
 			inner,
-			scope: inner.namespace(assign.expr) ?? new Scope(),
+			scope: inner.namespace(assign.expr) ?? new Scope(inner.semantics),
 			alias: inner.value(assign.expr) ?? T.ANY,
 		};
 	}
 
-	const scope = new Scope();
+	const scope = new Scope(inner.semantics);
 	// Parent-chain-aware (`inner.value`, not `inner.values.get`): an imported name may have resolved straight into `inner`'s parent
 	// rather than `inner` itself (`hoist`'s `case 'import'` fallback only fires when nothing already resolved it), so an own-map-only read would miss it.
 
@@ -3139,7 +3139,7 @@ export function inferReturn(fnj: JS.CallSig<any>, body: JS.Stmt<any>[], outer: S
 // `.map()` callback params previously never got typed at all) now runs for every lib method, generic or
 // not, while a generic method's body still falls back to `ctx.scope` at codegen time, same as before.
 export function makeLibScope(libAst: Stmt[]): Scope {
-	const libScope = new Scope;
+	const libScope = new Scope(T.TS_SEMANTICS);
 	// `undefined` is a language built-in, not a lib declaration -- real tsc REFUSES to let a `.d.ts`
 	// declare it ("conflicts with built-in global identifier"), so `lib.d.ts` can't carry it beside
 	// `NaN`/`Infinity`. `T.makeGlobal` binds it for the checker-only path; this is the wasm path's

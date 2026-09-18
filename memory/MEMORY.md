@@ -20,6 +20,7 @@ no longer exist in the tree — run it after a rename and fix what is LIVE; hist
 | `T.restElementTypes` | `T.elementTypes` (spreads now contribute their element) | type-utils regroup, 2026-09-18 |
 | `containsInfer`/`containsThis` | `containsKind(t, kind)` | type-utils regroup, 2026-09-18 |
 | backend-only helpers in type-utils (`substituteClassTypeParam` … `arrayPartOf`) | unexported functions in `backend.ts` | type-utils regroup, 2026-09-18 |
+| most of `type-utils.ts` | `TS/type-core.ts` (type-utils re-exports it); `arrayMember`/`objectPrototypeMember`/`callablePrototypeMember` → `TS_SEMANTICS` | type-core split, 2026-09-18 |
 
 The module dropped its `wasm`/`Wasm` prefixes throughout: the file is already named `wasm-codegen.ts` and
 is imported as `W`, so `W.Type` beats `WT.WasmType`.
@@ -62,6 +63,7 @@ is imported as `W`, so `W.Type` beats `WT.WasmType`.
 
 ## TS-to-wasm compiler
 
+- [type-core / Semantics split](tison_type_core_semantics.md) — `type-core.ts` is language-neutral (TS vocabulary), `type-utils.ts` is JS's layer; a root `Scope` carries its language's `Semantics`; Python imports type-core only
 - [type vs representation](tison_type_vs_representation.md) — many-to-one and must stay separable; tags name representations, and it is what lets `Node[]`/`Foo[]` share one physical array type
 - [array identity — RESOLVED](tison_array_identity.md) — `Array<T>` owns a `RawArray` field; the compiler knows only `RawArray`; the traps hit, the pre-existing bugs found, and why struct merging wasn't built
 - [towasm](tison_towasm.md) — **the authoritative gap list is backend.ts's own header comment**; this covers design invariants
