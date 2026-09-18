@@ -4002,6 +4002,18 @@ async function main() {
 	}
 
 	{
+		// The checker wrote a contextual `x?: T` back onto an unannotated callback parameter as a bare `T`, so its slot was not
+		// nullable and `x === undefined` was rejected (walker.ts's `body: x => x === undefined ? ...`). TS gives it `T | undefined`.
+		const { optionalContextualParam } = await compile(`
+			interface Wk { body: <T extends number>(x?: T[] | string) => number }
+			const w: Wk = { body: x => x === undefined ? 5 : 1 };
+			const len: (x?: number[]) => number = x => x === undefined ? 7 : x.length;
+			export function optionalContextualParam(): number { return w.body() + w.body([1]) * 10 + len() * 100 + len([1, 2]) * 1000; }
+		`);
+		check('an unannotated callback parameter takes an optional contextual one as possibly undefined', optionalContextualParam(), 2715);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').

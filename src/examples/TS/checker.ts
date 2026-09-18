@@ -302,9 +302,12 @@ function applyContextualParams(params: JS.Param<Type>[], expected: Type | undefi
 		const asArray	= (t: Type | undefined) => t && t.type === 'array' ? t.element
 			: t && t.type === 'ref' && t.name === 'Array' && t.typeArgs?.length === 1 ? t.typeArgs[0] : undefined;
 		const restElem	= asArray(restAnn) ?? asArray(restAnn && T.resolveOwn(restAnn, scope));
+		// An omittable contextual parameter (`x?: T`, or one with a default) is `T | undefined` to the callback, as in TS.
+		const contextual = (c: JS.Param<Type> | undefined) => c?.typeAnnotation && (hasMod(c, 'optional') || c.default)
+			? T.combineTypes([c.typeAnnotation, T.UNDEFINED]) : c?.typeAnnotation;
 		params.forEach((p, j) => {
 			if (!p.typeAnnotation)
-				p.typeAnnotation = sig.params[j]?.typeAnnotation ?? restElem;
+				p.typeAnnotation = contextual(sig.params[j]) ?? restElem;
 		});
 	}
 	return sig || undefined;
