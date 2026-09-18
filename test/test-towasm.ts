@@ -4096,6 +4096,22 @@ async function main() {
 	}
 
 	{
+		// An IMPORTED module's callback reaches codegen with no annotation written back, so its parameter's TS type comes from
+		// the wanted signature: an optional one must be `T | undefined` there too, or `x === undefined` is rejected (walker.ts's `body`).
+		const { importedOptionalParam } = await compileMulti({
+			lib: `
+				export interface Wk { body: <T extends number>(x?: T[] | string) => number }
+				export function make(): Wk { const w: Wk = { body: x => x === undefined ? 5 : 1 }; return w; }
+			`,
+			main: `
+				import { make } from './lib';
+				export function importedOptionalParam(): number { const w = make(); return w.body() + w.body([1]) * 10; }
+			`,
+		}, 'main');
+		check('an imported callback takes an optional parameter as possibly undefined', importedOptionalParam(), 15);
+	}
+
+	{
 		// An overload group stamped only its bodyless SIGNATURES with the declaring module's scope; the implementation --
 		// the declaration towasm compiles -- kept unstamped annotations, so an imported param type (type-utils' `NumRange`
 		// in `rangeToType`) was looked up in the calling module and had no wasm type ('param 'r' needs an explicit type').

@@ -1655,6 +1655,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// enclosing declaration's own type, and the parameter name alone rarely says which.
 		const sigText = () => T.typeKey({ type: 'function', ...sig } as Type);
 		const defaults = T.defaultsWithImplicitUndefined(func.params);
+		const omittable = (i: number) => !!defaults[i] && T.nullLiteralKind(defaults[i]!) === 'undefined';
 		const params = func.params.map((p, i) => {
 			// `void` is valid TS in a param position but has no wasm value, so box it as `any` like any other "no meaningful value" position rather than rejecting valid source.
 			const wt = p.typeAnnotation && typeOf(p.typeAnnotation);
@@ -1663,11 +1664,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				throw `function type parameter '${describeBinding(p.key)}': '${p.typeAnnotation ? T.typeKey(p.typeAnnotation) : '<no annotation>'}' has no representation, in '${sigText()}'`;
 			// A slot a caller may fill with `undefined` (a bare `p?: T`, or a default only the callee can apply) is nullable;
 			// a re-emitted default always arrives. Same rule as `resolveParam`, or the two physical signatures disagree.
-			return defaults[i] && T.nullLiteralKind(defaults[i]!) === 'undefined' ? types.nullable(boxed) : boxed;
+			return omittable(i) ? types.nullable(boxed) : boxed;
 		});
 		// Always built: an UNANNOTATED closure parameter takes its type from the callee's declared
-		// signature (`emitClosureLiteral`), which needs the TS type and not just the physical one.
-		const resolvedParams = func.params.map((p, i) => ({ key: p.key, wtype: params[i], tsType: p.typeAnnotation! }));
+		// signature (`emitClosureLiteral`), which needs the TS type and not just the physical one. It widens with a nullable
+		// slot, as `resolveParam`'s does: an imported module's callback reaches here unannotated, and `x === undefined` needs it.
+		const resolvedParams = func.params.map((p, i) => ({ key: p.key, wtype: params[i], tsType: omittable(i) ? T.combineTypes([p.typeAnnotation!, T.UNDEFINED]) : p.typeAnnotation! }));
 		let hasRest = false;
 		// The rest ELEMENT as well as the array: a closure literal with more parameters than the
 		// signature has fixed ones takes each extra one from here, and binds it out of the rest array.
