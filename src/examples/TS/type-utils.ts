@@ -3276,11 +3276,16 @@ function memberOptionalState(t: Type, prop: string, scope: Scope, depth: number)
 		const m = findTypeMember(t.members, prop);
 		return m ? (hasMod(m, 'optional') ? 'optional' : 'required') : undefined;
 	}
-	if (t.type !== 'intersection')
+	if (t.type !== 'intersection' && t.type !== 'union')
 		return undefined;
 	if (depth <= 0) {
 		scope.hitDepthLimit('memberOptional');
 		return undefined;
+	}
+	// A union's read is each member's read, so one member marking `prop` optional makes the whole read possibly undefined.
+	if (t.type === 'union') {
+		const states = t.types.map(p => memberOptionalState(p, prop, scope, depth - 1));
+		return states.includes('optional') ? 'optional' : states.every(s => s === 'required') ? 'required' : undefined;
 	}
 	// `prop` is optional in `A & B` only if every part that declares it marks it optional -- one part requiring it
 	// makes the combined type require it too, matching `lookupMember`'s own intersection case.
