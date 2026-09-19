@@ -226,6 +226,12 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// (errorConstructorSubtypes); the augmentation is undone between cases, as the corpus harness undoes it between files.
 	['a script augments the global interface every declaration sees', 'interface ErrorConstructor { capture(o: object): void } let x: ErrorConstructor; x = RangeError; const s: string = RangeError.capture;', ["is not assignable to type 'string'"]],
 	['a script augmentation does not reach the next file', 'const s: string = RangeError.capture;', ["Property 'capture' does not exist"]],
+	// A SCRIPT's `interface` augments the GLOBAL one, so the lib's own `RangeErrorConstructor extends ErrorConstructor` has it too
+	// (errorConstructorSubtypes); the augmentation is undone between cases, as the corpus harness undoes it between files.
+	['a script augments the global interface every declaration sees', 'interface ErrorConstructor { capture(o: object): void } let x: ErrorConstructor; x = RangeError; const s: string = RangeError.capture;', ["is not assignable to type 'string'"]],
+	['a script augmentation does not reach the next file', 'const s: string = RangeError.capture;', ["Property 'capture' does not exist"]],
+	// `tag<T>`...`` is a tagged template, not `(tag < T) > `...`` -- the type-argument terminal reads a backtick after `>` too.
+	['a tagged template takes type arguments', 'declare function tag<T>(s: TemplateStringsArray): T; const s: string = tag<number>`x`;', [NOT_ASSIGNABLE('number', 'string')]],
 	// Rest arguments are inferred from as one tuple: against `[(self) => R<T>[]] | R<T>[]` (core.ts's `Rules`), the array member infers `T`.
 	['a rest parameter of tuple-or-array type infers from its arguments', 'interface R<T> { a?: (x: number) => T } declare function rule<T>(action: (x: number) => T): R<T>; declare function rules<T>(...alts: [(self: () => R<T>[]) => R<T>[]] | R<T>[]): R<T>[]; const q: string = rules(rule(x => ({ p: 1 })), rule(x => ({ p: 2 })));', [NOT_ASSIGNABLE('R<{\n  p: number\n}>[]', 'string')]],
 	// A resolution cut short by the depth limit answers `any` for THAT call; cached, every alias it passed through stayed `any`.
