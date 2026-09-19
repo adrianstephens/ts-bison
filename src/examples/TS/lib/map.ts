@@ -20,7 +20,6 @@ class Map<K, V> {
 		for (let i = 0; i < n; i++)
 			this.set(entries[i][0], entries[i][1]);
 	}
-	// TS's constructor takes any `Iterable`, which has no representation yet; these two are the forms that do.
 	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(other: ReadonlyMap<K, V> | null | undefined) {
 		if (other) {
@@ -28,6 +27,13 @@ class Map<K, V> {
 			for (let i = 0; i < keys.length; i++)
 				this.set(keys[i], values[i]);
 		}
+	}
+	// TS's own constructor; the two above are fast paths for the commonest arguments.
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(entries: Iterable<readonly [K, V]> | null | undefined) {
+		if (entries)
+			for (const [k, v] of entries)
+				this.set(k, v);
 	}
 	get size(): number { return this.keys_.length; }
 
@@ -106,7 +112,6 @@ class Set<T> {
 		for (let i = 0; i < n; i++)
 			this.add(values[i]);
 	}
-	// As `Map`'s: TS's takes any `Iterable`, which has no representation yet.
 	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(other: ReadonlySet<T> | null | undefined) {
 		if (other) {
@@ -114,6 +119,13 @@ class Set<T> {
 			for (let i = 0; i < values.length; i++)
 				this.add(values[i]);
 		}
+	}
+	// As `Map`'s: TS's own constructor, after the fast paths.
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(values: Iterable<T> | null | undefined) {
+		if (values)
+			for (const v of values)
+				this.add(v);
 	}
 
 	get size(): number { return this.items_.length; }

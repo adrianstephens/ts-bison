@@ -2370,6 +2370,44 @@ async function main() {
 	}
 
 	{
+		// `Iterable<T>`: a parameter is specialized per argument; a slot receiving several layouts (a local, a field, a closure's
+		// parameter, an upcast) is an open shape, iterated through `[Symbol.iterator]`/`next` dispatched at run time.
+		const { iterParam, iterSlots, iterCtors, twoClasses } = await compile(`
+			function sum(xs: Iterable<number>): number { let s = 0; for (const x of xs) s += x; return s; }
+			function* gen(): Generator<number, void, unknown> { yield 10; yield 20; }
+			export function iterParam(): number { return sum([4, 5]) + sum(new Set<number>([1, 2, 3])) * 100 + sum(gen()) * 10000; }
+			interface Opts { known?: Iterable<number> }
+			function count(o: Opts): number { let n = 0; for (const x of o.known ?? []) n += x; return n; }
+			export function iterSlots(): number {
+				const a: Iterable<number> = new Set<number>([1, 2]);
+				let t = 0;
+				for (const x of a) t += x;
+				const add = (k: number, terms: Iterable<number>) => { for (const x of terms) t += x * k; };
+				add(1000, new Set<number>([7]));
+				const m = new Map<string, number>([['a', 100]]);
+				for (const [k, v] of m as Iterable<[string, number]>) t += v;
+				return t + count({ known: [3, 4] }) * 10 + count({ known: new Set<number>([5]) }) * 10000;
+			}
+			interface CtorOpts { knownTypes?: Iterable<string> }
+			function mk(options?: CtorOpts): number { return new Set<string>(options?.knownTypes).size; }
+			function* names(): Generator<string, void, unknown> { yield 'x'; yield 'y'; yield 'x'; }
+			export function iterCtors(): number {
+				return mk() + mk({ knownTypes: ['a', 'b'] }) * 10 + mk({ knownTypes: new Set<string>(['q']) }) * 100 + mk({ knownTypes: names() }) * 1000
+					+ new Map<string, number>(new Map<string, number>([['a', 1]]).entries()).size * 10000;
+			}
+			interface Shape { area(): number }
+			class Sq { constructor(public s: number) {} area() { return this.s * this.s; } }
+			class Rect { constructor(public w: number, public h: number) {} area() { return this.w * this.h; } }
+			function tot(xs: Shape[]): number { let t = 0; for (const x of xs) t += x.area(); return t; }
+			export function twoClasses(): number { return tot([new Sq(2), new Rect(2, 3)]); }
+		`);
+		check('Iterable parameter: array, Set, generator', iterParam(), 300609);
+		check('Iterable slots: local, closure parameter, upcast, optional field', iterSlots(), 57173);
+		check('Set/Map from any Iterable', iterCtors(), 12120);
+		check('an interface held by two unrelated classes', twoClasses(), 10);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

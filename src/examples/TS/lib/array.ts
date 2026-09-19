@@ -299,6 +299,10 @@ export class Array<T> extends ArrayBase {
 		for (let i = 0; i < this.length; i++)
 			callback(this[i], i, this);
 	}
+	// What a value known only as an `Iterable` iterates by; a `for...of` over a known array still reads by position.
+	[Symbol.iterator](): Generator<T, void, unknown> {
+		return __towasm_indexed<T>(() => this.length, i => this[i]);
+	}
 	join(separator = ','): string {
 		let result = '';
 		for (let i = 0; i < this.length; i++) {

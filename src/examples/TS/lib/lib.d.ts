@@ -135,6 +135,15 @@ interface Generator<Y, R, N> {
 	next(v: N): IteratorResult<Y, R>;
 	[Symbol.iterator](): Generator<Y, R, N>;
 }
+interface Iterator<T, R = any, N = any> {
+	next(v?: N): IteratorResult<T, R>;
+}
+interface Iterable<T, R = any, N = any> {
+	[Symbol.iterator](): Iterator<T, R, N>;
+}
+interface IterableIterator<T, R = any, N = any> extends Iterator<T, R, N> {
+	[Symbol.iterator](): IterableIterator<T, R, N>;
+}
 declare function __towasm_indexed<T>(size: () => number, at: (i: number) => T): Generator<T, void, unknown>;
 
 declare type PropertyKey = string | number | symbol;
@@ -358,6 +367,7 @@ interface Array<T> {
 	reduceRight(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T): T;
 	reduceRight(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T, initialValue: T): T;
 	reduceRight<U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number, array: T[]) => U, initialValue: U): U;
+	[Symbol.iterator](): Generator<T, void, unknown>;
 }
 
 // As TS's `ArrayConstructor`: `Array` is callable WITHOUT `new` as well (`Array(n).fill(x)`, the standard
@@ -412,6 +422,7 @@ interface ReadonlyArray<T> {
 	reduceRight(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: readonly T[]) => T): T;
 	reduceRight(callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: readonly T[]) => T, initialValue: T): T;
 	reduceRight<U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number, array: readonly T[]) => U, initialValue: U): U;
+	[Symbol.iterator](): Generator<T, void, unknown>;
 }
 
 // Likewise the non-mutating part of `Map`/`Set` (lib/map.ts): physically each IS one (`READONLY_ALIAS`).

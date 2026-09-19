@@ -1174,7 +1174,7 @@ function accessorKey(kind: 'get' | 'set', name: string): string {
 // A structural shape's expando identity: its member names. A named shape and its anonymous twin share it, so they get
 // the same expando fields and `layoutTwin` can still merge them.
 function shapeKey(members: readonly TS.TypeMember[]): string {
-	return `#shape#${members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string' ? [m.key] : []).sort().join(',')}`;
+	return `#shape#${members.flatMap(m => (m.type === 'property' || m.type === 'method') ? T.memberKey(m.key) ?? [] : []).sort().join(',')}`;
 }
 function structuralKey(name: string, params: JS.Param<Type>[]): string {
 	return `${name}#struct<${params.map(p => p.typeAnnotation ? T.typeKey(p.typeAnnotation) : '_').join(',')}>`;
@@ -1367,7 +1367,8 @@ function layoutSketch(t: Type | undefined, scope: Scope, depth = 3): string {
 	// `TemplatePart<unknown>` and `TemplatePart<Type>` are one instantiation, which substituting them apart would hide.
 	if (t.type === 'ref' && t.typeArgs?.length && !scope.type(t.name)?.isTypeParam)
 		return `${t.name}<${t.typeArgs.map(a => ownsLayout(a, scope) ? layoutArgKey(a, scope) : 'ref').join(',')}>`;
-	const r = T.resolve(scope, t);
+	// A literal is stored as its base type: `'k'` is a string and `1 | 2` a number.
+	const r = T.widenLiterals(T.resolve(scope, t), false, true);
 	const members = T.unionMembers(r, scope).filter(m => !T.isNullish(m, scope));
 	// A union of references is one `anyref`, and so is `any`/`unknown`/`object` -- `TemplatePart<unknown>`'s `exp?` and
 	// `TemplatePart<Type>`'s (a union) are the same slot, while `Sig` and `Meth` are two distinct struct references.
@@ -1385,8 +1386,10 @@ function layoutSketch(t: Type | undefined, scope: Scope, depth = 3): string {
 		return `arr:${ownsLayout(el, scope) ? layoutSketch(el, scope, depth - 1) : 'ref'}`;
 	}
 	if (r.type === 'object')
-		return `{${r.members.flatMap(m => (m.type === 'property' || m.type === 'method') && typeof m.key === 'string'
-			? [`${m.key}:${layoutSketch(T.lookupMember(r, m.key, scope), scope, depth - 1)}`] : []).sort().join(',')}}`;
+		return `{${r.members.flatMap(m => {
+			const key = (m.type === 'property' || m.type === 'method') && T.memberKey(m.key);
+			return key ? [`${key}:${layoutSketch(T.lookupMember(r, key, scope), scope, depth - 1)}`] : [];
+		}).sort().join(',')}}`;
 	return 'ref';
 }
 
@@ -1422,10 +1425,11 @@ function primitivePart(t: TS.IntersectionType, scope: Scope): Type | undefined {
 }
 
 
-// A value with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable; one without (an array: the lib declares it none) is read by position.
+// A value with `[Symbol.iterator]()` iterates by the protocol, as JS iterates every iterable. An array is read by position:
+// its own `[Symbol.iterator]` is for a value known only as an `Iterable`.
 function iteratesByProtocol(e: Expr, ctx: FunctionContext): T.IterationTypes | undefined {
 	const t = ctx.narrowedTypeOf(e);
-	if (!T.lookupMember(t, '[Symbol.iterator]', ctx.typeScope))
+	if (T.unionMembers(t, ctx.typeScope).every(m => arrayPartOf(m, ctx.typeScope)) || !T.lookupMember(t, '[Symbol.iterator]', ctx.typeScope))
 		return undefined;
 	const it = T.iterationTypes(t, ctx.typeScope);
 	if (!it)
@@ -2084,6 +2088,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		}
 
 		if (t.type === 'ref' && t.typeArgs?.length) {
+			if (openShapes.has(T.typeKey(T.resolve(global, t))))
+				return W.REF_ANY;
 			const name = READONLY_ALIAS.get(t.name) ?? t.name;
 			const decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
 			if (decl?.type === 'class_decl' && decl.typeParams?.length) {
@@ -2661,6 +2667,15 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return W.isAny(wtypeOf(e, ctx));
 	}
 
+	// Each argument of a call dispatched at run time, as its own representation: a bare `null`/`undefined` has none, so it goes as a null `any`.
+	function emitDynamicArgs(args: Expr[], ctx: FunctionContext): W.Type[] {
+		return args.map(a => T.isNullLiteral(a) ? emitAs(a, ctx, W.REF_ANY_NULLABLE) : emitExpr(a, ctx));
+	}
+
+	function dispatchesAsAny(recv: Expr, args: Expr[], ctx: FunctionContext): boolean {
+		return (T.isAny(ctx.narrowedTypeOf(recv)) || physicallyAny(recv, ctx)) && !args.some(a => a.type === 'spread');
+	}
+
 	function classOfForIndexing(e: Expr, ctx: FunctionContext): ClassInfo | undefined {
 		if (physicallyAny(e, ctx))
 			return undefined;
@@ -2709,6 +2724,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	function ownerFor(t: Type): ClassInfo | undefined {
+		// An open shape is stored as `any` and may hold any layout, so nothing owns it statically.
+		if (openShapes.size && openShapes.has(T.typeKey(T.resolve(global, t))))
+			return undefined;
 		// Same fast path `wasmTypeOf` needs, for the same reason -- a hoisted `builtinTypes` name would
 		// otherwise fully expand via its own `declScope` before reaching the `w.type === 'ref'` check below.
 		if (t.type === 'ref') {
@@ -3653,12 +3671,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		let changed = false;
 		const params = declared.map((p, i) => {
 			const arg = args[i];
-			// A literal is built AS the parameter's type (its context), and an index-signature parameter is a dynamic object read
-			// by key: neither is a struct to specialize for.
-			if (!arg || arg.type === 'spread' || arg.type === 'object' || arg.type === 'array' || !p.typeAnnotation
-				|| indexSignatureValueType(T.resolve(global, p.typeAnnotation)))
+			// A literal is built AS the parameter's type (its context), unless an array literal meets a type holding no array storage (an `Iterable`);
+			// an index-signature parameter is a dynamic object read by key. Neither is a struct to specialize for.
+			if (!arg || arg.type === 'spread' || arg.type === 'object' || !p.typeAnnotation || indexSignatureValueType(T.resolve(global, p.typeAnnotation)))
 				return p;
-			const want = typeOf(p.typeAnnotation), got = wtypeOf(arg, ctx);
+			const want = typeOf(p.typeAnnotation);
+			if (arg.type === 'array' && storageKindOf(want))
+				return p;
+			const got = wtypeOf(arg, ctx);
 			if (!want || !got || typeof want === 'string' || typeof got === 'string' || !('ref' in want) || !('ref' in got)
 				|| want.ref === got.ref || want.ref === 'any' || got.ref === 'any' || isSubclassOf(got.ref, want.ref))
 				return p;
@@ -6223,13 +6243,13 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						if (!owner) {
 							// A receiver typed `any` still has its method at run time: the ordinary dispatch (`ensureAnyDispatch`), inside
 							// the null guard, so a nullish receiver skips the arguments too (walker.ts `stmt.finalizer?.some(...)`).
-							if (T.isAny(ctx.narrowedTypeOf(objExpr)) && !e.arguments.some(a => a.type === 'spread')) {
+							if (dispatchesAsAny(objExpr, e.arguments, ctx)) {
 								const w = wtypeOf(e, ctx);
 								const resultWtype = w && w !== 'void' ? types.nullable(w) : W.REF_ANY_NULLABLE;
 								emitAs(objExpr, ctx, W.REF_ANY_NULLABLE);
 								return ctx.emitOptionalAccess(W.REF_ANY_NULLABLE, resultWtype, toValType, objLocal => {
 									ctx.emit(I.local.get(objLocal), I.ref.as_non_null);
-									ctx.emit(I.call(ensureAnyDispatch(methodName, e.arguments.map(a => emitExpr(a, ctx)), e.arguments.map(a => ctx.narrowedTypeOf(a)), resultWtype, ctx).funcIndex));
+									ctx.emit(I.call(ensureAnyDispatch(methodName, emitDynamicArgs(e.arguments, ctx), e.arguments.map(a => ctx.narrowedTypeOf(a)), resultWtype, ctx).funcIndex));
 								});
 							}
 							throw `unknown method '${methodName}' (its receiver's type: '${T.typeKey(ctx.narrowedTypeOf(objExpr)).slice(0, 160)}')`;
@@ -6315,15 +6335,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 					const owner = ownerOf(obj, ctx);
 					if (!owner) {
-						// No single static owner -- a genuinely `any` receiver still resolves through a real runtime dispatch, as in JS.
-						// Checked via the checker's own type, not `wtypeOf` (which gives `undefined`, not `REF_ANY`, for an `any`-typed
-						// expression). `want ?? REF_ANY`: a bare expression-statement passes no `want`; `coerceTop` widens to `REF_ANY`.
-						if (T.isAny(ctx.narrowedTypeOf(obj)) && !e.arguments.some(a => a.type === 'spread')) {
-							emitAs(obj, ctx, W.REF_ANY);
-							const info = ensureAnyDispatch(e.callee.property, e.arguments.map(a => emitExpr(a, ctx)), e.arguments.map(a => ctx.narrowedTypeOf(a)), want ?? W.REF_ANY, ctx);
-							ctx.emit(I.call(info.funcIndex));
-							return info.result;
-						}
 						// A real union receiver -- the sibling of `case 'member'`'s own union FIELD dispatch, same `ref.test` cascade but
 						// calling each member's method. Emitted inline rather than as a shared dispatcher (`ensureUnionFieldDispatch`)
 						// because the arguments are ordinary expressions right here: re-emitting them per arm duplicates code but not
@@ -6348,6 +6359,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							};
 							ctx.emit(...buildArm(0));
 							return result;
+						}
+						// Otherwise a receiver typed or STORED as `any` (an open shape) resolves through a runtime dispatch, as in JS.
+						// `want ?? REF_ANY`: a bare expression-statement passes no `want`; `coerceTop` widens to `REF_ANY`.
+						if (dispatchesAsAny(obj, e.arguments, ctx)) {
+							emitAs(obj, ctx, W.REF_ANY);
+							const info = ensureAnyDispatch(e.callee.property, emitDynamicArgs(e.arguments, ctx), e.arguments.map(a => ctx.narrowedTypeOf(a)), want ?? W.REF_ANY, ctx);
+							ctx.emit(I.call(info.funcIndex));
+							return info.result;
 						}
 						throw `unknown method '${e.callee.property}' (its receiver's type: '${T.typeKey(ctx.narrowedTypeOf(obj)).slice(0, 160)}')`;
 					}
@@ -6395,7 +6414,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// A callee typed `any` (core.ts `params[0](() => rules)`), or held as one (a union of signatures): dispatched over the program's closure types.
 				if ((T.isAny(ctx.narrowedTypeOf(e.callee)) || physicallyAny(e.callee, ctx)) && !e.arguments.some(a => a.type === 'spread')) {
 					emitAs(e.callee, ctx, W.REF_ANY);
-					const info = ensureAnyCallDispatch(e.arguments.map(a => emitExpr(a, ctx)), want ?? W.REF_ANY);
+					const info = ensureAnyCallDispatch(emitDynamicArgs(e.arguments, ctx), want ?? W.REF_ANY);
 					ctx.emit(I.call(info.funcIndex));
 					return info.result;
 				}
@@ -7918,16 +7937,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 		for (const m of members) {
 			switch (m.type) {
-				case 'property': {
-					if (typeof m.key !== 'string')
-						throw `object-shape type '${declName}' has a computed property name -- not supported`;
-					addField(info, m.key, m.typeAnnotation, hasMod(m, 'optional'));
-					break;
-				}
+				case 'property':
 				case 'method': {
-					if (typeof m.key !== 'string')
-						throw `object-shape type '${declName}' has a computed property name -- not supported`;
-					addField(info, m.key, {...(m as TS.CallSig), type: 'function'}, hasMod(m, 'optional'));
+					const key = T.memberKey(m.key);
+					if (key === undefined)
+						throw `object-shape type '${declName}' has a computed property name with no static spelling -- not supported`;
+					addField(info, key, m.type === 'method' ? {...(m as TS.CallSig), type: 'function'} : m.typeAnnotation, hasMod(m, 'optional'));
 					break;
 				}
 				default:
@@ -9491,23 +9506,35 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	function noteTypes(slot: Type | undefined, value: Type | undefined, scope: Scope, depth = 4): void {
 		if (!slot || !value || depth < 0)
 			return;
-		const s = T.resolve(scope, slot), v = T.resolve(scope, value);
+		// A readonly view is its container, physically.
+		const physical	= (x: Type): Type => x.type === 'ref' && READONLY_ALIAS.has(x.name) ? { ...x, name: READONLY_ALIAS.get(x.name)! } : x;
+		const s			= T.resolve(scope, physical(slot)), v = T.resolve(scope, physical(value));
 		if (T.typeKey(s) === T.typeKey(v))
 			return;
-		if (s.type === 'array' && v.type === 'array')
-			return noteTypes(s.element, v.element, scope, depth - 1);
-		if (s.type !== 'object')
+		const se = T.arrayLikeElement(s), ve = T.arrayLikeElement(v);
+		if (se && ve)
+			return noteTypes(se, ve, scope, depth - 1);
+		// What a method of the value returns is what the slot's method is read as returning. Not a level deeper: the member step that reached it was.
+		if (s.type === 'function' && v.type === 'function')
+			return noteTypes(s.returnType, v.returnType, scope, depth);
+		// Two instantiations of one generic class are distinct structs when their arguments' layouts differ, as two shapes are.
+		const instance = s.type === 'ref' && v.type === 'ref' && s.name === v.name && !!s.typeArgs?.length && T.isClassRef(s, scope);
+		if (s.type !== 'object' && !instance)
 			return;
-		if (v.type === 'object')
-			for (const m of s.members)
-				if ((m.type === 'property' || m.type === 'method') && typeof m.key === 'string')
-					noteTypes(T.lookupMember(s, m.key, scope), T.lookupMember(v, m.key, scope), scope, depth - 1);
+		if (s.type === 'object')
+			for (const m of s.members) {
+				const key = (m.type === 'property' || m.type === 'method') && T.memberKey(m.key);
+				if (key)
+					noteTypes(T.lookupMember(s, key, scope), T.lookupMember(v, key, scope), scope, depth - 1);
+			}
 		// An `any` value is the program's own promise about what it holds, kept by the `ref.cast` every read of one already
-		// emits -- widening on it would open nearly every shape, since `any` reaches everywhere.
-		if (T.isAny(v) || (v.type === 'ref' && v.name === 'unknown'))
+		// emits -- widening on it would open nearly every shape, since `any` reaches everywhere. So is an `any` type argument (`new Map`).
+		const promised = (x: Type) => T.isAny(x) || (x.type === 'ref' && x.name === 'unknown');
+		if (promised(v))
 			return;
+		const kept = instance && v.type === 'ref' && s.type === 'ref' ? { ...v, typeArgs: v.typeArgs?.map((a, i) => promised(a) ? s.typeArgs![i] : a) } : v;
 		// Only a value of a genuinely different LAYOUT widens: two types that share one are already interchangeable.
-		if (layoutSketch(s, scope) !== layoutSketch(v, scope) && T.isAssignable(v, s, scope))
+		if (layoutSketch(s, scope) !== layoutSketch(kept, scope) && T.isAssignable(v, s, scope))
 			openShapes.add(T.typeKey(s));
 	}
 	function collectOpenShapes() {
@@ -9531,6 +9558,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				(e, process) => {
 					if (e.type === 'assign') {
 						noteSlot(checkerTypeOf(unwrapAs(e.target), scope), e.value, scope);
+					// An upcast is read as its target type from then on, as a slot of that type would be.
+					} else if (e.type === 'as') {
+						noteSlot(e.typeAnnotation, e.expression, scope);
 					// A plain call argument carries no contextual stamp this pass can read, so the parameter types come from
 					// the callee's own signature -- a rest parameter by its element type, which `push({ sig, decl })` needs.
 					} else if (e.type === 'call') {
@@ -9538,6 +9568,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// Every overload that could take this many arguments is noted: marking a shape open only costs speed.
 						const fn	= T.resolve(scope, checkerTypeOf(unwrapAs(e.callee), scope));
 						const sigs	= fn.type === 'function' ? [fn] : fn.type === 'object' ? fn.members.filter(m => m.type === 'call') : [];
+						// Only a named function is monomorphized per argument layout; a closure's, method's or constructor's parameter is a slot.
+						const callee		= unwrapAs(e.callee);
+						const calleeDecl	= callee.type === 'identifier' ? scope.decl(callee.name)
+							: callee.type === 'member' && callee.object.type === 'identifier' ? scope.namespace(callee.object.name)?.decl(callee.property) : undefined;
+						const monomorphized	= calleeDecl?.type === 'function_decl';
 						for (const sig of sigs as TS.CallSig[]) {
 							if (!sig.rest && sig.params.length < e.arguments.length)
 								continue;
@@ -9545,9 +9580,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							e.arguments.forEach((arg, i) => {
 								if (arg.type !== 'spread')
 								{
-									// A declared parameter is NOT a slot: the callee is monomorphized per argument layout, which keeps the caller's own object (test `structuralParam`).
-									// Only a rest parameter's bundle -- an array, so its element type is erased -- has to be widened.
-									if (!sig.params[i]?.typeAnnotation && restEl && restEl.type === 'array')
+									// A named function's declared parameter is NOT a slot: it keeps the caller's own object (test `structuralParam`). A literal is built AS
+									// the parameter's type, though, so what it holds meets that type's members; a rest parameter's bundle is an array whose element type is erased.
+									const declared = sig.params[i]?.typeAnnotation;
+									if (declared && (!monomorphized || arg.type === 'object' || arg.type === 'array'))
+										noteSlot(declared, arg, scope);
+									else if (!declared && restEl && restEl.type === 'array')
 										noteSlot(restEl.element, arg, scope, 4, true);
 								}
 							});
