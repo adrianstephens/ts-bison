@@ -26,6 +26,10 @@ export type Element		= ElementI | 'u8' | 'u16' | 'u32' | 'u64';
 // The PHYSICAL shape of a closure: what wasm needs to call it, and nothing about the language that produced it. `FuncSig` extends this with the binding data only argument-binding reads.
 export interface ClosureSig	{ params: Type[]; result: Type; hasRest?: boolean }
 
+// The physical result of an asm body: a signature and its instructions. `Inline` in the language half is
+// this plus the argument-binding payload an asm body never reads, so this is its projection, not a copy.
+export interface Inline extends ClosureSig { inline: wasm.Instr[] }
+
 export type Type		= Scalar
 	| 'void'	// only valid as a function result, never a param/local/field.
 	| { ref:		string; nullable?: boolean }
@@ -145,23 +149,6 @@ export function combineUnion(wtypes: readonly Type[]): Type {
 		return 'f64';
 	return REF_ANY;
 }
-
-export function storageTypeKey(v: wasm.StorageType): string {
-	return typeof v === 'string' ? v : `ref:${v.ref}:${v.nullable}`;
-}
-export function wTypeKey(type: wasm.SubType): string|undefined {
-	const comp = 'type' in type ? type.type : type;
-	return comp.kind === 'func' ? `func(${comp.params.map(p => storageTypeKey(p.type)).join(',')})=>(${comp.results.map(storageTypeKey).join(',')})`
-		: comp.kind === 'array' ? `array(${storageTypeKey(comp.field.type)}:${comp.field.mut})`
-		// Field MUTABILITY is part of a struct's identity in wasm, exactly as it already is for an array
-		// above -- omitting it silently merged two genuinely different types. It bit as soon as a scalar
-		// holder (`ensureHolderType`, one mutable f64 field) appeared: identical to the immutable `f64` BOX
-		// (`ensureBoxType`) under the old key, so a holder became a box and `ref.test` for `typeof x ===
-		// 'number'` started matching holders too. `final`/`supertypes` likewise: a subtype is not its base.
-		: comp.kind === 'struct' ? `struct(${comp.fields.map(f => `${storageTypeKey(f.type)}:${f.mut}`).join(',')})${'final' in type && type.final ? ':final' : ''}${'supertypes' in type && type.supertypes.length ? ':<' + type.supertypes.join(',') : ''}`
-		: undefined;
-}
-
 
 export class Error {
 	msg:	string;
@@ -752,12 +739,12 @@ export class Types extends Array<wasm.SubType> {
 	// as a side effect, and a speculative candidate scan must not add types nothing uses. An absent type means
 	// no value of that kind exists to reach an `any` slot.
 	has(desc: wasm.SubType): boolean {
-		const key = wTypeKey(desc);
+		const key = wasm.typeKey(desc);
 		return key !== undefined && this.typeMap.has(key);
 	}
 
 	register(type: wasm.SubType): number {
-		const key		= wTypeKey(type);
+		const key		= wasm.typeKey(type);
 		const existing	= key !== undefined ? this.typeMap.get(key) : undefined;
 		if (existing !== undefined)
 			return existing;
@@ -829,45 +816,13 @@ export class TagSection extends Array<wasm.TagType> {
 // declared types off it) and the answers the language alone has: what a declared type lowers to, and what
 // a `TYPEINDEX` operand names. Those are its ordinary type-model operations, not something the island adds.
 
-// The four numeric wasm types, in "widen to me first" preference order when an operand's own type has no
-// real instruction -- f64 first, since widening i32/i64/f32 up to it is exact or an already-accepted tradeoff.
-const NUMERIC_TYPES = ['f64', 'f32', 'i64', 'i32'] as const;
-type NumericType = typeof NUMERIC_TYPES[number];
-function isNumericType(t: Type | undefined): t is NumericType { return NUMERIC_TYPES.includes(t as NumericType); }
-
-// The physical result of an asm body: a signature and its instructions. `Inline` in the language half is
-// this plus the argument-binding payload an asm body never reads, so this is its projection, not a copy.
-interface AsmInline extends ClosureSig { inline: wasm.Instr[] }
-
-// The signature ONE asm call settled on -- concrete representations only, so the language's own types stay
-// on its side -- plus the `TYPEINDEX` resolver that belongs to it. The two travel together because a
-// `TYPEINDEX` operand must agree with the very signature its own call settled on (an `array.copy`'s operand
-// types are read against it), which is a fact about the types involved and so only the language can answer.
-export interface AsmDecl extends ClosureSig {
-	typeIndex(text: string): number | undefined;
-}
-
-// What the language knows about an island before any call site exists.
-export interface AsmSource {
-	asm: string;
-	defines?: Record<string, string | number>;
-	// Whether the declared signature depends on the call site's type arguments: a generic owner, or a body
-	// naming `TYPEINDEX`. Decided by the language, since only it has type parameters.
-	generic: boolean;
-	// The declared arity. A `$T`-switched body's runtime signature is the chosen numeric type, but its
-	// arity still comes from the declaration.
-	paramCount: number;
-}
-
 // An island, prepared once. A `$T`-switched body needs no signature at all -- the chosen numeric type IS
 // its signature -- so the two shapes are distinguished here rather than by an optional argument the caller
 // could get wrong.
 type PreparedAsm =
-	| { switched: true;		render(args: (Type | undefined)[], ctx: FunctionContext): AsmInline }
-	| { switched: false;	render(args: (Type | undefined)[], ctx: FunctionContext, decl: AsmDecl): AsmInline };
+	| { switched: true;		render(args: (Type | undefined)[], ctx: FunctionContext): Inline }
+	| { switched: false;	render(args: (Type | undefined)[], ctx: FunctionContext, sig: ClosureSig, typeIndex: (text: string)=> number | undefined): Inline };
 
-// One numeric type's expansion of a `$T`-switch body.
-type TypeSwitchVariants = Partial<Record<NumericType, { locals: WAT.WatLocal[]; body: wasm.Instr[] }>>;
 
 function assertFlatInstrs(instrs: WAT.WatInstr[], asm: string): wasm.Instr[] {
 	return instrs.map(i => {
@@ -881,56 +836,6 @@ function assertFlatInstrs(instrs: WAT.WatInstr[], asm: string): wasm.Instr[] {
 			throw `inline asm '${asm}': '${i.localIndex}' needs an enclosing '(switch $T ...)' declaring which types it's for`;
 		return i;
 	});
-}
-
-// A `$T`-keyed switch, expanded once per numeric type its arms declare. An arm's own body can declare
-// further `$T`-typed locals (embedded as `__local` markers in its own body, same as everywhere else --
-// switch_arm never splits them out) and further `$T.suffix` references, so a winning arm is processed by
-// recursing back into this same walk, exactly as if the arm's own body were the whole generic body.
-function expandTypeSwitch(parsed: { locals: WAT.WatLocal[]; body: WAT.WatInstr[] }, sw: WAT.SwitchPlaceholder, asm: string): TypeSwitchVariants {
-	const variants: TypeSwitchVariants = {};
-
-	for (const type of new Set(sw.arms.flatMap(a => a.values).filter(a => typeof a === 'string').map(a => a.slice(1) as NumericType))) {
-		const locals:	WAT.WatLocal[] = [];
-		const body:		WAT.WatInstr[] = [];
-
-		const addLocals = (ls: WAT.WatLocal[]) => locals.push(...ls.map(l => ({
-			id:		l.id,
-			count:	l.count,
-			type:	typeof l.type === 'object' && 'typeParam' in l.type ? type : l.type,
-		})));
-
-		function process(items: WAT.WatInstr[]): boolean {
-			for (const i of items) {
-				if (i.op === '__local') {
-					addLocals([i]);
-				} else if (i.op === 'local.get' && typeof i.localIndex === 'string' && i.localIndex.startsWith('$T.')) {
-					const oper = i.localIndex.slice(3);
-					if (!(oper in I[type]))
-						return false;
-					body.push((I[type] as any)[oper]);
-				} else if (i.op === '__switch' && i.key === '$T') {
-					const arm = i.arms.find(a => a.values.includes(`$${type}`));
-					if (!arm)
-						return false;
-					if (!process(arm.body))
-						return false;
-				} else {
-					body.push(i);
-				}
-			}
-			return true;
-		}
-
-		addLocals(parsed.locals);
-		if (!process(parsed.body))
-			throw `inline asm '${asm}': switch arm '(${sw.arms.find(a => a.values.includes(`$${type}`))!.values.join(' ')})' claims '${type}' but its own body doesn't resolve for it`;
-		variants[type] = { locals, body: assertFlatInstrs(body, asm) };
-	}
-	if (!Object.keys(variants).length)
-		throw `inline asm '${asm}': switch '$T' has no arms`;
-
-	return variants;
 }
 
 // Resolves named scratch locals to real local indices via ctx.local
@@ -982,26 +887,78 @@ function resolveTypeExprs(instrs: wasm.Instr[], resolveIndex: (text: string) => 
 // The three shapes an asm body takes. A generic body's signature and type operands depend on the call
 // site's type arguments, so its operands are resolved per call; a `$T` body's signature is the numeric type
 // its arguments agree on; anything else is resolved once.
-export function makeAsm(src: AsmSource): PreparedAsm {
-	const { asm } = src;
-	const parsed = WAT.parseAsmBody(asm, src.defines);
+export function makeAsm(asm: string, defines: Record<string, string | number> | undefined, paramCount: number, generic = false): PreparedAsm {
+	const parsed = WAT.parseAsmBody(asm, defines);
 
-	if (src.generic) {
-		const flat = assertFlatInstrs(parsed.body, asm);
-		const locals = parsed.locals.map(l => ({ id: l.id, count: l.count, type: l.type as wasm.ValType }));
+	if (generic) {
+		const body		= assertFlatInstrs(parsed.body, asm);
+		const locals	= parsed.locals.map(l => ({ id: l.id, count: l.count, type: l.type as wasm.ValType }));
 		return {
 			switched: false,
-			render: (_args, ctx, decl) => ({
-				params: decl.params, result: decl.result,
-				inline: resolveAsmLocals(resolveTypeExprs(flat, decl.typeIndex), locals, ctx, asm)
+			render: (_args, ctx, decl, typeIndex) => ({
+				params:	decl.params,
+				result:	decl.result,
+				inline:	resolveAsmLocals(resolveTypeExprs(body, typeIndex), locals, ctx, asm)
 			})
 		};
 	}
 
 	const sw = parsed.body.find((i): i is WAT.SwitchPlaceholder => i.op === '__switch' && i.key === '$T');
 	if (sw) {
-		const variants = expandTypeSwitch(parsed, sw, asm);
-		const { paramCount } = src;
+		// The four numeric wasm types, in "widen to me first" preference order when an operand's own type has no
+		// real instruction -- f64 first, since widening i32/i64/f32 up to it is exact or an already-accepted tradeoff.
+		const NUMERIC_TYPES = ['f64', 'f32', 'i64', 'i32'] as const;
+		type NumericType = typeof NUMERIC_TYPES[number];
+		function isNumericType(t: Type | undefined): t is NumericType { return NUMERIC_TYPES.includes(t as NumericType); }
+		// One numeric type's expansion of a `$T`-switch body.
+		type TypeSwitchVariants = Partial<Record<NumericType, { locals: WAT.WatLocal[]; body: wasm.Instr[] }>>;
+
+		// A `$T`-keyed switch, expanded once per numeric type its arms declare. An arm's own body can declare
+		// further `$T`-typed locals (embedded as `__local` markers in its own body, same as everywhere else --
+		// switch_arm never splits them out) and further `$T.suffix` references, so a winning arm is processed by
+		// recursing back into this same walk, exactly as if the arm's own body were the whole generic body.
+		const variants: TypeSwitchVariants = {};
+
+		for (const type of new Set(sw.arms.flatMap(a => a.values).filter(a => typeof a === 'string').map(a => a.slice(1) as NumericType))) {
+			const locals:	WAT.WatLocal[] = [];
+			const body:		WAT.WatInstr[] = [];
+
+			const addLocals = (ls: WAT.WatLocal[]) => locals.push(...ls.map(l => ({
+				id:		l.id,
+				count:	l.count,
+				type:	typeof l.type === 'object' && 'typeParam' in l.type ? type : l.type,
+			})));
+
+			function process(items: WAT.WatInstr[]): boolean {
+				for (const i of items) {
+					if (i.op === '__local') {
+						addLocals([i]);
+					} else if (i.op === 'local.get' && typeof i.localIndex === 'string' && i.localIndex.startsWith('$T.')) {
+						const oper = i.localIndex.slice(3);
+						if (!(oper in I[type]))
+							return false;
+						body.push((I[type] as any)[oper]);
+					} else if (i.op === '__switch' && i.key === '$T') {
+						const arm = i.arms.find(a => a.values.includes(`$${type}`));
+						if (!arm)
+							return false;
+						if (!process(arm.body))
+							return false;
+					} else {
+						body.push(i);
+					}
+				}
+				return true;
+			}
+
+			addLocals(parsed.locals);
+			if (!process(parsed.body))
+				throw `inline asm '${asm}': switch arm '(${sw.arms.find(a => a.values.includes(`$${type}`))!.values.join(' ')})' claims '${type}' but its own body doesn't resolve for it`;
+			variants[type] = { locals, body: assertFlatInstrs(body, asm) };
+		}
+		if (!Object.keys(variants).length)
+			throw `inline asm '${asm}': switch '$T' has no arms`;
+
 		return {
 			switched: true,
 			render: (args, ctx) => {
@@ -1017,16 +974,18 @@ export function makeAsm(src: AsmSource): PreparedAsm {
 		};
 	}
 
-	const body = {
-		locals: parsed.locals.map(l => {
-			if (typeof l.type === 'object' && 'typeParam' in l.type)
-				throw `inline asm '${asm}': '(local ${l.id ?? ''} $${l.type.typeParam})' needs a '$T'-generic asm`;
-			return { id: l.id, count: l.count, type: l.type };
-		}),
-		body: assertFlatInstrs(parsed.body, asm)
-	};
+	const locals = parsed.locals.map(l => {
+		if (typeof l.type === 'object' && 'typeParam' in l.type)
+			throw `inline asm '${asm}': '(local ${l.id ?? ''} $${l.type.typeParam})' needs a '$T'-generic asm`;
+		return { id: l.id, count: l.count, type: l.type };
+	});
+	const body = assertFlatInstrs(parsed.body, asm);
 	return {
 		switched: false,
-		render: (_args, ctx, decl) => ({ params: decl.params, result: decl.result, inline: resolveAsmLocals(body.body, body.locals, ctx, asm) })
+		render: (_args, ctx, sig, _typeIndex) => ({
+			params:	sig.params,
+			result:	sig.result,
+			inline:	resolveAsmLocals(body, locals, ctx, asm)
+		})
 	};
 }

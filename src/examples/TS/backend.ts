@@ -7,7 +7,7 @@ import * as W from '../wasm-codegen';
 import { Literal, Identifier, Binary, Assign, Conditional, Member, hasMod, Module as CModule } from '../common';
 import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
 import { Walker, walker, walkerB } from './walker';
-import { AsmDecl, makeAsm as makeAsm0 } from '../wasm-codegen';
+import { makeAsm as makeAsm0 } from '../wasm-codegen';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
 import * as wasm from '@isopodlabs/binary_libs/wasm';
 import * as WAT from '../wat-parser';
@@ -575,18 +575,40 @@ function makeAsm(call: JS.Call<Type>, codegen: AsmCodegen, defines?: Record<stri
 		: false;
 	// An OPEN type parameter, unsubstituted because this call site gave no explicit type arguments: `T[]` still
 	// falls back to `arr:ref` in `asmDeclaredType`, but a bare `T` had none, so `Array._fill(a, i, x, n)` threw
-	// instead of letting the per-call signature take the argument's real physical type (`isOpenParam`, in `declFor` below).
+	// instead of letting the per-call signature take the argument's real physical type (`isOpenParam`, in `sigFor` below).
 	const resolveType = (t: Type): W.Type | undefined => isOpenParam(t) ? W.REF_ANY_NULLABLE : asmDeclaredType(t, codegen.typeOf);
-	const generic = !!typeParams?.length || asm.includes(WAT.TYPEINDEX_MACRO);
 
-	// The signature ONE call settled on, in concrete representations -- all `../wasm-codegen` needs of TypeScript's
-	// types. Declared types are substituted with the call site's type arguments first, so `__asm<[i32], T[]>`
-	// resolves `T[]` to a real element kind instead of the `arr:ref` an unsubstituted `T` falls back to.
-	const declFor = (typeArgs: readonly Type[] | undefined, argWtypes: readonly (W.Type | undefined)[]): AsmDecl => {
-		const subs = typeParams?.length && typeArgs?.length ? new Map(typeParams.map((n, i) => [n, typeArgs[i]] as const)) : undefined;
-		const sub = (t: Type) => subs ? T.substituteType(t, subs) : t;
-		const params = declared.map(t => {
-			const wt = resolveType(sub(t));
+	// The signature ONE call settled on, and the `TYPEINDEX` resolver that must agree with it: a `T[]` operand is looked up
+	// among the types this call's own params and result took, since an open `T` re-resolved alone falls back to `arr:ref`
+	// where the arguments made it `arr:f64` -- and an `array.copy` whose operand type disagrees with its operands is invalid wasm.
+	const settle = (params: W.Type[], result: W.Type) => {
+		const known = new Map<string, W.Type>(declared.map((t, i) => [T.typeKey(t), params[i]]));
+		if (resultType)
+			known.set(T.typeKey(resultType), result);
+		const typeIndex = (text: string): number | undefined => {
+			const m = /^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*((?:\[\s*\]\s*)*)$/.exec(text);
+			if (!m)
+				throw `inline asm '${asm}': TYPEINDEX("${text}") is not a name-and-'[]' type expression`;
+			let t: Type = TS.RefType(m[1]);
+			for (let i = m[2].split('[').length - 1; i > 0; i--)
+				t = TS.ArrayType(t);
+			const wt = known.get(T.typeKey(t)) ?? resolveType(t);
+			const index = wt && codegen.typeIndexOf?.(wt);
+			if (index === undefined)
+				throw `inline asm '${asm}': TYPEINDEX("${text}") has no wasm type index`;
+			return index;
+		};
+		return { sig: { params, result }, typeIndex };
+	};
+
+	// Declared types are substituted with the call's type arguments first, so `__asm<[i32], T[]>` resolves `T[]` to a real element
+	// kind. With none (`Array._copy(dst, 0, src, 0, n)`) an open parameter takes its ARGUMENT's physical type -- but only there: a
+	// closed position (`start: i32`) still needs its declared type, or a coercion the caller's emit would have inserted disappears.
+	const sigFor = (typeArgs?: readonly Type[], argWtypes: readonly (W.Type | undefined)[] = []) => {
+		const subs	= typeParams && typeArgs?.length ? new Map(typeParams.map((n, i) => [n, typeArgs[i]])) : undefined;
+		const sub	= (t: Type) => subs ? T.substituteType(t, subs) : t;
+		const params = declared.map((t, i) => {
+			const wt = !subs && isOpenParam(t) && argWtypes[i] || resolveType(sub(t));
 			if (!wt)
 				throw `unsupported inline-asm param type '${T.tocode.type(t)}'`;
 			return wt;
@@ -594,44 +616,27 @@ function makeAsm(call: JS.Call<Type>, codegen: AsmCodegen, defines?: Record<stri
 		const result = resultType ? resolveType(sub(resultType)) : 'void';
 		if (!result)
 			throw `unsupported inline-asm result type '${T.tocode.type(resultType)}'`;
-		// With no explicit type arguments (`Array._copy(dst, 0, src, 0, n)`) an open parameter is still unsubstituted
-		// and `resolveType` can only fall back for it; the ARGUMENT in such a position already carries the physical
-		// type the callee will receive, so use it -- but ONLY there: a closed position (`start: i32`, `val: T` against
-		// an `f64` array) still needs its real declared type, or a coercion the caller's own emit would have inserted silently disappears.
-		const finalParams = !subs && typeParams?.length
-			? params.map((w, i) => isOpenParam(declared[i]) && argWtypes[i] ? argWtypes[i] : w)
-			: params;
-		// Every declared type this call has an answer for, keyed by the type as written. A `TYPEINDEX` operand is
-		// looked up here rather than by position: where a type parameter is still open, `T[]` alone resolves to the
-		// `arr:ref` fallback while this signature has already taken `arr:f64` from the argument -- and an `array.copy`
-		// whose operand type disagreed with its operands emitted wasm that would not even encode.
-		const known = new Map<string, W.Type>();
-		declared.forEach((t, i) => known.set(T.typeKey(t), finalParams[i]));
-		if (resultType)
-			known.set(T.typeKey(resultType), result);
-		return { params: finalParams, result, typeIndex: (text: string): number | undefined => {
-			const m = /^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*((?:\[\s*\]\s*)*)$/.exec(text);
-			if (!m)
-				throw `inline asm '${asm}': TYPEINDEX("${text}") is not a name-and-'[]' type expression`;
-
-			let t: Type = TS.RefType(m[1]);
-			for (let i = m[2].split('[').length - 1; i > 0; i--)
-				t = TS.ArrayType(t);
-
-			const wt = known.get(T.typeKey(t)) ?? resolveType(t);
-			const index = wt && codegen.typeIndexOf?.(wt);
-			if (index === undefined)
-				throw `inline asm '${asm}': TYPEINDEX("${text}") has no wasm type index`;
-			return index;
-		} };
+		return settle(params, result);
 	};
 
 	// The island, prepared once. A `$T`-switched body needs no signature at all -- the numeric type its arguments
 	// agree on IS its signature -- so `PreparedAsm` distinguishes it rather than taking an optional one.
-	const prepared = makeAsm0({ asm, defines, generic, paramCount: declared.length });
-	return prepared.switched	? (args, ctx)			=> prepared.render(args.map(a => a.wtype), ctx)
-		: generic				? (args, ctx, typeArgs)	=> prepared.render(args.map(a => a.wtype), ctx, declFor(typeArgs, args.map(a => a.wtype)))
-		: (args, ctx) => prepared.render(args.map(a => a.wtype), ctx, declFor(undefined, []));
+	const prepared = makeAsm0(asm, defines, declared.length, !!typeParams?.length || asm.includes(WAT.TYPEINDEX_MACRO));
+	if (prepared.switched)
+		return (args, ctx) => prepared.render(args.map(a => a.wtype), ctx);
+	if (typeParams?.length) {
+		return (args, ctx, typeArgs) => {
+			const { sig, typeIndex } = sigFor(typeArgs, args.map(a => a.wtype));
+			return prepared.render(args.map(a => a.wtype), ctx, sig, typeIndex);
+		};
+	}
+	// Settled at the first call, not here: builtins are made for every island up front, and one no call reaches must
+	// neither throw nor build types.
+	let fixed: ReturnType<typeof settle> | undefined;
+	return (args, ctx) => {
+		fixed ??= sigFor();
+		return prepared.render(args.map(a => a.wtype), ctx, fixed.sig, fixed.typeIndex);
+	};
 }
 
 // `Uint8Array`/`Int32Array`/`Uint32Array` are real generic instantiations of `TypedArray<T>`

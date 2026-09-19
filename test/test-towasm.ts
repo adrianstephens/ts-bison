@@ -2277,6 +2277,27 @@ async function main() {
 	}
 
 	{
+		// A generic island's `TYPEINDEX` answers from the signature ITS call settled on: an open `T[]` took `arr:f64` from the
+		// arguments, and re-resolved alone it has no type index at all.
+		const { typeIndexOpen } = await compile(`
+			class Bulk<T> {
+				static copy<T>(dst: T[], d: i32, src: T[], s: i32, n: i32): void {
+					return __asm<[T[], i32, T[], i32, i32], void>('array.copy TYPEINDEX("T[]") TYPEINDEX("T[]")')(dst, d, src, s, n);
+				}
+			}
+			export function typeIndexOpen(): number {
+				const src = new RawArray<f64>(3), dst = new RawArray<f64>(3);
+				src[0] = 1.5;
+				src[1] = 2;
+				src[2] = 4;
+				Bulk.copy(dst as unknown as number[], 0, src as unknown as number[], 1, 2);
+				return dst[0] * 100 + dst[1];
+			}
+		`);
+		check('inline asm: TYPEINDEX in a generic island follows its call', typeIndexOpen(), 204);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed
