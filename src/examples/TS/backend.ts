@@ -5948,10 +5948,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// goes through exactly the `stringTemplate`/`.toString()` path `${x}` already does, rather than a second stringifier that could disagree with it. Only
 						// when the two sides DISAGREE (`string + string` keeps `String.add`, `number + number` its numeric op). `definitelyString` is deliberately
 						// all-members-of-a-union: a `string | number` operand is decided at runtime, which this cannot model.
-						// `**` has no wasm instruction and no `numericOpInline` case, so it failed for every numeric operand as "unsupported compound-assignment method 'pow'".
-						// `Math.pow` (`lib/number.ts`) is the real implementation, so rewriting to it here reuses that rather than adding a second one. A BIGINT operand still
-						// dispatches to `BigInt.pow` above via `leftInfo.owner`, so this is only reached for a genuinely numeric `**`.
-						if (method === 'pow')
+						// `**` has no wasm instruction and no `numericOpInline` case, so a numeric one is `Math.pow` (`lib/number.ts`). An owner with a `pow` of its
+						// own (`BigInt`) dispatches to it below, as every operator does.
+						if (method === 'pow' && !leftInfo.owner?.methodDecls?.get(method))
 							return emitExpr(JS.Call(JS.Member(Identifier('Math'), 'pow'), [left, right]), ctx, want);
 
 						if (method === 'add') {

@@ -99,6 +99,27 @@ function bigSign(a: RawArray<u32>): boolean {
 	return (a[a.length - 1] & 0x80000000) !== 0;
 }
 
+// The low `bits` of `a`'s two's complement, read as signed (`asIntN`) or unsigned (`asUintN`): past its limbs `a` reads as its
+// sign. An unsigned result whose top kept bit is set needs one more, zero, limb, or it would read as negative.
+function bigTruncate(a: RawArray<u32>, bits: number, signed: boolean): bigint {
+	const part	= bits % 32;
+	const kept	= (bits - part) / 32 + (part > 0 ? 1 : 0);
+	const n		= kept + (!signed && part === 0 ? 1 : 0);
+	const fill	= bigSign(a) ? 0xffffffff : 0;
+	const r: RawArray<u32> = new RawArray<u32>(n > 0 ? n : 1);
+	for (let i = 0; i < kept; i++) {
+		const limb: number = i < a.length ? a[i] : fill;
+		r[i] = limb;
+	}
+	if (part > 0) {
+		const unit: number	= Math.pow(2, part);
+		const top: number	= r[kept - 1];
+		const low: number	= top % unit;
+		r[kept - 1] = signed && low >= unit / 2 ? low + (4294967296 - unit) : low;
+	}
+	return bigTrim(r) as unknown as bigint;
+}
+
 export function bigTrim(a: RawArray<u32>): RawArray<u32> {
 	let n = a.length;
 	while (n > 1 && a[n - 1] === ((a[n - 2] & 0x80000000) !== 0 ? 0xffffffff : 0))
@@ -314,6 +335,21 @@ export class BigInt {
 	constructor(value: number) {
 		return bigFromNumber(value) as unknown as BigInt;
 	}
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: boolean) {
+		return bigFromNumber(value ? 1 : 0) as unknown as BigInt;
+	}
+	// TS's own signature: one argument of any of the four, told apart at run time (`BigInt(v)` with `v: number | bigint`).
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: bigint | number | string | boolean) {
+		return (typeof value === 'bigint' ? value
+			: typeof value === 'number' ? bigFromNumber(value)
+			: typeof value === 'string' ? bigFromString(value)
+			: bigFromNumber(value ? 1 : 0)) as unknown as BigInt;
+	}
+
+	static asIntN(bits: number, int: bigint): bigint	{ return bigTruncate(int as unknown as RawArray<u32>, bits, true); }
+	static asUintN(bits: number, int: bigint): bigint	{ return bigTruncate(int as unknown as RawArray<u32>, bits, false); }
 
     valueOf(): bigint { return this as unknown as bigint; }
 //	static readonly [Symbol.toStringTag]: "BigInt";

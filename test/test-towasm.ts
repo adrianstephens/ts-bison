@@ -2245,6 +2245,38 @@ async function main() {
 	}
 
 	{
+		// `BigInt(v)`/`Number(v)` of a `number | bigint` take the union constructor, which tells them apart at run time; a
+		// bigint `**` is `BigInt.pow` wherever it appears; `asIntN`/`asUintN` against values from node.
+		const { unionCtors, bigPow, asN } = await compile(`
+			const addValue = (a: number | bigint, b: number | bigint): number | bigint => typeof a === 'bigint' ? a + BigInt(b) : a + Number(b);
+			export function unionCtors(): number {
+				return Number(addValue(5n, 3)) * 10000 + Number(addValue(2, 7n)) * 100 + Number(addValue(1, 1)) + Number(BigInt(true)) * 1000000 + Number(BigInt('12')) * 10000000;
+			}
+			export function bigPow(): number {
+				const c: [number, bigint] = [100, 2n ** 3n], d: bigint[] = [3n ** 4n];
+				let e = 2n;
+				e **= 10n;
+				return Number(c[1]) + Number(d[0]) * 100 + Number(e) * 100000 + 2 ** 3 * 1000;
+			}
+			const cases: [number, bigint][] = [[64, 5n], [64, -5n], [8, 255n], [8, -129n], [32, 0xffffffffn], [32, -1n], [0, 7n], [1, 1n], [33, -(2n ** 40n) + 3n], [100, 2n ** 99n], [31, 2n ** 31n + 5n]];
+			const expected = '5,5,-5,18446744073709551611,-1,255,127,127,-1,4294967295,-1,4294967295,0,0,-1,1,3,3,-633825300114114700748351602688,633825300114114700748351602688,5,5'.split(',');
+			export function asN(): number {
+				let i = 0;
+				for (const [b, v] of cases) {
+					if (BigInt.asIntN(b, v).toString() !== expected[i++])
+						return i - 1;
+					if (BigInt.asUintN(b, v).toString() !== expected[i++])
+						return i - 1;
+				}
+				return -1;
+			}
+		`);
+		check('BigInt/Number of a union: the union constructor', unionCtors(), 121080902);
+		check('bigint ** is BigInt.pow in any context', bigPow(), 102416108);
+		check('BigInt.asIntN/asUintN match node', asN(), -1);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

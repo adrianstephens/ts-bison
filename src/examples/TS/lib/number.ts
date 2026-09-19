@@ -236,6 +236,14 @@ export class Number {
 	constructor(value: i64) { const n = value; return n as unknown as Number; }
 	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(value: bigint) { return bigToNumber(value) as unknown as Number; }
+	// One argument of several primitives, told apart at run time (`Number(v)` with `v: number | bigint`).
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(value: number | bigint | string | boolean) {
+		return (typeof value === 'number' ? value
+			: typeof value === 'bigint' ? bigToNumber(value)
+			: typeof value === 'string' ? numberFromString(value)
+			: value ? 1 : 0) as unknown as Number;
+	}
 
 	static readonly EPSILON = 2.2204460492503130808472633361816e-16;
 	static readonly MAX_SAFE_INTEGER: number = 9007199254740991;
