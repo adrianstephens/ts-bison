@@ -209,7 +209,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['fitting rest and spread arguments are clean', 'function f(a: number, ...xs: number[]): number { return a; } declare const ns: number[]; declare const t: [number, number]; f(1); f(1, 2, 3); f(1, ...ns); f(1, 2, ...t); const q: number[] = []; q.push(...ns, 4);', []],
 	['an overload is chosen by its rest arguments too', 'declare const fa: number[]; const r: string = fa.concat(0);', [NOT_ASSIGNABLE('number[]', 'string')]],
 	// `oneStepIndexed` stepped into tuples and arrays but not a named property, so `T[K] extends any[]` took the false branch (TS's genericRestParameters1).
-	['a rest type conditional over an indexed access decides', "type Rec = { move: [number, 'left' | 'right']; stop: string; done: [] }; type Ev<T> = { emit<K extends keyof T = keyof T>(e: K, ...payload: T[K] extends any[] ? T[K] : [T[K]]): void }; declare var events: Ev<Rec>; events.emit('move', 10, 'left'); events.emit('done');", []],
+	['a rest type conditional over an indexed access decides', "type Rec = { move: [number, 'left' | 'right']; stop: string; done: [] }; type Ev<T> = { emit<K extends keyof T = keyof T>(e: K, ...payload: T[K] extends any[] ? T[K] : [T[K]]): void }; declare var events: Ev<Rec>; events.emit('move', 10, 'left'); events.emit('stop', 'Bye!'); events.emit('done');", []],
 	// Every block of a namespace is checked in the MERGED scope: re-hoisting a block into a fresh one hid what a later block adds.
 	['a namespace block sees what later blocks merge in', 'declare namespace N { interface I { a: number } const make: { new(): I } } declare namespace N { interface I { b: string } } const x = new N.make(); const s: string = x.b; const n: string = x.a;', [NOT_ASSIGNABLE('number', 'string')]],
 	['a namespace merged onto a function keeps its call', 'function f(): number { return 1; } namespace f { export const hello: number = 1; } const r: number = f(); const s: string = f.hello;', [NOT_ASSIGNABLE('number', 'string')]],
@@ -222,10 +222,6 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// TS's getTypeFromBindingPattern: with a default anywhere in the pattern the parameter is what the PATTERN implies, not what it
 	// is defaulted to (`= []` would make it `never[]`); with no default the initializer says more (destructuringWithLiteralInitializers).
 	['a destructuring parameter takes its type from its pattern', 'function g1([x = 0, y = 0] = []) {} const bad1: (a?: [string?]) => void = g1; function g3({ a, b } = { a: 1, b: "x" }) {} const bad3: (o?: { a: string }) => void = g3; g1(); g1([1, 1]);', ["is not assignable to type '(a?: [string?]) => void'", "is not assignable to type '(o?: {"]],
-	// A SCRIPT's `interface` augments the GLOBAL one, so the lib's own `RangeErrorConstructor extends ErrorConstructor` has it too
-	// (errorConstructorSubtypes); the augmentation is undone between cases, as the corpus harness undoes it between files.
-	['a script augments the global interface every declaration sees', 'interface ErrorConstructor { capture(o: object): void } let x: ErrorConstructor; x = RangeError; const s: string = RangeError.capture;', ["is not assignable to type 'string'"]],
-	['a script augmentation does not reach the next file', 'const s: string = RangeError.capture;', ["Property 'capture' does not exist"]],
 	// A SCRIPT's `interface` augments the GLOBAL one, so the lib's own `RangeErrorConstructor extends ErrorConstructor` has it too
 	// (errorConstructorSubtypes); the augmentation is undone between cases, as the corpus harness undoes it between files.
 	['a script augments the global interface every declaration sees', 'interface ErrorConstructor { capture(o: object): void } let x: ErrorConstructor; x = RangeError; const s: string = RangeError.capture;', ["is not assignable to type 'string'"]],

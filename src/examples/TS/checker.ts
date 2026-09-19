@@ -1804,9 +1804,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				if (wantTuple)
 					return { type: 'tuple', elements: elems };
 				// An EMPTY literal is its context, else TS's `never[]`, which a union (`c ? xs : []`) drops. An `any[]` there
-				// absorbed the union, leaving member lookup nothing to offer and a `.map` callback's parameter no type.
+				// absorbed the union, leaving member lookup nothing to offer and a `.map` callback's parameter no type. Against
+				// several array types it is `never[]` too, which each accepts: `[]` for `number[] | string[]` is no `(number | string)[]`.
 				if (!elems.length)
-					return resolvedExpected?.type === 'array' ? resolvedExpected : TS.ArrayType(elemExpected ?? T.NEVER);
+					return resolvedExpected?.type === 'array' ? resolvedExpected : TS.ArrayType(arrayLike.length > 1 ? T.NEVER : elemExpected ?? T.NEVER);
 				// LITERAL WIDENING, as real TS does it: `[1, 2, 3]` is `number[]`, not `(1|2|3)[]` -- an
 				// array literal is MUTABLE, so keeping the initialiser's literal types made `a[0] = 5` a
 				// type error ("Type '5' is not assignable to type '1 | 2 | 3'"). It also leaked into

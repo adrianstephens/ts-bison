@@ -2345,14 +2345,16 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 				});
 			if (src.type === 'object' || src.type === 'intersection' || src.type === 'tuple')
 				return dst.members.every(m => {
-					if (m.type !== 'property' || typeof m.key !== 'string')
-						return true;		// methods/call/index/computed: unchecked (inventory C4)
+					if ((m.type !== 'property' && m.type !== 'method') || typeof m.key !== 'string')
+						return true;		// call/index/computed: unchecked (inventory C4)
 					// `lookupMember` gets its own fresh budget, not `recurse`'s remaining `depth` -- same reasoning as
 					// `lookupMember`'s own `resolve()` call.
 					const got = lookupMember(src, m.key, scope);
+					// A method is its function type, each overload in turn (TS's method bivariance is the function rule's).
+					const want = m.type === 'property' ? m.typeAnnotation : withScope(TS.FunctionType(JS.Params(m.params, m.rest), m.returnType ?? ANY, m.typeParams), dstScope);
 					// An optional property also accepts undefined. A missing required one is an error even when its type admits
 					// `undefined` (TS: "Property is missing") -- absence only counts against a sealed source.
-					return got ? recurse(got, hasMod(m, 'optional') ? TS.UnionType([m.typeAnnotation, UNDEFINED]) : m.typeAnnotation, depth - 1)
+					return got ? recurse(got, hasMod(m, 'optional') ? TS.UnionType([want, UNDEFINED]) : want, depth - 1)
 						: hasMod(m, 'optional') || !sealed(src, scope);
 				});
 			return false;
