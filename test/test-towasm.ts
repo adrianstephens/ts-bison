@@ -2298,6 +2298,34 @@ async function main() {
 	}
 
 	{
+		// `++`/`--` step a bigint by `1n` (an `i64` slot or limbs alike), and a `number | bigint` by whichever it holds at run time.
+		const { bigSteps, unionSteps } = await compile(`
+			export function bigSteps(): number {
+				let b = 5n;
+				b++;
+				--b;
+				++b;
+				const c = b++;
+				let l = 2n ** 70n;
+				l--;
+				return Number(b) * 10 + Number(c) + Number(l % 1000n) * 1000;
+			}
+			const clamp = (bound: number | bigint, up: boolean): number | bigint => {
+				if (up)
+					--bound;
+				else
+					++bound;
+				return bound;
+			};
+			export function unionSteps(): number {
+				return Number(clamp(5, true)) * 1000 + Number(clamp(10n, false)) * 10 + Number(clamp(7n, true)) * 100000;
+			}
+		`);
+		check('++/-- on a bigint', bigSteps(), 423076);
+		check('++/-- on a number | bigint', unionSteps(), 604110);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

@@ -4615,6 +4615,50 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return info;
 	}
 
+	// `++x`/`x++` (`postfix`): the target read once, stepped, written back; the value is the new one, or the old one kept.
+	function emitIncDec(operand: Expr, op: '++' | '--', postfix: boolean, ctx: FunctionContext, want?: W.Type): W.Type {
+		return ctx.inScope((): W.Type => {
+			const target = emitAssignTarget(operand, ctx, postfix ? 'keep' : 'discard');
+			emitStep(target.wtype, ctx.narrowedTypeOf(operand), op === '++' ? 'add' : 'sub', ctx);
+			target.write(!postfix && want !== 'void');
+			if (want === 'void')
+				return want;
+			if (postfix)
+				ctx.emit(I.local.get(target.old!));
+			return target.wtype;
+		});
+	}
+
+	// `++`/`--`'s step on the value on the stack: a number's is 1, a bigint's `1n` (its own `add`/`sub`), and a boxed `any` -- a
+	// `number | bigint` -- takes whichever its value is, as JS decides at run time, told apart as `typeof` tells them.
+	function emitStep(wtype: W.Type, t: Type, method: 'add' | 'sub', ctx: FunctionContext): void {
+		if (wtype === 'i32' || wtype === 'f64')
+			return void ctx.emit(I[wtype].const(1), I[wtype][method]);
+		if (wtype === 'i64')
+			return void ctx.emit(I.i64.const(1n), I.i64[method]);
+		const big = builtinTypeOwner('bigint')!;
+		if (T.typeofName(t, ctx.typeScope) === 'bigint')
+			return void emitMethodCall(big, method, [Literal(1n)], ctx);
+		if (!W.isAny(wtype)) {
+			// A nullable primitive gets a specific, actionable message: narrowing it to non-null would need per-read tracking codegen does for no type.
+			if (W.unboxedPrimitive(wtype))
+				throw "'++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then";
+			throw "'++'/'--' needs a number, a bigint, or an 'any' holding one";
+		}
+		const heap	= types.heapType('bigint')!;
+		const v		= ctx.temp(`$step$${ctx.tempCounter++}`, wtype);
+		ctx.emit(I.local.set(v), I.local.get(v), I.ref.test(heap));
+		ctx.emitIf(toValType(wtype), () => {
+			ctx.emit(I.local.get(v), I.ref.cast(heap));
+			emitMethodCall(big, method, [Literal(1n)], ctx);
+		}, () => {
+			ctx.emit(I.local.get(v));
+			coerceTop(wtype, ctx, 'f64');
+			ctx.emit(I.f64.const(1), I.f64[method]);
+			coerceTop('f64', ctx, wtype);
+		});
+	}
+
 	// A bare `f` or a namespace-qualified `NS.f` read as a VALUE resolves to a top-level function exactly as a call would.
 	function functionValueDecl(e: Expr, ctx: FunctionContext): { name: string; decl: FunctionDecl; module: string } | undefined {
 		if (e.type === 'identifier') {
@@ -5522,25 +5566,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 
 			case 'unary': {
 				if (e.operator === '++' || e.operator === '--')
-					return ctx.inScope((): W.Type => {
-						const target = emitAssignTarget(e.operand, ctx, 'discard');
-						const wtype = target.wtype;
-						if (wtype !== 'i32' && wtype !== 'f64') {
-							// A nullable primitive gets a specific, actionable message -- narrowing it (`if (x !== null)`) to a real non-null occurrence would need per-read
-							// narrowing tracking, which codegen does for no type (see `coerceTop`'s soundness contract).
-							if (W.unboxedPrimitive(wtype))
-								throw "'++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then";
-							throw "'++'/'--' is only supported on number/boolean-kind locals";
-						}
-
-						ctx.emit(I[wtype].const(1), I[wtype][e.operator === '++' ? 'add' : 'sub']);
-						if (want === 'void') {
-							target.write(false);
-							return want;
-						}
-						target.write(true);
-						return wtype;
-					});
+					return emitIncDec(e.operand, e.operator, false, ctx, want);
 
 				// `delete obj[k]`, like `++`/`--`, needs the target's own object+key rather than its evaluated value, so it gets its own branch before the generic
 				// operand dispatch below. Only a dynamic object has a real `delete` to dispatch to.
@@ -5625,24 +5651,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				if (e.operator === '!')
 					return emitExpr(e.operand, ctx, want);
 				if (e.operator === '++' || e.operator === '--')
-					return ctx.inScope((): W.Type => {
-						const target = emitAssignTarget(e.operand, ctx, 'keep');
-						const wtype = target.wtype;
-						if (wtype !== 'i32' && wtype !== 'f64') {
-							// A nullable primitive gets a specific, actionable message -- narrowing it (`if (x !== null)`) to a real non-null occurrence would need per-read
-							// narrowing tracking, which codegen does for no type (see `coerceTop`'s soundness contract).
-							if (W.unboxedPrimitive(wtype))
-								throw "'++'/'--' on a nullable primitive needs narrowing to non-null first, and isn't supported even then";
-							throw "'++'/'--' is only supported on number/boolean-kind locals";
-						}
-
-						ctx.emit(I[wtype].const(1), I[wtype][e.operator === '++' ? 'add' : 'sub']);
-						target.write(false);
-						if (want === 'void')
-							return want;
-						ctx.emit(I.local.get(target.old!));
-						return wtype;
-					});
+					return emitIncDec(e.operand, e.operator, true, ctx, want);
 				throw `unsupported postfix operator '${e.operator}'`;
 
 			case 'assign': {
