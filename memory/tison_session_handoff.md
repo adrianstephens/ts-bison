@@ -11,28 +11,33 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## In flight -- HEAD `ed85749` (step 2 of the checker-driven open-shape plan)
+## Latest: 2026-09-20 -- HEAD `c8c8fbc` (checker work, step 2 of the open-shape plan)
 
 **The plan the user approved:** drive towasm's open-shape pass from the checker's own assignability checks (every
 accepted "value into slot" flow stamped on the value node), in order: (2) check rest/spread arguments -- DONE
 `fa0e437`; then (1) `checkFlow` stamping at the nine flow sites; (3) towasm reads the stamps (keeping its
-monomorphization/erasure rules); (4) spreads + union-member descent in `noteSlot`. Not started: 1, 3, 4.
+monomorphization/erasure rules); (4) spreads + union-member descent in `noteSlot`. **Steps 1, 3, 4 not started.**
 
-**Detour, uncommitted: inventory C4 (isAssignable skipped METHODS)** -- `assistant/c4-methods.patch`, also live in the
-tree. Needed because `string` counted as `any[]` (genericRestParameters1). Its corpus delta vs `864c5f1` is 30 true
-positives, 1 false positive removed, and 3 false positives from PRE-EXISTING gaps it exposes, each its own feature:
-script files' declarations must merge into the global scope (errorConstructorSubtypes: `interface ErrorConstructor`
-augmentation); the parser reads ``tag<T>`...` `` as comparisons (genericTemplateOverloadResolution); a destructuring
-parameter's type must come from its binding pattern, not its `= []` default (destructuringWithLiteralInitializers 65).
-Fixed on the way, committed: `864c5f1` (namespace blocks checked in their merged scope, function+namespace merge,
-annotation-only refs resolved lazily), `70f0a53` (TS's co/contravariant preference; arrays inferred by element),
-`ed85749` (generic source instantiated in the target's context). User not yet asked: land C4 now, or first fix the 3.
+**Step 2 and its fallout, all committed** (`fa0e437`..`c8c8fbc`), corpus A/B +25 errors ALL verified true positives
+with tsc 6.0.3, -11 false positives, corpus gate 838 = baseline throughout:
+- `fa0e437` rest/spread arguments checked as one tuple; overload choice reads them too.
+- `864c5f1` declarations merge whatever order they are hoisted in (namespace blocks checked in the MERGED scope,
+  function+namespace values, annotation-only refs resolved lazily). Fixed 24 pre-existing false positives.
+- `70f0a53` TS's covariant/contravariant preference + arrays inferred by element; `ed85749` a generic source
+  signature is instantiated in the target's context.
+- `ba05b5d` destructuring parameters typed from their PATTERN; `ad475ae` a script's `interface` augments the
+  global one every declaration sees (`Scope.recordTypes()` undoes it between corpus files / checker cases);
+  `c843304` ``tag<T>`...` `` parses as a tagged template.
+- `c8c8fbc` **inventory C4's methods**: assignability compares method members. Call/index signatures still skipped.
 
-**Instruments added:** `assistant/probe-fulllib.ts <file>` checks a file under lib.esnext.full exactly as test-checker
-does (ERR + GAP lines); `assistant/tsc-type-at.ts` also prints tsc's RESOLVED SIGNATURE for a call expression. Probe
-traps: literal types are compared leniently (use `number`/`string` branches, not `'yes'`); in zsh `echo ====` aborts.
+**Watch for:** an unannotated function with a destructuring parameter infers an `any` RETURN (found, unfixed).
+A script's non-interface declarations are still local, so a second script does not see them.
 
-## Latest: 2026-09-19 (evening) -- HEAD `9c94144`
+**Instruments:** `assistant/probe-fulllib.ts <file>` checks a file under lib.esnext.full exactly as test-checker does;
+`assistant/tsc-type-at.ts <file> <line> <text>` prints tsc's own type, and its RESOLVED SIGNATURE for a call.
+Probe traps: literal types compare leniently (probe with `number`/`string`, never `'yes'`); in zsh `echo ====` aborts.
+
+## Earlier: 2026-09-19 (evening) -- HEAD `9c94144`
 
 **Survey 268/404, nothing regressed; checker.ts 58/58 AND compiles as a whole file (3073 funcs).** Four fixes,
 `a01d942`..`fd5df24`; root causes are in the commit messages. What to know before editing nearby:
@@ -217,7 +222,7 @@ While relocating code, run only the fast set: `npx tsc -b src/examples`, `test-t
 ## Tree state
 
 **Never trust this line — the user edits and commits concurrently; re-check `git status`.** At the time of
-writing: HEAD `9c94144`; the user's own uncommitted `Tuple` export in ts-parser.ts.
+writing: HEAD `c8c8fbc`; the user's own uncommitted `Tuple` export in ts-parser.ts.
 
 ## Keeping this current
 

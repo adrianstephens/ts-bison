@@ -72,9 +72,12 @@ Order smallest-first, each with `corpus-ab.sh` and a per-file ERR diff.
    compile yet (js-parser 372, towasm 1274, wasm 1187, core 81); probes assistant/tsc-probe/s4.ts and s5.ts.
 3. Overload no-fit -> WARNING, args unchecked (1628). TS 2769; needs exact overload resolution first.
    (Overloaded class members no longer expose their implementation, 3f23a8a, so this now fires where TS errs.)
-4. isAssignable skips methods/call/index members (2087), function params (2070), missing returns (2069):
-   `{ f() { return "x" } }` into `{ f(): number }` and `(x: number) => x` into `(x: string) => number`
-   accepted. Fix: methods as function types (method bivariance), function-typed props contravariant.
+4. **METHODS DONE c8c8fbc** -- compared as their function type, each overload in turn; a missing one counts
+   against a sealed source as a missing property does. It hid a lot: `string` satisfied `any[]`. Removing it
+   cost five fixes first (ba05b5d, ad475ae, c843304 and, before them, 70f0a53, ed85749) and ended at
+   +25 true positives / -11 false positives on the corpus. STILL OPEN: call/index members (2087), function
+   params (2070), missing returns (2069): `(x: number) => x` into `(x: string) => number` is accepted.
+   Fix: function-typed props contravariant.
 5. **MOSTLY DONE 86ea3d8** (class refs compared by members; truly unresolved names still pass; a type-parameter
    DESTINATION is still checked through its constraint -- TS keeps T opaque; variadicTuples1 lost 5 real errors).
    isAssignable passes any unresolved/nominal ref (1995-1996, 2080, 2123, 2132): unrelated classes
