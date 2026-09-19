@@ -11,32 +11,24 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## Latest: 2026-09-18 night -- HEAD `a4966cc` (Iterable) + an UNCOMMITTED regression fix in the tree
+## Latest: 2026-09-19 -- HEAD `b354a81`
 
-**`a4966cc` REGRESSED the survey** (the gates did not see it): 144 compile, and 81 that compiled at `71e9ddf` no longer did. Main cause:
-backend.ts's module-level `builtinTypes = new Map<string,{...}>([...])` fits no array-constructor overload in the checker
-(the old `Map<string,{...}>` row); the new `Iterable` constructor fit, and codegen then failed converting to it.
+**`a4966cc` (Iterable) regressed the survey to 144/402; `b354a81` fixed it: 208/402 compile**, none regressed against
+`a4966cc` (each commit message has the root cause). The open-shape pass (`collectOpenShapes`) now walks `new`
+(`instantiateConstruct`), looks through `a = b` and `c ? a : b` (branches in their `narrow`ed scope), types values in the
+slot's context, and keys a shape by its STRUCT (`openKey` over `layoutArgs`/`layoutKey`). `x as T` is NOT a flow (an `as`
+never changes representation), so `for (... of m as Iterable<...>)` is unsupported; proper fix is to dispatch on
+`unwrapAs`'s type, which changes every `as` receiver -- the user has not decided.
 
-**The fix is in the working tree, NOT committed** (backend.ts + test-towasm.ts; gates green: towasm 960, checker, cpp,
-difftest 2191/2200 0 disagree, corpus gate 838). Survey on it: **208/402 compile** (233 failures, 62 causes). What it does:
-- `collectOpenShapes` walks `new` too (construct signatures instantiated from the built type: `instantiateConstruct`);
-  a declared parameter mentioning its signature's own type parameters is skipped.
-- `noteSlot`: `a = b` is `b`; `c ? a : b` is each branch in its NARROWED scope (`narrow`); a `new` of the slot's own class
-  is built at the slot; an array literal meeting a non-array object slot opens it; values typed IN the slot's context.
-- `openKey`: a shape opens under its struct's key (`layoutArgs`/`layoutKey`, factored out of `ensureObjectShape`); classes by own key.
-- Nullable slots strip nullish; `fits` shared by both any-dispatchers, and method dispatch drops candidates whose result can't
-  become `want`. REVERTED from `a4966cc`: noting `x as T` (an `as` never changes representation; opened view casts spuriously),
-  so `for (... of m as Iterable<...>)` is unsupported again (explicit internal error). Proper fix: dispatch on `unwrapAs`'s type.
+**checker.ts is 0/58, and was already at `ecc5f6c`** (the 58/58 below predates `f934254`, which added the `Set`/`Map` copy
+constructors: its probes then failed on "no overload of `Set<string>`'s constructor"). Now they fail later: `Param` ->
+`{modifiers?: string[]}` through `T.isParamProperty`, a generic `const` arrow -- one physical closure, its parameter laid out
+as the constraint struct. That is the next row to work (44 declarations).
 
-**UNRESOLVED before committing:** the 208 run lists **46 checker.ts declarations** failing with `cannot convert ref:Param<any>
-@./js-parser to ref:{...}` (checker.ts was 58/58 at `71e9ddf`). Probed alone (`probe-one-decl.ts`, even several per process
-with `DBG_SHARED_LIB=1`) they compile. Suspect probe-order state in the survey's shared lib scope, possibly from the pre-pass
-now calling the checker's `typeOf` WITH an expected type. Next step: `selfhost-survey.sh tison/src/examples/TS/checker.ts`
-(single file, several minutes) -- the user interrupted that run, and has not chosen between re-running / committing / stopping.
-
-`probe-one-decl.ts` (gitignored) now resolves sibling packages from the packages root, so it matches the survey.
-Pre-existing, not a regression: a `Map` literal whose object values omit an optional field (`{wtype}` beside
-`{wtype, class}`) traps "illegal cast" at `ecc5f6c` too.
+**Instruments:** `assistant/survey-sequence.ts <file> <decl>...` reproduces the survey EXACTLY (fresh parse + check per
+probe, one shared lib scope, the survey's un-exporting; `NOWHOLE=1` skips the whole-file compile). Trust it over
+`probe-one-decl.ts`, which parses once and reported checker.ts declarations as compiling when the survey said otherwise.
+Pre-existing, not a regression: a `Map` literal whose object values omit an optional field traps "illegal cast".
 
 **`Iterable` design (`a4966cc`):** lib declares `Iterator`/`Iterable`/`IterableIterator`; `Array`/`ReadonlyArray` have a real
 `[Symbol.iterator]`; a `for...of` over a known array stays positional. Open shapes are THE mechanism for interface-typed values:
@@ -195,7 +187,7 @@ While relocating code, run only the fast set: `npx tsc -b src/examples`, `test-t
 ## Tree state
 
 **Never trust this line — the user edits and commits concurrently; re-check `git status`.** At the time of
-writing: HEAD `a4966cc`; backend.ts and test-towasm.ts hold the uncommitted regression fix above.
+writing: HEAD `b354a81`, clean tree.
 
 ## Keeping this current
 
