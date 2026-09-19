@@ -2357,6 +2357,19 @@ async function main() {
 	}
 
 	{
+		// `new Set(x)`/`new Map(x)` of a readonly view or nothing, beside an array: TS's constructors take any iterable, or nothing.
+		const { copyCtors } = await compile(`
+			const f = (earlier?: ReadonlySet<string>) => { const s = new Set<string>(earlier); s.add('z'); return s.size; };
+			const g = (m?: ReadonlyMap<string, number>) => { const c = new Map(m); c.set('q', 1); return c.size; };
+			export function copyCtors(): number {
+				const base = new Map([['a', 1], ['b', 2]]);
+				return f(new Set(['a', 'b'])) * 1000 + f() * 100 + g(base) * 10 + g() + new Map(base).size * 10000 + new Set([1, 2, 2]).size * 100000;
+			}
+		`);
+		check('Set/Map: copy from a readonly view, or from nothing', copyCtors(), 223131);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

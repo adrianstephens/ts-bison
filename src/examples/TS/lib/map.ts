@@ -20,11 +20,14 @@ class Map<K, V> {
 		for (let i = 0; i < n; i++)
 			this.set(entries[i][0], entries[i][1]);
 	}
+	// TS's constructor takes any `Iterable`, which has no representation yet; these two are the forms that do.
 	// @ts-expect-error - tison extension: multiple constructor implementations
-	constructor(other: Map<K, V>) {
-		const n = other.keys_.length;
-		for (let i = 0; i < n; i++)
-			this.set(other.keys_[i], other.values_[i]);
+	constructor(other: ReadonlyMap<K, V> | null | undefined) {
+		if (other) {
+			const keys = other.keys(), values = other.values();
+			for (let i = 0; i < keys.length; i++)
+				this.set(keys[i], values[i]);
+		}
 	}
 	get size(): number { return this.keys_.length; }
 
@@ -97,10 +100,20 @@ class Map<K, V> {
 class Set<T> {
 	private items_: T[] = [];
 
+	// @ts-expect-error - tison extension: multiple constructor implementations
 	constructor(values: readonly T[] = []) {
 		const n = values.length;
 		for (let i = 0; i < n; i++)
 			this.add(values[i]);
+	}
+	// As `Map`'s: TS's takes any `Iterable`, which has no representation yet.
+	// @ts-expect-error - tison extension: multiple constructor implementations
+	constructor(other: ReadonlySet<T> | null | undefined) {
+		if (other) {
+			const values = other.values();
+			for (let i = 0; i < values.length; i++)
+				this.add(values[i]);
+		}
 	}
 
 	get size(): number { return this.items_.length; }
