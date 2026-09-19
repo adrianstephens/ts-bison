@@ -99,23 +99,22 @@ function bigSign(a: RawArray<u32>): boolean {
 	return (a[a.length - 1] & 0x80000000) !== 0;
 }
 
-// The low `bits` of `a`'s two's complement, read as signed (`asIntN`) or unsigned (`asUintN`): past its limbs `a` reads as its
-// sign. An unsigned result whose top kept bit is set needs one more, zero, limb, or it would read as negative.
+// The low `bits` of `a`'s two's complement (past its limbs, its sign), read as signed or unsigned: the top limb is shifted up
+// and back, arithmetically or logically, and one more limb holds the result's sign for `bigTrim` to keep or drop.
 function bigTruncate(a: RawArray<u32>, bits: number, signed: boolean): bigint {
-	const part	= bits % 32;
-	const kept	= (bits - part) / 32 + (part > 0 ? 1 : 0);
-	const n		= kept + (!signed && part === 0 ? 1 : 0);
+	const n		= (bits + 31) >> 5;
+	const shift	= n * 32 - bits;
 	const fill	= bigSign(a) ? 0xffffffff : 0;
-	const r: RawArray<u32> = new RawArray<u32>(n > 0 ? n : 1);
-	for (let i = 0; i < kept; i++) {
+	const r: RawArray<u32> = new RawArray<u32>(n + 1);
+	for (let i = 0; i < n; i++) {
 		const limb: number = i < a.length ? a[i] : fill;
 		r[i] = limb;
 	}
-	if (part > 0) {
-		const unit: number	= Math.pow(2, part);
-		const top: number	= r[kept - 1];
-		const low: number	= top % unit;
-		r[kept - 1] = signed && low >= unit / 2 ? low + (4294967296 - unit) : low;
+	if (n > 0) {
+		const top: number	= r[n - 1];
+		r[n - 1] = signed ? (top << shift) >> shift : (top << shift) >>> shift;
+		const high: number	= r[n - 1];
+		r[n] = signed && high >= 0x80000000 ? 0xffffffff : 0;
 	}
 	return bigTrim(r) as unknown as bigint;
 }
