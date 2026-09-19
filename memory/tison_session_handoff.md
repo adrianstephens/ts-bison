@@ -44,7 +44,14 @@ nor a literal in a UNION slot. Before `9c94144` it got further only by building 
 `T.collectMembers` lists a getter as a property key. An `i32` boxed into `any` vs a `number` reader (f64 box) traps
 through an OPEN `Iterable<number>`. `x as T` is not a flow for open shapes (user undecided).
 
-**Instruments:** `assistant/survey-sequence.ts <file> <decl>...` reproduces the survey exactly (`NOWHOLE=1`);
+**The survey compiles a SNAPSHOT of its source** (user's call, 2026-09-19): `assistant/selfhost-snapshot.sh [tison-rev]`
+extracts committed `src/` of tison, binary-libs and binary into `assistant/selfhost-snapshot/` (revs in `SNAPSHOT.json`,
+printed in the survey header); the survey refuses to run without one, `--live` surveys the working tree. Refresh it
+deliberately and read that run's delta as the source's (the header flags a changed source). Line numbers in survey
+output are the SNAPSHOT's -- at `374a86e` ts-parser.ts's failure is 467, the live tree's 469.
+
+**Instruments:** `assistant/survey-sequence.ts <logical path> <decl>...` reproduces the survey exactly (`NOWHOLE=1`; reads
+the snapshot, `LIVE=1` the working tree);
 `assistant/tsc-type-at.ts <file> <line> <exprText>` asks REAL tsc for a type (TS API) -- compare before calling
 something a checker bug. `test-checker.ts` reads `dist/` like test-towasm: rebuild on both sides of an A/B.
 
