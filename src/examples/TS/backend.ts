@@ -2390,8 +2390,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const cls = ownerOf(operand, ctx);
 		if (cls)
 			return cls.fields.map(f => f.name);
-		const t = T.resolve(ctx.scope, ctx.narrowedTypeOf(operand));
-		return t.type === 'object' && !indexSignatureValueType(t)
+		const t = T.resolveObjectType(ctx.narrowedTypeOf(operand), ctx.scope);
+		return t && !indexSignatureValueType(t)
 			? t.members.flatMap(m => m.type === 'property' && typeof m.key === 'string' ? [m.key] : [])
 			: undefined;
 	}
@@ -6252,13 +6252,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							return sig.result;
 						}
 					}
-					// One-shot: consumed here (for this call's own generic type-param inference, if it applies)
-					// and cleared immediately, so it can't leak into this same call's own arguments below (see
-					// `contextualReturn`'s own comment on why that would be wrong).
+					// Consumed here, for this call's own type-argument inference, and cleared while it compiles so it can't leak into its arguments
+					// (see `contextualReturn`'s own comment); restored after, as the rest of the enclosing expression is still in it.
 					if (!isModuleValue(e.callee.name, ctx) && !ctx.resolvesName(e.callee.name)) {
-						const contextualReturn = ctx.contextualReturn;
-						ctx.contextualReturn = undefined;
-						return emitCall(e.callee.name, e.arguments, ctx, e.typeArgs, contextualReturn ?? (() => checkerTypeOf(e, ctx.scope)));
+						const contextualReturn = ctx.contextualReturn, name = e.callee.name;
+						return ctx.withContext(undefined, () => emitCall(name, e.arguments, ctx, e.typeArgs, contextualReturn ?? (() => checkerTypeOf(e, ctx.scope))));
 					}
 				}
 

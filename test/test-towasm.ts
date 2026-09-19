@@ -4393,6 +4393,26 @@ async function main() {
 	}
 
 	{
+		// A literal split per discriminant value lost its context after the first variant's call (checker.ts's `{ type: fnPart.type, ...instantiate(...) }`),
+		// and the spread of an `extends` interface named no keys, so the second variant matched nothing.
+		const { ctxLeak } = await compile(`
+			interface Params { params: number[] }
+			interface Sig extends Params { returnType?: number }
+			interface Fn extends Sig { type: 'function' }
+			interface Ctor extends Sig { type: 'constructor'; abstract?: boolean }
+			type Type = Fn | Ctor | { type: 'other' };
+			function inst(s: Sig): Sig { return { params: s.params.map(p => p * 2) }; }
+			function flip(t: Fn): Type { const k: 'function' | 'constructor' = t.params.length > 1 ? 'constructor' : 'function'; return { type: k, ...inst(t) }; }
+			export function ctxLeak(): number {
+				const fn: Fn = { type: 'function', params: [7, 8, 9] }, s: Sig = fn;
+				const r = flip({ type: 'function', params: [1, 2] }), f = flip({ type: 'function', params: [3] });
+				return (r.type === 'constructor' ? r.params[1] : -1) * 10 + (f.type === 'function' ? f.params[0] : -1) + s.params.length * 100;
+			}
+		`);
+		check('each variant of a discriminant-split literal keeps its context, and spreads an extending interface', ctxLeak(), 346);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`
