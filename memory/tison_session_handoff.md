@@ -13,7 +13,7 @@ wholesale, do not append.** It drifted to 223 lines by appending; that is the fa
 
 ## Latest: 2026-09-18 night -- HEAD `a4966cc` (Iterable) + an UNCOMMITTED regression fix in the tree
 
-**`a4966cc` REGRESSED the survey** (the gates did not see it): 144 compile vs 81 that compiled at `71e9ddf`. Main cause:
+**`a4966cc` REGRESSED the survey** (the gates did not see it): 144 compile, and 81 that compiled at `71e9ddf` no longer did. Main cause:
 backend.ts's module-level `builtinTypes = new Map<string,{...}>([...])` fits no array-constructor overload in the checker
 (the old `Map<string,{...}>` row); the new `Iterable` constructor fit, and codegen then failed converting to it.
 
