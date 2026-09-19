@@ -11,46 +11,48 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## Latest: 2026-09-18 evening -- HEAD `f934254`
+## Latest: 2026-09-18 night -- HEAD `a4966cc` (Iterable) + an UNCOMMITTED regression fix in the tree
 
-Eleven fixes, `0009613`..`7cbdc6f`, all from walking checker.ts's `typeOf` chain (`probe-one-decl.ts ... checker.ts typeOf`);
-each commit message has the root cause. Mechanisms worth knowing before editing nearby:
-- object-literal METHODS are closures in their fields; METHOD VALUES (`obj.m` unread) are closures over one `envThis`
-  shape, and `f.call(t, ...)` rebuilds that env (`ensureAnyRebindThis` for a boxed union of signatures). User chose this
-  design (option A). Not done: `.apply`/`.bind`; a `this`-using object-literal method.
-- `symbol` is `lib/symbol.ts` via `builtinTypes`; `typeof` knows it.
-- `fieldDeclaredType` is what a field ACCEPTS (`T | undefined` when optional).
-- checker: uncontextual `[]` is `never[]`; `AUTO_ARRAY` for `let x = []` / `x = []` into an untyped `let`; destructuring
-  defaults union their type in; a destructuring ASSIGNMENT target no longer contextually types the right side.
-- `T.isParamProperty`: one rule (`readonly` alone counts) at all four sites.
-- `objectShapeOf` is the one type-to-struct resolution: a declared shape with those members, else an intersection AS
-  WRITTEN over one named shape (`{type:'call'} & CallSig`) laid out as its wasm SUBTYPE, else anonymous. Asking the
-  RESOLVED type too was a regression (an `extends` expands to an intersection) -- fixed in `9ff40e2`.
-- `physicalScope`: an array literal, like a call, is typed in the narrowed scope (it has no slot).
-- `ReadonlyMap`/`ReadonlySet` declared in lib.d.ts; `ensureClassRef` applies `READONLY_ALIAS`.
-- A callee held physically as `any` takes the any-call dispatch; a LOCAL callee never falls into the global-function lookup.
+**`a4966cc` REGRESSED the survey** (the gates did not see it): 144 compile vs 81 that compiled at `71e9ddf`. Main cause:
+backend.ts's module-level `builtinTypes = new Map<string,{...}>([...])` fits no array-constructor overload in the checker
+(the old `Map<string,{...}>` row); the new `Iterable` constructor fit, and codegen then failed converting to it.
 
-**Since `b082f8f`** (each commit has its root cause): `mapObject` union spread (`ownerFor` keeps a union member's
-object literals), `++`/`--` on bigint and `number | bigint`, `??`/`!` keep an aliased union by name, `ownerFor` of a
-union whose members share one owner, instantiation keys resolve an argument's tuple/array/union parts, and a GENERIC
-CLASS instance is stripped of the template's stamps and re-checked as generic functions already were (`0cabd72`; the
-user asked whether that is a hack -- it is the existing function mechanism; "instantiate the answers" TS-style was
-considered and declined).
+**The fix is in the working tree, NOT committed** (backend.ts + test-towasm.ts; gates green: towasm 960, checker, cpp,
+difftest 2191/2200 0 disagree, corpus gate 838). Survey on it: **208/402 compile** (233 failures, 62 causes). What it does:
+- `collectOpenShapes` walks `new` too (construct signatures instantiated from the built type: `instantiateConstruct`);
+  a declared parameter mentioning its signature's own type parameters is skipped.
+- `noteSlot`: `a = b` is `b`; `c ? a : b` is each branch in its NARROWED scope (`narrow`); a `new` of the slot's own class
+  is built at the slot; an array literal meeting a non-array object slot opens it; values typed IN the slot's context.
+- `openKey`: a shape opens under its struct's key (`layoutArgs`/`layoutKey`, factored out of `ensureObjectShape`); classes by own key.
+- Nullable slots strip nullish; `fits` shared by both any-dispatchers, and method dispatch drops candidates whose result can't
+  become `want`. REVERTED from `a4966cc`: noting `x as T` (an `as` never changes representation; opened view casts spuriously),
+  so `for (... of m as Iterable<...>)` is unsupported again (explicit internal error). Proper fix: dispatch on `unwrapAs`'s type.
 
-Survey after `71e9ddf`: type-core 124/124, type-utils 21/21, printer 18/18, checker.ts whole file compiles and all 58
-declarations do with `5473de0`. Top rows left: `Map<string,{...}>` constructor overload (47, backend.ts), object
-literal needs a known target type (24, ts-parser/peg), `Array.from` (11), js-parser `Array<any>` -> `{...}` (11).
+**UNRESOLVED before committing:** the 208 run lists **46 checker.ts declarations** failing with `cannot convert ref:Param<any>
+@./js-parser to ref:{...}` (checker.ts was 58/58 at `71e9ddf`). Probed alone (`probe-one-decl.ts`, even several per process
+with `DBG_SHARED_LIB=1`) they compile. Suspect probe-order state in the survey's shared lib scope, possibly from the pre-pass
+now calling the checker's `typeOf` WITH an expected type. Next step: `selfhost-survey.sh tison/src/examples/TS/checker.ts`
+(single file, several minutes) -- the user interrupted that run, and has not chosen between re-running / committing / stopping.
 
-**Agreed follow-up: full `Iterable` support.** Declare `Iterable`/`Iterator` in the lib and represent an
-interface-typed value (Set, Map, Generator, TypedArray each have their own struct): boxed `any`, `[Symbol.iterator]`
-dispatched at run time, a by-position arm for arrays. Then add a general `Iterable` overload AFTER the specific
-`Set`/`Map` constructors (`f934254`), which stay as the fast path (the user confirmed: both, as with `BigInt`).
+`probe-one-decl.ts` (gitignored) now resolves sibling packages from the packages root, so it matches the survey.
+Pre-existing, not a regression: a `Map` literal whose object values omit an optional field (`{wtype}` beside
+`{wtype, class}`) traps "illegal cast" at `ecc5f6c` too.
+
+**`Iterable` design (`a4966cc`):** lib declares `Iterator`/`Iterable`/`IterableIterator`; `Array`/`ReadonlyArray` have a real
+`[Symbol.iterator]`; a `for...of` over a known array stays positional. Open shapes are THE mechanism for interface-typed values:
+a named function's structural parameter specializes per argument; any other slot (closure/method/constructor parameter, literal
+contents) that receives another layout is stored as `any`. `ownerFor` answers none for an open shape; `dispatchesAsAny` sends a
+receiver typed or stored as `any` to `ensureAnyDispatch`. `Set`/`Map` take `Iterable | null | undefined` after their fast paths.
+`Iterator.next` is `next(v?: N)`, not TS's rest-tuple form.
+
+Earlier the same day (`0009613`..`0cabd72`): object-literal METHODS are closures in their fields; METHOD VALUES are
+closures over one `envThis` (option A, user's choice; `.apply`/`.bind` not done); `fieldDeclaredType` is what a field
+ACCEPTS; uncontextual `[]` is `never[]`, `AUTO_ARRAY` for untyped `let x = []`; `objectShapeOf` is the one type-to-struct
+resolution; a GENERIC CLASS instance is re-checked as generic functions are (`0cabd72`, not a hack -- same mechanism).
 
 **Committing beside the user's WIP**: they edit backend.ts/wasm-codegen.ts/lib.d.ts concurrently. Stage only your hunks
-(`git diff > p; filter hunks; git apply --cached --recount`), or for lib.d.ts `hash-object` a HEAD copy plus your edit and
-`update-index --cacheinfo`. Gates then ran on a tree holding their WIP -- say so in the commit.
-
-**Trap:** `cd src/examples/TS/lib && tsc -p .` EMITS `.js` beside every lib source (no `noEmit`); use `--noEmit`.
+(`git diff > p; filter hunks; git apply --cached --recount`). **Trap:** `cd src/examples/TS/lib && tsc -p .` EMITS `.js`
+beside every lib source; use `--noEmit` (tsc lives in the WORKSPACE root's `node_modules/.bin`).
 
 ## As of 2026-09-18 -- HEAD `148f0b4`
 
@@ -193,7 +195,7 @@ While relocating code, run only the fast set: `npx tsc -b src/examples`, `test-t
 ## Tree state
 
 **Never trust this line — the user edits and commits concurrently; re-check `git status`.** At the time of
-writing: HEAD `148f0b4`; the user is editing source (`wasm-codegen.ts` and others), uncommitted.
+writing: HEAD `a4966cc`; backend.ts and test-towasm.ts hold the uncommitted regression fix above.
 
 ## Keeping this current
 
