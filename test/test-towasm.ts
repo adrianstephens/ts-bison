@@ -4452,6 +4452,39 @@ async function main() {
 	}
 
 	{
+		// A spread's struct is the literal's only if it holds every key the literal provides: `{ ...m, ...extra }` was built as
+		// `extra`'s `{modifiers}` and every read of it trapped. A spread of a union (`c ? { modifiers } : {}`) provides any member's
+		// keys; its `{}` arm is read by the spread's copy, through its own type, not the enclosing literal's context. A context of
+		// one shape decides a literal with nothing to discriminate by (`xs.push({})`, `const y: Opt = {}`).
+		const { spreadBeside, spreadConditional, emptyInContext } = await compile(`
+			type M = { type: 'a'; x: number; modifiers?: string[] } | { type: 'b'; y: number; modifiers?: string[] };
+			function beside(m: M, mods: string[]): number { const extra: { modifiers?: string[] } = { modifiers: mods }; const r = { ...m, ...extra }; return (r.modifiers?.length ?? 5) + (r.type === 'a' ? r.x * 10 : -1); }
+			export function spreadBeside(): number { return beside({ type: 'a', x: 3 }, ['p', 'q']); }
+			function addMods(m: M, mods: string[]): M { return { ...m, ...(mods.length ? { modifiers: mods } : {}) }; }
+			export function spreadConditional(): number {
+				const a = addMods({ type: 'a', x: 3 }, ['p', 'q']);
+				const b = addMods({ type: 'b', y: 4 }, []);
+				return (a.type === 'a' ? a.x : 0) + (a.modifiers?.length ?? 0) * 10 + (b.modifiers ? 1000 : 100) + (b.type === 'b' ? b.y * 10000 : 0);
+			}
+			interface Opt { a?: number; b?: string }
+			interface Other { a?: number; c?: boolean }
+			function mkOther(): Other { return { c: true }; }
+			function count(xs: Opt[]): number { let n = 0; for (const x of xs) n += x.a ?? 1; return n; }
+			export function emptyInContext(): number {
+				const o = mkOther();
+				const xs: Opt[] = [];
+				xs.push({});
+				xs.push({ a: 5 });
+				const y: Opt = {};
+				return count(xs) + (y.b ? 100 : 10) + (o.c ? 1000 : 0);
+			}
+		`);
+		check('a spread beside another spread keeps its own shape', spreadBeside(), 32);
+		check('a spread of a conditional object, one arm empty', spreadConditional(), 40123);
+		check('an empty literal takes a context of one shape', emptyInContext(), 1016);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`

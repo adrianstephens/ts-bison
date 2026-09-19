@@ -2374,26 +2374,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return merged.length && !merged.every(t => T.isAny(t)) ? merged : explicit;
 	}
 
-	// A bare object literal with no single resolvable target type (`case 'object'`'s own `want` doesn't name one class) -- a
-	// last-resort structural match against every reachable, struct-backed class/object-shape (the same "every class ever
-	// discovered" scan `findAnyDispatchCandidates` uses for method dispatch, just picking which shape a literal builds as).
-	// A candidate qualifies only when its own field set exactly matches the literal's property names; when several match (the
-	// common discriminated-union shape, e.g. `SpreadExpr`/`OtherExpr` both `{kind, value}`), a discriminant narrows: a property
-	// whose literal value matches exactly one candidate's literal-typed field declaration. Deliberately narrow -- exact fields
-	// plus literal-value discrimination, not general structural subtyping -- covering nothing broader.
-	// `cls`'s declared type for field `key`, for `matchObjectShape`'s discriminant check. A real class's member lives on
-	// `cls.decl.body` (`JS.Field`'s `typeAnnotation`), but an object-shape type alias (`type X = {...}`, not a real class)
-	// never populates that at all (`ensureObjectShape`'s own comment: `decl: { name, body: [] }`, deliberately empty), so its
-	// field types are re-resolved from the original structural type the same way `ensureObjectShape` derived them when building `cls`.
-	// A spread operand's own keys, resolved exactly as `case 'object'` resolves them to BUILD the spread (`ownerOf` first,
-	// then the anonymous shape), so matching and construction cannot disagree about which fields a spread supplies.
+	// A spread operand is read by the spread's copy, through its OWN type: the enclosing literal's context is not its reader's.
+	function emitSpreadOperand(operand: Expr, ctx: FunctionContext, want: W.Type): W.Type {
+		return ctx.withContext(ctx.narrowedTypeOf(operand), () => emitAs(operand, ctx, want));
+	}
+
+	// The keys a spread operand may provide: what its TYPE says a value carries -- of a union, any member's. Not a struct's field
+	// list, which may hold more (an optional field the type lacks, an accessor's `#get:` companion) that no value ever supplies.
 	function spreadKeys(operand: Expr, ctx: FunctionContext): string[] | undefined {
-		const cls = ownerOf(operand, ctx);
-		if (cls)
-			return cls.fields.map(f => f.name);
-		const t = T.resolveObjectType(ctx.narrowedTypeOf(operand), ctx.scope);
-		return t && !indexSignatureValueType(t)
-			? t.members.flatMap(m => m.type === 'property' && typeof m.key === 'string' ? [m.key] : [])
+		const parts		= T.unionMembers(ctx.narrowedTypeOf(operand), ctx.scope).filter(m => !T.isNullish(m, ctx.scope));
+		const members	= parts.flatMap(m => T.collectMembers(m, ctx.scope));
+		return parts.every(m => ['object', 'intersection'].includes(T.resolveMembers(m, ctx.scope).type)) && !members.some(m => m.type === 'index')
+			? [...new Set(members.flatMap(m => m.type === 'property' ? [T.memberKey(m.key)] : []))].filter((k): k is string => !!k)
 			: undefined;
 	}
 
@@ -2429,7 +2421,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					continue;
 				const n		= ctx.tempCounter++;
 				const src	= ctx.declareLocal(`$usrc$${n}`, W.REF_ANY_NULLABLE);
-				emitAs(p.operand, ctx, W.REF_ANY_NULLABLE);
+				emitSpreadOperand(p.operand, ctx, W.REF_ANY_NULLABLE);
 				ctx.emit(I.local.set(src.index));
 				return emitArms(owners.map((o, k) => ({
 					test: () => ctx.emit(I.local.get(src.index), I.ref.test(o!.typeIndex)),
@@ -2463,20 +2455,17 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		return undefined;
 	}
 
-	// `{ ...t, returnType: r }`: a spread operand with ONE known shape that already has every written key IS the
-	// literal's shape, as in TS (its type is the operand's own, with those keys replaced).
+	// `{ ...t, returnType: r }`: a spread operand with ONE known shape that already has every key the literal provides
+	// IS the literal's shape, as in TS. Every key, the other spreads' too: `{ ...m, ...extra }` is not `extra`'s shape.
 	function spreadOwner(e: JS.ObjectExpr<Type>, ctx: FunctionContext): ClassInfo | undefined {
-		const written = e.properties.flatMap(p => p.type === 'field' && typeof p.key === 'string' ? [p.key] : []);
-		for (const p of e.properties) {
-			if (p.type !== 'spread')
-				continue;
-			const cls = ownerOf(p.operand, ctx);
-			if (cls && cls.typeIndex !== -1 && written.every(k => cls.fieldIndex.has(k)))
-				return cls;
-		}
-		return undefined;
+		const provided = e.properties.flatMap(p => p.type === 'spread' ? spreadKeys(p.operand, ctx) ?? [undefined] : [typeof p.key === 'string' ? p.key : undefined]);
+		return e.properties.flatMap(p => p.type === 'spread' ? [ownerOf(p.operand, ctx)] : [])
+			.find(cls => cls && cls.typeIndex !== -1 && provided.every(k => k !== undefined && cls.fieldIndex.has(k)));
 	}
 
+	// A bare object literal with no single resolvable target type (`case 'object'`'s own `want` doesn't name one class) -- a
+	// last-resort structural match against every reachable, struct-backed class/object-shape (the same "every class ever
+	// discovered" scan `findAnyDispatchCandidates` uses for method dispatch, just picking which shape a literal builds as).
 	function matchObjectShape(e: JS.ObjectExpr<Type>, ctx: FunctionContext, anon = true): ClassInfo | undefined {
 		// `props`: every key the literal PROVIDES, a spread's included: no class names this literal's target, so it is read
 		// through its own type, and a struct lacking one of its keys would lose it. `explicit`: the fields actually WRITTEN.
@@ -2515,12 +2504,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		);
 		if (candidates.length === 1)
 			return candidates[0];
-		// No declared interface/class anywhere has this exact field set -- a genuinely anonymous shape (e.g.
-		// `const mapSig = {a: ..., b: ...}`, never named via `interface`/`type X = ...`), the same gap
-		// `ensureAnonObjectShape` already fills at a function type's own return position; keyed the same way, an
-		// identically-shaped anonymous literal elsewhere (or after generic substitution) collapses onto the same
-		// physical struct. Also reached when the discriminant tiebreak below rules out every name-matching candidate
-		// (`matches.length === 0`) -- see `matchObjectShapeByType`'s own identical fallback for why.
+		// No declared shape fits, or several do with nothing to decide and no context (`any` is none) to read it through: it is
+		// read through its own type, whose owner is the anonymous shape -- as `objectShapeOf` answers for that type.
 		const fallback = () => {
 			if (!anon)
 				return undefined;
@@ -2536,7 +2521,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			const vals = T.literalValues(cls.fieldDeclaredType(key, global) ?? T.ANY);
 			return !vals || vals.includes(value.value);
 		}));
-		return matches.length === 1 ? matches[0] : matches.length === 0 ? fallback() : undefined;
+		return matches.length === 1 ? matches[0] : matches.length === 0 || !ctx.contextualReturn || T.isAny(ctx.contextualReturn) ? fallback() : undefined;
 	}
 
 	// `matchObjectShape`'s type-level counterpart, used by `typeOf`'s 'object' case when a real object TYPE (not a
@@ -2868,15 +2853,21 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				return undefined;
 			props.set(p.key, p.value);
 		}
-		if (!props.size)
+		// ...but it does supply required fields. Unknown keys may supply any: the context can't make `{ modifiers }` a `Method`.
+		const spreads	= e.properties.flatMap(p => p.type === 'spread' ? [spreadKeys(p.operand, ctx)] : []);
+		const supplied	= spreads.every(k => k) ? new Set([...props.keys(), ...spreads.flat()]) : undefined;
+		// With nothing to discriminate by (no written field, no known key), only a context of ONE shape decides (`xs.push({})`).
+		const shapes = T.objectShapes(ctx.contextualReturn, ctx.scope);
+		if (!props.size && !supplied && shapes.length !== 1)
 			return undefined;
-		const matches = T.objectShapes(ctx.contextualReturn, ctx.scope).filter(({ objT }) => {
+		const matches = shapes.filter(({ objT }) => {
 			const fieldNames = new Set(objT.members.filter((m): m is TS.TypeMember & { type: 'property'; key: string } => m.type === 'property' && typeof m.key === 'string').map(m => m.key));
 			// The literal must name no field this member doesn't declare (an excess-property-style check -- otherwise
 			// `Field`'s own `key`/`typeAnnotation` names would equally "fit" `static_block`, which declares neither); a
 			// field this member declares as a real discriminant must admit this literal's value among its possible
 			// values -- one with no such signal isn't required to "match" anything.
-			return [...props.keys()].every(k => fieldNames.has(k)) && [...props].every(([key, value]) => {
+			const required = objT.members.flatMap(m => m.type === 'property' && !hasMod(m, 'optional') ? [T.memberKey(m.key)] : []);
+			return [...props.keys()].every(k => fieldNames.has(k)) && (!supplied || required.every(k => supplied.has(k))) && [...props].every(([key, value]) => {
 				if (value.type !== 'literal')
 					return true;
 				const m = objT.members.find(m => m.type === 'property' && m.key === key);
@@ -5425,7 +5416,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							if (srcCls && srcCls.decl.name !== 'Map') {
 								const srcName	= `#spread$${n}$${spreadIndex++}`;
 								const srcLocal	= ctx.declareValue(srcName, srcCls.thisWtype!, srcCls.thisTsType!);
-								emitAs(p.operand, ctx, srcCls.thisWtype!);
+								emitSpreadOperand(p.operand, ctx, srcCls.thisWtype!);
 								ctx.emit(I.local.set(srcLocal.index));
 								for (const key of srcCls.fieldIndex.keys()) {
 									ctx.emit(I.local.get(mapLocal.index));
@@ -5436,7 +5427,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							const spreadName	= `#spread$${n}$${spreadIndex}`;
 							const kName			= `#spreadkey$${n}$${spreadIndex++}`;
 							const spreadLocal	= ctx.declareValue(spreadName, owner.thisWtype!, owner.thisTsType!);
-							emitAs(p.operand, ctx, owner.thisWtype!);
+							emitSpreadOperand(p.operand, ctx, owner.thisWtype!);
 							ctx.emit(I.local.set(spreadLocal.index));
 							// The same desugaring `case 'for'`'s own `'in'` kind uses, synthesized directly rather than as a real `for...in` node -- there is no user-written
 							// loop variable or body, just one copy step per spread argument.
@@ -5490,7 +5481,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							if (!unionCls && !dynamic)
 								throw `object literal for '${owner.name}': a spread operand needs a known object type, got '${T.typeKey(spreadT)}'`;
 							const spreadLocal = ctx.declareLocal(`$spread$${ctx.tempCounter++}`, W.REF_ANY_NULLABLE);
-							emitAs(p.operand, ctx, W.REF_ANY_NULLABLE);
+							emitSpreadOperand(p.operand, ctx, W.REF_ANY_NULLABLE);
 							ctx.emit(I.local.set(spreadLocal.index));
 							const src: FieldSource = { spreadLocal, unionCls, dynamic, nullable: solid.length < parts.length };
 							const keys = unionCls ? unionCls.flatMap(m => m.fields.map(f => f.name)) : dynamic!.flatMap(m => m.members.map(k => k.type === 'property' && T.memberKey(k.key)).filter((k): k is string => !!k));
@@ -5499,7 +5490,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							continue;
 						}
 						const spreadLocal = ctx.declareValue(`$spread$${ctx.tempCounter++}`, spreadCls.thisWtype!, spreadCls.thisTsType!);
-						emitAs(p.operand, ctx, spreadCls.thisWtype!);
+						emitSpreadOperand(p.operand, ctx, spreadCls.thisWtype!);
 						ctx.emit(I.local.set(spreadLocal.index));
 						for (const f of spreadCls.fields)
 							addSource(f.name, { spreadLocal, spreadCls });
