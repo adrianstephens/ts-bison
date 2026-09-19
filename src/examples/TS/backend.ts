@@ -1355,10 +1355,19 @@ function layoutKey(name: string, args: readonly Type[], scope: Scope): string {
 	return args.length ? `${name}<${args.map(a => layoutArgKey(a, scope)).join(',')}>` : name;
 }
 // A shape opens under its struct's key, so `Iterable<[string, X]>` opens `Iterable<Y>` too; a class instantiation by its own.
+// An alias opens what it names (`TS.CallSig` is `JS.CallSig<Type>`), under the bare name its struct is registered by.
 function openKey(t: Type, scope: Scope): string {
-	const part	= T.nonNullable(t, scope);
-	const entry	= part.type === 'ref' && part.typeArgs?.length && !T.isClassRef(part, scope) ? scope.type(part.name) : undefined;
-	return part.type === 'ref' && entry?.typeParams?.length ? layoutKey(part.name, layoutArgs(entry.typeParams, part.typeArgs, scope), scope) : T.typeKey(T.resolve(scope, part));
+	let part = T.nonNullable(t, scope);
+	for (let next = T.expandRefOnce(scope, part); next.type === 'ref' && part.type === 'ref' && next.name !== part.name; next = T.expandRefOnce(scope, part))
+		part = next;
+	const entry	= part.type === 'ref' && part.typeArgs?.length && !T.isClassRef(part, scope) ? T.ownScope(part, scope).lookupType(part.name) : undefined;
+	return part.type === 'ref' && entry?.typeParams?.length ? layoutKey(part.name.slice(part.name.lastIndexOf('.') + 1), layoutArgs(entry.typeParams, part.typeArgs, scope), scope) : T.typeKey(T.resolve(scope, part));
+}
+
+// `t`'s non-nullish part resolved, an interface's `extends` intersection merged into the one object it describes.
+function resolvedShape(t: Type, scope: Scope): Type {
+	const r = T.resolve(scope, T.nonNullable(t, scope));
+	return r.type === 'intersection' ? T.resolveObjectType(r, scope) ?? r : r;
 }
 
 // `t` resolved, and so are the parts of the tuples, arrays and unions it is built from: one type spelled two ways
@@ -2105,9 +2114,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				return cls.thisType;
 		}
 
+		// An open shape is stored as `any` and may hold any layout (`ownerFor` agrees); a union's nullable part is its members' business.
+		if (openShapes.size && t.type !== 'union' && openShapes.has(openKey(t, global)))
+			return W.REF_ANY;
 		if (t.type === 'ref' && t.typeArgs?.length) {
-			if (openShapes.has(openKey(t, global)))
-				return W.REF_ANY;
 			const name = READONLY_ALIAS.get(t.name) ?? t.name;
 			const decl = LIB_DECL_MAP.get(name) ?? userGenericClassDecls.get(name);
 			if (decl?.type === 'class_decl' && decl.typeParams?.length) {
@@ -2134,8 +2144,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				break;
 			}
 			case 'object': {
-				if (openShapes.has(openKey(t, global)))
-					return W.REF_ANY;
 				const vt	= indexSignatureValueType(resolved);
 				const cls	= vt && ensureClass('Map', [TS.RefType('string'), vt]);
 				if (cls)
@@ -2211,16 +2219,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (cls)
 				return cls.thisType;
 		}
-		// Tried regardless of whether `t` itself is a `ref` (not an `else if`): `ensureClass` only resolves a BARE name (`scope.type(name)` never splits on
-		// '.'), so a namespace-qualified ref (`TS.TypeParam`, from `import * as TS from '...'`) that already resolves down to a plain 'object' shape would
-		// otherwise never reach this fallback -- a gap only for a dotted ref resolving straight to an object, not a union (which goes through the separate
-		// 'union' case above). It is still only reached when `ensureClass` had no nominal name to resolve by (a class currently mid-construction resolving
-		// its own name already returned above, so this never preempts it); a generic parameter's own structural bound (`Record<string, any>`) substituted
-		// with a real interface-typed argument is the one case actually anonymous by construction (`matchObjectShapeByType`'s own comment). An interface
-		// `extends`ing another resolves to a real INTERSECTION rather than an 'object' (`ownerFor`'s own intersection case says the same), so a
-		// namespace-qualified ref to one (`JS.CallSig<any>`, which is `{typeParams?; returnType?; ...} & Params<any>`) reached neither `ensureClass`
-		// (dotted name) nor the object branch below, and had no representation at all; flattened through the shared `resolveObjectType`, so this agrees
-		// with `ownerFor` on the shape.
+		// `ensureClass` never resolves a dotted ref (`TS.TypeParam`), and an interface `extends`ing another resolves to an intersection: both are
+		// flattened through `resolveObjectType` to the shape `ownerFor` sees.
 		const flat = resolved.type === 'object' ? resolved : resolved.type === 'intersection' ? T.resolveObjectType(resolved, global) : undefined;
 		if (flat) {
 			const shapeMatch = objectShapeOf(t, flat);
@@ -5467,7 +5467,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// right here (real JS's one-evaluation-per-spread semantics, matching the Map-backed case above) rather than re-emitting `p.operand` once per field it
 				// supplies. A later source for the same field name overwrites an earlier one, and only a field this class actually declares is ever read back off a spread
 				// operand -- any of the operand's own extra fields are simply not part of this shape, as a real JS spread's excess properties would never be looked at.
-				interface FieldSource { expr?: Expr; method?: JS.Method<Type>; spreadLocal?: W.Local; spreadCls?: ClassInfo; unionCls?: ClassInfo[]; nullable?: boolean }
+				interface FieldSource { expr?: Expr; method?: JS.Method<Type>; spreadLocal?: W.Local; spreadCls?: ClassInfo; unionCls?: ClassInfo[]; dynamic?: TS.ObjectType[]; nullable?: boolean }
 				// Every source for a field, in written order -- not just the last one. `{...D, ...opts}` is the reason: an OPTIONAL property of a later operand is only
 				// "last wins" when it is actually present at runtime, so an absent one has to fall back to whatever came before it.
 				const sources = new Map<string, FieldSource[]>();
@@ -5478,18 +5478,22 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						const spreadT	= T.resolve(ctx.scope, ctx.narrowedTypeOf(p.operand));
 						const spreadCls	= ownerOf(p.operand, ctx) ?? (spreadT.type === 'object' ? ensureAnonObjectShape(spreadT) : undefined);
 						if (!spreadCls) {
-							// A union spread operand (`js-parser.ts`'s `{ ...args[0] }`, `args[0]: CallSig | Params`): each field is read off whichever member the value is, and is
-							// absent where that member has none, as it is for a nullish operand.
-							const parts		= spreadT.type === 'union' ? T.unionMembers(spreadT, ctx.scope) : [];
+							// A union operand (`js-parser.ts`'s `{ ...args[0] }`, `args[0]: CallSig | Params`) reads each field off whichever member the value is, absent where
+							// it has none. A member stored as `any` (an open shape) has no struct to test for, so then each key its type names is read at run time, by name.
+							const parts		= T.unionMembers(spreadT, ctx.scope);
 							const solid		= parts.filter(m => !T.isNullish(m, ctx.scope));
-							const unionCls	= solid.flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]);
-							if (!unionCls.length || !unionCls.every(o => o && o.typeIndex !== -1))
+							const owners	= spreadT.type === 'union' ? solid.flatMap(m => flattenOwners(m, ctx.typeScope) ?? [undefined]) : [];
+							const unionCls	= owners.length && owners.every((o): o is ClassInfo => !!o && o.typeIndex !== -1) ? owners : undefined;
+							const shapes	= solid.map(m => T.resolveObjectType(m, ctx.scope));
+							const dynamic	= !unionCls && solid.length && shapes.every((m): m is TS.ObjectType => !!m) ? shapes : undefined;
+							if (!unionCls && !dynamic)
 								throw `object literal for '${owner.name}': a spread operand needs a known object type, got '${T.typeKey(spreadT)}'`;
 							const spreadLocal = ctx.declareLocal(`$spread$${ctx.tempCounter++}`, W.REF_ANY_NULLABLE);
 							emitAs(p.operand, ctx, W.REF_ANY_NULLABLE);
 							ctx.emit(I.local.set(spreadLocal.index));
-							const src: FieldSource = { spreadLocal, unionCls: unionCls as ClassInfo[], nullable: solid.length < parts.length };
-							for (const name of new Set(src.unionCls!.flatMap(m => m.fields.map(f => f.name))))
+							const src: FieldSource = { spreadLocal, unionCls, dynamic, nullable: solid.length < parts.length };
+							const keys = unionCls ? unionCls.flatMap(m => m.fields.map(f => f.name)) : dynamic!.flatMap(m => m.members.map(k => k.type === 'property' && T.memberKey(k.key)).filter((k): k is string => !!k));
+							for (const name of new Set(keys))
 								addSource(name, src);
 							continue;
 						}
@@ -5511,11 +5515,23 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				}
 				// "Certain" means the source always yields a value: an explicit `k: v`, a spread of a field that isn't optional, or -- for a union spread -- a field every
 				// member declares and none optionally, with a never-nullish operand.
-				const certain	= (src: FieldSource, name: string) => !!src.expr || !!src.method || (src.unionCls
+				const certain	= (src: FieldSource, name: string) => !!src.expr || !!src.method || (src.dynamic
+					? !src.nullable && src.dynamic.every(o => o.members.some(m => m.type === 'property' && T.memberKey(m.key) === name && !hasMod(m, 'optional')))
+					: src.unionCls
 					? !src.nullable && src.unionCls.every(m => { const i = m.fieldIndex.get(name); return i !== undefined && !m.fields[i].optional; })
 					: !src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].optional);
 				const rawWtype	= (src: FieldSource, name: string) => src.spreadCls!.fields[src.spreadCls!.fieldIndex.get(name)!].wtype;
 				const readSpread = (src: FieldSource, name: string, want: W.Type): void => {
+					if (src.dynamic) {
+						const read = () => {
+							ctx.emit(I.local.get(src.spreadLocal!.index), I.ref.as_non_null, I.call(ensureAnyField(name).funcIndex));
+							coerceTop(W.REF_ANY_NULLABLE, ctx, want);
+						};
+						if (!src.nullable)
+							return read();
+						ctx.emit(I.local.get(src.spreadLocal!.index), I.ref.is_null);
+						return void ctx.emitIf(toValType(want), () => ctx.emitDefaultValue(want, types, toValType), read);
+					}
 					if (!src.unionCls) {
 						const idx = src.spreadCls!.fieldIndex.get(name)!;
 						ctx.emit(I.local.get(src.spreadLocal!.index));
@@ -5566,7 +5582,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					const last = chain[chain.length - 1];
 					if (chain.length === 1 || certain(last, f.name))
 						return emitOne(last, f);
-					const srcWtype	= last.unionCls ? types.nullable(f.wtype) : rawWtype(last, f.name);
+					const srcWtype	= last.dynamic ? W.REF_ANY_NULLABLE : last.unionCls ? types.nullable(f.wtype) : rawWtype(last, f.name);
 					const tmp		= ctx.declareLocal(`$spread$${f.name}$${ctx.tempCounter++}`, srcWtype);
 					readSpread(last, f.name, srcWtype);
 					ctx.emit(I.local.tee(tmp.index), I.ref.is_null);
@@ -9501,17 +9517,21 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	function noteSlot(slot: Type | undefined, value: Expr, scope: Scope, depth = 4, erased = false): void {
 		if (!slot || depth < 0)
 			return;
-		// `a = b` is `b`, and `c ? a : b` either; a `new` of the slot's own class takes the slot's type arguments, built there as a literal is.
+		// `a = b` is `b`, and `c ? a : b` or `a ?? b` either; a `new` of the slot's own class takes the slot's type arguments, built there as a literal is.
 		if (value.type === 'assign' && !value.operator)
 			return noteSlot(slot, value.value, scope, depth, erased);
 		if (value.type === 'conditional') {
 			noteSlot(slot, value.consequent, narrow(value.test, scope, true), depth, erased);
 			return noteSlot(slot, value.alternate, narrow(value.test, scope, false), depth, erased);
 		}
+		if (value.type === 'binary' && (value.operator === '??' || value.operator === '||' || value.operator === '&&')) {
+			noteSlot(slot, value.left, scope, depth, erased);
+			return noteSlot(slot, value.right, value.operator === '??' ? scope : narrow(value.left, scope, value.operator === '&&'), depth, erased);
+		}
 		const part = T.nonNullable(slot, scope);
 		if (value.type === 'new' && value.callee.type === 'identifier' && part.type === 'ref' && (READONLY_ALIAS.get(part.name) ?? part.name) === value.callee.name)
 			return;
-		const s = T.nonNullable(T.resolve(scope, slot), scope);
+		const s = resolvedShape(slot, scope);
 		if (value.type === 'object' && s.type === 'object') {
 			for (const f of value.properties)
 				if (f.type === 'field' && typeof f.key === 'string' && f.value)
@@ -9521,10 +9541,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				noteTypes(slot, T.widenLiterals(checkerTypeOf(unwrapAs(value), scope)), scope, depth);
 			return;
 		}
-		// An array literal is built as an array whatever its context, and a shape's struct is never one; the checker accepted the flow.
+		// An array literal is built as an array whatever its context, and a shape's struct is never one -- where it fits: of the overloads noted for a call, only one takes it.
 		if (value.type === 'array' && s.type === 'object' && !T.unionMembers(slot, scope).some(m => arrayPartOf(m, scope))) {
-			openShapes.add(openKey(slot, scope));
-			return noteTypes(slot, checkerTypeOf(value, scope, true, slot), scope, depth);
+			const built = checkerTypeOf(value, scope, true, slot);
+			if (T.isAssignable(built, slot, scope))
+				openShapes.add(openKey(slot, scope));
+			return noteTypes(slot, built, scope, depth);
 		}
 		if (value.type === 'array' && s.type === 'array') {
 			for (const el of value.elements)
@@ -9533,16 +9555,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return;
 		}
 		// Typed in the slot's context, as it is built: an uncontextual `new Map` is `Map<any, any>`, and a literal may fit only in context.
+		// A call's type arguments may come from that context (`xs.find(isCtor)` as a `CallSig`), yet it returns what it was given.
 		noteTypes(slot, checkerTypeOf(unwrapAs(value), scope, true, slot), scope, depth);
+		if (unwrapAs(value).type === 'call')
+			noteTypes(slot, checkerTypeOf(unwrapAs(value), scope), scope, depth);
 	}
 	// The same question with no expression to descend: a value's TYPE meeting a slot's, member-wise and through elements.
 	function noteTypes(slot: Type | undefined, value: Type | undefined, scope: Scope, depth = 4): void {
 		if (!slot || !value || depth < 0)
 			return;
-		// A readonly view is its container, physically.
-		const physical	= (x: Type): Type => x.type === 'ref' && READONLY_ALIAS.has(x.name) ? { ...x, name: READONLY_ALIAS.get(x.name)! } : x;
-		// A nullable slot holds its non-null part's values.
-		const s			= T.nonNullable(T.resolve(scope, physical(slot)), scope), v = T.resolve(scope, physical(value));
+		// A nullable slot holds its non-null part's values, and a readonly view is its container, physically.
+		const physical	= (x: Type): Type => (n => n.type === 'ref' && READONLY_ALIAS.has(n.name) ? { ...n, name: READONLY_ALIAS.get(n.name)! } : n)(T.nonNullable(x, scope));
+		const s			= resolvedShape(physical(slot), scope), v = resolvedShape(physical(value), scope);
 		if (T.typeKey(s) === T.typeKey(v))
 			return;
 		const se = T.arrayLikeElement(s), ve = T.arrayLikeElement(v);

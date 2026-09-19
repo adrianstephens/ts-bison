@@ -4360,6 +4360,31 @@ async function main() {
 	}
 
 	{
+		// A nullable slot of an `extends` interface, reached through an alias, never opened (checker.ts's `let sig: TS.CallSig | undefined = ... ?? ...`).
+		const { openExtends } = await compile(`
+			interface Params<T> { params: T[] }
+			interface CallSig<T> extends Params<T> { returnType?: T }
+			type Sig = CallSig<Type>;
+			interface Fn extends Sig { type: 'function' }
+			interface Ctor extends Sig { type: 'constructor'; abstract?: boolean }
+			type Type = Fn | Ctor | { type: 'other' };
+			const isCtor = (p: Type): p is Ctor => p.type === 'constructor';
+			const isFn = (p: Type): p is Fn => p.type === 'function';
+			function pick(parts: Type[], construct: boolean): Sig | undefined {
+				let sig: Sig | undefined = construct ? parts.find(isCtor) ?? parts.find(isFn) : parts.find(isFn);
+				return sig;
+			}
+			export function openExtends(): number {
+				const parts: Type[] = [{ type: 'other' }, { type: 'constructor', params: [{ type: 'other' }, { type: 'other' }] }, { type: 'function', params: [] }];
+				const s = pick(parts, true), f = pick(parts, false);
+				const copy: Fn = { type: 'function', ...s! };
+				return (s ? s.params.length : -1) * 10 + (f ? f.params.length : -1) + copy.params.length * 100;
+			}
+		`);
+		check('an extending interface value opens its nullable, aliased base slot, and spreads from it', openExtends(), 220);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`
