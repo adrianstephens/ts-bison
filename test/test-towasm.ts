@@ -2336,6 +2336,27 @@ async function main() {
 	}
 
 	{
+		// A generic class instance's bodies are typed as THAT instance: a local initialised from `V[]` is a real `number[]`, not the template's erased `any[]`.
+		const { genericCtor, genericMethod } = await compile(`
+			class Counted<K, V> {
+				n = 0;
+				constructor(other: Map<K, V>) {
+					const vs = other.values();
+					this.n = vs.length;
+				}
+				add(xs: V[]) {
+					const ys = xs.slice();
+					this.n += ys.length;
+				}
+			}
+			export function genericCtor(): number { return new Counted(new Map([['a', 1], ['b', 2]])).n; }
+			export function genericMethod(): number { const c = new Counted(new Map([['a', 1]])); c.add([5, 6, 7]); return c.n; }
+		`);
+		check('generic class: constructor locals typed per instance', genericCtor(), 2);
+		check('generic class: method locals typed per instance', genericMethod(), 4);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

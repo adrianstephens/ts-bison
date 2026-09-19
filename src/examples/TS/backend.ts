@@ -1199,9 +1199,7 @@ function nextCall(iterator: Expr, it: T.IterationTypes, typeScope: Scope): Expr 
 
 // Substitutes a generic class's type parameters throughout its decl.
 function substituteClassTypeParam(decl: JS.ClassDecl<Type>, map: ReadonlyMap<string, Type>): JS.ClassDecl<Type> {
-	const out = walker(undefined, undefined, (t, process) =>
-		t.type === 'ref' && map.has(t.name) ? map.get(t.name) : process(t)
-	).statement(decl)!;
+	const out = substituteTypeParams(map).statement(decl) as JS.ClassDecl<Type>;
 	// A STATIC member is restored verbatim: real TS forbids one referencing its class's type parameters, so
 	// substituting into one can only corrupt a static's OWN same-named type parameter -- `Array<any>`'s
 	// `_alloc<T>(n): T[]` became `any[]`, allocating `arr:ref` whatever it was called with, so `$ret` never had a chance to resolve it.
@@ -1218,7 +1216,9 @@ function substituteTypeParams(map: ReadonlyMap<string, Type>): Walker {
 		// re-checks so its own narrowing (on the concrete types) is stamped afresh.
 		(s, process) => { const built = process(s); delete (built as any).scope; return built; },
 		(e, process) => { const built = process(e); delete (built as any).scope; return built; },
-		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t)
+		(t, process) => t.type === 'ref' && map.has(t.name) ? map.get(t.name)! : process(t),
+		undefined,
+		(m, process) => { const built = process(m); delete (built as any).scope; return built; }
 	);
 }
 
@@ -8195,6 +8195,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							throw `class '${name}' needs ${decl.typeParams.length} explicit type argument(s)`;
 				}
 				decl = substituteClassTypeParam(decl, new Map(decl.typeParams.map((p, i) => [p.name, i < got ? typeArgs![i] : p.default!])));
+				// Re-checked, as `instantiateDecl` re-checks a generic function's instance: its bodies' stamped types must be this
+				// instantiation's, or a local initialised from `V[]` got the generic's erased `any[]` slot for a real `number[]`.
+				checkHoisted([decl], new Scope(moduleScopeOf(homeModule) ?? libGlobal));
 			}
 			// `thisTsType` must be a real reference to this class -- the ref itself carries the real name and type arguments, not the mangled composite cache key,
 			// or `this.length`/`this[i]` can't resolve (`T.lookupMember` silently falls back to `any`).
