@@ -1179,8 +1179,9 @@ function structuralKey(name: string, params: JS.Param<Type>[]): string {
 }
 
 
+// Keyed as a class instantiation is (`layoutArgKey`): `i32` resolves to `number` but is laid out apart from it.
 function genericKey(name: string, typeParams: readonly TS.TypeParam[], map: Map<string, Type>, scope: Scope) {
-	return `${name}<${typeParams.map(p => T.typeKey(T.resolve(scope, map.get(p.name)!))).join(',')}>`;
+	return layoutKey(name, typeParams.map(p => map.get(p.name)!), scope);
 }
 
 function homeKey(homeModule: string, name: string) {

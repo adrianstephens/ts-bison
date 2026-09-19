@@ -4413,6 +4413,19 @@ async function main() {
 	}
 
 	{
+		// A generic function's instance was keyed by RESOLVED type arguments, so `__towasm_indexed<i32>` (for `Array<i32>`'s iterator) served `Array<number>` too.
+		const { i32Iter } = await compile(`
+			const total = (xs: Iterable<number>): number => { let s = 0; for (const x of xs) s += x; return s; };
+			export function i32Iter(): number {
+				const a: i32[] = [];
+				a.push(3);
+				return total([0.5, 0.25]) + total(new Set([1, 2])) * 10 + a.length * 100;
+			}
+		`);
+		check('a generic instantiation over i32 is not shared with number', i32Iter(), 130.75);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`
