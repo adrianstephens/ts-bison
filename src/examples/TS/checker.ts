@@ -168,7 +168,7 @@ function resolveFnMember(t: Type, scope: Scope): TS.CallSig | undefined {
 // literal is a tuple -- readonly unless `inner` itself asks for a mutable array (TS's checkArrayLiteral). Each element and
 // property passes on the part of `inner` it stands in: `{ args: [] } as const` against `{ args: Expr[] }` is mutable.
 const constContext = (inner?: Type): TS.RefType => TS.RefType('const', inner ? [inner] : undefined);
-const isConstContext = (t: Type | undefined): t is TS.RefType => t?.type === 'ref' && t.name === 'const' && (t.typeArgs?.length ?? 0) <= 1;
+export const isConstContext = (t: Type | undefined): t is TS.RefType => t?.type === 'ref' && t.name === 'const' && (t.typeArgs?.length ?? 0) <= 1;
 // The context a const context gives an element or property value: its own part of `inner` where TS's isConstContext reaches the
 // value (a literal, array or object literal), none past anything else -- a conditional's branches, a call's result are ordinary.
 const constContextOf = (e: Expr, inner: Type | undefined): Type | undefined => e.type === 'literal' || e.type === 'array' || e.type === 'object' ? constContext(inner) : undefined;
@@ -1638,7 +1638,8 @@ export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], ty
 		settleFromReturn(inference, scope);
 	}
 	// The rest arguments are inferred from as one tuple, as TS synthesizes it: against an array, its elements are ONE candidate
-	// (`new Array(false, 1, 'x')` is `T = boolean | number | string`); against a union (`[(self) => R<T>] | R<T>[]`), each member.
+	// (`new Array(false, 1, 'x')` is `T = boolean | number | string`, the OPTIMISATION `inferTypeArgs` explains); against a union
+	// (`[(self) => R<T>] | R<T>[]`), each member.
 	if (sig.rest?.typeAnnotation && restArgs?.length)
 		inference.infer(sig.rest.typeAnnotation, { type: 'tuple', elements: restArgs }, deferred);
 	for (const { paramT, argT, contra } of deferred)
@@ -2769,6 +2770,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			const returnType = retDef.length ? T.widenNullish(T.combineTypes(retDef), inner) : alwaysThrows(body[body.length - 1]) ? T.NEVER : T.VOID;
 
 			if (!declaredReturn) {
+				fn.inferredReturn = true;
 				fn.returnType = generator
 					? TS.RefType(async ? 'AsyncGenerator' : 'Generator', [yields!.length ? T.combineTypes(yields!) : T.NEVER, returnType, T.ANY])
 					: T.wrapReturnIfAsync(inferredPredicate(body.length === 1 && body[0].type === 'return' ? body[0].argument : undefined, returnType), inner, async);
@@ -2786,6 +2788,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
 				err(SEVERITY.ERROR, (body as any).pos)`Type '${show().type(t)}' is not assignable to declared return type '${show().type(expected)}'`;
 		} else if (!isPredicate && !declaredReturn) {
+			fn.inferredReturn = true;
 			fn.returnType = T.wrapReturnIfAsync(inferredPredicate(body, T.widenNullish(widenForContext(t, inferHint, inner), inner)), inner, async);
 		}
 	}

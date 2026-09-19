@@ -54,7 +54,7 @@ export interface Param<T>					{ key: BindingTarget; default?: Expr<T>; typeAnnot
 export function  Param<T>(key: BindingTarget, typeAnnotation?: T, modifiers?: string[]): Param<T> { return { key, typeAnnotation, modifiers }; }
 export interface Params<T>					{ params: Param<T>[]; rest?: Rest<T>; }
 export function  Params<T>(params: Param<T>[], rest?: Rest<T>) : Params<T> { return {params, rest }; }
-export interface CallSig<T> extends Params<T> { typeParams?: TypeParam<T>[]; returnType?: T; declScope?: unknown; scope?: unknown; pure?: boolean }
+export interface CallSig<T> extends Params<T> { typeParams?: TypeParam<T>[]; returnType?: T; inferredReturn?: boolean; declScope?: unknown; scope?: unknown; pure?: boolean }
 
 export type CallSigParams<T> =
 	|	[CallSig<T>]

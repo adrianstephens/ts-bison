@@ -5,7 +5,7 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import * as W from '../wasm-codegen';
 import { Literal, Identifier, Binary, Assign, Conditional, Member, hasMod, Module as CModule } from '../common';
-import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload } from './checker';
+import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload, isConstContext } from './checker';
 import { Walker, walker, walkerB } from './walker';
 import { makeAsm as makeAsm0 } from '../wasm-codegen';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
@@ -4451,8 +4451,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const fnContext		= contextFn && T.resolve(ctx.typeScope, contextFn);
 		// This function's OWN declared return type is the literal's context: `return { type: kind, ...sig }` against a declared
 		// union picks the member it names (`matchContextualUnionMember`), where an untargeted literal matches every same-shaped
-		// class in the program and shape matching then refuses to guess.
-		const returnContext	= (e.returnType as Type | undefined) ?? (fnContext?.type === 'function' ? fnContext.returnType : undefined);
+		// class in the program and shape matching then refuses to guess. One the checker only INFERRED yields to the caller's context,
+		// which is what reads the value: `rules<F | H>(rule(x => ({ type: 'f', ... })))` builds an `F`, not its own `{type; n}`.
+		const contextReturn	= fnContext?.type === 'function' ? fnContext.returnType : undefined;
+		const returnContext	= e.inferredReturn ? contextReturn ?? e.returnType : e.returnType ?? contextReturn;
 		const { funcTypeIndex, structTypeIndex } = ensureClosureType(sig);
 		const { funcIndex, typeIndex }	= types.funcAt(funcTypeIndex);
 		const info: FuncInfo = { ...sig, funcIndex, typeIndex };
@@ -5360,8 +5362,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			// The asserted type is compile-time-only: compile the inner expression and pass its actual `WasmType` straight through, ignoring the assertion.
 			case 'as':
 				// The asserted type is the expression's own context: `{ type: 'array', ... } as Expr` names the union
-				// member to build, where an untargeted literal matches every same-shaped class in the program.
-				return ctx.withContext(e.typeAnnotation, () => emitExpr(e.expression, ctx, want));
+				// member to build, where an untargeted literal matches every same-shaped class in the program. `as const` names no type.
+				return isConstContext(e.typeAnnotation) ? emitExpr(e.expression, ctx, want) : ctx.withContext(e.typeAnnotation, () => emitExpr(e.expression, ctx, want));
 
 			// `f<A>` / `NS.f<A>` read as a VALUE (`ts-parser.ts`'s `export const CallSig = JS.CallSig<Type>`): the generic function instantiated at those type arguments,
 			// as a closure. A call through one goes the same way.

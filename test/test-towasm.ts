@@ -4516,6 +4516,28 @@ async function main() {
 	}
 
 	{
+		// An arrow the checker only inferred a return for builds what its caller reads (`F`, of `F | H`), not its own `{type; n}`
+		// -- which no reader of `F | H` tests for -- and `as const` names no context (ts-parser.ts's `primary_type`).
+		const { callerContext } = await compile(`
+			interface R<T> { a: (x: string[]) => T }
+			function rule<T>(a: (x: string[]) => T): R<T> { return { a }; }
+			function rules<T>(...alts: R<T>[]): R<T>[] { return alts; }
+			interface F { type: 'f'; n: number; extra?: string }
+			interface G { type: 'f'; n: number; other?: boolean }
+			interface H { type: 'h'; s: string }
+			function mkG(): G { return { type: 'f', n: 2 }; }
+			export function callerContext(): number {
+				const g = mkG();
+				const inner = rules(rule(x => ({ n: x.length })));
+				const tagged = rules<F | H>(rule(x => ({ type: 'f', ...inner[0].a(x) } as const)), rule(x => ({ type: 'h', s: 'z' })));
+				const t = tagged[0].a(['a', 'b', 'c', 'd']);
+				return g.n * 10 + (t.type === 'f' ? t.n * 100 : -1);
+			}
+		`);
+		check("an arrow's inferred return yields to its caller's context, as const or not", callerContext(), 420);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`
