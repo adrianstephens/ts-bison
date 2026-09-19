@@ -7268,19 +7268,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	type Expected = Type | (() => Type);
 	function inferCallTypeArgs(typeParams: TS.TypeParam[], params: JS.Param<Type>[], args: Expr[], typeArgs: Type[] | undefined, ctx: FunctionContext, expected?: Expected, returnType?: Type, rest?: JS.Rest<Type>): Map<string, Type> {
 		const scope = ctx.scope;
-		// A spread position has no single argument type (`instantiate`'s own `argTs` convention); its element
-		// type goes into `restElementTs`, one candidate as TS synthesizes the rest array.
+		// A spread position has no single argument type (`instantiate`'s own `argTs` convention); it and the plain arguments past
+		// `params` fill the rest parameter, as the checker's own tuple of them.
 		// NARROWED, as the checker infers: `if (t.type === 'object_pattern') mapObject(t, ...)` instantiates at that member, not the whole union.
 		const argTs: (Type | undefined)[] = args.map(a => a.type === 'spread' ? undefined : ctx.narrowedTypeOf(a));
-		const restElementTs: Type[] = [];
-		args.forEach((a, i) => {
-			const t = a.type === 'spread' ? T.resolveOwn(checkerTypeOf(a.operand, scope), scope) : i >= params.length ? argTs[i] : undefined;
-			const el = a.type === 'spread' && t ? T.arrayLikeElement(t) ?? (t.type === 'tuple' ? T.combineTypes(T.elementTypes(t, scope)) : undefined)
-				: t;
-			if (el)
-				restElementTs.push(el);
+		const restArgs = args.flatMap((a, i): TS.TupleElement[] => {
+			if (a.type !== 'spread')
+				return i >= params.length && argTs[i] ? [argTs[i]] : [];
+			const t		= T.resolveOwn(checkerTypeOf(a.operand, scope), scope);
+			const el	= T.arrayLikeElement(t);
+			return el ? [{ type: 'spread', argument: TS.ArrayType(el) }] : t.type === 'tuple' ? t.elements : [];
 		});
-		return checkerInferTypeArgMap({ params, rest, returnType, typeParams }, argTs, typeArgs, scope, restElementTs, typeof expected === 'function' ? expected() : expected);
+		return checkerInferTypeArgMap({ params, rest, returnType, typeParams }, argTs, typeArgs, scope, restArgs, typeof expected === 'function' ? expected() : expected);
 	}
 
 	// A plain `import { foo }` binding in `homeModule` that names a function its declaring module compiles.

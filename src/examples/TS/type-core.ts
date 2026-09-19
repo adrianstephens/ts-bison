@@ -2716,11 +2716,7 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				// Every element is a candidate, unioned -- `readonly T[]` from `['a', 'b'] as const` is `'a' | 'b'`, not the first alone.
 				const outer = pooled;
 				pooled = new Map();
-				a.elements.forEach(el => {
-					const t = tupleElementType(el);
-					if (t)
-						recurse(paramT.element, t, depth - 1);
-				});
+				elementTypes(a, scope).forEach(t => recurse(paramT.element, t, depth - 1));
 				const got = pooled;
 				pooled = outer;
 				got.forEach((ts, name) => found(name, combineTypes(ts)));

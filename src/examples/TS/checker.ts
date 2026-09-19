@@ -1595,7 +1595,7 @@ export function exportScope(body: Stmt[], parent: Scope, filename?: string, into
 // ---- lazy return-type inference -------------------------------------------------------------
 
 // Instantiates `sig` against `argTs`, substituting type params through params/return type. Pure -- doesn't validate (see `argsFit`).
-// `restElementTs`: a spread argument's element type(s), since `argTs` leaves a spread position `undefined` (arity unknown statically).
+// `restArgs`: what fills the rest parameter, as tuple elements -- a spread of unknown arity as a spread element.
 // What the call's destination implies settles a parameter no argument spoke for -- before any callback's own return is heard,
 // since an unannotated callback returns whatever shape its body made (`Rule([...], $ => ({...}))` needs the array's element
 // type). A hint still naming the call's own placeholders only fills in if nothing else does.
@@ -1611,10 +1611,10 @@ function settleFromReturn(inference: T.Inference, scope: Scope) {
 // inference (`T.Inference`) over the argument types, with the contextual result type settling what the
 // arguments left open and the deferred callback-return candidates replayed last. Exported because
 // `backend.ts`'s monomorphization needs the same answer -- it used to re-implement exactly this policy.
-// `restElementTs`: a spread argument's element type(s), since `argTs` leaves a spread position `undefined`.
+// `restArgs`: what fills the rest parameter, as tuple elements (`argTs` leaves a spread position `undefined`).
 // `inference`: the call site's own, already fed its arguments and callbacks in TS's order (see `case 'call'`);
 // a bare trial (an overload fit, an instantiation expression) infers from `argTs` here.
-export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, restElementTs?: Type[], expected?: Type, inference?: T.Inference, err?: Err, pos?: Location): Map<string, Type> {
+export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, restArgs?: TS.TupleElement[], expected?: Type, inference?: T.Inference, err?: Err, pos?: Location): Map<string, Type> {
 	const map = new Map<string, Type>();
 	if (!sig.typeParams?.length)
 		return map;
@@ -1637,11 +1637,10 @@ export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], ty
 			inference.inferReturn(sig.returnType, expected);
 		settleFromReturn(inference, scope);
 	}
-	// Rest arguments are ONE candidate, as TS's synthesized array of them: `new Array(false, 1, 'x')` is `T = boolean | number | string`.
-	if (sig.rest?.typeAnnotation && restElementTs?.length) {
-		const t = sig.rest.typeAnnotation;
-		inference.infer(t.type === 'array' ? t.element : t, T.combineTypes(restElementTs), deferred);
-	}
+	// The rest arguments are inferred from as one tuple, as TS synthesizes it: against an array, its elements are ONE candidate
+	// (`new Array(false, 1, 'x')` is `T = boolean | number | string`); against a union (`[(self) => R<T>] | R<T>[]`), each member.
+	if (sig.rest?.typeAnnotation && restArgs?.length)
+		inference.infer(sig.rest.typeAnnotation, { type: 'tuple', elements: restArgs }, deferred);
 	for (const { paramT, argT, contra } of deferred)
 		inference.infer(paramT, argT, undefined, contra);
 	const inferred = inference.current();
@@ -1662,13 +1661,13 @@ export function inferTypeArgMap(sig: TS.CallSig, argTs: (Type | undefined)[], ty
 }
 
 // Instantiates `sig` against `argTs`, substituting type params through params/return type. Pure -- doesn't validate (see `argsFit`).
-function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, pos: Location, restElementTs?: Type[], expected?: Type, err?: Err, inference?: T.Inference): TS.CallSig {
+function instantiate(sig: TS.CallSig, argTs: (Type | undefined)[], typeArgs: Type[] | undefined, scope: Scope, pos: Location, restArgs?: TS.TupleElement[], expected?: Type, err?: Err, inference?: T.Inference): TS.CallSig {
 	let returnType	= sig.returnType ?? T.ANY;
 	let params		= sig.params;
 	let rest		= sig.rest;
 
 	if (sig.typeParams?.length) {
-		const map	= inferTypeArgMap(sig, argTs, typeArgs, scope, restElementTs, expected, inference, err, pos);
+		const map	= inferTypeArgMap(sig, argTs, typeArgs, scope, restArgs, expected, inference, err, pos);
 		params		= params.map(p => p.typeAnnotation ? { ...p, typeAnnotation: T.substituteType(p.typeAnnotation, map) } : p);
 		rest		= rest?.typeAnnotation ? { ...rest, typeAnnotation: T.substituteType(rest.typeAnnotation, map) } : rest;
 		returnType	= T.substituteType(returnType, map);
@@ -2246,29 +2245,20 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					};
 					const annotated = new Map(e.arguments.flatMap((a, i) => (a.type === 'function' || a.type === 'arrow') && !isContextSensitive(a) ? [[i, typeCallback(a, i)] as const] : []));
 
-					const restElementTs: Type[] = [];
+					const spreads: TS.TupleElement[][] = [];
 					const argTs = e.arguments.map((a, i) => {
 						if (a.type === 'function' || a.type === 'arrow')
 							return annotated.get(i) ?? typeCallback(a, i);
 						if (a.type !== 'spread')
 							return preArgTs[i];
 						const t		= T.resolveOwn(arg(a.operand), scope);
-						const el	= t.type === 'array' ? t.element
-									: t.type === 'tuple' ? T.combineTypes(t.elements.map(el => T.tupleElementType(el)).filter(x => !!x))
-									: undefined;
-						if (el)
-							restElementTs.push(el);
+						spreads[i]	= t.type === 'array' ? [{ type: 'spread', argument: t }] : t.type === 'tuple' ? t.elements : [];
 						return undefined;
 					});
+					// A spread and the plain arguments past `sig.params.length` fill the rest parameter, in order.
+					const restArgs = e.arguments.flatMap((a, i) => a.type === 'spread' ? spreads[i] : i >= sig!.params.length && argTs[i] ? [argTs[i]] : []);
 
-					// A rest-only signature called with plain positional args leaves those past `sig.params.length` unmatched by the
-					// per-param inference loop -- feed them into the same rest-element inference a real spread would use.
-					e.arguments.forEach((a, i) => {
-						if (a.type !== 'spread' && i >= sig!.params.length && argTs[i])
-							restElementTs.push(argTs[i]);
-					});
-
-					return { ...instantiate(sig, argTs, typeArgs, scope, pos, restElementTs, expected, trial ? undefined : err, inference), declScope, argTs };
+					return { ...instantiate(sig, argTs, typeArgs, scope, pos, restArgs, expected, trial ? undefined : err, inference), declScope, argTs };
 				};
 
 				// Overload resolution, TS's two passes. Every candidate is first tried with its context-sensitive callbacks untyped (which
