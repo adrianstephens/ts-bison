@@ -4,7 +4,7 @@ description: LIVE cold-start state for the wasm-backend work — where things st
 metadata:
   node_type: memory
   type: project
-  modified: 2026-09-19
+  modified: 2026-09-20
 ---
 
 **Read this first, and usually instead of [[tison-towasm-self-hosting-plan]]** (2233 lines — open it only
