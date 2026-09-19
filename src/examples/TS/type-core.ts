@@ -2631,7 +2631,20 @@ export class Inference {
 	}
 	fix(name: string, t: Type)	{ this.fixed.set(name, t); }
 	fromCandidates(name: string): Type | undefined {
-		return this.fixed.get(name) ?? chooseInference(this.co.get(name) ?? [], this.contra.get(name) ?? [], this.scope, t => this.literal.has(t));
+		const fixed = this.fixed.get(name);
+		if (fixed)
+			return fixed;
+		const co		= this.co.get(name) ?? [], contra = this.contra.get(name) ?? [];
+		const covariant	= co.length ? chooseInference(co, [], this.scope, t => this.literal.has(t)) : undefined;
+		if (!covariant || !contra.length)
+			return covariant ?? chooseInference([], contra, this.scope);
+		// TS's preferCovariantType: only a covariant inference that is no conflicting pick among its candidates, fits some contravariant
+		// one, and holds every candidate of a parameter constrained by this one (`every<T, U extends T>(arr, isC)`: `T` is `isC`'s `A`).
+		const fits		= (t: Type, u: Type) => isAssignable(t, u, this.scope);
+		const bounded	= [...this.names.values()].filter(p => p.constraint?.type === 'ref' && p.constraint.name === name && !p.constraint.typeArgs);
+		const prefer	= !isRef(covariant, 'never') && !isAny(covariant) && co.every(t => fits(t, covariant)) && contra.some(t => fits(covariant, t))
+			&& bounded.every(p => (this.co.get(p.name) ?? []).every(t => fits(t, covariant)));
+		return prefer ? covariant : chooseInference([], contra, this.scope);
 	}
 	inferred(name: string): Type | undefined	{ return this.fromCandidates(name) ?? this.fromReturn.get(name); }
 	returnHint(name: string): Type | undefined	{ return this.fromReturn.get(name); }
@@ -2736,8 +2749,11 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 			const entry		= declScope.type(paramT.name);
 			const unfold	= () => instantiateEntry(entry!, paramT.typeArgs);
 			const sameName	= argT.type === 'ref' && argT.name === paramT.name;
-			if (paramT.name === 'Array' && paramT.typeArgs.length === 1 && a.type === 'array') {
-				recurse(paramT.typeArgs[0], a.element, depth - 1);
+			// Array-like to array-like is element to element, covariantly, as TS infers it -- not structurally through the methods,
+			// whose callback parameters would add CONTRAVARIANT candidates (`ReadonlyArray<T>` from a `(string | number)[]`).
+			const el = (paramT.name === 'Array' || paramT.name === 'ReadonlyArray') && paramT.typeArgs.length === 1 ? arrayLikeElement(a) : undefined;
+			if (el) {
+				recurse(paramT.typeArgs[0], el, depth - 1);
 			} else if (paramT.name === 'PromiseLike' && paramT.typeArgs.length === 1 && (argT.type === 'union' ? argT.types : [argT]).some(m => asPromiseRef(m, scope))) {
 				// `.then`'s 2nd alternative: the callback's return may be a union with only *some* members Promise-shaped (e.g.
 				// `Font | FontGroup | Promise<Font> | undefined`) -- `awaitType` distributes over the union, unwrapping just those.
