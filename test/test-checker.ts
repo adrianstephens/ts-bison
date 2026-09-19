@@ -202,6 +202,8 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['an empty array arm of a conditional takes the other arm', 'declare const c: boolean; declare const xs: { n: number }[]; const r = c ? xs : []; const q: string = r.map(x => x.n);', [NOT_ASSIGNABLE('number[]', 'string')]],
 	['an empty array declaration or assignment evolves', 'let a = []; a.push(1); let b; (b = [], b).push(5);', []],
 	['a destructuring default adds its own type', "let [x = 'a' in {}] = []; x = !x; const { y = 1 } = {} as { y?: string }; const q: boolean = y;", [NOT_ASSIGNABLE('string | number', 'boolean')]],
+	// Stripping `undefined` keeps an aliased union by name, as TS does: expanded, it no longer matched the alias itself.
+	['?? and ! keep an aliased union by name', "type U = { a: 1 } | { b: 2 }; declare const p: { c?: U }; declare function d(): U; const q: string = p.c ?? d(); declare const n: U | undefined; const r: string = n!;", [NOT_ASSIGNABLE('U', 'string'), NOT_ASSIGNABLE('U', 'string')]],
 	['a generic callback argument infers from its constraints','declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
 ];
 

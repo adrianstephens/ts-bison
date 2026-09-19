@@ -403,14 +403,20 @@ export function isOther(op: string) {
 // `&&` only as false, and `&&` narrows a string/number to its one falsy literal (`||`'s truthy side has no single value).
 export function logicalLeftPart(t: Type, op: string, scope: Scope): Type {
 	const other	= isOther(op[0]);
-	return combineTypes(unionMembers(t, scope).flatMap(m => {
+	// A member union nothing is dropped from stays as written: `p.constraint ?? x` is `Type`, not `Type`'s members.
+	const part	= (m: Type): Type[] => {
 		const p = resolveOwn(m, scope);
+		if (p.type === 'union') {
+			const kept = p.types.flatMap(part);
+			return kept.length === p.types.length && kept.every((k, i) => k === p.types[i]) ? [m] : kept;
+		}
 		if (other(p, scope))
 			return [];
 		if (op !== '??' && isBoolean(p))
 			return [Literal(op === '||')];
 		return [op === '&&' ? makeNullish(p) : m];
-	}));
+	};
+	return combineTypes(part(t));
 }
 
 // ===================================================================

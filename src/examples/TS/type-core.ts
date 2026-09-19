@@ -1999,17 +1999,17 @@ export function isNullish(t: Type, scope: Scope): boolean {
 // of a value's type -- e.g. `lookupMember`'s own union case requires *every* member to have the property
 // looked up, which a bare `null`/`undefined` member never does, so a `?.` member lookup needs this run on
 // the object type first (see `checker.ts`'s own `'member'` case) or it always misses, falling back to `any`.
-// `nonNullable = false` keeps `t` whole -- unless `strictNullChecks` is off, where no value is ever treated as possibly nullish.
-export function nonNullable(t: Type, scope: Scope, nonNullable = true): Type {
-	if (!nonNullable && scope.strictNullChecks())
+// `strip = false` keeps `t` whole -- unless `strictNullChecks` is off, where no value is ever treated as possibly nullish.
+export function nonNullable(t: Type, scope: Scope, strip = true): Type {
+	if (!strip && scope.strictNullChecks())
 		return t;
 	const r = resolveOwn(t, scope);
 	if (r.type !== 'union')
 		return t;
-	// Flattened: `Maybe<X> | undefined` hides `Maybe`'s own `null | undefined` one alias down.
-	const members	= unionMembers(r, scope);
-	const kept		= members.filter(m => !isNullish(m, scope));
-	return kept.length === 0 || kept.length === members.length ? t : combineTypes(kept);
+	// Each member as written unless it hides a nullish itself (`Maybe<X> | undefined`, `Maybe` one alias down): expanding
+	// every member made `Type | undefined` the union of `Type`'s members, which no longer matches `Type` itself.
+	const kept = r.types.flatMap(m => isNullish(m, scope) ? [] : [nonNullable(m, scope)]);
+	return kept.length === 0 || (kept.length === r.types.length && kept.every((k, i) => k === r.types[i])) ? t : combineTypes(kept);
 }
 
 // An inferred declaration or return type, as TS widens one without `strictNullChecks`: `null`/`undefined` leave a union and
