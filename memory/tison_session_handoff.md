@@ -11,7 +11,7 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## Latest: 2026-09-18 evening -- HEAD `b082f8f`
+## Latest: 2026-09-18 evening -- HEAD `f934254`
 
 Eleven fixes, `0009613`..`7cbdc6f`, all from walking checker.ts's `typeOf` chain (`probe-one-decl.ts ... checker.ts typeOf`);
 each commit message has the root cause. Mechanisms worth knowing before editing nearby:
@@ -30,12 +30,21 @@ each commit message has the root cause. Mechanisms worth knowing before editing 
 - `ReadonlyMap`/`ReadonlySet` declared in lib.d.ts; `ensureClassRef` applies `READONLY_ALIAS`.
 - A callee held physically as `any` takes the any-call dispatch; a LOCAL callee never falls into the global-function lookup.
 
-**BigInt row CLOSED** (`b082f8f`): union `BigInt`/`Number` constructors, `asIntN`/`asUintN` via `bigTruncate` (checked
-against node), and a bigint `**` is `BigInt.pow` in every context (it was `Math.pow` unless constant-folded).
+**Since `b082f8f`** (each commit has its root cause): `mapObject` union spread (`ownerFor` keeps a union member's
+object literals), `++`/`--` on bigint and `number | bigint`, `??`/`!` keep an aliased union by name, `ownerFor` of a
+union whose members share one owner, instantiation keys resolve an argument's tuple/array/union parts, and a GENERIC
+CLASS instance is stripped of the template's stamps and re-checked as generic functions already were (`0cabd72`; the
+user asked whether that is a hack -- it is the existing function mechanism; "instantiate the answers" TS-style was
+considered and declined).
 
-**Next blocker (`typeOf`)**: walker.ts `mapObject`'s `{...node}` with `N` a union routes a member to `ExprStmt<any>`
-("cannot convert ref:{type:'satisfies';...} to ref:ExprStmt<any>", 42:23). Also open: `Math.random` fails "unknown
-field 'seed'" in a probe.
+Survey after `71e9ddf`: type-core 124/124, type-utils 21/21, printer 18/18, checker.ts whole file compiles and all 58
+declarations do with `5473de0`. Top rows left: `Map<string,{...}>` constructor overload (47, backend.ts), object
+literal needs a known target type (24, ts-parser/peg), `Array.from` (11), js-parser `Array<any>` -> `{...}` (11).
+
+**Agreed follow-up: full `Iterable` support.** Declare `Iterable`/`Iterator` in the lib and represent an
+interface-typed value (Set, Map, Generator, TypedArray each have their own struct): boxed `any`, `[Symbol.iterator]`
+dispatched at run time, a by-position arm for arrays. Then add a general `Iterable` overload AFTER the specific
+`Set`/`Map` constructors (`f934254`), which stay as the fast path (the user confirmed: both, as with `BigInt`).
 
 **Committing beside the user's WIP**: they edit backend.ts/wasm-codegen.ts/lib.d.ts concurrently. Stage only your hunks
 (`git diff > p; filter hunks; git apply --cached --recount`), or for lib.d.ts `hash-object` a HEAD copy plus your edit and
