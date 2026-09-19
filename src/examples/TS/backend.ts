@@ -2722,6 +2722,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// a real `'object'` shape must NOT be widened: `widenLiterals`'s recursive object case would widen every
 		// member's declared type too, including a discriminant field (`{type:'static_block';...}`'s `type`) down to plain
 		// `string`, corrupting the literal precision `matchObjectShapeByType`'s discriminant tiebreak needs to tell union members apart.
+		// Nor is one that is a union's MEMBER: widened, `{type: 'as'} | {type: 'satisfies'}` became one `{type: string}` object.
 		const resolvedForOwner = T.resolve(global, t);
 		// `obj?.method(...)`'s receiver is nullable by construction -- strip `null`/`undefined` before
 		// dispatching; there's no "owner of `null`", only "owner of the non-nullish part `?.` already guarded".
@@ -2729,7 +2730,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const nonNullish = resolvedForOwner.type === 'union' ? T.nonNullable(resolvedForOwner, global) : resolvedForOwner;
 		if (nonNullish !== resolvedForOwner)
 			return ownerFor(nonNullish);
-		const w = resolvedForOwner.type === 'object' ? resolvedForOwner : T.widenLiterals(resolvedForOwner, false, true);
+		const widenOwner = (x: Type): Type => x.type === 'object' ? x : x.type === 'union' ? T.combineTypes(x.types.map(widenOwner)) : T.widenLiterals(x, false, true);
+		const w = widenOwner(resolvedForOwner);
 
 		switch (w.type) {
 			case 'union': {
