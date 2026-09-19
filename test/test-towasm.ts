@@ -4385,6 +4385,14 @@ async function main() {
 	}
 
 	{
+		// A runtime read of a field no reachable struct declares was a compile error; JS reads it as `undefined` (printer.ts's `decl.definite` on an open `Var`).
+		const { absentField } = await compile(`
+			export function absentField(): number { const x: any = { name: 'a' }; return x.definite === undefined ? 1 : 0; }
+		`);
+		check('a dynamic read of a field no struct declares is undefined', absentField(), 1);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`

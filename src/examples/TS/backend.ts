@@ -8948,11 +8948,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					coerceTop('f64', dctx, W.REF_ANY_NULLABLE);
 				} });
 			}
-			if (!candidates.length)
-				throw `no reachable class declares a field '${name}' -- a dynamic read on 'any' needs at least one real candidate`;
-
-			// A receiver matching nothing is a real object that simply doesn't declare this field, and JS defines that read as `undefined` -- which this
-			// function's own nullable result already represents. A NULL receiver is the separate case JS throws on, and keeps trapping.
+			// A receiver matching nothing -- every receiver, when no reachable struct declares the field -- is a real object that simply lacks it, and JS reads
+			// that as `undefined`, which the nullable result already represents. A NULL receiver is the separate case JS throws on, and keeps trapping.
 			const missing: wasm.Instr[] = [
 				I.local.get(recv.index), I.ref.is_null,
 				I.if(toValType(W.REF_ANY_NULLABLE), [I.unreachable], [I.ref.null(heapTypeIndexOf(W.REF_ANY_NULLABLE))]),
