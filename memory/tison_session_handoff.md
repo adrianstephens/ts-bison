@@ -11,7 +11,7 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## Latest: 2026-09-19 (evening) -- HEAD `fd5df24`
+## Latest: 2026-09-19 (evening) -- HEAD `9c94144`
 
 **Survey 268/404, nothing regressed; checker.ts 58/58 AND compiles as a whole file (3073 funcs).** Four fixes,
 `a01d942`..`fd5df24`; root causes are in the commit messages. What to know before editing nearby:
@@ -31,15 +31,14 @@ wholesale, do not append.** It drifted to 223 lines by appending; that is the fa
 `cannot convert {key:string} to Rest<any>` (24, below), `Array.from` on the constructor type (11), js-parser
 `Array<any>` -> `{...}` (11), backend's `Type` vs `W.Type` (7+).
 
-**The ts-parser row is a design question, parked in `assistant/layout-wip.patch`** (4 hunks, applies cleanly). `{ ...$[2],
-typeParams }` (line 340) is built as `CallSig`, but `$[2]`'s member `{params; rest: {key: string}}` was built as the
-anonymous shape, whose `rest` is an anonymous `{key}` struct -- no `Rest`. The type side (`findObjectShapeByType`)
-matches a type to a declared class on type-assignability alone, so it maps `{params; rest: {key}; typeParams}` to
-`CallSig` though `CallSig.rest` holds a different layout. The patch adds `holdsLayout` (same `layoutSketch`, `any`
-either side, or an open field) to the type side and to spread-sourced values on the literal side, and makes the
-no-context fallback `objectShapeOf` (the type's owner). Still failing when parked: the arrow's own return wtype
-resolves to `CallSig` through a path not yet traced. Needs the user's view: layout agreement narrows width-subtyping
-matches program-wide.
+**Layout agreement is COMMITTED (`af96da0`..`9c94144`), and option 1 has hit its limit at ts-parser.ts:469.** The user
+chose "option 1" (keep types more precise than tsc; the rest-element union is marked OPTIMISATION in type-core, droppable
+once option 2 exists) over "option 2" (width-subtyping flows become open shapes). `holdsLayout` refuses a declared class
+whose field layout differs; an arrow's INFERRED return yields to the caller's context (`inferredReturn` stamp); `as const`
+is no context; `Partial<X>` is no `X`. Line 469 (`{ type: 'function', ...$[0] } as const` in a `Type` context) is now
+correctly a `FunctionType`, but `$[0].rest` is an anonymous `{key}` struct (line 329's context-less `{ key: $[2] }`) and
+`FunctionType.rest` a `Rest`: a real width-subtyping flow, which only option 2 handles -- `noteSlot` sees neither spreads
+nor a literal in a UNION slot. Before `9c94144` it got further only by building an anonymous shape no reader tests for.
 
 **Known, unfixed:** the checker types `{ ...classInstance, y }` as `any` (the literal then has no target);
 `T.collectMembers` lists a getter as a property key. An `i32` boxed into `any` vs a `number` reader (f64 box) traps
@@ -190,7 +189,7 @@ While relocating code, run only the fast set: `npx tsc -b src/examples`, `test-t
 ## Tree state
 
 **Never trust this line — the user edits and commits concurrently; re-check `git status`.** At the time of
-writing: HEAD `fd5df24`; the user's own uncommitted `Tuple` export in ts-parser.ts.
+writing: HEAD `9c94144`; the user's own uncommitted `Tuple` export in ts-parser.ts.
 
 ## Keeping this current
 
