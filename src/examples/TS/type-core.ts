@@ -1048,6 +1048,9 @@ function reduceIntersection(t: TS.IntersectionType, scope: Scope, depth: number)
 	return kept.length === raw.length ? undefined : !kept.length ? UNKNOWN : kept.length === 1 ? kept[0] : TS.IntersectionType(kept);
 }
 
+// How many times `resolve` has run out of depth: a result produced while one did depends on the caller's depth, not on the type.
+let depthBails = 0;
+
 export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): Type {
 	const idx = stopAtRef ? 1 : 0;
 	const slot = scope.resolveCache?.get(t);
@@ -1063,12 +1066,16 @@ export function resolve(scope: Scope, t: Type, depth = 10, stopAtRef = false): T
 
 	if (depth < 0) {
 		scope.hitDepthLimit('Scope.resolve');
+		depthBails++;
 		return ANY;
 	}
 
 	(scope.resolving ??= new Set).add(t);
-	const result = uncached();
+	const bails		= depthBails;
+	const result	= uncached();
 	scope.resolving.delete(t);
+	if (depthBails !== bails)
+		return result;
 
 	const entry = (scope.resolveCache ??= new WeakMap).get(t) ?? [undefined, undefined];
 	entry[idx]	= result;

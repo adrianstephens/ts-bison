@@ -204,6 +204,8 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a destructuring default adds its own type', "let [x = 'a' in {}] = []; x = !x; const { y = 1 } = {} as { y?: string }; const q: boolean = y;", [NOT_ASSIGNABLE('string | number', 'boolean')]],
 	// Stripping `undefined` keeps an aliased union by name, as TS does: expanded, it no longer matched the alias itself.
 	['?? and ! keep an aliased union by name', "type U = { a: 1 } | { b: 2 }; declare const p: { c?: U }; declare function d(): U; const q: string = p.c ?? d(); declare const n: U | undefined; const r: string = n!;", [NOT_ASSIGNABLE('U', 'string'), NOT_ASSIGNABLE('U', 'string')]],
+	// A resolution cut short by the depth limit answers `any` for THAT call; cached, every alias it passed through stayed `any`.
+	['a type resolved past the depth limit is not cached as any', 'type A0 = A1; type A1 = A2; type A2 = A3; type A3 = A4; type A4 = A5; type A5 = A6; type A6 = A7; type A7 = A8; type A8 = A9; type A9 = A10; type A10 = A11; type A11 = A12; type A12 = { x: number }; const b: A0 = { x: 1 }; const q: A9 = { x: "s" };', ["is not assignable to type 'A9'"]],
 	['a generic callback argument infers from its constraints','declare function total<T>(map: (x: T) => T | undefined): (x: T) => T; declare function id<T extends string>(t?: T): T | undefined; const q: boolean = total(id);', ['(x: string) => string']],
 ];
 
