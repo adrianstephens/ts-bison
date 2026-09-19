@@ -2478,8 +2478,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	}
 
 	function matchObjectShape(e: JS.ObjectExpr<Type>, ctx: FunctionContext, anon = true): ClassInfo | undefined {
-		// `props`: every key the literal PROVIDES (a spread can satisfy required fields). `explicit`: only fields
-		// actually WRITTEN -- TS never excess-property-checks a spread, so a spread's extra keys must not disqualify.
+		// `props`: every key the literal PROVIDES, a spread's included: no class names this literal's target, so it is read
+		// through its own type, and a struct lacking one of its keys would lose it. `explicit`: the fields actually WRITTEN.
 		const props		= new Map<string, Expr>();
 		const explicit	= new Set<string>();
 		for (const p of e.properties) {
@@ -2511,7 +2511,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return !declared || !value || T.isAssignable(checkerTypeOf(unwrapAs(value), ctx.scope), declared, ctx.typeScope);
 		});
 		const candidates = [...new Set(classes.values())].filter(cls =>
-			cls.typeIndex !== -1 && !cls.anonymous && [...explicit].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional) && fits(cls)
+			cls.typeIndex !== -1 && !cls.anonymous && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional) && fits(cls)
 		);
 		if (candidates.length === 1)
 			return candidates[0];

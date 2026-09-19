@@ -4426,6 +4426,32 @@ async function main() {
 	}
 
 	{
+		// A literal no class targets is read through its own type, so a spread's keys must all have fields: an open `Sig` spread
+		// into `as Sig` matched both `Params` and `Sig` (only WRITTEN keys had to exist), and `Params` would have dropped `ret`.
+		const { spreadAsOpen, spreadIntoAny } = await compile(`
+			interface Params { params: number[] }
+			interface Sig extends Params { ret?: number; pure?: boolean }
+			interface Meth extends Sig { key: string }
+			function widen(m: Meth): Sig { const s: Sig = m; return s; }
+			function setRet(s: Sig): void { s.ret = (s.ret ?? 0) + 40; }
+			export function spreadAsOpen(): number {
+				const p: Params = { params: [9] };
+				const src: Sig = widen({ params: [1, 2], ret: 3, key: 'k' });
+				const copy = { ...src } as Sig;
+				setRet(copy);
+				return (copy.ret ?? -100) + copy.params.length * 100 + p.params.length * 1000;
+			}
+			export function spreadIntoAny(): number {
+				const src: Sig = { params: [1], ret: 5 };
+				const r: any = { ...src };
+				return r.ret;
+			}
+		`);
+		check('a spread of an open shape keeps every key', spreadAsOpen(), 1243);
+		check('a spread into an any-typed literal keeps every key', spreadIntoAny(), 5);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`
