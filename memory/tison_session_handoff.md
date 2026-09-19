@@ -11,7 +11,7 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## Latest: 2026-09-18 evening -- HEAD `7cbdc6f`
+## Latest: 2026-09-18 evening -- HEAD `b082f8f`
 
 Eleven fixes, `0009613`..`7cbdc6f`, all from walking checker.ts's `typeOf` chain (`probe-one-decl.ts ... checker.ts typeOf`);
 each commit message has the root cause. Mechanisms worth knowing before editing nearby:
@@ -30,10 +30,12 @@ each commit message has the root cause. Mechanisms worth knowing before editing 
 - `ReadonlyMap`/`ReadonlySet` declared in lib.d.ts; `ensureClassRef` applies `READONLY_ALIAS`.
 - A callee held physically as `any` takes the any-call dispatch; a LOCAL callee never falls into the global-function lookup.
 
-**Next blocker (`typeOf`)**: type-core `addValue` (284:123) -- "no overload of 'BigInt's constructor' matches": the known
-BigInt row. The user is editing `lib/bigint.ts`/lib.d.ts's BigInt concurrently, so left alone.
-Also open: walker.ts `mapObject`'s `{...node}` with `N` a union (probe `resolveFnMember`); `Math.random` fails
-"unknown field 'seed'" in a probe.
+**BigInt row CLOSED** (`b082f8f`): union `BigInt`/`Number` constructors, `asIntN`/`asUintN` via `bigTruncate` (checked
+against node), and a bigint `**` is `BigInt.pow` in every context (it was `Math.pow` unless constant-folded).
+
+**Next blocker (`typeOf`)**: walker.ts `mapObject`'s `{...node}` with `N` a union routes a member to `ExprStmt<any>`
+("cannot convert ref:{type:'satisfies';...} to ref:ExprStmt<any>", 42:23). Also open: `Math.random` fails "unknown
+field 'seed'" in a probe.
 
 **Committing beside the user's WIP**: they edit backend.ts/wasm-codegen.ts/lib.d.ts concurrently. Stage only your hunks
 (`git diff > p; filter hunks; git apply --cached --recount`), or for lib.d.ts `hash-object` a HEAD copy plus your edit and
