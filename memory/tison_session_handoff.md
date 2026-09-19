@@ -11,6 +11,27 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
+## In flight -- HEAD `ed85749` (step 2 of the checker-driven open-shape plan)
+
+**The plan the user approved:** drive towasm's open-shape pass from the checker's own assignability checks (every
+accepted "value into slot" flow stamped on the value node), in order: (2) check rest/spread arguments -- DONE
+`fa0e437`; then (1) `checkFlow` stamping at the nine flow sites; (3) towasm reads the stamps (keeping its
+monomorphization/erasure rules); (4) spreads + union-member descent in `noteSlot`. Not started: 1, 3, 4.
+
+**Detour, uncommitted: inventory C4 (isAssignable skipped METHODS)** -- `assistant/c4-methods.patch`, also live in the
+tree. Needed because `string` counted as `any[]` (genericRestParameters1). Its corpus delta vs `864c5f1` is 30 true
+positives, 1 false positive removed, and 3 false positives from PRE-EXISTING gaps it exposes, each its own feature:
+script files' declarations must merge into the global scope (errorConstructorSubtypes: `interface ErrorConstructor`
+augmentation); the parser reads ``tag<T>`...` `` as comparisons (genericTemplateOverloadResolution); a destructuring
+parameter's type must come from its binding pattern, not its `= []` default (destructuringWithLiteralInitializers 65).
+Fixed on the way, committed: `864c5f1` (namespace blocks checked in their merged scope, function+namespace merge,
+annotation-only refs resolved lazily), `70f0a53` (TS's co/contravariant preference; arrays inferred by element),
+`ed85749` (generic source instantiated in the target's context). User not yet asked: land C4 now, or first fix the 3.
+
+**Instruments added:** `assistant/probe-fulllib.ts <file>` checks a file under lib.esnext.full exactly as test-checker
+does (ERR + GAP lines); `assistant/tsc-type-at.ts` also prints tsc's RESOLVED SIGNATURE for a call expression. Probe
+traps: literal types are compared leniently (use `number`/`string` branches, not `'yes'`); in zsh `echo ====` aborts.
+
 ## Latest: 2026-09-19 (evening) -- HEAD `9c94144`
 
 **Survey 268/404, nothing regressed; checker.ts 58/58 AND compiles as a whole file (3073 funcs).** Four fixes,
