@@ -3019,6 +3019,9 @@ export class Scope {
 	// augments a same-named global one; a module's top level, and any block, is its own space instead.
 	globalSpace = false;
 
+	// Set by `recordTypes` while a caller wants this scope's own type entries restorable.
+	private recorded?: Map<string, TypeEntry | undefined>;
+
 	// Set on a function body's own scope: whether it is `async` (an async generator's `yield`/`yield*` await and iterate asynchronously), and for
 	// a generator with a declared type what its `yield` must produce and evaluates to.
 	functionKind?: { async: boolean; yield?: Type; next?: Type };
@@ -3123,16 +3126,42 @@ export class Scope {
 		// types are block scoped"). Inherited part FIRST, same order `mergeTypeEntry` uses: `lookupMember`
 		// REVERSES an intersection when merging same-named signatures into one overload set, so this is
 		// what actually gets the augmenting declaration tried first.
-		const inherited = augment && this.globalSpace && !this.types.has(name) ? this.parent?.type(name) : undefined;
-		if (inherited)
-			this.types.set(name, { typeParams: typeParams ?? inherited.typeParams, type: joinTypes([inherited.type, type]) });
+		// Merged into the scope that DECLARES it, not copied here: the augmentation must reach every type declared against it, and
+		// the lib's own `RangeErrorConstructor extends ErrorConstructor` resolves that name in the lib's scope, never in this one.
+		// A harness checking many files against one global undoes it between them (`recordTypes`).
+		const owner = augment && this.globalSpace && !this.types.has(name) ? this.ownerOfType(name) : undefined;
+		if (owner)
+			owner.mergeTypeEntry(name, {type, typeParams});
 		else
 			this.mergeTypeEntry(name, {type, typeParams});
 	}
 
 	private mergeTypeEntry(name: string, te: TypeEntry) {
 		const prev = this.types.get(name);
+		this.noteType(name);
 		this.types.set(name, prev ? { typeParams: prev.typeParams ?? te.typeParams, type: joinTypes([prev.type, te.type]) } : te);
+	}
+
+	private ownerOfType(name: string): Scope | undefined {
+		return this.types.has(name) ? this : this.parent?.ownerOfType(name);
+	}
+
+	// What a SCRIPT augments here, undone: a harness that checks many files against one global scope (the corpus, test-checker)
+	// must not carry one file's global `interface Array<T> { ... }` into the next. Returns the undo.
+	recordTypes(): () => void {
+		const before = this.recorded = new Map<string, TypeEntry | undefined>();
+		return () => {
+			this.recorded = undefined;
+			before.forEach((te, name) => te ? this.types.set(name, te) : this.types.delete(name));
+			// Both caches are keyed by type OBJECT, which the augmentation left untouched: what they hold of it is now wrong.
+			this.resolveCache		= undefined;
+			this.lookupMemberCache	= undefined;
+		};
+	}
+
+	private noteType(name: string) {
+		if (this.recorded && !this.recorded.has(name))
+			this.recorded.set(name, this.types.get(name));
 	}
 
 	lookupScope(parts: string[]): Scope | undefined {

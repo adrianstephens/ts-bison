@@ -222,6 +222,10 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	// TS's getTypeFromBindingPattern: with a default anywhere in the pattern the parameter is what the PATTERN implies, not what it
 	// is defaulted to (`= []` would make it `never[]`); with no default the initializer says more (destructuringWithLiteralInitializers).
 	['a destructuring parameter takes its type from its pattern', 'function g1([x = 0, y = 0] = []) {} const bad1: (a?: [string?]) => void = g1; function g3({ a, b } = { a: 1, b: "x" }) {} const bad3: (o?: { a: string }) => void = g3; g1(); g1([1, 1]);', ["is not assignable to type '(a?: [string?]) => void'", "is not assignable to type '(o?: {"]],
+	// A SCRIPT's `interface` augments the GLOBAL one, so the lib's own `RangeErrorConstructor extends ErrorConstructor` has it too
+	// (errorConstructorSubtypes); the augmentation is undone between cases, as the corpus harness undoes it between files.
+	['a script augments the global interface every declaration sees', 'interface ErrorConstructor { capture(o: object): void } let x: ErrorConstructor; x = RangeError; const s: string = RangeError.capture;', ["is not assignable to type 'string'"]],
+	['a script augmentation does not reach the next file', 'const s: string = RangeError.capture;', ["Property 'capture' does not exist"]],
 	// Rest arguments are inferred from as one tuple: against `[(self) => R<T>[]] | R<T>[]` (core.ts's `Rules`), the array member infers `T`.
 	['a rest parameter of tuple-or-array type infers from its arguments', 'interface R<T> { a?: (x: number) => T } declare function rule<T>(action: (x: number) => T): R<T>; declare function rules<T>(...alts: [(self: () => R<T>[]) => R<T>[]] | R<T>[]): R<T>[]; const q: string = rules(rule(x => ({ p: 1 })), rule(x => ({ p: 2 })));', [NOT_ASSIGNABLE('R<{\n  p: number\n}>[]', 'string')]],
 	// A resolution cut short by the depth limit answers `any` for THAT call; cached, every alias it passed through stayed `any`.
@@ -237,7 +241,10 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	let failures = 0;
 	for (const [name, code, expected, nonStrict] of cases) {
 		global.nullChecks = !nonStrict;
+		// Each case is a SCRIPT: what it augments in the global scope is undone before the next one.
+		const undo		= global.recordTypes();
 		const diags		= await TStypeCheckAsync(parser.parse(code), new ModuleLoader(__dirname, {}), global);
+		undo();
 		const errors	= diags.filter(d => d.severity === SEVERITY.ERROR).map(d => String(d.message));
 		const ok		= errors.length === expected.length && expected.every((e, i) => errors[i].includes(e));
 		if (!ok) {

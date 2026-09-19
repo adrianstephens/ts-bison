@@ -44,6 +44,8 @@ async function testFile(filename: string) {
 			continue;
 
 		tested++;
+		// A SCRIPT's declarations augment the global scope, which is shared across files here: undone after each one.
+		const undo = (await lib).recordTypes();
 		try {
 			const loader	= new ModuleLoader(path.dirname(filename), {});
 			const useParser	= virtual.name.endsWith('.tsx') ? parserX : parser;
@@ -70,6 +72,8 @@ async function testFile(filename: string) {
 			if (bucket === 'clean')
 				falsePositives.push(`${path.relative(TS_REPO, filename)}\tthrew\t${e instanceof Error ? e.message.split('\n')[0] : e}`);
 			console.error(`${filename} (${virtual.name}) failed:`, e);
+		} finally {
+			undo();
 		}
 	}
 }
