@@ -4346,6 +4346,20 @@ async function main() {
 	}
 
 	{
+		// A generic `const` arrow was called as one closure, its parameter laid out as the constraint (checker.ts's `T.isParamProperty`).
+		const { genericConstArrow } = await compile(`
+			interface A { name: string; modifiers?: string[] }
+			interface B { key: number; modifiers?: string[]; extra: string }
+			const isProp = <P extends { modifiers?: string[] }>(p: P): p is P & { modifiers: string[] } => !!p.modifiers?.some(m => m !== 'optional');
+			export function genericConstArrow(): number {
+				const a: A = { name: 'x', modifiers: ['public'] }, b: B = { key: 1, extra: 'y' };
+				return (isProp(a) ? 1 : 0) + (isProp(b) ? 10 : 0);
+			}
+		`);
+		check('a generic const arrow is instantiated per argument, as a generic function is', genericConstArrow(), 1);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`

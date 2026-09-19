@@ -723,10 +723,8 @@ interface AssignTarget { wtype: W.Type; old?: number; write(tee: boolean): numbe
 
 
 
-// A top-level `const name = (...) => ...` (or `= function(...) {...}`) is exactly as callable-by-name as a real
-// `function_decl` -- it can never be reassigned. Promoted the same way a `function_decl` already is, so it is
-// visible to every other top-level function's own `emitCall` lookup (`functionDeclByName`); `promotedConsts`
-// then keeps the `__toplevel` body below from *also* compiling it as a wasted local closure.
+// A top-level `const f = (...) => ...` is never reassigned, so it is a `function_decl` (`functionDeclByName`); `promotedConsts` keeps `__toplevel` from also building it.
+// Not when the const is annotated: its callers see the annotation (optional parameters, overloads), not the arrow.
 function arrowOrFunctionToDecl(name: string, e: JS.Arrow<Type> | JS.FunctionExpr<Type>): FunctionDecl {
 	return {
 		type: 'function_decl', name,
@@ -3731,8 +3729,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// `name` may be a plain (non-namespace) `import { foo }` binding local to `homeModule`: resolve it to the declaring
 				// module and retry there -- the same redirect a namespace-qualified call site's own `nsTarget` makes (`case 'call'`'s
 				// member-callee branch), just reached via a bare identifier instead of `NS.foo(...)`.
-				const imported = namedImportsByModule.get(homeModule)?.get(name);
-				if (imported && functionDeclByName.has(homeKey(imported.module, imported.name)))
+				const imported = importedFunction(name, homeModule);
+				if (imported)
 					return emitCall(imported.name, args, ctx, typeArgs, expected, imported.module);
 				// `C(...)` where `C` names a CLASS: the primitive wrappers are called without `new`, and their constructors are
 				// the conversion (`String`'s is `return s.toString()`). Structural, not a name list -- a constructor that IGNORES
@@ -6223,7 +6221,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					}
 					// A module-level `const X = someFactory(...)` holding a closure (`Rule = makeRule(...)`): found by the
 					// same lookup a plain READ of it uses -- entry, imported and lib modules alike -- then called as a closure.
-					{
+					// A `const f = () => ...` is a function declaration instead, called (and, if generic, instantiated) by `emitCall`.
+					if (!functionDeclByName.has(homeKey(ctx.homeModule, e.callee.name)) && !importedFunction(e.callee.name, ctx.homeModule)) {
 						const lazy = lazyGlobalFor(e.callee.name, ctx);
 						const calleeWtype = lazy?.wrapper.result;
 						if (lazy && calleeWtype && typeof calleeWtype !== 'string' && 'closure' in calleeWtype) {
@@ -6251,6 +6250,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// `obj?.a.method(...)`; `isOptionalChainLink`, not a bare `e.callee.optional`, see `case 'member'`'s own comment):
 				// one guarded operation, `obj` evaluated once and the call only in the non-null arm, restricted to a real user
 				// method (`ensureMethod`), never a `Math`/prelude intrinsic whose result type depends on the call site.
+				// A namespace-import-qualified call (`NS.foo(...)`, `import * as NS from '...'`) of a function the target module declares,
+				// a `const foo = () => ...` included; anything else it declares (a class, a factory-made closure) takes the paths below.
+				// `functionDeclByName`, not `resolveDecl`: it must never fall back to an unrelated same-named `LIB_DECL_MAP` global.
+				if (e.callee.type === 'member' && e.callee.object.type === 'identifier') {
+					const nsDecl	= ctx.scope.namespace(e.callee.object.name)?.decl(e.callee.property);
+					const nsTarget	= nsDecl && stmtHomeModule.get(nsDecl);
+					if (nsTarget !== undefined && functionDeclByName.has(homeKey(nsTarget, e.callee.property)))
+						return emitCall(e.callee.property, e.arguments, ctx, e.typeArgs, undefined, nsTarget);
+				}
+
 				if (e.callee.type === 'member' && !ctx.isNamespaceValue(e.callee)) {
 					if (isOptionalChainLink(e.callee)) {
 						const objExpr		= e.callee.object;
@@ -6333,18 +6342,6 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							return emitCall('__towasm_same_value', e.arguments, ctx);
 						if (intrinsic)
 							return emitObjectEntries(e.arguments, ctx, intrinsic as 'entries' | 'keys' | 'values');
-						// A namespace-import-qualified call (`NS.foo(...)`, `import * as NS from '...'`) into
-						// another module -- checked before `namespaceOwner`, which only knows about real classes/
-						// lib namespaces (`Math`, `Array`), never an actual cross-file import; only takes this
-						// path when the target module really does declare `foo` as a plain function, so an
-						// unsupported cross-module reference (a class, a scalar global, a host-module member like
-						// `path.join`) still falls through to the ordinary paths below and their own clear errors.
-						// `functionDeclByName` directly, not `resolveDecl` -- a namespace-qualified reference must only ever match what the
-						// *target module itself* declares, never spuriously fall back to an unrelated same-named `LIB_DECL_MAP` global.
-						const nsDecl	= ctx.scope.namespace(obj.name)?.decl(e.callee.property);
-						const nsTarget	= nsDecl && stmtHomeModule.get(nsDecl);
-						if (nsTarget !== undefined && functionDeclByName.has(homeKey(nsTarget, e.callee.property)))
-							return emitCall(e.callee.property, e.arguments, ctx, typeArgs, undefined, nsTarget);
 						const owner = namespaceOwner(obj.name, ctx);
 						if (owner)
 							return emitMethodCall(owner, e.callee.property, e.arguments, ctx, typeArgs);
@@ -7278,6 +7275,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				restElementTs.push(el);
 		});
 		return checkerInferTypeArgMap({ params, rest, returnType, typeParams }, argTs, typeArgs, scope, restElementTs, typeof expected === 'function' ? expected() : expected);
+	}
+
+	// A plain `import { foo }` binding in `homeModule` that names a function its declaring module compiles.
+	function importedFunction(name: string, homeModule: string) {
+		const imported = namedImportsByModule.get(homeModule)?.get(name);
+		return imported && functionDeclByName.has(homeKey(imported.module, imported.name)) ? imported : undefined;
 	}
 
 	function ensureFunc(name: string, decl: FunctionDecl, homeModule = '.'): FuncInfo {
@@ -10007,7 +10010,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					// Only `exportScope` stamps `Scope.addDecl` for a var_decl, and only for an EXPORTED one, so a
 					// non-exported module-level `const` (js-parser.ts's `import_attributes`) resolved nowhere; keyed per module.
 					topLevelVars.set(homeKey(moduleId, d.name), { stmt: s, d });
-					if (s.kind === 'const' && (d.init.type === 'arrow' || d.init.type === 'function')) {
+					if (s.kind === 'const' && !d.typeAnnotation && (d.init.type === 'arrow' || d.init.type === 'function')) {
 						functionDeclByName.set(homeKey(moduleId, d.name), arrowOrFunctionToDecl(d.name, d.init));
 						if (moduleId === '.')
 							promotedConsts.add(d.name);
