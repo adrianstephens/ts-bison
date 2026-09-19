@@ -37,83 +37,31 @@ A script's non-interface declarations are still local, so a second script does n
 `assistant/tsc-type-at.ts <file> <line> <text>` prints tsc's own type, and its RESOLVED SIGNATURE for a call.
 Probe traps: literal types compare leniently (probe with `number`/`string`, never `'yes'`); in zsh `echo ====` aborts.
 
-## Earlier: 2026-09-19 (evening) -- HEAD `9c94144`
+## Earlier -- the towasm literal work, `a01d942`..`9c94144` (2026-09-19)
 
-**Survey 268/404, nothing regressed; checker.ts 58/58 AND compiles as a whole file (3073 funcs).** Four fixes,
-`a01d942`..`fd5df24`; root causes are in the commit messages. What to know before editing nearby:
-- **A literal's struct must hold every key it PROVIDES** (spreads included) -- `matchObjectShape` and `spreadOwner`
-  both. `spreadKeys` reads the operand's TYPE (`T.collectMembers` per union member), never a struct's field list.
-- **Who reads a literal decides its struct.** With a context, the context (`matchContextualUnionMember`: a one-shape
-  context decides even `{}`; a member's REQUIRED keys must be supplied). With none (`any` counts as none), the literal's
-  own type -- ambiguity builds the anonymous shape. A spread operand's reader is the spread copy, so it is emitted in
-  its OWN type's context (`emitSpreadOperand`), never the enclosing literal's.
-- **type-core `resolve` never caches a result produced under a depth bail** (`depthBails`). Depth 10 is still shallow:
-  core.ts's `ElemValue` chain costs one level per `extends` arm. The circular bail is still cached (stack-dependent too).
-- **Rest arguments infer as one tuple** (`restArgs: TS.TupleElement[]`, checker and towasm's `inferCallTypeArgs`), so
-  `Rules(...)` (rest type `[fn] | Rules<T>`) infers instead of `Rules<any>`. We union the rest elements where tsc
-  picks their common supertype (`Rules<{p} | {p;r}>` vs `Rules<{p}>`) -- pre-existing for `T[]` rests.
+**Survey 268/404 at `fd5df24`, nothing regressed; checker.ts 58/58 and whole-file (3073 funcs).** The rules that
+came out of it, worth knowing before editing codegen nearby:
+- **A literal's struct holds every key it PROVIDES**, spreads included (`matchObjectShape`, `spreadOwner`);
+  `spreadKeys` reads the operand's TYPE (`T.collectMembers` per union member), never a struct's field list.
+- **Who READS a literal decides its struct.** With a context, the context (`matchContextualUnionMember`: one shape
+  decides even `{}`; a member's required keys must be supplied). With none (`any` is none), the literal's own type --
+  ambiguity builds the anonymous shape. A spread operand's reader is the spread copy, so it is emitted in its OWN
+  type's context (`emitSpreadOperand`). An arrow's INFERRED return yields to the caller's context; `as const` is none.
+- **A type is laid out as a declared class only where every member keeps its layout** (`holdsLayout`); `Partial<X>` is
+  no `X`; spreading an absent value supplies nothing.
+- **`resolve` never caches a result produced under a depth bail** (`depthBails`). Depth 10 is shallow: core.ts's
+  `ElemValue` chain costs one level per `extends` arm. The circular bail is still cached (stack-dependent too).
 
-**Next rows** (survey): object literal needs a known target (52: backend.ts 51, peg 1), ts-parser's
-`cannot convert {key:string} to Rest<any>` (24, below), `Array.from` on the constructor type (11), js-parser
-`Array<any>` -> `{...}` (11), backend's `Type` vs `W.Type` (7+).
+**Survey rows left** (at `fd5df24`): object literal needs a known target (52: backend.ts 51, peg 1), ts-parser's
+`cannot convert {key:string} to Rest<any>` (24), `Array.from` on the constructor type (11), js-parser
+`Array<any>` -> `{...}` (11), backend's `Type` vs `W.Type` (7+). **Re-run the survey: it predates all checker work
+since `fd5df24`.**
 
-**Layout agreement is COMMITTED (`af96da0`..`9c94144`), and option 1 has hit its limit at ts-parser.ts:469.** The user
-chose "option 1" (keep types more precise than tsc; the rest-element union is marked OPTIMISATION in type-core, droppable
-once option 2 exists) over "option 2" (width-subtyping flows become open shapes). `holdsLayout` refuses a declared class
-whose field layout differs; an arrow's INFERRED return yields to the caller's context (`inferredReturn` stamp); `as const`
-is no context; `Partial<X>` is no `X`. Line 469 (`{ type: 'function', ...$[0] } as const` in a `Type` context) is now
-correctly a `FunctionType`, but `$[0].rest` is an anonymous `{key}` struct (line 329's context-less `{ key: $[2] }`) and
-`FunctionType.rest` a `Rest`: a real width-subtyping flow, which only option 2 handles -- `noteSlot` sees neither spreads
-nor a literal in a UNION slot. Before `9c94144` it got further only by building an anonymous shape no reader tests for.
-
-**Known, unfixed:** the checker types `{ ...classInstance, y }` as `any` (the literal then has no target);
-`T.collectMembers` lists a getter as a property key. An `i32` boxed into `any` vs a `number` reader (f64 box) traps
-through an OPEN `Iterable<number>`. `x as T` is not a flow for open shapes (user undecided).
-
-**The survey compiles a SNAPSHOT of its source** (user's call, 2026-09-19): `assistant/selfhost-snapshot.sh [tison-rev]`
-extracts committed `src/` of tison, binary-libs and binary into `assistant/selfhost-snapshot/` (revs in `SNAPSHOT.json`,
-printed in the survey header); the survey refuses to run without one, `--live` surveys the working tree. Refresh it
-deliberately and read that run's delta as the source's (the header flags a changed source). Line numbers in survey
-output are the SNAPSHOT's -- at `374a86e` ts-parser.ts's failure is 467, the live tree's 469.
-
-**Instruments:** `assistant/survey-sequence.ts <logical path> <decl>...` reproduces the survey exactly (`NOWHOLE=1`; reads
-the snapshot, `LIVE=1` the working tree);
-`assistant/tsc-type-at.ts <file> <line> <exprText>` asks REAL tsc for a type (TS API) -- compare before calling
-something a checker bug. `test-checker.ts` reads `dist/` like test-towasm: rebuild on both sides of an A/B.
-
-## As of 2026-09-18 -- HEAD `148f0b4`
-
-**The files:** `TS/backend.ts` (~9,750) and `CPP/backend.ts` (379) over the neutral `wasm-codegen.ts`
-(~1,046); `TS/type-utils.ts` ~3,950. The module is imported as `W` since the user's `b3a0b01` rename.
-
-**2026-09-18 session:** 18 fixes from the self-hosting survey, `5a0a944`..`148f0b4`; each commit message
-has its root cause. The general mechanisms, worth knowing before editing nearby:
-- **A caller's type carries the caller's scope.** `T.Inference.add`/`inferReturn` stamp every candidate, and
-  `inferTypeArgMap` stamps explicit type arguments. A caller type substituted into a callee alias and resolved in
-  the callee's module scope went opaque, and `resolve`'s per-scope cache then kept the stale answer.
-- **Call arguments are typed in order** against what the earlier arguments inferred (TS's non-fixing mapper).
-- **Generic instances use NARROWED argument types** (`ctx.narrowedTypeOf`), as the checker infers. Since a call
-  result then need not match the un-narrowed view, `FunctionContext.physicalScope` types a call/`new` in the
-  narrowed scope; variables keep their slot's type.
-- **One struct per object type per compile**: `matchObjectShapeByType` memoizes under the typeKey, and a shape
-  built by `ensureAnonObjectShape` is `anonymous`, never a match candidate for another type.
-- `precise` in `isAssignable` is TS's subtype relation: `any` is below nothing but itself.
-- The lib declares `ReadonlyArray`. A mapped type's key is a binder in `substituteType` (`renameMappedKey`).
-- Callback parameters are checked BIVARIANTLY (`62ec84a`); the old "parameters deliberately unchecked" leniency is gone.
-
-**`npm run gate` is PARSER-ONLY** -- it cannot see a checker change. The checker gate is
-`bash tison/assistant/corpus-ab.sh <base-sha>` (~7 min): at `62ec84a` vs `17e1da7` it read false positives
-1209 -> 1204. Its "tsc-clean" label is from missing `.errors.txt` baselines, and some are stale: verify a new
-ERROR with the real tsc (`node_modules/.bin/tsc --noEmit --target es2020 <file>`, 6.0.3) before calling it a
-false positive -- seven of this session's were true positives.
-
-**Gates, at every commit through `148f0b4`:** build clean · test-towasm · test-checker · test-cpp-backend ·
-difftest **2191/2200 · 0 disagree · 9 unsupported** · corpus gate (parser) **838 / 11,012, baseline 838**.
-
-**Gate note:** difftest does NOT cover a change to *which* code reaches codegen — it only compares output
-for cases that already compile. `npm run gate` (the 11,012-file corpus) is the one that does. Run both for
-any guard or eligibility change. difftest's corpus is 2200 only with the nine assignment-order cases in
-`assistant/difftest.ts`, which is GITIGNORED — a fresh tree reports 2182/2191.
+**Option 1 (precision) hit its limit at ts-parser.ts:469** -- `{ ...$[2], typeParams }` is correctly a `FunctionType`,
+but `$[2].rest` is an anonymous `{key}` struct where `FunctionType.rest` is a `Rest`: a real width-subtyping flow,
+which only option 2 (open shapes) handles. That is what the open-shape plan above is for. The user's call: keep types
+MORE precise than tsc where it buys codegen (the rest-element union is marked OPTIMISATION in type-core, droppable
+once option 2 exists), and accept less optimal code where the source is too vague for tsc to be precise either.
 
 ## Architecture — SETTLED, do not re-propose
 
