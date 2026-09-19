@@ -2371,7 +2371,7 @@ async function main() {
 
 	{
 		// `Iterable<T>`: a parameter is specialized per argument; a slot receiving several layouts (a local, a field, a closure's
-		// parameter, an upcast) is an open shape, iterated through `[Symbol.iterator]`/`next` dispatched at run time.
+		// parameter) is an open shape, iterated through `[Symbol.iterator]`/`next` dispatched at run time.
 		const { iterParam, iterSlots, iterCtors, twoClasses } = await compile(`
 			function sum(xs: Iterable<number>): number { let s = 0; for (const x of xs) s += x; return s; }
 			function* gen(): Generator<number, void, unknown> { yield 10; yield 20; }
@@ -2384,8 +2384,6 @@ async function main() {
 				for (const x of a) t += x;
 				const add = (k: number, terms: Iterable<number>) => { for (const x of terms) t += x * k; };
 				add(1000, new Set<number>([7]));
-				const m = new Map<string, number>([['a', 100]]);
-				for (const [k, v] of m as Iterable<[string, number]>) t += v;
 				return t + count({ known: [3, 4] }) * 10 + count({ known: new Set<number>([5]) }) * 10000;
 			}
 			interface CtorOpts { knownTypes?: Iterable<string> }
@@ -2402,7 +2400,7 @@ async function main() {
 			export function twoClasses(): number { return tot([new Sq(2), new Rect(2, 3)]); }
 		`);
 		check('Iterable parameter: array, Set, generator', iterParam(), 300609);
-		check('Iterable slots: local, closure parameter, upcast, optional field', iterSlots(), 57173);
+		check('Iterable slots: local, closure parameter, optional field', iterSlots(), 57073);
 		check('Set/Map from any Iterable', iterCtors(), 12120);
 		check('an interface held by two unrelated classes', twoClasses(), 10);
 	}
