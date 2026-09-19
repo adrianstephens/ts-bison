@@ -3076,6 +3076,7 @@ export class Scope {
 	addSource(name: string, e: Expr)				{ (this.sources ??= new Map()).set(name, e); }
 	addNamespace(name: string, s: Scope)			{ (this.namespaces ??= new Map()).set(name, s); }
 	ownNamespace(name: string): Scope | undefined	{ return this.namespaces?.get(name); }
+	ownValue(name: string): Type | undefined		{ return this.values.get(name); }
 	addDecl(name: string, stmt: TS.Stmt)			{ (this.decls ??= new Map()).set(name, stmt); }
 
 	mergeType(name: string, type: Type, typeParams: TS.TypeParam[] | undefined, augment = false) {

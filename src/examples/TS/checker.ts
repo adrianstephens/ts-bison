@@ -1282,10 +1282,16 @@ function hoist(stmts: Stmt[], scope: Scope) {
 				const { scope: block, inner, alias } = exportScope(stmt.body, prior ?? scope, undefined, prior && namespaceInner.get(prior));
 				if (prior)
 					prior.copyAll(block);
-				else
-					namespaceInner.set(block, inner);
 				const ns	= prior ?? block;
-				const value = alias ?? ns.toObject();
+				// A namespace merged onto an enum's has an inner scope of its own; every later block merges into it.
+				if (!namespaceInner.has(ns))
+					namespaceInner.set(ns, inner);
+				// Merged onto a function or class, the namespace is both: its value keeps that one's call/construct signatures.
+				if (!prior)
+					namespaceBase.set(ns, scope.ownValue(stmt.name));
+				const members	= alias ?? ns.toObject();
+				const base		= namespaceBase.get(ns);
+				const value		= base ? TS.IntersectionType([base, members]) : members;
 				// A type-only namespace (empty value type) merged onto a same-named const/class here would clobber that name's real value with a
 				// sealed empty object before the sequential 'var_decl' walk assigns it, breaking an earlier-declared class's eager forward reference.
 				if (!(value.type === 'object' && value.members.length === 0))
@@ -1319,7 +1325,8 @@ function hoist(stmts: Stmt[], scope: Scope) {
 		const chosen	= sigs.length ? sigs : decls;
 		if (chosen.length > 1) {
 			// `declScope`/`stampSig`: each overload's own param/return types resolve in *this* module's scope, not whichever module calls it.
-			scope.addValue(name, TS.ObjectType(chosen.map(d => TS.TypeCall(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope)))));
+			// Merged, not overwritten: a same-named namespace hoisted earlier in this body is part of the value (`function f` + `namespace f`).
+			scope.mergeValue(name, TS.ObjectType(chosen.map(d => TS.TypeCall(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope)))));
 			// The real, compilable implementation (the one non-bodyless declaration a real overload group
 			// always has) -- there's no single decl a bodyless *signature* alone could resolve to.
 			const impl = decls.find(d => d.body);
@@ -1337,7 +1344,7 @@ function hoist(stmts: Stmt[], scope: Scope) {
 			const t = TS.FunctionType(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope));
 			if (!d.returnType && d.body)
 				lazyReturnType(t, d, scope, () => checkFunctionBody(t, d.body, ownThis(flowContainer(scope)), hasMod(d, 'async'), hasMod(d, 'generator'), hasMod(d, 'generator')));
-			scope.addValue(name, t);
+			scope.mergeValue(name, t);
 			scope.addDecl(name, d);
 		}
 	}
@@ -1357,10 +1364,12 @@ function hoistVar(scope: Scope, d: JS.Var<Type>, widen: boolean, typeAnnotation 
 		// throughout). Scoped to just this one call site, not `resolve` globally -- unwrapping still has
 		// to happen everywhere else (e.g. so an `i32` and a `number` branch of a ternary still unify).
 		const stopAtPseudoType = typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs && T.WASM_PSEUDO_TYPES.has(typeAnnotation.name);
-		// A bare (no-typeArgs) ref's own `declScope` wins over the ambient `scope` here -- this bakes the result in once rather than
-		// re-resolving lazily, so it must resolve in the declaring module now, before a generic ref's own type args get lost.
-		scope.addValue(d.name, typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs && typeAnnotation.declScope
-			? T.resolve(typeAnnotation.declScope as Scope, typeAnnotation, undefined, stopAtPseudoType)
+		// A bare (no-typeArgs) ref stays that ref for an annotation-only declaration, stamped with where it was written: resolving it
+		// now baked in the interface as declared SO FAR, before a later block merged into it (lib.es2020.intl's `PluralRulesConstructor`).
+		// Otherwise its own `declScope` wins over the ambient `scope`, resolved now, before a generic ref's own type args get lost.
+		const bareRef = typeAnnotation?.type === 'ref' && !typeAnnotation.typeArgs;
+		scope.addValue(d.name, bareRef && !d.init && !stopAtPseudoType ? T.stampScope(typeAnnotation, scope)
+			: bareRef && typeAnnotation.declScope ? T.resolve(typeAnnotation.declScope as Scope, typeAnnotation, undefined, stopAtPseudoType)
 			: typeAnnotation ? T.resolve(scope, typeAnnotation, undefined, stopAtPseudoType)
 			: isEmptyArrayLiteral(d.init) ? AUTO_ARRAY
 			: d.init ? T.widenNullish(typeOf(d.init, scope, widen, undefined, undefined, err), scope) : T.ANY);
@@ -1508,6 +1517,7 @@ export function bindModuleNames(filename: string | undefined, scope: Scope) {
 
 // A namespace's export view -> the scope its blocks hoist into, so a later same-named block merges into the first.
 const namespaceInner = new WeakMap<Scope, Scope>();
+const namespaceBase = new WeakMap<Scope, Type | undefined>();
 
 export function exportScope(body: Stmt[], parent: Scope, filename?: string, into?: Scope): { scope: Scope; inner: Scope; alias?: Type } {
 	// `hoist` + `hoistVars` (not full `checkBlock`): only top-level declaration *types* are needed, not a full check of a body checked separately.
@@ -2902,7 +2912,11 @@ export function checkHoisted(stmts: Stmt[], scope: Scope) {
 
 export function checkBlock(stmts: Stmt[], scope: Scope, typeOf = typeOf1(), checkStmt: checkStmt = checkStmt1()) {
 	hoist(stmts, scope);
+	checkStatements(stmts, scope, typeOf, checkStmt);
+}
 
+// The sequential walk of statements already hoisted into `scope`.
+function checkStatements(stmts: Stmt[], scope: Scope, typeOf: typeOf, checkStmt: checkStmt) {
 	for (const s of stmts) {
 		checkStmt(s, scope, typeOf, checkStmt);
 
@@ -3109,8 +3123,10 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 			}
 			break;
 
+		// In the namespace's MERGED scope, where every same-named block hoisted: re-hoisting one block into a fresh scope shadowed
+		// the merged declarations with its own (`Intl.Locale` lost the members lib.esnext.intl adds to lib.es2020.intl's).
 		case 'namespace_decl':
-			checkBlock(stmt.body, new Scope(scope), typeOf, checkStmt);
+			checkStatements(stmt.body, new Scope(namespaceInner.get(scope.namespace(stmt.name)!)!), typeOf, checkStmt);
 			break;
 
 		// type_alias_decl / interface_decl / enum_decl / import / export /

@@ -59,7 +59,7 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a missing required property errs',	'const z: { a: string | undefined } = {};',												["Type '{}' is not assignable to type '{"]],
 
 	// generic inference: candidates by polarity, TS's common supertype, parameters fixed as callbacks are typed
-	['common supertype of candidates',	'function f<T>(y: T, x: T): T { return y; } interface A { a: number } interface B extends A { b: number } declare const a: A, b: B; const r: string = f(b, a);', ["a: number\n}' is not assignable to type 'string'"]],
+	['common supertype of candidates',	'function f<T>(y: T, x: T): T { return y; } interface A { a: number } interface B extends A { b: number } declare const a: A, b: B; const r: string = f(b, a);', [NOT_ASSIGNABLE('A', 'string')]],
 	['literal candidates union',		'enum E { A, B, C } interface I<T extends E> { type: T } declare function foo<T extends E>(x: I<T>): T; declare const x: I<E.A | E.B> | I<E.C>; const r: string = foo(x);', ["is not assignable to type 'string'"]],
 	['contravariant candidates',		'declare function f1<T>(a: (x: T) => void, b: (x: T) => void): T; declare function fo(x: Object): void; declare function fs(x: string): void; const r: number = f1(fo, fs);', [NOT_ASSIGNABLE('string', 'number')]],
 	['instantiation expression rest',	'declare function g<T>(...args: ((x: T) => void)[]): T; const h = g<number>; h(x => { const s: string = x; });', [NOT_ASSIGNABLE('number', 'string')]],
@@ -210,6 +210,11 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['an overload is chosen by its rest arguments too', 'declare const fa: number[]; const r: string = fa.concat(0);', [NOT_ASSIGNABLE('number[]', 'string')]],
 	// `oneStepIndexed` stepped into tuples and arrays but not a named property, so `T[K] extends any[]` took the false branch (TS's genericRestParameters1).
 	['a rest type conditional over an indexed access decides', "type Rec = { move: [number, 'left' | 'right']; stop: string; done: [] }; type Ev<T> = { emit<K extends keyof T = keyof T>(e: K, ...payload: T[K] extends any[] ? T[K] : [T[K]]): void }; declare var events: Ev<Rec>; events.emit('move', 10, 'left'); events.emit('done');", []],
+	// Every block of a namespace is checked in the MERGED scope: re-hoisting a block into a fresh one hid what a later block adds.
+	['a namespace block sees what later blocks merge in', 'declare namespace N { interface I { a: number } const make: { new(): I } } declare namespace N { interface I { b: string } } const x = new N.make(); const s: string = x.b; const n: string = x.a;', [NOT_ASSIGNABLE('number', 'string')]],
+	['a namespace merged onto a function keeps its call', 'function f(): number { return 1; } namespace f { export const hello: number = 1; } const r: number = f(); const s: string = f.hello;', [NOT_ASSIGNABLE('number', 'string')]],
+	// An annotation-only declaration keeps its ref, so an interface augmented after it is read whole (lib.es2020.intl's constructors).
+	['a declaration typed by an interface sees its later augmentation', 'declare namespace N { interface C { new(a: string): number } const K: C } declare namespace N { interface C { new(a: number): string } } const r: boolean = new N.K(1);', [NOT_ASSIGNABLE('string', 'boolean')]],
 	// Rest arguments are inferred from as one tuple: against `[(self) => R<T>[]] | R<T>[]` (core.ts's `Rules`), the array member infers `T`.
 	['a rest parameter of tuple-or-array type infers from its arguments', 'interface R<T> { a?: (x: number) => T } declare function rule<T>(action: (x: number) => T): R<T>; declare function rules<T>(...alts: [(self: () => R<T>[]) => R<T>[]] | R<T>[]): R<T>[]; const q: string = rules(rule(x => ({ p: 1 })), rule(x => ({ p: 2 })));', [NOT_ASSIGNABLE('R<{\n  p: number\n}>[]', 'string')]],
 	// A resolution cut short by the depth limit answers `any` for THAT call; cached, every alias it passed through stayed `any`.
