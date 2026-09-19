@@ -11,40 +11,35 @@ metadata:
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## Latest: 2026-09-19 -- HEAD `b354a81`
+## Latest: 2026-09-19 (later) -- HEAD `e29174a`
 
-**`a4966cc` (Iterable) regressed the survey to 144/402; `b354a81` fixed it: 208/402 compile**, none regressed against
-`a4966cc` (each commit message has the root cause). The open-shape pass (`collectOpenShapes`) now walks `new`
-(`instantiateConstruct`), looks through `a = b` and `c ? a : b` (branches in their `narrow`ed scope), types values in the
-slot's context, and keys a shape by its STRUCT (`openKey` over `layoutArgs`/`layoutKey`). `x as T` is NOT a flow (an `as`
-never changes representation), so `for (... of m as Iterable<...>)` is unsupported; proper fix is to dispatch on
-`unwrapAs`'s type, which changes every `as` receiver -- the user has not decided.
+**Survey 267/403 compile (was 208 at `b354a81`), nothing regressed; checker.ts 57/58, type-core 124/124,
+type-utils 21/21, printer 18/18.** Five fixes, `8f7d8cc`..`e29174a`, each with a test that fails without it;
+root causes are in the commit messages. What to know before editing nearby:
+- **An unannotated top-level `const f = () => ...` IS a function decl** (`functionDeclByName`): bare and `NS.f()`
+  calls reach `emitCall`, so a generic one instantiates per argument. An ANNOTATED const stays a closure (its
+  callers see the annotation). `0b6f60e`'s lazy-closure call path had silently swallowed all of them.
+- **Open shapes:** `noteSlot`/`noteTypes` strip nullish BEFORE resolving (`resolvedShape`, which also merges an
+  `extends` intersection), look through `??`/`||`/`&&`, and note a call's uncontextual type too. `openKey`
+  follows aliases (`expandRefOnce`) and keys by the bare struct name. `typeOf` has ONE open check, before any
+  struct resolution. An array literal opens a slot only where assignable (every overload is noted).
+- **Fixing `openKey` made long-noted flows real**: `Var` is open (a `{name}` literal through a rest param).
+  `ensureAnyField` now reads `undefined` when no struct declares the field (the write guard stays).
+- `ctx.contextualReturn` is never cleared without restore (the bare-call path used to); `spreadKeys` flattens
+  intersections. A spread of an open shape reads each key at run time (`FieldSource.dynamic`).
+- `genericKey` = `layoutKey`: `i32` is not `number` for an instance key.
 
-**checker.ts is 0/58, and was already at `ecc5f6c`** (the 58/58 below predates `f934254`, which added the `Set`/`Map` copy
-constructors: its probes then failed on "no overload of `Set<string>`'s constructor"). Now they fail later: `Param` ->
-`{modifiers?: string[]}` through `T.isParamProperty`, a generic `const` arrow -- one physical closure, its parameter laid out
-as the constraint struct. That is the next row to work (44 declarations).
+**Next rows** (survey): object literal needs a known target (77; checker's last is `inferReturn`), `Array.from`
+on the constructor type (11), js-parser `Array<any>` -> `{...}` (11), backend's `Type` vs `W.Type` (7+).
+**Known, unfixed:** an `i32` boxed into `any` uses the i32 box but a `number` reader casts to the f64 box, so an
+`i32[]` through an OPEN `Iterable<number>` traps at run time; `x as T` is not a flow for open shapes (user
+undecided on dispatching by `unwrapAs`'s type). Pre-existing: a `Map` literal whose object values omit an
+optional field traps "illegal cast".
 
-**Instruments:** `assistant/survey-sequence.ts <file> <decl>...` reproduces the survey EXACTLY (fresh parse + check per
-probe, one shared lib scope, the survey's un-exporting; `NOWHOLE=1` skips the whole-file compile). Trust it over
-`probe-one-decl.ts`, which parses once and reported checker.ts declarations as compiling when the survey said otherwise.
-Pre-existing, not a regression: a `Map` literal whose object values omit an optional field traps "illegal cast".
-
-**`Iterable` design (`a4966cc`):** lib declares `Iterator`/`Iterable`/`IterableIterator`; `Array`/`ReadonlyArray` have a real
-`[Symbol.iterator]`; a `for...of` over a known array stays positional. Open shapes are THE mechanism for interface-typed values:
-a named function's structural parameter specializes per argument; any other slot (closure/method/constructor parameter, literal
-contents) that receives another layout is stored as `any`. `ownerFor` answers none for an open shape; `dispatchesAsAny` sends a
-receiver typed or stored as `any` to `ensureAnyDispatch`. `Set`/`Map` take `Iterable | null | undefined` after their fast paths.
-`Iterator.next` is `next(v?: N)`, not TS's rest-tuple form.
-
-Earlier the same day (`0009613`..`0cabd72`): object-literal METHODS are closures in their fields; METHOD VALUES are
-closures over one `envThis` (option A, user's choice; `.apply`/`.bind` not done); `fieldDeclaredType` is what a field
-ACCEPTS; uncontextual `[]` is `never[]`, `AUTO_ARRAY` for untyped `let x = []`; `objectShapeOf` is the one type-to-struct
-resolution; a GENERIC CLASS instance is re-checked as generic functions are (`0cabd72`, not a hack -- same mechanism).
-
-**Committing beside the user's WIP**: they edit backend.ts/wasm-codegen.ts/lib.d.ts concurrently. Stage only your hunks
-(`git diff > p; filter hunks; git apply --cached --recount`). **Trap:** `cd src/examples/TS/lib && tsc -p .` EMITS `.js`
-beside every lib source; use `--noEmit` (tsc lives in the WORKSPACE root's `node_modules/.bin`).
+**Instruments:** `assistant/survey-sequence.ts <file> <decl>...` reproduces the survey exactly (`NOWHOLE=1`);
+trust it over `probe-one-decl.ts`. **Trap:** a walker callback's parameter is named `process`, shadowing
+Node's -- debug with `globalThis.process.env`. `Iterable` design and committing-beside-WIP notes: see git
+`ab4745f`'s version of this file.
 
 ## As of 2026-09-18 -- HEAD `148f0b4`
 
@@ -187,7 +182,7 @@ While relocating code, run only the fast set: `npx tsc -b src/examples`, `test-t
 ## Tree state
 
 **Never trust this line — the user edits and commits concurrently; re-check `git status`.** At the time of
-writing: HEAD `b354a81`, clean tree.
+writing: HEAD `e29174a`, clean tree.
 
 ## Keeping this current
 
