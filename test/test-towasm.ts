@@ -2326,6 +2326,16 @@ async function main() {
 	}
 
 	{
+		// `o ?? ''` keeps the alias `Ops`; a union whose members all have one owner (`String`) has that owner.
+		const { aliasConcat } = await compile(`
+			type Ops = '+' | '-' | '**';
+			const assignOp = (o?: Ops) => (o ?? '') + '=';
+			export function aliasConcat(): number { return assignOp('**').length * 10 + assignOp().length; }
+		`);
+		check('a union of one owner concatenates as a string', aliasConcat(), 31);
+	}
+
+	{
 		// `this[i] === x` (or any `===` between two boxed-`any` array elements) used to fail wasm
 		// validation outright: a generic `T[]`'s element always physically reads back as boxed `anyref`
 		// (see the comments near `case 'array'`/`case 'index'`), but `ref.eq` requires `eqref`-typed

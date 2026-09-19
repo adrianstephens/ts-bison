@@ -2737,7 +2737,11 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			case 'union': {
 				// A union of tuples (js-parser.ts `CallSigParams<T>`, a rest's type) is one `arr:ref` whichever member it is.
 				const members = T.unionMembers(w, global).map(m => T.resolve(global, m));
-				return members.every(m => m.type === 'tuple') ? tupleArrayOwner(members as TupleT[]) : undefined;
+				if (members.every(m => m.type === 'tuple'))
+					return tupleArrayOwner(members as TupleT[]);
+				// Members all owned alike (`assignableOps | ''`, string literals behind an alias beside another): that owner.
+				const owners = new Set(members.map(ownerFor));
+				return owners.size === 1 ? [...owners][0] : undefined;
 			}
 			case 'array':
 				// `T[]`/`Array<T>`/`ReadonlyArray<T>` all resolve to `Array`'s own methods -- `ReadonlyArray` has no
