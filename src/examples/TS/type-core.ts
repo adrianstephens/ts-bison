@@ -879,7 +879,8 @@ function oneStepIndexed(t: Type, scope: Scope): Type {
 		return (obj.elements[idx.value] && tupleElementType(obj.elements[idx.value])) || t;
 	if (obj.type === 'array' && isNumberLike(idx, scope))
 		return obj.element;
-	return t;
+	// A named property: `Record1['move']` is its declared `[number, 'left' | 'right']`.
+	return idx.type === 'literal' && typeof idx.value === 'string' ? lookupMember(obj, idx.value, scope) ?? t : t;
 }
 
 // A homomorphic mapped type's own `readonly`/`-readonly`/`optional`/`-optional` tags override the source member's matching
@@ -1869,10 +1870,13 @@ export function argsFit(sig: TS.CallSig, argTs: (Type | undefined)[], scope: Sco
 		return false;
 	// `sig.declScope`: each param's own declared type resolves names in its *declaring* module's scope, not the caller's (see `isAssignable`'s `dstScope`).
 	const dstScope = declScopeOf(sig, scope);
+	// The arguments past the fixed parameters fill the rest as one tuple, as the call's own check reads them: `concat(0)` fits
+	// `(...items: (T | ConcatArray<T>)[])`, not the `ConcatArray<T>[]` overload before it. A spread's elements are not known here.
+	const rest = argTs.slice(sig.params.length).filter((t): t is Type => !!t);
 	return argTs.every((t, i) => {
 		const p = sig.params[i];
 		return !t || !p?.typeAnnotation || isAssignable(t, hasMod(p, 'optional') ? TS.UnionType([p.typeAnnotation, UNDEFINED]) : p.typeAnnotation, scope, dstScope);
-	});
+	}) && (hasSpread || !sig.rest?.typeAnnotation || !rest.length || isAssignable({ type: 'tuple', elements: rest }, sig.rest.typeAnnotation, scope, dstScope));
 }
 
 // The signatures of `kind` a value of type `t` is invoked through: a function/constructor type, or an object's (and an
@@ -2150,7 +2154,7 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			const el = arrayLikeElement(dst);
 			// A readonly tuple fits only a ReadonlyArray, as a readonly array does.
 			if (el)
-				return !(src.readonly && isRef(dst, 'Array')) && src.elements.every(e => { const t = tupleElementType(e); return !t || recurse(t, el, depth - 1); });
+				return !(src.readonly && isRef(dst, 'Array')) && elementTypes(src, scope).every(t => recurse(t, el, depth - 1));
 		}
 		if (dst.type === 'tuple') {
 			// an inferred array literal has lost its element positions: compare loosely, either direction

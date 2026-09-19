@@ -2253,13 +2253,15 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						if (a.type !== 'spread')
 							return preArgTs[i];
 						const t		= T.resolveOwn(arg(a.operand), scope);
-						spreads[i]	= t.type === 'array' ? [{ type: 'spread', argument: t }] : t.type === 'tuple' ? t.elements : [];
+						if (t.type === 'array' || t.type === 'tuple')
+							spreads[i] = t.type === 'array' ? [{ type: 'spread', argument: t }] : t.elements;
 						return undefined;
 					});
-					// A spread and the plain arguments past `sig.params.length` fill the rest parameter, in order.
-					const restArgs = e.arguments.flatMap((a, i) => a.type === 'spread' ? spreads[i] : i >= sig!.params.length && argTs[i] ? [argTs[i]] : []);
+					// A spread and the plain arguments past `sig.params.length` fill the rest parameter, in order. `restKnown`: every spread's elements are.
+					const restArgs	= e.arguments.flatMap((a, i) => a.type === 'spread' ? spreads[i] ?? [] : i >= sig!.params.length && argTs[i] ? [argTs[i]] : []);
+					const restKnown	= e.arguments.every((a, i) => a.type !== 'spread' || !!spreads[i]);
 
-					return { ...instantiate(sig, argTs, typeArgs, scope, pos, restArgs, expected, trial ? undefined : err, inference), declScope, argTs };
+					return { ...instantiate(sig, argTs, typeArgs, scope, pos, restArgs, expected, trial ? undefined : err, inference), declScope, argTs, restArgs, restKnown };
 				};
 
 				// Overload resolution, TS's two passes. Every candidate is first tried with its context-sensitive callbacks untyped (which
@@ -2285,11 +2287,12 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					err(SEVERITY.WARNING, pos)`No overload of '${show().expression(e.callee)}' matches this call; arguments left unchecked`;
 
 				if (sig) {
-					const { declScope, argTs, params, returnType } = settle(sig, false);
-					
+					const { declScope, argTs, params, rest, returnType, restArgs, restKnown } = settle(sig, false);
+					const firstSpread = e.arguments.findIndex(a => a.type === 'spread');
+
 					// TBD: check if callee if pure
 
-					if (err && !argTs.some(t => t === undefined)) {	// no spread args
+					if (err && firstSpread < 0) {
 						// TS's minimum argument count runs through the last required parameter -- and in an immediately-invoked function
 						// expression, an unannotated parameter no argument reaches is optional.
 						const iife		= e.type === 'call' && (e.callee.type === 'function' || e.callee.type === 'arrow') ? e.callee : undefined;
@@ -2297,6 +2300,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						const max		= sig.rest ? Infinity : params.length;
 						if (argTs.length < required || argTs.length > max)
 							err(SEVERITY.ERROR, pos)`Expected ${required === max ? required : required + '-' + (max === Infinity ? 'more' : max)} arguments, but got ${argTs.length} in '${show().expression(e)}'`;
+					}
+					// Checkable while no spread lands on a fixed parameter: the rest parameter then takes every argument past them as ONE
+					// tuple, a spread of unknown length as a spread element (`[A, ...X[]]`), which is how TS checks it.
+					if (err && (firstSpread < 0 || firstSpread >= params.length)) {
 						argTs.forEach((t, i) => {
 							const p = params[i];
 							if (t && p && p.typeAnnotation) {
@@ -2307,6 +2314,9 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 									checkExcessProps(e.arguments[i], p.typeAnnotation, pos, declScope, err);
 							}
 						});
+						const restT: Type = { type: 'tuple', elements: restArgs };
+						if (rest?.typeAnnotation && restArgs.length && restKnown && !checkAssignable(restT, rest.typeAnnotation, scope, pos, declScope, err))
+							err(SEVERITY.ERROR, pos)`Arguments of type '${show().type(restT)}' are not assignable to rest parameter '...${show().bindingTarget(rest.key)}: ${show().type(rest.typeAnnotation)}' in '${show().expression(e)}'`;
 					}
 
 					if (e.callee.type === 'member' && e.callee.object.type === 'identifier' && e.callee.object.name === 'Math')
