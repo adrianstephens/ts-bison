@@ -1341,7 +1341,21 @@ function ownsLayout(t: Type, scope: Scope): boolean {
 
 // The tag is read UNRESOLVED on purpose: `T.resolve` collapses every `TypedArray` tag alike to plain `number`.
 function layoutArgKey(t: Type, scope: Scope): string {
-	return t.type === 'ref' && !t.typeArgs && T.WASM_PSEUDO_TYPES.has(t.name) ? t.name : T.typeKey(T.resolve(scope, t));
+	return t.type === 'ref' && !t.typeArgs && T.WASM_PSEUDO_TYPES.has(t.name) ? t.name : T.typeKey(resolveParts(t, scope));
+}
+// `t` resolved, and so are the parts of the tuples, arrays and unions it is built from: one type spelled two ways
+// (`[string, TS.TypeParam]`, `[string, TypeParam<Type>]`) keyed two instantiations of one class, which could not convert.
+function resolveParts(t: Type, scope: Scope, depth = 3): Type {
+	const r = T.resolve(scope, t);
+	if (depth === 0)
+		return r;
+	const part = (x: Type) => resolveParts(x, scope, depth - 1);
+	const elem = (e: TS.TupleElement): TS.TupleElement => e.type === 'optional' || e.type === 'labeled' ? { ...e, element: part(e.element) }
+		: e.type === 'spread' ? { ...e, argument: part(e.argument) } : part(e);
+	return	r.type === 'tuple'	? { ...r, elements: r.elements.map(elem) }
+		:	r.type === 'array'	? TS.ArrayType(part(r.element), r.readonly)
+		:	r.type === 'union'	? TS.UnionType(r.types.map(part))
+		:	r;
 }
 
 // Would these two types occupy the same wasm slot? Answered WITHOUT building a shape -- this runs before codegen -- by the same collapse `ensureClass`
