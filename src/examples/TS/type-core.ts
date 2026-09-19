@@ -2124,6 +2124,22 @@ function splitDiscriminants(src: TS.ObjectType | Extract<Type, { type: 'tuple' }
 // always, but differs for a `dst` from another module's signature. Every recursive call passes each value's own origin scope.
 // `precise`: TS's subtype relation, for inference's common supertype and a guard's narrowing: none of the C1 leniency (a widened
 // source into a literal target, so `string` is not below `"def"`), and `any` is below nothing but itself (`any[]` is not below `string[]`).
+// A generic signature at the type arguments the target's parameters imply, the rest at their constraints (`unknown` where none).
+function instantiateInContextOf(src: TS.CallSig, typeParams: TS.TypeParam[], dst: TS.CallSig, scope: Scope, dstScope: Scope): TS.CallSig {
+	const own		= (f: TS.CallSig) => f.params.filter(p => p.key !== 'this');
+	const tparams	= new Map(typeParams.map(p => [p.name, p] as const));
+	const map		= new Map<string, Type>();
+	own(src).forEach((p, i) => {
+		const d = own(dst)[i]?.typeAnnotation;
+		if (p.typeAnnotation && d)
+			inferTypeArgs(p.typeAnnotation, d, tparams, map, scope, dstScope);
+	});
+	typeParams.forEach(p => map.has(p.name) || map.set(p.name, p.constraint ?? UNKNOWN));
+	const sub = (t: Type | undefined) => t && substituteType(t, map);
+	return { ...src, typeParams: undefined, params: src.params.map(p => ({ ...p, typeAnnotation: sub(p.typeAnnotation) })),
+		rest: src.rest && { ...src.rest, typeAnnotation: sub(src.rest.typeAnnotation) }, returnType: sub(src.returnType) };
+}
+
 export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope = scope, strict = false, depth = 10, precise = false): boolean {
 	const recurse = (src: Type, dst: Type, depth: number): boolean => {
 		if (depth < 0) {
@@ -2292,20 +2308,23 @@ export function isAssignable(src: Type, dst: Type, scope: Scope, dstScope: Scope
 			// TS's arity rule (compareSignaturesRelated): a source needing more arguments than the target ever passes is not one.
 			if (!dst.rest && minArgumentCount(src, scope) > dst.params.filter(p => p.key !== 'this').length)
 				return false;
+			// A GENERIC source is instantiated in the target's context first (TS's instantiateSignatureInContextOf): its type parameters
+			// inferred from the target's parameters, the rest at their constraints -- `<T>(x: T) => number` is a `(x: number) => void`.
+			const fn = src.typeParams?.length ? instantiateInContextOf(src, src.typeParams, dst, scope, dstScope) : src;
 			// Parameters are BIVARIANT, TS's method-parameter rule and its weakest: each pair need only relate one way,
 			// but a `(h: Handler) => ...` is no `(value: number) => ...` callback either way.
-			const own = (f: typeof src) => f.params.filter(p => p.key !== 'this');
-			const srcParams = own(src), dstParams = own(dst);
+			const own = (f: TS.CallSig) => f.params.filter(p => p.key !== 'this');
+			const srcParams = own(fn), dstParams = own(dst);
 			if (srcParams.some((p, i) => {
 				const s = p.typeAnnotation, d = dstParams[i]?.typeAnnotation;
 				return s && d && !recurse(s, d, depth - 1) && !recurse(d, s, depth - 1);
 			}))
 				return false;
-			if (!dst.returnType || !src.returnType)
+			if (!dst.returnType || !fn.returnType)
 				return true;	// missing return type (e.g. an unmodeled class method): lenient
 			// returns covariant, void-dst absorbs anything
 			return dst.returnType.type === 'ref' && dst.returnType.name === 'void'
-				|| recurse(src.returnType, dst.returnType, depth - 1);
+				|| recurse(fn.returnType, dst.returnType, depth - 1);
 		}
 
 		if (dst.type === 'object') {
