@@ -4,42 +4,50 @@ description: LIVE cold-start state for the wasm-backend work — where things st
 metadata:
   node_type: memory
   type: project
-  modified: 2026-09-18
+  modified: 2026-09-19
 ---
 
 **Read this first, and usually instead of [[tison-towasm-self-hosting-plan]]** (2233 lines — open it only
 for the accumulated history of a specific row). This file is live state and nothing else: **rewrite it
 wholesale, do not append.** It drifted to 223 lines by appending; that is the failure mode.
 
-## Latest: 2026-09-19 (later) -- HEAD `e29174a`
+## Latest: 2026-09-19 (evening) -- HEAD `fd5df24`
 
-**Survey 267/403 compile (was 208 at `b354a81`), nothing regressed; checker.ts 57/58, type-core 124/124,
-type-utils 21/21, printer 18/18.** Five fixes, `8f7d8cc`..`e29174a`, each with a test that fails without it;
-root causes are in the commit messages. What to know before editing nearby:
-- **An unannotated top-level `const f = () => ...` IS a function decl** (`functionDeclByName`): bare and `NS.f()`
-  calls reach `emitCall`, so a generic one instantiates per argument. An ANNOTATED const stays a closure (its
-  callers see the annotation). `0b6f60e`'s lazy-closure call path had silently swallowed all of them.
-- **Open shapes:** `noteSlot`/`noteTypes` strip nullish BEFORE resolving (`resolvedShape`, which also merges an
-  `extends` intersection), look through `??`/`||`/`&&`, and note a call's uncontextual type too. `openKey`
-  follows aliases (`expandRefOnce`) and keys by the bare struct name. `typeOf` has ONE open check, before any
-  struct resolution. An array literal opens a slot only where assignable (every overload is noted).
-- **Fixing `openKey` made long-noted flows real**: `Var` is open (a `{name}` literal through a rest param).
-  `ensureAnyField` now reads `undefined` when no struct declares the field (the write guard stays).
-- `ctx.contextualReturn` is never cleared without restore (the bare-call path used to); `spreadKeys` flattens
-  intersections. A spread of an open shape reads each key at run time (`FieldSource.dynamic`).
-- `genericKey` = `layoutKey`: `i32` is not `number` for an instance key.
+**Survey 268/404, nothing regressed; checker.ts 58/58 AND compiles as a whole file (3073 funcs).** Four fixes,
+`a01d942`..`fd5df24`; root causes are in the commit messages. What to know before editing nearby:
+- **A literal's struct must hold every key it PROVIDES** (spreads included) -- `matchObjectShape` and `spreadOwner`
+  both. `spreadKeys` reads the operand's TYPE (`T.collectMembers` per union member), never a struct's field list.
+- **Who reads a literal decides its struct.** With a context, the context (`matchContextualUnionMember`: a one-shape
+  context decides even `{}`; a member's REQUIRED keys must be supplied). With none (`any` counts as none), the literal's
+  own type -- ambiguity builds the anonymous shape. A spread operand's reader is the spread copy, so it is emitted in
+  its OWN type's context (`emitSpreadOperand`), never the enclosing literal's.
+- **type-core `resolve` never caches a result produced under a depth bail** (`depthBails`). Depth 10 is still shallow:
+  core.ts's `ElemValue` chain costs one level per `extends` arm. The circular bail is still cached (stack-dependent too).
+- **Rest arguments infer as one tuple** (`restArgs: TS.TupleElement[]`, checker and towasm's `inferCallTypeArgs`), so
+  `Rules(...)` (rest type `[fn] | Rules<T>`) infers instead of `Rules<any>`. We union the rest elements where tsc
+  picks their common supertype (`Rules<{p} | {p;r}>` vs `Rules<{p}>`) -- pre-existing for `T[]` rests.
 
-**Next rows** (survey): object literal needs a known target (77; checker's last is `inferReturn`), `Array.from`
-on the constructor type (11), js-parser `Array<any>` -> `{...}` (11), backend's `Type` vs `W.Type` (7+).
-**Known, unfixed:** an `i32` boxed into `any` uses the i32 box but a `number` reader casts to the f64 box, so an
-`i32[]` through an OPEN `Iterable<number>` traps at run time; `x as T` is not a flow for open shapes (user
-undecided on dispatching by `unwrapAs`'s type). Pre-existing: a `Map` literal whose object values omit an
-optional field traps "illegal cast".
+**Next rows** (survey): object literal needs a known target (52: backend.ts 51, peg 1), ts-parser's
+`cannot convert {key:string} to Rest<any>` (24, below), `Array.from` on the constructor type (11), js-parser
+`Array<any>` -> `{...}` (11), backend's `Type` vs `W.Type` (7+).
+
+**The ts-parser row is a design question, parked in `assistant/layout-wip.patch`** (4 hunks, applies cleanly). `{ ...$[2],
+typeParams }` (line 340) is built as `CallSig`, but `$[2]`'s member `{params; rest: {key: string}}` was built as the
+anonymous shape, whose `rest` is an anonymous `{key}` struct -- no `Rest`. The type side (`findObjectShapeByType`)
+matches a type to a declared class on type-assignability alone, so it maps `{params; rest: {key}; typeParams}` to
+`CallSig` though `CallSig.rest` holds a different layout. The patch adds `holdsLayout` (same `layoutSketch`, `any`
+either side, or an open field) to the type side and to spread-sourced values on the literal side, and makes the
+no-context fallback `objectShapeOf` (the type's owner). Still failing when parked: the arrow's own return wtype
+resolves to `CallSig` through a path not yet traced. Needs the user's view: layout agreement narrows width-subtyping
+matches program-wide.
+
+**Known, unfixed:** the checker types `{ ...classInstance, y }` as `any` (the literal then has no target);
+`T.collectMembers` lists a getter as a property key. An `i32` boxed into `any` vs a `number` reader (f64 box) traps
+through an OPEN `Iterable<number>`. `x as T` is not a flow for open shapes (user undecided).
 
 **Instruments:** `assistant/survey-sequence.ts <file> <decl>...` reproduces the survey exactly (`NOWHOLE=1`);
-trust it over `probe-one-decl.ts`. **Trap:** a walker callback's parameter is named `process`, shadowing
-Node's -- debug with `globalThis.process.env`. `Iterable` design and committing-beside-WIP notes: see git
-`ab4745f`'s version of this file.
+`assistant/tsc-type-at.ts <file> <line> <exprText>` asks REAL tsc for a type (TS API) -- compare before calling
+something a checker bug. `test-checker.ts` reads `dist/` like test-towasm: rebuild on both sides of an A/B.
 
 ## As of 2026-09-18 -- HEAD `148f0b4`
 
@@ -182,7 +190,7 @@ While relocating code, run only the fast set: `npx tsc -b src/examples`, `test-t
 ## Tree state
 
 **Never trust this line — the user edits and commits concurrently; re-check `git status`.** At the time of
-writing: HEAD `e29174a`, clean tree.
+writing: HEAD `fd5df24`; the user's own uncommitted `Tuple` export in ts-parser.ts.
 
 ## Keeping this current
 
