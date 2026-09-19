@@ -2714,6 +2714,8 @@ export function inferTypeArgs(paramT: Type, argT: Type, tparams: ReadonlyMap<str
 				recurse(paramT.element, a.element, depth - 1);
 			} else if (a.type === 'tuple') {
 				// Every element is a candidate, unioned -- `readonly T[]` from `['a', 'b'] as const` is `'a' | 'b'`, not the first alone.
+				// OPTIMISATION, more precise than tsc (which keeps the common supertype, forgetting keys the values still carry): towasm
+				// lays structs out by these keys. Droppable once width-subtyping flows are open shapes, which need no such precision.
 				const outer = pooled;
 				pooled = new Map();
 				elementTypes(a, scope).forEach(t => recurse(paramT.element, t, depth - 1));

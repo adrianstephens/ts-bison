@@ -4485,6 +4485,27 @@ async function main() {
 	}
 
 	{
+		// A type is laid out as a declared class only where every member keeps its layout (ts-parser.ts's `generic_params`):
+		// `{params; rest: {key}}` holds an anonymous `{key}`, which no `Sig` -- whose `rest` is a `Rest` -- can take.
+		const { layoutSpread } = await compile(`
+			interface R<T> { a: (x: string[]) => T }
+			function rule<T>(a: (x: string[]) => T): R<T> { return { a }; }
+			function rules<T>(...alts: R<T>[]): R<T>[] { return alts; }
+			interface Rest { key: string; ann?: number }
+			interface Params { params: number[]; rest?: Rest }
+			interface Sig extends Params { typeParams?: string[] }
+			function mkSig(): Sig { return { params: [] }; }
+			export function layoutSpread(): number {
+				const list = rules(rule(x => ({ params: [1] })), rule(x => ({ params: [1, 2], rest: { key: x[0] } })));
+				const withTp = rules(rule(x => ({ ...list[1].a(x), typeParams: x })));
+				const s = mkSig(), b = withTp[0].a(['r', 'T']);
+				return s.params.length + b.params.length * 10 + (b.rest?.key === 'r' ? 100 : 0) + b.typeParams.length * 1000;
+			}
+		`);
+		check('a spread whose member lays a field out differently is not built as the declared class', layoutSpread(), 2120);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`

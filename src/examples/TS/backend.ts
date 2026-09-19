@@ -2463,6 +2463,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			.find(cls => cls && cls.typeIndex !== -1 && provided.every(k => k !== undefined && cls.fieldIndex.has(k)));
 	}
 
+	// Can a field declared `declared` hold a value already laid out as `t`? A `{key: string}` struct is no `Rest`, though assignable:
+	// only the same layout, `any` either side, or an open field will do -- per union member, which one `anyref` sketch would hide.
+	function holdsLayout(declared: Type, t: Type): boolean {
+		const members = T.unionMembers(t, global).filter(m => !T.isNullish(m, global));
+		if (members.length > 1)
+			return members.every(m => holdsLayout(declared, m));
+		const want = layoutSketch(declared, global), got = layoutSketch(t, global);
+		return want === got || want === 'any' || got === 'any' || openShapes.has(openKey(declared, global));
+	}
+
 	// A bare object literal with no single resolvable target type (`case 'object'`'s own `want` doesn't name one class) -- a
 	// last-resort structural match against every reachable, struct-backed class/object-shape (the same "every class ever
 	// discovered" scan `findAnyDispatchCandidates` uses for method dispatch, just picking which shape a literal builds as).
@@ -2494,10 +2504,18 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// counting it twice fails the "exactly one candidate" test below. The field TYPES must accept the literal's
 		// own values, not just share names (the same check, and the same "unknown declared type is not judged"
 		// tolerance, `matchObjectShapeByType` makes), or it can't be stored in it (`{sig: Sig}` into `{sig: Meth}`).
-		const fits = (cls: ClassInfo) => [...explicit].every(k => {
-			const declared	= cls.fieldDeclaredType(k, global);
-			const value		= props.get(k);
-			return !declared || !value || T.isAssignable(checkerTypeOf(unwrapAs(value), ctx.scope), declared, ctx.typeScope);
+		// A written value is built in its field's context; a SPREAD's already has a layout, which the field must hold.
+		const fits = (cls: ClassInfo) => [...props].every(([k, value]) => {
+			const declared = cls.fieldDeclaredType(k, global);
+			if (!declared)
+				return true;
+			if (explicit.has(k))
+				return T.isAssignable(checkerTypeOf(unwrapAs(value), ctx.scope), declared, ctx.typeScope);
+			// Per member: a key only some members of a union carry has no common type to look up.
+			return T.unionMembers(ctx.narrowedTypeOf(value), ctx.typeScope).every(m => {
+				const got = T.lookupMember(m, k, ctx.typeScope);
+				return !got || holdsLayout(declared, got);
+			});
 		});
 		const candidates = [...new Set(classes.values())].filter(cls =>
 			cls.typeIndex !== -1 && !cls.anonymous && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional) && fits(cls)
@@ -2505,12 +2523,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		if (candidates.length === 1)
 			return candidates[0];
 		// No declared shape fits, or several do with nothing to decide and no context (`any` is none) to read it through: it is
-		// read through its own type, whose owner is the anonymous shape -- as `objectShapeOf` answers for that type.
+		// read through its own type, so it is built as that type's owner (`objectShapeOf`, one answer per type) -- what every reader expects.
 		const fallback = () => {
 			if (!anon)
 				return undefined;
 			const resolved = T.resolve(ctx.scope, checkerTypeOf(e, ctx.scope));
-			return resolved.type === 'object' && !indexSignatureValueType(resolved) ? ensureAnonObjectShape(resolved) : undefined;
+			return resolved.type === 'object' && !indexSignatureValueType(resolved) ? objectShapeOf(resolved, resolved) : undefined;
 		};
 		if (candidates.length === 0)
 			return fallback();
@@ -2554,10 +2572,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// number[]` where `Obj`'s own is `number[]`, and the literal was then built against the wrong one. Asked of the
 		// CHECKER, never `typeOf`: this runs while a shape is being resolved, and `typeOf` builds shapes, so asking it
 		// re-enters (ts-parser.ts's `CallSig` -> `Param[]` -> the recursive `Type` union did not terminate). A field
-		// whose declared type is unknown to `fieldDeclaredType` is not judged.
+		// whose declared type is unknown to `fieldDeclaredType` is not judged. Nor may a member's layout differ from its field's (`holdsLayout`).
 		const candidates = [...new Set(classes.values())].filter(cls =>
 			cls.typeIndex !== -1 && !cls.anonymous && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
-			&& [...props].every(([k, pt]) => { const declared = cls.fieldDeclaredType(k, global); return !declared || T.isAssignable(pt, declared, global); })
+			&& [...props].every(([k, pt]) => { const declared = cls.fieldDeclaredType(k, global); return !declared || T.isAssignable(pt, declared, global) && holdsLayout(declared, pt); })
 		);
 		if (candidates.length === 1)
 			return candidates[0];
