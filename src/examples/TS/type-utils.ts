@@ -244,13 +244,35 @@ function widenedDefaultType(d: JS.Expr<any> | undefined): Type | undefined {
 	return w.type === 'ref' && !w.typeArgs && WASM_PSEUDO_TYPES.has(w.name) ? NUMBER : w;
 }
 
+// TS's getTypeFromBindingPattern: what a destructuring pattern implies about what it destructures. It is the parameter's own type
+// where the pattern has a DEFAULT anywhere (`[x = 0, y = 0] = []` is `[(number | undefined)?, ...]`, never the initializer's
+// `never[]`); with no default at all the initializer says more (`{a, b} = {a: 1, b: 'x'}` is its own type).
+function patternDefaults(target: JS.BindingTarget): boolean {
+	return typeof target !== 'string' && (target.type === 'array_pattern'
+		? target.elements.some(el => !!el && (!!el.default || patternDefaults(el.target)))
+		: target.properties.some(p => !!p.default || patternDefaults(p.value)));
+}
+
+// A default makes its slot optional and its type nullable, as TS writes it; a nested pattern says what it implies.
+function patternType(target: JS.BindingTarget): Type {
+	const implied = (t: JS.BindingTarget, def?: JS.Expr<any>): Type => {
+		const base = typeof t !== 'string' ? patternType(t) : widenedDefaultType(def) ?? ANY;
+		return def ? combineTypes([base, UNDEFINED]) : base;
+	};
+	if (typeof target === 'string')
+		return ANY;
+	return target.type === 'array_pattern'
+		? { type: 'tuple', elements: target.elements.map(el => el?.default ? { type: 'optional', element: implied(el.target, el.default) } : el ? implied(el.target) : ANY) }
+		: TS.ObjectType(target.properties.flatMap(p => typeof p.key === 'string' ? [TS.TypeProperty(p.key, implied(p.value, p.default), p.default ? ['optional'] : undefined)] : []));
+}
+
 // JS.ParamList to TS.ParamList; a defaulted parameter counts as optional
 export function FixParams(params: JS.Params<any>): TS.Params {
 	return {
 		params: params.params.filter(p => p.key !== 'this').map((p): TS.Param => ({
 			key:			typeof p.key === 'string' ? p.key : '_',
 			modifiers:		hasMod(p, 'optional') || !!p.default ? ['optional'] : [],
-			typeAnnotation: p.typeAnnotation as Type ?? widenedDefaultType(p.default),
+			typeAnnotation: p.typeAnnotation as Type ?? (typeof p.key !== 'string' && patternDefaults(p.key) ? patternType(p.key) : widenedDefaultType(p.default)),
 			default:		p.default
 		})),
 		rest: params.rest as JS.Rest<Type>
