@@ -2573,8 +2573,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// CHECKER, never `typeOf`: this runs while a shape is being resolved, and `typeOf` builds shapes, so asking it
 		// re-enters (ts-parser.ts's `CallSig` -> `Param[]` -> the recursive `Type` union did not terminate). A field
 		// whose declared type is unknown to `fieldDeclaredType` is not judged. Nor may a member's layout differ from its field's (`holdsLayout`).
+		// A required field needs a required member: `Partial<FunctionDecl>` is no `FunctionDecl`.
+		const certain = new Set(t.members.flatMap(m => m.type === 'property' && !hasMod(m, 'optional') ? [T.memberKey(m.key)] : []));
 		const candidates = [...new Set(classes.values())].filter(cls =>
-			cls.typeIndex !== -1 && !cls.anonymous && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => props.has(f.name) || f.optional)
+			cls.typeIndex !== -1 && !cls.anonymous && [...props.keys()].every(k => cls.fieldIndex.has(k)) && cls.fields.every(f => certain.has(f.name) || f.optional)
 			&& [...props].every(([k, pt]) => { const declared = cls.fieldDeclaredType(k, global); return !declared || T.isAssignable(pt, declared, global) && holdsLayout(declared, pt); })
 		);
 		if (candidates.length === 1)
@@ -5487,7 +5489,8 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 						// An anonymous object shape has no nominal class for `ownerOf` to find, so it gets the same synthesized struct a literal targeting that shape would.
 						const spreadT	= T.resolve(ctx.scope, ctx.narrowedTypeOf(p.operand));
 						const spreadCls	= ownerOf(p.operand, ctx) ?? (spreadT.type === 'object' ? ensureAnonObjectShape(spreadT) : undefined);
-						if (!spreadCls) {
+						// A NULLABLE operand is one too (`{ ...more }`, `more?: Partial<Decl>`): spreading `undefined` supplies nothing.
+						if (!spreadCls || T.unionMembers(spreadT, ctx.scope).some(m => T.isNullish(m, ctx.scope))) {
 							// A union operand (`js-parser.ts`'s `{ ...args[0] }`, `args[0]: CallSig | Params`) reads each field off whichever member the value is, absent where
 							// it has none. A member stored as `any` (an open shape) has no struct to test for, so then each key its type names is read at run time, by name.
 							const parts		= T.unionMembers(spreadT, ctx.scope);

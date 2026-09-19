@@ -4506,6 +4506,16 @@ async function main() {
 	}
 
 	{
+		// A `Partial<Decl>` is no `Decl` (ts-parser.ts's `bodyless_function`), and spreading an absent one supplies nothing.
+		const { partialMore } = await compile(`
+			interface Decl { type: 'decl'; name: string; params: number[]; modifiers?: string[] }
+			function mkDecl(name: string, more?: Partial<Decl>): Decl { return { type: 'decl', name, params: [], ...more }; }
+			export function partialMore(): number { return (mkDecl('f', { modifiers: ['async', 'x'] }).modifiers?.length ?? 0) + mkDecl('g').params.length * 10 + 7; }
+		`);
+		check('a Partial is not the declared shape, and an absent one spreads nothing', partialMore(), 9);
+	}
+
+	{
 		// `delete` on a struct's field, by computed key (walker.ts's `mapObject`) or by name: the field reads back `undefined`,
 		// the one state an omitted optional field already has. The spread copy is what loses it, not the original.
 		const { structDelete } = await compile(`
