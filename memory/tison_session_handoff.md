@@ -30,8 +30,22 @@ with tsc 6.0.3, -11 false positives, corpus gate 838 = baseline throughout:
   `c843304` ``tag<T>`...` `` parses as a tagged template.
 - `c8c8fbc` **inventory C4's methods**: assignability compares method members. Call/index signatures still skipped.
 
+**Survey 268/403 at `0b8c5a7`** (snapshot `tison@374a86e`), per file identical to before the checker work: checker.ts 58/58
+and whole-file (3085 funcs), type-core 124/124, type-utils 21/21, printer 18/18. Rows left: object literal needs a known
+target, ts-parser's `{...}` -> `Rest<any>` (23), js-parser `Array<any>` -> `{...}` (11), `Array.from` (11).
+
+**`af96da0` cost 133 declarations and only the SURVEY saw it** (difftest, the suites and the corpus gate were all green):
+`holdsLayout` compared raw `layoutSketch` values, which answer `noteTypes`'s question. Fixed in `0b8c5a7` by sketching
+each side as a SLOT. **Run a survey before landing anything that changes which code reaches codegen.**
+
 **Watch for:** an unannotated function with a destructuring parameter infers an `any` RETURN (found, unfixed).
-A script's non-interface declarations are still local, so a second script does not see them.
+A script's non-interface declarations are still local, so a second script does not see them. `resolve` does not reduce
+an intersection of literal types (`"function" & ("function" | "arrow")`), which `holdsLayout` still rejects.
+
+**Environment trap (2026-09-20):** probes failing with `Cannot find module '@isopodlabs/binary'` mean the workspace links
+were pruned (an `npm install` at the packages root drops what its package.json does not declare). Restore with
+`ln -s ../../binary` and `ln -s ../../binary-libs binary_libs` in `packages/node_modules/@isopodlabs/`. A survey run
+while they are missing crashes most workers and its numbers are meaningless -- check the report for WORKER CRASHED.
 
 **Instruments:** `assistant/probe-fulllib.ts <file>` checks a file under lib.esnext.full exactly as test-checker does;
 `assistant/tsc-type-at.ts <file> <line> <text>` prints tsc's own type, and its RESOLVED SIGNATURE for a call.
