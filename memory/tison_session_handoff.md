@@ -13,10 +13,18 @@ wholesale, do not append.** It drifted to 223 lines by appending; that is the fa
 
 ## Latest: 2026-09-20 -- HEAD `c8c8fbc` (checker work, step 2 of the open-shape plan)
 
-**The plan the user approved:** drive towasm's open-shape pass from the checker's own assignability checks (every
-accepted "value into slot" flow stamped on the value node), in order: (2) check rest/spread arguments -- DONE
-`fa0e437`; then (1) `checkFlow` stamping at the nine flow sites; (3) towasm reads the stamps (keeping its
-monomorphization/erasure rules); (4) spreads + union-member descent in `noteSlot`. **Steps 1, 3, 4 not started.**
+**The open-shape plan is DONE** (`fa0e437`, `2695dea`, `7dd17a4`): the checker stamps every flow it accepts on the value's
+own node (`checkFlow` -> `FlowSlot`, nine sites) and towasm's pass reads those stamps, so WHICH SITES are flows is now
+complete by construction. Returns, yields, field initializers, parameter defaults, spreads, generic-call arguments and
+union slots were all invisible before. What only towasm knows it still contributes: a named function's parameter is no
+slot; a rest argument fills an array ELEMENT (`FlowSlot.element`); and every OVERLOAD candidate's parameter is noted,
+because codegen resolves its own overload (`new Set([x])` fits `readonly T[]` and `Iterable<T>` alike).
+
+**Codegen rules that came out of it:** `interface LP extends P` is laid out OVER `P`'s struct, so such a value opens
+nothing (only an interface's own `extends` part -- a class that merely satisfies the slot, `Array` for `Iterable`, must
+still open it). A union member held as `any` is the arm no `ref.test` picked (the `else`; two open members are
+indistinguishable), and an OPEN spread operand's keys are read BY NAME -- never off a synthesized struct, which
+miscompiled as an "illegal cast" until `7dd17a4`.
 
 **Step 2 and its fallout, all committed** (`fa0e437`..`c8c8fbc`), corpus A/B +25 errors ALL verified true positives
 with tsc 6.0.3, -11 false positives, corpus gate 838 = baseline throughout:
@@ -30,7 +38,9 @@ with tsc 6.0.3, -11 false positives, corpus gate 838 = baseline throughout:
   `c843304` ``tag<T>`...` `` parses as a tagged template.
 - `c8c8fbc` **inventory C4's methods**: assignability compares method members. Call/index signatures still skipped.
 
-**Survey 268/403 at `0b8c5a7`** (snapshot `tison@374a86e`), per file identical to before the checker work: checker.ts 58/58
+**Survey 269/403 at `7dd17a4`**; ts-parser.ts's 23 declarations now sit on the `Array<any>` -> `{...}` conversion row
+(the grammar's `$` values array intersected with `pos`), shared with js-parser -- the next thing to look at, with
+backend.ts's own 52-declaration "object literal needs a known target" row. Earlier: **survey 268/403 at `0b8c5a7`** (snapshot `tison@374a86e`), per file identical to before the checker work: checker.ts 58/58
 and whole-file (3085 funcs), type-core 124/124, type-utils 21/21, printer 18/18. Rows left: object literal needs a known
 target, ts-parser's `{...}` -> `Rest<any>` (23), js-parser `Array<any>` -> `{...}` (11), `Array.from` (11).
 
