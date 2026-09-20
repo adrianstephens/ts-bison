@@ -4526,6 +4526,31 @@ async function main() {
 	}
 
 	{
+		// A SPREAD carries flows too -- `{ ...src }` fills `Wrap.inner` from `src.inner` -- and a literal's slot is the union member
+		// it discriminates to. Both open more shapes, and a member held as `any` has no struct to `ref.test` for: it is the arm no
+		// other test picked, and its own keys are read BY NAME, never off a synthesized struct the value was never built as.
+		const { spreadFlow, openArm } = await compile(`
+			interface Sig { params: number[] }
+			interface Other { params: number[]; extra: string }
+			interface Wrap { inner: Sig }
+			function wrap(src: { inner: Other }): Wrap { return { ...src }; }
+			export function spreadFlow(): number { return wrap({ inner: { params: [1, 2], extra: 'x' } }).inner.params.length; }
+			interface Meth { type: 'm'; key: string; params: number[] }
+			interface Fld { type: 'f'; key: string }
+			interface Wider { type: 'm'; key: string; params: number[]; extra: string }
+			function widen(w: Wider): Meth { const m: Meth = w; return m; }
+			function copy(x: Meth | Fld): Meth | Fld { return { ...x, key: 'z' }; }
+			export function openArm(): number {
+				const a = copy(widen({ type: 'm', key: 'k', params: [1, 2, 3], extra: 'e' }));
+				const b = copy({ type: 'f', key: 'q' });
+				return (a.type === 'm' ? a.params.length * 10 : 0) + (b.key === 'z' ? 100 : 0);
+			}
+		`);
+		check('a spread carries its own flows', spreadFlow(), 2);
+		check('a union spread whose member is an open shape', openArm(), 130);
+	}
+
+	{
 		// A `Partial<Decl>` is no `Decl` (ts-parser.ts's `bodyless_function`), and spreading an absent one supplies nothing.
 		const { partialMore } = await compile(`
 			interface Decl { type: 'decl'; name: string; params: number[]; modifiers?: string[] }

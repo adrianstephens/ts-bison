@@ -2403,11 +2403,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return ctx.swapOut(outer);
 		};
 		interface Arm { test: () => void; build: () => void }
-		const cascade = ([arm, ...rest]: Arm[]): wasm.Instr[] => arm
-			? [...capture(arm.test), I.if(toValType(result), capture(arm.build), cascade(rest))]
-			: [I.unreachable];
-		const emitArms = (arms: Arm[]) => {
-			ctx.emit(...cascade(arms));
+		// `otherwise`: the arm no test can pick -- a member stored as `any` (an open shape) has no struct to `ref.test` for.
+		const cascade = ([arm, ...rest]: Arm[], otherwise?: () => void): wasm.Instr[] => arm
+			? [...capture(arm.test), I.if(toValType(result), capture(arm.build), cascade(rest, otherwise))]
+			: otherwise ? capture(otherwise) : [I.unreachable];
+		const emitArms = (arms: Arm[], otherwise?: () => void) => {
+			ctx.emit(...cascade(arms, otherwise));
 			return result;
 		};
 		const withProp = (i: number, q: JS.ObjectExpr<Type>['properties'][number]) => ({ ...e, properties: e.properties.map((p, j) => j === i ? q : p) }) as Expr;
@@ -2417,20 +2418,24 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (p.type === 'spread') {
 				const members	= T.unionMembers(T.resolve(ctx.typeScope, ctx.narrowedTypeOf(p.operand)), ctx.typeScope).filter(m => !T.isNullish(m, ctx.typeScope));
 				const owners	= members.map(m => ownerFor(m));
-				if (members.length < 2 || !owners.every(o => o && o.typeIndex !== -1))
+				// A member held as `any` (an OPEN shape) has no struct to test for, so it can only be the arm no other test picked:
+				// one such member is the `else`, two are indistinguishable at run time.
+				const openAt	= owners.findIndex(o => !o || o.typeIndex === -1);
+				if (members.length < 2 || owners.filter(o => !o || o.typeIndex === -1).length > 1)
 					continue;
 				const n		= ctx.tempCounter++;
 				const src	= ctx.declareLocal(`$usrc$${n}`, W.REF_ANY_NULLABLE);
 				emitSpreadOperand(p.operand, ctx, W.REF_ANY_NULLABLE);
 				ctx.emit(I.local.set(src.index));
-				return emitArms(owners.map((o, k) => ({
-					test: () => ctx.emit(I.local.get(src.index), I.ref.test(o!.typeIndex)),
-					build: () => {
-						const name	= `$uvar$${n}$${k}`;
-						ctx.emit(I.local.get(src.index), I.ref.cast(o!.typeIndex), I.local.set(ctx.declareValue(name, o!.thisWtype!, members[k]).index));
-						coerceTop(emitExpr(withProp(i, JS.Spread(Identifier(name))), ctx), ctx, result);
-					},
-				})));
+				const buildArm = (k: number) => () => {
+					const name	= `$uvar$${n}$${k}`, o = owners[k];
+					ctx.emit(I.local.get(src.index), o ? I.ref.cast(o.typeIndex) : I.ref.as_non_null, I.local.set(ctx.declareValue(name, o?.thisWtype ?? W.REF_ANY, members[k]).index));
+					coerceTop(emitExpr(withProp(i, JS.Spread(Identifier(name))), ctx), ctx, result);
+				};
+				return emitArms(members.flatMap((_, k) => k === openAt ? [] : [{
+					test: () => ctx.emit(I.local.get(src.index), I.ref.test(owners[k]!.typeIndex)),
+					build: buildArm(k),
+				}]), openAt >= 0 ? buildArm(openAt) : undefined);
 			}
 			if (p.type === 'field' && p.value && typeof p.key === 'string') {
 				// Unwidened: the question is which LITERALS it can hold (`narrowedTypeOf` widens, for physical representation).
@@ -5493,7 +5498,9 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 					if (p.type === 'spread') {
 						// An anonymous object shape has no nominal class for `ownerOf` to find, so it gets the same synthesized struct a literal targeting that shape would.
 						const spreadT	= T.resolve(ctx.scope, ctx.narrowedTypeOf(p.operand));
-						const spreadCls	= ownerOf(p.operand, ctx) ?? (spreadT.type === 'object' ? ensureAnonObjectShape(spreadT) : undefined);
+						// An OPEN shape holds any layout, so it has no struct to read fields off -- not even a synthesized one, which the
+						// value would have to be cast to. Its keys are read by name below, as a union member stored as `any` is.
+						const spreadCls	= ownerOf(p.operand, ctx) ?? (spreadT.type === 'object' && !openShapes.has(openKey(spreadT, global)) ? ensureAnonObjectShape(spreadT) : undefined);
 						// A NULLABLE operand is one too (`{ ...more }`, `more?: Partial<Decl>`): spreading `undefined` supplies nothing.
 						if (!spreadCls || T.unionMembers(spreadT, ctx.scope).some(m => T.isNullish(m, ctx.scope))) {
 							// A union operand (`js-parser.ts`'s `{ ...args[0] }`, `args[0]: CallSig | Params`) reads each field off whichever member the value is, absent where
@@ -9545,9 +9552,16 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			return;
 		const s = resolvedShape(slot, scope);
 		if (value.type === 'object' && s.type === 'object') {
-			for (const f of value.properties)
+			for (const f of value.properties) {
 				if (f.type === 'field' && typeof f.key === 'string' && f.value)
 					noteSlot(T.lookupMember(s, f.key, scope), f.value, scope, depth - 1);
+				// A SPREAD fills the same fields a written one does, from whatever its operand may be: each key of each member.
+				if (f.type === 'spread')
+					for (const m of T.unionMembers(checkerTypeOf(unwrapAs(f.operand), scope), scope))
+						for (const key of T.collectMembers(m, scope).flatMap(p => p.type === 'property' ? [T.memberKey(p.key)] : []))
+							if (key)
+								noteTypes(T.lookupMember(s, key, scope), T.lookupMember(m, key, scope), scope, depth - 1);
+			}
 			// Literal types widened first, or every `const m: M = {...}` differs from `M` by its own `key: "k"` vs `string`.
 			if (erased)
 				noteTypes(slot, T.widenLiterals(checkerTypeOf(unwrapAs(value), scope)), scope, depth);

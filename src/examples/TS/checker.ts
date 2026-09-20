@@ -1213,8 +1213,11 @@ export const flowSlotOf = (e: Expr): FlowSlot | undefined => (e as { flowSlot?: 
 // `??=`: the first real (unmuted) check wins, the same reasoning as `fn.scope ??=`. The slot's own scope travels with it,
 // stamped onto the refs that carry none (`T.stampScope`), since the reader has only the VALUE's scope to resolve in.
 function stampFlow(value: Expr | undefined, type: Type | undefined, scope: Scope, element?: boolean) {
-	if (value && type)
-		(value as { flowSlot?: FlowSlot }).flowSlot ??= { type: T.stampScope(type, scope), element };
+	if (!value || !type)
+		return;
+	// An object literal's real slot is the union member it discriminates to -- the one it is BUILT as, here and in codegen.
+	const slot = value.type === 'object' ? discriminateContext(type, value, scope) : type;
+	(value as { flowSlot?: FlowSlot }).flowSlot ??= { type: T.stampScope(slot, scope), element };
 }
 
 // `checkAssignable` for a real flow: the value's node carries the slot it flows into.
