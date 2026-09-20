@@ -2469,7 +2469,10 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		const members = T.unionMembers(t, global).filter(m => !T.isNullish(m, global));
 		if (members.length > 1)
 			return members.every(m => holdsLayout(declared, m));
-		const want = layoutSketch(declared, global), got = layoutSketch(t, global);
+		// Compared as SLOTS: a field's own nullish part is not a layout, an alias resolves to what it names, and every array of
+		// references is one physical array (`arr:any` is `arr:ref`).
+		const sketch	= (x: Type) => layoutSketch(T.resolve(global, T.nonNullable(x, global)), global).replace(/arr:any/g, 'arr:ref');
+		const want		= sketch(declared), got = sketch(t);
 		return want === got || want === 'any' || got === 'any' || openShapes.has(openKey(declared, global));
 	}
 
