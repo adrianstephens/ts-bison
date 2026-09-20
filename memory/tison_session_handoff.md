@@ -38,9 +38,14 @@ target, ts-parser's `{...}` -> `Rest<any>` (23), js-parser `Array<any>` -> `{...
 `holdsLayout` compared raw `layoutSketch` values, which answer `noteTypes`'s question. Fixed in `0b8c5a7` by sketching
 each side as a SLOT. **Run a survey before landing anything that changes which code reaches codegen.**
 
-**Watch for:** an unannotated function with a destructuring parameter infers an `any` RETURN (found, unfixed).
-A script's non-interface declarations are still local, so a second script does not see them. `resolve` does not reduce
-an intersection of literal types (`"function" & ("function" | "arrow")`), which `holdsLayout` still rejects.
+**Fixed since** (`64c4565`, `29df413`): a destructuring parameter's function infers its return (the lazy inference checked
+the FIXED signature, whose patterns are flattened to `_`); an intersection drops a repeated part. Both neutral on the
+survey, +1 true positive on the corpus.
+
+**Known gaps, deliberately left:** a script's non-interface declarations are still local, so a second script does not see
+them (corpus fidelity only -- every file tison compiles of its own is a module); `@ts-ignore`/`@ts-expect-error` are not
+implemented (2 corpus false positives, and the lexer would have to keep comments); inventory C4's call/index members are
+still unchecked; variadic tuple-to-tuple assignability still skips spread elements.
 
 **Environment trap (2026-09-20):** probes failing with `Cannot find module '@isopodlabs/binary'` mean the workspace links
 were pruned (an `npm install` at the packages root drops what its package.json does not declare). Restore with
