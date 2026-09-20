@@ -73,6 +73,8 @@ export type TupleElement = Type
  	| { type: 'spread'; argument: Type; label?: string }
 	| { type: 'optional'; element: Type }
 	| { type: 'labeled'; label: string; element: Type; optional?: boolean };
+export interface Tuple { type: 'tuple'; elements: TupleElement[]; readonly?: boolean }
+export function  Tuple(elements: TupleElement[], readonly?: boolean): Tuple { return {type: 'tuple', elements, readonly}; }
 
 export interface ObjectType	{ type: 'object'; members: TypeMember[] }
 export function  ObjectType(members: TypeMember[]): ObjectType { return {type: 'object', members }; }

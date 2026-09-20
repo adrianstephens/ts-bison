@@ -165,8 +165,6 @@ type FullSig = Required<Omit<FuncSig, 'resolvedParams' | 'restElem'>> & Pick<Fun
 interface FuncInfo extends FuncSig	{ funcIndex: number; typeIndex: number, body?: wasm.FuncBody; reassignsThis?: boolean }
 export interface Inline extends FuncSig	{ inline: wasm.Instr[] }
 interface ClosureTypeInfo			{ funcTypeIndex: number; structTypeIndex: number; sig: FuncSig }
-type TupleT = Extract<Type, { type: 'tuple' }>;
-
 
 const LIB_DIR		= path.join(__dirname, 'lib');
 // Globbed, not listed: a hardcoded list fails SILENTLY when a new lib file is forgotten -- the declarations simply do not exist, and the first sign is an unrelated "unknown class"/"unresolved identifier".
@@ -2750,7 +2748,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 	// The `ClassInfo` a static `Type` dispatches method calls against -- derived directly from the `Type` itself, never by reverse-decoding an already-collapsed `WasmType`
 	// A tuple is an `Array` over REF storage whatever its elements: its element is the union of every position when that is
 	// ref-kind, else `any` (`[number, number]` would otherwise name `f64` storage). Asked of the element -- no class built to ask.
-	function tupleArrayOwner(tuples: TupleT[]): ClassInfo | undefined {
+	function tupleArrayOwner(tuples: TS.Tuple[]): ClassInfo | undefined {
 		const el = T.combineTypes(tuples.flatMap(tu => T.elementTypes(tu, global)));
 		return ensureClass('Array', [rawElemKind(el, typeOf) === 'ref' ? el : T.ANY]);
 	}
@@ -2802,7 +2800,7 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 				// A union of tuples (js-parser.ts `CallSigParams<T>`, a rest's type) is one `arr:ref` whichever member it is.
 				const members = T.unionMembers(w, global).map(m => T.resolve(global, m));
 				if (members.every(m => m.type === 'tuple'))
-					return tupleArrayOwner(members as TupleT[]);
+					return tupleArrayOwner(members as TS.Tuple[]);
 				// Members all owned alike (`assignableOps | ''`, string literals behind an alias beside another): that owner.
 				const owners = new Set(members.map(ownerFor));
 				return owners.size === 1 ? [...owners][0] : undefined;
@@ -9660,12 +9658,12 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 							: callee.type === 'member' && callee.object.type === 'identifier' ? scope.namespace(callee.object.name)?.decl(callee.property) : undefined;
 						const imported		= callee.type === 'identifier' && (!calleeDecl || calleeDecl.type === 'import') ? namedImportsByModule.get(moduleId)?.get(callee.name) : undefined;
 						const monomorphized	= calleeDecl?.type === 'function_decl' || (!!imported && functionDeclByName.has(homeKey(imported.module, imported.name)));
-						if (monomorphized)
+						if (monomorphized) {
 							e.arguments.forEach(a => a.type !== 'object' && a.type !== 'array' && notASlot.add(a));
 						// The checker stamps the overload IT chose; codegen resolves its own (`resolveOverload`), so every candidate's
 						// parameter is a slot this value may reach -- `new Set([x])` fits `readonly T[]` and `Iterable<T>` alike.
 						// Over-approximating costs speed; missing a slot miscompiles.
-						else {
+						} else {
 							const fn	= T.resolve(scope, checkerTypeOf(unwrapAs(e.callee), scope));
 							const sigs	= (fn.type === 'object' ? fn.members.filter(m => m.type === (e.type === 'new' ? 'construct' : 'call')) : [])
 								.map(sig => e.type === 'new' ? instantiateConstruct(sig as TS.CallSig, checkerTypeOf(e, scope)) : sig as TS.CallSig);
