@@ -1044,7 +1044,10 @@ function reduceIntersection(t: TS.IntersectionType, scope: Scope, depth: number)
 	const isEmpty		= (r: Type) => r.type === 'object' && !r.members.length;
 	const hasObject		= res.some((r, i) => doms[i] === 'structural' && !isEmpty(r));
 	const unitDomain	= values.size ? domainOf(res[units.findIndex(v => v !== undefined)], scope) : undefined;
-	const kept			= raw.filter((_, i) => !(isRef(raw[i], 'unknown') || (hasObject && isEmpty(res[i])) || (unitDomain && units[i] === undefined && res[i].type === 'ref' && doms[i] === unitDomain)));
+	// A part that repeats adds nothing: `'function' & ('function' | 'arrow')` narrows to `'function' & 'function'`, which IS `'function'`.
+	const seen			= new Set<string>();
+	const kept			= raw.filter((_, i) => !(isRef(raw[i], 'unknown') || (hasObject && isEmpty(res[i])) || (unitDomain && units[i] === undefined && res[i].type === 'ref' && doms[i] === unitDomain))
+		&& !seen.has(typeKey(res[i])) && (seen.add(typeKey(res[i])), true));
 
 	return kept.length === raw.length ? undefined : !kept.length ? UNKNOWN : kept.length === 1 ? kept[0] : TS.IntersectionType(kept);
 }
