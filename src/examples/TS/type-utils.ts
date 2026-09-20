@@ -247,14 +247,14 @@ function widenedDefaultType(d: JS.Expr<any> | undefined): Type | undefined {
 // TS's getTypeFromBindingPattern: what a destructuring pattern implies about what it destructures. It is the parameter's own type
 // where the pattern has a DEFAULT anywhere (`[x = 0, y = 0] = []` is `[(number | undefined)?, ...]`, never the initializer's
 // `never[]`); with no default at all the initializer says more (`{a, b} = {a: 1, b: 'x'}` is its own type).
-function patternDefaults(target: JS.BindingTarget): boolean {
+export function patternDefaults(target: JS.BindingTarget): boolean {
 	return typeof target !== 'string' && (target.type === 'array_pattern'
 		? target.elements.some(el => !!el && (!!el.default || patternDefaults(el.target)))
 		: target.properties.some(p => !!p.default || patternDefaults(p.value)));
 }
 
 // A default makes its slot optional and its type nullable, as TS writes it; a nested pattern says what it implies.
-function patternType(target: JS.BindingTarget): Type {
+export function patternType(target: JS.BindingTarget): Type {
 	const implied = (t: JS.BindingTarget, def?: JS.Expr<any>): Type => {
 		const base = typeof t !== 'string' ? patternType(t) : widenedDefaultType(def) ?? ANY;
 		return def ? combineTypes([base, UNDEFINED]) : base;

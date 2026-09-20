@@ -228,6 +228,9 @@ const cases: [name: string, code: string, errors: string[], nonStrict?: true][] 
 	['a script augmentation does not reach the next file', 'const s: string = RangeError.capture;', ["Property 'capture' does not exist"]],
 	// `tag<T>`...`` is a tagged template, not `(tag < T) > `...`` -- the type-argument terminal reads a backtick after `>` too.
 	['a tagged template takes type arguments', 'declare function tag<T>(s: TemplateStringsArray): T; const s: string = tag<number>`x`;', [NOT_ASSIGNABLE('number', 'string')]],
+	// The lazily inferred return was checked against the FIXED signature, whose `FixParams` flattened every pattern to `_`, so
+	// nothing the pattern binds existed and the body read `any`. Checked against the declaration now, its parameters refreshed after.
+	['a function with a destructuring parameter infers its return', 'function g([x = 0, y = 0] = []) { return x + y; } function h({ a = 0 } = {}) { return a; } const n: string = g(); const m: string = h();', [NOT_ASSIGNABLE('number', 'string'), NOT_ASSIGNABLE('number', 'string')]],
 	// Rest arguments are inferred from as one tuple: against `[(self) => R<T>[]] | R<T>[]` (core.ts's `Rules`), the array member infers `T`.
 	['a rest parameter of tuple-or-array type infers from its arguments', 'interface R<T> { a?: (x: number) => T } declare function rule<T>(action: (x: number) => T): R<T>; declare function rules<T>(...alts: [(self: () => R<T>[]) => R<T>[]] | R<T>[]): R<T>[]; const q: string = rules(rule(x => ({ p: 1 })), rule(x => ({ p: 2 })));', [NOT_ASSIGNABLE('R<{\n  p: number\n}>[]', 'string')]],
 	// A resolution cut short by the depth limit answers `any` for THAT call; cached, every alias it passed through stayed `any`.

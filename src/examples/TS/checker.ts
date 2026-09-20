@@ -382,6 +382,12 @@ function narrowMath(func: string, params: TS.Param[]): Type | undefined {
 // Makes an unannotated body's `sig.returnType` a self-memoizing accessor: the first read infers it (muted, `infer`) and replaces
 // itself with the plain value, recorded on `decl` too -- the real declaration a compiler reads. While inferring it reads as absent
 // (so inference sees nothing declared); a recursive call's reader falls back to `any`, as TS types such a recursion.
+// A body check infers what a parameter's own default or pattern says (writing it back onto the DECLARATION), which the fixed
+// signature was copied before: `FixParams` reads the declaration again, so the signature carries the same types.
+function refreshParams(sig: TS.CallSig, decl: JS.CallSig<any>) {
+	T.FixParams(decl).params.forEach((p, i) => sig.params[i] && (sig.params[i].typeAnnotation ??= p.typeAnnotation));
+}
+
 function lazyReturnType(sig: TS.CallSig, decl: { returnType?: Type }, scope: Scope, infer: () => void, fold = (t: Type) => t) {
 	let resolving = false;
 	Object.defineProperty(sig, 'returnType', {
@@ -605,7 +611,12 @@ function classShapes(c: TS.Class, scope: Scope): { instance: Type; value: Type; 
 		lazyReturnType(sig, decl, scope, () => {
 			bodyScopes ??= classBodyScopes(c, scope, instance, value, superType);
 			const generator = hasMod(decl, 'generator');
-			checkFunctionBody(sig, decl.body, hasMod(decl, 'static') ? bodyScopes.stat : bodyScopes.inst, hasMod(decl, 'async'), generator, generator);
+			// The DECLARATION, not `sig`: `FixParams` flattens a destructuring parameter's pattern to the name `_`, so checking
+			// the body against `sig` leaves every name the pattern binds unbound and the return infers `any`. Copied back
+			// through `sig`'s own setter (above), which stamps and folds it.
+			checkFunctionBody(decl, decl.body, hasMod(decl, 'static') ? bodyScopes.stat : bodyScopes.inst, hasMod(decl, 'async'), generator, generator);
+			refreshParams(sig, decl);
+			sig.returnType = decl.returnType;
 		}, selfRefs);
 	}
 	return { instance, value, superType };
@@ -1343,7 +1354,12 @@ function hoist(stmts: Stmt[], scope: Scope) {
 			const d = chosen[0];
 			const t = TS.FunctionType(T.stampSig(T.withScope(T.FixSig(d, T.ANY), scope), scope));
 			if (!d.returnType && d.body)
-				lazyReturnType(t, d, scope, () => checkFunctionBody(t, d.body, ownThis(flowContainer(scope)), hasMod(d, 'async'), hasMod(d, 'generator'), hasMod(d, 'generator')));
+				// `d`, not `t`: a destructuring parameter's pattern is `_` in the fixed signature (see `classShapes`'s own note).
+				lazyReturnType(t, d, scope, () => {
+					checkFunctionBody(d, d.body, ownThis(flowContainer(scope)), hasMod(d, 'async'), hasMod(d, 'generator'), hasMod(d, 'generator'));
+					refreshParams(t, d);
+					t.returnType = d.returnType as Type | undefined;
+				});
 			scope.mergeValue(name, t);
 			scope.addDecl(name, d);
 		}
@@ -2698,7 +2714,13 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${show().type(precise)}' is not assignable to parameter type '${show().type(anno)}'`;
 		// Written back, as `applyContextualParams` writes a contextual one: the function's own type (`FixParams`) has no
 		// scope to type a non-literal default in, so `(s, seen = new Set<string>()) => ...` lost `seen`'s type.
-		if (!anno && dt)
+		// What the PATTERN implies outranks what it is defaulted to, as in `FixParams` -- checking the body without it binds
+		// `{ a = 0 } = {}`'s `a` against the default's own `{}`, which declares no `a` at all, and the body reads `any`.
+		const implied	= !anno && typeof p.key !== 'string' && T.patternDefaults(p.key) ? T.patternType(p.key) : undefined;
+		const declared	= implied ?? dt;
+		// An IMPLIED type is never written back: `FixParams` derives the same one from the pattern, and a parameter that
+		// carries no written annotation is what tells an IIFE's own rule it is optional (`(({ x = 1 }) => x)()`).
+		if (!anno && !implied && dt)
 			p.typeAnnotation = typeof p.key === 'string' ? T.widenNullish(dt, inner) : dt;
 		if (typeof p.key === 'string') {
 			inner.addValue(p.key, anno ? T.optional(anno, hasMod(p, 'optional') && !p.default) : dt ? T.widenNullish(dt, inner) : T.ANY);
@@ -2706,8 +2728,8 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			// The whole argument, under a name no source can spell, is the pattern's source -- so a destructured
 			// discriminated union correlates as a `const` one does, unless the body reassigns one of its names.
 			const hidden = `#param${fn.params.indexOf(p)}`;
-			inner.addValue(hidden, anno ?? dt ?? T.ANY);
-			bindPattern(inner, p.key, anno ?? dt ?? T.ANY, { type: 'identifier', name: hidden } as Expr, !writesAny(body, new Set(T.bindingNames(p.key))));
+			inner.addValue(hidden, anno ?? declared ?? T.ANY);
+			bindPattern(inner, p.key, anno ?? declared ?? T.ANY, { type: 'identifier', name: hidden } as Expr, !writesAny(body, new Set(T.bindingNames(p.key))));
 		}
 	}
 	
