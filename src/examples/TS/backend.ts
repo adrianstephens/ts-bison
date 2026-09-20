@@ -5,7 +5,7 @@ import * as JS from './js-parser';
 import * as T from './type-utils';
 import * as W from '../wasm-codegen';
 import { Literal, Identifier, Binary, Assign, Conditional, Member, hasMod, Module as CModule } from '../common';
-import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload, isConstContext } from './checker';
+import { checkHoisted, typeOf as checkerTypeOf, isOptionalChainLink, narrow, inferTypeArgMap as checkerInferTypeArgMap, resolveOverload, isConstContext, flowSlotOf } from './checker';
 import { Walker, walker, walkerB } from './walker';
 import { makeAsm as makeAsm0 } from '../wasm-codegen';
 import { foldConstants, BuildStateMachine, collectHoistedLocals, StateMachine, SuspendBoundary } from './transform';
@@ -9601,8 +9601,14 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 		// emits -- widening on it would open nearly every shape, since `any` reaches everywhere.
 		if (T.isAny(v) || (v.type === 'ref' && v.name === 'unknown'))
 			return;
+		// `interface LP<T> extends P<T>` resolves to `P<T> & {...}` and is laid out OVER `P`'s struct (`ensureIntersectionShape`),
+		// a wasm subtype that needs no conversion: such a value is already what the slot holds.
+		// Only an interface's own `extends` part: a CLASS that merely satisfies the slot structurally (`Array` for `Iterable`) is a
+		// different struct, which must open the slot as before.
+		const overSlot = !T.isClassRef(physical(value), scope)
+			&& T.flattenIntersection(T.resolveMembers(physical(value), scope), scope).some(p => p !== v && !T.isClassRef(p, scope) && T.typeKey(resolvedShape(p, scope)) === T.typeKey(s));
 		// Only a value of a genuinely different LAYOUT widens: two types that share one are already interchangeable.
-		if (layoutSketch(s, scope) !== layoutSketch(v, scope) && T.isAssignable(v, s, scope))
+		if (!overSlot && layoutSketch(s, scope) !== layoutSketch(v, scope) && T.isAssignable(v, s, scope))
 			openShapes.add(openKey(physical(slot), scope));
 	}
 	// A generic construct signature (`new <K, V>(...) => Map<K, V>`) over the type arguments of the instance it built.
@@ -9622,55 +9628,50 @@ export function TStoWasm(ast: Module, modules?: Map<string, Module>, namedImport
 			if (!modScope)
 				continue;
 			let scope = modScope;
+			// A named function's declared parameter is NOT a slot: the callee is compiled per argument layout (test `structuralParam`).
+			// A literal argument is still built AS that parameter's type, so what it holds does meet that type's members.
+			const notASlot = new WeakSet<object>();
 			walkerB(
 				(st, process) => {
 					const saved = scope;
 					scope = (st as unknown as { scope?: Scope }).scope ?? scope;
-					if (st.type === 'var_decl')
-						for (const d of st.declarations)
-							if (d.typeAnnotation && d.init)
-								noteSlot(d.typeAnnotation, d.init, scope);
 					const r = process(st);
 					scope = saved;
 					return r;
 				},
 				(e, process) => {
-					if (e.type === 'assign') {
-						noteSlot(checkerTypeOf(unwrapAs(e.target), scope), e.value, scope);
-					// A plain call argument carries no contextual stamp this pass can read, so the parameter types come from
-					// the callee's own signature -- a rest parameter by its element type, which `push({ sig, decl })` needs.
-					} else if (e.type === 'call' || e.type === 'new') {
-						// A callee types either as a function or, for an overload set (`push`), as an object of `call` members; a class as its `construct`
-						// members, instantiated by what the `new` built. Every overload that could take this many arguments is noted: marking a shape open only costs speed.
-						const fn	= T.resolve(scope, checkerTypeOf(unwrapAs(e.callee), scope));
-						const sigs	= (fn.type === 'function' || fn.type === 'constructor' ? [fn] : fn.type === 'object' ? fn.members.filter(m => m.type === (e.type === 'new' ? 'construct' : 'call')) : [])
-							.map(sig => e.type === 'new' ? instantiateConstruct(sig as TS.CallSig, checkerTypeOf(e, scope)) : sig as TS.CallSig);
-						// Only a named function is monomorphized per argument layout; a closure's, method's or constructor's parameter is a slot.
+					if (e.type === 'call' || e.type === 'new') {
 						const callee		= unwrapAs(e.callee);
 						const calleeDecl	= callee.type === 'identifier' ? scope.decl(callee.name)
 							: callee.type === 'member' && callee.object.type === 'identifier' ? scope.namespace(callee.object.name)?.decl(callee.property) : undefined;
 						const imported		= callee.type === 'identifier' && (!calleeDecl || calleeDecl.type === 'import') ? namedImportsByModule.get(moduleId)?.get(callee.name) : undefined;
-						const monomorphized	= calleeDecl?.type === 'function_decl' || !!imported && functionDeclByName.has(homeKey(imported.module, imported.name));
-						for (const sig of sigs) {
-							if (!sig.rest && sig.params.length < e.arguments.length)
-								continue;
-							const restEl = sig.rest?.typeAnnotation && T.resolve(scope, sig.rest.typeAnnotation);
-							e.arguments.forEach((arg, i) => {
-								if (arg.type !== 'spread')
-								{
-									// A named function's declared parameter is NOT a slot: it keeps the caller's own object (test `structuralParam`). A literal is built AS
-									// the parameter's type, though, so what it holds meets that type's members; a rest parameter's bundle is an array whose element type is erased.
-									// A parameter written over the signature's own type parameters is no slot's type.
+						const monomorphized	= calleeDecl?.type === 'function_decl' || (!!imported && functionDeclByName.has(homeKey(imported.module, imported.name)));
+						if (monomorphized)
+							e.arguments.forEach(a => a.type !== 'object' && a.type !== 'array' && notASlot.add(a));
+						// The checker stamps the overload IT chose; codegen resolves its own (`resolveOverload`), so every candidate's
+						// parameter is a slot this value may reach -- `new Set([x])` fits `readonly T[]` and `Iterable<T>` alike.
+						// Over-approximating costs speed; missing a slot miscompiles.
+						else {
+							const fn	= T.resolve(scope, checkerTypeOf(unwrapAs(e.callee), scope));
+							const sigs	= (fn.type === 'object' ? fn.members.filter(m => m.type === (e.type === 'new' ? 'construct' : 'call')) : [])
+								.map(sig => e.type === 'new' ? instantiateConstruct(sig as TS.CallSig, checkerTypeOf(e, scope)) : sig as TS.CallSig);
+							for (const sig of sigs.length > 1 ? sigs : []) {
+								if (!sig.rest && sig.params.length < e.arguments.length)
+									continue;
+								e.arguments.forEach((arg, i) => {
 									const declared = sig.params[i]?.typeAnnotation;
-									const generic = !!declared && !!sig.typeParams?.some(p => T.mentionsTypeParam(declared, p.name));
-									if (declared && !generic && (!monomorphized || arg.type === 'object' || arg.type === 'array'))
+									// A parameter written over the signature's own type parameters is no slot's type.
+									if (arg.type !== 'spread' && declared && !sig.typeParams?.some(p => T.mentionsTypeParam(declared, p.name)))
 										noteSlot(declared, arg, scope);
-									else if (!declared && restEl && restEl.type === 'array')
-										noteSlot(restEl.element, arg, scope, 4, true);
-								}
-							});
+								});
+							}
 						}
 					}
+					// Every flow the CHECKER accepted, stamped on the value it accepted (`checkFlow`): a declaration, an assignment,
+					// an argument, a return, a yield, a field. Enumerating them here instead left spreads, returns and generic calls out.
+					const flow = flowSlotOf(e);
+					if (flow && !notASlot.has(e))
+						noteSlot(flow.type, e, scope, 4, flow.element);
 					return process(e);
 				}).statements(m.body);
 		}

@@ -4506,6 +4506,26 @@ async function main() {
 	}
 
 	{
+		// Open shapes follow the flows the CHECKER accepted (`checkFlow` stamps each on its value): a RETURN, a class FIELD's
+		// initializer and a YIELD are flows too, and towasm's own enumeration of statement kinds saw none of them.
+		const { flowKinds } = await compile(`
+			interface Sig { params: number[] }
+			interface Meth { type: 'm'; key: string; params: number[] }
+			function asSig(m: Meth): Sig { return m; }
+			class Holder { sig: Sig = { params: [9] }; }
+			function* gen(m: Meth): Generator<Sig, void, unknown> { yield m; }
+			export function flowKinds(): number {
+				const s = asSig({ type: 'm', key: 'k', params: [1, 2] });
+				const h = new Holder();
+				let y = 0;
+				for (const g of gen({ type: 'm', key: 'q', params: [1, 2, 3] })) y = g.params.length;
+				return s.params.length + h.sig.params.length * 10 + y * 100;
+			}
+		`);
+		check('a return, a field initializer and a yield are flows', flowKinds(), 312);
+	}
+
+	{
 		// A `Partial<Decl>` is no `Decl` (ts-parser.ts's `bodyless_function`), and spreading an absent one supplies nothing.
 		const { partialMore } = await compile(`
 			interface Decl { type: 'decl'; name: string; params: number[]; modifiers?: string[] }

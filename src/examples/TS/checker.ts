@@ -1201,6 +1201,28 @@ export function narrow(test: Expr, scope: Scope, sense: boolean): Scope {
 	}
 }
 
+// Every place a value is accepted INTO a slot -- a declaration, an assignment, an argument, a return, a yield, a field -- is a
+// FLOW, and towasm's open-shape pass must see all of them: a slot receiving a value of another layout is stored as `any`
+// (`collectOpenShapes`). The checker already visits each one, so it stamps the slot on the value's own node, as it stamps
+// `scope`/`contextualType` elsewhere; enumerating the flows again in towasm is what left spreads, returns and generic calls out.
+// `element`: the slot is an array's element (a rest argument), which does not survive to the value's emit site.
+export interface FlowSlot { type: Type; element?: boolean }
+
+export const flowSlotOf = (e: Expr): FlowSlot | undefined => (e as { flowSlot?: FlowSlot }).flowSlot;
+
+// `??=`: the first real (unmuted) check wins, the same reasoning as `fn.scope ??=`. The slot's own scope travels with it,
+// stamped onto the refs that carry none (`T.stampScope`), since the reader has only the VALUE's scope to resolve in.
+function stampFlow(value: Expr | undefined, type: Type | undefined, scope: Scope, element?: boolean) {
+	if (value && type)
+		(value as { flowSlot?: FlowSlot }).flowSlot ??= { type: T.stampScope(type, scope), element };
+}
+
+// `checkAssignable` for a real flow: the value's node carries the slot it flows into.
+function checkFlow(value: Expr | undefined, src: Type, dst: Type, scope: Scope, pos: Location, dstScope: Scope, err: Err): boolean {
+	stampFlow(value, dst, dstScope);
+	return checkAssignable(src, dst, scope, pos, dstScope, err);
+}
+
 // Tries `T.isAssignable` strict then lax; a GAP means strict failed only due to an opaque type (keyof/conditional/infer/mapped).
 // Every real assignability check should go through this, not `T.isAssignable` directly. `dstScope` resolves `dst`'s own structure.
 function checkAssignable(src: Type, dst: Type, scope: Scope, pos: Location, dstScope: Scope, err: Err): boolean {
@@ -2334,6 +2356,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 						argTs.forEach((t, i) => {
 							const p = params[i];
 							if (t && p && p.typeAnnotation) {
+								stampFlow(e.arguments[i], p.typeAnnotation, declScope);
 								// an optional parameter also accepts undefined
 								if (!checkAssignable(t, hasMod(p, 'optional') ? TS.UnionType([p.typeAnnotation, T.UNDEFINED]) : p.typeAnnotation, scope, pos, declScope, err))
 									err(SEVERITY.ERROR, pos)`Argument of type '${show().type(t)}' is not assignable to parameter '${show().bindingTarget(p.key)}: ${show().type(p.typeAnnotation)}' in '${show().expression(e)}'`;
@@ -2341,6 +2364,10 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 									checkExcessProps(e.arguments[i], p.typeAnnotation, pos, declScope, err);
 							}
 						});
+						// Each plain argument past the fixed parameters fills an ELEMENT of the rest array.
+						const restEl = rest?.typeAnnotation && T.arrayLikeElement(T.resolveOwn(rest.typeAnnotation, declScope));
+						if (restEl)
+							e.arguments.forEach((a, i) => i >= params.length && a.type !== 'spread' && stampFlow(a, restEl, declScope, true));
 						const restT: Type = { type: 'tuple', elements: restArgs };
 						if (rest?.typeAnnotation && restArgs.length && restKnown && !checkAssignable(restT, rest.typeAnnotation, scope, pos, declScope, err))
 							err(SEVERITY.ERROR, pos)`Arguments of type '${show().type(restT)}' are not assignable to rest parameter '...${show().bindingTarget(rest.key)}: ${show().type(rest.typeAnnotation)}' in '${show().expression(e)}'`;
@@ -2468,7 +2495,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 					}
 
 					if (!e.operator) {
-						if (!checkAssignable(rt, lt, scope, pos, scope, err)) {
+						if (!checkFlow(e.value, rt, lt, scope, pos, scope, err)) {
 							err(SEVERITY.ERROR, pos)`Type '${show().type(rt)}' is not assignable to type '${show().type(lt)}' in '${show().expression(e.target)} = ...'`;
 						} else {
 							checkExcessProps(e.value, lt, pos, scope, err);
@@ -2582,7 +2609,7 @@ export function typeOf(e: Expr, scope: Scope, widen = true, expected?: Type, yie
 				// `yield* x` yields what `x` iterates to and evaluates to what its iterator returns.
 				const delegated	= e.delegate ? iterationOrReport(argT, scope, pos, err, async) : undefined;
 				const yielded	= delegated ? delegated.yield : T.unwrapIfAsync(argT, scope, async);
-				if (err && fnKind?.yield && !checkAssignable(yielded, fnKind.yield, scope, pos, scope, err))
+				if (err && fnKind?.yield && !checkFlow(e.delegate ? undefined : e.operand, yielded, fnKind.yield, scope, pos, scope, err))
 					err(SEVERITY.ERROR, pos)`Type '${show().type(yielded)}' is not assignable to the yielded type '${show().type(fnKind.yield)}'`;
 				yieldCollector?.push(delegated ? yielded : T.widenLiterals(yielded));
 				// `yield x` evaluates to what `next(v)` is given: the declared N, else `any` (as TS, which flags it under noImplicitAny).
@@ -2710,7 +2737,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 		// Checked precise; an unannotated parameter's own type is the widened one, as TS infers it.
 		const precise	= p.default && typeOf(p.default, inner, false, anno, undefined, err);
 		const dt		= precise && T.widenLiterals(precise);
-		if (err && precise && anno && !checkAssignable(precise, anno, inner, (p as any).pos, inner, err))
+		if (err && precise && anno && !checkFlow(p.default, precise, anno, inner, (p as any).pos, inner, err))
 			err(SEVERITY.ERROR, (p as any).pos)`Default value of type '${show().type(precise)}' is not assignable to parameter type '${show().type(anno)}'`;
 		// Written back, as `applyContextualParams` writes a contextual one: the function's own type (`FixParams`) has no
 		// scope to type a non-literal default in, so `(s, seen = new Set<string>()) => ...` lost `seen`'s type.
@@ -2770,7 +2797,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 					const argument = s.argument;
 					const t = typeOf(argument, scope, false, expected, undefined, err);
 					if (err) {
-						if (!checkAssignable(T.unwrapIfAsync(t, scope, async), expected, scope, (argument as any).pos, scope, err))
+						if (!checkFlow(argument, T.unwrapIfAsync(t, scope, async), expected, scope, (argument as any).pos, scope, err))
 							err(SEVERITY.ERROR, (argument as any).pos)`Type '${show().type(t)}' is not assignable to declared return type '${show().type(expected)}'`;
 						else
 							checkExcessProps(argument, expected, (argument as any).pos, scope, err);
@@ -2828,7 +2855,7 @@ function checkFunctionBody(fn: TS.CallSig, body: JS.Stmt<any>[] | Expr | undefin
 			(body as any).scope ??= inner;
 		const t = typeOf(body, inner, false, expected ?? inferHint, undefined, err);
 		if (expected) {
-			if (err && !checkAssignable(T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
+			if (err && !checkFlow(body as Expr, T.unwrapIfAsync(t, inner, async), expected, inner, (body as any).pos, inner, err))
 				err(SEVERITY.ERROR, (body as any).pos)`Type '${show().type(t)}' is not assignable to declared return type '${show().type(expected)}'`;
 		} else if (!isPredicate && !declaredReturn) {
 			fn.inferredReturn = true;
@@ -2847,7 +2874,7 @@ function checkClass(c: TS.Class, scope: Scope, err?: Err) {
 					const inner = hasMod(m, 'static') ? statScope : instScope;
 					const t		= typeOf(m.value, inner, false, m.typeAnnotation, undefined, err);
 					if (m.typeAnnotation && err) {
-						if (!checkAssignable(t, m.typeAnnotation, inner, (m as any).pos, inner, err))
+						if (!checkFlow(m.value, t, m.typeAnnotation, inner, (m as any).pos, inner, err))
 							err(SEVERITY.ERROR, (m as any).pos)`Type '${show().type(t)}' is not assignable to type '${show().type(m.typeAnnotation)}'`;
 						else
 							checkExcessProps(m.value, m.typeAnnotation, (m as any).pos, inner, err);
@@ -3016,7 +3043,7 @@ export function checkStmt(stmt: Stmt, scope: Scope, typeOf: typeOf, checkStmt: c
 					const init = typeOf(d.init, scope, anno);
 					if (!init)
 						checkExcessProps(d.init, anno, pos, scope, err);
-					else if (!checkAssignable(init, anno, scope, pos, scope, err))
+					else if (!checkFlow(d.init, init, anno, scope, pos, scope, err))
 						err(SEVERITY.ERROR, pos)`Type '${show().type(init)}' is not assignable to type '${show().type(anno)}' in declaration of '${show().bindingTarget(d.name)}'`;
 				}
 				if (!stmt.ambient)
